@@ -53,20 +53,27 @@ public final class ChunkPacketAccessor {
   /**
    * 回填改写结果，并剔除被伪装方块占位的方块实体。
    *
+   * <p><b>写回自检</b>：{@code setBuffer} 只通过 ProtocolLib 的字段访问器把新数组写进 NMS 对象。
+   * 写完立刻回读一次，确认字段指向的就是我们传入的那个数组——若 ProtocolLib 某个版本改成写副本、
+   * 或封包结构不匹配（拿到的是别的对象），这里会返回 {@code false}，调用方据此告警，
+   * 避免出现「算了但没写」却毫无征兆的静默失效。
+   *
    * @param data            新的 section 字节
    * @param localPositions  被伪装的方块位置，编码为 {@code y << 8 | z << 4 | x}（区块内相对坐标）
    * @param minHeight       该世界最低建筑高度，用于把方块实体的绝对 Y 换算为区块内相对 Y
+   * @return true 表示新字节已确认写回封包；false 表示回读结果与写入不一致（调用方应告警）
    */
-  public void update(byte[] data, int[] localPositions, int minHeight) {
+  public boolean update(byte[] data, int[] localPositions, int minHeight) {
     chunkData.setBuffer(data);
+    boolean verified = chunkData.getBuffer() == data;
 
     if (localPositions.length == 0) {
-      return;
+      return verified;
     }
 
     List<WrappedLevelChunkData.BlockEntityInfo> blockEntities = chunkData.getBlockEntityInfo();
     if (blockEntities.isEmpty()) {
-      return;
+      return verified;
     }
 
     List<WrappedLevelChunkData.BlockEntityInfo> kept = new ArrayList<>(blockEntities.size());
@@ -79,6 +86,7 @@ public final class ChunkPacketAccessor {
     if (kept.size() != blockEntities.size()) {
       chunkData.setBlockEntityInfo(kept);
     }
+    return verified;
   }
 
   private static boolean isObfuscated(WrappedLevelChunkData.BlockEntityInfo info, int[] localPositions,

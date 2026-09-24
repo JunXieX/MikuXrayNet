@@ -51,12 +51,31 @@ public final class PacketEventsHook {
       logger.info("方块状态映射构建完成：服务端版本 " + releaseName
           + "，状态数 " + registry.getUniqueBlockStateCount()
           + "，直接格式位宽 " + registry.getMaxBitsPerBlockState());
+      logger.info(occlusionSelfCheck(registry));
       return true;
     } catch (Throwable throwable) {
       logger.log(Level.SEVERE, "构建方块状态映射失败，反矿透模块停用", throwable);
       this.registry = null;
       return false;
     }
+  }
+
+  /**
+   * 遮挡表自检：输出遮挡状态数与典型方块的抽样判定。
+   *
+   * <p>这是「反矿透是否真的会隐藏」的地基自证：若这里的 stone / deepslate 不是「遮挡」，
+   * 那么 {@code shouldObfuscate} 恒为 false、所有矿物都会原样下发（不伪装）。
+   */
+  private static String occlusionSelfCheck(BlockStateRegistry registry) {
+    StringBuilder message = new StringBuilder("遮挡表就绪：遮挡 ")
+        .append(registry.occludingStateCount()).append('/')
+        .append(registry.getUniqueBlockStateCount());
+    for (String name : new String[] {"stone", "deepslate", "air", "water", "anvil"}) {
+      int stateId = BlockStateRegistry.resolveStateId(name);
+      message.append("；抽样 ").append(name).append('=')
+          .append(stateId < 0 ? "未识别" : (registry.isOccluding(stateId) ? "遮挡" : "非遮挡"));
+    }
+    return message.toString();
   }
 
   /** 已构建的注册表；未成功构建时为 null。 */

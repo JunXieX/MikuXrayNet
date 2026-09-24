@@ -44,6 +44,39 @@ class DiskCacheStoreTest {
     return data;
   }
 
+  /** 互不相同的随机负载（同一 bucket 内多条内容各不相同，Deflater 无法把它压小）。 */
+  private static byte[] randomPayload(int length, long seed) {
+    byte[] data = new byte[length];
+    new Random(seed).nextBytes(data);
+    return data;
+  }
+
+  /**
+   * 单文件大小上限用例（回归：真机上 16MB 上限写出了 30MB 的文件）。
+   *
+   * <p>根因是上限只看「已落盘字节」，而 {@code put} 只改内存、真正 append 发生在落盘时，
+   * 于是首次落盘会把整批 bucket（此处 32 条 × 64KB ≈ 2MB）一次性追加，直接冲破上限。
+   * 修正后上限同时计入「已接受但尚未 append 的待写字节」。
+   */
+  @Test
+  void regionFileSizeLimitCountsUnflushedData(@TempDir Path dir) throws Exception {
+    AntiXrayConfig.DiskCache limit1Mb = new AntiXrayConfig.DiskCache(true, 20000, 1, 600, 2, 600,
+        3600, 4, 256, 4096);
+    try (DiskCacheStore store = store(dir, limit1Mb)) {
+      for (int chunkX = 0; chunkX < 32; chunkX++) {
+        store.put(WORLD, chunkX, 0, 1, randomPayload(64 * 1024, chunkX));
+      }
+      store.flush();
+
+      Path file = dir.resolve(WORLD).resolve("r.0.0.b_linear");
+      assertTrue(Files.isRegularFile(file), "应已生成区域文件");
+      long size = Files.size(file);
+      assertTrue(size <= 1_200_000L,
+          "1MB 上限必须同时拦住尚未落盘的数据，实际文件 " + size + " 字节");
+      assertTrue(store.stats().rejectedBySize.sum() > 0L, "超出上限的写入必须被拒绝并计数");
+    }
+  }
+
   @Test
   void putThenGetReturnsIdenticalPayload(@TempDir Path dir) {
     try (DiskCacheStore store = store(dir, config(1024, 600, 600))) {
@@ -138,7 +171,7 @@ class DiskCacheStoreTest {
       store.invalidateWorld(WORLD);
 
       assertEquals(1, store.openRegionFiles(), "只关闭目标世界的句柄");
-      assertTrue(Files.isRegularFile(dir.resolve(WORLD).resolve("r.0.0.blin")),
+      assertTrue(Files.isRegularFile(dir.resolve(WORLD).resolve("r.0.0.b_linear")),
           "世界卸载不删除缓存文件（重启后可复用）");
     }
   }
@@ -171,7 +204,7 @@ class DiskCacheStoreTest {
 
   @Test
   void corruptRegionFileIsRebuiltInsteadOfFailing(@TempDir Path dir) throws Exception {
-    Path file = dir.resolve(WORLD).resolve("r.0.0.blin");
+    Path file = dir.resolve(WORLD).resolve("r.0.0.b_linear");
     Files.createDirectories(file.getParent());
     Files.write(file, new byte[] {1, 2, 3, 4, 5});
 

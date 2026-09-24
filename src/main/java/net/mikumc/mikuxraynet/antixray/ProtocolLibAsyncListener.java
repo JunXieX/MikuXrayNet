@@ -306,6 +306,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         seed(task.worldName(), task.chunkX(), task.chunkZ()), neighbors);
     task.markEncoded();
 
+    if (result.failed()) {
+      // 解码/重编码异常：必须可观测——否则「本该伪装却失败」会被并进「跳过」里，看起来一切正常
+      stats.chunksFailed.increment();
+      logThrottled("区块改写异常（已按原包放行）：" + result.failure(), null);
+    }
     if (result.changed()) {
       stats.chunksRewritten.increment();
     } else {
@@ -418,7 +423,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     if (positions.length == 0) {
       return;
     }
-    accessor.update(data, positions, task.minHeight());
+    if (!accessor.update(data, positions, task.minHeight())) {
+      // 「算了但没写」：setBuffer 回读不一致（ProtocolLib 版本/封包结构不符），必须留痕
+      stats.writeBackFailures.increment();
+      logThrottled("区块改写结果未能写回封包（setBuffer 回读不一致），本轮按原包内容放行", null);
+    }
 
     // 记录「该玩家在这个区块里被伪装过的坐标」，供邻近显形使用（纯内存写入，可在工作线程执行）
     if (revealedIndex != null) {

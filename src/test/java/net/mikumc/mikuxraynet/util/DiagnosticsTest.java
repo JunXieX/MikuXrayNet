@@ -17,7 +17,7 @@ class DiagnosticsTest {
     return new Diagnostics.Snapshot(
         true, true, false, true, 1,
         90L, 10L, 42,
-        100L, 5L, 2L,
+        100L, 5L, 2L, 1L, 2L,
         7L, 3L, 1L,
         20L, 30L,
         4L, 40L, 12L,
@@ -39,6 +39,8 @@ class DiagnosticsTest {
     assertTrue(text.contains("改写缓存"), text);
     assertTrue(text.contains("命中率 90.0%"), text);
     assertTrue(text.contains("区块改写"), text);
+    assertTrue(text.contains("异常 2"), text);
+    assertTrue(text.contains("写回失败 1"), text);
     assertTrue(text.contains("超时放行"), text);
     assertTrue(text.contains("邻近显形"), text);
     assertTrue(text.contains("视锥剔除 3"), text);
@@ -78,7 +80,7 @@ class DiagnosticsTest {
     Diagnostics.Snapshot empty = new Diagnostics.Snapshot(
         false, false, true, false, 0,
         0L, 0L, 0,
-        0L, 0L, 0L,
+        0L, 0L, 0L, 0L, 0L,
         0L, 0L, 0L,
         0L, 0L,
         0L, 0L, 0L,

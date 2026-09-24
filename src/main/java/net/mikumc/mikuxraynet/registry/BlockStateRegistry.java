@@ -154,6 +154,11 @@ public final class BlockStateRegistry implements RegistryAccessor {
     return blockId >= 0 && blockId < uniqueBlockStateCount && occludingStates.get(blockId);
   }
 
+  /** 被判定为「遮挡」的状态数（启动自检日志用，便于一眼看出遮挡表是否全空）。 */
+  public int occludingStateCount() {
+    return occludingStates.cardinality();
+  }
+
   /** 把 PE 状态摊平为纯判定输入（不保留任何 PE 引用）。 */
   private static OcclusionRules.Facts facts(StateType type, String name, WrappedBlockState state) {
     return new OcclusionRules.Facts(

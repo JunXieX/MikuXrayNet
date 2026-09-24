@@ -153,7 +153,7 @@ proximity:
 
 disk-cache:
   # 磁盘缓存：把「已改写完成的区块负载」持久化到
-  #   plugins/MikuXrayNet/cache/<世界名>/r.<regionX>.<regionZ>.blin
+  #   plugins/MikuXrayNet/cache/<世界名>/r.<regionX>.<regionZ>.b_linear
   # （32×32 区块一个文件，格式为 BufferedLinearV3，压缩用 JDK 自带 Deflater）。
   # 收益：重启后同一区块（原始字节指纹 + 配置指纹 + 区块代次都一致时）可直接复用，
   #       省掉重复的解码、遮挡判定与重编码 CPU（首次生成的区块收益最明显）。
@@ -171,6 +171,7 @@ disk-cache:
 
   # 单个区域文件（32×32 = 1024 个区块）的大小上限（MB）。
   # 达到上限后该文件暂不接受新写入，等后台维护压缩回收（丢弃垃圾与过期条目）腾出空间。
+  # 计数同时包含「已落盘字节」与「已接受但尚未 append 的待写字节」（bucket 是整块追加的）。
   max-file-size-mb: 16
 
   # 条目过期秒数：超过该时间未被重写的条目在读取与后台维护时被清理（默认 30 分钟）。

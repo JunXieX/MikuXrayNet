@@ -21,6 +21,7 @@ import java.util.Set;
  *   <li>空气 / 非固体（{@code isSolid()==false}）→ 不遮挡；</li>
  *   <li>形状超出整方块（{@code exceedsCube()}，如栅栏/墙/竹子/脚手架）→ 不遮挡；</li>
  *   <li>双层台阶（{@code type=double}）→ 遮挡（这是唯一需要看「状态属性」而非只看方块类型的修正）；</li>
+ *   <li>名称属于「形状小于整方块」白名单（箱子族等，PE 无对应标志位，见 {@link #NON_OCCLUDING_NAMES}）→ 不遮挡；</li>
  *   <li>材质属于植物/玻璃/树叶/液体等装饰性类别 → 不遮挡；</li>
  *   <li>名称以薄片族后缀结尾（台阶/楼梯/板/门/告示牌等）→ 不遮挡；</li>
  *   <li>其余 → 遮挡。</li>
@@ -41,7 +42,18 @@ public final class OcclusionRules {
       "_stairs", "_slab", "_fence", "_fence_gate", "_wall", "_pane", "_door", "_trapdoor",
       "_pressure_plate", "_button", "_carpet", "_sign", "_banner", "_bed", "_rail", "_torch",
       "_lantern", "_chain", "_bars", "_candle", "_campfire", "_flower_pot", "_head", "_skull",
-      "_sapling", "_sprouts", "_roots", "_fan", "_bush"};
+      "_sapling", "_sprouts", "_roots", "_fan", "_bush", "_shulker_box"};
+
+  /**
+   * 实体但「形状小于整方块」的方块名称白名单。
+   *
+   * <p><b>为什么需要这张表</b>：PacketEvents 只提供 {@code exceedsCube}（形状<b>超出</b>整方块，如栅栏/墙），
+   * <b>没有</b>「小于整方块」的标志位；箱子族这类方块在 PE 里 {@code isSolid=true}、材质也不是装饰性材质，
+   * 只按内置规则会被误判为「遮挡」。依据真机 PE 2.13.0（V_26_2）实测：
+   * {@code chest → solid=true / exceedsCube=false / material=WOOD}，故必须在此显式纠正。
+   */
+  private static final Set<String> NON_OCCLUDING_NAMES = Set.of(
+      "chest", "trapped_chest", "ender_chest", "shulker_box");
 
   private OcclusionRules() {
   }
@@ -74,6 +86,9 @@ public final class OcclusionRules {
     }
     if (facts.doubleSlab()) {
       return true;
+    }
+    if (NON_OCCLUDING_NAMES.contains(name)) {
+      return false;
     }
     if (!facts.materialOccluding()) {
       return false;

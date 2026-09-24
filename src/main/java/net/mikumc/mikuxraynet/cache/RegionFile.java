@@ -12,7 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * 单个区域缓存文件（{@code r.<regionX>.<regionZ>.blin}）的读写句柄，格式见 {@link BufferedLinearV3Format}。
+ * 单个区域缓存文件（{@code r.<regionX>.<regionZ>.b_linear}）的读写句柄，格式见 {@link BufferedLinearV3Format}。
  *
  * <p><b>线程纪律</b>：所有方法都只在 {@link DiskCacheStore} 的磁盘线程上调用（单线程串行），
  * 因此内部只用普通字段与一把逻辑串行化，不做额外的线程安全处理。

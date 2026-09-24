@@ -1,7 +1,9 @@
 package net.mikumc.mikuxraynet.antixray;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
+import java.util.List;
 import java.util.Random;
 import java.util.function.IntPredicate;
 import java.util.logging.Logger;
@@ -45,12 +47,24 @@ public final class ObfuscationProcessor {
     public static final PaletteOptions DISABLED = new PaletteOptions(false, false);
   }
 
-  /** 改写结果；{@code obfuscatedPositions} 编码为 {@code y << 8 | z << 4 | x}（区块内相对坐标）。 */
-  public record Result(byte[] data, int[] obfuscatedPositions) {
+  /**
+   * 改写结果。
+   *
+   * @param data                改写后的 section 字节（未改动时即为入参 {@code source}）
+   * @param obfuscatedPositions 被伪装的方块位置，编码为 {@code y << 8 | z << 4 | x}（区块内相对坐标）
+   * @param failure             {@code null} 表示正常；非 null 为「解码/重编码异常」的摘要
+   *                            （此时已 fail-open 放行原包，调用方应计数并告警，勿与「无目标方块」混淆）
+   */
+  public record Result(byte[] data, int[] obfuscatedPositions, String failure) {
 
     /** 是否真的改动了字节。 */
     public boolean changed() {
       return obfuscatedPositions.length > 0;
+    }
+
+    /** 是否因解码/重编码异常而放弃改写（fail-open）。 */
+    public boolean failed() {
+      return failure != null;
     }
   }
 
@@ -102,14 +116,19 @@ public final class ObfuscationProcessor {
   public static ObfuscationProcessor create(ChunkCodec codec, BlockStateRegistry registry,
       AntiXrayConfig config, Logger logger, PaletteOptions paletteOptions) {
     BitSet targets = new BitSet(registry.getUniqueBlockStateCount());
+    List<String> resolvedTargets = new ArrayList<>();
     for (String name : config.hideBlocks()) {
       int stateId = BlockStateRegistry.resolveStateId(name);
       if (stateId < 0) {
         logger.warning("反矿透配置中的隐藏方块名称无法识别，已跳过：" + name);
       } else {
         targets.set(stateId);
+        resolvedTargets.add(name);
       }
     }
+    // 启动自检：把「实际匹配到的目标方块清单」打出来，便于一眼看出是否漏了深层矿变体
+    logger.info("反矿透目标方块解析完成：" + resolvedTargets.size() + '/' + config.hideBlocks().size()
+        + " 种 → " + resolvedTargets);
 
     int[] replacementIds = new int[config.replacementWeights().size()];
     int[] cumulativeWeights = new int[replacementIds.length];
@@ -161,11 +180,11 @@ public final class ObfuscationProcessor {
    * @param sectionCount 该世界的 section 数量
    * @param seed         伪装随机种子；同种子同输入必然得到同结果（缓存可安全复用）
    * @param neighbors    4 个水平邻块的贴边快照；{@code null} 表示缺失，按缺失策略处理
-   * @return 改写结果；任何异常都回退为「原字节 + 空位置」（fail-open）
+   * @return 改写结果；解码/重编码异常都回退为「原字节 + 空位置 + 异常摘要」（fail-open）
    */
   public Result rewrite(byte[] source, int sectionCount, long seed, NeighborEdges neighbors) {
     if (!isActive() || sectionCount <= 0 || source.length == 0) {
-      return new Result(source, NO_POSITIONS);
+      return new Result(source, NO_POSITIONS, null);
     }
 
     Random random = new Random(seed);
@@ -177,7 +196,8 @@ public final class ObfuscationProcessor {
     try {
       chunk = codec.decode(source, sectionCount);
     } catch (RuntimeException exception) {
-      return new Result(source, NO_POSITIONS);
+      // 解码失败：多半是区块二进制布局与预期不符（版本/第三方改写），必须可观测，不能静默当作「无改动」
+      return new Result(source, NO_POSITIONS, describe(exception));
     }
 
     try {
@@ -230,14 +250,22 @@ public final class ObfuscationProcessor {
 
       if (!changed) {
         // 无改动：直接复用原字节，跳过整次重编码
-        return new Result(source, NO_POSITIONS);
+        return new Result(source, NO_POSITIONS, null);
       }
-      return new Result(chunk.finalizeOutput(), Arrays.copyOf(positions, count));
+      return new Result(chunk.finalizeOutput(), Arrays.copyOf(positions, count), null);
     } catch (RuntimeException exception) {
-      return new Result(source, NO_POSITIONS);
+      return new Result(source, NO_POSITIONS, describe(exception));
     } finally {
       chunk.close();
     }
+  }
+
+  /** 异常摘要（供可观测的告警日志使用；不含堆栈，避免刷屏）。 */
+  private static String describe(Throwable throwable) {
+    String message = throwable.getMessage();
+    return message == null || message.isBlank()
+        ? throwable.getClass().getSimpleName()
+        : throwable.getClass().getSimpleName() + ": " + message;
   }
 
   /**

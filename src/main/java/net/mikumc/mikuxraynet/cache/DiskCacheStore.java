@@ -24,7 +24,7 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 
 /**
  * 磁盘缓存：把「已改写完成的区块负载」持久化到
- * {@code plugins/MikuXrayNet/cache/<世界名>/r.<regionX>.<regionZ>.blin}，重启后可直接复用，
+ * {@code plugins/MikuXrayNet/cache/<世界名>/r.<regionX>.<regionZ>.b_linear}，重启后可直接复用，
  * 省掉重复的重解码与遮挡判定（CPU 开销）。
  *
  * <p><b>文件格式</b>：{@link BufferedLinearV3Format}（32×32 区块一区），
@@ -40,7 +40,8 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
  * <p><b>生命周期（本项目最看重的一点）</b>：绝不持有 {@code World / Chunk / Player} 引用（键只有
  * 字符串与整数）；世界卸载 → {@link #invalidateWorld} 落盘并关闭该世界的全部句柄；插件停用 →
  * {@link #close} 全部落盘并关闭；后台维护任务负责「落盘 + 压缩回收 + 关闭闲置句柄」，另有
- * 总条目上限、单文件大小上限、条目过期时间三重限额，{@link #stats()} 暴露持有量与命中率供
+ * 总条目上限、单文件大小上限、条目过期时间三重限额（单文件上限同时计入「已接受但尚未落盘」的字节，
+ * 因为 bucket 是整块追加的），{@link #stats()} 暴露持有量与命中率供
  * {@code /mikuxraynet status} 自查。
  *
  * <p><b>线程纪律</b>：全部磁盘 IO 都在本类自有的单线程
@@ -60,6 +61,9 @@ public final class DiskCacheStore implements AutoCloseable {
   /** 触发压缩回收的垃圾占比（垃圾字节 > 活数据的一半）。 */
   private static final double COMPACT_GARBAGE_RATIO = 0.5D;
 
+  /** 区域缓存文件后缀（BufferedLinearV3 的线性 bucket 布局）。 */
+  private static final String REGION_FILE_SUFFIX = ".b_linear";
+
   /** 区域坐标键（只含不可变类型，不可能钉住世界对象）。 */
   private record RegionKey(String worldName, int regionX, int regionZ) {
   }
@@ -73,6 +77,16 @@ public final class DiskCacheStore implements AutoCloseable {
 
     private final RegionFile file;
     private volatile long lastAccessNanos;
+
+    /**
+     * 已接受但尚未 append 到文件里的负载字节（只有磁盘线程访问）。
+     *
+     * <p><b>为什么必须单独记账</b>：{@link RegionFile#put} 只改内存并标脏，真正 append 发生在
+     * {@link RegionFile#flushDirty()}（维护周期 / 显式 flush / 关闭）。只看
+     * {@link RegionFile#sizeBytes()} 会漏掉整批待落盘数据，导致「单文件上限」在首次落盘时被一次性冲破
+     * （实测出现过 16MB 上限却写出 30MB 文件）。
+     */
+    private long pendingBytes;
 
     private Handle(RegionFile file) {
       this.file = file;
@@ -337,8 +351,9 @@ public final class DiskCacheStore implements AutoCloseable {
     int regionX = BufferedLinearV3Format.regionCoordinate(chunkX);
     int regionZ = BufferedLinearV3Format.regionCoordinate(chunkZ);
     Handle handle = handle(worldName, regionX, regionZ, true);
-    if (handle.file.sizeBytes() >= maxFileSizeBytes) {
-      // 单文件上限：等维护任务的压缩回收把垃圾释放后再写
+    if (handle.file.sizeBytes() + handle.pendingBytes >= maxFileSizeBytes) {
+      // 单文件上限：既看已落盘字节，也看尚未 append 的待落盘字节
+      // （bucket 是整块追加的，只看已落盘大小会让首次落盘一次性冲破上限）
       stats.rejectedBySize.increment();
       return;
     }
@@ -349,6 +364,8 @@ public final class DiskCacheStore implements AutoCloseable {
     if (!replaced) {
       approximateEntries.incrementAndGet();
     }
+    // 该负载会在 flushDirty 时随所属 bucket 整块 append；bucket 重写产生的旧副本计入垃圾，由压缩回收
+    handle.pendingBytes += payload.length;
     stats.puts.increment();
   }
 
@@ -372,6 +389,8 @@ public final class DiskCacheStore implements AutoCloseable {
         if (handle.file.isDirty()) {
           handle.file.flushDirty();
         }
+        // 无论是否真的写过，此刻内存里的负载都已（随 bucket 整块）落到文件：待落盘记账清零
+        handle.pendingBytes = 0L;
       } catch (Throwable throwable) {
         fail("磁盘缓存落盘失败（该区域文件将在下次维护重试）", throwable);
       }
@@ -404,6 +423,8 @@ public final class DiskCacheStore implements AutoCloseable {
         if (dropped > 0) {
           approximateEntries.updateAndGet(value -> Math.max(0, value - dropped));
         }
+        // 压缩会把内存里的全部 bucket（含脏的）整文件重写：待落盘记账随之清零
+        handle.pendingBytes = 0L;
         stats.compactions.increment();
         done++;
       } catch (Throwable throwable) {
@@ -525,7 +546,7 @@ public final class DiskCacheStore implements AutoCloseable {
 
   private Path pathFor(String worldName, int regionX, int regionZ) {
     return rootDir.resolve(sanitize(worldName))
-        .resolve("r." + regionX + "." + regionZ + ".blin");
+        .resolve("r." + regionX + "." + regionZ + REGION_FILE_SUFFIX);
   }
 
   /** 世界名 → 目录名：只保留安全字符，避免路径穿越或非法文件名。 */
