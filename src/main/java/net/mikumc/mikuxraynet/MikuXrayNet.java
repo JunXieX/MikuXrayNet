@@ -1,7 +1,10 @@
 package net.mikumc.mikuxraynet;
 
 import com.comphenix.protocol.ProtocolManager;
+import io.papermc.paper.command.brigadier.BasicCommand;
+import io.papermc.paper.command.brigadier.CommandSourceStack;
 import java.io.File;
+import java.util.Collection;
 import java.util.List;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.antixray.BlockChangeRevealListener;
@@ -394,19 +397,89 @@ public final class MikuXrayNet extends JavaPlugin {
     startBandwidth();
   }
 
-  /** 注册管理命令（执行器与补全器）。 */
+  /** 管理命令名（两份插件描述与代码注册三处必须一致，由 PluginDescriptionConsistencyTest 守门）。 */
+  private static final String COMMAND_NAME = "mikuxraynet";
+  private static final String COMMAND_DESCRIPTION = "MikuXrayNet 管理命令";
+  private static final String COMMAND_PERMISSION = "mikuxraynet.admin";
+  private static final List<String> COMMAND_ALIASES = List.of("mxnet", "mxr");
+
+  /**
+   * 注册管理命令（执行器与补全器）。
+   *
+   * <p>双路径，因为本插件同时提供两份插件描述（paper-plugin.yml 优先、plugin.yml 回退）：
+   * <ul>
+   *   <li><b>传统路径</b>：核心按 plugin.yml 加载时，Bukkit 会依据 commands 段注册 PluginCommand，
+   *       这里取回来绑定执行器即可；</li>
+   *   <li><b>现代路径</b>：核心按 paper-plugin.yml 加载时，Paper 不会从 YAML 注册任何命令
+   *       （PaperPluginClassLoader#init 以 Map.of() 填充 PluginDescriptionFile#commands），
+   *       必须在 onEnable 内调用 {@link org.bukkit.plugin.java.JavaPlugin#registerCommand}。
+   *       判断方式：此路径下调用 {@code getCommand} 会抛 {@link UnsupportedOperationException}。</li>
+   * </ul>
+   */
   private void registerCommand() {
     try {
       MikuCommand executor = new MikuCommand(this);
-      PluginCommand command = getCommand("mikuxraynet");
-      if (command == null) {
-        getLogger().warning("未在 plugin.yml 中找到命令 mikuxraynet，管理命令不可用");
+      PluginCommand legacyCommand = legacyPluginCommand();
+      if (legacyCommand != null) {
+        legacyCommand.setExecutor(executor);
+        legacyCommand.setTabCompleter(executor);
+        getLogger().info("管理命令 /" + COMMAND_NAME + " 已按 plugin.yml 传统方式注册");
         return;
       }
-      command.setExecutor(executor);
-      command.setTabCompleter(executor);
+      registerCommand(COMMAND_NAME, COMMAND_DESCRIPTION, COMMAND_ALIASES,
+          new PaperCommandBridge(executor));
+      getLogger().info("管理命令 /" + COMMAND_NAME + " 已按 paper-plugin.yml 现代方式注册");
     } catch (Throwable throwable) {
-      getLogger().log(Level.WARNING, "注册管理命令失败", throwable);
+      getLogger().log(Level.WARNING, "注册管理命令失败（管理命令不可用）", throwable);
+    }
+  }
+
+  /**
+   * 取传统描述（plugin.yml）注册的命令；现代描述（paper-plugin.yml）下无此类命令。
+   *
+   * <p>Paper 对「paper 插件」在 onEnable 内调用 {@code getCommand} 会直接抛
+   * {@link UnsupportedOperationException}，并明确提示 paper 插件不支持 YAML 命令声明，
+   * 因此把它当作「无传统命令」处理，转走现代注册路径。
+   */
+  private PluginCommand legacyPluginCommand() {
+    try {
+      return getCommand(COMMAND_NAME);
+    } catch (UnsupportedOperationException unsupported) {
+      return null;
+    } catch (Throwable throwable) {
+      getLogger().log(Level.WARNING, "查询传统命令时出现异常", throwable);
+      return null;
+    }
+  }
+
+  /**
+   * Bukkit 执行器 → Paper Brigadier 命令的适配层。
+   *
+   * <p>两条路径复用同一份 {@link MikuCommand} 逻辑，避免出现两套命令实现而漂移；
+   * 子命令的权限与中文回显都在 MikuCommand 内部判定，这里只透传发送者与参数。
+   */
+  private static final class PaperCommandBridge implements BasicCommand {
+
+    private final MikuCommand delegate;
+
+    PaperCommandBridge(MikuCommand delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public void execute(CommandSourceStack source, String[] args) {
+      delegate.onCommand(source.getSender(), null, COMMAND_NAME, args);
+    }
+
+    @Override
+    public Collection<String> suggest(CommandSourceStack source, String[] args) {
+      List<String> suggestions = delegate.onTabComplete(source.getSender(), null, COMMAND_NAME, args);
+      return suggestions == null ? List.of() : suggestions;
+    }
+
+    @Override
+    public String permission() {
+      return COMMAND_PERMISSION;
     }
   }
 

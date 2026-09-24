@@ -1,0 +1,158 @@
+# ============================================================================
+# Paper 现代插件描述（paper-plugin.yml）—— MikuXrayNet
+#
+# 【依据】字段名与语义全部取自 Paper 官方文档与源码，不凭记忆书写：
+#   · 文档：https://docs.papermc.io/paper/dev/getting-started/paper-plugins/
+#   · 解析器：io.papermc.paper.plugin.provider.configuration.PaperPluginMeta
+#     （字段清单：name / main / bootstrapper / loader / version / api-version /
+#       description / authors / contributors / website / prefix / load /
+#       permissions / default-permission / provides / has-open-classloader / dependencies）
+#   · 依赖项结构：...provider.configuration.type.DependencyConfiguration
+#     record (LoadOrder load, Boolean required, Boolean joinClasspath)
+#     默认值 required=true、joinClasspath=true；LoadOrder = BEFORE | AFTER | OMIT
+#   · 版本选择：...provider.type.PluginFileType#guessType 按 [PAPER, SPIGOT] 顺序探测，
+#     命中 paper-plugin.yml 即 FULL STOP，不再读 plugin.yml
+#   · 键名风格：Paper 用 kebab-case（join-classpath / api-version …），
+#     已用 configurate 4.2.0 离线实测「kebab-case 键 → camelCase 字段」映射成立
+#
+# 【为什么与 plugin.yml 两份并存】
+#   1) Paper 系核心（Paper/Leaf 等）只认本文件，且会「整体忽略」plugin.yml（不是合并）；
+#   2) 纯 Bukkit/Spigot 或老核心不认 paper-plugin.yml，会回退去读 plugin.yml；
+#   3) 因此两份描述的公共字段必须逐字一致，由 PluginDescriptionConsistencyTest 守门。
+# ============================================================================
+name: MikuXrayNet
+version: '${project.version}'          # 由 Maven 资源过滤替换为真实版本号
+main: net.mikumc.mikuxraynet.MikuXrayNet
+# Paper 插件要求的 api-version 下限是 1.19（PaperPluginMeta.MINIMUM）。
+api-version: '26.2'
+authors:
+  - JunXieX
+description: MikuMC 服务器原创插件
+# 默认即 POSTWORLD，此处显式写出以表明本插件不在 STARTUP 阶段加载（与 plugin.yml 行为一致）。
+load: POSTWORLD
+
+# ---------------------------------------------------------------------------
+# 依赖段：Paper 插件不使用 depend / softdepend，改用 dependencies.server。
+#   load            BEFORE | AFTER | OMIT —— 依赖相对于「本插件」的加载顺序，默认 OMIT
+#   required        true | false —— 缺失时是否阻止本插件加载，默认 true
+#   join-classpath  true | false —— 是否把对方类加载器并入本插件的可见类路径，默认 true
+#
+# 【类加载隔离：本插件的关键风险点，务必看懂再改】
+#   Paper 插件默认彼此隔离，只有「在 dependencies 里声明」且 join-classpath=true 才能读取
+#   对方插件的类（含传递依赖）。证据链：
+#     1) PaperPluginMeta#getPluginDependencies()  = dependencies.server 中 required&&joinClasspath 的项
+#        PaperPluginMeta#getPluginSoftDependencies() = dependencies.server 中 !required&&joinClasspath 的项
+#        → join-classpath=false 的项不进依赖树，**没有类路径访问权**（只是加载顺序声明）
+#     2) SimpleMetaDependencyTree#registerDependencies 为上面两份清单建边
+#     3) PaperPluginClassLoader#refreshClassloaderDependencyTree 用
+#        DependencyContext#isTransitiveDependency 建立「可访问类加载器组」
+#     4) PaperPluginClassLoader#loadClass 最终通过该组解析依赖插件的类
+#   本插件源码直接引用 com.comphenix.protocol.*（ProtocolLib）与
+#   com.github.retrooper.packetevents.*（PacketEvents），所以这两个前置
+#   **必须 join-classpath: true**，否则运行期会 NoClassDefFoundError。
+# ---------------------------------------------------------------------------
+dependencies:
+  server:
+    # PacketEvents：硬前置。启动期用它构建方块状态映射表与遮挡位图（只当「库」用，不订阅其封包事件）。
+    # 它自身是传统 plugin.yml 插件，但同样按插件「名称」参与依赖解析与类路径合并（跨描述类型混用无限制，
+    # 因为依赖树只认 PluginMeta#getName）。
+    packetevents:
+      load: BEFORE
+      required: true
+      join-classpath: true
+
+    # ProtocolLib：唯一的封包拦截通道。
+    # required: false —— 与我们既有行为一致：缺失时只停用反矿透主体，保留配置与命令（等价 SoftDepend）。
+    # join-classpath: true —— 必须保留！源码引用 com.comphenix.protocol.*。
+    # 注意 required 与 join-classpath 相互独立：required=false 的项只要 join-classpath=true，
+    # 仍会进入依赖树并获得类路径访问权（见上面第 1、2 条证据）。
+    ProtocolLib:
+      load: BEFORE
+      required: false
+      join-classpath: true
+
+    # 以下三个是可选软依赖：本插件不引用它们的任何类型，只需要「它们先于本插件加载」，
+    # 因此 join-classpath: false（不并入类路径，把类加载隔离面收窄到最小）。
+    ViaVersion:
+      load: BEFORE
+      required: false
+      join-classpath: false
+    ViaBackwards:
+      load: BEFORE
+      required: false
+      join-classpath: false
+    Geyser-Spigot:
+      load: BEFORE
+      required: false
+      join-classpath: false
+
+# ---------------------------------------------------------------------------
+# 权限段：结构（node → description / default / children）与 plugin.yml 完全一致，
+# 因为 Paper 的 PermissionConfigurationSerializer 最终调用的是 Bukkit 的
+# Permission#loadPermission(name, Map, defaultPerm, output)，即同一套语义。
+# 默认值随 default-permission（本处各项都显式写了 default，故不涉及）。
+# 必须与 plugin.yml 逐字一致，由 PluginDescriptionConsistencyTest 守门。
+# ---------------------------------------------------------------------------
+permissions:
+  mikuxraynet.*:
+    description: MikuXrayNet 全部权限
+    default: false
+    children:
+      mikuxraynet.admin: true
+      mikuxraynet.bypass: true
+  mikuxraynet.admin:
+    description: 访问管理命令与查看统计
+    default: op
+    children:
+      mikuxraynet.status: true
+      mikuxraynet.dump: true
+      mikuxraynet.reload: true
+  mikuxraynet.status:
+    description: 查看运行状态与统计
+    default: op
+  mikuxraynet.dump:
+    description: 导出诊断转储文件
+    default: op
+  mikuxraynet.reload:
+    description: 热重载配置
+    default: op
+  mikuxraynet.bypass:
+    description: 绕过反矿透混淆，看到真实世界
+    default: false
+
+# ---------------------------------------------------------------------------
+# 【重要】以下两段在 Paper 上是「惰性」的（写了也完全不生效），保留只为与 plugin.yml 字段一致，
+# 便于两份描述对照维护；真正的行为由代码承担，详见各段注释。
+#
+# commands：Paper 明确不支持在 paper-plugin.yml 里声明命令。
+#   证据 1（文档）：https://docs.papermc.io/paper/dev/getting-started/paper-plugins/#commands
+#     “Paper plugins do not use the commands field to register commands … you can register
+#      commands using the Brigadier Command API.”
+#   证据 2（源码）：PaperPluginClassLoader#init(JavaPlugin) 构造 PluginDescriptionFile 时
+#     传入 Map.of() 作为 commands（源码注释：“Commands, we use a separate system”）；
+#     PaperPluginMeta 本身也没有 commands 字段。
+#   证据 3（源码）：PaperPluginInstanceManager#enablePlugin 只在
+#     plugin.getPluginMeta() instanceof PluginDescriptionFile（传统插件）时才解析 YAML 命令。
+#   应对（兼容写法）：命令改由 MikuXrayNet#registerCommand 在 onEnable 内用
+#     JavaPlugin#registerCommand(label, description, aliases, BasicCommand) 注册
+#     （该方法已在本项目编译目标 paper-api 26.2.build.129-stable 上用 javap 核实存在）。
+#   本段仅为「两份描述字段对齐」而保留；在纯 Bukkit/Spigot 上 paper-plugin.yml 不会被读取，
+#   那里由 plugin.yml 的 commands 段生效。
+# ---------------------------------------------------------------------------
+commands:
+  mikuxraynet:
+    description: MikuXrayNet 管理命令
+    usage: /mikuxraynet <status|dump|reload>
+    aliases:
+      - mxnet
+      - mxr
+    permission: mikuxraynet.admin
+    permission-message: 你没有权限使用该命令
+
+# ---------------------------------------------------------------------------
+# folia-supported：不是 paper-plugin.yml 的字段（PaperPluginMeta 字段清单中不存在，
+#   它是传统 plugin.yml 的字段，由 Folia/Leaf 的 PluginDescriptionFile 补丁读取）。
+#   保留在此仅为与 plugin.yml 字段一致；Paper 路径上该标记不生效 —— 这是本次改用
+#   现代描述引入的既有能力差异，已在交付报告中列为「真机复验点」。
+# ---------------------------------------------------------------------------
+folia-supported: true

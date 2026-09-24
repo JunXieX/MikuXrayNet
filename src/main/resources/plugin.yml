@@ -1,3 +1,17 @@
+# ============================================================================
+# 传统（Bukkit/Spigot）插件描述 —— MikuXrayNet
+#
+# 【为什么本文件与 paper-plugin.yml 两份并存】
+#   · Paper 系核心按 [paper-plugin.yml → plugin.yml] 的顺序探测插件描述
+#     （源码：...provider.type.PluginFileType#guessType），命中 paper-plugin.yml 后
+#     **整体忽略本文件**（不是字段合并）。所以在 Paper 上真正生效的是 paper-plugin.yml。
+#   · 本文件的作用是「兼容回退」：纯 Bukkit/Spigot 或老核心不认 paper-plugin.yml，
+#     会读取本文件正常加载本插件（含其中的 commands / folia-supported，这两项在现代描述里不可用）。
+#   · 因此两份描述的公共字段（name / version / api-version / commands / permissions 等）
+#     必须逐字一致，改动请同步修改另一份 —— 由 PluginDescriptionConsistencyTest 守门。
+#   · 注意：Paper 上的命令不依赖本文件的 commands 段（Paper 插件不走 YAML 命令注册），
+#     实际注册在 MikuXrayNet#registerCommand 中完成，本段仅服务于回退路径。
+# ============================================================================
 name: MikuXrayNet
 version: '${project.version}'
 main: net.mikumc.mikuxraynet.MikuXrayNet
@@ -11,11 +25,13 @@ folia-supported: true
 
 # PacketEvents 是硬依赖：启动期用它构建方块状态映射表与遮挡位图。
 # 缺失时插件禁用（不使用 PacketEvents 的封包事件，它只作为「库」提供状态映射）。
+# 对应 paper-plugin.yml 的 dependencies.server.packetevents（required: true, join-classpath: true）。
 depend:
   - packetevents
 
 # ProtocolLib 是唯一封包拦截通道（真异步扣包）。缺失时插件禁用核心功能，
 # 仅保留配置与命令，便于管理员排查。
+# 对应 paper-plugin.yml 的 dependencies.server.ProtocolLib（required: false, join-classpath: true）。
 softdepend:
   - ProtocolLib
   - ViaVersion

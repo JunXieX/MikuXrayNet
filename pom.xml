@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -123,12 +123,17 @@
         <finalName>MikuXrayNet-${project.version}</finalName>
 
         <resources>
-            <!-- plugin.yml 需要把 ${project.version} 替换成真实版本号 -->
+            <!--
+              两份插件描述都需要把 ${project.version} 替换成真实版本号。
+              注意：这里的 includes 是「白名单」，不在名单内的资源走下面的不过滤分支，
+              因此新增描述文件时必须同步加进来，否则 jar 里会残留未替换的占位符。
+            -->
             <resource>
                 <directory>src/main/resources</directory>
                 <filtering>true</filtering>
                 <includes>
                     <include>plugin.yml</include>
+                    <include>paper-plugin.yml</include>
                 </includes>
             </resource>
             <!-- 其余资源（含两份带中文注释的配置文件）必须原样打包，不做占位符替换 -->
@@ -137,6 +142,7 @@
                 <filtering>false</filtering>
                 <excludes>
                     <exclude>plugin.yml</exclude>
+                    <exclude>paper-plugin.yml</exclude>
                 </excludes>
             </resource>
         </resources>
