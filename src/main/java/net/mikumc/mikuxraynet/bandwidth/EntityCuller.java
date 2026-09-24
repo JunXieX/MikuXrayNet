@@ -3,6 +3,7 @@ package net.mikumc.mikuxraynet.bandwidth;
 import io.papermc.paper.event.player.PlayerTrackEntityEvent;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -108,13 +109,36 @@ public final class EntityCuller implements Listener {
   public void onQuit(PlayerQuitEvent event) {
     Player player = event.getPlayer();
     cancelRecheckTask(player.getUniqueId());
-    Map<Integer, Entity> map = hidden.remove(player.getUniqueId());
-    if (map != null) {
-      for (Entity entity : map.values()) {
-        show(player, entity);
-      }
+    for (Entity entity : drainPlayer(player.getUniqueId()).values()) {
+      show(player, entity);
     }
     purgeInFlight(player.getUniqueId());
+  }
+
+  /**
+   * 当前处于隐藏中的实体总数（诊断用实时值）。
+   *
+   * <p><b>为什么需要它</b>：{@code entitiesHidden} 与 {@code entitiesShown} 是累计计数，两者天然不等——
+   * 实体死亡 / 区块卸载 / 离场会被服务端自然回收，此时**不需要**也不应该再发 showEntity；
+   * 只有「当前隐藏中」这个实时值才能让两个累计数自证（累计隐藏 = 累计恢复 + 当前隐藏中 + 自然回收）。
+   */
+  public int hiddenCount() {
+    int total = 0;
+    for (Map<Integer, Entity> map : hidden.values()) {
+      total += map.size();
+    }
+    return total;
+  }
+
+  /** 取出并从登记表移除某玩家的全部隐藏实体（玩家退出 / 插件停用时的全量恢复入口）；无记录返回空表。 */
+  Map<Integer, Entity> drainPlayer(UUID playerId) {
+    Map<Integer, Entity> map = hidden.get(playerId);
+    if (map == null) {
+      return Map.of();
+    }
+    Map<Integer, Entity> drained = new LinkedHashMap<>(map);
+    hidden.remove(playerId, map);
+    return drained;
   }
 
   /** 为单个玩家登记周期复检任务；同一玩家重复登记时以最新任务为准（旧任务取消）。 */
@@ -238,8 +262,8 @@ public final class EntityCuller implements Listener {
     }
   }
 
-  /** 主线程/区域线程：读方块判定遮挡并执行隐藏/恢复。 */
-  private void evaluate(Player player, Entity entity, List<int[]> paths) {
+  /** 主线程/区域线程：读方块判定遮挡并执行隐藏/恢复（包可见：供离线单测直接驱动账本行为）。 */
+  void evaluate(Player player, Entity entity, List<int[]> paths) {
     if (!entity.isValid() || !player.isOnline()) {
       Map<Integer, Entity> map = hidden.get(player.getUniqueId());
       if (map != null) {
@@ -317,15 +341,16 @@ public final class EntityCuller implements Listener {
   /** 停用时的兜底：把所有被隐藏的实体恢复显示，不留副作用。 */
   private void restoreAll() {
     for (Player player : Bukkit.getOnlinePlayers()) {
-      Map<Integer, Entity> map = hidden.remove(player.getUniqueId());
-      if (map == null) {
+      Map<Integer, Entity> drained = drainPlayer(player.getUniqueId());
+      if (drained.isEmpty()) {
         continue;
       }
-      for (Entity entity : map.values()) {
+      for (Entity entity : drained.values()) {
         // 一律回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
         Schedulers.onEntity(plugin, player, () -> show(player, entity));
       }
     }
+    // 离线玩家（停用时已不在线）的登记一并丢弃：它们已随退出被恢复，这里只兜底清账本
     hidden.clear();
   }
 

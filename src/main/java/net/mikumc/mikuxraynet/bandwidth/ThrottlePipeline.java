@@ -187,6 +187,12 @@ public final class ThrottlePipeline {
     return tracker == null ? 0 : tracker.afkCount();
   }
 
+  /** 当前处于隐藏中的实体数（诊断用实时值）；未启用实体剔除模块时为 0。 */
+  public int hiddenEntityCount() {
+    EntityCuller culler = entityCuller;
+    return culler == null ? 0 : culler.hiddenCount();
+  }
+
   /** 管线是否已装配。 */
   public boolean started() {
     return started;

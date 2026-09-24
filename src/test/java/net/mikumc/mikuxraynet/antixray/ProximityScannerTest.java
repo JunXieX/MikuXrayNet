@@ -2,6 +2,7 @@ package net.mikumc.mikuxraynet.antixray;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
@@ -142,6 +143,101 @@ class ProximityScannerTest {
     assertEquals(List.of(new ObfuscatedChunkIndex.Position(1, 64, 1)),
         scan(index, revealed, PLAYER, 16.0D, 2, tally), "剩余坐标留到下次");
     assertEquals(1, tally.chunksScanned, "尚未整块显形，不能跳过该区块");
+  }
+
+  /**
+   * 连续 N 次显形后：该玩家该区块的已显形集合恰好 N 条，且此后每周期同一区块<b>重复发送 = 0</b>
+   * （一个坐标都不再评估）。这正是「发送计数与已显形计数必须一一对应」的守门测试。
+   */
+  @Test
+  void everyRevealedCoordinateIsCountedOnceAndNeverResent() {
+    ObfuscatedChunkIndex index = index();
+    RevealedSet revealed = revealed();
+    ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT,
+        new int[] {local(1, 64, 1), local(2, 64, 1), local(3, 64, 1)});
+
+    int sent = 0;
+    for (int pass = 0; pass < 3; pass++) {
+      List<ObfuscatedChunkIndex.Position> candidates = scan(index, revealed, PLAYER, 16.0D, 1, null);
+      sent += candidates.size();
+      revealAll(candidates, revealed, PLAYER);
+    }
+
+    assertEquals(3, sent, "三个坐标恰好各发送一次（额度 1 时需 3 次巡检）");
+    assertEquals(3, revealed.sizeFor(PLAYER, key), "连续 N 次显形后该区块的已显形集合恰有 N 条");
+
+    for (int pass = 0; pass < 5; pass++) {
+      ProximityScanner.Tally tally = new ProximityScanner.Tally();
+      assertTrue(scan(index, revealed, PLAYER, 16.0D, 8, tally).isEmpty(), "已整块显形不得重复发送");
+      assertEquals(0, tally.positionsEvaluated, "重复发送 = 0：被跳过的区块一个坐标都不评估");
+      assertEquals(1, tally.chunksSkipped);
+    }
+  }
+
+  /**
+   * 「整块跳过」必须能持续生效：区块在扫描半径内时，无论是否被跳过都要刷新已显形标记的活跃时间，
+   * 否则该标记会在 expire-seconds 后被过期清掉，「整块跳过」周期性失效并导致同一批坐标重复发包。
+   */
+  @Test
+  void skippedChunkKeepsItsMarkerFreshAgainstExpiry() {
+    long window = 10 * SECOND_NANOS;
+    ObfuscatedChunkIndex index = new ObfuscatedChunkIndex(1_000_000, 300 * SECOND_NANOS, () -> clock[0]);
+    RevealedSet revealed = new RevealedSet(1_000_000, window, () -> clock[0]);
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
+
+    // t=0 显形；t=9s（窗口内）再巡检一次 → 该区块已被整块跳过，但活跃时间必须同时被刷新
+    revealAll(scan(index, revealed, PLAYER, 16.0D, 64, null), revealed, PLAYER);
+    clock[0] = 9 * SECOND_NANOS;
+    ProximityScanner.Tally tally = new ProximityScanner.Tally();
+    assertTrue(scan(index, revealed, PLAYER, 16.0D, 64, tally).isEmpty());
+    assertEquals(1, tally.chunksSkipped);
+
+    // t=11s：距「最近一次刷新」仅 2 秒 → 标记不得被清（未刷新时距 t=0 已 11 秒，会被清掉）
+    clock[0] = 11 * SECOND_NANOS;
+    revealed.expire();
+    assertEquals(1, revealed.markerCount(), "被跳过的区块也必须刷新活跃时间，否则整块跳过会周期性失效");
+    assertEquals(2, revealed.sizeFor(PLAYER, ChunkKey.ofBlock(WORLD, 1, 1)));
+
+    // t=21s：距最近一次刷新已超窗口 → 兜底过期仍必须生效
+    clock[0] = 21 * SECOND_NANOS;
+    revealed.expire();
+    assertEquals(0, revealed.markerCount(), "长期未扫描到的标记仍必须被过期清理");
+  }
+
+  /**
+   * 「已显形坐标 ⊆ 区块伪装清单」这一不变式必须在三处维护点都成立（否则整块跳过会误跳过）：
+   * ① 服务端自行下发方块变更时的 removePosition（两个结构同步摘除）；
+   * ② 区块被重新下发（writeBack：先登记新区块清单，再清掉该区块的已显形标记）；
+   * ③ 区块卸载（清单失效 + 标记失效）。
+   */
+  @Test
+  void revealedStaysSubsetOfChunkListingAtEveryMaintenancePoint() {
+    ObfuscatedChunkIndex index = index();
+    RevealedSet revealed = revealed();
+    ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT,
+        new int[] {local(1, 64, 1), local(2, 64, 1), local(3, 64, 1)});
+    revealAll(scan(index, revealed, PLAYER, 16.0D, 64, null), revealed, PLAYER);
+    assertEquals(index.entry(key).size(), revealed.sizeFor(PLAYER, key), "开始前必须整块显形");
+
+    // 维护点①：BlockChangeRevealListener 的真实顺序（命中才摘除，两者同步）
+    assertTrue(index.removePosition(WORLD, 1, 64, 1));
+    revealed.removePosition(WORLD, 1, 64, 1);
+    assertEquals(index.entry(key).size(), revealed.sizeFor(PLAYER, key));
+
+    // 维护点②：ProtocolLibAsyncListener#writeBack 的真实顺序（先 recordChunk，再 clearChunk）
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(2, 64, 1), local(3, 64, 1)});
+    revealed.clearChunk(key);
+    assertTrue(revealed.sizeFor(PLAYER, key) <= index.entry(key).size(),
+        "已显形坐标不得多于区块清单");
+    assertEquals(0, revealed.sizeFor(PLAYER, key), "区块重发后必须清掉旧标记（客户端又拿回了伪装结果）");
+
+    // 维护点③：ChunkUnloadEvent 的真实顺序（清单与标记一并失效）
+    index.invalidateChunk(WORLD, 0, 0);
+    revealed.clearChunk(key);
+    assertNull(index.entry(key));
+    assertEquals(0, revealed.sizeFor(PLAYER, key));
   }
 
   // ------------------------------------------------------------------ 玩家隔离

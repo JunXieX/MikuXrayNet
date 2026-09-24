@@ -66,6 +66,7 @@ public final class Diagnostics {
       long blockChangesPassed,
       long entitiesHidden,
       long entitiesShown,
+      int entitiesHiddenNow,
       int afkPlayers,
       long afkEntered,
       long afkPacketsDropped,
@@ -87,7 +88,8 @@ public final class Diagnostics {
       int diskCacheOpenFiles,
       int obfuscatedChunkCount,
       int obfuscatedPositionCount,
-      int revealedMarkerCount,
+      int revealedPositionCount,
+      long revealedRegisteredTotal,
       long indexEvictedByCapacity,
       long revealedDroppedByCapacity) {
 
@@ -165,6 +167,7 @@ public final class Diagnostics {
         throttleStats == null ? 0L : throttleStats.blockChangesPassed.sum(),
         throttleStats == null ? 0L : throttleStats.entitiesHidden.sum(),
         throttleStats == null ? 0L : throttleStats.entitiesShown.sum(),
+        pipeline == null ? 0 : pipeline.hiddenEntityCount(),
         pipeline == null ? 0 : pipeline.afkPlayerCount(),
         throttleStats == null ? 0L : throttleStats.afkEntered.sum(),
         throttleStats == null ? 0L : throttleStats.afkPacketsDropped.sum(),
@@ -186,7 +189,8 @@ public final class Diagnostics {
         diskCache == null ? 0 : diskCache.openRegionFiles(),
         chunkIndex == null ? 0 : chunkIndex.chunkCount(),
         chunkIndex == null ? 0 : chunkIndex.positionCount(),
-        revealedSet == null ? 0 : revealedSet.markerCount(),
+        revealedSet == null ? 0 : revealedSet.positionCount(),
+        revealedSet == null ? 0L : revealedSet.registeredTotal(),
         chunkIndex == null ? 0L : chunkIndex.evictedByCapacity(),
         revealedSet == null ? 0L : revealedSet.droppedByCapacity());
   }
@@ -206,11 +210,18 @@ public final class Diagnostics {
         + "，跳过 " + s.chunksSkipped()
         + "，异常 " + s.chunksFailed() + "，写回失败 " + s.writeBackFailures()
         + "，超时放行 " + s.chunksTimedOut());
-    lines.add("邻近显形：发送 " + s.revealsSent() + "，跳过 " + s.revealsSkipped()
+    // 注意「坐标跳过」与「整块跳过」是两件事：前者是候选坐标因区块未加载 / 发包失败被跳过，
+    // 后者是「整块都已显形」的区块被整体略过（只出现在一次性「首次显形诊断」日志里）。
+    // 只写「跳过」会被误读成「整块跳过为 0 → 整块跳过没生效」，故此处写明「坐标跳过」。
+    lines.add("邻近显形：发送 " + s.revealsSent() + "，坐标跳过 " + s.revealsSkipped()
         + "，变更注销 " + s.revealsUnregistered() + "，视锥剔除 " + s.proximityFrustumCulled()
         + "，射线剔除 " + s.proximityRayCulled());
+    // 口径说明：这里刻意分列「实时坐标数」与「累计登记数」——前者随登出 / 过期 / 区块失效归零，
+    // 后者只增不减。若只显示实时值，玩家中途重登或走远后被清理时会看到「发送 N 但已显形 0」，
+    // 极易被误读成「显形路径没有登记」（实际登记在发包成功后必然发生）。
     lines.add("显形索引：伪装区块 " + s.obfuscatedChunkCount() + "（坐标 " + s.obfuscatedPositionCount()
-        + "）｜已显形 条目 " + s.revealedMarkerCount()
+        + "）｜已显形 坐标 " + s.revealedPositionCount() + "（当前在线）｜累计登记 "
+        + s.revealedRegisteredTotal()
         + "｜安全阀触发 " + s.indexEvictedByCapacity() + "/" + s.revealedDroppedByCapacity()
         + "（正常运营下应为 0，触发即说明有 bug）");
     lines.add("磁盘缓存：" + (s.diskCacheOpenFiles() > 0 || s.diskCacheEntries() > 0 ? "已启用" : "无数据")
@@ -219,7 +230,8 @@ public final class Diagnostics {
         + "，条目约 " + s.diskCacheEntries() + "，打开区域文件 " + s.diskCacheOpenFiles());
     lines.add("带宽：零位移取消 " + s.entityPacketsCancelled() + "，合并批次 " + s.blockMergeBatches()
         + "（合并 " + s.blockChangesMerged() + " 条），实体隐藏 " + s.entitiesHidden()
-        + "/恢复 " + s.entitiesShown());
+        + "/恢复 " + s.entitiesShown() + "（当前隐藏中 " + s.entitiesHiddenNow()
+        + "；两者之差 = 死亡/卸载被服务端自然回收 + 仍在隐藏）");
     lines.add("带宽：AFK 玩家 " + s.afkPlayers() + "（累计进入 " + s.afkEntered() + "），AFK 丢包 "
         + s.afkPacketsDropped() + "，降视距 " + s.viewDistanceReduced()
         + "/还原 " + s.viewDistanceRestored());
@@ -237,10 +249,28 @@ public final class Diagnostics {
     return "带宽开关：总开关 " + c.enabled()
         + "｜零位移取消 " + c.entityPackets().enabled()
         + "｜变更合并 " + c.blockChanges().enabled()
-        + "｜调色板重排 " + c.palette().enabled()
+        + "｜调色板重排 " + paletteSwitch(c.palette())
         + "｜实体剔除 " + c.entityCulling().enabled()
         + "｜AFK 降级 " + c.afk().enabled()
         + "｜高延迟降视距 " + c.latency().enabled();
+  }
+
+  /**
+   * 调色板重排的开关回显。
+   *
+   * <p><b>为什么不直接打印 {@code palette.enabled()}</b>：调色板模块有「总开关」与「行为开关 reorder」
+   * 两层，真正的重排只由 {@code reorder} 决定（默认 false，实测重排会使压缩字节变大）。
+   * 只打印模块总开关时会出现「调色板重排 true」这种极易被误读为「重排已启用」的输出，
+   * 因此这里把两层的实际效果合成一句无歧义的中文。
+   */
+  private static String paletteSwitch(BandwidthConfig.Palette palette) {
+    if (!palette.enabled()) {
+      return "关闭（模块未启用，不做任何重排）";
+    }
+    if (!palette.reorder()) {
+      return "关闭（模块启用但 reorder=false，不做任何重排）";
+    }
+    return "启用（reorder=true）";
   }
 
   /** 转储文本格式化（纯函数）：状态面板 + 环境信息 + 配置项有效值。 */

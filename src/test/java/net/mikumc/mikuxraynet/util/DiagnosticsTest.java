@@ -3,6 +3,9 @@ package net.mikumc.mikuxraynet.util;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
+import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import org.bukkit.configuration.InvalidConfigurationException;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -14,6 +17,10 @@ class DiagnosticsTest {
 
   /** 固定计数器快照（数值只用于断言关键字段与命中率，不参与业务逻辑）。 */
   private static Diagnostics.Snapshot fixed() {
+    return fixed(null);
+  }
+
+  private static Diagnostics.Snapshot fixed(BandwidthConfig bandwidth) {
     return new Diagnostics.Snapshot(
         true, true, false, true, 1,
         90L, 10L, 42,
@@ -21,12 +28,22 @@ class DiagnosticsTest {
         7L, 3L, 1L,
         20L, 30L,
         4L, 40L, 12L,
-        6L, 5L,
+        6L, 5L, 4,
         2, 3L, 8L,
         9L, 4L,
         4, 2, 10, 2048,
-        "Paper 1.20.4", "25", null, null,
-        3L, 2L, 30L, 10L, 12, 2, 7, 41, 12, 3L, 2L);
+        "Paper 1.20.4", "25", null, bandwidth,
+        3L, 2L, 30L, 10L, 12, 2, 7, 41, 12, 108L, 3L, 2L);
+  }
+
+  private static BandwidthConfig bandwidth(String content) {
+    YamlConfiguration configuration = new YamlConfiguration();
+    try {
+      configuration.loadFromString(content);
+    } catch (InvalidConfigurationException exception) {
+      throw new IllegalStateException("测试用 YAML 不合法", exception);
+    }
+    return BandwidthConfig.from(configuration);
   }
 
   @Test
@@ -44,11 +61,15 @@ class DiagnosticsTest {
     assertTrue(text.contains("写回失败 1"), text);
     assertTrue(text.contains("超时放行"), text);
     assertTrue(text.contains("邻近显形"), text);
+    assertTrue(text.contains("邻近显形：发送 7，坐标跳过 3"),
+        "「跳过」必须写明是「坐标跳过」，否则会被误读成「整块跳过 = 0 → 整块跳过没生效」：" + text);
     assertTrue(text.contains("视锥剔除 3"), text);
     assertTrue(text.contains("射线剔除 2"), text);
-    assertTrue(text.contains("显形索引：伪装区块 7（坐标 41）｜已显形 条目 12｜安全阀触发 3/2"),
-        "状态面板必须分列伪装区块数、伪装坐标数、已显形条目数与安全阀触发数（否则结构异常会静默发生）："
-            + text);
+    assertTrue(text.contains("显形索引：伪装区块 7（坐标 41）｜已显形 坐标 12（当前在线）｜累计登记 108｜安全阀触发 3/2"),
+        "状态面板必须分列伪装区块数、伪装坐标数、实时已显形坐标数、累计登记数与安全阀触发数"
+            + "（否则「发送 N 但已显形 0」这类口径误读会静默发生）：" + text);
+    assertTrue(text.contains("实体隐藏 6/恢复 5（当前隐藏中 4"),
+        "实体隐藏/恢复必须附带实时「当前隐藏中」，否则 721 vs 299 这类不对称无法自证：" + text);
     assertTrue(text.contains("磁盘缓存"), text);
     assertTrue(text.contains("命中率 75.0%"), text);
     assertTrue(text.contains("带宽"), text);
@@ -88,14 +109,34 @@ class DiagnosticsTest {
         0L, 0L, 0L,
         0L, 0L,
         0L, 0L, 0L,
-        0L, 0L,
+        0L, 0L, 0,
         0, 0L, 0L,
         0L, 0L,
         0, 0, 0, 0,
         "Folia 1.21", "21", null, null,
-        0L, 0L, 0L, 0L, 0, 0, 0, 0, 0, 0L, 0L);
+        0L, 0L, 0L, 0L, 0, 0, 0, 0, 0, 0L, 0L, 0L);
     String text = String.join("\n", Diagnostics.formatStatus(empty));
     assertTrue(text.contains("命中率 0.0%"), text);
     assertTrue(text.contains("平台 Folia"), text);
+  }
+
+  /**
+   * 调色板重排的回显必须把「模块总开关」与「行为开关 reorder」合成一句无歧义中文：
+   * 只打印 {@code palette.enabled()} 会输出「调色板重排 true」，而真正决定是否重排的是 reorder（默认 false）。
+   */
+  @Test
+  void paletteSwitchIsUnambiguous() {
+    String defaultOff = String.join("\n",
+        Diagnostics.formatStatus(fixed(bandwidth("enabled: true\n"))));
+    assertTrue(defaultOff.contains("调色板重排 关闭（模块启用但 reorder=false，不做任何重排）"),
+        "模块启用 + reorder=false 时必须明确写「不做任何重排」：" + defaultOff);
+
+    String reorderOn = String.join("\n",
+        Diagnostics.formatStatus(fixed(bandwidth("palette:\n  reorder: true\n"))));
+    assertTrue(reorderOn.contains("调色板重排 启用（reorder=true）"), reorderOn);
+
+    String moduleOff = String.join("\n",
+        Diagnostics.formatStatus(fixed(bandwidth("palette:\n  enabled: false\n"))));
+    assertTrue(moduleOff.contains("调色板重排 关闭（模块未启用，不做任何重排）"), moduleOff);
   }
 }

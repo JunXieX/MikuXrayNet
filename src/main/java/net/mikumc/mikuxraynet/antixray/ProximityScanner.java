@@ -17,6 +17,9 @@ import java.util.UUID;
  *   <li>结果按距离由近到远排序并截断到 {@code limit}（与旧实现一致：总是先还原脚边的矿）。</li>
  * </ol>
  *
+ * <p><b>活跃时间刷新</b>：只要区块在扫描半径内，无论它是否被「整块跳过」，都会刷新该玩家在此区块的
+ * 已显形标记活跃时间——否则整块显形的区块会因长期未被刷新而被过期清掉，「整块跳过」随之周期性失效。
+ *
  * <p>纯计算，不触碰任何 Bukkit API，可在任意线程调用、可离线单测。
  */
 final class ProximityScanner {
@@ -63,6 +66,10 @@ final class ProximityScanner {
         if (entry == null) {
           continue;
         }
+        // 刷新该玩家在此区块的活跃时间必须放在「整块跳过」判定之前：整块已显形的区块不再逐坐标评估，
+        // 若此时不刷新，它的标记会在 expire-seconds 后被过期清掉，导致「整块跳过」周期性失效、
+        // 同一批坐标被反复重新评估与重复发包（真机上表现为「20 万次判定只换来百余次发送」）。
+        revealed.touch(playerId, key);
         if (revealed.sizeFor(playerId, key) >= entry.size()) {
           // 整块已全部显形：稳态下每周期只处理「新进入视野的区块」
           if (tally != null) {
@@ -70,7 +77,6 @@ final class ProximityScanner {
           }
           continue;
         }
-        revealed.touch(playerId, key);
         if (tally != null) {
           tally.chunksScanned++;
         }

@@ -162,6 +162,44 @@ class RevealedSetTest {
     assertEquals(1, revealed.sizeFor(PLAYER, chunk(0, 0)), "清理后计数归零，可以重新标记");
   }
 
+  /**
+   * 「累计登记」与「实时坐标数」是两个口径：前者只增不减（不随登出 / 过期 / 失效回落），
+   * 后者随清理实时回落。真机上的「发送 108 但已显形 0」正是只看实时值导致的误读，
+   * 因此这里锁死：标记确实在记录（累计登记恒 &gt;= 实时值），且登出只影响实时值。
+   */
+  @Test
+  void registeredTotalIsCumulativeWhilePositionCountIsLive() {
+    RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
+    ChunkKey key = chunk(0, 0);
+
+    revealed.mark(PLAYER, key, 1, 64, 1);
+    revealed.mark(PLAYER, key, 2, 64, 1);
+    revealed.mark(PLAYER, key, 2, 64, 1); // 重复标记不计入累计登记
+
+    assertEquals(2L, revealed.registeredTotal(), "只统计真正新登记的坐标（去重不重复计数）");
+    assertEquals(2, revealed.positionCount(), "实时坐标数与累计登记一致（尚未清理）");
+
+    revealed.clearPlayer(PLAYER);
+    assertEquals(0, revealed.positionCount(), "实时坐标数随登出归零");
+    assertEquals(2L, revealed.registeredTotal(), "累计登记不与登出绑定：这才能证明标记确实在记录");
+  }
+
+  /** 安全阀放弃标记的坐标不算「登记成功」，且累计登记只增不减（区块失效后不回落）。 */
+  @Test
+  void registeredTotalIgnoresCapacityDropsAndChunkInvalidation() {
+    RevealedSet revealed = revealed(1, 60 * SECOND_NANOS);
+
+    revealed.mark(PLAYER, chunk(0, 0), 1, 64, 1);
+    revealed.mark(PLAYER, chunk(0, 0), 2, 64, 1); // 触发安全阀，未登记
+
+    assertEquals(1L, revealed.droppedByCapacity());
+    assertEquals(1L, revealed.registeredTotal(), "被安全阀放弃的坐标不得计入累计登记");
+
+    revealed.clearChunk(chunk(0, 0));
+    assertEquals(0, revealed.positionCount(), "区块失效后实时坐标数归零");
+    assertEquals(1L, revealed.registeredTotal(), "累计登记不因区块失效而回落");
+  }
+
   /** 正常运营量级（49 个区块 × 约 404 个坐标）下安全阀不得触发。 */
   @Test
   void safetyValveNeverTriggersAtProductionScale() {

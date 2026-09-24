@@ -43,6 +43,15 @@ public final class RevealedSet {
   private final ConcurrentHashMap<UUID, AtomicInteger> playerTotals = new ConcurrentHashMap<>();
   /** 安全阀：仅当单玩家已显形坐标越过上限（正常运营不该发生）时被放弃标记的坐标数。 */
   private final LongAdder droppedByCapacity = new LongAdder();
+  /**
+   * 插件运行期「累计登记」的已显形坐标数：<b>只增不减</b>，因此不随登出 / 过期 / 区块失效而回落。
+   *
+   * <p><b>为什么要它</b>：{@link #positionCount()} 是实时口径——玩家一登出（{@link #clearPlayer}）、
+   * 或标记超过 expire-seconds 未被扫描到，就会归零。真机上因此出现过「邻近显形写了『发送 108』
+   * 但显形索引显示『已显形 0』」的误读。把「实时坐标数」与「累计登记数」并列显示，
+   * 数字才能自证「标记确实在记录」，而不是被当成「没记录 / 重复发包」的 bug 证据。
+   */
+  private final LongAdder registeredTotal = new LongAdder();
 
   private final int maxPositionsPerPlayer;
   private final long expireNanos;
@@ -124,6 +133,7 @@ public final class RevealedSet {
       }
       marker.packed[marker.size++] = packedValue;
       total.incrementAndGet();
+      registeredTotal.increment();
     }
   }
 
@@ -262,6 +272,25 @@ public final class RevealedSet {
       total += players.size();
     }
     return total;
+  }
+
+  /**
+   * 当前仍生效的已显形坐标总数（所有玩家合计，<b>实时口径</b>）。
+   *
+   * <p>玩家登出、标记过期、区块重发 / 卸载、世界卸载、热重载清空都会让这个数字回落，
+   * 因此它天然会小于「累计登记」数；两者并列才能看出「标记在不在记录」。
+   */
+  public int positionCount() {
+    int total = 0;
+    for (AtomicInteger count : playerTotals.values()) {
+      total += Math.max(0, count.get());
+    }
+    return total;
+  }
+
+  /** 插件运行期累计登记过的已显形坐标数（<b>只增不减</b>，不与登出 / 过期绑定）。 */
+  public long registeredTotal() {
+    return registeredTotal.sum();
   }
 
   /** 安全阀触发时被放弃标记的坐标数（诊断用；正常运营下应为 0，触发即说明有 bug）。 */
