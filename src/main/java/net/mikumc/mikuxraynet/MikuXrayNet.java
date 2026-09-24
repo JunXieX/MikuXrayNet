@@ -1,7 +1,12 @@
 package net.mikumc.mikuxraynet;
 
+import com.comphenix.protocol.ProtocolManager;
+import net.mikumc.mikuxraynet.antixray.BlockChangeRevealListener;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
+import net.mikumc.mikuxraynet.antixray.ProximityRevealer;
+import net.mikumc.mikuxraynet.antixray.ProximityStats;
+import net.mikumc.mikuxraynet.antixray.RevealedBlockIndex;
 import net.mikumc.mikuxraynet.bandwidth.ThrottlePipeline;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
 import net.mikumc.mikuxraynet.bootstrap.PacketEventsHook;
@@ -25,7 +30,8 @@ import org.bukkit.plugin.java.JavaPlugin;
  *
  * <p>本插件在 Paper 26.x 上提供两项能力：
  * <ul>
- *   <li><b>反矿透</b>：出站区块封包改写，把暴露于空气的矿物替换为伪装方块；</li>
+ *   <li><b>反矿透</b>：出站区块封包改写，把完全被掩埋的矿物替换为伪装方块，并在玩家靠近这些
+ *       坐标时主动把真实方块发回客户端（邻近显形，见 {@code antixray.ProximityRevealer}）；</li>
  *   <li><b>带宽优化</b>：零位移包抑制、方块变更合并、实体射线剔除、AFK 降级与高延迟降视距
  *       （由 {@code bandwidth.ThrottlePipeline} 装配，可用 bandwidth.yml 分别开关）。</li>
  * </ul>
@@ -41,6 +47,8 @@ public final class MikuXrayNet extends JavaPlugin {
   private MikuWorkPool workPool;
   private ProtocolLibHook protocolLibHook;
   private ThrottlePipeline throttlePipeline;
+  private ProximityRevealer proximityRevealer;
+  private BlockChangeRevealListener blockChangeRevealListener;
 
   @Override
   public void onLoad() {
@@ -68,9 +76,12 @@ public final class MikuXrayNet extends JavaPlugin {
       throttlePipeline = null;
     }
     if (protocolLibHook != null) {
+      // 先停区块改写：之后不会再有坐标被写进显形索引
       protocolLibHook.unregister();
       protocolLibHook = null;
     }
+    // 最后停邻近显形：撤销巡检任务、注销变更注销监听并清空索引，不留副作用
+    stopProximity();
     if (workPool != null) {
       workPool.close();
       workPool = null;
@@ -116,9 +127,16 @@ public final class MikuXrayNet extends JavaPlugin {
         ? new NeighborChunkProvider(antiXray.neighbors().cacheMaximumSize())
         : null;
 
+    // 邻近显形索引：关闭该功能时传 null，改写路径完全不做任何额外记录
+    AntiXrayConfig.Proximity proximity = antiXray.proximity();
+    RevealedBlockIndex revealedIndex = proximity.enabled()
+        ? new RevealedBlockIndex(proximity.maxPositions(), proximity.maxPositionsPerPlayer(),
+            proximity.expireSeconds())
+        : null;
+
     MikuWorkPool pool = new MikuWorkPool(antiXray.threads(), antiXray.queueCapacity());
     ProtocolLibHook hook = new ProtocolLibHook(this);
-    if (!hook.register(antiXray, processor, pool, neighborProvider)) {
+    if (!hook.register(antiXray, processor, pool, neighborProvider, revealedIndex)) {
       pool.close();
       return;
     }
@@ -126,10 +144,56 @@ public final class MikuXrayNet extends JavaPlugin {
     this.workPool = pool;
     this.protocolLibHook = hook;
     registerWorldUnloadInvalidation();
+    startProximity(antiXray, revealedIndex);
 
     getLogger().info("反矿透已启用：目标方块 " + antiXray.hideBlocks().size() + " 种，伪装方块 "
         + antiXray.replacementWeights().size() + " 种；区块边界邻块快照 "
         + (neighborProvider != null ? "已启用" : "已关闭"));
+  }
+
+  /**
+   * 邻近显形装配：索引为 null（配置关闭）或拿不到 ProtocolLib 协议管理器时只跳过该子模块，
+   * 反矿透主体照常工作。
+   */
+  private void startProximity(AntiXrayConfig antiXray, RevealedBlockIndex revealedIndex) {
+    if (revealedIndex == null) {
+      getLogger().info("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
+      return;
+    }
+
+    ProtocolManager protocolManager = protocolLibHook == null ? null : protocolLibHook.protocolManager();
+    if (protocolManager == null) {
+      getLogger().warning("未取得 ProtocolLib 协议管理器，邻近显形停用");
+      return;
+    }
+
+    ProximityStats stats = new ProximityStats();
+    this.proximityRevealer = new ProximityRevealer(this, protocolManager, antiXray, revealedIndex, stats);
+    this.blockChangeRevealListener = new BlockChangeRevealListener(this, protocolManager, revealedIndex, stats);
+    try {
+      proximityRevealer.start();
+      blockChangeRevealListener.start();
+    } catch (Throwable throwable) {
+      getLogger().warning("邻近显形装配失败（不影响反矿透主体）：" + throwable.getMessage());
+      stopProximity();
+    }
+  }
+
+  /** 停用邻近显形：注销巡检任务与变更注销监听，并清空显形索引。 */
+  private void stopProximity() {
+    if (blockChangeRevealListener != null) {
+      blockChangeRevealListener.stop();
+      blockChangeRevealListener = null;
+    }
+    if (proximityRevealer != null) {
+      proximityRevealer.stop();
+      proximityRevealer = null;
+    }
+  }
+
+  /** 邻近显形（统计计数与索引持有量的读取入口，供 {@code /mikuxraynet status} 使用）；未启用时为 null。 */
+  public ProximityRevealer proximityRevealer() {
+    return proximityRevealer;
   }
 
   /** 带宽优化装配：各子模块独立注册，注册失败只停用该子模块，不影响其它功能。 */

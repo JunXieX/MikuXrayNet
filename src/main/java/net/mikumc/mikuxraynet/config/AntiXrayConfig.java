@@ -51,6 +51,20 @@ public final class AntiXrayConfig {
   public record Neighbors(boolean enabled, MissingPolicy missingPolicy, int cacheMaximumSize) {
   }
 
+  /**
+   * 邻近显形：玩家靠近曾被伪装的坐标时，主动把该坐标的真实方块发回客户端。
+   *
+   * @param distance             触发显形的距离（格，三维欧氏距离，等于阈值也算命中）
+   * @param intervalTicks        巡检周期（tick）
+   * @param maxRevealsPerTick    单次巡检的发包上限（普通服务端为全服合计，Folia 为每玩家）
+   * @param expireSeconds        显形索引条目的过期秒数
+   * @param maxPositions         显形索引的全服坐标上限
+   * @param maxPositionsPerPlayer 单个玩家的坐标上限
+   */
+  public record Proximity(boolean enabled, double distance, int intervalTicks, int maxRevealsPerTick,
+      int expireSeconds, int maxPositions, int maxPositionsPerPlayer) {
+  }
+
   private final boolean enabled;
   private final Set<String> worlds;
   private final List<String> hideBlocks;
@@ -58,6 +72,7 @@ public final class AntiXrayConfig {
   private final boolean layerObfuscation;
   private final boolean removeBlockEntities;
   private final Neighbors neighbors;
+  private final Proximity proximity;
   private final int cacheMaximumSize;
   private final int cacheExpireAfterAccessSeconds;
   private final int threads;
@@ -67,8 +82,8 @@ public final class AntiXrayConfig {
 
   private AntiXrayConfig(boolean enabled, Set<String> worlds, List<String> hideBlocks,
       Map<String, Integer> replacementWeights, boolean layerObfuscation, boolean removeBlockEntities,
-      Neighbors neighbors, int cacheMaximumSize, int cacheExpireAfterAccessSeconds, int threads,
-      int timeoutMillis, int queueCapacity) {
+      Neighbors neighbors, Proximity proximity, int cacheMaximumSize, int cacheExpireAfterAccessSeconds,
+      int threads, int timeoutMillis, int queueCapacity) {
     this.enabled = enabled;
     this.worlds = Set.copyOf(worlds);
     this.hideBlocks = List.copyOf(hideBlocks);
@@ -76,6 +91,7 @@ public final class AntiXrayConfig {
     this.layerObfuscation = layerObfuscation;
     this.removeBlockEntities = removeBlockEntities;
     this.neighbors = neighbors;
+    this.proximity = proximity;
     this.cacheMaximumSize = Math.max(1, cacheMaximumSize);
     this.cacheExpireAfterAccessSeconds = Math.max(1, cacheExpireAfterAccessSeconds);
     this.threads = Math.max(0, threads);
@@ -118,6 +134,14 @@ public final class AntiXrayConfig {
             root.getBoolean("neighbors.enabled", true),
             missingPolicy(root.getString("neighbors.missing-policy", "hide")),
             root.getInt("neighbors.cache-maximum-size", 512)),
+        new Proximity(
+            root.getBoolean("proximity.enabled", true),
+            Math.max(0.0D, root.getDouble("proximity.distance", 12.0D)),
+            Math.max(1, root.getInt("proximity.interval-ticks", 5)),
+            Math.max(1, root.getInt("proximity.max-reveals-per-tick", 32)),
+            Math.max(1, root.getInt("proximity.expire-seconds", 120)),
+            Math.max(1, root.getInt("proximity.max-positions", 65536)),
+            Math.max(1, root.getInt("proximity.max-positions-per-player", 2048))),
         root.getInt("cache.maximum-size", 4096),
         root.getInt("cache.expire-after-access-seconds", 60),
         root.getInt("advanced.threads", 0),
@@ -162,6 +186,11 @@ public final class AntiXrayConfig {
   /** 邻区块贴边快照相关配置。 */
   public Neighbors neighbors() {
     return neighbors;
+  }
+
+  /** 邻近显形相关配置。 */
+  public Proximity proximity() {
+    return proximity;
   }
 
   public int cacheMaximumSize() {

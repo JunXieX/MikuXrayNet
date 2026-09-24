@@ -1,11 +1,13 @@
 package net.mikumc.mikuxraynet.concurrency;
 
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * 单个区块封包的改写任务：只承载「基本类型 + 世界名」与状态机，不持有任何 Bukkit / 封包对象。
+ * 单个区块封包的改写任务：只承载「基本类型 / 不可变标识 + 世界名」与状态机，
+ * 不持有任何 Bukkit / 封包对象。
  *
  * <p>状态机：{@code CREATED → DECODED → ENCODED → RELEASED}。
  *
@@ -28,6 +30,7 @@ public final class RewriteTask {
   private static final int GATE_WRITING = 1;
   private static final int GATE_DONE = 2;
 
+  private final UUID playerId;
   private final int chunkX;
   private final int chunkZ;
   private final String worldName;
@@ -41,13 +44,15 @@ public final class RewriteTask {
   private final AtomicReference<Stage> stage = new AtomicReference<>(Stage.CREATED);
 
   /**
+   * @param playerId     该封包的接收者（UUID 不持有玩家强引用）
    * @param minHeight    该世界最低建筑高度，用于与封包中绝对 Y 坐标的方块实体对齐
    * @param sectionCount 该世界的 section 数量（高度 / 16）
    * @param timeoutMillis 处理超时（毫秒）
    * @param delivery     放行动作（通常是 ProtocolLib 的 {@code signalPacketTransmission}）
    */
-  public RewriteTask(int chunkX, int chunkZ, String worldName, int minHeight, int sectionCount,
-      long timeoutMillis, Runnable delivery) {
+  public RewriteTask(UUID playerId, int chunkX, int chunkZ, String worldName, int minHeight,
+      int sectionCount, long timeoutMillis, Runnable delivery) {
+    this.playerId = playerId;
     this.chunkX = chunkX;
     this.chunkZ = chunkZ;
     this.worldName = worldName;
@@ -55,6 +60,10 @@ public final class RewriteTask {
     this.sectionCount = sectionCount;
     this.deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
     this.delivery = delivery;
+  }
+
+  public UUID playerId() {
+    return playerId;
   }
 
   public int chunkX() {

@@ -53,16 +53,19 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final NeighborChunkProvider neighborProvider;
   private final boolean neighborsEnabled;
   private final boolean handleChunkBatch;
+  private final RevealedBlockIndex revealedIndex;
   private final ConcurrentHashMap<UUID, ChunkBatchGate> batches = new ConcurrentHashMap<>();
   private final AtomicInteger errorLogs = new AtomicInteger();
 
   /**
    * @param neighborProvider 邻区块贴边快照提供者；仅在 {@code neighbors.enabled} 时被使用
    * @param handleChunkBatch 是否拦截 1.20.2+ 的区块批量包（不可用时由装配方降级为 false）
+   * @param revealedIndex    显形索引；{@code null} 表示不做邻近显形
    */
   public ProtocolLibAsyncListener(Plugin plugin, AntiXrayConfig config, ObfuscationProcessor processor,
       MikuWorkPool workPool, AsynchronousManager asynchronousManager,
-      NeighborChunkProvider neighborProvider, boolean handleChunkBatch) {
+      NeighborChunkProvider neighborProvider, boolean handleChunkBatch,
+      RevealedBlockIndex revealedIndex) {
     super(plugin, ListenerPriority.NORMAL, packetTypes(handleChunkBatch));
     this.config = config;
     this.processor = processor;
@@ -72,6 +75,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     this.neighborProvider = neighborProvider;
     this.neighborsEnabled = neighborProvider != null && config.neighbors().enabled();
     this.handleChunkBatch = handleChunkBatch;
+    this.revealedIndex = revealedIndex;
   }
 
   /** 与 MAP_CHUNK 同列白名单，才能让批次包走同一条「每玩家有序发送队列」。 */
@@ -129,8 +133,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     int minHeight = world.getMinHeight();
     int sectionCount = (world.getMaxHeight() - minHeight) / 16;
-    RewriteTask task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(), world.getName(), minHeight,
-        sectionCount, config.timeoutMillis(),
+    RewriteTask task = new RewriteTask(player.getUniqueId(), accessor.chunkX(), accessor.chunkZ(),
+        world.getName(), minHeight, sectionCount, config.timeoutMillis(),
         gate == null
             ? () -> asynchronousManager.signalPacketTransmission(event)
             : () -> {
@@ -316,6 +320,12 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return;
     }
     accessor.update(data, positions, task.minHeight());
+
+    // 记录「该玩家在这个区块里被伪装过的坐标」，供邻近显形使用（纯内存写入，可在工作线程执行）
+    if (revealedIndex != null) {
+      revealedIndex.record(task.playerId(), task.worldName(), task.chunkX(), task.chunkZ(),
+          task.minHeight(), positions);
+    }
   }
 
   /** 该玩家是否受本模块影响（权限绕过 + 世界范围）。 */
@@ -323,11 +333,14 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     return !player.hasPermission(BYPASS_PERMISSION) && config.appliesTo(player.getWorld().getName());
   }
 
-  /** 使某个世界的缓存整体失效（世界卸载时调用）。 */
+  /** 使某个世界的缓存整体失效（世界卸载时调用），同时清掉该世界的显形记录。 */
   public void invalidateWorld(String worldName) {
     cache.invalidateWorld(worldName);
     if (neighborProvider != null) {
       neighborProvider.invalidateWorld(worldName);
+    }
+    if (revealedIndex != null) {
+      revealedIndex.clearWorld(worldName);
     }
   }
 

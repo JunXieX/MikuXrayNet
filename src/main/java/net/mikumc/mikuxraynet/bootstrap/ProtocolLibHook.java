@@ -2,12 +2,14 @@ package net.mikumc.mikuxraynet.bootstrap;
 
 import com.comphenix.protocol.AsynchronousManager;
 import com.comphenix.protocol.ProtocolLibrary;
+import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.async.AsyncListenerHandler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
 import net.mikumc.mikuxraynet.antixray.ProtocolLibAsyncListener;
+import net.mikumc.mikuxraynet.antixray.RevealedBlockIndex;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import org.bukkit.plugin.Plugin;
@@ -23,6 +25,7 @@ public final class ProtocolLibHook {
   private final Plugin plugin;
   private final Logger logger;
 
+  private ProtocolManager protocolManager;
   private AsynchronousManager asynchronousManager;
   private AsyncListenerHandler asyncListenerHandler;
   private ProtocolLibAsyncListener listener;
@@ -39,18 +42,21 @@ public final class ProtocolLibHook {
    * 若当前 ProtocolLib / 服务端不支持这两个包类型而注册失败，则降级为仅拦截 {@code MAP_CHUNK}
    * （区块改写照常工作，只是失去批次闸门）。
    *
+   * @param revealedIndex 显形索引；{@code null} 表示不做邻近显形
    * @return true 表示注册成功并已启动异步分发
    */
   public boolean register(AntiXrayConfig config, ObfuscationProcessor processor, MikuWorkPool workPool,
-      NeighborChunkProvider neighborProvider) {
-    Throwable batchFailure = tryRegister(config, processor, workPool, neighborProvider, true);
+      NeighborChunkProvider neighborProvider, RevealedBlockIndex revealedIndex) {
+    Throwable batchFailure = tryRegister(config, processor, workPool, neighborProvider, revealedIndex,
+        true);
     if (batchFailure == null) {
       return true;
     }
 
     logger.log(Level.WARNING,
         "区块批量包（CHUNK_BATCH_START/FINISHED）拦截注册失败，降级为仅拦截 MAP_CHUNK", batchFailure);
-    Throwable fallbackFailure = tryRegister(config, processor, workPool, neighborProvider, false);
+    Throwable fallbackFailure = tryRegister(config, processor, workPool, neighborProvider,
+        revealedIndex, false);
     if (fallbackFailure == null) {
       return true;
     }
@@ -61,11 +67,13 @@ public final class ProtocolLibHook {
 
   /** 单次注册尝试；成功返回 {@code null}，失败返回异常并回滚已注册的监听器。 */
   private Throwable tryRegister(AntiXrayConfig config, ObfuscationProcessor processor,
-      MikuWorkPool workPool, NeighborChunkProvider neighborProvider, boolean handleChunkBatch) {
+      MikuWorkPool workPool, NeighborChunkProvider neighborProvider, RevealedBlockIndex revealedIndex,
+      boolean handleChunkBatch) {
     try {
-      this.asynchronousManager = ProtocolLibrary.getProtocolManager().getAsynchronousManager();
+      this.protocolManager = ProtocolLibrary.getProtocolManager();
+      this.asynchronousManager = protocolManager.getAsynchronousManager();
       this.listener = new ProtocolLibAsyncListener(plugin, config, processor, workPool,
-          asynchronousManager, neighborProvider, handleChunkBatch);
+          asynchronousManager, neighborProvider, handleChunkBatch, revealedIndex);
       this.asyncListenerHandler = asynchronousManager.registerAsyncHandler(listener);
       // 必须显式 start()，否则异步监听器不会真正开始分发封包
       this.asyncListenerHandler.start();
@@ -77,6 +85,11 @@ public final class ProtocolLibHook {
       unregister();
       return throwable;
     }
+  }
+
+  /** ProtocolLib 协议管理器（供邻近显形与方块变更注销复用同一入口）。 */
+  public ProtocolManager protocolManager() {
+    return protocolManager;
   }
 
   /** 注销拦截；可重复调用，异常安全。 */
