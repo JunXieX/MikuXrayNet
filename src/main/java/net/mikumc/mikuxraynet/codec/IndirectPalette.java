@@ -72,4 +72,27 @@ public class IndirectPalette implements Palette {
       ByteBufUtil.writeVarInt(buffer, this.valueFor(id));
     }
   }
+
+  /** 当前调色板条目数。 */
+  int paletteSize() {
+    return this.size;
+  }
+
+  /** 读取某个本地索引对应的方块状态 id。 */
+  int valueAt(int id) {
+    return this.byId[id];
+  }
+
+  /**
+   * 用新的值顺序重建索引表（{@code values} 必须是原值集合的一个排列）。
+   *
+   * <p>用于调色板重排：索引表与 {@code byValue} 反查表一并更新，语义不变。
+   */
+  void rebuild(int[] values) {
+    this.size = values.length;
+    for (int id = 0; id < values.length; id++) {
+      this.byId[id] = values[id];
+      this.byValue[values[id]] = (byte) id;
+    }
+  }
 }

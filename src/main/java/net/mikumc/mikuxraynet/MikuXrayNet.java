@@ -1,5 +1,6 @@
 package net.mikumc.mikuxraynet;
 
+import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
 import net.mikumc.mikuxraynet.bandwidth.ThrottlePipeline;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
@@ -10,6 +11,7 @@ import net.mikumc.mikuxraynet.codec.ChunkCodec;
 import net.mikumc.mikuxraynet.codec.ChunkVersionFlags;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
+import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.config.MikuConfig;
 import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
 import org.bukkit.Bukkit;
@@ -96,7 +98,10 @@ public final class MikuXrayNet extends JavaPlugin {
 
     BlockStateRegistry registry = packetEventsHook.registry();
     ChunkCodec codec = new ChunkCodec(registry, versionFlags());
-    ObfuscationProcessor processor = ObfuscationProcessor.create(codec, registry, antiXray, getLogger());
+    // 调色板压缩重排由 bandwidth.yml 的 palette 段控制（与反矿透共用同一次编码）
+    BandwidthConfig.Palette palette = config.bandwidth().palette();
+    ObfuscationProcessor processor = ObfuscationProcessor.create(codec, registry, antiXray, getLogger(),
+        new ObfuscationProcessor.PaletteOptions(palette.reorder(), palette.strictVerify()));
     if (!processor.isActive()) {
       getLogger().warning("未解析到有效的隐藏方块或伪装方块，反矿透模块停用（请检查 antixray.yml）");
       return;
@@ -107,9 +112,13 @@ public final class MikuXrayNet extends JavaPlugin {
       return;
     }
 
+    NeighborChunkProvider neighborProvider = antiXray.neighbors().enabled()
+        ? new NeighborChunkProvider(antiXray.neighbors().cacheMaximumSize())
+        : null;
+
     MikuWorkPool pool = new MikuWorkPool(antiXray.threads(), antiXray.queueCapacity());
     ProtocolLibHook hook = new ProtocolLibHook(this);
-    if (!hook.register(antiXray, processor, pool)) {
+    if (!hook.register(antiXray, processor, pool, neighborProvider)) {
       pool.close();
       return;
     }
@@ -119,7 +128,8 @@ public final class MikuXrayNet extends JavaPlugin {
     registerWorldUnloadInvalidation();
 
     getLogger().info("反矿透已启用：目标方块 " + antiXray.hideBlocks().size() + " 种，伪装方块 "
-        + antiXray.replacementWeights().size() + " 种");
+        + antiXray.replacementWeights().size() + " 种；区块边界邻块快照 "
+        + (neighborProvider != null ? "已启用" : "已关闭"));
   }
 
   /** 带宽优化装配：各子模块独立注册，注册失败只停用该子模块，不影响其它功能。 */

@@ -39,12 +39,25 @@ public final class AntiXrayConfig {
     DEFAULT_REPLACEMENT_WEIGHTS = Collections.unmodifiableMap(weights);
   }
 
+  /** 邻块数据缺失（未加载、跨区域、已清理）时的降级策略。 */
+  public enum MissingPolicy {
+    /** 视为遮挡：宁可多伪装，也不留下沿区块边界的泄漏（默认）。 */
+    HIDE,
+    /** 视为暴露：保持「边界那一圈不伪装」的旧行为（存在可利用的透视口子）。 */
+    EXPOSE
+  }
+
+  /** 邻区块贴边快照。 */
+  public record Neighbors(boolean enabled, MissingPolicy missingPolicy, int cacheMaximumSize) {
+  }
+
   private final boolean enabled;
   private final Set<String> worlds;
   private final List<String> hideBlocks;
   private final Map<String, Integer> replacementWeights;
   private final boolean layerObfuscation;
   private final boolean removeBlockEntities;
+  private final Neighbors neighbors;
   private final int cacheMaximumSize;
   private final int cacheExpireAfterAccessSeconds;
   private final int threads;
@@ -54,14 +67,15 @@ public final class AntiXrayConfig {
 
   private AntiXrayConfig(boolean enabled, Set<String> worlds, List<String> hideBlocks,
       Map<String, Integer> replacementWeights, boolean layerObfuscation, boolean removeBlockEntities,
-      int cacheMaximumSize, int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis,
-      int queueCapacity) {
+      Neighbors neighbors, int cacheMaximumSize, int cacheExpireAfterAccessSeconds, int threads,
+      int timeoutMillis, int queueCapacity) {
     this.enabled = enabled;
     this.worlds = Set.copyOf(worlds);
     this.hideBlocks = List.copyOf(hideBlocks);
     this.replacementWeights = Collections.unmodifiableMap(new LinkedHashMap<>(replacementWeights));
     this.layerObfuscation = layerObfuscation;
     this.removeBlockEntities = removeBlockEntities;
+    this.neighbors = neighbors;
     this.cacheMaximumSize = Math.max(1, cacheMaximumSize);
     this.cacheExpireAfterAccessSeconds = Math.max(1, cacheExpireAfterAccessSeconds);
     this.threads = Math.max(0, threads);
@@ -69,7 +83,7 @@ public final class AntiXrayConfig {
     this.queueCapacity = Math.max(1, queueCapacity);
     // 影响改写结果的全部配置项都参与哈希；顺序敏感，故用有序列表
     this.configHash = Objects.hash(this.hideBlocks, new ArrayList<>(replacementWeights.entrySet()),
-        layerObfuscation);
+        layerObfuscation, neighbors.enabled(), neighbors.missingPolicy());
   }
 
   /** 从配置根节点解析。 */
@@ -100,11 +114,24 @@ public final class AntiXrayConfig {
         weights,
         root.getBoolean("obfuscation.layer-obfuscation", false),
         root.getBoolean("obfuscation.remove-block-entities", true),
+        new Neighbors(
+            root.getBoolean("neighbors.enabled", true),
+            missingPolicy(root.getString("neighbors.missing-policy", "hide")),
+            root.getInt("neighbors.cache-maximum-size", 512)),
         root.getInt("cache.maximum-size", 4096),
         root.getInt("cache.expire-after-access-seconds", 60),
         root.getInt("advanced.threads", 0),
         root.getInt("advanced.timeout-millis", 2500),
         root.getInt("advanced.queue-capacity", 2048));
+  }
+
+  /** 解析缺失策略；取值非法时回落到最安全的 {@link MissingPolicy#HIDE}。 */
+  private static MissingPolicy missingPolicy(String value) {
+    if (value == null) {
+      return MissingPolicy.HIDE;
+    }
+    return "expose".equals(value.trim().toLowerCase(Locale.ROOT)) ? MissingPolicy.EXPOSE
+        : MissingPolicy.HIDE;
   }
 
   public boolean enabled() {
@@ -130,6 +157,11 @@ public final class AntiXrayConfig {
 
   public boolean removeBlockEntities() {
     return removeBlockEntities;
+  }
+
+  /** 邻区块贴边快照相关配置。 */
+  public Neighbors neighbors() {
+    return neighbors;
   }
 
   public int cacheMaximumSize() {

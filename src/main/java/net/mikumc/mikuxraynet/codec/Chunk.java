@@ -17,6 +17,10 @@ import io.netty.buffer.Unpooled;
  */
 public class Chunk implements AutoCloseable {
 
+  /** section 在原始字节数组中的区间（{@code offset} 为下标，{@code length} 为字节数，含尾部群系容器）。 */
+  public record SectionRange(int offset, int length) {
+  }
+
   private final ChunkCodec codec;
 
   private final ChunkSectionHolder[] sections;
@@ -50,6 +54,15 @@ public class Chunk implements AutoCloseable {
       return chunkSection.chunkSection;
     }
     return null;
+  }
+
+  /**
+   * 该 section 在原始字节数组中的区间；{@code null} 表示该 section 在缓冲区中没有字节
+   * （或区间无法确定，此时 {@link #finalizeOutput()} 会退回整块重编码）。
+   */
+  public SectionRange originalSectionRange(int index) {
+    ChunkSectionHolder holder = this.sections[index];
+    return holder == null ? null : holder.range();
   }
 
   public byte[] finalizeOutput() {
@@ -104,8 +117,14 @@ public class Chunk implements AutoCloseable {
 
     private int extraBytes;
 
+    /** 该 section 在原始缓冲中的起始下标与总字节数（含尾部群系容器）；-1 表示未能确定。 */
+    private int sectionOffset = -1;
+    private int sectionLength = -1;
+
     public ChunkSectionHolder() {
       this.chunkSection = new ChunkSection(codec);
+
+      int start = inputBuffer.readerIndex();
 
       // read() 会把方块状态读到 section 内部，返回值（扁平化状态数组）此处不再需要
       this.chunkSection.read(inputBuffer);
@@ -115,9 +134,26 @@ public class Chunk implements AutoCloseable {
         skipBiomePalettedContainer();
         this.extraBytes = inputBuffer.readerIndex() - this.extraOffset;
       }
+
+      this.sectionOffset = start;
+      this.sectionLength = inputBuffer.readerIndex() - start;
+    }
+
+    /** 原始字节区间；区间不可用时返回 {@code null}。 */
+    public SectionRange range() {
+      if (this.sectionOffset < 0 || this.sectionLength <= 0) {
+        return null;
+      }
+      return new SectionRange(this.sectionOffset, this.sectionLength);
     }
 
     public void write() {
+      // 选择性重编码：未改动的 section 直接原样搬运原始字节，省下一次完整的调色板/位打包重编码
+      if (!this.chunkSection.isModified() && this.sectionOffset >= 0 && this.sectionLength > 0) {
+        outputBuffer.writeBytes(inputBuffer, this.sectionOffset, this.sectionLength);
+        return;
+      }
+
       this.chunkSection.write(outputBuffer);
       if (this.extraBytes > 0) {
         outputBuffer.writeBytes(inputBuffer, this.extraOffset, extraBytes);

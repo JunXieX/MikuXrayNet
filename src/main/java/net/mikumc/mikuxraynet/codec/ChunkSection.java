@@ -1,6 +1,7 @@
 // 移植自 Orebfuscator（GPL-3.0），本项目为私有自用部署。
 package net.mikumc.mikuxraynet.codec;
 
+import java.util.Arrays;
 import io.netty.buffer.ByteBuf;
 
 /**
@@ -20,12 +21,16 @@ import io.netty.buffer.ByteBuf;
  */
 public class ChunkSection {
 
+  private static final int SECTION_VOLUME = 4096;
+
   private final RegistryAccessor registryAccessor;
   private final ChunkVersionFlags versionFlags;
 
   private int blockCount;
   private int fluidCount;
   private int bitsPerBlock = -1;
+  /** 是否被外部改写（供选择性 section 重编码判断“可原样搬运”）。 */
+  private boolean modified;
 
   private Palette palette;
   private VarBitBuffer data;
@@ -90,6 +95,7 @@ public class ChunkSection {
   }
 
   public void setBlockState(int index, int blockId) {
+    this.modified = true;
     int prevBlockId = this.getBlockState(index);
 
     if (!registryAccessor.isAir(prevBlockId)) {
@@ -174,5 +180,82 @@ public class ChunkSection {
       directData[i] = this.getBlockState(i);
     }
     return directData;
+  }
+
+  /** 该 section 是否被外部通过 {@link #setBlockState}（或调色板重排）改写。 */
+  public boolean isModified() {
+    return this.modified;
+  }
+
+  /** 按序号读出全部 4096 个方块状态（供重排自检与单测；不改变任何状态）。 */
+  public int[] readAllBlockStates() {
+    int[] states = new int[SECTION_VOLUME];
+    for (int i = 0; i < states.length; i++) {
+      states[i] = this.getBlockState(i);
+    }
+    return states;
+  }
+
+  /**
+   * 按出现频次重排调色板：出现次数多的方块状态排到低位索引，从而让位打包数据产生更多 0 位、提升网络压缩率。
+   *
+   * <p>只对间接调色板生效（单值/直接调色板没有可重排的调色板段，返回 false）。调色板值与位打包索引
+   * 同步重映射，因此方块状态语义完全不变；位宽与方块计数不动。
+   *
+   * @param verify true 时对重排前后的方块序列做自检，不一致即抛 {@link IllegalStateException}
+   *               （由调用方 fail-open）；会额外分配两份 4096 长数组，仅在配置开启时使用
+   * @return 是否实际发生了重排
+   */
+  public boolean reorderPaletteByFrequency(boolean verify) {
+    if (!(this.palette instanceof IndirectPalette indirectPalette)) {
+      return false;
+    }
+
+    int size = indirectPalette.paletteSize();
+    if (size <= 1) {
+      return false;
+    }
+
+    int[] before = verify ? readAllBlockStates() : null;
+
+    int[] frequency = new int[size];
+    for (int i = 0; i < SECTION_VOLUME; i++) {
+      frequency[this.data.get(i)]++;
+    }
+
+    // 频次降序；同频保持原索引顺序，保证结果确定（同输入必然同输出，缓存可复用）
+    Integer[] order = new Integer[size];
+    for (int i = 0; i < size; i++) {
+      order[i] = i;
+    }
+    Arrays.sort(order, (a, b) -> frequency[b] != frequency[a]
+        ? Integer.compare(frequency[b], frequency[a])
+        : Integer.compare(a, b));
+
+    int[] remap = new int[size];
+    int[] values = new int[size];
+    boolean changed = false;
+    for (int newId = 0; newId < size; newId++) {
+      int oldId = order[newId];
+      remap[oldId] = newId;
+      values[newId] = indirectPalette.valueAt(oldId);
+      if (oldId != newId) {
+        changed = true;
+      }
+    }
+    if (!changed) {
+      return false;
+    }
+
+    for (int i = 0; i < SECTION_VOLUME; i++) {
+      this.data.set(i, remap[this.data.get(i)]);
+    }
+    indirectPalette.rebuild(values);
+    this.modified = true;
+
+    if (verify && !Arrays.equals(before, readAllBlockStates())) {
+      throw new IllegalStateException("调色板重排自检失败：方块序列发生变化");
+    }
+    return true;
   }
 }

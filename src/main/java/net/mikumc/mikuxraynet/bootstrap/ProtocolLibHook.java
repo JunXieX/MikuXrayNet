@@ -5,6 +5,7 @@ import com.comphenix.protocol.ProtocolLibrary;
 import com.comphenix.protocol.async.AsyncListenerHandler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
 import net.mikumc.mikuxraynet.antixray.ProtocolLibAsyncListener;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
@@ -34,27 +35,47 @@ public final class ProtocolLibHook {
   /**
    * 注册异步区块监听器（真异步扣包）。
    *
+   * <p>先尝试把 1.20.2+ 的 {@code CHUNK_BATCH_START/FINISHED} 与 {@code MAP_CHUNK} 一起注册；
+   * 若当前 ProtocolLib / 服务端不支持这两个包类型而注册失败，则降级为仅拦截 {@code MAP_CHUNK}
+   * （区块改写照常工作，只是失去批次闸门）。
+   *
    * @return true 表示注册成功并已启动异步分发
    */
-  public boolean register(AntiXrayConfig config, ObfuscationProcessor processor, MikuWorkPool workPool) {
-    boolean success = false;
+  public boolean register(AntiXrayConfig config, ObfuscationProcessor processor, MikuWorkPool workPool,
+      NeighborChunkProvider neighborProvider) {
+    Throwable batchFailure = tryRegister(config, processor, workPool, neighborProvider, true);
+    if (batchFailure == null) {
+      return true;
+    }
+
+    logger.log(Level.WARNING,
+        "区块批量包（CHUNK_BATCH_START/FINISHED）拦截注册失败，降级为仅拦截 MAP_CHUNK", batchFailure);
+    Throwable fallbackFailure = tryRegister(config, processor, workPool, neighborProvider, false);
+    if (fallbackFailure == null) {
+      return true;
+    }
+
+    logger.log(Level.SEVERE, "ProtocolLib 异步拦截注册失败，反矿透模块停用", fallbackFailure);
+    return false;
+  }
+
+  /** 单次注册尝试；成功返回 {@code null}，失败返回异常并回滚已注册的监听器。 */
+  private Throwable tryRegister(AntiXrayConfig config, ObfuscationProcessor processor,
+      MikuWorkPool workPool, NeighborChunkProvider neighborProvider, boolean handleChunkBatch) {
     try {
       this.asynchronousManager = ProtocolLibrary.getProtocolManager().getAsynchronousManager();
-      this.listener = new ProtocolLibAsyncListener(plugin, config, processor, workPool, asynchronousManager);
+      this.listener = new ProtocolLibAsyncListener(plugin, config, processor, workPool,
+          asynchronousManager, neighborProvider, handleChunkBatch);
       this.asyncListenerHandler = asynchronousManager.registerAsyncHandler(listener);
       // 必须显式 start()，否则异步监听器不会真正开始分发封包
       this.asyncListenerHandler.start();
 
-      success = true;
-      logger.info("反矿透封包拦截已启用（ProtocolLib 异步通道，监听 MAP_CHUNK）");
-      return true;
+      logger.info("反矿透封包拦截已启用（ProtocolLib 异步通道，监听 "
+          + (handleChunkBatch ? "MAP_CHUNK + CHUNK_BATCH_START/FINISHED" : "MAP_CHUNK") + "）");
+      return null;
     } catch (Throwable throwable) {
-      logger.log(Level.SEVERE, "ProtocolLib 异步拦截注册失败，反矿透模块停用", throwable);
-      return false;
-    } finally {
-      if (!success) {
-        unregister();
-      }
+      unregister();
+      return throwable;
     }
   }
 

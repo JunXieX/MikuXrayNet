@@ -21,7 +21,10 @@ import org.junit.jupiter.api.Test;
  * 遮挡判定测试：用合成状态表 + 合成 section 字节验证 6 面正交判定与边界降级行为。
  *
  * <p>判定语义（与实现一致）：目标方块只有在上下左右前后 6 个正交方向全部被遮挡时才被替换；
- * 任一方向暴露、越出区块边界或越出世界上下界都保持原样；对角方向不参与判定。
+ * 任一方向暴露、越出世界上下界都保持原样；对角方向不参与判定。
+ *
+ * <p>区块边界（越过本区块的 6 个面）：有 {@link NeighborEdges} 时按邻块贴边快照判定，
+ * 快照缺失时按 {@code missing-policy}（hide = 视为遮挡 / expose = 视为暴露）。
  */
 class ObfuscationProcessorTest {
 
@@ -121,7 +124,7 @@ class ObfuscationProcessorTest {
 
     ObfuscationProcessor.Result result = processor().rewrite(source, 1, 42L);
 
-    assertFalse(result.changed(), "区块边界外与世界下界外按未遮挡处理（保守视为暴露）");
+    assertFalse(result.changed(), "missing-policy=expose 下，区块边界外与世界下界外按未遮挡处理");
   }
 
   @Test
@@ -157,10 +160,98 @@ class ObfuscationProcessorTest {
     assertEquals(first, second, "层状伪装模式下同一高度层必须使用同一种伪装方块");
   }
 
+  @Test
+  void borderTargetIsHiddenWhenNeighborPlaneOccludes() {
+    int[] states = filled(STONE);
+    states[index(0, 8, 8)] = DIAMOND_ORE;
+
+    ObfuscationProcessor.Result result = processor(false)
+        .rewrite(chunk(states), 1, 42L, uniformEdges(16, true));
+
+    assertTrue(result.changed(), "邻块贴边层遮挡时，区块边界方块也应被伪装（消除边界泄漏）");
+    assertArrayEquals(new int[] {index(0, 8, 8)}, result.obfuscatedPositions());
+    assertEquals(STONE, decodeState(result.data(), 1, index(0, 8, 8)));
+  }
+
+  @Test
+  void borderTargetIsKeptWhenNeighborPlaneIsOpen() {
+    int[] states = filled(STONE);
+    states[index(0, 8, 8)] = DIAMOND_ORE;
+    byte[] source = chunk(states);
+
+    ObfuscationProcessor.Result result = processor(false).rewrite(source, 1, 42L, uniformEdges(16, false));
+
+    assertFalse(result.changed(), "邻块那一格是空气时该面暴露，不得伪装");
+    assertSame(source, result.data(), "无改动时必须直接用原字节，不触发重编码");
+  }
+
+  @Test
+  void zBorderUsesMatchingNeighborSide() {
+    int[] states = filled(STONE);
+    states[index(8, 8, 15)] = DIAMOND_ORE;
+
+    NeighborEdges onlyZPlus = edges(16, plane(16, false), plane(16, false), plane(16, false),
+        plane(16, true));
+    assertTrue(processor(false).rewrite(chunk(states), 1, 42L, onlyZPlus).changed(),
+        "z=16 方向应在 Z_PLUS 侧邻块快照中查询");
+
+    NeighborEdges onlyZMinus = edges(16, plane(16, false), plane(16, false), plane(16, true),
+        plane(16, false));
+    assertFalse(processor(false).rewrite(chunk(states), 1, 42L, onlyZMinus).changed(),
+        "只有 Z_MINUS 侧遮挡时，z=15 这一面仍然暴露");
+  }
+
+  @Test
+  void missingNeighborFollowsConfiguredPolicy() {
+    int[] states = filled(STONE);
+    states[index(0, 8, 8)] = DIAMOND_ORE;
+
+    assertTrue(processor(true).rewrite(chunk(states), 1, 42L).changed(),
+        "missing-policy=hide：邻块缺失时宁可多伪装");
+    assertFalse(processor(false).rewrite(chunk(states), 1, 42L).changed(),
+        "missing-policy=expose：邻块缺失时按旧行为保持原样");
+  }
+
+  @Test
+  void worldLimitsStillWinOverMissingPolicy() {
+    int[] states = filled(STONE);
+    states[index(8, 0, 8)] = DIAMOND_ORE;
+
+    // 下方已越出世界下界：即使全部邻块平面都「遮挡」，也必须保持原样（不能凭空遮挡世界之外）
+    assertFalse(processor(true).rewrite(chunk(states), 1, 42L, uniformEdges(16, true)).changed(),
+        "越出世界上下界一律视为暴露");
+  }
+
   private static int[] filled(int state) {
     int[] states = new int[4096];
     Arrays.fill(states, state);
     return states;
+  }
+
+  private static byte[] plane(int height, boolean occluding) {
+    byte[] plane = new byte[height << 4];
+    if (occluding) {
+      Arrays.fill(plane, (byte) 1);
+    }
+    return plane;
+  }
+
+  private static NeighborEdges uniformEdges(int height, boolean occluding) {
+    byte[] plane = plane(height, occluding);
+    return new NeighborEdges(height, plane, plane, plane, plane);
+  }
+
+  private static NeighborEdges edges(int height, byte[] xMinus, byte[] xPlus, byte[] zMinus, byte[] zPlus) {
+    return new NeighborEdges(height, xMinus, xPlus, zMinus, zPlus);
+  }
+
+  /** 指定缺失策略的处理器；{@code missingPolicyHide=true} 即 antixray.yml 的默认值。 */
+  private static ObfuscationProcessor processor(boolean missingPolicyHide) {
+    BitSet targets = new BitSet();
+    targets.set(DIAMOND_ORE);
+    return new ObfuscationProcessor(new ChunkCodec(registry(), MODERN), blockId -> blockId != AIR,
+        targets, new int[] {STONE}, new int[] {1}, false, missingPolicyHide,
+        ObfuscationProcessor.PaletteOptions.DISABLED);
   }
 
   private static int index(int x, int y, int z) {
