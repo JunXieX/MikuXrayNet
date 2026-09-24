@@ -94,13 +94,13 @@ class ProximityScannerTest {
     index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {
         local(8, 64, 8),   // 距离 0
         local(8, 72, 8),   // 距离恰好 8（含等于必须命中）
-        local(9, 64, 8)});  // 距离 9（必须排除）
+        local(8, 73, 8)});  // 距离 9（必须排除）；注意仍落在区块 0 内，用于验证「含等号」而非半径
 
     List<ObfuscatedChunkIndex.Position> found = scan(index, revealed, PLAYER, 8.0D, 64, null);
 
     assertEquals(2, found.size());
     assertTrue(found.contains(new ObfuscatedChunkIndex.Position(8, 72, 8)), "距离恰好等于阈值必须命中");
-    assertFalse(found.contains(new ObfuscatedChunkIndex.Position(9, 64, 8)), "超出阈值必须排除");
+    assertFalse(found.contains(new ObfuscatedChunkIndex.Position(8, 73, 8)), "超出阈值必须排除");
   }
 
   // ------------------------------------------------------------------ 整块跳过

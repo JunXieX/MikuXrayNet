@@ -105,7 +105,9 @@ class RevealedSetTest {
     RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
     revealed.mark(PLAYER, chunk(0, 0), 1, 64, 1);
     revealed.mark(OTHER_PLAYER, chunk(0, 0), 1, 64, 1);
-    revealed.mark(PLAYER, new ChunkKey("world_nether", 0, 0), 1, 64, 1);
+    // 其它世界的存活标记必须记在「不会被 clearPlayer 清掉」的玩家上，否则下面的世界作用域断言无意义：
+    // clearPlayer(PLAYER) 会按契约清掉 PLAYER 在所有世界的标记（含 world_nether）。
+    revealed.mark(OTHER_PLAYER, new ChunkKey("world_nether", 0, 0), 1, 64, 1);
 
     revealed.clearPlayer(PLAYER);
     assertEquals(0, revealed.sizeFor(PLAYER, chunk(0, 0)), "只清理该玩家");
@@ -113,7 +115,7 @@ class RevealedSetTest {
 
     revealed.clearWorld(WORLD);
     assertEquals(0, revealed.sizeFor(OTHER_PLAYER, chunk(0, 0)), "世界卸载清理该世界");
-    assertEquals(1, revealed.sizeFor(PLAYER, new ChunkKey("world_nether", 0, 0)),
+    assertEquals(1, revealed.sizeFor(OTHER_PLAYER, new ChunkKey("world_nether", 0, 0)),
         "其它世界不受影响");
 
     revealed.clear();
