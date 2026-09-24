@@ -6,7 +6,6 @@ import com.comphenix.protocol.async.AsyncMarker;
 import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketEvent;
-import java.nio.ByteBuffer;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
@@ -15,6 +14,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
+import net.mikumc.mikuxraynet.cache.DiskPayload;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.concurrency.RewriteTask;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
@@ -281,19 +281,22 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 内存未命中时尝试磁盘缓存；命中则回填内存缓存。
    *
    * <p>磁盘读带 50ms 预算（见 {@code DiskCacheStore}），超时/异常一律按未命中降级，
-   * 因此不会把封包处理拖过时限。负载里带原始字节指纹，指纹不符即视为未命中。
+   * 因此不会把封包处理拖过时限。负载里带原始字节指纹（指纹不符即视为未命中）与<b>被伪装坐标</b>
+   * （回填后由 {@link #writeBack} 写回显形索引——否则磁盘命中的区块永远不进索引）。
    */
   private CachedChunk loadFromDisk(RewriteTask task, long sourceHash) {
     if (diskCache == null || !diskCache.usable()) {
       return null;
     }
     try {
-      CachedChunk fromDisk = decodeDiskPayload(
+      DiskPayload.Decoded decoded = DiskPayload.decode(
           diskCache.get(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash()),
           sourceHash);
-      if (fromDisk != null) {
-        cache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(), fromDisk);
+      if (decoded == null) {
+        return null;
       }
+      CachedChunk fromDisk = new CachedChunk(decoded.sourceHash(), decoded.data(), decoded.positions());
+      cache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(), fromDisk);
       return fromDisk;
     } catch (Throwable throwable) {
       logThrottled("读取磁盘缓存失败，已按未命中处理", throwable);
@@ -326,9 +329,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions());
     cache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(), value);
     if (diskCache != null) {
-      // 磁盘写入是「提交即返回」的异步操作（自有磁盘线程），不阻塞本工作线程
+      // 磁盘写入是「提交即返回」的异步操作（自有磁盘线程），不阻塞本工作线程；
+      // 负载里带上被伪装坐标，磁盘缓存命中时才能重新写入显形索引（见 DiskPayload）。
       diskCache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(),
-          encodeDiskPayload(sourceHash, result.obfuscatedPositions(), result.data()));
+          DiskPayload.encode(sourceHash, result.obfuscatedPositions(), result.data()));
     }
     writeBack(accessor, task, value.data(), value.positions());
   }
@@ -367,53 +371,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
           + "；输出字节是否变化=" + (result.data() != source ? "是" : "否"));
     } catch (Throwable throwable) {
       logThrottled("首次改写诊断生成失败（不影响改写主流程）", throwable);
-    }
-  }
-
-  /**
-   * 磁盘缓存负载编码：{@code [i64 原始字节指纹][i32 伪装坐标数][i32… 伪装坐标][改写后的 section 字节]}。
-   *
-   * <p>指纹用于识别「同一区块位置的封包字节是否变了」；伪装坐标用于回填时剔除方块实体，
-   * 也用于重新写入显形索引。
-   */
-  private static byte[] encodeDiskPayload(long sourceHash, int[] positions, byte[] data) {
-    ByteBuffer buffer = ByteBuffer.allocate(8 + 4 + positions.length * Integer.BYTES + data.length);
-    buffer.putLong(sourceHash);
-    buffer.putInt(positions.length);
-    for (int position : positions) {
-      buffer.putInt(position);
-    }
-    buffer.put(data);
-    return buffer.array();
-  }
-
-  /** 解码磁盘缓存负载；指纹不符、截断或结构异常都返回 {@code null}（按未命中处理）。 */
-  private static CachedChunk decodeDiskPayload(byte[] payload, long expectedSourceHash) {
-    if (payload == null || payload.length < 12) {
-      return null;
-    }
-    try {
-      ByteBuffer buffer = ByteBuffer.wrap(payload);
-      long sourceHash = buffer.getLong();
-      if (sourceHash != expectedSourceHash) {
-        return null;
-      }
-      int count = buffer.getInt();
-      if (count < 0 || count > buffer.remaining() / Integer.BYTES) {
-        return null;
-      }
-      int[] positions = new int[count];
-      for (int index = 0; index < count; index++) {
-        positions[index] = buffer.getInt();
-      }
-      byte[] data = new byte[buffer.remaining()];
-      buffer.get(data);
-      if (data.length == 0) {
-        return null;
-      }
-      return new CachedChunk(sourceHash, data, positions);
-    } catch (RuntimeException exception) {
-      return null;
     }
   }
 

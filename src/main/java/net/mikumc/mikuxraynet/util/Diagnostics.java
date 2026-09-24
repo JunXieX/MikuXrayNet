@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Locale;
 import net.mikumc.mikuxraynet.MikuXrayNet;
 import net.mikumc.mikuxraynet.antixray.ProximityStats;
+import net.mikumc.mikuxraynet.antixray.RevealedBlockIndex;
 import net.mikumc.mikuxraynet.antixray.RewriteStats;
 import net.mikumc.mikuxraynet.bandwidth.ThrottlePipeline;
 import net.mikumc.mikuxraynet.bandwidth.ThrottleStats;
@@ -82,7 +83,9 @@ public final class Diagnostics {
       long diskCacheHits,
       long diskCacheMisses,
       int diskCacheEntries,
-      int diskCacheOpenFiles) {
+      int diskCacheOpenFiles,
+      int revealedIndexEntries,
+      long revealedIndexDropped) {
 
     /** 配置指纹（取自反矿透配置；无配置时为 0）。 */
     public int configFingerprint() {
@@ -129,6 +132,7 @@ public final class Diagnostics {
     MikuWorkPool pool = plugin.workPool();
     DiskCacheStore diskCache = plugin.diskCacheStore();
     DiskCacheStats diskStats = diskCache == null ? null : diskCache.stats();
+    RevealedBlockIndex revealedIndex = plugin.revealedIndex();
     MikuConfig config = plugin.mikuConfig();
 
     return new Snapshot(
@@ -174,7 +178,9 @@ public final class Diagnostics {
         diskStats == null ? 0L : diskStats.hits.sum(),
         diskStats == null ? 0L : diskStats.misses.sum(),
         diskCache == null ? 0 : diskCache.entries(),
-        diskCache == null ? 0 : diskCache.openRegionFiles());
+        diskCache == null ? 0 : diskCache.openRegionFiles(),
+        revealedIndex == null ? 0 : revealedIndex.size(),
+        revealedIndex == null ? 0L : revealedIndex.droppedByCapacity());
   }
 
   /** 状态面板格式化（纯函数）。 */
@@ -195,6 +201,8 @@ public final class Diagnostics {
     lines.add("邻近显形：发送 " + s.revealsSent() + "，跳过 " + s.revealsSkipped()
         + "，变更注销 " + s.revealsUnregistered() + "，视锥剔除 " + s.proximityFrustumCulled()
         + "，射线剔除 " + s.proximityRayCulled());
+    lines.add("显形索引：条目 " + s.revealedIndexEntries() + "，丢弃 " + s.revealedIndexDropped()
+        + "（丢弃 = 容量满时淘汰的远处坐标 + 确实无法腾出空间而放弃的新坐标）");
     lines.add("磁盘缓存：" + (s.diskCacheOpenFiles() > 0 || s.diskCacheEntries() > 0 ? "已启用" : "无数据")
         + "｜命中 " + s.diskCacheHits() + "，未命中 " + s.diskCacheMisses()
         + "，命中率 " + hitRate(s.diskCacheHits(), s.diskCacheMisses())

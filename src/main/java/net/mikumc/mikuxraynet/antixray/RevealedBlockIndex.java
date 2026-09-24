@@ -18,7 +18,8 @@ import java.util.function.LongSupplier;
  * <p><b>内存纪律</b>：键只有 UUID 与 {@code (世界名, chunkX, chunkZ)}，坐标压成一个 {@code long}；
  * 全程不持有 Player / World / Chunk / 封包 的强引用。因此它不会把世界对象钉在堆上，
  * 玩家登出、世界卸载时按 UUID / 世界名整体清理即可。三重上界保证有界：
- * 全服坐标上限、单玩家坐标上限、按时间过期。
+ * 全服坐标上限、单玩家坐标上限、按时间过期；任一上限触顶时<b>优先淘汰离玩家最远的区块</b>，
+ * 而不是丢弃新记录——否则登录时连续下发数百个区块会让「身边坐标」被先到的远处坐标挤掉。
  *
  * <p><b>线程纪律</b>：写入来自反矿透的工作线程，查询与注销来自主线程 / Folia 区域线程；
  * 内部只用并发容器与「逐区块条目锁」，纯数据结构，不触碰任何 Bukkit API，可离线单测。
@@ -41,6 +42,16 @@ public final class RevealedBlockIndex {
 
     private final ConcurrentHashMap<ChunkKey, ChunkEntry> chunks = new ConcurrentHashMap<>();
     private final AtomicInteger positionCount = new AtomicInteger();
+
+    /**
+     * 该玩家最近一次被查询到的水平位置（由 {@link #candidates} 刷新）。
+     *
+     * <p>只用于容量淘汰的决策：满员时优先淘汰「离玩家最远」的区块，保证玩家身边的坐标一定还在索引里。
+     * 主线程/区域线程写、工作线程读，volatile 足够（只求最终可见，不要求严格时序）。
+     */
+    private volatile int lastX;
+    private volatile int lastZ;
+    private volatile boolean hasPosition;
   }
 
   /** 单个区块内被伪装过的坐标（打包为 long）；读写都在条目锁内进行。 */
@@ -57,6 +68,12 @@ public final class RevealedBlockIndex {
   /** y 占 12 位：支持 -2048 ~ 2047，覆盖 -64 ~ 320 的建筑高度。 */
   private static final int Y_BITS = 12;
   private static final int Y_MASK = (1 << Y_BITS) - 1;
+
+  /**
+   * 单次 {@link #record} 里最多淘汰的区块数（防止「淘汰跟不上写入」时陷入长循环）。
+   * 一个区块通常有上百个坐标，正常情况下淘汰一个区块就足以腾出空间。
+   */
+  private static final int MAX_EVICTIONS_PER_RECORD = 64;
 
   private final ConcurrentHashMap<UUID, PlayerIndex> players = new ConcurrentHashMap<>();
   private final AtomicInteger totalPositions = new AtomicInteger();
@@ -89,28 +106,31 @@ public final class RevealedBlockIndex {
   /**
    * 记录一个坐标被伪装过。
    *
-   * <p>容量判定先于条目创建：容量已满时连区块条目都不会新建，只累加「容量丢弃」计数
-   * （此时的重复坐标同样按丢弃计数，不影响已有记录）。
+   * <p><b>容量策略</b>：满员时<b>不再丢弃新记录</b>，而是先淘汰「离玩家最远」的区块条目来腾出空间
+   * （{@link #evictFarthestChunk}）——玩家身边、离得近的坐标因此不会被新来的远处区块挤掉。
+   * 只有在「拿不到玩家位置、或淘汰也腾不出空间」时才退回丢弃新记录，并累加「容量丢弃」计数。
    *
-   * @return 是否真的写入（已在索引中或超出容量上限时返回 false）
+   * @return 是否真的写入（已在索引中或确实无法腾出空间时返回 false）
    */
   public boolean record(UUID playerId, String worldName, int x, int y, int z) {
     if (playerId == null || worldName == null) {
       return false;
     }
-    if (totalPositions.get() >= maxPositions) {
+    ChunkKey key = new ChunkKey(worldName, x >> 4, z >> 4);
+
+    if (totalPositions.get() >= maxPositions && !makeRoomGlobally()) {
       droppedByCapacity.increment();
       return false;
     }
 
     PlayerIndex playerIndex = players.computeIfAbsent(playerId, uuid -> new PlayerIndex());
-    if (playerIndex.positionCount.get() >= maxPositionsPerPlayer) {
+    if (playerIndex.positionCount.get() >= maxPositionsPerPlayer
+        && !makeRoomForPlayer(playerIndex)) {
       droppedByCapacity.increment();
       return false;
     }
 
-    ChunkEntry entry = playerIndex.chunks.computeIfAbsent(
-        new ChunkKey(worldName, x >> 4, z >> 4), key -> new ChunkEntry());
+    ChunkEntry entry = playerIndex.chunks.computeIfAbsent(key, k -> new ChunkEntry());
     long packedValue = pack(x, y, z);
 
     synchronized (entry) {
@@ -131,6 +151,107 @@ public final class RevealedBlockIndex {
       totalPositions.incrementAndGet();
       return true;
     }
+  }
+
+  // ------------------------------------------------------------------ 容量淘汰（保留近处）
+
+  /**
+   * 全服上限已满：淘汰「贡献最多坐标的那个玩家」里离他自己最远的区块，直到全服低于上限。
+   *
+   * <p>只淘汰「已经知道位置的玩家」的条目——拿不到位置就无法判断远近，此时退回丢弃新记录，
+   * 保持原有保守行为（不会误删可能就在玩家身边的坐标）。
+   *
+   * @return 是否已腾出空间（false 表示无法腾出，调用方丢弃新记录）
+   */
+  private boolean makeRoomGlobally() {
+    for (int attempt = 0;
+        attempt < MAX_EVICTIONS_PER_RECORD && totalPositions.get() >= maxPositions; attempt++) {
+      if (!evictFarthestChunkOfLargestPlayer()) {
+        break;
+      }
+    }
+    return totalPositions.get() < maxPositions;
+  }
+
+  /** 在全部「已知位置」的玩家里挑坐标数最多的一个，淘汰其离玩家最远的区块。 */
+  private boolean evictFarthestChunkOfLargestPlayer() {
+    PlayerIndex largest = null;
+    int largestCount = 0;
+    for (PlayerIndex candidate : players.values()) {
+      if (!candidate.hasPosition) {
+        continue;
+      }
+      int count = candidate.positionCount.get();
+      if (count > largestCount) {
+        largestCount = count;
+        largest = candidate;
+      }
+    }
+    return largest != null && evictFarthestChunk(largest);
+  }
+
+  /** 单玩家上限已满：淘汰该玩家离自己最远的区块，直到低于上限。 */
+  private boolean makeRoomForPlayer(PlayerIndex playerIndex) {
+    for (int attempt = 0;
+        attempt < MAX_EVICTIONS_PER_RECORD
+            && playerIndex.positionCount.get() >= maxPositionsPerPlayer; attempt++) {
+      if (!evictFarthestChunk(playerIndex)) {
+        break;
+      }
+    }
+    return playerIndex.positionCount.get() < maxPositionsPerPlayer;
+  }
+
+  /**
+   * 淘汰玩家索引里「离玩家最远」的一个区块条目。
+   *
+   * <p>按区块中心与玩家的<b>水平距离</b>比较（区块是竖直列，同一列内不再区分远近）；
+   * 距离并列时取先遍历到的那个，不追求稳定顺序。淘汰掉的坐标数计入「容量丢弃」计数，保证可观测。
+   *
+   * <p>若「最远的」恰好是本次正在写入的区块，也照淘汰——随后 {@link #record} 会把新坐标重新写进去。
+   * 这样语义始终是「保留离玩家最近的坐标」，不会因为「不淘汰正在写的区块」而反过来把身边坐标挤掉。
+   *
+   * @return 是否真的淘汰掉了一个区块条目
+   */
+  private boolean evictFarthestChunk(PlayerIndex playerIndex) {
+    if (!playerIndex.hasPosition) {
+      return false;
+    }
+    int playerX = playerIndex.lastX;
+    int playerZ = playerIndex.lastZ;
+
+    ChunkKey victim = null;
+    long farthest = -1L;
+    for (ChunkKey key : playerIndex.chunks.keySet()) {
+      long distance = horizontalDistanceSquared(key, playerX, playerZ);
+      if (distance > farthest) {
+        farthest = distance;
+        victim = key;
+      }
+    }
+    if (victim == null) {
+      return false;
+    }
+
+    ChunkEntry entry = playerIndex.chunks.remove(victim);
+    if (entry == null) {
+      return false;
+    }
+    int removed;
+    synchronized (entry) {
+      removed = entry.size;
+    }
+    subtract(playerIndex.positionCount, removed);
+    subtract(totalPositions, removed);
+    droppedByCapacity.add(removed);
+    return true;
+  }
+
+  /** 区块中心与玩家的水平距离平方（区块是竖直列，忽略 y）。 */
+  private static long horizontalDistanceSquared(ChunkKey key, int x, int z) {
+    long dx = (long) ((key.chunkX() << 4) + 8) - x;
+    long dz = (long) ((key.chunkZ() << 4) + 8) - z;
+    return dx * dx + dz * dz;
   }
 
   /**
@@ -235,6 +356,9 @@ public final class RevealedBlockIndex {
    *
    * <p>命中区块的条目在读取期间加锁，因此与工作线程的写入不会读到半更新的数组。
    *
+   * <p>顺带把玩家当前位置记到该玩家的索引上（供容量淘汰判断远近）；主线程/区域线程调用，
+   * 工作线程只读，故用 volatile 字段承载。
+   *
    * @param limit 返回条数上限；小于等于 0 时返回空列表
    * @return 候选坐标（不超过 limit 条）；无候选时返回空列表
    */
@@ -248,6 +372,10 @@ public final class RevealedBlockIndex {
     if (playerIndex == null) {
       return List.of();
     }
+
+    playerIndex.lastX = x;
+    playerIndex.lastZ = z;
+    playerIndex.hasPosition = true;
 
     double maxDistanceSquared = maxDistance * maxDistance;
     List<Position> found = new ArrayList<>();
@@ -380,7 +508,7 @@ public final class RevealedBlockIndex {
     return total;
   }
 
-  /** 因容量上限被丢弃的坐标数（诊断用）。 */
+  /** 因容量上限被丢弃或淘汰的坐标数（诊断用；含「满员时淘汰掉的远处坐标」与「确实无法腾出空间而放弃的新坐标」）。 */
   public long droppedByCapacity() {
     return droppedByCapacity.sum();
   }

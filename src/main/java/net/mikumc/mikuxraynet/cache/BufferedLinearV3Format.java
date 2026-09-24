@@ -18,7 +18,7 @@ import java.util.zip.Inflater;
  * <p><b>文件布局</b>
  * <pre>
  *   偏移 0     : 魔数 u64 = MAGIC
- *   偏移 8     : 版本 u8 = 0x03
+ *   偏移 8     : 版本 u8 = 0x04
  *   偏移 9     : 压缩方案 u8（0x01 = Deflate 历史格式；0x02 = Zstd 当前写入，见下）
  *   偏移 10    : 校验种子 i32（默认 0x0721）
  *   偏移 14    : 16 × u64 bucket 偏移表（每个 bucket 覆盖 64 个区块，共 1024 个区块 = 32×32）
@@ -28,6 +28,11 @@ import java.util.zip.Inflater;
  * 长度 {@code <= 0} 表示空槽。条目字节为
  * {@code [i32 负载长度][i64 区块代次][i64 写入时间][i32 配置指纹][i32 负载校验和][负载]}，
  * 校验和为 {@link XXHash32}（与格式头种子一致）。
+ *
+ * <p><b>版本历史</b>：{@code 0x03} 为初版；{@code 0x04} 起明确「负载信封必须携带被伪装坐标清单」
+ * （见 {@code DiskPayload}：{@code [i64 指纹][i32 坐标数][i32×N 坐标][区块字节]}），
+ * 否则磁盘缓存命中的区块不会进入显形索引。读取 {@code 0x03} 旧文件时明确拒绝并（只提示一次）
+ * 由调用方删除重建，避免复用与当前信封约定不一致的历史条目。
  *
  * <p><b>压缩方案（偏移 9 的那个字节）</b>：该字节决定整个文件里所有 bucket 的压缩算法。
  * 当前写入统一使用 <b>zstd</b>（{@code 0x02}），用的是服务端自带的 zstd-jni（{@code scope=provided}，
@@ -48,6 +53,12 @@ public final class BufferedLinearV3Format {
   /** 仅提示一次的「zstd 回退 Deflater」日志开关。 */
   private static final AtomicBoolean ZSTD_FALLBACK_WARNED = new AtomicBoolean();
 
+  /** 仅提示一次的「旧版（0x03）区域文件已被拒绝、将重建」日志开关。 */
+  private static final AtomicBoolean LEGACY_VERSION_WARNED = new AtomicBoolean();
+
+  /** 初版格式版本：其负载信封未约定必须携带被伪装坐标，读取时明确拒绝。 */
+  private static final byte LEGACY_VERSION = 0x03;
+
   /**
    * zstd 压缩等级：<b>3 = 速度优先</b>（用户指定最快档）。
    *
@@ -61,8 +72,8 @@ public final class BufferedLinearV3Format {
   /** 与参考实现一致的文件魔数。 */
   public static final long MAGIC = 0xFFFFDFF7EDDAFD97L;
 
-  /** 与参考实现一致的格式版本（bucket 化布局）。 */
-  public static final byte VERSION = 0x03;
+  /** 与参考实现一致的格式版本（bucket 化布局 + 负载信封携带伪装坐标）。 */
+  public static final byte VERSION = 0x04;
 
   /** 压缩方案：JDK Deflater（历史格式，仅用于读取旧文件）。 */
   public static final byte COMPRESSION_DEFLATE = 0x01;
@@ -142,6 +153,14 @@ public final class BufferedLinearV3Format {
     }
   }
 
+  /** 旧版（0x03）文件被拒绝时的唯一一次中文提示（并发安全）；由调用方删除重建。 */
+  private static void warnLegacyVersionOnce(byte version) {
+    if (version == LEGACY_VERSION && LEGACY_VERSION_WARNED.compareAndSet(false, true)) {
+      LOGGER.warning("检测到旧版磁盘缓存格式（0x03）：新版（0x04）要求负载信封携带被伪装坐标清单，"
+          + "旧文件将被拒绝并删除重建（缓存只是可选加速，不影响封包链路，也绝不影响反矿透本身）");
+    }
+  }
+
   /**
    * 当前写入使用的压缩方案字节：zstd 可用时为 {@link #COMPRESSION_ZSTD}，否则 {@link #COMPRESSION_DEFLATE}。
    *
@@ -201,7 +220,9 @@ public final class BufferedLinearV3Format {
     }
     byte version = buffer.get();
     if (version != VERSION) {
-      throw new IOException("不支持的格式版本 " + version);
+      warnLegacyVersionOnce(version);
+      throw new IOException("不支持的格式版本 " + version + "（当前支持 " + VERSION
+          + (version == LEGACY_VERSION ? "；旧版缓存将被删除重建" : "") + "）");
     }
     byte compression = buffer.get();
     if (compression != COMPRESSION_DEFLATE && compression != COMPRESSION_ZSTD) {

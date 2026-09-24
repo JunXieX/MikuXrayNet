@@ -217,9 +217,14 @@ public final class AntiXrayConfig {
             // （脚边的矿还没轮到就被远处候选挤占）。取舍：越大越及时但单次发包越多；5 tick 一次、128 个
             // 约等于 512 个/秒的上限，仍远低于区块包流量，不会成为带宽瓶颈。
             Math.max(1, root.getInt("proximity.max-reveals-per-tick", 128)),
-            Math.max(1, root.getInt("proximity.expire-seconds", 120)),
-            Math.max(1, root.getInt("proximity.max-positions", 65536)),
-            Math.max(1, root.getInt("proximity.max-positions-per-player", 2048)),
+            // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处，
+            // 窗口太短会让「还没走到就被清掉」的坐标永不还原。
+            Math.max(1, root.getInt("proximity.expire-seconds", 300)),
+            // 默认 512000（原为 65536）：约 8 个满配玩家（每人 65536 坐标）的量级，多玩家同时在线不立刻触顶。
+            Math.max(1, root.getInt("proximity.max-positions", 512000)),
+            // 默认 65536（原为 2048）：视距 10 的登录规模约 400+ 区块 × 每区块约 174 坐标 ≈ 7 万个坐标；
+            // 2048 在十几个区块内就被填满，玩家身边的坐标进不了索引（真机 bug 根因）。约 1 MB/玩家。
+            Math.max(1, root.getInt("proximity.max-positions-per-player", 65536)),
             root.getBoolean("proximity.frustum.enabled", true),
             clampFov(root.getDouble("proximity.frustum.fov", 80.0D)),
             Math.max(0.0D, root.getDouble("proximity.frustum.min-distance", 4.0D)),

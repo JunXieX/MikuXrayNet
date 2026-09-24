@@ -40,6 +40,11 @@ class ConfigDefaultsTest {
     assertEquals(5, config.proximity().intervalTicks(), "巡检周期保持 5 tick（约 0.25 秒一次）");
     assertTrue(config.proximity().raycastEnabled(), "射线可见性默认开启（隔着墙不显形）");
     assertEquals(4.0D, config.proximity().frustumMinDistance(), 1.0E-9D, "min-distance 保持 4 格");
+    assertEquals(65536, config.proximity().maxPositionsPerPlayer(),
+        "单玩家坐标上限默认 65536（2048 会被登录时的区块流在十几个区块内填满，身边坐标进不了索引）");
+    assertEquals(512000, config.proximity().maxPositions(),
+        "全服坐标上限默认 512000（约 8 个满配玩家，避免多玩家同时在线立刻触顶）");
+    assertEquals(300, config.proximity().expireSeconds(), "显形索引过期默认 300 秒（原为 120）");
   }
 
   @Test

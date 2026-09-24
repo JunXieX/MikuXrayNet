@@ -113,6 +113,8 @@ public final class ProximityRevealer implements Listener {
   private final AtomicInteger errorCounter = new AtomicInteger();
   private final AtomicLong passes = new AtomicLong();
   private final AtomicBoolean firstRevealDiagnosed = new AtomicBoolean();
+  /** 「显形索引容量丢弃」只提示一次（CAS 抢占），避免每轮巡检刷屏。 */
+  private final AtomicBoolean dropWarned = new AtomicBoolean();
 
   private BukkitTask globalTask;
 
@@ -185,6 +187,7 @@ public final class ProximityRevealer implements Listener {
 
   /** 全服巡检（非 Folia：主线程，遍历在线玩家并共享本次发包额度）。 */
   private void passAll() {
+    warnIfCapacityDropped();
     maybeExpire();
     Budget budget = new Budget(limit());
     for (Player player : Bukkit.getOnlinePlayers()) {
@@ -201,12 +204,28 @@ public final class ProximityRevealer implements Listener {
 
   /** 单个玩家的巡检（Folia：在玩家所属区域线程执行）。 */
   private void pass(Player player) {
+    warnIfCapacityDropped();
     maybeExpire();
     try {
       reveal(player, new Budget(limit()));
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
+  }
+
+  /**
+   * 显形索引发生容量丢弃时提示<b>一次</b>：说明「索引已满 → 部分矿物靠近时不会还原」，
+   * 并指出可调大的配置项。只读一个 {@code LongAdder} 与一次 CAS，无热路径开销。
+   */
+  private void warnIfCapacityDropped() {
+    long dropped = index.droppedByCapacity();
+    if (dropped <= 0L || !dropWarned.compareAndSet(false, true)) {
+      return;
+    }
+    plugin.getLogger().warning("显形索引已满，部分矿物靠近时不会还原（已丢弃/淘汰 " + dropped
+        + " 个坐标）；可调大 antixray.yml 的 proximity.max-positions-per-player（当前 "
+        + proximity.maxPositionsPerPlayer() + "）与 proximity.max-positions（当前 "
+        + proximity.maxPositions() + "）。");
   }
 
   /** 主线程 / 区域线程：取候选坐标 → （可选）工作线程筛选 → 读真实方块 → 发包 → 注销该坐标。 */

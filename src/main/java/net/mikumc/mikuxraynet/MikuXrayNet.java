@@ -278,6 +278,11 @@ public final class MikuXrayNet extends JavaPlugin {
     return proximityRevealer;
   }
 
+  /** 显形索引（供诊断读取条目数与容量丢弃数）；未启用邻近显形时为 null。 */
+  public RevealedBlockIndex revealedIndex() {
+    return revealedIndex;
+  }
+
   /** 邻近显形统计计数；反矿透未启用时为 null。 */
   public ProximityStats proximityStats() {
     return proximityStats;

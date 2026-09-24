@@ -76,6 +76,19 @@ class BufferedLinearV3FormatTest {
         () -> BufferedLinearV3Format.decodeHeader(new byte[] {1, 2, 3}), "长度不足必须拒绝");
   }
 
+  /** 版本字节：新写入必须是 0x04；初版 0x03 必须被明确拒绝（交由调用方删除重建）。 */
+  @Test
+  void headerCarriesCurrentVersionAndRejectsLegacy() {
+    byte[] header = BufferedLinearV3Format.encodeHeader(SEED);
+    assertEquals(BufferedLinearV3Format.VERSION, header[8], "新文件版本字节必须是 0x04");
+    assertEquals(0x04, BufferedLinearV3Format.VERSION, "版本常量必须是 0x04");
+
+    byte[] legacy = BufferedLinearV3Format.encodeHeader(SEED);
+    legacy[8] = 0x03;
+    assertThrows(IOException.class, () -> BufferedLinearV3Format.decodeHeaderInfo(legacy),
+        "旧版（0x03）区域文件必须被拒绝（负载信封约定已升级）");
+  }
+
   @Test
   void positionTableRoundTrip() throws IOException {
     long[] offsets = new long[BufferedLinearV3Format.BUCKET_COUNT];
