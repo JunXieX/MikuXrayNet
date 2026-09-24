@@ -241,7 +241,8 @@ public final class Diagnostics {
         .append(String.join(", ", c.hideBlocks())).append('\n');
     sb.append("replacement-weights=").append(c.replacementWeights()).append('\n');
     sb.append("layer-obfuscation=").append(c.layerObfuscation())
-        .append("，remove-block-entities=").append(c.removeBlockEntities()).append('\n');
+        .append("，remove-block-entities=").append(c.removeBlockEntities())
+        .append("，obfuscation.mode=").append(c.obfuscationMode()).append('\n');
     sb.append("neighbors.enabled=").append(c.neighbors().enabled())
         .append("，missing-policy=").append(c.neighbors().missingPolicy())
         .append("，cache-maximum-size=").append(c.neighbors().cacheMaximumSize()).append('\n');
@@ -290,6 +291,7 @@ public final class Diagnostics {
         .append("，merge-radius=").append(c.blockChanges().mergeRadius())
         .append("，max-per-packet=").append(c.blockChanges().maxPerPacket())
         .append("，merge-window-millis=").append(c.blockChanges().mergeWindowMillis())
+        .append("，immediate-radius=").append(c.blockChanges().immediateRadius())
         .append("，resend-on-overflow=").append(c.blockChanges().resendOnOverflow())
         .append("，max-pending-entries=").append(c.blockChanges().maxPendingEntries()).append('\n');
     sb.append("palette.reorder=").append(c.palette().reorder())

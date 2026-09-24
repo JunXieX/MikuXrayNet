@@ -222,6 +222,48 @@ class ObfuscationProcessorTest {
         "越出世界上下界一律视为暴露");
   }
 
+  @Test
+  void allModeObfuscatesExposedOre() {
+    int[] states = filled(STONE);
+    states[index(8, 8, 8)] = DIAMOND_ORE;
+    states[index(9, 8, 8)] = AIR;
+
+    ObfuscationProcessor.Result result = processorAll().rewrite(chunk(states), 1, 42L);
+
+    assertTrue(result.changed(), "all 模式下即使有面暴露（矿洞壁）也必须伪装");
+    assertArrayEquals(new int[] {index(8, 8, 8)}, result.obfuscatedPositions());
+    assertEquals(STONE, decodeState(result.data(), 1, index(8, 8, 8)), "裸露矿被替换为伪装方块");
+  }
+
+  @Test
+  void enclosedModeKeepsExposedOreWhileAllModeHidesIt() {
+    // 四周全空气：完全裸露的矿（矿洞中央/壁上）
+    int[] states = filled(AIR);
+    states[index(8, 8, 8)] = DIAMOND_ORE;
+    byte[] source = chunk(states);
+
+    assertFalse(processor(false).rewrite(source, 1, 42L).changed(),
+        "enclosed 模式行为不变：全暴露的矿保持原样");
+    ObfuscationProcessor.Result all = processorAll().rewrite(source, 1, 42L);
+    assertTrue(all.changed(), "切换到 all 后同一输入必须被伪装（配置切换行为正确）");
+    assertEquals(STONE, decodeState(all.data(), 1, index(8, 8, 8)));
+  }
+
+  @Test
+  void allModeIgnoresOcclusionAndNeighborData() {
+    int[] states = filled(AIR);
+    states[index(0, 0, 0)] = DIAMOND_ORE;
+    byte[] source = chunk(states);
+
+    ObfuscationProcessor.Result withoutNeighbors = processorAll().rewrite(source, 1, 42L);
+    ObfuscationProcessor.Result withOpenEdges = processorAll().rewrite(source, 1, 42L, uniformEdges(16, false));
+
+    // all 模式不做遮挡判定，因此既不依赖邻块快照，也不受世界上下界 / 区块边界影响
+    assertTrue(withoutNeighbors.changed(), "all 模式下区块边界的裸露矿同样被伪装");
+    assertArrayEquals(withoutNeighbors.obfuscatedPositions(), withOpenEdges.obfuscatedPositions(),
+        "all 模式下邻块数据不影响伪装坐标");
+  }
+
   private static int[] filled(int state) {
     int[] states = new int[4096];
     Arrays.fill(states, state);
@@ -252,6 +294,15 @@ class ObfuscationProcessorTest {
     return new ObfuscationProcessor(new ChunkCodec(registry(), MODERN), blockId -> blockId != AIR,
         targets, new int[] {STONE}, new int[] {1}, false, missingPolicyHide,
         ObfuscationProcessor.PaletteOptions.DISABLED);
+  }
+
+  /** {@code obfuscation.mode: all} 的处理器：所有目标矿一律伪装，不做 6 面遮挡判定。 */
+  private static ObfuscationProcessor processorAll() {
+    BitSet targets = new BitSet();
+    targets.set(DIAMOND_ORE);
+    return new ObfuscationProcessor(new ChunkCodec(registry(), MODERN), blockId -> blockId != AIR,
+        targets, new int[] {STONE}, new int[] {1}, false, false,
+        ObfuscationProcessor.PaletteOptions.DISABLED, true);
   }
 
   private static int index(int x, int y, int z) {

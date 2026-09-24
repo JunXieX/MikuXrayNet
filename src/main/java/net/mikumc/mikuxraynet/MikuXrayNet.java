@@ -194,7 +194,8 @@ public final class MikuXrayNet extends JavaPlugin {
     startProximity(antiXray, index, proximityStats);
 
     getLogger().info("反矿透已启用：目标方块 " + antiXray.hideBlocks().size() + " 种，伪装方块 "
-        + antiXray.replacementWeights().size() + " 种；区块边界邻块快照 "
+        + antiXray.replacementWeights().size() + " 种；伪装模式 " + antiXray.obfuscationMode()
+        + "；区块边界邻块快照 "
         + (neighborProvider != null ? "已启用" : "已关闭") + "；磁盘缓存 "
         + (diskCache != null ? "已启用（" + new File(getDataFolder(), "cache").getPath() + "）" : "已关闭"));
   }

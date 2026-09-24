@@ -122,4 +122,16 @@ class ProximitySelectorTest {
         ProximitySelector.rayPath(facingPositiveZ(), 0, 64, 0, 8), (x, y, z) -> true),
         "贴得太近（无中间体素）时不做遮挡判定");
   }
+
+  /** 遮挡判定决定「显形 / 不显形」：这是防止「隔着墙把矿亮给透视客户端」的关键闸门。 */
+  @Test
+  void occludedCandidateIsNotRevealedWhileVisibleOneIs() {
+    ProximitySelector.Eye eye = facingPositiveZ();
+    int[] path = ProximitySelector.rayPath(eye, 0, 64, 6, 16);
+
+    assertTrue(ProximitySelector.isRayOccluded(path, (x, y, z) -> z == 3),
+        "视线被墙挡住 → 不显形（等玩家靠近/转向再说）");
+    assertFalse(ProximitySelector.isRayOccluded(path, (x, y, z) -> false),
+        "视线通畅 → 显形");
+  }
 }

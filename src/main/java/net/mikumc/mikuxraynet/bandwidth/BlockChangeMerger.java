@@ -27,7 +27,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import org.bukkit.Location;
 import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.HandlerList;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 
 /**
@@ -38,6 +46,10 @@ import org.bukkit.plugin.Plugin;
  * {@code incrementProcessingDelay()} 登记延迟 → 变更入有界缓冲 → 时间窗到期（或条目超限）时冲刷 →
  * 合并包通过 {@link ProtocolManager#sendServerPacket}（Netty 安全）发出，原包被取消。
  *
+ * <p><b>近身变更立即放行</b>：距离玩家 {@code block-changes.immediate-radius}（默认 8 格）以内的
+ * 方块变更<b>不进合并窗口</b>，原包立即放行——玩家自己挖/放方块时目标就在脚边，被窗口延迟会让
+ * 客户端预测得不到确认，表现为「挖掘时顿一下」。半径外的变更（爆炸、大面积刷新等）照常合并。
+ *
  * <p><b>fail-open</b>：读不出字段、构造失败、校验不通过、玩家离线 —— 一律原样放行原包，绝不丢更新。
  * 原包放行通过 {@link AsyncMarker} 的 {@code signalPacketTransmission} 完成，并用一次性闸保证
  * 「恰好放行一次」。
@@ -45,10 +57,14 @@ import org.bukkit.plugin.Plugin;
  * <p><b>首包自检</b>：第一次真正发送合并包时会回读刚写入的字段做结构校验；未通过校验前会
  * <em>同时</em>保留原包（重复下发相同方块状态是无害幂等操作），校验通过后才开始取消原包。
  */
-public final class BlockChangeMerger extends PacketAdapter {
+public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
   private static final String BYPASS_PERMISSION = "mikuxraynet.bypass";
   private static final int MAX_ERROR_LOGS = 3;
+
+  /** 玩家所在方块坐标（只含基本类型，供封包线程安全读取）。 */
+  private record BlockPos(int x, int y, int z) {
+  }
 
   /** 冲刷批次内的 section 分组键。 */
   private record SectionKey(int x, int y, int z) {
@@ -85,6 +101,15 @@ public final class BlockChangeMerger extends PacketAdapter {
   private final ThrottleStats stats;
   private final ScheduledExecutorService flusher;
   private final ConcurrentHashMap<UUID, Pending> pending = new ConcurrentHashMap<>();
+  /**
+   * 玩家所在方块坐标缓存（主线程 / 区域线程经 {@link PlayerMoveEvent} 刷新）。
+   *
+   * <p><b>为什么不直接读 {@code player.getLocation()}</b>：本监听回调运行在 ProtocolLib 的封包线程，
+   * 遵循「封包线程不触碰实体坐标」的 Folia 纪律（与 {@code AfkTracker} 同款做法）。
+   * 因此在主线程刷新后缓存，封包线程只读缓存；{@link PlayerMoveEvent} 仅在跨越方块边界时更新，
+   * 空闲时（含原地挖掘）几乎零开销。缓存未命中（刚登录尚未移动）时按「未知」处理，退化为照常合并。
+   */
+  private final ConcurrentHashMap<UUID, BlockPos> playerPositions = new ConcurrentHashMap<>();
   private final AtomicInteger errorCounter = new AtomicInteger();
 
   private volatile boolean verified;
@@ -106,12 +131,17 @@ public final class BlockChangeMerger extends PacketAdapter {
     });
   }
 
-  /** 注册异步监听器（真异步扣包）。 */
+  /** 注册异步监听器（真异步扣包）与坐标缓存事件。 */
   public void start() {
     handler = asynchronousManager.registerAsyncHandler(this);
     handler.start();
+    plugin.getServer().getPluginManager().registerEvents(this, plugin);
+    for (Player player : plugin.getServer().getOnlinePlayers()) {
+      remember(player);
+    }
     plugin.getLogger().info("带宽模块已启用：方块变更合并（时间窗 " + config.mergeWindowMillis()
-        + "ms，邻域半径 " + config.mergeRadius() + "，缓冲上限 " + config.maxPendingEntries() + "）");
+        + "ms，邻域半径 " + config.mergeRadius() + "，立即放行半径 " + config.immediateRadius()
+        + " 格，缓冲上限 " + config.maxPendingEntries() + "）");
   }
 
   /** 注销监听器并偿还所有正在延迟中的原包。 */
@@ -125,7 +155,60 @@ public final class BlockChangeMerger extends PacketAdapter {
       }
       handler = null;
     }
+    HandlerList.unregisterAll(this);
+    playerPositions.clear();
     flusher.shutdownNow();
+  }
+
+  @EventHandler(ignoreCancelled = true)
+  public void onJoin(PlayerJoinEvent event) {
+    remember(event.getPlayer());
+  }
+
+  @EventHandler(ignoreCancelled = true)
+  public void onQuit(PlayerQuitEvent event) {
+    playerPositions.remove(event.getPlayer().getUniqueId());
+  }
+
+  /** 仅在玩家跨越方块边界时刷新缓存，避免高频移动事件的额外开销。 */
+  @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+  public void onMove(PlayerMoveEvent event) {
+    Location to = event.getTo();
+    if (to == null) {
+      return;
+    }
+    int blockX = to.getBlockX();
+    int blockY = to.getBlockY();
+    int blockZ = to.getBlockZ();
+    BlockPos current = playerPositions.get(event.getPlayer().getUniqueId());
+    if (current != null && current.x() == blockX && current.y() == blockY && current.z() == blockZ) {
+      return;
+    }
+    playerPositions.put(event.getPlayer().getUniqueId(), new BlockPos(blockX, blockY, blockZ));
+  }
+
+  /** 主线程读取玩家方块坐标并写入缓存；异常时留空（未知坐标退化为照常合并）。 */
+  private void remember(Player player) {
+    try {
+      Location location = player.getLocation();
+      playerPositions.put(player.getUniqueId(),
+          new BlockPos(location.getBlockX(), location.getBlockY(), location.getBlockZ()));
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /** 该玩家的近身变更判定；坐标未知（缓存未命中）时返回 false，退化为照常合并。 */
+  private boolean shouldPassThroughImmediately(UUID playerId, List<Update<WrappedBlockData>> updates) {
+    int radius = config.immediateRadius();
+    if (radius <= 0) {
+      return false;
+    }
+    BlockPos position = playerPositions.get(playerId);
+    if (position == null) {
+      return false;
+    }
+    return BlockChangeBatch.anyWithinRadius(updates, position.x(), position.y(), position.z(), radius);
   }
 
   @Override
@@ -145,6 +228,13 @@ public final class BlockChangeMerger extends PacketAdapter {
 
     List<Update<WrappedBlockData>> updates = readUpdates(event.getPacketType(), event.getPacket());
     if (updates == null || updates.isEmpty()) {
+      stats.blockChangesPassed.increment();
+      return;
+    }
+
+    // 近身变更立即放行：不登记延迟、不入缓冲，原包按原样流出。
+    // 这样玩家自己挖/放方块时的方块更新不会被合并窗口拖延，客户端预测得以立即确认（消除顿感）。
+    if (shouldPassThroughImmediately(player.getUniqueId(), updates)) {
       stats.blockChangesPassed.increment();
       return;
     }

@@ -16,10 +16,14 @@ import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
 /**
  * 反矿透核心：对单个区块做「6 面正交遮挡判定 + 按权重随机替换」，并可顺带做调色板压缩重排。
  *
- * <p><b>判定语义</b>：只有当目标方块的
- * 上下左右前后 6 个正交方向全部被遮挡（即该方块在客户端不可见）时才替换为伪装方块；
- * 任一方向未遮挡——包括世界上下界之外、以及 section 缺失——都按「暴露」处理并保持原样。
- * 对角方向的方块不参与遮挡判定。
+ * <p><b>判定语义</b>：由 {@code antixray.yml: obfuscation.mode} 选择——
+ * <ul>
+ *   <li>{@code enclosed}（旧行为）：只有当目标方块的上下左右前后 6 个正交方向全部被遮挡
+ *       （即该方块在客户端「不可见」）时才替换为伪装方块；任一方向未遮挡——包括世界上下界之外、
+ *       以及 section 缺失——都按「暴露」处理并保持原样。对角方向的方块不参与遮挡判定。</li>
+ *   <li>{@code all}（默认）：所有目标方块一律伪装，<b>不做</b> 6 面遮挡判定，因此矿洞壁上的
+ *       裸露矿也会被伪装；由邻近显形在玩家靠近且可见时还原真实方块（见 {@code ProximityRevealer}）。</li>
+ * </ul>
  *
  * <p><b>区块边界</b>：越过本区块的 6 个面时改查 {@link NeighborEdges}（邻块贴边一层快照）。
  * 邻块数据缺失时按 {@code antixray.yml: neighbors.missing-policy} 处理，默认 {@code hide}
@@ -76,6 +80,7 @@ public final class ObfuscationProcessor {
   private final boolean layerObfuscation;
   private final boolean missingPolicyHide;
   private final PaletteOptions paletteOptions;
+  private final boolean obfuscateAll;
 
   /**
    * 「解码侧统计」诊断结果（{@link #diagnose}）：只回答「这次解码到底看到了什么」。
@@ -88,7 +93,8 @@ public final class ObfuscationProcessor {
   }
 
   /**
-   * 直接用「已解析」的数据构造（供单测与显式装配使用）。
+   * 直接用「已解析」的数据构造（供单测与显式装配使用）；伪装模式为 {@code enclosed}
+   * （只伪装 6 面全遮挡的掩埋矿），与旧行为一致。
    *
    * @param occlusionTable    遮挡判定表：方块状态 id → 是否整块不透明
    * @param targets           目标方块状态位图
@@ -101,6 +107,20 @@ public final class ObfuscationProcessor {
   public ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, BitSet targets,
       int[] replacementIds, int[] cumulativeWeights, boolean layerObfuscation,
       boolean missingPolicyHide, PaletteOptions paletteOptions) {
+    this(codec, occlusionTable, targets, replacementIds, cumulativeWeights, layerObfuscation,
+        missingPolicyHide, paletteOptions, false);
+  }
+
+  /**
+   * 完整构造（追加伪装模式）。
+   *
+   * @param obfuscateAll {@code true} 即 {@code obfuscation.mode: all}——所有目标矿一律伪装，
+   *                     跳过 6 面遮挡判定（靠邻近显形在玩家靠近可见时还原）；
+   *                     {@code false} 即 {@code enclosed}——只伪装 6 面全遮挡的掩埋矿。
+   */
+  public ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, BitSet targets,
+      int[] replacementIds, int[] cumulativeWeights, boolean layerObfuscation,
+      boolean missingPolicyHide, PaletteOptions paletteOptions, boolean obfuscateAll) {
     this.codec = codec;
     this.occlusionTable = occlusionTable;
     this.targets = targets;
@@ -109,9 +129,10 @@ public final class ObfuscationProcessor {
     this.layerObfuscation = layerObfuscation;
     this.missingPolicyHide = missingPolicyHide;
     this.paletteOptions = paletteOptions;
+    this.obfuscateAll = obfuscateAll;
   }
 
-  /** 兼容构造：邻块缺失按「暴露」处理、不做调色板重排（即接入邻块快照之前的行为）。 */
+  /** 兼容构造：邻块缺失按「暴露」处理、不做调色板重排、模式为 enclosed（即接入邻块快照之前的行为）。 */
   public ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, BitSet targets,
       int[] replacementIds, int[] cumulativeWeights, boolean layerObfuscation) {
     this(codec, occlusionTable, targets, replacementIds, cumulativeWeights, layerObfuscation, false,
@@ -162,9 +183,10 @@ public final class ObfuscationProcessor {
     }
 
     boolean missingPolicyHide = config.neighbors().missingPolicy() == AntiXrayConfig.MissingPolicy.HIDE;
+    boolean obfuscateAll = config.obfuscationMode() == AntiXrayConfig.ObfuscationMode.ALL;
 
     return new ObfuscationProcessor(codec, registry::isOccluding, targets, replacementIds,
-        cumulativeWeights, config.layerObfuscation(), missingPolicyHide, paletteOptions);
+        cumulativeWeights, config.layerObfuscation(), missingPolicyHide, paletteOptions, obfuscateAll);
   }
 
   /** 兼容重载：不做调色板重排。 */
@@ -226,7 +248,8 @@ public final class ObfuscationProcessor {
           if (!targets.get(section.getBlockState(index))) {
             continue;
           }
-          if (!isFullyOccluded(chunk, baseY, index, neighbors)) {
+          // mode=all：所有目标矿一律伪装（不看 6 面遮挡）；mode=enclosed：只伪装 6 面全遮挡的掩埋矿。
+          if (!obfuscateAll && !isFullyOccluded(chunk, baseY, index, neighbors)) {
             continue;
           }
 

@@ -115,4 +115,27 @@ class BlockChangeBatchTest {
     assertEquals(2, clusters.get(0).size());
     assertEquals(1, clusters.get(1).size());
   }
+
+  @Test
+  @DisplayName("立即放行半径：半径内存在变更即命中（近身变更不走合并）")
+  void immediateRadiusDetectsNearbyUpdate() {
+    List<Update<Integer>> mixed = List.of(new Update<>(40, 64, 0, 1), new Update<>(1, 65, 1, 2));
+
+    assertTrue(BlockChangeBatch.anyWithinRadius(mixed, 0, 64, 0, 8),
+        "只要有一条落在半径内（玩家脚下/身旁的挖掘更新）就必须命中");
+    assertFalse(BlockChangeBatch.anyWithinRadius(List.of(new Update<>(40, 64, 0, 1)), 0, 64, 0, 8),
+        "全部在半径外时照常合并");
+  }
+
+  @Test
+  @DisplayName("立即放行半径：含边界命中、半径 0 关闭、空/null 安全")
+  void immediateRadiusBoundaryAndDisabled() {
+    List<Update<Integer>> boundary = List.of(new Update<>(8, 64, 0, 1));
+
+    assertTrue(BlockChangeBatch.anyWithinRadius(boundary, 0, 64, 0, 8), "恰好 8 格（含边界）必须命中");
+    assertFalse(BlockChangeBatch.anyWithinRadius(boundary, 0, 64, 0, 7), "超出半径不得命中");
+    assertFalse(BlockChangeBatch.anyWithinRadius(boundary, 0, 64, 0, 0), "半径 0 表示关闭立即放行");
+    assertFalse(BlockChangeBatch.anyWithinRadius(List.of(), 0, 64, 0, 8), "空列表不得命中");
+    assertFalse(BlockChangeBatch.anyWithinRadius(null, 0, 64, 0, 8), "null 不得命中");
+  }
 }

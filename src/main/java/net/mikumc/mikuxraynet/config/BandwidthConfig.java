@@ -15,9 +15,16 @@ public final class BandwidthConfig {
   public record EntityPackets(boolean skipZeroMovement, Set<String> whitelist) {
   }
 
-  /** 方块变更合并。 */
+  /**
+   * 方块变更合并。
+   *
+   * @param immediateRadius 玩家周围该半径（格，欧氏距离）内的方块变更<b>立即放行、不进合并窗口</b>；
+   *                        0 表示全部走合并（等价于旧行为）。默认 8——依据是玩家自己挖方块时，
+   *                        目标方块距玩家自身仅 1~2 格，若被合并窗口延迟，客户端预测得不到确认会出现「顿感」。
+   *                        半径内的变更多为交互/近身方块（挖掘、放置、脚下更新），实时性远比省包重要。
+   */
   public record BlockChanges(boolean merge, int mergeRadius, int maxPerPacket, boolean resendOnOverflow,
-      int mergeWindowMillis, int maxPendingEntries) {
+      int mergeWindowMillis, int maxPendingEntries, int immediateRadius) {
   }
 
   /**
@@ -81,8 +88,12 @@ public final class BandwidthConfig {
             Math.max(0, root.getInt("block-changes.merge-radius", 2)),
             Math.max(1, root.getInt("block-changes.max-per-packet", 4096)),
             root.getBoolean("block-changes.resend-on-overflow", true),
-            Math.max(1, root.getInt("block-changes.merge-window-millis", 50)),
-            Math.max(1, root.getInt("block-changes.max-pending-entries", 256))),
+            // 默认 20（原为 50）：50ms 的合并窗口会让玩家自己挖方块后的方块更新延迟最多 50ms，
+            // 客户端预测受阻 → 出现「顿感」。收紧到 20 后改为 20ms；真正的交互延迟由
+            // immediate-radius 消除（近身变更根本不进窗口）。
+            Math.max(1, root.getInt("block-changes.merge-window-millis", 20)),
+            Math.max(1, root.getInt("block-changes.max-pending-entries", 256)),
+            Math.max(0, root.getInt("block-changes.immediate-radius", 8))),
         new Palette(
             // 默认 false：实测开启重排会使压缩字节变大且耗时增加（见 Palette 的说明）
             root.getBoolean("palette.reorder", false),

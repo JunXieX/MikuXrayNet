@@ -48,8 +48,15 @@ public final class BufferedLinearV3Format {
   /** 仅提示一次的「zstd 回退 Deflater」日志开关。 */
   private static final AtomicBoolean ZSTD_FALLBACK_WARNED = new AtomicBoolean();
 
-  /** zstd 压缩等级：与参考实现的 zstd level 1 定位一致（快速、够用）。 */
-  private static final int ZSTD_LEVEL = 1;
+  /**
+   * zstd 压缩等级：<b>3 = 速度优先</b>（用户指定最快档）。
+   *
+   * <p>本项目取 3 而非更高等级：磁盘缓存属「可选加速」，压缩发生在上游重编码路径之后，
+   * 等级越高越省磁盘字节但越拖慢写入；3 在压缩率与耗时之间取速度优先。
+   * 该等级只影响压缩产物字节，不改动文件头的方案字节（{@link #COMPRESSION_ZSTD}），
+   * 因此与既有 {@code 0x02} 缓存文件完全兼容、可互相解压。
+   */
+  private static final int ZSTD_LEVEL = 3;
 
   /** 与参考实现一致的文件魔数。 */
   public static final long MAGIC = 0xFFFFDFF7EDDAFD97L;
@@ -230,7 +237,7 @@ public final class BufferedLinearV3Format {
   // ------------------------------------------------------------------ 压缩
 
   /**
-   * 压缩一段数据：优先 zstd（{@link #ZSTD_LEVEL}，与参考实现 level 1 定位一致），
+   * 压缩一段数据：优先 zstd（{@link #ZSTD_LEVEL} = 3，速度优先），
    * zstd 不可用或其抛异常时回退 {@link Deflater#BEST_SPEED}（fail-open）。
    */
   public static byte[] compress(byte[] raw) {

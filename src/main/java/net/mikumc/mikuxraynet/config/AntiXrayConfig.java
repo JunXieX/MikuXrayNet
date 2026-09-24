@@ -48,6 +48,24 @@ public final class AntiXrayConfig {
     EXPOSE
   }
 
+  /**
+   * 伪装范围模式（{@code obfuscation.mode}）。
+   *
+   * <p><b>enclosed</b>：只伪装「6 面全被遮挡」的方块（掩埋矿）。矿洞壁上的裸露矿保持原样，
+   * 因此透视端能直接看到裸露矿；好处是玩家几乎不会看到「假方块」。
+   *
+   * <p><b>all</b>（默认）：所有目标矿一律伪装（不看 6 面遮挡），靠邻近显形在玩家靠近且可见时还原。
+   * 透视端看不到任何真实矿物（含矿洞壁上的裸露矿）；代价是矿洞壁上的矿会暂时显示为伪装方块，
+   * 玩家靠近可见后才变回真实矿物——若显形不及时，可能挖到「看起来是石头、其实是矿」的方块，
+   * 这是该模式的固有代价。CPU 略降（省去逐方块的 6 面遮挡判定）。
+   */
+  public enum ObfuscationMode {
+    /** 只伪装被完全掩埋的矿（旧行为）。 */
+    ENCLOSED,
+    /** 所有目标矿一律伪装，靠邻近显形还原（默认，最防透视）。 */
+    ALL
+  }
+
   /** 邻区块贴边快照。 */
   public record Neighbors(boolean enabled, MissingPolicy missingPolicy, int cacheMaximumSize) {
   }
@@ -76,7 +94,7 @@ public final class AntiXrayConfig {
    * @param frustumEnabled        是否只显形玩家视野锥内的候选坐标
    * @param frustumFov            视野锥全张开角（度）
    * @param frustumMinDistance    该距离内的候选豁免视锥判定
-   * @param raycastEnabled        是否做射线可见性判定（被墙挡住的不显形）
+   * @param raycastEnabled        是否做射线可见性判定（被墙挡住的不显形；<b>默认开启</b>）
    * @param raycastSamples        每条射线的最大采样体素数
    */
   public record Proximity(boolean enabled, double distance, int intervalTicks, int maxRevealsPerTick,
@@ -109,6 +127,7 @@ public final class AntiXrayConfig {
   private final List<String> hideBlocks;
   private final Map<String, Integer> replacementWeights;
   private final boolean layerObfuscation;
+  private final ObfuscationMode obfuscationMode;
   private final boolean removeBlockEntities;
   private final Neighbors neighbors;
   private final Occlusion occlusion;
@@ -122,15 +141,16 @@ public final class AntiXrayConfig {
   private final int configHash;
 
   private AntiXrayConfig(boolean enabled, Set<String> worlds, List<String> hideBlocks,
-      Map<String, Integer> replacementWeights, boolean layerObfuscation, boolean removeBlockEntities,
-      Neighbors neighbors, Occlusion occlusion, Proximity proximity, DiskCache diskCache,
-      int cacheMaximumSize, int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis,
-      int queueCapacity) {
+      Map<String, Integer> replacementWeights, boolean layerObfuscation, ObfuscationMode obfuscationMode,
+      boolean removeBlockEntities, Neighbors neighbors, Occlusion occlusion, Proximity proximity,
+      DiskCache diskCache, int cacheMaximumSize, int cacheExpireAfterAccessSeconds, int threads,
+      int timeoutMillis, int queueCapacity) {
     this.enabled = enabled;
     this.worlds = Set.copyOf(worlds);
     this.hideBlocks = List.copyOf(hideBlocks);
     this.replacementWeights = Collections.unmodifiableMap(new LinkedHashMap<>(replacementWeights));
     this.layerObfuscation = layerObfuscation;
+    this.obfuscationMode = obfuscationMode;
     this.removeBlockEntities = removeBlockEntities;
     this.neighbors = neighbors;
     this.occlusion = occlusion;
@@ -141,9 +161,10 @@ public final class AntiXrayConfig {
     this.threads = Math.max(0, threads);
     this.timeoutMillis = Math.max(100, timeoutMillis);
     this.queueCapacity = Math.max(1, queueCapacity);
-    // 影响改写结果的全部配置项都参与哈希（含遮挡覆盖表）；顺序敏感，故用有序列表
+    // 影响改写结果的全部配置项都参与哈希（含遮挡覆盖表与伪装模式）；顺序敏感，故用有序列表。
+    // 伪装模式必须参与：否则「enclosed 写出的缓存」会在切换到 all 后被复用，导致裸露矿泄漏。
     this.configHash = Objects.hash(this.hideBlocks, new ArrayList<>(replacementWeights.entrySet()),
-        layerObfuscation, neighbors.enabled(), neighbors.missingPolicy(),
+        layerObfuscation, obfuscationMode, neighbors.enabled(), neighbors.missingPolicy(),
         OcclusionRules.sortedList(this.occlusion.extraOccluding()),
         OcclusionRules.sortedList(this.occlusion.extraNonOccluding()));
   }
@@ -175,6 +196,8 @@ public final class AntiXrayConfig {
         hideBlocks,
         weights,
         root.getBoolean("obfuscation.layer-obfuscation", false),
+        // 默认 all：用户明确要求「透视不能直接看到裸露在矿洞中的矿物」，故默认对所有目标矿一律伪装。
+        obfuscationMode(root.getString("obfuscation.mode", "all")),
         root.getBoolean("obfuscation.remove-block-entities", true),
         new Neighbors(
             root.getBoolean("neighbors.enabled", true),
@@ -185,7 +208,9 @@ public final class AntiXrayConfig {
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding"))),
         new Proximity(
             root.getBoolean("proximity.enabled", true),
-            Math.max(0.0D, root.getDouble("proximity.distance", 12.0D)),
+            // 默认 8（原为 12）：真机反馈「离玩家近的、没有裸露的矿物也出现在透视范围内」——
+            // 显形距离越大，越早把远处矿物亮给透视客户端；8 格贴近「贴脸才发现」的原版观感。
+            Math.max(0.0D, root.getDouble("proximity.distance", 8.0D)),
             Math.max(1, root.getInt("proximity.interval-ticks", 5)),
             Math.max(1, root.getInt("proximity.max-reveals-per-tick", 32)),
             Math.max(1, root.getInt("proximity.expire-seconds", 120)),
@@ -194,7 +219,9 @@ public final class AntiXrayConfig {
             root.getBoolean("proximity.frustum.enabled", true),
             clampFov(root.getDouble("proximity.frustum.fov", 80.0D)),
             Math.max(0.0D, root.getDouble("proximity.frustum.min-distance", 4.0D)),
-            root.getBoolean("proximity.raycast.enabled", false),
+            // 默认 true（原为 false）：真机 dump 显示为 false，导致「隔着墙也把矿物亮给透视客户端」。
+            // 改为 true 后只在射线无遮挡时才发真实方块，代价是每个候选多几次主线程读方块。
+            root.getBoolean("proximity.raycast.enabled", true),
             Math.max(2, root.getInt("proximity.raycast.samples", 16))),
         new DiskCache(
             root.getBoolean("disk-cache.enabled", true),
@@ -231,6 +258,14 @@ public final class AntiXrayConfig {
         : MissingPolicy.HIDE;
   }
 
+  /** 解析伪装模式；只有显式填写 {@code enclosed} 才回到旧行为，其它（含非法值、null）一律取更安全的 {@link ObfuscationMode#ALL}。 */
+  private static ObfuscationMode obfuscationMode(String value) {
+    if (value != null && "enclosed".equals(value.trim().toLowerCase(Locale.ROOT))) {
+      return ObfuscationMode.ENCLOSED;
+    }
+    return ObfuscationMode.ALL;
+  }
+
   public boolean enabled() {
     return enabled;
   }
@@ -255,6 +290,11 @@ public final class AntiXrayConfig {
 
   public boolean layerObfuscation() {
     return layerObfuscation;
+  }
+
+  /** 伪装范围模式（enclosed = 只藏掩埋矿；all = 所有目标矿一律伪装）。 */
+  public ObfuscationMode obfuscationMode() {
+    return obfuscationMode;
   }
 
   public boolean removeBlockEntities() {
