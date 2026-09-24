@@ -216,9 +216,24 @@ public final class Diagnostics {
     lines.add("带宽：AFK 玩家 " + s.afkPlayers() + "（累计进入 " + s.afkEntered() + "），AFK 丢包 "
         + s.afkPacketsDropped() + "，降视距 " + s.viewDistanceReduced()
         + "/还原 " + s.viewDistanceRestored());
+    lines.add(bandwidthSwitches(s.bandwidth()));
     lines.add("线程池：线程 " + s.poolThreads() + "，活动 " + s.poolActive()
         + "，队列 " + s.queueSize() + "/" + s.queueCapacity());
     return lines;
+  }
+
+  /** 带宽各模块开关回显（一行，供 status/dump 看出每个开关的实际取值）。 */
+  private static String bandwidthSwitches(BandwidthConfig c) {
+    if (c == null) {
+      return "带宽开关：配置未加载";
+    }
+    return "带宽开关：总开关 " + c.enabled()
+        + "｜零位移取消 " + c.entityPackets().enabled()
+        + "｜变更合并 " + c.blockChanges().enabled()
+        + "｜调色板重排 " + c.palette().enabled()
+        + "｜实体剔除 " + c.entityCulling().enabled()
+        + "｜AFK 降级 " + c.afk().enabled()
+        + "｜高延迟降视距 " + c.latency().enabled();
   }
 
   /** 转储文本格式化（纯函数）：状态面板 + 环境信息 + 配置项有效值。 */
@@ -296,27 +311,33 @@ public final class Diagnostics {
       return;
     }
     sb.append("enabled=").append(c.enabled()).append('\n');
-    sb.append("entity-packets.skip-zero-movement=").append(c.entityPackets().skipZeroMovement())
+    sb.append("entity-packets.enabled=").append(c.entityPackets().enabled())
+        .append("，skip-zero-movement=").append(c.entityPackets().skipZeroMovement())
         .append("，whitelist=").append(c.entityPackets().whitelist()).append('\n');
-    sb.append("block-changes.merge=").append(c.blockChanges().merge())
+    sb.append("block-changes.enabled=").append(c.blockChanges().enabled())
+        .append("，merge=").append(c.blockChanges().merge())
         .append("，merge-radius=").append(c.blockChanges().mergeRadius())
         .append("，max-per-packet=").append(c.blockChanges().maxPerPacket())
         .append("，merge-window-millis=").append(c.blockChanges().mergeWindowMillis())
         .append("，immediate-radius=").append(c.blockChanges().immediateRadius())
         .append("，resend-on-overflow=").append(c.blockChanges().resendOnOverflow())
         .append("，max-pending-entries=").append(c.blockChanges().maxPendingEntries()).append('\n');
-    sb.append("palette.reorder=").append(c.palette().reorder())
+    sb.append("palette.enabled=").append(c.palette().enabled())
+        .append("，reorder=").append(c.palette().reorder())
         .append("，strict-verify=").append(c.palette().strictVerify()).append('\n');
-    sb.append("entity-culling.raycast=").append(c.entityCulling().raycast())
+    sb.append("entity-culling.enabled=").append(c.entityCulling().enabled())
+        .append("，raycast=").append(c.entityCulling().raycast())
         .append("，force-visible-distance=").append(c.entityCulling().forceVisibleDistance())
         .append("，threads=").append(c.entityCulling().threads())
         .append("，update-interval-ticks=").append(c.entityCulling().updateIntervalTicks())
         .append("，ray-samples=").append(c.entityCulling().raySamples()).append('\n');
-    sb.append("afk.seconds=").append(c.afk().seconds())
+    sb.append("afk.enabled=").append(c.afk().enabled())
+        .append("，seconds=").append(c.afk().seconds())
         .append("，distance=").append(c.afk().distance())
         .append("，drop-particles=").append(c.afk().dropParticles())
         .append("，drop-block-break-animation=").append(c.afk().dropBlockBreakAnimation()).append('\n');
-    sb.append("latency.threshold-millis=").append(c.latency().thresholdMillis())
+    sb.append("latency.enabled=").append(c.latency().enabled())
+        .append("，threshold-millis=").append(c.latency().thresholdMillis())
         .append("，sustain-seconds=").append(c.latency().sustainSeconds())
         .append("，reduce-view-distance=").append(c.latency().reduceViewDistance())
         .append("，min-view-distance=").append(c.latency().minViewDistance())

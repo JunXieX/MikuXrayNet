@@ -11,43 +11,59 @@ import org.bukkit.configuration.ConfigurationSection;
  */
 public final class BandwidthConfig {
 
-  /** 零位移实体包抑制。 */
-  public record EntityPackets(boolean skipZeroMovement, Set<String> whitelist) {
+  /**
+   * 零位移实体包抑制。
+   *
+   * @param enabled           模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
+   * @param skipZeroMovement  行为开关：取消「位移与转向增量全为 0」的实体位置包；仅在 {@code enabled=true} 时生效。
+   */
+  public record EntityPackets(boolean enabled, boolean skipZeroMovement, Set<String> whitelist) {
   }
 
   /**
    * 方块变更合并。
    *
+   * @param enabled         模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
+   * @param merge           行为开关：合并邻域方块变更；仅在 {@code enabled=true} 时生效。
    * @param immediateRadius 玩家周围该半径（格，欧氏距离）内的方块变更<b>立即放行、不进合并窗口</b>；
    *                        0 表示全部走合并（等价于旧行为）。默认 8——依据是玩家自己挖方块时，
    *                        目标方块距玩家自身仅 1~2 格，若被合并窗口延迟，客户端预测得不到确认会出现「顿感」。
    *                        半径内的变更多为交互/近身方块（挖掘、放置、脚下更新），实时性远比省包重要。
    */
-  public record BlockChanges(boolean merge, int mergeRadius, int maxPerPacket, boolean resendOnOverflow,
-      int mergeWindowMillis, int maxPendingEntries, int immediateRadius) {
+  public record BlockChanges(boolean enabled, boolean merge, int mergeRadius, int maxPerPacket,
+      boolean resendOnOverflow, int mergeWindowMillis, int maxPendingEntries, int immediateRadius) {
   }
 
   /**
    * 调色板重排。
    *
-   * <p>{@code reorder} 默认 {@code false}：CI 实测（zlib level 6 压缩后字节）表明开启重排使压缩字节
-   * 普遍变大（全实心 +2.9%、稀疏矿脉 +4.9%~+6.4%、乱序调色板 +1.4%~+2.3%，仅洞穴略优），且耗时明显增加。
-   * {@code strictVerify} 仅在 {@code reorder=true} 时有意义。
+   * @param enabled      模块总开关：为 {@code false} 时本模块完全不生效（反矿透编码链路取 {@code DISABLED}）。
+   * @param reorder      行为开关，默认 {@code false}：CI 实测表明开启重排使压缩字节普遍变大——
+   *                     zlib level 6（网络封包口径）下全实心 +2.9%、稀疏矿脉 +4.9%~+6.4%、
+   *                     乱序调色板 +1.4%~+2.3%；ZSTD level 3（磁盘缓存口径）下全实心 +8.3%、
+   *                     稀疏矿脉 +1.6%~+11.0%、乱序调色板 +6.4%~+8.4%。仅洞穴与主世界地下略优（约 -0.3%~-3.6%），
+   *                     而耗时普遍增至约 4~6 倍。故默认关闭；{@code strictVerify} 亦仅在 {@code reorder=true} 时有意义。
    */
-  public record Palette(boolean reorder, boolean strictVerify) {
+  public record Palette(boolean enabled, boolean reorder, boolean strictVerify) {
   }
 
-  /** 实体射线剔除。 */
-  public record EntityCulling(boolean raycast, double forceVisibleDistance, int threads,
+  /**
+   * 实体射线剔除。
+   *
+   * @param enabled  模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
+   * @param raycast  行为开关：依据视线射线剔除被遮挡实体；仅在 {@code enabled=true} 时生效。
+   */
+  public record EntityCulling(boolean enabled, boolean raycast, double forceVisibleDistance, int threads,
       int updateIntervalTicks, int raySamples) {
   }
 
-  /** AFK 降级。 */
-  public record Afk(int seconds, double distance, boolean dropParticles, boolean dropBlockBreakAnimation) {
+  /** AFK 降级。{@code enabled} 为模块总开关，关闭时本模块完全不注册（零开销）。 */
+  public record Afk(boolean enabled, int seconds, double distance, boolean dropParticles,
+      boolean dropBlockBreakAnimation) {
   }
 
-  /** 高延迟降视距。 */
-  public record Latency(int thresholdMillis, int reduceViewDistance, int sustainSeconds,
+  /** 高延迟降视距。{@code enabled} 为模块总开关，关闭时本模块完全不注册（零开销）。 */
+  public record Latency(boolean enabled, int thresholdMillis, int reduceViewDistance, int sustainSeconds,
       int minViewDistance, int checkIntervalSeconds) {
   }
 
@@ -81,9 +97,12 @@ public final class BandwidthConfig {
     return new BandwidthConfig(
         root.getBoolean("enabled", true),
         new EntityPackets(
+            // 各模块总开关均默认 true：新增开关不得改变既有行为（原样保持「全部启用」）
+            root.getBoolean("entity-packets.enabled", true),
             root.getBoolean("entity-packets.skip-zero-movement", true),
             Set.copyOf(root.getStringList("entity-packets.whitelist"))),
         new BlockChanges(
+            root.getBoolean("block-changes.enabled", true),
             root.getBoolean("block-changes.merge", true),
             Math.max(0, root.getInt("block-changes.merge-radius", 2)),
             Math.max(1, root.getInt("block-changes.max-per-packet", 4096)),
@@ -95,21 +114,25 @@ public final class BandwidthConfig {
             Math.max(1, root.getInt("block-changes.max-pending-entries", 256)),
             Math.max(0, root.getInt("block-changes.immediate-radius", 8))),
         new Palette(
+            root.getBoolean("palette.enabled", true),
             // 默认 false：实测开启重排会使压缩字节变大且耗时增加（见 Palette 的说明）
             root.getBoolean("palette.reorder", false),
             root.getBoolean("palette.strict-verify", false)),
         new EntityCulling(
+            root.getBoolean("entity-culling.enabled", true),
             root.getBoolean("entity-culling.raycast", true),
             Math.max(0.0D, root.getDouble("entity-culling.force-visible-distance", 32.0D)),
             Math.max(0, root.getInt("entity-culling.threads", 0)),
             Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),
             Math.max(2, root.getInt("entity-culling.ray-samples", 24))),
         new Afk(
+            root.getBoolean("afk.enabled", true),
             Math.max(1, root.getInt("afk.seconds", 300)),
             Math.max(0.0D, root.getDouble("afk.distance", 16.0D)),
             root.getBoolean("afk.drop-particles", true),
             root.getBoolean("afk.drop-block-break-animation", true)),
         new Latency(
+            root.getBoolean("latency.enabled", true),
             Math.max(1, root.getInt("latency.threshold-millis", 400)),
             Math.max(1, root.getInt("latency.reduce-view-distance", 2)),
             Math.max(0, root.getInt("latency.sustain-seconds", 30)),

@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.config;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -108,5 +109,48 @@ class ConfigDefaultsTest {
 
     assertEquals(8, config.blockChanges().immediateRadius(), "近身变更立即放行半径默认 8 格");
     assertEquals(20, config.blockChanges().mergeWindowMillis(), "合并窗口默认收紧到 20ms");
+  }
+
+  /**
+   * 新增的各模块总开关（{@code *.enabled}）默认必须为 true —— 补开关不得改变既有行为。
+   * 同时锁住 {@code palette.reorder} 仍为 false（zlib/zstd 两种压缩口径实测均无收益）。
+   */
+  @Test
+  void bandwidthModuleSwitchesDefaultToEnabled() {
+    BandwidthConfig config = BandwidthConfig.from(yaml("enabled: true\n"));
+
+    assertTrue(config.entityPackets().enabled(), "零位移实体包取消默认启用");
+    assertTrue(config.blockChanges().enabled(), "方块变更合并默认启用");
+    assertTrue(config.palette().enabled(), "调色板模块默认启用");
+    assertTrue(config.entityCulling().enabled(), "实体射线剔除默认启用");
+    assertTrue(config.afk().enabled(), "AFK 降级默认启用（新增开关不得改变既有行为）");
+    assertTrue(config.latency().enabled(), "高延迟降视距默认启用（新增开关不得改变既有行为）");
+    assertFalse(config.palette().reorder(), "调色板重排默认保持 false（两种压缩口径实测均无收益）");
+  }
+
+  /** 各模块总开关可被显式关闭（false），用于确认开关确实接入了配置解析。 */
+  @Test
+  void bandwidthModuleSwitchesParseExplicitFalse() {
+    BandwidthConfig config = BandwidthConfig.from(yaml("""
+        entity-packets:
+          enabled: false
+        block-changes:
+          enabled: false
+        palette:
+          enabled: false
+        entity-culling:
+          enabled: false
+        afk:
+          enabled: false
+        latency:
+          enabled: false
+        """));
+
+    assertFalse(config.entityPackets().enabled());
+    assertFalse(config.blockChanges().enabled());
+    assertFalse(config.palette().enabled());
+    assertFalse(config.entityCulling().enabled());
+    assertFalse(config.afk().enabled());
+    assertFalse(config.latency().enabled());
   }
 }

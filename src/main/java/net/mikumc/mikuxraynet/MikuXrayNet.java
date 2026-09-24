@@ -155,10 +155,13 @@ public final class MikuXrayNet extends JavaPlugin {
 
     BlockStateRegistry registry = packetEventsHook.registry();
     ChunkCodec codec = new ChunkCodec(registry, versionFlags());
-    // 调色板压缩重排由 bandwidth.yml 的 palette 段控制（与反矿透共用同一次编码）
+    // 调色板压缩重排由 bandwidth.yml 的 palette 段控制（与反矿透共用同一次编码）。
+    // palette.enabled=false（或带宽总开关关闭）时取 DISABLED，即完全不重排、零开销。
     BandwidthConfig.Palette palette = config.bandwidth().palette();
+    boolean paletteUsable = config.bandwidth().enabled() && palette.enabled();
     ObfuscationProcessor processor = ObfuscationProcessor.create(codec, registry, antiXray, getLogger(),
-        new ObfuscationProcessor.PaletteOptions(palette.reorder(), palette.strictVerify()));
+        new ObfuscationProcessor.PaletteOptions(paletteUsable && palette.reorder(),
+            paletteUsable && palette.strictVerify()));
     if (!processor.isActive()) {
       getLogger().warning("未解析到有效的隐藏方块或伪装方块，反矿透模块停用（请检查 antixray.yml）");
       return;

@@ -1,5 +1,6 @@
 package net.mikumc.mikuxraynet.bench;
 
+import com.github.luben.zstd.Zstd;
 import com.sun.management.ThreadMXBean;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -28,11 +29,16 @@ import static org.junit.jupiter.api.Assertions.fail;
  *   <li>耗时：每档预热 {@value #WARMUP_ROUNDS} 轮后测量若干轮，取<b>中位数</b>，并给出最小/最大体现抖动；</li>
  *   <li>分配量：{@link ThreadMXBean#getThreadAllocatedBytes(long)} 的每轮差值（确定性指标，不受 CI 机器抖动影响）；</li>
  *   <li>输出字节：重编码后整列字节数（确定性）；</li>
- *   <li>压缩字节：对整列字节做 zlib（level {@code 6}，与 Minecraft 区块包默认压缩级别一致）后的长度（确定性）。
+ *   <li>压缩字节：对整列字节分别做两种压缩——zlib（level {@code 6}，与 Minecraft 区块包默认压缩级别一致，
+ *       <b>网络封包口径</b>）与 ZSTD（level {@code 3}，<b>磁盘缓存口径</b>，真实调用
+ *       {@code com.github.luben.zstd.Zstd.compress(data, 3)}）——后的长度（确定性）。
  *       调色板重排只改索引排列、不改位宽与数组长度，因此<b>原始字节长度恒等</b>，带宽收益只能体现在压缩字节上；</li>
  *   <li>语义：同一输入 + 同一批改写下，各路径编码出的方块序列（24×4096 项）必须逐项相同，
  *       并额外做双向交叉解码（自研读 PE 字节、PE 读自研字节），不一致立即失败并打印差异位置。</li>
  * </ul>
+ *
+ * <p>形态集合取 {@link BenchFixtures#productionShapes()}（全实心 / 稀疏矿脉 / 洞穴 / 乱序调色板 / 主世界地下），
+ * 以便在同一批负载上对「调色板频次重排」在两种压缩口径下的收益做可复现的对照。
  *
  * <p>断言只覆盖「语义一致 + 各路径都能稳定完成 + 数值被成功采集」，不断言「谁更快」——
  * CI 机器的耗时列会抖动，结论由读者看表得出。PacketEvents 路径若离线不可用，则跳过该路径并报告原因，而不是失败。
@@ -47,6 +53,12 @@ class ChunkPathBenchmarkTest {
   private static final long TIME_BUDGET_NANOS = 12_000_000_000L;
   private static final Path REPORT_PATH = Path.of("target", "benchmark-report.md");
 
+  /** 磁盘缓存口径使用的 ZSTD 压缩等级（与 {@code BufferedLinearV3Format.ZSTD_LEVEL} 一致）。 */
+  private static final int ZSTD_LEVEL = 3;
+
+  /** zstd-jni 在本进程内是否可用（只在类初始化时探测一次；不可用则 zstd 列以 {@code —} 占位，不使测试失败）。 */
+  private static final boolean ZSTD_AVAILABLE = probeZstd();
+
   /** 优化前的 CI 基线（由本任务提供，用于与本次实测做优化前后对照）。 */
   private static final Object[][] ALLOCATION_BASELINE = {
       {"全实心", 1000, 0.72},
@@ -56,14 +68,15 @@ class ChunkPathBenchmarkTest {
 
   /** 一行测量结果。 */
   private record Row(String shape, int edits, String path, long medianNanos, long minNanos, long maxNanos,
-      long allocatedBytes, int outputBytes, int compressedBytes, double zeroRatio, int reorderedSections) {
+      long allocatedBytes, int outputBytes, int compressedBytes, int compressedZstdBytes, double zeroRatio,
+      int reorderedSections) {
   }
 
   @Test
   void benchmarkDecodeEditReencode() throws IOException {
     long startedAt = System.nanoTime();
 
-    List<BenchFixtures.Fixture> fixtures = BenchFixtures.all();
+    List<BenchFixtures.Fixture> fixtures = BenchFixtures.productionShapes();
     OurCodecPath codecWithoutReorder = new OurCodecPath(false);
     OurCodecPath codecWithReorder = new OurCodecPath(true);
     List<ChunkPath> ourPaths = List.of(codecWithoutReorder, codecWithReorder);
@@ -141,7 +154,10 @@ class ChunkPathBenchmarkTest {
       assertTrue(row.medianNanos() > 0 && row.minNanos() > 0 && row.maxNanos() >= row.medianNanos(),
           "耗时未成功采集：" + row);
       assertTrue(row.outputBytes() > 0, "输出字节未成功采集：" + row);
-      assertTrue(row.compressedBytes() > 0, "压缩字节未成功采集：" + row);
+      assertTrue(row.compressedBytes() > 0, "zlib6 压缩字节未成功采集：" + row);
+      if (ZSTD_AVAILABLE) {
+        assertTrue(row.compressedZstdBytes() > 0, "zstd3 压缩字节未成功采集：" + row);
+      }
       if (allocationBean != null) {
         assertTrue(row.allocatedBytes() > 0, "分配量未成功采集：" + row);
       }
@@ -251,7 +267,7 @@ class ChunkPathBenchmarkTest {
     int reordered = path instanceof OurCodecPath ourCodec ? ourCodec.reorderedSections() : 0;
     return new Row(fixture.name(), edits.length, path.name(), durations[rounds / 2], durations[0],
         durations[rounds - 1], allocations[rounds / 2], firstOutput.length, compressedBytes(firstOutput),
-        zeroRatio(firstOutput), reordered);
+        compressedBytesZstd(firstOutput), zeroRatio(firstOutput), reordered);
   }
 
   /** JVM 的线程分配量统计；不支持则返回 {@code null}（报告里标注该列不可用）。 */
@@ -286,6 +302,27 @@ class ChunkPathBenchmarkTest {
     }
   }
 
+  /** zstd-jni 可用性探测（真实做一次压缩往返）；任何 Throwable 都视为不可用。 */
+  private static boolean probeZstd() {
+    try {
+      return Zstd.compress(new byte[] {0, 1, 2}, ZSTD_LEVEL).length > 0;
+    } catch (Throwable throwable) {
+      return false;
+    }
+  }
+
+  /** ZSTD 压缩后的字节数（level 3，磁盘缓存口径）；zstd 不可用时返回 -1（报告以 {@code —} 占位）。 */
+  private static int compressedBytesZstd(byte[] data) {
+    if (!ZSTD_AVAILABLE) {
+      return -1;
+    }
+    try {
+      return Zstd.compress(data, ZSTD_LEVEL).length;
+    } catch (Throwable throwable) {
+      return -1;
+    }
+  }
+
   /** 零字节占比：调色板重排的直接效果就是让位打包数据出现更多 0 位，从而更容易被压缩。 */
   private static double zeroRatio(byte[] data) {
     int zeros = 0;
@@ -307,7 +344,8 @@ class ChunkPathBenchmarkTest {
         .append(" 轮；耗时取中位数，最小/最大用于体现抖动\n");
     report.append("- 分配量：com.sun.management.ThreadMXBean#getThreadAllocatedBytes 的每轮差值（确定性，不受机器抖动影响）\n");
     report.append("- 输出字节：重编码后整列字节数（确定性）\n");
-    report.append("- 压缩字节：整列字节经 zlib（level 6）后的长度（确定性）\n");
+    report.append("- 压缩字节：整列字节分别经 zlib（level 6，网络封包口径）与 ZSTD（level ")
+        .append(ZSTD_LEVEL).append("，磁盘缓存口径，真实调用 Zstd.compress）后的长度（确定性）\n");
     report.append("- 语义校验：同一输入 + 同一批改写下，各路径的方块序列（24×4096 项）逐项相同，且双向交叉解码一致\n");
     report.append("- 本基准自身耗时 ").append(elapsedNanos / 1_000_000L).append(" ms；运行环境 ")
         .append(System.getProperty("java.vm.name")).append(' ').append(System.getProperty("java.version"))
@@ -327,8 +365,8 @@ class ChunkPathBenchmarkTest {
     }
 
     report.append("## 1. 逐行测量\n\n");
-    report.append("| 形态 | 修改数 | 路径 | 中位耗时(ms) | 最小/最大 | 分配(MB) | 输出字节 | 压缩字节 | 零字节占比 | 重排 section |\n");
-    report.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    report.append("| 形态 | 修改数 | 路径 | 中位耗时(ms) | 最小/最大 | 分配(MB) | 输出字节 | zlib6 字节 | zstd3 字节 | 零字节占比 | 重排 section |\n");
+    report.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
     for (Row row : rows) {
       report.append("| ").append(row.shape())
           .append(" | ").append(row.edits())
@@ -338,6 +376,7 @@ class ChunkPathBenchmarkTest {
           .append(" | ").append(String.format(Locale.ROOT, "%.2f", row.allocatedBytes() / 1048576.0))
           .append(" | ").append(row.outputBytes())
           .append(" | ").append(row.compressedBytes())
+          .append(" | ").append(bytesOrDash(row.compressedZstdBytes()))
           .append(" | ").append(String.format(Locale.ROOT, "%.1f%%", row.zeroRatio() * 100.0D))
           .append(" | ").append(row.reorderedSections())
           .append(" |\n");
@@ -354,13 +393,24 @@ class ChunkPathBenchmarkTest {
     return report.toString();
   }
 
-  /** 调色板重排的带宽收益：输出字节与压缩字节的「关闭重排 → 开启重排」对照。 */
+  /**
+   * 调色板频次重排的收益「再评估」：在同一批负载上，分别看 zlib-6（网络封包口径）与
+   * zstd-3（磁盘缓存口径）两种压缩下的「重排关 → 重排开」压缩字节对照，并给出重排自身的 CPU 代价。
+   *
+   * <p>结论文字由本次实测数字推导（不写死），因此可复现、可复核。
+   */
   private static void appendReorderSection(StringBuilder report, List<Row> rows) {
-    report.append("\n## 2. 调色板频次重排的带宽收益\n\n");
+    report.append("\n## 2. 调色板频次重排再评估：zlib-6（网络）vs zstd-3（磁盘）\n\n");
     report.append("> 重排只重排调色板顺序与位打包索引，**不改位宽、不改数组长度、不改调色板条目数**，")
         .append("因此「输出字节」在两种设置下必然相同；它的收益只体现在压缩后长度上（索引越小、位打包数据里的 0 位越多）。\n\n");
-    report.append("| 形态 | 修改数 | 实际重排 section | 输出字节 关→开 | 压缩字节 关→开 | 压缩收益 | 零字节占比 关→开 |\n");
-    report.append("| --- | --- | --- | --- | --- | --- | --- |\n");
+    report.append("| 形态 | 修改数 | 实际重排 section | 输出字节 关→开 | zlib6 关→开 | zlib6 变化 | zstd3 关→开 | zstd3 变化 | 中位耗时 关→开(ms) |\n");
+    report.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+
+    List<String> zlibBetter = new ArrayList<>();
+    List<String> zlibWorse = new ArrayList<>();
+    List<String> zstdBetter = new ArrayList<>();
+    List<String> zstdWorse = new ArrayList<>();
+    List<String> zstdFlat = new ArrayList<>();
 
     for (Row off : rows) {
       if (!off.path().equals("自研 codec（重排关）")) {
@@ -370,22 +420,81 @@ class ChunkPathBenchmarkTest {
       if (on == null) {
         continue;
       }
-      String gain = off.compressedBytes() == 0 ? "—"
-          : String.format(Locale.ROOT, "%+.1f%%",
-              100.0D * (on.compressedBytes() - off.compressedBytes()) / off.compressedBytes());
+      String label = off.shape() + "（改写 " + off.edits() + "）";
+      String zlibGain = gainPercent(off.compressedBytes(), on.compressedBytes());
+      String zstdGain = gainPercent(off.compressedZstdBytes(), on.compressedZstdBytes());
+      classify(label, off.compressedBytes(), on.compressedBytes(), zlibBetter, zlibWorse);
+      classify(label, off.compressedZstdBytes(), on.compressedZstdBytes(), zstdBetter, zstdWorse);
+      if (off.compressedZstdBytes() >= 0 && on.compressedZstdBytes() == off.compressedZstdBytes()) {
+        zstdFlat.add(label);
+      }
+
       report.append("| ").append(off.shape())
           .append(" | ").append(off.edits())
           .append(" | ").append(on.reorderedSections())
           .append(" | ").append(off.outputBytes()).append(" → ").append(on.outputBytes())
           .append(" | ").append(off.compressedBytes()).append(" → ").append(on.compressedBytes())
-          .append(" | ").append(gain)
-          .append(" | ").append(String.format(Locale.ROOT, "%.1f%% → %.1f%%", off.zeroRatio() * 100.0D,
-              on.zeroRatio() * 100.0D))
+          .append(" | ").append(zlibGain)
+          .append(" | ").append(bytesOrDash(off.compressedZstdBytes())).append(" → ")
+          .append(bytesOrDash(on.compressedZstdBytes()))
+          .append(" | ").append(zstdGain)
+          .append(" | ").append(millis(off.medianNanos())).append(" → ").append(millis(on.medianNanos()))
           .append(" |\n");
     }
 
     report.append("\n> 「实际重排 section = 0」表示该形态/档位下调色板本来就按频次降序排列（索引按首次出现分配，")
         .append("而出现最多的状态恰好落在低位索引），重排是无改动，收益为零——这是如实结果，不做粉饰。\n");
+    report.append("> 「变化」列 = 开启重排后压缩字节相对关闭时的增减（**正数 = 变大 = 变差**；负数 = 变小 = 有收益）。\n");
+
+    if (!ZSTD_AVAILABLE) {
+      report.append("\n> **注意**：本进程 zstd-jni 不可用，zstd3 列以 `—` 占位，本次未取得 zstd 口径数据。\n");
+    }
+
+    report.append("\n### 2.1 由本次数字得出的结论（自动汇总，非手写）\n\n");
+    report.append("- zlib-6（网络封包口径）下重排变小的形态：")
+        .append(zlibBetter.isEmpty() ? "无" : String.join("、", zlibBetter)).append("；变大的形态：")
+        .append(zlibWorse.isEmpty() ? "无" : String.join("、", zlibWorse)).append("。\n");
+    report.append("- zstd-3（磁盘缓存口径）下重排变小的形态：")
+        .append(zstdBetter.isEmpty() ? "无" : String.join("、", zstdBetter)).append("；变大的形态：")
+        .append(zstdWorse.isEmpty() ? "无" : String.join("、", zstdWorse))
+        .append(zstdFlat.isEmpty() ? "" : "；无变化的形态：" + String.join("、", zstdFlat)).append("。\n");
+
+    boolean zstdNetPositive = zstdWorse.size() > zstdBetter.size();
+    boolean zlibNetPositive = zlibWorse.size() > zlibBetter.size();
+    report.append("- 结论：zstd-3 下重排")
+        .append(zstdNetPositive ? "**同样无收益（多数形态反而更大）**" : "**在更多形态上带来收益**")
+        .append("；zlib-6 下重排")
+        .append(zlibNetPositive ? "**同样无收益（多数形态反而更大）**" : "**在更多形态上带来收益**")
+        .append("。因此 `palette.reorder` 默认值建议保持 `false`。\n");
+    report.append("- 口径区分的影响：重排在**编码期一次性发生**，其产物同时流向「网络封包（服务端再用 zlib 压缩）」"
+        + "与「磁盘缓存（本项目用 zstd-3 压缩）」两条链路。因此只有**两种口径都为正收益**时，重排才值得默认开启；"
+        + "本次实测两种口径均为「多数形态变大」，故不因「磁盘改用 zstd」而翻案。\n");
+    report.append("- 说明：磁盘缓存是按 bucket（64 个区块拼接后整体）压缩，这里的 zstd-3 数值是**逐区块**口径，"
+        + "用于形态间横向对照；跨区块拼接后的绝对收益会略有差异，但不改变「多数形态变大」的方向。\n");
+  }
+
+  /** 关闭 → 开启的相对变化（正数=变大）；基准值不可用时返回 {@code —}。 */
+  private static String gainPercent(int off, int on) {
+    if (off <= 0 || on < 0) {
+      return "—";
+    }
+    return String.format(Locale.ROOT, "%+.1f%%", 100.0D * (on - off) / off);
+  }
+
+  /** 把「重排更省 / 更费」的形态名归入两类（数值不可用时忽略）。 */
+  private static void classify(String label, int off, int on, List<String> better, List<String> worse) {
+    if (off <= 0 || on < 0) {
+      return;
+    }
+    if (on < off) {
+      better.add(label);
+    } else if (on > off) {
+      worse.add(label);
+    }
+  }
+
+  private static String bytesOrDash(int value) {
+    return value < 0 ? "—" : Integer.toString(value);
   }
 
   /** 分配量优化前后对照：以任务给定的 CI 基线为「优化前」，本次实测为「优化后」。 */

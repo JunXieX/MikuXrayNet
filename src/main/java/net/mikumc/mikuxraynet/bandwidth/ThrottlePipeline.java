@@ -14,17 +14,45 @@ import org.bukkit.plugin.Plugin;
  * <p>异常安全：每个子模块独立注册，任一环节失败只禁用该子模块并打印中文原因，不影响其它模块，
  * 更不影响反矿透。停用时按注册的逆序注销，并保证「偿还所有被延迟的包、恢复被隐藏的实体与视距」。
  *
- * <p>子模块与默认开关（均可在 bandwidth.yml 中配置）：
+ * <p>子模块与默认开关（均可在 bandwidth.yml 中配置；每个模块都有独立总开关 {@code *.enabled}，默认全部开启）：
  * <ul>
- *   <li>{@link EntityPacketFilter} 零位移实体包取消（默认开启）；</li>
- *   <li>{@link BlockChangeMerger} 方块变更合并（默认开启，时间窗与缓冲上限保守）；</li>
- *   <li>{@link EntityCuller} 实体射线剔除（默认开启，强制可见距离 32 格）；</li>
- *   <li>{@link AfkTracker} AFK 降级 + 低价值包按距离丢弃（默认开启，丢包类型保守）；</li>
- *   <li>{@link LatencyMonitor} 高延迟降视距（默认开启，需持续超阈值）。</li>
+ *   <li>{@link EntityPacketFilter} 零位移实体包取消（{@code entity-packets.enabled}）；</li>
+ *   <li>{@link BlockChangeMerger} 方块变更合并（{@code block-changes.enabled}，时间窗与缓冲上限保守）；</li>
+ *   <li>{@link EntityCuller} 实体射线剔除（{@code entity-culling.enabled}，强制可见距离 32 格）；</li>
+ *   <li>{@link AfkTracker} AFK 降级 + 低价值包按距离丢弃（{@code afk.enabled}，丢包类型保守）；</li>
+ *   <li>{@link LatencyMonitor} 高延迟降视距（{@code latency.enabled}，需持续超阈值）。</li>
  * </ul>
- * 不具备 ProtocolLib 时，零位移取消、变更合并与 AFK 丢包自动停用，其余模块仍可用。
+ * 任一模块的 {@code enabled=false} 都意味着它<b>完全不注册</b>（不建监听器、不起任务、不产生任何开销），
+ * 而不是「注册了但不生效」。不具备 ProtocolLib 时，零位移取消、变更合并与 AFK 丢包自动停用，其余模块仍可用。
  */
 public final class ThrottlePipeline {
+
+  /**
+   * 各带宽子模块的注册决策（纯函数，仅由配置推导，便于离线单测「关闭即不注册」）。
+   *
+   * @param entityPackets 零位移实体包取消是否会注册
+   * @param blockChanges  方块变更合并是否会注册
+   * @param entityCulling 实体射线剔除是否会注册
+   * @param afk           AFK 降级是否会注册
+   * @param latency       高延迟降视距是否会注册
+   */
+  public record ModulePlan(boolean entityPackets, boolean blockChanges, boolean entityCulling,
+      boolean afk, boolean latency) {
+  }
+
+  /**
+   * 依配置推导各子模块的注册决策：总开关或模块 {@code enabled} 关闭（以及其行为开关关闭）时，
+   * 对应模块<b>不会注册</b>，因此不产生任何开销。依赖可用性（ProtocolLib）不在此判定，由 {@link #start()} 处理。
+   */
+  public static ModulePlan plan(BandwidthConfig config) {
+    boolean master = config.enabled();
+    return new ModulePlan(
+        master && config.entityPackets().enabled() && config.entityPackets().skipZeroMovement(),
+        master && config.blockChanges().enabled() && config.blockChanges().merge(),
+        master && config.entityCulling().enabled() && config.entityCulling().raycast(),
+        master && config.afk().enabled(),
+        master && config.latency().enabled());
+  }
 
   private final Plugin plugin;
   private final BandwidthConfig config;
@@ -69,15 +97,21 @@ public final class ThrottlePipeline {
     final ProtocolManager manager = protocolManager;
     final AsynchronousManager asynchronous = asynchronousManager;
 
-    if (config.entityPackets().skipZeroMovement()) {
+    // 依配置推导注册计划：未启用的模块在此完全不注册（不建监听器、不起任务、零开销）
+    ModulePlan plan = plan(config);
+
+    if (plan.entityPackets()) {
       entityPacketFilter = register(() -> {
         EntityPacketFilter module = new EntityPacketFilter(plugin, manager,
             config.entityPackets(), stats);
         module.start();
         return module;
       });
+    } else {
+      logDisabled("零位移实体包取消", config.entityPackets().enabled()
+          ? "entity-packets.skip-zero-movement" : "entity-packets.enabled");
     }
-    if (config.blockChanges().merge()) {
+    if (plan.blockChanges()) {
       if (manager == null || asynchronous == null) {
         plugin.getLogger().warning("方块变更合并需要 ProtocolLib，已停用");
       } else {
@@ -88,24 +122,38 @@ public final class ThrottlePipeline {
           return module;
         });
       }
+    } else {
+      logDisabled("方块变更合并", config.blockChanges().enabled()
+          ? "block-changes.merge" : "block-changes.enabled");
     }
-    if (config.entityCulling().raycast()) {
+    if (plan.entityCulling()) {
       entityCuller = register(() -> {
         EntityCuller module = new EntityCuller(plugin, config.entityCulling(), stats);
         module.start();
         return module;
       });
+    } else {
+      logDisabled("实体射线剔除", config.entityCulling().enabled()
+          ? "entity-culling.raycast" : "entity-culling.enabled");
     }
-    afkTracker = register(() -> {
-      AfkTracker module = new AfkTracker(plugin, manager, config.afk(), stats);
-      module.start();
-      return module;
-    });
-    latencyMonitor = register(() -> {
-      LatencyMonitor module = new LatencyMonitor(plugin, config.latency(), stats);
-      module.start();
-      return module;
-    });
+    if (plan.afk()) {
+      afkTracker = register(() -> {
+        AfkTracker module = new AfkTracker(plugin, manager, config.afk(), stats);
+        module.start();
+        return module;
+      });
+    } else {
+      logDisabled("AFK 降级", "afk.enabled");
+    }
+    if (plan.latency()) {
+      latencyMonitor = register(() -> {
+        LatencyMonitor module = new LatencyMonitor(plugin, config.latency(), stats);
+        module.start();
+        return module;
+      });
+    } else {
+      logDisabled("高延迟降视距", "latency.enabled");
+    }
 
     started = true;
   }
@@ -151,6 +199,11 @@ public final class ThrottlePipeline {
       plugin.getLogger().log(Level.WARNING, "带宽子模块注册失败，已单独停用该模块", throwable);
       return null;
     }
+  }
+
+  /** 模块被配置关闭时的一次性中文提示（不会打印任何「已启用」行，因为该模块根本没注册）。 */
+  private void logDisabled(String name, String reasonKey) {
+    plugin.getLogger().info("带宽模块已关闭（配置）：" + name + "（bandwidth.yml: " + reasonKey + "=false）");
   }
 
   private <T> void close(String name, T module, ModuleStopper<T> stopper) {
