@@ -22,12 +22,26 @@ public class SimpleVarBitBuffer implements VarBitBuffer {
   private final long[] buffer;
 
   public SimpleVarBitBuffer(int bitsPerEntry, int size) {
+    this(bitsPerEntry, size, new long[calculateArraySize(bitsPerEntry, size)]);
+  }
+
+  /**
+   * 用外部提供的存储构造（供 {@link ChunkScratch} 复用 long 数组）。
+   *
+   * @param buffer 长度必须等于 {@link #calculateArraySize(int, int)}：长度会参与写出与读取校验
+   */
+  SimpleVarBitBuffer(int bitsPerEntry, int size, long[] buffer) {
     this.bitsPerEntry = bitsPerEntry;
     this.entriesPerLong = 64 / bitsPerEntry;
     this.adjustmentMask = (1L << bitsPerEntry) - 1L;
 
     this.size = size;
-    this.buffer = new long[(int) Math.ceil((float) size / this.entriesPerLong)];
+    this.buffer = buffer;
+
+    if (buffer.length != calculateArraySize(bitsPerEntry, size)) {
+      throw new IllegalArgumentException(
+          "buffer.length != VarBitBuffer::size " + buffer.length + " " + calculateArraySize(bitsPerEntry, size));
+    }
   }
 
   public int get(int index) {

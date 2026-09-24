@@ -25,6 +25,7 @@ public class ChunkSection {
 
   private final RegistryAccessor registryAccessor;
   private final ChunkVersionFlags versionFlags;
+  private final ChunkScratch scratch;
 
   private int blockCount;
   private int fluidCount;
@@ -35,15 +36,21 @@ public class ChunkSection {
   private Palette palette;
   private VarBitBuffer data;
 
-  public ChunkSection(ChunkCodec codec) {
+  ChunkSection(ChunkCodec codec, ChunkScratch scratch) {
     this.registryAccessor = codec.registryAccessor();
     this.versionFlags = codec.versionFlags();
+    this.scratch = scratch;
 
     this.setBitsPerBlock(0, true);
   }
 
   public RegistryAccessor registryAccessor() {
     return registryAccessor;
+  }
+
+  /** 所属区块的按线程复用 scratch，供调色板与位打包缓冲区借用数组。 */
+  ChunkScratch scratch() {
+    return scratch;
   }
 
   private void setBitsPerBlock(int bitsPerBlock, boolean grow) {
@@ -66,7 +73,8 @@ public class ChunkSection {
       if (this.bitsPerBlock == 0) {
         this.data = new ZeroVarBitBuffer(4096);
       } else {
-        this.data = new SimpleVarBitBuffer(this.bitsPerBlock, 4096);
+        this.data = new SimpleVarBitBuffer(this.bitsPerBlock, 4096,
+            scratch.longs(SimpleVarBitBuffer.calculateArraySize(this.bitsPerBlock, 4096)));
       }
     }
   }
@@ -150,7 +158,12 @@ public class ChunkSection {
     }
   }
 
-  public int[] read(ByteBuf buffer) {
+  /**
+   * 从缓冲区读入该 section 的方块计数、位宽、调色板与位打包数据。
+   *
+   * <p>不返回任何扁平化数组：调用方只关心 section 内部状态，额外构造 4096 项 int 数组纯属浪费。
+   */
+  public void read(ByteBuf buffer) {
     this.blockCount = buffer.readShort();
 
     if (this.versionFlags.hasFluidCount()) {
@@ -173,12 +186,6 @@ public class ChunkSection {
     for (int i = 0; i < data.length; i++) {
       data[i] = buffer.readLong();
     }
-
-    int[] directData = new int[4096];
-    for (int i = 0; i < directData.length; i++) {
-      directData[i] = this.getBlockState(i);
-    }
-    return directData;
   }
 
   /** 该 section 是否被外部通过 {@link #setBlockState}（或调色板重排）改写。 */

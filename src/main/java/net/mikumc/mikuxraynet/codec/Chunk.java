@@ -14,6 +14,10 @@ import io.netty.buffer.Unpooled;
  *
  * <p>用法：{@link #getSection(int)} 取得 section 后改写方块状态，最后调用 {@link #finalizeOutput()}
  * 得到重编码后的完整字节数组（未改动部分原样搬运）。用毕必须 {@link #close()}。
+ *
+ * <p>分配：调色板反查表、位打包 long 数组与输出缓冲区都由按线程复用的 {@link ChunkScratch} 提供，
+ * {@link #close()} 时归还给本线程，供下一个区块复用，避免每个区块都重建这几百 KB 的数组。
+ * 因此同一输入不因复用而产生任何字节差异：所有借出的数组在借出方手里都会被完整初始化。
  */
 public class Chunk implements AutoCloseable {
 
@@ -26,22 +30,36 @@ public class Chunk implements AutoCloseable {
   private final ChunkSectionHolder[] sections;
 
   private final ByteBuf inputBuffer;
-  private final ByteBuf outputBuffer;
+  private ByteBuf outputBuffer;
+
+  /** 按线程复用的数组来源；{@link #close()} 时归还，供同线程的下一个区块复用。 */
+  private final ChunkScratch scratch;
+
+  /** 原始缓冲区中位于所有 section 之后的尾部字节（1.18 之前是独立群系段），写出时原样搬运。 */
+  private final int trailingOffset;
+  private final int trailingLength;
+
+  private boolean closed;
 
   Chunk(ChunkCodec codec, byte[] data, boolean[] sectionsPresent) {
     this.codec = codec;
+    this.scratch = ChunkScratch.acquire();
 
     this.sections = new ChunkSectionHolder[sectionsPresent.length];
 
     this.inputBuffer = Unpooled.wrappedBuffer(data);
-    // 初始容量至少为 1：Unpooled.buffer(0) 返回只读的 EMPTY_BUFFER，无法承接升位后变大的调色板
-    this.outputBuffer = Unpooled.buffer(Math.max(1, data.length));
+    // 输出缓冲区复用 scratch 的字节数组：容量不足时在 finalizeOutput 里扩容重写
+    this.outputBuffer = Unpooled.wrappedBuffer(this.scratch.outputArray(Math.max(1, data.length)));
+    this.outputBuffer.clear();
 
     for (int sectionIndex = 0; sectionIndex < this.sections.length; sectionIndex++) {
       if (sectionsPresent[sectionIndex]) {
         this.sections[sectionIndex] = new ChunkSectionHolder();
       }
     }
+
+    this.trailingOffset = this.inputBuffer.readerIndex();
+    this.trailingLength = this.inputBuffer.readableBytes();
   }
 
   public int getSectionCount() {
@@ -66,23 +84,46 @@ public class Chunk implements AutoCloseable {
   }
 
   public byte[] finalizeOutput() {
+    for (int attempt = 0; ; attempt++) {
+      ByteBuf out = this.outputBuffer;
+      out.clear();
+      try {
+        writeAll(out);
+        // 若底层缓冲区在写出过程中自行扩容，把真实容量同步回 scratch，后续区块一次到位
+        this.scratch.keepOutputCapacity(out.capacity());
+        return Arrays.copyOfRange(out.array(), out.arrayOffset(), out.arrayOffset() + out.readableBytes());
+      } catch (IndexOutOfBoundsException overflow) {
+        // 复用的输出数组容量不足（升位后调色板变大等情况）：翻倍扩容后整体重写。
+        // 只会在输出超过该线程历史最大长度时发生，稳态下不再触发。
+        if (attempt >= 24) {
+          throw overflow;
+        }
+        this.outputBuffer = Unpooled.wrappedBuffer(this.scratch.growOutput(out.capacity() + 1));
+      }
+    }
+  }
+
+  private void writeAll(ByteBuf out) {
     for (ChunkSectionHolder chunkSection : this.sections) {
       if (chunkSection != null) {
-        chunkSection.write();
+        chunkSection.write(out);
       }
     }
 
-    this.outputBuffer.writeBytes(this.inputBuffer);
-
-    return Arrays.copyOfRange(
-        this.outputBuffer.array(), this.outputBuffer.arrayOffset(),
-        this.outputBuffer.arrayOffset() + this.outputBuffer.readableBytes());
+    // 用绝对下标搬运尾部字节：扩容重写时不会因为 readerIndex 已被推进而丢数据
+    out.writeBytes(this.inputBuffer, this.trailingOffset, this.trailingLength);
   }
 
   @Override
   public void close() {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+
     this.inputBuffer.release();
     this.outputBuffer.release();
+    this.scratch.recycle();
   }
 
   private void skipBiomePalettedContainer() {
@@ -122,11 +163,11 @@ public class Chunk implements AutoCloseable {
     private int sectionLength = -1;
 
     public ChunkSectionHolder() {
-      this.chunkSection = new ChunkSection(codec);
+      this.chunkSection = new ChunkSection(codec, scratch);
 
       int start = inputBuffer.readerIndex();
 
-      // read() 会把方块状态读到 section 内部，返回值（扁平化状态数组）此处不再需要
+      // read() 把方块状态读到 section 内部，本类不需要返回值（扁平化数组已从 read 中移除）
       this.chunkSection.read(inputBuffer);
       this.extraOffset = inputBuffer.readerIndex();
 
@@ -147,7 +188,7 @@ public class Chunk implements AutoCloseable {
       return new SectionRange(this.sectionOffset, this.sectionLength);
     }
 
-    public void write() {
+    public void write(ByteBuf outputBuffer) {
       // 选择性重编码：未改动的 section 直接原样搬运原始字节，省下一次完整的调色板/位打包重编码
       if (!this.chunkSection.isModified() && this.sectionOffset >= 0 && this.sectionLength > 0) {
         outputBuffer.writeBytes(inputBuffer, this.sectionOffset, this.sectionLength);

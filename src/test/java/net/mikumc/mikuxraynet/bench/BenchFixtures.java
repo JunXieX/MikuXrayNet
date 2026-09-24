@@ -9,13 +9,17 @@ import net.mikumc.mikuxraynet.codec.TestChunkBuilder;
 /**
  * 离线基准的合成数据：16×16×384 的完整列（24 个 16³ section，1.18+ 布局，Paper 26.2 的字节标志）。
  *
- * <p>三种形态覆盖真实区块的典型分布：
+ * <p>四种形态覆盖真实区块的典型分布：
  * <ol>
  *   <li>{@link #solid()}「全实心」：全部 section 都是单值调色板（bitsPerBlock=0）的石头；</li>
  *   <li>{@link #sparseOres()}「稀疏矿脉」：下部 8 个 section 是 4 位间接调色板（石头 + 深板岩 + 6 种矿），
  *       每 section 约 25 个矿方块（共约 200 个），其余 section 为单值石头；</li>
  *   <li>{@link #caves()}「洞穴」：每 section 用 4×4×4 粗粒确定性噪声挖出约 55% 空气，洞穴内壁暴露，
- *       调色板最多 9 项（空气 + 石头 + 深板岩 + 矿）。</li>
+ *       调色板最多 9 项（空气 + 石头 + 深板岩 + 矿）；</li>
+ *   <li>{@link #shuffledPalette()}「乱序调色板（合成）」：调色板按<b>频次升序</b>排列（出现最多的方块落在
+ *       最后一个索引），代表第三方插件/历史区块产生的「未按频次排列」的调色板。前三种形态的调色板按
+ *       「首次出现顺序」建立、且出现最多的状态恰好落在低位索引，重排对它们是无改动，因此必须补这一种形态
+ *       才能量化重排的收益。</li>
  * </ol>
  *
  * <p>字节全部由 {@link TestChunkBuilder}（与生产 codec 的单测共用同一份布局实现）写出，
@@ -97,7 +101,7 @@ public final class BenchFixtures {
   }
 
   public static List<Fixture> all() {
-    return List.of(solid(), sparseOres(), caves());
+    return List.of(solid(), sparseOres(), caves(), shuffledPalette());
   }
 
   /** ① 全实心：24 个单值石头 section。 */
@@ -188,6 +192,40 @@ public final class BenchFixtures {
       builder.indirectSection(PALETTE_BITS, blockCount, 0, Arrays.copyOf(palette, paletteSize), indices, 3, BIOME_LIST);
     }
     return new Fixture("洞穴", builder.build());
+  }
+
+  /**
+   * ④ 乱序调色板（合成）：每 section 都是 4 位间接调色板，但调色板按「频次升序」排列——
+   * 出现最多的方块落在最后一个索引（约 49%），最少见的落在索引 1。
+   *
+   * <p>用途：前三形态的调色板按首次出现顺序建立且最高频状态已在索引 0，重排对它们无改动；
+   * 这一形态专门用来量化「调色板本来乱序时重排能省多少压缩后带宽」。
+   */
+  public static Fixture shuffledPalette() {
+    int[] palette = new int[10];
+    palette[0] = AIR;
+    for (int i = 1; i < palette.length; i++) {
+      palette[i] = 10 + i;
+    }
+
+    TestChunkBuilder builder = new TestChunkBuilder(FLAGS);
+    for (int section = 0; section < SECTION_COUNT; section++) {
+      int[] indices = new int[SECTION_VOLUME];
+      int blockCount = 0;
+      for (int index = 0; index < SECTION_VOLUME; index++) {
+        // 频次与调色板索引相反：索引越大出现越多（最频繁的落在最后一个索引）
+        int roll = hash(section * SECTION_VOLUME + index) % 100;
+        int id = roll < 49 ? 9 : roll < 61 ? 0 : roll < 73 ? 8 : roll < 78 ? 7
+            : roll < 83 ? 6 : roll < 87 ? 5 : roll < 90 ? 4 : roll < 93 ? 3 : roll < 96 ? 2 : 1;
+        indices[index] = id;
+        if (palette[id] != AIR) {
+          blockCount++;
+        }
+      }
+
+      builder.indirectSection(PALETTE_BITS, blockCount, 0, palette, indices, 3, BIOME_LIST);
+    }
+    return new Fixture("乱序调色板（合成）", builder.build());
   }
 
   /**

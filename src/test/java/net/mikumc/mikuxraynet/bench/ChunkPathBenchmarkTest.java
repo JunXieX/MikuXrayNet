@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.bench;
 
 import com.sun.management.ThreadMXBean;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
@@ -10,6 +11,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.zip.Deflater;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -25,12 +27,14 @@ import static org.junit.jupiter.api.Assertions.fail;
  * <ul>
  *   <li>耗时：每档预热 {@value #WARMUP_ROUNDS} 轮后测量若干轮，取<b>中位数</b>，并给出最小/最大体现抖动；</li>
  *   <li>分配量：{@link ThreadMXBean#getThreadAllocatedBytes(long)} 的每轮差值（确定性指标，不受 CI 机器抖动影响）；</li>
- *   <li>输出字节：重编码后整列字节数（确定性，直接反映带宽）；</li>
- *   <li>语义：同一输入 + 同一批改写下，两条路径编码出的方块序列（24×4096 项）必须逐项相同，
+ *   <li>输出字节：重编码后整列字节数（确定性）；</li>
+ *   <li>压缩字节：对整列字节做 zlib（level {@code 6}，与 Minecraft 区块包默认压缩级别一致）后的长度（确定性）。
+ *       调色板重排只改索引排列、不改位宽与数组长度，因此<b>原始字节长度恒等</b>，带宽收益只能体现在压缩字节上；</li>
+ *   <li>语义：同一输入 + 同一批改写下，各路径编码出的方块序列（24×4096 项）必须逐项相同，
  *       并额外做双向交叉解码（自研读 PE 字节、PE 读自研字节），不一致立即失败并打印差异位置。</li>
  * </ul>
  *
- * <p>断言只覆盖「语义一致 + 两条路径都能稳定完成 + 数值被成功采集」，不断言「谁更快」——
+ * <p>断言只覆盖「语义一致 + 各路径都能稳定完成 + 数值被成功采集」，不断言「谁更快」——
  * CI 机器的耗时列会抖动，结论由读者看表得出。PacketEvents 路径若离线不可用，则跳过该路径并报告原因，而不是失败。
  */
 class ChunkPathBenchmarkTest {
@@ -43,9 +47,16 @@ class ChunkPathBenchmarkTest {
   private static final long TIME_BUDGET_NANOS = 12_000_000_000L;
   private static final Path REPORT_PATH = Path.of("target", "benchmark-report.md");
 
+  /** 优化前的 CI 基线（由本任务提供，用于与本次实测做优化前后对照）。 */
+  private static final Object[][] ALLOCATION_BASELINE = {
+      {"全实心", 1000, 0.72},
+      {"稀疏矿脉", 1000, 0.71},
+      {"洞穴", 1000, 1.34},
+  };
+
   /** 一行测量结果。 */
   private record Row(String shape, int edits, String path, long medianNanos, long minNanos, long maxNanos,
-      long allocatedBytes, int outputBytes) {
+      long allocatedBytes, int outputBytes, int compressedBytes, double zeroRatio, int reorderedSections) {
   }
 
   @Test
@@ -53,26 +64,35 @@ class ChunkPathBenchmarkTest {
     long startedAt = System.nanoTime();
 
     List<BenchFixtures.Fixture> fixtures = BenchFixtures.all();
-    OurCodecPath ourPath = new OurCodecPath();
+    OurCodecPath codecWithoutReorder = new OurCodecPath(false);
+    OurCodecPath codecWithReorder = new OurCodecPath(true);
+    List<ChunkPath> ourPaths = List.of(codecWithoutReorder, codecWithReorder);
+
     String peUnavailableReason = probePePath(fixtures.getFirst());
     ChunkPath pePath = peUnavailableReason == null ? new PeModelPath() : null;
 
     // 1) 语义校验：同一输入 + 同一批改写，期望序列由「原始列的方块序列 + 改写」推出
     for (BenchFixtures.Fixture fixture : fixtures) {
-      int[] baseStates = ourPath.readStates(fixture.bytes());
+      int[] baseStates = codecWithoutReorder.readStates(fixture.bytes());
       for (int editCount : EDIT_COUNTS) {
         BenchFixtures.Edit[] edits = BenchFixtures.edits(editCount);
         int[] expected = expectedStates(baseStates, edits);
         String label = fixture.name() + " / 改写 " + editCount;
 
-        byte[] ourOutput = ourPath.encode(fixture.bytes(), edits);
-        assertSameSequence("自研 codec（" + label + "）", expected, ourPath.readStates(ourOutput));
+        byte[] outputWithoutReorder = codecWithoutReorder.encode(fixture.bytes(), edits);
+        assertSameSequence("自研 codec（" + label + "）", expected, codecWithoutReorder.readStates(outputWithoutReorder));
+
+        byte[] outputWithReorder = codecWithReorder.encode(fixture.bytes(), edits);
+        assertSameSequence("自研 codec + 重排（" + label + "）", expected, codecWithReorder.readStates(outputWithReorder));
+        // 重排只重排调色板顺序与位打包索引，不得改变输出长度（位宽、调色板条目数都不变）
+        assertTrue(outputWithReorder.length <= outputWithoutReorder.length,
+            "开启重排不得使输出变长（" + label + "）：" + outputWithReorder.length + " > " + outputWithoutReorder.length);
 
         if (pePath != null) {
           byte[] peOutput = pePath.encode(fixture.bytes(), edits);
           assertSameSequence("PacketEvents 模型（" + label + "）", expected, pePath.readStates(peOutput));
-          assertSameSequence("交叉解码：PE 读自研字节（" + label + "）", expected, pePath.readStates(ourOutput));
-          assertSameSequence("交叉解码：自研读 PE 字节（" + label + "）", expected, ourPath.readStates(peOutput));
+          assertSameSequence("交叉解码：PE 读自研字节（" + label + "）", expected, pePath.readStates(outputWithReorder));
+          assertSameSequence("交叉解码：自研读 PE 字节（" + label + "）", expected, codecWithoutReorder.readStates(peOutput));
         }
       }
     }
@@ -80,19 +100,26 @@ class ChunkPathBenchmarkTest {
     // 2) 测量：先估时决定轮数，保证基准自身不拖慢 CI
     ThreadMXBean allocationBean = allocationBean();
     int heaviestEditCount = EDIT_COUNTS[EDIT_COUNTS.length - 1];
-    long estimate = estimateIterationNanos(ourPath, fixtures.getFirst(), BenchFixtures.edits(heaviestEditCount));
+    long estimate = 0L;
+    for (ChunkPath path : ourPaths) {
+      estimate = Math.max(estimate,
+          estimateIterationNanos(path, fixtures.getFirst(), BenchFixtures.edits(heaviestEditCount)));
+    }
     if (pePath != null) {
       estimate = Math.max(estimate,
           estimateIterationNanos(pePath, fixtures.getFirst(), BenchFixtures.edits(heaviestEditCount)));
     }
-    int rounds = chooseRounds(estimate, fixtures.size() * EDIT_COUNTS.length * (pePath == null ? 1 : 2));
+    int pathCount = ourPaths.size() + (pePath == null ? 0 : 1);
+    int rounds = chooseRounds(estimate, fixtures.size() * EDIT_COUNTS.length * pathCount);
 
     List<Row> rows = new ArrayList<>();
     for (BenchFixtures.Fixture fixture : fixtures) {
       byte[] pristine = fixture.bytes().clone();
       for (int editCount : EDIT_COUNTS) {
         BenchFixtures.Edit[] edits = BenchFixtures.edits(editCount);
-        rows.add(measure(ourPath, fixture, edits, rounds, allocationBean));
+        for (ChunkPath path : ourPaths) {
+          rows.add(measure(path, fixture, edits, rounds, allocationBean));
+        }
         if (pePath != null) {
           rows.add(measure(pePath, fixture, edits, rounds, allocationBean));
         }
@@ -107,13 +134,13 @@ class ChunkPathBenchmarkTest {
     Files.writeString(REPORT_PATH, report, StandardCharsets.UTF_8);
     System.out.println(report);
 
-    // 4) 只断言「数值被成功采集」与「两条路径都稳定完成」
-    assertTrue(rows.size() == fixtures.size() * EDIT_COUNTS.length * (pePath == null ? 1 : 2),
-        "测量行数不足：" + rows.size());
+    // 4) 只断言「数值被成功采集」与「各路径都稳定完成」
+    assertTrue(rows.size() == fixtures.size() * EDIT_COUNTS.length * pathCount, "测量行数不足：" + rows.size());
     for (Row row : rows) {
       assertTrue(row.medianNanos() > 0 && row.minNanos() > 0 && row.maxNanos() >= row.medianNanos(),
           "耗时未成功采集：" + row);
       assertTrue(row.outputBytes() > 0, "输出字节未成功采集：" + row);
+      assertTrue(row.compressedBytes() > 0, "压缩字节未成功采集：" + row);
       if (allocationBean != null) {
         assertTrue(row.allocatedBytes() > 0, "分配量未成功采集：" + row);
       }
@@ -130,7 +157,7 @@ class ChunkPathBenchmarkTest {
     }
   }
 
-  /** 期望的整列方块序列：原始序列叠加改写（与路径无关，两条路径必须都收敛到它）。 */
+  /** 期望的整列方块序列：原始序列叠加改写（与路径无关，各路径必须都收敛到它）。 */
   private static int[] expectedStates(int[] baseStates, BenchFixtures.Edit[] edits) {
     int[] expected = baseStates.clone();
     for (BenchFixtures.Edit edit : edits) {
@@ -180,7 +207,7 @@ class ChunkPathBenchmarkTest {
     long threadId = Thread.currentThread().getId();
     long[] durations = new long[rounds];
     long[] allocations = new long[rounds];
-    int firstOutputBytes = -1;
+    byte[] firstOutput = null;
     int lastOutputBytes = -1;
 
     for (int i = 0; i < rounds; i++) {
@@ -191,19 +218,21 @@ class ChunkPathBenchmarkTest {
       durations[i] = System.nanoTime() - start;
       allocations[i] = allocationBean == null ? 0L : allocationBean.getThreadAllocatedBytes(threadId) - allocatedBefore;
 
-      if (firstOutputBytes < 0) {
-        firstOutputBytes = output.length;
+      if (firstOutput == null) {
+        firstOutput = output;
       }
       lastOutputBytes = output.length;
     }
 
-    assertEquals(firstOutputBytes, lastOutputBytes, path.name() + "：同一输入的输出字节数必须稳定");
+    assertEquals(firstOutput.length, lastOutputBytes, path.name() + "：同一输入的输出字节数必须稳定");
 
     Arrays.sort(durations);
     Arrays.sort(allocations);
 
+    int reordered = path instanceof OurCodecPath ourCodec ? ourCodec.reorderedSections() : 0;
     return new Row(fixture.name(), edits.length, path.name(), durations[rounds / 2], durations[0],
-        durations[rounds - 1], allocations[rounds / 2], firstOutputBytes);
+        durations[rounds - 1], allocations[rounds / 2], firstOutput.length, compressedBytes(firstOutput),
+        zeroRatio(firstOutput), reordered);
   }
 
   /** JVM 的线程分配量统计；不支持则返回 {@code null}（报告里标注该列不可用）。 */
@@ -221,6 +250,34 @@ class ChunkPathBenchmarkTest {
     return allocationBean;
   }
 
+  /** zlib 压缩后的字节数（level 6，与 Minecraft 区块包默认压缩级别一致）；同输入必然同输出。 */
+  private static int compressedBytes(byte[] data) {
+    Deflater deflater = new Deflater(Deflater.DEFAULT_COMPRESSION);
+    try {
+      deflater.setInput(data);
+      deflater.finish();
+      byte[] buffer = new byte[8192];
+      ByteArrayOutputStream compressed = new ByteArrayOutputStream();
+      while (!deflater.finished()) {
+        compressed.write(buffer, 0, deflater.deflate(buffer));
+      }
+      return compressed.size();
+    } finally {
+      deflater.end();
+    }
+  }
+
+  /** 零字节占比：调色板重排的直接效果就是让位打包数据出现更多 0 位，从而更容易被压缩。 */
+  private static double zeroRatio(byte[] data) {
+    int zeros = 0;
+    for (byte value : data) {
+      if (value == 0) {
+        zeros++;
+      }
+    }
+    return data.length == 0 ? 0.0D : (double) zeros / data.length;
+  }
+
   private static String buildReport(int fixtureCount, List<Row> rows, int rounds, String peUnavailableReason,
       boolean allocationsSupported, long elapsedNanos) {
     StringBuilder report = new StringBuilder();
@@ -230,8 +287,9 @@ class ChunkPathBenchmarkTest {
     report.append("- 每档预热 ").append(WARMUP_ROUNDS).append(" 轮、测量 ").append(rounds)
         .append(" 轮；耗时取中位数，最小/最大用于体现抖动\n");
     report.append("- 分配量：com.sun.management.ThreadMXBean#getThreadAllocatedBytes 的每轮差值（确定性，不受机器抖动影响）\n");
-    report.append("- 输出字节：重编码后整列字节数（确定性，直接反映带宽）\n");
-    report.append("- 语义校验：同一输入 + 同一批改写下，两条路径的方块序列（24×4096 项）逐项相同，且双向交叉解码一致\n");
+    report.append("- 输出字节：重编码后整列字节数（确定性）\n");
+    report.append("- 压缩字节：整列字节经 zlib（level 6）后的长度（确定性）\n");
+    report.append("- 语义校验：同一输入 + 同一批改写下，各路径的方块序列（24×4096 项）逐项相同，且双向交叉解码一致\n");
     report.append("- 本基准自身耗时 ").append(elapsedNanos / 1_000_000L).append(" ms；运行环境 ")
         .append(System.getProperty("java.vm.name")).append(' ').append(System.getProperty("java.version"))
         .append(" / ").append(System.getProperty("os.name")).append("\n\n");
@@ -249,8 +307,9 @@ class ChunkPathBenchmarkTest {
       report.append("> 当前 JVM 不支持线程分配量统计，分配列以 0 占位。\n\n");
     }
 
-    report.append("| 形态 | 修改数 | 路径 | 中位耗时(ms) | 最小/最大 | 分配(MB) | 输出字节 |\n");
-    report.append("| --- | --- | --- | --- | --- | --- | --- |\n");
+    report.append("## 1. 逐行测量\n\n");
+    report.append("| 形态 | 修改数 | 路径 | 中位耗时(ms) | 最小/最大 | 分配(MB) | 输出字节 | 压缩字节 | 零字节占比 | 重排 section |\n");
+    report.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
     for (Row row : rows) {
       report.append("| ").append(row.shape())
           .append(" | ").append(row.edits())
@@ -259,15 +318,95 @@ class ChunkPathBenchmarkTest {
           .append(" | ").append(millis(row.minNanos())).append(" / ").append(millis(row.maxNanos()))
           .append(" | ").append(String.format(Locale.ROOT, "%.2f", row.allocatedBytes() / 1048576.0))
           .append(" | ").append(row.outputBytes())
+          .append(" | ").append(row.compressedBytes())
+          .append(" | ").append(String.format(Locale.ROOT, "%.1f%%", row.zeroRatio() * 100.0D))
+          .append(" | ").append(row.reorderedSections())
           .append(" |\n");
     }
+
+    appendReorderSection(report, rows);
+    appendAllocationSection(report, rows);
 
     report.append("\n> 覆盖：").append(fixtureCount).append(" 种形态 × ").append(EDIT_COUNTS.length)
         .append(" 个改写档位（10 / 100 / 1000）× ").append(rows.size() / (fixtureCount * EDIT_COUNTS.length))
         .append(" 条路径。\n");
-    report.append("> 本表只陈述测量结果，不构成「谁更快」的结论；耗时列受 CI 机器抖动影响，分配量与输出字节是确定性的。\n");
+    report.append("> 本表只陈述测量结果，不构成「谁更快」的结论；耗时列受 CI 机器抖动影响，分配量与输出/压缩字节是确定性的。\n");
 
     return report.toString();
+  }
+
+  /** 调色板重排的带宽收益：输出字节与压缩字节的「关闭重排 → 开启重排」对照。 */
+  private static void appendReorderSection(StringBuilder report, List<Row> rows) {
+    report.append("\n## 2. 调色板频次重排的带宽收益\n\n");
+    report.append("> 重排只重排调色板顺序与位打包索引，**不改位宽、不改数组长度、不改调色板条目数**，")
+        .append("因此「输出字节」在两种设置下必然相同；它的收益只体现在压缩后长度上（索引越小、位打包数据里的 0 位越多）。\n\n");
+    report.append("| 形态 | 修改数 | 实际重排 section | 输出字节 关→开 | 压缩字节 关→开 | 压缩收益 | 零字节占比 关→开 |\n");
+    report.append("| --- | --- | --- | --- | --- | --- | --- |\n");
+
+    for (Row off : rows) {
+      if (!off.path().equals("自研 codec（重排关）")) {
+        continue;
+      }
+      Row on = findRow(rows, off.shape(), off.edits(), "自研 codec（重排开）");
+      if (on == null) {
+        continue;
+      }
+      String gain = off.compressedBytes() == 0 ? "—"
+          : String.format(Locale.ROOT, "%+.1f%%",
+              100.0D * (on.compressedBytes() - off.compressedBytes()) / off.compressedBytes());
+      report.append("| ").append(off.shape())
+          .append(" | ").append(off.edits())
+          .append(" | ").append(on.reorderedSections())
+          .append(" | ").append(off.outputBytes()).append(" → ").append(on.outputBytes())
+          .append(" | ").append(off.compressedBytes()).append(" → ").append(on.compressedBytes())
+          .append(" | ").append(gain)
+          .append(" | ").append(String.format(Locale.ROOT, "%.1f%% → %.1f%%", off.zeroRatio() * 100.0D,
+              on.zeroRatio() * 100.0D))
+          .append(" |\n");
+    }
+
+    report.append("\n> 「实际重排 section = 0」表示该形态/档位下调色板本来就按频次降序排列（索引按首次出现分配，")
+        .append("而出现最多的状态恰好落在低位索引），重排是无改动，收益为零——这是如实结果，不做粉饰。\n");
+  }
+
+  /** 分配量优化前后对照：以任务给定的 CI 基线为「优化前」，本次实测为「优化后」。 */
+  private static void appendAllocationSection(StringBuilder report, List<Row> rows) {
+    report.append("\n## 3. 每区块分配量：优化前（任务给定基线）vs 本次实测\n\n");
+    report.append("| 形态 | 修改数 | 优化前分配(MB) | 本次·重排关(MB) | 本次·重排开(MB) | 降幅(相对优化前) |\n");
+    report.append("| --- | --- | --- | --- | --- | --- |\n");
+
+    for (Object[] baseline : ALLOCATION_BASELINE) {
+      String shape = (String) baseline[0];
+      int edits = (Integer) baseline[1];
+      double before = (Double) baseline[2];
+
+      Row off = findRow(rows, shape, edits, "自研 codec（重排关）");
+      Row on = findRow(rows, shape, edits, "自研 codec（重排开）");
+      double offMb = off == null ? Double.NaN : off.allocatedBytes() / 1048576.0D;
+      double onMb = on == null ? Double.NaN : on.allocatedBytes() / 1048576.0D;
+
+      report.append("| ").append(shape)
+          .append(" | ").append(edits)
+          .append(" | ").append(String.format(Locale.ROOT, "%.2f", before))
+          .append(" | ").append(formatMb(offMb))
+          .append(" | ").append(formatMb(onMb))
+          .append(" | ").append(Double.isNaN(offMb) ? "—"
+              : String.format(Locale.ROOT, "%.0f%%", 100.0D * (before - offMb) / before))
+          .append(" |\n");
+    }
+  }
+
+  private static String formatMb(double value) {
+    return Double.isNaN(value) ? "—" : String.format(Locale.ROOT, "%.2f", value);
+  }
+
+  private static Row findRow(List<Row> rows, String shape, int edits, String path) {
+    for (Row row : rows) {
+      if (row.shape().equals(shape) && row.edits() == edits && row.path().equals(path)) {
+        return row;
+      }
+    }
+    return null;
   }
 
   private static String millis(long nanos) {
