@@ -1,4 +1,4 @@
-// 移植自 Orebfuscator（GPL-3.0），本项目为私有自用部署。
+
 package net.mikumc.mikuxraynet.codec;
 
 import java.util.Arrays;
@@ -52,8 +52,7 @@ public class ChunkSection {
         this.bitsPerBlock = 0;
         this.palette = new SingleValuePalette(this, 0);
       } else if (!grow && bitsPerBlock == 1) {
-        // fix: fawe chunk format incompatibility with bitsPerBlock == 1
-        // https://github.com/Imprex-Development/Orebfuscator/issues/36
+        // 兼容第三方插件（如 FAWE）改写区块后产生的非法 bitsPerBlock == 1
         this.bitsPerBlock = bitsPerBlock;
         this.palette = new IndirectPalette(this.bitsPerBlock, this);
       } else if (bitsPerBlock <= 8) {

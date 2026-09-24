@@ -14,7 +14,7 @@ import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
 /**
  * 反矿透核心：对单个区块做「6 面正交遮挡判定 + 按权重随机替换」，并可顺带做调色板压缩重排。
  *
- * <p><b>判定语义</b>（移植自 Orebfuscator 的 {@code ObfuscationProcessor}）：只有当目标方块的
+ * <p><b>判定语义</b>：只有当目标方块的
  * 上下左右前后 6 个正交方向全部被遮挡（即该方块在客户端不可见）时才替换为伪装方块；
  * 任一方向未遮挡——包括世界上下界之外、以及 section 缺失——都按「暴露」处理并保持原样。
  * 对角方向的方块不参与遮挡判定。

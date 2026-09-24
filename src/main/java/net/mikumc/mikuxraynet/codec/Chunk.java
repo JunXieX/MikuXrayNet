@@ -1,4 +1,4 @@
-// 移植自 Orebfuscator（GPL-3.0），本项目为私有自用部署。
+
 package net.mikumc.mikuxraynet.codec;
 
 import java.util.Arrays;

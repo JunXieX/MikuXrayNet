@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 体素遮挡射线（移植 ESU {@code RaytraceHandler} 的步进/DDA 思路，改写为纯计算）。
+ * 体素遮挡射线（固定步长 / 3D-DDA 步进，纯计算实现）。
  *
  * <p>本类只做数学运算：输入射线的起终点（世界坐标），输出射线途经的体素坐标序列。
  * 由工作线程负责「算序列」，主线程/区域线程负责「读方块判定是否遮挡」，从而保证
