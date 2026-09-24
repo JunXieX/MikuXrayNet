@@ -17,6 +17,8 @@ import net.mikumc.mikuxraynet.bandwidth.ThrottleStats;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.bootstrap.ProtocolLibHook;
+import net.mikumc.mikuxraynet.cache.DiskCacheStats;
+import net.mikumc.mikuxraynet.cache.DiskCacheStore;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
@@ -71,7 +73,13 @@ public final class Diagnostics {
       String serverVersion,
       String javaVersion,
       AntiXrayConfig antiXray,
-      BandwidthConfig bandwidth) {
+      BandwidthConfig bandwidth,
+      long proximityFrustumCulled,
+      long proximityRayCulled,
+      long diskCacheHits,
+      long diskCacheMisses,
+      int diskCacheEntries,
+      int diskCacheOpenFiles) {
 
     /** 配置指纹（取自反矿透配置；无配置时为 0）。 */
     public int configFingerprint() {
@@ -116,6 +124,8 @@ public final class Diagnostics {
     ProximityStats proximityStats = plugin.proximityStats();
     BypassRegistry bypass = plugin.bypassRegistry();
     MikuWorkPool pool = plugin.workPool();
+    DiskCacheStore diskCache = plugin.diskCacheStore();
+    DiskCacheStats diskStats = diskCache == null ? null : diskCache.stats();
     MikuConfig config = plugin.mikuConfig();
 
     return new Snapshot(
@@ -152,7 +162,13 @@ public final class Diagnostics {
         Bukkit.getName() + " " + Bukkit.getMinecraftVersion(),
         System.getProperty("java.version", "未知"),
         config == null ? null : config.antiXray(),
-        config == null ? null : config.bandwidth());
+        config == null ? null : config.bandwidth(),
+        proximityStats == null ? 0L : proximityStats.revealsFrustumCulled.sum(),
+        proximityStats == null ? 0L : proximityStats.revealsRayCulled.sum(),
+        diskStats == null ? 0L : diskStats.hits.sum(),
+        diskStats == null ? 0L : diskStats.misses.sum(),
+        diskCache == null ? 0 : diskCache.entries(),
+        diskCache == null ? 0 : diskCache.openRegionFiles());
   }
 
   /** 状态面板格式化（纯函数）。 */
@@ -169,7 +185,12 @@ public final class Diagnostics {
     lines.add("区块改写：改写 " + s.chunksRewritten() + "，跳过 " + s.chunksSkipped()
         + "，超时放行 " + s.chunksTimedOut());
     lines.add("邻近显形：发送 " + s.revealsSent() + "，跳过 " + s.revealsSkipped()
-        + "，变更注销 " + s.revealsUnregistered());
+        + "，变更注销 " + s.revealsUnregistered() + "，视锥剔除 " + s.proximityFrustumCulled()
+        + "，射线剔除 " + s.proximityRayCulled());
+    lines.add("磁盘缓存：" + (s.diskCacheOpenFiles() > 0 || s.diskCacheEntries() > 0 ? "已启用" : "无数据")
+        + "｜命中 " + s.diskCacheHits() + "，未命中 " + s.diskCacheMisses()
+        + "，命中率 " + hitRate(s.diskCacheHits(), s.diskCacheMisses())
+        + "，条目约 " + s.diskCacheEntries() + "，打开区域文件 " + s.diskCacheOpenFiles());
     lines.add("带宽：零位移取消 " + s.entityPacketsCancelled() + "，合并批次 " + s.blockMergeBatches()
         + "（合并 " + s.blockChangesMerged() + " 条），实体隐藏 " + s.entitiesHidden()
         + "/恢复 " + s.entitiesShown());
@@ -216,6 +237,8 @@ public final class Diagnostics {
     sb.append("neighbors.enabled=").append(c.neighbors().enabled())
         .append("，missing-policy=").append(c.neighbors().missingPolicy())
         .append("，cache-maximum-size=").append(c.neighbors().cacheMaximumSize()).append('\n');
+    sb.append("occlusion.extra-occluding=").append(c.occlusion().extraOccluding())
+        .append("，extra-non-occluding=").append(c.occlusion().extraNonOccluding()).append('\n');
     sb.append("proximity.enabled=").append(c.proximity().enabled())
         .append("，distance=").append(c.proximity().distance())
         .append("，interval-ticks=").append(c.proximity().intervalTicks())
@@ -223,6 +246,21 @@ public final class Diagnostics {
         .append("，expire-seconds=").append(c.proximity().expireSeconds()).append('\n');
     sb.append("proximity.max-positions=").append(c.proximity().maxPositions())
         .append("，max-positions-per-player=").append(c.proximity().maxPositionsPerPlayer()).append('\n');
+    sb.append("proximity.frustum.enabled=").append(c.proximity().frustumEnabled())
+        .append("，fov=").append(c.proximity().frustumFov())
+        .append("，min-distance=").append(c.proximity().frustumMinDistance())
+        .append("，raycast.enabled=").append(c.proximity().raycastEnabled())
+        .append("，raycast.samples=").append(c.proximity().raycastSamples()).append('\n');
+    sb.append("disk-cache.enabled=").append(c.diskCache().enabled())
+        .append("，max-entries=").append(c.diskCache().maxEntries())
+        .append("，max-file-size-mb=").append(c.diskCache().maxFileSizeMb())
+        .append("，expire-seconds=").append(c.diskCache().expireSeconds()).append('\n');
+    sb.append("disk-cache.bucket-cache-size=").append(c.diskCache().bucketCacheSize())
+        .append("，idle-close-seconds=").append(c.diskCache().idleCloseSeconds())
+        .append("，maintenance-interval-seconds=").append(c.diskCache().maintenanceIntervalSeconds())
+        .append("，compact-per-pass=").append(c.diskCache().compactPerPass())
+        .append("，queue-capacity=").append(c.diskCache().queueCapacity())
+        .append("，generation-tracker-size=").append(c.diskCache().generationTrackerSize()).append('\n');
     sb.append("cache.maximum-size=").append(c.cacheMaximumSize())
         .append("，expire-after-access-seconds=").append(c.cacheExpireAfterAccessSeconds()).append('\n');
     sb.append("advanced.threads=").append(c.threads())

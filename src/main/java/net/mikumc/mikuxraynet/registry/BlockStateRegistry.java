@@ -4,9 +4,11 @@ import com.github.retrooper.packetevents.PacketEvents;
 import com.github.retrooper.packetevents.protocol.player.ClientVersion;
 import com.github.retrooper.packetevents.protocol.world.MaterialType;
 import com.github.retrooper.packetevents.protocol.world.states.WrappedBlockState;
+import com.github.retrooper.packetevents.protocol.world.states.enums.Type;
 import com.github.retrooper.packetevents.protocol.world.states.type.StateType;
 import com.github.retrooper.packetevents.protocol.world.states.type.StateTypes;
 import java.util.BitSet;
+import java.util.Collection;
 import java.util.EnumSet;
 import java.util.Locale;
 import java.util.Set;
@@ -18,14 +20,18 @@ import net.mikumc.mikuxraynet.codec.RegistryAccessor;
  * <p><b>只在启动期构建一次</b>（{@link #build} 需要 PacketEvents 已就绪），构建完成后实例内部
  * 只保留 {@code int + BitSet}，热路径不再触碰任何 PacketEvents 类型。
  *
- * <p>遮挡（occluding）语义说明：PacketEvents 的 {@link StateType} 没有 NMS 的
- * {@code isSolidRender}，故用「实体性 + 形状不超出整方块 + 材质非薄片」近似：
+ * <p><b>遮挡（occluding）判定</b>：规则见 {@link OcclusionRules}（纯逻辑、可单测）；本类只负责把
+ * PE 的状态语义摊平成 {@link OcclusionRules.Facts}：
  * <ul>
- *   <li>空气、非实体（{@code isSolid()==false}）、形状超出整方块（{@code exceedsCube()}）一律不算遮挡；</li>
- *   <li>材质属于植物/玻璃/树叶/液体/薄雪/蛛网等装饰性类别的不算遮挡；</li>
- *   <li>名称以台阶/楼梯/栏杆/墙/板/门/活板门/压力板/按钮/地毯/告示牌等薄片族后缀结尾的不算遮挡。</li>
+ *   <li>{@code air} ← {@code StateType#isAir()}；</li>
+ *   <li>{@code solid} ← {@code StateType#isSolid()}；</li>
+ *   <li>{@code exceedsCube} ← {@code StateType#exceedsCube()}（形状超出整方块的栅栏/墙/竹子/脚手架等）；</li>
+ *   <li>{@code materialOccluding} ← 材质类别是否不属于装饰性类别；</li>
+ *   <li>{@code doubleSlab} ← 名称以 {@code _slab} 结尾且状态属性 {@code type == DOUBLE}（双台阶填满整方块，
+ *       只看方块名会误判为「不遮挡」）。</li>
  * </ul>
- * 该近似可能把少量确实能遮挡的方块（如铁砧、双台阶）判为「不遮挡」，方向是「更保守地判定为可被看到」。
+ * 判定结果可被 {@code antixray.yml} 的 {@code occlusion.extra-occluding} /
+ * {@code occlusion.extra-non-occluding} 覆盖（用户自行纠正判定的出口）。
  */
 public final class BlockStateRegistry implements RegistryAccessor {
 
@@ -41,13 +47,6 @@ public final class BlockStateRegistry implements RegistryAccessor {
       MaterialType.FIRE, MaterialType.DECORATION, MaterialType.WEB, MaterialType.BUILDABLE_GLASS,
       MaterialType.LEAVES, MaterialType.GLASS, MaterialType.BARRIER, MaterialType.POWDER_SNOW,
       MaterialType.FROGSPAWN, MaterialType.BAMBOO_SAPLING, MaterialType.CACTUS);
-
-  /** 薄片方块名称后缀（不足以填满整方块，故不能遮挡）。 */
-  private static final String[] THIN_NAME_SUFFIXES = {
-      "_stairs", "_slab", "_fence", "_fence_gate", "_wall", "_pane", "_door", "_trapdoor",
-      "_pressure_plate", "_button", "_carpet", "_sign", "_banner", "_bed", "_rail", "_torch",
-      "_lantern", "_chain", "_bars", "_candle", "_campfire", "_flower_pot", "_head", "_skull",
-      "_sapling", "_sprouts", "_roots", "_fan", "_bush"};
 
   private final int uniqueBlockStateCount;
   private final int maxBitsPerBlockState;
@@ -70,9 +69,15 @@ public final class BlockStateRegistry implements RegistryAccessor {
    * <p>状态 id 在原版映射中是 0..N-1 的稠密区间，越界 id 会回落为空气（globalId=0），
    * 因此逐个探测到「回落到空气」即得到总数 N。
    *
+   * @param extraOccluding    额外视为「遮挡」的方块名（覆盖表；可为空集）
+   * @param extraNonOccluding 额外视为「不遮挡」的方块名（覆盖表；可为空集）
    * @return 已完全脱 PE 的注册表实例
    */
-  public static BlockStateRegistry build() {
+  public static BlockStateRegistry build(Collection<String> extraOccluding,
+      Collection<String> extraNonOccluding) {
+    Set<String> occludingOverrides = OcclusionRules.normalizeAll(extraOccluding);
+    Set<String> nonOccludingOverrides = OcclusionRules.normalizeAll(extraNonOccluding);
+
     ClientVersion version = PacketEvents.getAPI().getServerManager().getVersion().toClientVersion();
     int count = probeStateCount(version);
 
@@ -92,7 +97,8 @@ public final class BlockStateRegistry implements RegistryAccessor {
       if (state.isFluid() || type.getMaterialType() == MaterialType.BUBBLE_COLUMN) {
         fluidStates.set(id);
       }
-      if (isOccluding(type, name)) {
+      if (OcclusionRules.isOccluding(facts(type, name, state), occludingOverrides,
+          nonOccludingOverrides)) {
         occludingStates.set(id);
       }
     }
@@ -148,6 +154,30 @@ public final class BlockStateRegistry implements RegistryAccessor {
     return blockId >= 0 && blockId < uniqueBlockStateCount && occludingStates.get(blockId);
   }
 
+  /** 把 PE 状态摊平为纯判定输入（不保留任何 PE 引用）。 */
+  private static OcclusionRules.Facts facts(StateType type, String name, WrappedBlockState state) {
+    return new OcclusionRules.Facts(
+        type.isAir(),
+        type.isSolid(),
+        type.exceedsCube(),
+        !NON_OCCLUDING_MATERIALS.contains(type.getMaterialType()),
+        isDoubleSlab(name, state),
+        name);
+  }
+
+  /** 双台阶：名称属于台阶族且状态属性 type=double（此时它填满整方块，可以与整块石头一样遮挡）。 */
+  private static boolean isDoubleSlab(String name, WrappedBlockState state) {
+    if (!name.endsWith("_slab")) {
+      return false;
+    }
+    try {
+      return state.getTypeData() == Type.DOUBLE;
+    } catch (RuntimeException exception) {
+      // 该状态没有 type 属性（映射异常）：按非双台阶处理
+      return false;
+    }
+  }
+
   private static int probeStateCount(ClientVersion version) {
     int id = 0;
     while (id < MAX_STATE_SCAN) {
@@ -166,20 +196,5 @@ public final class BlockStateRegistry implements RegistryAccessor {
 
   private static int ceilLog2(int value) {
     return 32 - Integer.numberOfLeadingZeros(Math.max(1, value - 1));
-  }
-
-  private static boolean isOccluding(StateType type, String name) {
-    if (type.isAir() || !type.isSolid() || type.exceedsCube()) {
-      return false;
-    }
-    if (NON_OCCLUDING_MATERIALS.contains(type.getMaterialType())) {
-      return false;
-    }
-    for (String suffix : THIN_NAME_SUFFIXES) {
-      if (name.endsWith(suffix)) {
-        return false;
-      }
-    }
-    return true;
   }
 }

@@ -3,6 +3,7 @@ package net.mikumc.mikuxraynet.bootstrap;
 import com.github.retrooper.packetevents.PacketEvents;
 import com.github.retrooper.packetevents.PacketEventsAPI;
 import com.github.retrooper.packetevents.manager.server.ServerVersion;
+import java.util.Collection;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
@@ -30,9 +31,12 @@ public final class PacketEventsHook {
   /**
    * 探测 PacketEvents 是否就绪，并构建方块状态映射。
    *
+   * @param extraOccluding    遮挡判定覆盖表：额外视为「遮挡」的方块名
+   * @param extraNonOccluding 遮挡判定覆盖表：额外视为「不遮挡」的方块名
    * @return true 表示映射可用；false 表示模块应降级停用
    */
-  public boolean initialize() {
+  public boolean initialize(Collection<String> extraOccluding,
+      Collection<String> extraNonOccluding) {
     try {
       PacketEventsAPI<?> api = PacketEvents.getAPI();
       if (api == null || !api.isInitialized()) {
@@ -42,7 +46,7 @@ public final class PacketEventsHook {
 
       ServerVersion version = api.getServerManager().getVersion();
       this.releaseName = version == null ? "未知" : version.getReleaseName();
-      this.registry = BlockStateRegistry.build();
+      this.registry = BlockStateRegistry.build(extraOccluding, extraNonOccluding);
 
       logger.info("方块状态映射构建完成：服务端版本 " + releaseName
           + "，状态数 " + registry.getUniqueBlockStateCount()

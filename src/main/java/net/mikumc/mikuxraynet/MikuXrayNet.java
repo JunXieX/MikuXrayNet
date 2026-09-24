@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet;
 
 import com.comphenix.protocol.ProtocolManager;
+import java.io.File;
 import java.util.List;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.antixray.BlockChangeRevealListener;
@@ -14,6 +15,7 @@ import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
 import net.mikumc.mikuxraynet.bootstrap.PacketEventsHook;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.bootstrap.ProtocolLibHook;
+import net.mikumc.mikuxraynet.cache.DiskCacheStore;
 import net.mikumc.mikuxraynet.codec.ChunkCodec;
 import net.mikumc.mikuxraynet.codec.ChunkVersionFlags;
 import net.mikumc.mikuxraynet.command.MikuCommand;
@@ -57,6 +59,7 @@ public final class MikuXrayNet extends JavaPlugin {
   private BlockChangeRevealListener blockChangeRevealListener;
   private RevealedBlockIndex revealedIndex;
   private ProximityStats proximityStats;
+  private DiskCacheStore diskCacheStore;
   private BypassRegistry bypassRegistry;
   private boolean antiXrayActive;
 
@@ -96,6 +99,8 @@ public final class MikuXrayNet extends JavaPlugin {
     }
     // 最后停邻近显形：撤销巡检任务、注销变更注销监听并清空索引，不留副作用
     stopProximity();
+    // 磁盘缓存最后关闭：先落盘再关句柄（此时已不会再有新的写入与代次变更）
+    closeDiskCache();
     if (workPool != null) {
       workPool.close();
       workPool = null;
@@ -133,7 +138,8 @@ public final class MikuXrayNet extends JavaPlugin {
     }
 
     PacketEventsHook packetEventsHook = new PacketEventsHook(getLogger());
-    if (!packetEventsHook.initialize()) {
+    if (!packetEventsHook.initialize(antiXray.occlusion().extraOccluding(),
+        antiXray.occlusion().extraNonOccluding())) {
       return;
     }
 
@@ -164,16 +170,24 @@ public final class MikuXrayNet extends JavaPlugin {
             proximity.expireSeconds())
         : null;
 
+    // 磁盘缓存：关闭时为 null，改写路径退化为纯内存缓存
+    DiskCacheStore diskCache = antiXray.diskCache().enabled()
+        ? new DiskCacheStore(new File(getDataFolder(), "cache").toPath(), antiXray.diskCache(),
+            getLogger())
+        : null;
+
     MikuWorkPool pool = new MikuWorkPool(antiXray.threads(), antiXray.queueCapacity());
     ProtocolLibHook hook = new ProtocolLibHook(this);
-    if (!hook.register(antiXray, processor, pool, neighborProvider, index, bypassRegistry)) {
+    if (!hook.register(antiXray, processor, pool, neighborProvider, index, bypassRegistry, diskCache)) {
       pool.close();
+      closeDiskCache(diskCache);
       return;
     }
 
     this.workPool = pool;
     this.protocolLibHook = hook;
     this.revealedIndex = index;
+    this.diskCacheStore = diskCache;
     this.proximityStats = new ProximityStats();
     this.antiXrayActive = true;
     registerWorldUnloadInvalidation();
@@ -181,32 +195,42 @@ public final class MikuXrayNet extends JavaPlugin {
 
     getLogger().info("反矿透已启用：目标方块 " + antiXray.hideBlocks().size() + " 种，伪装方块 "
         + antiXray.replacementWeights().size() + " 种；区块边界邻块快照 "
-        + (neighborProvider != null ? "已启用" : "已关闭"));
+        + (neighborProvider != null ? "已启用" : "已关闭") + "；磁盘缓存 "
+        + (diskCache != null ? "已启用（" + new File(getDataFolder(), "cache").getPath() + "）" : "已关闭"));
   }
 
   /**
    * 邻近显形装配：索引为 null（配置关闭）或拿不到 ProtocolLib 协议管理器时只跳过该子模块，
    * 反矿透主体照常工作。
+   *
+   * <p>方块变更观察监听器在「显形索引或磁盘缓存任一启用」时都会注册：它既负责注销已显形的坐标，
+   * 也负责把「区块已变更」告诉磁盘缓存（递增区块代次）。
    */
   private void startProximity(AntiXrayConfig antiXray, RevealedBlockIndex revealedIndex,
       ProximityStats stats) {
-    if (revealedIndex == null) {
-      getLogger().info("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
-      return;
-    }
-
     ProtocolManager protocolManager = protocolLibHook == null ? null : protocolLibHook.protocolManager();
     if (protocolManager == null) {
       getLogger().warning("未取得 ProtocolLib 协议管理器，邻近显形停用");
       return;
     }
 
-    this.proximityRevealer = new ProximityRevealer(this, protocolManager, antiXray, revealedIndex, stats,
-        bypassRegistry);
-    this.blockChangeRevealListener = new BlockChangeRevealListener(this, protocolManager, revealedIndex, stats);
+    if (revealedIndex == null) {
+      getLogger().info("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
+    }
+
+    if (diskCacheStore == null && revealedIndex == null) {
+      return;
+    }
+
+    this.blockChangeRevealListener = new BlockChangeRevealListener(this, protocolManager, revealedIndex,
+        stats, diskCacheStore);
     try {
-      proximityRevealer.start();
       blockChangeRevealListener.start();
+      if (revealedIndex != null) {
+        this.proximityRevealer = new ProximityRevealer(this, protocolManager, antiXray, revealedIndex,
+            stats, bypassRegistry, workPool);
+        proximityRevealer.start();
+      }
     } catch (Throwable throwable) {
       getLogger().warning("邻近显形装配失败（不影响反矿透主体）：" + throwable.getMessage());
       stopProximity();
@@ -223,6 +247,29 @@ public final class MikuXrayNet extends JavaPlugin {
       proximityRevealer.stop();
       proximityRevealer = null;
     }
+  }
+
+  /** 关闭磁盘缓存（落盘 + 关闭全部句柄）。 */
+  private void closeDiskCache() {
+    DiskCacheStore store = diskCacheStore;
+    diskCacheStore = null;
+    closeDiskCache(store);
+  }
+
+  private void closeDiskCache(DiskCacheStore store) {
+    if (store == null) {
+      return;
+    }
+    try {
+      store.close();
+    } catch (Throwable throwable) {
+      getLogger().log(Level.WARNING, "关闭磁盘缓存时出现异常（已强制结束）", throwable);
+    }
+  }
+
+  /** 磁盘缓存（供命令与诊断读取持有量与命中率）；未启用时为 null。 */
+  public DiskCacheStore diskCacheStore() {
+    return diskCacheStore;
   }
 
   /** 邻近显形（供命令与诊断读取统计计数与索引持有量）；未启用时为 null。 */
@@ -302,6 +349,11 @@ public final class MikuXrayNet extends JavaPlugin {
         if (hook != null) {
           hook.invalidateAll();
         }
+        // 配置指纹变化后旧磁盘条目不会再被命中：先落盘，之后由过期/旧代次清理回收
+        DiskCacheStore store = diskCacheStore;
+        if (store != null) {
+          store.flush();
+        }
       }
 
       @Override
@@ -315,7 +367,8 @@ public final class MikuXrayNet extends JavaPlugin {
   /** 按新配置重建邻近显形（复用同一显形索引与统计对象，避免与改写链路脱钩）。 */
   private void restartProximity() {
     stopProximity();
-    if (antiXrayActive && revealedIndex != null && proximityStats != null) {
+    if (antiXrayActive && proximityStats != null
+        && (revealedIndex != null || diskCacheStore != null)) {
       startProximity(config.antiXray(), revealedIndex, proximityStats);
     }
   }
@@ -345,7 +398,7 @@ public final class MikuXrayNet extends JavaPlugin {
     }
   }
 
-  /** 世界卸载时整体失效该世界的改写缓存，避免缓存把已卸载世界的数据留在堆上。 */
+  /** 世界卸载时整体失效该世界的改写缓存与磁盘缓存句柄（落盘 + 关闭，避免把已卸载世界的资源留在堆上）。 */
   private void registerWorldUnloadInvalidation() {
     getServer().getPluginManager().registerEvents(new Listener() {
       @EventHandler
@@ -353,6 +406,10 @@ public final class MikuXrayNet extends JavaPlugin {
         ProtocolLibHook hook = protocolLibHook;
         if (hook != null) {
           hook.invalidateWorld(event.getWorld().getName());
+        }
+        DiskCacheStore store = diskCacheStore;
+        if (store != null) {
+          store.invalidateWorld(event.getWorld().getName());
         }
       }
     }, this);

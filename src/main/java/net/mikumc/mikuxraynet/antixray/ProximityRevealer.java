@@ -5,12 +5,14 @@ import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.Schedulers;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
+import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import org.bukkit.Bukkit;
@@ -25,6 +27,7 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.scheduler.BukkitTask;
+import org.bukkit.util.Vector;
 
 /**
  * 邻近显形：周期巡检每个在线玩家，把其附近「曾被反矿透伪装过」的坐标的真实方块状态发回客户端。
@@ -32,9 +35,17 @@ import org.bukkit.scheduler.BukkitTask;
  * <p><b>为什么需要</b>：被完全掩埋的方块在区块封包里已被替换为伪装方块，客户端会一直看到伪装结果；
  * 只有服务端下发方块变更时才会纠正。主动把玩家附近的真实方块发回去，体验才与原版一致。
  *
- * <p><b>线程纪律</b>：本类只在主线程 / Folia 区域线程执行——位置读取、方块读取与发包都在
- * 玩家所属线程完成（非 Folia 为统一主线程任务，Folia 为各玩家的区域任务）。
- * 纯计算部分（距离筛选）交给 {@link RevealedBlockIndex}，它不触碰任何 Bukkit API。
+ * <p><b>筛选（可选、可配）</b>：
+ * <ul>
+ *   <li><b>视锥剔除</b>（默认开启，80°）：只显形玩家视野锥内的候选坐标；最小距离内豁免，
+ *       避免「贴着走过的矿物不显形」；</li>
+ *   <li><b>射线可见性</b>（默认关闭）：从眼睛到方块做体素步进，被墙挡住的不显形，等玩家靠近再说。</li>
+ * </ul>
+ *
+ * <p><b>线程纪律</b>：位置读取、方块读取与发包都在主线程 / Folia 区域线程（非 Folia 为统一主线程任务，
+ * Folia 为各玩家的区域任务）；纯计算（视锥角度、射线体素路径）交给 {@link MikuWorkPool} 的工作线程，
+ * 算完再回到玩家所属线程读方块——工作线程不触碰任何 Bukkit API。
+ * 队列已满时退化为「主线程直接做纯计算且只做视锥」的保底路径（射线判定跳过），绝不阻塞。
  *
  * <p><b>发包纪律</b>：ProtocolLib 是唯一封包通道，包用 {@code createPacket} 构造、用
  * {@code sendServerPacket(..., filters=false)} 发出，因此显形包不会再次进入本插件的出站监听器。
@@ -45,6 +56,12 @@ public final class ProximityRevealer implements Listener {
   private static final int MAX_ERROR_LOGS = 3;
   /** 每多少次巡检清理一次过期条目（默认周期 5 tick 时约 5 秒一次）。 */
   private static final int EXPIRE_EVERY_PASSES = 20;
+  /**
+   * 候选坐标的超额倍数：视锥/射线会剔除部分候选，因此按额度的该倍数取候选，
+   * 避免「远处最多、近处还没轮到」的候选把名额占满。
+   */
+  private static final int CANDIDATE_OVERSAMPLE = 4;
+  private static final int MAX_CANDIDATES = 512;
 
   /** 单次巡检的发包额度（非 Folia 为全服合计，Folia 为每个玩家各自的巡检）。 */
   private static final class Budget {
@@ -56,6 +73,22 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
+  /** 工作线程算出的显形计划：候选三元组 + 与之一一对应的射线路径（未做射线判定时为空数组）。 */
+  private static final class Plan {
+
+    private final int[] coordinates;
+    private final int[][] paths;
+
+    private Plan(int[] coordinates, int[][] paths) {
+      this.coordinates = coordinates;
+      this.paths = paths;
+    }
+
+    private int count() {
+      return coordinates.length / 3;
+    }
+  }
+
   private final Plugin plugin;
   private final ProtocolManager protocolManager;
   private final AntiXrayConfig config;
@@ -63,13 +96,15 @@ public final class ProximityRevealer implements Listener {
   private final RevealedBlockIndex index;
   private final ProximityStats stats;
   private final BypassRegistry bypassRegistry;
+  private final MikuWorkPool workPool;
   private final AtomicInteger errorCounter = new AtomicInteger();
   private final AtomicLong passes = new AtomicLong();
 
   private BukkitTask globalTask;
 
   public ProximityRevealer(Plugin plugin, ProtocolManager protocolManager, AntiXrayConfig config,
-      RevealedBlockIndex index, ProximityStats stats, BypassRegistry bypassRegistry) {
+      RevealedBlockIndex index, ProximityStats stats, BypassRegistry bypassRegistry,
+      MikuWorkPool workPool) {
     this.plugin = plugin;
     this.protocolManager = protocolManager;
     this.config = config;
@@ -77,6 +112,7 @@ public final class ProximityRevealer implements Listener {
     this.index = index;
     this.stats = stats;
     this.bypassRegistry = bypassRegistry;
+    this.workPool = workPool;
   }
 
   /** 启动巡检：非 Folia 为统一主线程任务；Folia 为各玩家的区域任务（玩家退役后自动失效）。 */
@@ -91,7 +127,10 @@ public final class ProximityRevealer implements Listener {
       globalTask = Bukkit.getScheduler().runTaskTimer(plugin, this::passAll, interval, interval);
     }
     plugin.getLogger().info("邻近显形已启用：距离 " + proximity.distance() + " 格，周期 " + interval
-        + " tick，单次上限 " + proximity.maxRevealsPerTick() + " 个");
+        + " tick，单次上限 " + proximity.maxRevealsPerTick() + " 个；视锥 "
+        + (proximity.frustumEnabled() ? proximity.frustumFov() + "°（最小距离 "
+            + proximity.frustumMinDistance() + " 格内豁免）" : "已关闭")
+        + "，射线可见性 " + (proximity.raycastEnabled() ? "已开启" : "已关闭"));
   }
 
   /** 停用：注销任务与事件监听，并清空显形索引（不留副作用）。 */
@@ -156,12 +195,10 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
-  /** 主线程 / 区域线程：取候选坐标 → 读真实方块 → 发包 → 注销该坐标。 */
+  /** 主线程 / 区域线程：取候选坐标 → （可选）工作线程筛选 → 读真实方块 → 发包 → 注销该坐标。 */
   private void reveal(Player player, Budget budget) {
-    if (!player.isOnline()) {
-      return;
-    }
-    if (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId())) {
+    if (!player.isOnline()
+        || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
       return;
     }
 
@@ -174,39 +211,159 @@ public final class ProximityRevealer implements Listener {
     Location location = player.getLocation();
     List<RevealedBlockIndex.Position> candidates = index.candidates(player.getUniqueId(), worldName,
         location.getBlockX(), location.getBlockY(), location.getBlockZ(), proximity.distance(),
-        budget.remaining);
+        fetchLimit(budget.remaining));
     if (candidates.isEmpty()) {
       return;
     }
 
-    for (RevealedBlockIndex.Position position : candidates) {
+    if (!proximity.frustumEnabled() && !proximity.raycastEnabled()) {
+      sendCandidates(player, world, candidates, null, budget);
+      return;
+    }
+
+    // 只把纯值交给工作线程；这里的 Player 引用仅供「交回所属线程」调度使用，工作线程不对它做任何调用
+    ProximitySelector.Eye eye = eyeOf(player);
+    int[] coordinates = flatten(candidates);
+    boolean raycast = proximity.raycastEnabled();
+
+    if (workPool == null || !workPool.hasCapacity()) {
+      // 队列已满：保底路径——主线程直接做纯计算（射线判定跳过），不阻塞、不丢显形
+      stats.revealsQueuedSkipped.increment();
+      sendCandidates(player, world, null, computePlan(eye, coordinates, false), budget);
+      return;
+    }
+
+    try {
+      workPool.execute(() -> {
+        Plan plan = computePlan(eye, coordinates, raycast);
+        // 读方块与发包必须回到玩家所属线程
+        Schedulers.onEntity(plugin, player, () -> {
+          try {
+            if (player.isOnline()) {
+              sendCandidates(player, player.getWorld(), null, plan, budget);
+            }
+          } catch (Throwable throwable) {
+            logThrottled(throwable);
+          }
+        });
+      });
+    } catch (Throwable throwable) {
+      // 入队失败（线程池关闭等）：退化为主线程纯计算，绝不丢显形
+      logThrottled(throwable);
+      sendCandidates(player, world, null, computePlan(eye, coordinates, false), budget);
+    }
+  }
+
+  /** 工作线程：视锥剔除 + 射线路径计算（纯数学，不触碰任何 Bukkit API）。 */
+  private Plan computePlan(ProximitySelector.Eye eye, int[] coordinates, boolean raycast) {
+    boolean frustum = proximity.frustumEnabled();
+    double minDistance = proximity.frustumMinDistance();
+    double fov = proximity.frustumFov();
+    int samples = proximity.raycastSamples();
+
+    int count = coordinates.length / 3;
+    int[] kept = new int[coordinates.length];
+    int[][] paths = raycast ? new int[count][] : null;
+    int keptCount = 0;
+
+    for (int i = 0; i < count; i++) {
+      int x = coordinates[i * 3];
+      int y = coordinates[i * 3 + 1];
+      int z = coordinates[i * 3 + 2];
+
+      if (frustum && !ProximitySelector.withinFrustum(eye, x, y, z, minDistance, fov)) {
+        stats.revealsFrustumCulled.increment();
+        continue;
+      }
+
+      if (raycast) {
+        paths[keptCount] = ProximitySelector.rayPath(eye, x, y, z, samples);
+      }
+      kept[keptCount * 3] = x;
+      kept[keptCount * 3 + 1] = y;
+      kept[keptCount * 3 + 2] = z;
+      keptCount++;
+    }
+
+    int[] result = new int[keptCount * 3];
+    System.arraycopy(kept, 0, result, 0, result.length);
+    int[][] trimmedPaths = paths == null ? null : Arrays.copyOf(paths, keptCount);
+    return new Plan(result, trimmedPaths);
+  }
+
+  /** 直接发包路径（未启用筛选）：逐个候选发送并注销。 */
+  private void sendCandidates(Player player, World world, List<RevealedBlockIndex.Position> candidates,
+      Plan plan, Budget budget) {
+    if (candidates != null) {
+      for (RevealedBlockIndex.Position position : candidates) {
+        if (budget.remaining <= 0) {
+          return;
+        }
+        sendOne(player, world, position.x(), position.y(), position.z(), null, budget);
+      }
+      return;
+    }
+    if (plan == null) {
+      return;
+    }
+
+    int count = plan.count();
+    for (int i = 0; i < count; i++) {
       if (budget.remaining <= 0) {
         return;
       }
-      if (!world.isChunkLoaded(position.x() >> 4, position.z() >> 4)) {
-        // 区块未加载：本次跳过，坐标留在索引里等玩家真正靠近
-        stats.revealsSkipped.increment();
-        continue;
-      }
-      if (send(player, world, position)) {
-        index.unregister(player.getUniqueId(), worldName, position.x(), position.y(), position.z());
-        stats.revealsSent.increment();
-        budget.remaining--;
-      } else {
-        stats.revealsSkipped.increment();
-      }
+      int x = plan.coordinates[i * 3];
+      int y = plan.coordinates[i * 3 + 1];
+      int z = plan.coordinates[i * 3 + 2];
+      int[] path = plan.paths == null ? null : plan.paths[i];
+      sendOne(player, world, x, y, z, path, budget);
+    }
+  }
+
+  /** 单个坐标：区块未加载则跳过、射线被挡则跳过，否则读真实方块并发包、成功后注销。 */
+  private void sendOne(Player player, World world, int x, int y, int z, int[] path, Budget budget) {
+    if (!world.isChunkLoaded(x >> 4, z >> 4)) {
+      // 区块未加载：本次跳过，坐标留在索引里等玩家真正靠近
+      stats.revealsSkipped.increment();
+      return;
+    }
+
+    if (path != null && isRayOccluded(world, path)) {
+      stats.revealsRayCulled.increment();
+      return;
+    }
+
+    if (send(player, world, x, y, z)) {
+      index.unregister(player.getUniqueId(), world.getName(), x, y, z);
+      stats.revealsSent.increment();
+      budget.remaining--;
+    } else {
+      stats.revealsSkipped.increment();
+    }
+  }
+
+  /** 主线程 / 区域线程读方块做射线遮挡判定；任何异常都按「可见」处理（fail-open，宁可多显形）。 */
+  private boolean isRayOccluded(World world, int[] path) {
+    try {
+      return ProximitySelector.isRayOccluded(path, (x, y, z) -> {
+        BlockData data = world.getBlockData(x, y, z);
+        return data != null && data.isOccluding();
+      });
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+      return false;
     }
   }
 
   /** 构造并发送一条方块变更包；任何异常都只返回 false，不影响原包流程与其它坐标。 */
-  private boolean send(Player player, World world, RevealedBlockIndex.Position position) {
+  private boolean send(Player player, World world, int x, int y, int z) {
     try {
-      BlockData data = world.getBlockData(position.x(), position.y(), position.z());
+      BlockData data = world.getBlockData(x, y, z);
       if (data == null) {
         return false;
       }
 
-      BlockPosition blockPosition = new BlockPosition(position.x(), position.y(), position.z());
+      BlockPosition blockPosition = new BlockPosition(x, y, z);
       PacketContainer packet = protocolManager.createPacket(PacketType.Play.Server.BLOCK_CHANGE);
       packet.getBlockPositionModifier().writeSafely(0, blockPosition);
       packet.getBlockData().writeSafely(0, WrappedBlockData.createData(data));
@@ -239,6 +396,30 @@ public final class ProximityRevealer implements Listener {
 
   private int limit() {
     return Math.max(1, proximity.maxRevealsPerTick());
+  }
+
+  /** 取候选时按额度的若干倍取（视锥/射线会剔除一部分），并限制总量避免单次扫描过重。 */
+  private int fetchLimit(int budget) {
+    return Math.max(1, Math.min(MAX_CANDIDATES, Math.max(1, budget) * CANDIDATE_OVERSAMPLE));
+  }
+
+  /** 玩家眼睛位置与视线方向快照（主线程读取，之后只传纯值）。 */
+  private static ProximitySelector.Eye eyeOf(Player player) {
+    Location eye = player.getEyeLocation();
+    Vector direction = eye.getDirection();
+    return ProximitySelector.eye(eye.getX(), eye.getY(), eye.getZ(),
+        direction.getX(), direction.getY(), direction.getZ());
+  }
+
+  private static int[] flatten(List<RevealedBlockIndex.Position> candidates) {
+    int[] coordinates = new int[candidates.size() * 3];
+    for (int i = 0; i < candidates.size(); i++) {
+      RevealedBlockIndex.Position position = candidates.get(i);
+      coordinates[i * 3] = position.x();
+      coordinates[i * 3 + 1] = position.y();
+      coordinates[i * 3 + 2] = position.z();
+    }
+    return coordinates;
   }
 
   private void logThrottled(Throwable throwable) {

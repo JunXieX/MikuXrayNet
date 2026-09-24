@@ -6,12 +6,14 @@ import com.comphenix.protocol.async.AsyncMarker;
 import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketEvent;
+import java.nio.ByteBuffer;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
+import net.mikumc.mikuxraynet.cache.DiskCacheStore;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.concurrency.RewriteTask;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
@@ -55,6 +57,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final boolean handleChunkBatch;
   private final RevealedBlockIndex revealedIndex;
   private final BypassRegistry bypassRegistry;
+  private final DiskCacheStore diskCache;
   private final RewriteStats stats = new RewriteStats();
   private final ConcurrentHashMap<UUID, ChunkBatchGate> batches = new ConcurrentHashMap<>();
   private final AtomicInteger errorLogs = new AtomicInteger();
@@ -64,11 +67,12 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * @param handleChunkBatch 是否拦截 1.20.2+ 的区块批量包（不可用时由装配方降级为 false）
    * @param revealedIndex    显形索引；{@code null} 表示不做邻近显形
    * @param bypassRegistry   直通名单；{@code null} 表示退化为无直通（仍按世界范围判定）
+   * @param diskCache        磁盘缓存；{@code null} 表示只用内存缓存
    */
   public ProtocolLibAsyncListener(Plugin plugin, AntiXrayConfig config, ObfuscationProcessor processor,
       MikuWorkPool workPool, AsynchronousManager asynchronousManager,
       NeighborChunkProvider neighborProvider, boolean handleChunkBatch,
-      RevealedBlockIndex revealedIndex, BypassRegistry bypassRegistry) {
+      RevealedBlockIndex revealedIndex, BypassRegistry bypassRegistry, DiskCacheStore diskCache) {
     super(plugin, ListenerPriority.NORMAL, packetTypes(handleChunkBatch));
     this.config = config;
     this.processor = processor;
@@ -80,6 +84,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     this.handleChunkBatch = handleChunkBatch;
     this.revealedIndex = revealedIndex;
     this.bypassRegistry = bypassRegistry;
+    this.diskCache = diskCache;
   }
 
   /** 与 MAP_CHUNK 同列白名单，才能让批次包走同一条「每玩家有序发送队列」。 */
@@ -248,7 +253,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
         CachedChunk cached = cache.get(task.worldName(), task.chunkX(), task.chunkZ(),
             config.configHash());
-        if (cached != null && cached.sourceHash() == sourceHash) {
+        if (cached == null || cached.sourceHash() != sourceHash) {
+          cached = loadFromDisk(task, sourceHash);
+        }
+
+        if (cached != null) {
           writeBack(accessor, task, cached.data(), cached.positions());
         } else {
           NeighborEdges neighbors = neighborsEnabled
@@ -265,7 +274,31 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     task.signalOnce();
   }
 
-  /** 改写并回填缓存。 */
+  /**
+   * 内存未命中时尝试磁盘缓存；命中则回填内存缓存。
+   *
+   * <p>磁盘读带 50ms 预算（见 {@code DiskCacheStore}），超时/异常一律按未命中降级，
+   * 因此不会把封包处理拖过时限。负载里带原始字节指纹，指纹不符即视为未命中。
+   */
+  private CachedChunk loadFromDisk(RewriteTask task, long sourceHash) {
+    if (diskCache == null || !diskCache.usable()) {
+      return null;
+    }
+    try {
+      CachedChunk fromDisk = decodeDiskPayload(
+          diskCache.get(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash()),
+          sourceHash);
+      if (fromDisk != null) {
+        cache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(), fromDisk);
+      }
+      return fromDisk;
+    } catch (Throwable throwable) {
+      logThrottled("读取磁盘缓存失败，已按未命中处理", throwable);
+      return null;
+    }
+  }
+
+  /** 改写并回填内存缓存与磁盘缓存。 */
   private void rewrite(RewriteTask task, ChunkPacketAccessor accessor, byte[] source, long sourceHash,
       NeighborEdges neighbors) {
     task.markDecoded();
@@ -281,7 +314,59 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions());
     cache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(), value);
+    if (diskCache != null) {
+      // 磁盘写入是「提交即返回」的异步操作（自有磁盘线程），不阻塞本工作线程
+      diskCache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(),
+          encodeDiskPayload(sourceHash, result.obfuscatedPositions(), result.data()));
+    }
     writeBack(accessor, task, value.data(), value.positions());
+  }
+
+  /**
+   * 磁盘缓存负载编码：{@code [i64 原始字节指纹][i32 伪装坐标数][i32… 伪装坐标][改写后的 section 字节]}。
+   *
+   * <p>指纹用于识别「同一区块位置的封包字节是否变了」；伪装坐标用于回填时剔除方块实体，
+   * 也用于重新写入显形索引。
+   */
+  private static byte[] encodeDiskPayload(long sourceHash, int[] positions, byte[] data) {
+    ByteBuffer buffer = ByteBuffer.allocate(8 + 4 + positions.length * Integer.BYTES + data.length);
+    buffer.putLong(sourceHash);
+    buffer.putInt(positions.length);
+    for (int position : positions) {
+      buffer.putInt(position);
+    }
+    buffer.put(data);
+    return buffer.array();
+  }
+
+  /** 解码磁盘缓存负载；指纹不符、截断或结构异常都返回 {@code null}（按未命中处理）。 */
+  private static CachedChunk decodeDiskPayload(byte[] payload, long expectedSourceHash) {
+    if (payload == null || payload.length < 12) {
+      return null;
+    }
+    try {
+      ByteBuffer buffer = ByteBuffer.wrap(payload);
+      long sourceHash = buffer.getLong();
+      if (sourceHash != expectedSourceHash) {
+        return null;
+      }
+      int count = buffer.getInt();
+      if (count < 0 || count > buffer.remaining() / Integer.BYTES) {
+        return null;
+      }
+      int[] positions = new int[count];
+      for (int index = 0; index < count; index++) {
+        positions[index] = buffer.getInt();
+      }
+      byte[] data = new byte[buffer.remaining()];
+      buffer.get(data);
+      if (data.length == 0) {
+        return null;
+      }
+      return new CachedChunk(sourceHash, data, positions);
+    } catch (RuntimeException exception) {
+      return null;
+    }
   }
 
   /**

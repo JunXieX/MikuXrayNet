@@ -21,12 +21,24 @@ public final class ProximityStats {
   /** 因服务端自行下发方块变更而从索引注销的坐标数。 */
   public final LongAdder unregistered = new LongAdder();
 
+  /** 被视锥剔除的候选坐标数（不在玩家视野锥内）。 */
+  public final LongAdder revealsFrustumCulled = new LongAdder();
+
+  /** 因射线被遮挡而跳过显形的候选坐标数（等玩家靠近后再显形）。 */
+  public final LongAdder revealsRayCulled = new LongAdder();
+
+  /** 因工作队列已满而退化为「主线程只做视锥」的次数（射线判定降级）。 */
+  public final LongAdder revealsQueuedSkipped = new LongAdder();
+
   /** 生成中文可读快照（顺序稳定，便于命令输出）。 */
   public Map<String, Long> snapshot() {
     Map<String, Long> map = new LinkedHashMap<>();
     map.put("显形发送", revealsSent.sum());
     map.put("显形跳过", revealsSkipped.sum());
     map.put("变更注销", unregistered.sum());
+    map.put("视锥剔除", revealsFrustumCulled.sum());
+    map.put("射线剔除", revealsRayCulled.sum());
+    map.put("降级次数", revealsQueuedSkipped.sum());
     return map;
   }
 }
