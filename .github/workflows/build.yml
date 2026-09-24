@@ -51,16 +51,24 @@ jobs:
           path: target/MikuXrayNet-*.jar
           if-no-files-found: error
 
-      - name: Resolve release title
+      - name: Resolve release info
         if: startsWith(github.ref, 'refs/tags/')
-        id: title
-        run: echo "value=MikuXrayNet ${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        id: rel
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          echo "title=MikuXrayNet ${VER}" >> "$GITHUB_OUTPUT"
+          # 版本规则（大版本.正式版.测试版）：第三位 > 0 视为测试版（预发布），= 0 为正式版
+          PATCH="${VER##*.}"
+          case "$PATCH" in
+            0) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+          esac
 
       - name: Publish Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
-          name: ${{ steps.title.outputs.value }}
+          name: ${{ steps.rel.outputs.title }}
           files: target/MikuXrayNet-*.jar
-          prerelease: ${{ contains(github.ref_name, 'Beta') }}
+          prerelease: ${{ steps.rel.outputs.prerelease }}
           generate_release_notes: true
