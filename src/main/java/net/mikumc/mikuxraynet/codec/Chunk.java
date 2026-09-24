@@ -77,6 +77,9 @@ public class Chunk implements AutoCloseable {
   /**
    * 该 section 在原始字节数组中的区间；{@code null} 表示该 section 在缓冲区中没有字节
    * （或区间无法确定，此时 {@link #finalizeOutput()} 会退回整块重编码）。
+   *
+   * <p>测试专用豁免：生产的选择性重编码由 {@code ChunkSectionHolder} 内部完成，
+   * 本方法当前仅单测与基准路径在用，保留以免破坏测试。
    */
   public SectionRange originalSectionRange(int index) {
     ChunkSectionHolder holder = this.sections[index];

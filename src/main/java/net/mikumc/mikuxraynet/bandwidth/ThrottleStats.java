@@ -1,14 +1,12 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
-import java.util.LinkedHashMap;
-import java.util.Map;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
- * 带宽模块统计计数，供后续 {@code /mikuxraynet status} 读取。
+ * 带宽模块统计计数，供 {@code /mikuxraynet status} 读取。
  *
  * <p>全部字段为无锁 {@link LongAdder}：网络线程、工作线程、主线程都可以安全累加，
- * 读取时通过 {@link #snapshot()} 取得一致的可读快照。
+ * 读取方（诊断聚合）直接按需取 {@code sum()}。
  */
 public final class ThrottleStats {
 
@@ -43,24 +41,4 @@ public final class ThrottleStats {
   /** 高延迟降视距：降视距次数 / 还原次数。 */
   public final LongAdder viewDistanceReduced = new LongAdder();
   public final LongAdder viewDistanceRestored = new LongAdder();
-
-  /** 生成中文可读快照（顺序稳定，便于命令输出）。 */
-  public Map<String, Long> snapshot() {
-    Map<String, Long> map = new LinkedHashMap<>();
-    map.put("零位移取消", entityPacketsCancelled.sum());
-    map.put("零位移放行", entityPacketsPassed.sum());
-    map.put("合并批次", blockMergeBatches.sum());
-    map.put("合并变更数", blockChangesMerged.sum());
-    map.put("变更原样放行", blockChangesPassed.sum());
-    map.put("实体隐藏", entitiesHidden.sum());
-    map.put("实体恢复", entitiesShown.sum());
-    map.put("复检提交", recheckSubmitted.sum());
-    map.put("复检致隐藏", recheckHidden.sum());
-    map.put("复检致恢复", recheckShown.sum());
-    map.put("进入AFK", afkEntered.sum());
-    map.put("AFK丢包", afkPacketsDropped.sum());
-    map.put("降视距", viewDistanceReduced.sum());
-    map.put("还原视距", viewDistanceRestored.sum());
-    return map;
-  }
 }

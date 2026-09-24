@@ -32,12 +32,22 @@ public final class NeighborEdges {
     this.zPlus = zPlus;
   }
 
-  /** 快照覆盖的区块内高度（section 数 × 16）。 */
+  /**
+   * 快照覆盖的区块内高度（section 数 × 16）。
+   *
+   * <p>测试专用豁免：生产查询走 {@link #occluding}（内部已含高度越界判定），
+   * 本方法当前仅单测与基准路径在用，保留以免破坏测试。
+   */
   public int height() {
     return height;
   }
 
-  /** 该侧平面是否可用。 */
+  /**
+   * 该侧平面是否可用。
+   *
+   * <p>测试专用豁免：生产查询直接调 {@link #occluding}（平面缺失返回 {@link #MISSING}），
+   * 本方法当前仅单测与基准路径在用，保留以免破坏测试。
+   */
   public boolean has(Side side) {
     return plane(side) != null;
   }

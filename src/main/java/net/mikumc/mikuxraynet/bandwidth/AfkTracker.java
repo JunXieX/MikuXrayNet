@@ -146,12 +146,6 @@ public final class AfkTracker implements Listener {
         location.getX(), location.getY(), location.getZ()));
   }
 
-  /** 当前是否处于 AFK 状态（供诊断/命令查询）。 */
-  public boolean isAfk(UUID playerId) {
-    AfkState state = states.get(playerId);
-    return state != null && state.isTimedOut(System.currentTimeMillis(), timeoutMillis);
-  }
-
   /** 当前处于 AFK 状态的玩家数（诊断用，非热路径）。 */
   public int afkCount() {
     long now = System.currentTimeMillis();

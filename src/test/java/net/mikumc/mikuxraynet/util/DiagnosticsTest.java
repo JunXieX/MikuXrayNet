@@ -1,5 +1,6 @@
 package net.mikumc.mikuxraynet.util;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
@@ -86,6 +87,27 @@ class DiagnosticsTest {
     List<String> first = Diagnostics.formatStatus(fixed());
     List<String> second = Diagnostics.formatStatus(fixed());
     assertTrue(first.equals(second), "同样的计数器必须得到同样的文本");
+  }
+
+  /**
+   * 周期运行摘要（diagnostics.interval-seconds 驱动）必须恒为一行、只含关键计数，
+   * 与完整状态面板（formatStatus）区分开——周期日志输出整面板会刷屏。
+   */
+  @Test
+  void summaryLineIsSingleLineWithKeyCounters() {
+    String line = Diagnostics.formatSummaryLine(fixed());
+
+    assertFalse(line.contains("\n"), "运行摘要必须恒为一行：" + line);
+    assertTrue(line.startsWith("运行摘要："), line);
+    assertTrue(line.contains("反矿透 生效"), line);
+    assertTrue(line.contains("区块改写 100（异常 2，超时放行 2）"), line);
+    assertTrue(line.contains("显形发送 7"), line);
+    assertTrue(line.contains("实体隐藏 6/恢复 5（当前隐藏中 4）"), line);
+    assertTrue(line.contains("磁盘缓存命中 30"), line);
+    assertTrue(line.contains("队列 10/2048"), line);
+    // 精简版不得把整面板的内容都塞进来（如依赖状态、AFK、带宽开关段）
+    assertFalse(line.contains("依赖"), "单行摘要不该包含状态面板的完整内容：" + line);
+    assertFalse(line.contains("AFK"), line);
   }
 
   @Test

@@ -125,10 +125,6 @@ public class ChunkSection {
     this.data.set(index, paletteIndex);
   }
 
-  public int getBlock(int x, int y, int z) {
-    return this.getBlockState(positionToIndex(x, y, z));
-  }
-
   public int getBlockState(int index) {
     return this.palette.valueFor(this.data.get(index));
   }

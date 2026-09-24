@@ -1,6 +1,8 @@
 package net.mikumc.mikuxraynet.concurrency;
 
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -23,6 +25,15 @@ public final class MikuWorkPool implements AutoCloseable {
   private final ThreadPoolExecutor executor;
   private final ScheduledExecutorService watchdog;
   private final int queueCapacity;
+
+  /**
+   * 已提交、尚未执行完毕的改写任务登记。
+   *
+   * <p><b>为什么需要</b>：{@code close()} 时 {@code shutdownNow} 会把队列里还没跑的任务一并丢弃——
+   * 若没有这份登记，这些任务对应的封包就「既没人改写、也没人放行」，客户端永久卡在加载界面。
+   * close 会对其中尚未开始写入的任务逐一 {@link RewriteTask#signalOnce()} 放行（fail-open 真正兜底）。
+   */
+  private final Set<RewriteTask> pending = ConcurrentHashMap.newKeySet();
 
   public MikuWorkPool(int threads, int queueCapacity) {
     int workerCount = threads > 0 ? threads : Math.min(4, Runtime.getRuntime().availableProcessors());
@@ -77,15 +88,56 @@ public final class MikuWorkPool implements AutoCloseable {
     this.executor.execute(task);
   }
 
+  /**
+   * 提交一个区块改写任务（登记进 {@link #pending}，执行完毕后自动解除登记）。
+   *
+   * <p>队列已满会抛 {@link java.util.concurrent.RejectedExecutionException}（登记随之解除）；
+   * {@link #close()} 时会对其中尚未开始写入的任务做放行兜底。
+   */
+  public void execute(RewriteTask task, Runnable payload) {
+    pending.add(task);
+    try {
+      this.executor.execute(() -> {
+        try {
+          payload.run();
+        } finally {
+          pending.remove(task);
+        }
+      });
+    } catch (Throwable throwable) {
+      pending.remove(task);
+      throw throwable;
+    }
+  }
+
   /** 登记一个超时回调；调用方应在任务结束时取消它，避免无谓地延长封包引用寿命。 */
   public ScheduledFuture<?> scheduleTimeout(Runnable timeoutAction, long delayMillis) {
     return this.watchdog.schedule(timeoutAction, Math.max(1L, delayMillis), TimeUnit.MILLISECONDS);
   }
 
-  /** 关闭线程池；已提交未执行的任务会被丢弃（fail-open 由各任务的 signalOnce 兜底）。 */
+  /**
+   * 关闭线程池。关闭前先「排空队列 + 放行兜底」：
+   * 对每个已登记、尚未开始写入的 {@link RewriteTask} 调 {@link RewriteTask#signalOnce()} 放行，
+   * 否则 shutdownNow 丢弃的排队任务会让对应封包永远无人放行（客户端卡加载界面）。
+   *
+   * <p>放行顺序上先 {@code shutdownNow} 再兜底：队列一旦排空就不会再有排队任务被启动，
+   * 而正在写入中的任务（{@link RewriteTask#isWriting()}）由其工作线程自行放行，
+   * 兜底跳过它们，避免「包已发出却仍在改写」的写回竞争。
+   * {@code signalOnce} 幂等（CAS 保证恰好一次）：已被看门狗放行或已完成的任务不受影响。
+   */
   @Override
   public void close() {
     this.executor.shutdownNow();
+    for (RewriteTask task : pending) {
+      if (!task.isWriting()) {
+        try {
+          task.signalOnce();
+        } catch (Throwable ignored) {
+          // 单个任务的放行动作异常（例如玩家已掉线导致回调失败）不得中断其余任务的兜底放行
+        }
+      }
+    }
+    pending.clear();
     this.watchdog.shutdownNow();
   }
 }

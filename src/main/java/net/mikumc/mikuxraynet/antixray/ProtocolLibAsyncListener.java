@@ -6,8 +6,9 @@ import com.comphenix.protocol.async.AsyncMarker;
 import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketEvent;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -21,6 +22,10 @@ import net.mikumc.mikuxraynet.util.BypassRegistry;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.HandlerList;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 
 /**
@@ -47,6 +52,63 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private record CachedChunk(long sourceHash, byte[] data, int[] positions) {
   }
 
+  /**
+   * 未配对批次闸门表：按插入序持有，超限时<b>只淘汰最旧的一个</b>，玩家退出时按 UUID 清理。
+   *
+   * <p>旧实现是「超限 {@code clear()} 清掉所有玩家」——一个异常玩家的陈旧闸门会让全服
+   * 正在进行中的批次全部失去计数（提前放行 FINISHED）。LinkedHashMap（插入序）+ 淘汰队首
+   * 把影响面收敛到单个玩家：被淘汰玩家的 FINISHED 无配对 START，直接照常放行，
+   * 其余玩家的批次闸门不受影响。
+   *
+   * <p>网络线程并发访问（不同玩家的封包回调可同时到达），操作统一加锁；锁内只有内存操作。
+   */
+  static final class BatchTable {
+
+    private final int maxPending;
+    private final LinkedHashMap<UUID, ChunkBatchGate> gates = new LinkedHashMap<>();
+
+    BatchTable() {
+      this(MAX_PENDING_BATCHES);
+    }
+
+    /** 测试用构造：可指定容量上限。 */
+    BatchTable(int maxPending) {
+      this.maxPending = Math.max(1, maxPending);
+    }
+
+    /** 取某玩家当前未配对的闸门；无则返回 {@code null}。 */
+    synchronized ChunkBatchGate get(UUID playerId) {
+      return gates.get(playerId);
+    }
+
+    /** 打开某玩家的批次闸门；已达上限时先淘汰最旧的未完成条目（只清一个）。 */
+    synchronized void open(UUID playerId) {
+      while (gates.size() >= maxPending) {
+        Iterator<UUID> iterator = gates.keySet().iterator();
+        if (!iterator.hasNext()) {
+          break;
+        }
+        iterator.next();
+        iterator.remove();
+      }
+      gates.put(playerId, new ChunkBatchGate());
+    }
+
+    /** 移除并返回某玩家的闸门（批次结束 / 玩家退出时调用）。 */
+    synchronized ChunkBatchGate remove(UUID playerId) {
+      return gates.remove(playerId);
+    }
+
+    synchronized int size() {
+      return gates.size();
+    }
+
+    /** 清空全部闸门（停用时调用；此时不会再有批次包到达）。 */
+    synchronized void clear() {
+      gates.clear();
+    }
+  }
+
   private final AntiXrayConfig config;
   private final ObfuscationProcessor processor;
   private final MikuWorkPool workPool;
@@ -60,7 +122,22 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final BypassRegistry bypassRegistry;
   private final DiskCacheStore diskCache;
   private final RewriteStats stats = new RewriteStats();
-  private final ConcurrentHashMap<UUID, ChunkBatchGate> batches = new ConcurrentHashMap<>();
+  private final BatchTable batches = new BatchTable();
+  /**
+   * 玩家退出清理批次闸门的 Bukkit 监听。
+   *
+   * <p>ProtocolLib 的 {@code PacketAdapter} 不是 Bukkit {@link Listener}，因此用独立的匿名监听对象
+   * 注册/注销，与 {@link #registerQuitHook()} 严格配对。中途掉线的玩家不会再有 FINISHED 包来移除
+   * 其批次闸门，必须在退出事件里清理。
+   */
+  private final Listener quitListener = new Listener() {
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+      batches.remove(event.getPlayer().getUniqueId());
+    }
+  };
+  /** 退出监听是否已注册（注册/注销必须配对）。 */
+  private volatile boolean quitHookRegistered;
   private final AtomicInteger errorLogs = new AtomicInteger();
   /** 「首次改写诊断」只打一次（CAS 抢占），避免每区块刷屏。 */
   private final AtomicBoolean firstRewriteDiagnosed = new AtomicBoolean();
@@ -91,6 +168,35 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     this.revealedSet = revealedSet;
     this.bypassRegistry = bypassRegistry;
     this.diskCache = diskCache;
+    registerQuitHook();
+  }
+
+  /**
+   * 注册玩家退出监听：中途掉线的玩家不再有 FINISHED 包来移除其批次闸门，
+   * 必须在退出事件里清理，否则陈旧闸门只能靠超限淘汰兜底。
+   */
+  private void registerQuitHook() {
+    try {
+      getPlugin().getServer().getPluginManager().registerEvents(quitListener, getPlugin());
+      quitHookRegistered = true;
+    } catch (Throwable throwable) {
+      logThrottled("玩家退出清理监听注册失败（批次闸门退化为仅靠超限淘汰兜底）", throwable);
+    }
+  }
+
+  /**
+   * 注销本监听器的玩家退出监听（与 {@link #registerQuitHook()} 配对，停用时调用），并清空闸门表。
+   */
+  public void unregisterBukkitHooks() {
+    if (quitHookRegistered) {
+      quitHookRegistered = false;
+      try {
+        HandlerList.unregisterAll(quitListener);
+      } catch (Throwable throwable) {
+        logThrottled("注销玩家退出清理监听时出现异常（通常可忽略）", throwable);
+      }
+    }
+    batches.clear();
   }
 
   /** 与 MAP_CHUNK 同列白名单，才能让批次包走同一条「每玩家有序发送队列」。 */
@@ -148,7 +254,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     int minHeight = world.getMinHeight();
     int sectionCount = (world.getMaxHeight() - minHeight) / 16;
-    RewriteTask task = new RewriteTask(player.getUniqueId(), accessor.chunkX(), accessor.chunkZ(),
+    RewriteTask task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
         world.getName(), minHeight, sectionCount, config.timeoutMillis(),
         gate == null
             ? () -> asynchronousManager.signalPacketTransmission(event)
@@ -185,7 +291,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
 
     try {
-      workPool.execute(() -> handleAsync(task, accessor, timeout));
+      workPool.execute(task, () -> handleAsync(task, accessor, timeout));
     } catch (Throwable throwable) {
       // 已登记延迟却没能入队：必须立即放行，否则该封包永久卡住
       logThrottled("区块改写任务入队失败，已按原包放行", throwable);
@@ -200,11 +306,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     if (player == null || !appliesTo(player)) {
       return;
     }
-    if (batches.size() > MAX_PENDING_BATCHES) {
-      // 异常情况（例如玩家在批次中途掉线）下的兜底：丢弃陈旧闸门，避免无界增长
-      batches.clear();
-    }
-    batches.put(player.getUniqueId(), new ChunkBatchGate());
+    // 闸门表有界：超限时 BatchTable 只淘汰最旧的一个条目（旧实现 clear() 会误清所有玩家的批次）
+    batches.open(player.getUniqueId());
   }
 
   /**
@@ -310,10 +413,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** 改写并回填内存缓存与磁盘缓存。 */
   private void rewrite(RewriteTask task, ChunkPacketAccessor accessor, byte[] source, long sourceHash,
       NeighborEdges neighbors) {
-    task.markDecoded();
     ObfuscationProcessor.Result result = processor.rewrite(source, task.sectionCount(),
         seed(task.worldName(), task.chunkX(), task.chunkZ()), neighbors);
-    task.markEncoded();
 
     if (result.failed()) {
       // 解码/重编码异常：必须可观测——否则「本该伪装却失败」会被并进「跳过」里，看起来一切正常
@@ -399,7 +500,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       }
 
       try {
-        workPool.execute(() -> handleAsync(task, accessor, timeout));
+        workPool.execute(task, () -> handleAsync(task, accessor, timeout));
       } catch (Throwable throwable) {
         // 任何意外都必须归还这次延迟，否则该封包永久卡住（signalOnce 保证恰好放行一次）
         logThrottled("邻区块抓取后的改写调度失败，已按原包放行", throwable);
@@ -423,7 +524,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     if (positions.length == 0) {
       return;
     }
-    if (!accessor.update(data, positions, task.minHeight())) {
+    if (!accessor.update(data, positions, task.minHeight(), config.removeBlockEntities())) {
       // 「算了但没写」：setBuffer 回读不一致（ProtocolLib 版本/封包结构不符），必须留痕
       stats.writeBackFailures.increment();
       logThrottled("区块改写结果未能写回封包（setBuffer 回读不一致），本轮按原包内容放行", null);
@@ -495,11 +596,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** 当前缓存条目数（诊断用）。 */
   public int cacheSize() {
     return cache.size();
-  }
-
-  /** 当前邻块快照条目数（诊断用）。 */
-  public int neighborCacheSize() {
-    return neighborProvider == null ? 0 : neighborProvider.size();
   }
 
   private void logThrottled(String message, Throwable throwable) {

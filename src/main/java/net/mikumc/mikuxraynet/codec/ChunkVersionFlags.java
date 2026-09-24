@@ -32,6 +32,12 @@ public final class ChunkVersionFlags {
         isAtOrAbove(minecraftVersion, "1.18"));
   }
 
+  /**
+   * 按各标志显式构造。
+   *
+   * <p>测试专用豁免：生产路径只用 {@link #ChunkVersionFlags(String)}（按版本推导），
+   * 本构造当前仅单测在用，保留以免破坏测试。
+   */
   public ChunkVersionFlags(boolean hasFluidCount, boolean hasLongArrayLengthField,
       boolean hasBiomePalettedContainer, boolean hasSingleValuePalette) {
     this.hasFluidCount = hasFluidCount;

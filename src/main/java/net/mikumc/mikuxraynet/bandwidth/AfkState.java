@@ -34,11 +34,6 @@ public final class AfkState {
     this.z = z;
   }
 
-  /** 上次活动时间（毫秒时间戳）。 */
-  public long lastActiveMillis() {
-    return lastActiveMillis;
-  }
-
   public boolean afk() {
     return afk;
   }

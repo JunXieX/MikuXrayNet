@@ -265,7 +265,12 @@ public final class RevealedSet {
     }
   }
 
-  /** 当前「玩家 × 区块」标记条目数（诊断用）。 */
+  /**
+   * 当前「玩家 × 区块」标记条目数（诊断用）。
+   *
+   * <p>测试专用豁免：生产诊断走 {@link #positionCount()}（坐标口径），
+   * 本方法当前仅单测在用，保留以免破坏测试。
+   */
   public int markerCount() {
     int total = 0;
     for (ConcurrentHashMap<UUID, Marker> players : chunks.values()) {

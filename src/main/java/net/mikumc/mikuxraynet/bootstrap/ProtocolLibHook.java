@@ -105,6 +105,11 @@ public final class ProtocolLibHook {
   /** 注销拦截；可重复调用，异常安全。 */
   public void unregister() {
     try {
+      ProtocolLibAsyncListener current = listener;
+      if (current != null) {
+        // 先注销监听器自己的 Bukkit 事件监听（玩家退出清理），与构造时的注册配对
+        current.unregisterBukkitHooks();
+      }
       if (asynchronousManager != null && asyncListenerHandler != null) {
         asynchronousManager.unregisterAsyncHandler(asyncListenerHandler);
       }

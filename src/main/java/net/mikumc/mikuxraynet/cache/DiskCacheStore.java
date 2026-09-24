@@ -9,6 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -107,6 +108,14 @@ public final class DiskCacheStore implements AutoCloseable {
   private final Map<ChunkRef, Long> generations = new LinkedHashMap<>(1024, 0.75f, true);
   private final AtomicInteger pendingOps = new AtomicInteger();
   private final AtomicInteger approximateEntries = new AtomicInteger();
+  /**
+   * 已做过「磁盘既有条目补计」的区域文件（每进程每文件至多一次）。
+   *
+   * <p>重启后 {@link #approximateEntries} 从 0 开始；首次打开某个已存在的区域文件时把磁盘上的
+   * 真实条目数补计进来，否则 {@code max-entries} 上限在重启后完全失效（旧条目不占额度）。
+   * 句柄闲置关闭后重开不会重扫（文件内容未变，计数仍准确）。
+   */
+  private final Set<RegionKey> entryCounted = ConcurrentHashMap.newKeySet();
   private final long maxFileSizeBytes;
   private final long readTimeoutMillis;
   private final ScheduledExecutorService executor;
@@ -287,22 +296,6 @@ public final class DiskCacheStore implements AutoCloseable {
   /** 当前打开的区域文件数（诊断用）。 */
   public int openRegionFiles() {
     return open.size();
-  }
-
-  /** 当前跟踪代次的区块数（诊断用）。 */
-  public int trackedChunks() {
-    synchronized (generations) {
-      return generations.size();
-    }
-  }
-
-  /** 当前区域文件占用字节（诊断用，近似值）。 */
-  public long diskBytes() {
-    long total = 0L;
-    for (Handle handle : open.values()) {
-      total += handle.file.sizeBytes();
-    }
-    return total;
   }
 
   /** 是否处于可用状态（配置开启且未关闭）。 */
@@ -548,13 +541,60 @@ public final class DiskCacheStore implements AutoCloseable {
     }
 
     Handle created = new Handle(file);
+    if (entryCounted.add(key) && file.sizeBytes() > BufferedLinearV3Format.DATA_AREA_OFFSET) {
+      // 重启后 approximateEntries 从 0 开始：必须把磁盘上已有的条目补计进来，
+      // 否则 max-entries 上限在重启后完全失效（旧条目不占额度，磁盘可无限增长）。
+      // 异步一次性扫描（逐 bucket 解码计数），不阻塞触发本次打开的读写；此后由
+      // put/remove/compact 增量维护。排程与扫描之间恰被落盘的新写入会被重复计入一次——
+      // 计数本就是近似值，偏差方向是「提前拒绝新写入」，保守无害。
+      try {
+        executor.execute(() -> countDiskEntries(key, created));
+      } catch (Throwable throwable) {
+        // 排程失败（停用等）：放回待计数集合，下次打开重试
+        entryCounted.remove(key);
+      }
+    }
     Handle raced = open.putIfAbsent(key, created);
     if (raced != null) {
-      // 理论上不会发生（全部在磁盘线程串行），兜底：保留先到者
-      closeHandleQuietly(created);
+      // 理论上不会发生（全部在磁盘线程串行），兜底：保留先到者。
+      // 只 close 不 delete——文件可能正被先到者使用，删除会破坏对方句柄（A9）。
+      try {
+        created.file.close();
+      } catch (Throwable throwable) {
+        fail("关闭重复打开的磁盘缓存区域文件失败（不影响先到者）", throwable);
+      }
       return raced;
     }
     return created;
+  }
+
+  /**
+   * 首次打开某区域文件时，把磁盘上已有的条目数补进 {@link #approximateEntries}（一次性后台扫描）。
+   *
+   * <p>计数取「文件里的全部条目」而不过滤过期/旧代次——这些条目随后被惰性清理或压缩回收时
+   * 会正常递减，多计的部分只是暂时的保守值；宁可计数偏大提前拒绝写入，也不偏小放任磁盘增长。
+   */
+  private void countDiskEntries(RegionKey key, Handle handle) {
+    if (closed || open.get(key) != handle) {
+      // 句柄已被世界卸载/停用关闭或被重建：放回待计数集合，下次打开时重试
+      entryCounted.remove(key);
+      return;
+    }
+    try {
+      int count = 0;
+      int totalSlots = BufferedLinearV3Format.BUCKET_COUNT * BufferedLinearV3Format.BUCKET_SIZE;
+      for (int chunkIndex = 0; chunkIndex < totalSlots; chunkIndex++) {
+        if (handle.file.get(chunkIndex) != null) {
+          count++;
+        }
+      }
+      if (count > 0) {
+        approximateEntries.addAndGet(count);
+      }
+    } catch (Throwable throwable) {
+      // 计数失败只影响上限的准确度（偏小），绝不影响缓存读写（fail-open）
+      fail("统计磁盘缓存既有条目失败（max-entries 计数可能偏小，不影响缓存功能）", throwable);
+    }
   }
 
   private Path pathFor(String worldName, int regionX, int regionZ) {

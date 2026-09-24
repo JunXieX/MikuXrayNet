@@ -165,22 +165,6 @@ final class RegionFile implements AutoCloseable {
     return bucketSlots == null ? null : bucketSlots[slotInBucket(chunkIndex)];
   }
 
-  /** 已加载 bucket 内的近似条目数（诊断用；未加载的 bucket 不计入）。 */
-  int approximateEntryCount() {
-    int count = 0;
-    for (BufferedLinearV3Format.Entry[] bucketSlots : slots) {
-      if (bucketSlots == null) {
-        continue;
-      }
-      for (BufferedLinearV3Format.Entry entry : bucketSlots) {
-        if (entry != null) {
-          count++;
-        }
-      }
-    }
-    return count;
-  }
-
   // ------------------------------------------------------------------ 写
 
   /**
@@ -497,6 +481,10 @@ final class RegionFile implements AutoCloseable {
         try {
           if (flushBucket(victim)) {
             writePosTable();
+            // 驱逐落盘后旧副本成为垃圾：与 flushDirty/compact 口径一致地重算垃圾字节数，
+            // 否则压缩回收的「垃圾占比」判定会低估，垃圾迟迟得不到回收
+            garbageBytes = Math.max(0L,
+                fileSize - BufferedLinearV3Format.DATA_AREA_OFFSET - liveBytes);
           }
         } catch (IOException exception) {
           // 落盘失败：保留脏标记与内存态，等下次 flush/close 再试

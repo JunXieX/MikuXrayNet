@@ -91,16 +91,6 @@ public final class PlatformSupport {
     return detection().folia();
   }
 
-  /** 当前生效的判定模式。 */
-  public static Mode mode() {
-    return detection().mode();
-  }
-
-  /** 判定依据（启动日志与诊断用），例如「服务端名称=Leaf（不含 folia 标识 → Paper 系）」。 */
-  public static String evidence() {
-    return detection().evidence();
-  }
-
   /** 平台描述（启动日志）。例：{@code Leaf 26.2（Paper 系，单主线程）｜判定依据：服务端名称=Leaf}。 */
   public static String platformDescription() {
     Detection detection = detection();

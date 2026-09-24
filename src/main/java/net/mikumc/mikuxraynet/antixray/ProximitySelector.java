@@ -53,7 +53,12 @@ public final class ProximitySelector {
   public static final int FACE_POS_Z = 1 << 4;
   public static final int FACE_NEG_Z = 1 << 5;
 
-  /** 六个面全暴露的掩码。 */
+  /**
+   * 六个面全暴露的掩码。
+   *
+   * <p>测试专用豁免：生产路径只在 {@link #exposedFaces} 内部用作「无遮挡表」时的返回值，
+   * 无外部生产调用方；保留为公开常量以免破坏单测。
+   */
   public static final int ALL_FACES =
       FACE_POS_X | FACE_NEG_X | FACE_POS_Y | FACE_NEG_Y | FACE_POS_Z | FACE_NEG_Z;
 
@@ -157,6 +162,9 @@ public final class ProximitySelector {
    * 显形判定请用 {@link #isVisible}——矿几乎总是嵌在岩石里，到中心的射线会先钻进
    * 相邻岩石，把「明明看得到」的裸露矿误判为被遮挡。
    *
+   * <p>测试专用豁免：生产显形判定走 {@link #isVisible} 的多候选点采样，本方法当前仅单测在用，
+   * 保留以免破坏测试。
+   *
    * @param maxSamples 最多采样数（越小越省主线程读方块次数，但可能漏判薄墙）
    */
   public static int[] rayPath(Eye eye, int blockX, int blockY, int blockZ, int maxSamples) {
@@ -177,6 +185,8 @@ public final class ProximitySelector {
    * <p>注意：这只是「单点」采样，角落场景仍会被旁边方块挡住；生产路径已改用 {@link #isVisible} 的
    * 多候选点判定，本方法保留给需要单点语义的场合与离线测试。
    *
+   * <p>测试专用豁免：生产显形判定走 {@link #isVisible}，本方法当前仅单测在用，保留以免破坏测试。
+   *
    * <p>起点（眼睛）与终点所在体素由 {@link OcclusionRaytracer#voxelPath} 排除，因此贴墙、站在
    * 方块棱角上、甚至眼位就在目标方块内（此时长度 0 → 空路径 → 视为可见）都能正确退化。
    *
@@ -194,6 +204,9 @@ public final class ProximitySelector {
 
   /**
    * 给定遮挡查询，判定射线路径是否被挡住。
+   *
+   * <p>测试专用豁免：生产路径只有 {@link #isVisible} 内部复用它做逐路径判定，无其它生产调用方；
+   * 保留为公开方法以免破坏单测。
    *
    * @param path  {@link #visibilityPath}（或 {@link #rayPath}）返回的扁平坐标数组（x,y,z 依次排列）
    * @param query 遮挡查询；为 {@code null} 时不做判定（返回 false，即视为可见）

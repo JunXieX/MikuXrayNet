@@ -184,6 +184,36 @@ class DiskCacheStoreTest {
     }
   }
 
+  /**
+   * max-entries 上限必须跨重启继续生效（回归：重启后近似计数从 0 开始，磁盘上的旧条目全部不占额度）。
+   *
+   * <p>重启 = 用同一目录重新创建 DiskCacheStore。首次打开既有区域文件时会异步扫描补计磁盘条目；
+   * 第二次读取已排在计数任务之后，因此返回时补计必然完成。
+   */
+  @Test
+  void maxEntriesLimitSurvivesRestart(@TempDir Path dir) {
+    byte[] first = payload(128);
+    byte[] second = payload(256);
+    try (DiskCacheStore original = store(dir, config(2, 600, 600))) {
+      original.put(WORLD, 0, 0, 1, first);
+      original.put(WORLD, 1, 0, 1, second);
+      original.flush();
+    }
+
+    try (DiskCacheStore restarted = store(dir, config(2, 600, 600))) {
+      assertEquals(0, restarted.openRegionFiles(), "重启后句柄表为空");
+      assertArrayEquals(first, restarted.get(WORLD, 0, 0, 1), "重启后既有条目仍可读");
+      // 第一次读取建立了句柄并排程补计；第二次读取已排在补计任务之后 → 返回时补计必然完成
+      assertArrayEquals(second, restarted.get(WORLD, 1, 0, 1));
+      assertEquals(2, restarted.entries(), "磁盘上的既有条目必须补进近似计数");
+
+      restarted.put(WORLD, 2, 0, 1, payload(512));
+      assertEquals(1L, restarted.stats().rejectedByCapacity.sum(),
+          "重启后 max-entries 上限必须继续生效（旧条目占额度）");
+      assertNull(restarted.get(WORLD, 2, 0, 1), "被拒绝的条目不得可读");
+    }
+  }
+
   @Test
   void invalidateWorldOnlyClosesThatWorld(@TempDir Path dir) {
     try (DiskCacheStore store = store(dir, config(1024, 600, 600))) {

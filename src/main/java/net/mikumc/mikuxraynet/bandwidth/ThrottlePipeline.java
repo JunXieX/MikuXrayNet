@@ -193,11 +193,6 @@ public final class ThrottlePipeline {
     return culler == null ? 0 : culler.hiddenCount();
   }
 
-  /** 管线是否已装配。 */
-  public boolean started() {
-    return started;
-  }
-
   private <T> T register(ModuleFactory<T> factory) {
     try {
       return factory.create();

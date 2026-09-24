@@ -5,6 +5,7 @@ import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import io.papermc.paper.command.brigadier.Commands;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.io.File;
 import java.util.Collection;
 import java.util.List;
@@ -31,6 +32,7 @@ import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.config.MikuConfig;
 import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
+import net.mikumc.mikuxraynet.util.Diagnostics;
 import net.mikumc.mikuxraynet.util.ReloadCoordinator;
 import org.bukkit.Bukkit;
 import org.bukkit.command.PluginCommand;
@@ -70,6 +72,9 @@ public final class MikuXrayNet extends JavaPlugin {
   private ProximityStats proximityStats;
   private DiskCacheStore diskCacheStore;
   private BypassRegistry bypassRegistry;
+  private Diagnostics diagnostics;
+  /** 周期运行摘要任务（bandwidth.yml: diagnostics.interval-seconds；0 = 关闭）。 */
+  private ScheduledTask diagnosticsTask;
   private boolean antiXrayActive;
 
   private final ReloadCoordinator reloadCoordinator = new ReloadCoordinator();
@@ -96,11 +101,13 @@ public final class MikuXrayNet extends JavaPlugin {
     startAntiXray();
     startBandwidth();
     registerCommand();
+    startDiagnosticsTask();
     getLogger().info("MikuXrayNet 已启用");
   }
 
   @Override
   public void onDisable() {
+    stopDiagnosticsTask();
     if (throttlePipeline != null) {
       // 先停带宽管线：它需要偿还延迟中的包、恢复被隐藏的实体与视距
       throttlePipeline.stop();
@@ -331,6 +338,55 @@ public final class MikuXrayNet extends JavaPlugin {
     return throttlePipeline;
   }
 
+  /**
+   * 启动周期运行摘要任务（{@code bandwidth.yml: diagnostics.interval-seconds}）：
+   * 每 interval 秒输出一行 INFO 精简摘要（复用 {@link Diagnostics} 既有快照），
+   * {@code 0} 表示完全不输出。该键此前是死配置，此方法是其真正消费点。
+   */
+  private void startDiagnosticsTask() {
+    stopDiagnosticsTask();
+    int intervalSeconds = Math.max(0, config.bandwidth().diagnostics().intervalSeconds());
+    if (intervalSeconds == 0) {
+      return;
+    }
+    if (diagnostics == null) {
+      diagnostics = new Diagnostics(this);
+    }
+    long periodTicks = intervalSeconds * 20L;
+    try {
+      // GlobalRegionScheduler：Paper 上落在主线程，快照只读计数器与配置，安全
+      diagnosticsTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(this,
+          scheduled -> outputDiagnosticsLine(), periodTicks, periodTicks);
+    } catch (Throwable throwable) {
+      getLogger().warning("周期诊断任务登记失败（不影响其它功能）：" + throwable.getMessage());
+    }
+  }
+
+  /** 停用周期运行摘要任务（可重复调用）。 */
+  private void stopDiagnosticsTask() {
+    ScheduledTask task = diagnosticsTask;
+    diagnosticsTask = null;
+    if (task != null) {
+      try {
+        task.cancel();
+      } catch (Throwable ignored) {
+        // 任务可能已结束，忽略
+      }
+    }
+  }
+
+  private void outputDiagnosticsLine() {
+    try {
+      Diagnostics current = diagnostics;
+      if (current != null) {
+        getLogger().info(current.summaryLine());
+      }
+    } catch (Throwable throwable) {
+      // 摘要只是可观测性输出：任何异常都不能影响插件主流程
+      getLogger().log(Level.WARNING, "周期诊断摘要输出失败", throwable);
+    }
+  }
+
   /** 统一配置入口（供诊断读取有效值）。 */
   public MikuConfig mikuConfig() {
     return config;
@@ -395,6 +451,8 @@ public final class MikuXrayNet extends JavaPlugin {
       public void restartPeriodicTasks() {
         restartProximity();
         restartBandwidth();
+        // 摘要间隔可随热重载变更（0 = 关闭）
+        startDiagnosticsTask();
       }
     });
   }

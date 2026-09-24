@@ -35,11 +35,12 @@ class ConfigDefaultsTest {
 
     assertEquals(AntiXrayConfig.ObfuscationMode.ALL, config.obfuscationMode(),
         "默认模式必须是 all（透视不得直接看到裸露在矿洞中的矿）");
-    assertEquals(48.0D, config.proximity().distance(), 1.0E-9D,
-        "显形距离默认 48 格（32 仍偏近；显形只在视线通畅且方块有暴露面时还原，放大距离不会隔墙泄露）");
+    assertEquals(64.0D, config.proximity().distance(), 1.0E-9D,
+        "显形距离默认 64 格（48 仍偏近；显形只在视线通畅且方块有暴露面时还原，放大距离不会隔墙泄露；"
+            + "扫描半径 ceil(64/16)=4 即 9×9 区块）");
     assertEquals(256, config.proximity().maxRevealsPerTick(),
-        "单次显形额度默认 256（原 128；配合 48 格距离，候选更多，额度需相应放大）");
-    assertEquals(5, config.proximity().intervalTicks(), "巡检周期保持 5 tick（约 0.25 秒一次）");
+        "单次显形额度默认 256（原 128；配合 64 格距离，候选更多，额度需相应放大）");
+    assertEquals(4, config.proximity().intervalTicks(), "巡检周期收紧为 4 tick（0.2 秒一次，显形更及时）");
     assertTrue(config.proximity().raycastEnabled(), "可见性判定默认开启（隔着墙不显形）");
     assertEquals(4.0D, config.proximity().frustumMinDistance(), 1.0E-9D, "min-distance 保持 4 格");
     assertEquals(524288, config.proximity().maxPositionsPerPlayer(),

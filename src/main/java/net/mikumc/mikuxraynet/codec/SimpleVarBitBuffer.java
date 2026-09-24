@@ -21,10 +21,6 @@ public class SimpleVarBitBuffer implements VarBitBuffer {
   private final int size;
   private final long[] buffer;
 
-  public SimpleVarBitBuffer(int bitsPerEntry, int size) {
-    this(bitsPerEntry, size, new long[calculateArraySize(bitsPerEntry, size)]);
-  }
-
   /**
    * 用外部提供的存储构造（供 {@link ChunkScratch} 复用 long 数组）。
    *

@@ -132,7 +132,12 @@ public final class ObfuscationProcessor {
     this.obfuscateAll = obfuscateAll;
   }
 
-  /** 兼容构造：邻块缺失按「暴露」处理、不做调色板重排、模式为 enclosed（即接入邻块快照之前的行为）。 */
+  /**
+   * 兼容构造：邻块缺失按「暴露」处理、不做调色板重排、模式为 enclosed（即接入邻块快照之前的行为）。
+   *
+   * <p>测试专用豁免：生产装配一律走 {@link #create}（或 9 参完整构造），本构造当前仅单测在用，
+   * 保留以免破坏既有测试。
+   */
   public ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, BitSet targets,
       int[] replacementIds, int[] cumulativeWeights, boolean layerObfuscation) {
     this(codec, occlusionTable, targets, replacementIds, cumulativeWeights, layerObfuscation, false,
@@ -187,12 +192,6 @@ public final class ObfuscationProcessor {
 
     return new ObfuscationProcessor(codec, registry::isOccluding, targets, replacementIds,
         cumulativeWeights, config.layerObfuscation(), missingPolicyHide, paletteOptions, obfuscateAll);
-  }
-
-  /** 兼容重载：不做调色板重排。 */
-  public static ObfuscationProcessor create(ChunkCodec codec, BlockStateRegistry registry,
-      AntiXrayConfig config, Logger logger) {
-    return create(codec, registry, config, logger, PaletteOptions.DISABLED);
   }
 
   /** 是否具备生效条件（目标与伪装方块都已解析）。 */

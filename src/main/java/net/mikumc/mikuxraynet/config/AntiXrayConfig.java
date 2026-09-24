@@ -220,14 +220,16 @@ public final class AntiXrayConfig {
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding"))),
         new Proximity(
             root.getBoolean("proximity.enabled", true),
-            // 默认 48（原为 32，更早为 12）：真机反馈「32 格仍然偏近，走到跟前才变回来」。显形只在射线通畅
+            // 默认 64（原为 48，更早为 32/12）：真机反馈「48 格仍然偏近，走到跟前才变回来」。显形只在射线通畅
             // （视线真能看到、且只取暴露面上的采样点）时才还原，因此放大距离不会隔着墙泄露——它只是把
             // 「本来就看得到的矿」更早、更远地还给玩家。取舍：距离越大越及时、观感越接近原版，但候选越多、
             // 发包量与每 tick 上限（max-reveals-per-tick）越相关。
-            Math.max(0.0D, root.getDouble("proximity.distance", 48.0D)),
-            Math.max(1, root.getInt("proximity.interval-ticks", 5)),
-            // 默认 256（原为 128）：配合扩大到 48 格的距离，候选数量随之上升，单次额度也要相应放大，
-            // 否则脚边的矿会被远处候选挤到后面。5 tick 一次、256 个 ≈ 1024 个/秒，仍远低于区块包流量。
+            Math.max(0.0D, root.getDouble("proximity.distance", 64.0D)),
+            // 默认 4（原为 5）：显形周期越短、玩家转身后「石头还没变回来」的窗口越小；局部扫描已把
+            // 单周期开销与探索历史脱钩（整块显形完的区块直接跳过），4 tick 的额外扫描量可忽略。
+            Math.max(1, root.getInt("proximity.interval-ticks", 4)),
+            // 默认 256（原为 128）：配合扩大到 64 格的距离，候选数量随之上升，单次额度也要相应放大，
+            // 否则脚边的矿会被远处候选挤到后面。4 tick 一次、256 个 ≈ 1280 个/秒，仍远低于区块包流量。
             Math.max(1, root.getInt("proximity.max-reveals-per-tick", 256)),
             // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处，
             // 窗口太短会让「还没走到就被清掉」的坐标永不还原。

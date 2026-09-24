@@ -51,23 +51,25 @@ public final class ChunkPacketAccessor {
   }
 
   /**
-   * 回填改写结果，并剔除被伪装方块占位的方块实体。
+   * 回填改写结果，并（按开关）剔除被伪装方块占位的方块实体。
    *
    * <p><b>写回自检</b>：{@code setBuffer} 只通过 ProtocolLib 的字段访问器把新数组写进 NMS 对象。
    * 写完立刻回读一次，确认字段指向的就是我们传入的那个数组——若 ProtocolLib 某个版本改成写副本、
    * 或封包结构不匹配（拿到的是别的对象），这里会返回 {@code false}，调用方据此告警，
    * 避免出现「算了但没写」却毫无征兆的静默失效。
    *
-   * @param data            新的 section 字节
-   * @param localPositions  被伪装的方块位置，编码为 {@code y << 8 | z << 4 | x}（区块内相对坐标）
-   * @param minHeight       该世界最低建筑高度，用于把方块实体的绝对 Y 换算为区块内相对 Y
+   * @param data                 新的 section 字节
+   * @param localPositions       被伪装的方块位置，编码为 {@code y << 8 | z << 4 | x}（区块内相对坐标）
+   * @param minHeight            该世界最低建筑高度，用于把方块实体的绝对 Y 换算为区块内相对 Y
+   * @param removeBlockEntities  {@code antixray.yml: obfuscation.remove-block-entities}；
+   *                             false 时跳过方块实体剔除段（只回填字节，保留封包原带的所有方块实体）
    * @return true 表示新字节已确认写回封包；false 表示回读结果与写入不一致（调用方应告警）
    */
-  public boolean update(byte[] data, int[] localPositions, int minHeight) {
+  public boolean update(byte[] data, int[] localPositions, int minHeight, boolean removeBlockEntities) {
     chunkData.setBuffer(data);
     boolean verified = chunkData.getBuffer() == data;
 
-    if (localPositions.length == 0) {
+    if (!shouldFilterBlockEntities(removeBlockEntities, localPositions)) {
       return verified;
     }
 
@@ -78,7 +80,8 @@ public final class ChunkPacketAccessor {
 
     List<WrappedLevelChunkData.BlockEntityInfo> kept = new ArrayList<>(blockEntities.size());
     for (WrappedLevelChunkData.BlockEntityInfo info : blockEntities) {
-      if (!isObfuscated(info, localPositions, minHeight)) {
+      if (!isObfuscated(info.getY() - minHeight, info.getSectionX(), info.getSectionZ(),
+          localPositions)) {
         kept.add(info);
       }
     }
@@ -89,14 +92,29 @@ public final class ChunkPacketAccessor {
     return verified;
   }
 
-  private static boolean isObfuscated(WrappedLevelChunkData.BlockEntityInfo info, int[] localPositions,
-      int minHeight) {
-    int y = info.getY() - minHeight;
-    if (y < 0) {
+  /**
+   * 是否需要执行方块实体剔除（配置开关与被伪装坐标清单的汇合点；纯函数，离线可测）。
+   *
+   * <p>开关关闭、或本次没有任何被伪装坐标时都不需要剔除——旧实现里该开关是死配置键，
+   * 剔除段无条件执行，此判定即开关的真正消费点。
+   */
+  static boolean shouldFilterBlockEntities(boolean removeBlockEntities, int[] localPositions) {
+    return removeBlockEntities && localPositions.length > 0;
+  }
+
+  /**
+   * 纯几何判定：某方块实体是否落在被伪装坐标清单里。
+   *
+   * @param relativeY  方块实体的区块内相对 Y（绝对 Y − 世界最低建筑高度；负值必然不在清单里）
+   * @param sectionX   方块实体的 section 内 X（0..15）
+   * @param sectionZ   方块实体的 section 内 Z（0..15）
+   * @param localPositions 被伪装坐标清单，编码为 {@code y << 8 | z << 4 | x}
+   */
+  static boolean isObfuscated(int relativeY, int sectionX, int sectionZ, int[] localPositions) {
+    if (relativeY < 0) {
       return false;
     }
-
-    int packed = y << 8 | info.getSectionZ() << 4 | info.getSectionX();
+    int packed = relativeY << 8 | sectionZ << 4 | sectionX;
     for (int position : localPositions) {
       if (position == packed) {
         return true;

@@ -113,6 +113,26 @@ public final class Diagnostics {
     return formatStatus(snapshot());
   }
 
+  /**
+   * 拉取实时指标并生成「单行运行摘要」（{@code bandwidth.yml: diagnostics.interval-seconds} 驱动的
+   * 周期日志用）：复用 {@link #snapshot()}，只输出最关键的计数，绝不输出整个状态面板刷屏。
+   */
+  public String summaryLine() {
+    return formatSummaryLine(snapshot());
+  }
+
+  /** 单行运行摘要格式化（纯函数，恒为一行，不含换行）。 */
+  public static String formatSummaryLine(Snapshot s) {
+    return "运行摘要：反矿透 " + (s.antiXrayActive() ? "生效" : "未生效")
+        + "｜区块改写 " + s.chunksRewritten() + "（异常 " + s.chunksFailed()
+        + "，超时放行 " + s.chunksTimedOut() + "）"
+        + "｜显形发送 " + s.revealsSent() + "，坐标跳过 " + s.revealsSkipped()
+        + "｜实体隐藏 " + s.entitiesHidden() + "/恢复 " + s.entitiesShown()
+        + "（当前隐藏中 " + s.entitiesHiddenNow() + "）"
+        + "｜磁盘缓存命中 " + s.diskCacheHits() + "，条目约 " + s.diskCacheEntries()
+        + "｜队列 " + s.queueSize() + "/" + s.queueCapacity();
+  }
+
   /** 拉取实时指标并生成转储文本。 */
   public String dumpText(String timestamp) {
     return formatDump(snapshot(), timestamp);

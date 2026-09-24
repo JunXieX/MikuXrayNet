@@ -7,6 +7,8 @@ import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -67,7 +69,7 @@ import org.bukkit.util.Vector;
 public final class ProximityRevealer implements Listener {
 
   private static final int MAX_ERROR_LOGS = 3;
-  /** 每多少次巡检清理一次过期条目（默认周期 5 tick 时约 5 秒一次）。 */
+  /** 每多少次巡检清理一次过期条目（默认周期 4 tick 时约 4 秒一次）。 */
   private static final int EXPIRE_EVERY_PASSES = 20;
   /**
    * 候选坐标的超额倍数：视锥/射线会剔除部分候选，因此按额度的该倍数取候选，
@@ -132,6 +134,15 @@ public final class ProximityRevealer implements Listener {
 
   private ScheduledTask globalTask;
 
+  /**
+   * Folia 每玩家的区域巡检任务句柄（按 UUID 保存）。
+   *
+   * <p><b>为什么必须保存</b>：{@code repeatOnEntity} 返回的句柄若被丢弃，{@link #stop()} 就只取消了
+   * 全局任务，Folia 上各玩家的区域任务会在插件停用后继续跑到实体退役为止——句柄泄漏 + 停用后
+   * 仍在发包。这里逐一保存，停用与玩家退出时全部取消。
+   */
+  private final ConcurrentHashMap<UUID, ScheduledTask> entityTasks = new ConcurrentHashMap<>();
+
   public ProximityRevealer(Plugin plugin, ProtocolManager protocolManager, AntiXrayConfig config,
       ObfuscatedChunkIndex chunkIndex, RevealedSet revealedSet, ProximityStats stats,
       BypassRegistry bypassRegistry, MikuWorkPool workPool) {
@@ -146,7 +157,7 @@ public final class ProximityRevealer implements Listener {
     this.workPool = workPool;
   }
 
-  /** 启动巡检：非 Folia 为统一主线程任务；Folia 为各玩家的区域任务（玩家退役后自动失效）。 */
+  /** 启动巡检：非 Folia 为统一主线程任务；Folia 为各玩家的区域任务（句柄按 UUID 保存，见 entityTasks）。 */
   public void start() {
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     long interval = Math.max(1, proximity.intervalTicks());
@@ -154,7 +165,7 @@ public final class ProximityRevealer implements Listener {
       // 保留平台差异（策略分支，非 API 分支）：Folia 无法从全局线程安全读取玩家世界/位置，
       // 因此每个玩家一条区域任务（实体调度器，延迟与周期都以 tick 计）。
       for (Player player : Bukkit.getOnlinePlayers()) {
-        Schedulers.repeatOnEntity(plugin, player, interval, interval, () -> pass(player));
+        scheduleEntityTask(player, interval);
       }
     } else {
       // Paper：单条全局任务，保留「全服共享发包额度」的既有语义（延迟与周期都以 tick 计）。
@@ -176,9 +187,26 @@ public final class ProximityRevealer implements Listener {
       globalTask.cancel();
       globalTask = null;
     }
+    // Folia 每玩家任务句柄全部取消：句柄若被丢弃，区域任务会在停用后继续跑到实体退役（泄漏）
+    for (ScheduledTask task : entityTasks.values()) {
+      try {
+        task.cancel();
+      } catch (Throwable ignored) {
+        // 任务可能已随实体退役结束，取消失败可忽略
+      }
+    }
+    entityTasks.clear();
     HandlerList.unregisterAll(this);
     chunkIndex.clear();
     revealedSet.clear();
+  }
+
+  /** 在玩家所属线程上启动周期巡检并保存句柄（调度失败则无句柄可存）。 */
+  private void scheduleEntityTask(Player player, long interval) {
+    ScheduledTask task = Schedulers.repeatOnEntity(plugin, player, interval, interval, () -> pass(player));
+    if (task != null) {
+      entityTasks.put(player.getUniqueId(), task);
+    }
   }
 
   @EventHandler(ignoreCancelled = true)
@@ -186,14 +214,20 @@ public final class ProximityRevealer implements Listener {
     if (!PlatformSupport.isFolia()) {
       return;
     }
-    long interval = Math.max(1, proximity.intervalTicks());
-    Player player = event.getPlayer();
-    Schedulers.repeatOnEntity(plugin, player, interval, interval, () -> pass(player));
+    scheduleEntityTask(event.getPlayer(), Math.max(1, proximity.intervalTicks()));
   }
 
-  /** 玩家登出即清理其已显形标记，避免为离线玩家保留坐标。 */
+  /** 玩家登出：取消其巡检任务句柄，并清理其已显形标记，避免为离线玩家保留坐标。 */
   @EventHandler(ignoreCancelled = true)
   public void onQuit(PlayerQuitEvent event) {
+    ScheduledTask task = entityTasks.remove(event.getPlayer().getUniqueId());
+    if (task != null) {
+      try {
+        task.cancel();
+      } catch (Throwable ignored) {
+        // 任务可能已随实体退役结束，取消失败可忽略
+      }
+    }
     revealedSet.clearPlayer(event.getPlayer().getUniqueId());
   }
 

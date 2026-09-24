@@ -119,11 +119,6 @@ public final class BypassRegistry implements Listener {
     return bypassed.size();
   }
 
-  /** 清空名单（插件停用）。 */
-  public void clear() {
-    bypassed.clear();
-  }
-
   /** 重新评估全部在线玩家，并清掉已下线玩家的残留条目。 */
   private void refreshAll() {
     try {
