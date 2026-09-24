@@ -85,6 +85,7 @@ public final class Diagnostics {
       int diskCacheEntries,
       int diskCacheOpenFiles,
       int revealedIndexEntries,
+      long revealedIndexEvicted,
       long revealedIndexDropped) {
 
     /** 配置指纹（取自反矿透配置；无配置时为 0）。 */
@@ -180,6 +181,7 @@ public final class Diagnostics {
         diskCache == null ? 0 : diskCache.entries(),
         diskCache == null ? 0 : diskCache.openRegionFiles(),
         revealedIndex == null ? 0 : revealedIndex.size(),
+        revealedIndex == null ? 0L : revealedIndex.evictedByCapacity(),
         revealedIndex == null ? 0L : revealedIndex.droppedByCapacity());
   }
 
@@ -201,8 +203,9 @@ public final class Diagnostics {
     lines.add("邻近显形：发送 " + s.revealsSent() + "，跳过 " + s.revealsSkipped()
         + "，变更注销 " + s.revealsUnregistered() + "，视锥剔除 " + s.proximityFrustumCulled()
         + "，射线剔除 " + s.proximityRayCulled());
-    lines.add("显形索引：条目 " + s.revealedIndexEntries() + "，丢弃 " + s.revealedIndexDropped()
-        + "（丢弃 = 容量满时淘汰的远处坐标 + 确实无法腾出空间而放弃的新坐标）");
+    lines.add("显形索引：条目 " + s.revealedIndexEntries() + "，淘汰 " + s.revealedIndexEvicted()
+        + "，丢弃 " + s.revealedIndexDropped()
+        + "（淘汰 = 容量满时按距玩家最远优先换掉的坐标，属正常调优；丢弃 = 无法淘汰而直接放弃的新坐标，属异常）");
     lines.add("磁盘缓存：" + (s.diskCacheOpenFiles() > 0 || s.diskCacheEntries() > 0 ? "已启用" : "无数据")
         + "｜命中 " + s.diskCacheHits() + "，未命中 " + s.diskCacheMisses()
         + "，命中率 " + hitRate(s.diskCacheHits(), s.diskCacheMisses())

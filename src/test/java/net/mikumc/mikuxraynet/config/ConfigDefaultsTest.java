@@ -33,17 +33,17 @@ class ConfigDefaultsTest {
 
     assertEquals(AntiXrayConfig.ObfuscationMode.ALL, config.obfuscationMode(),
         "默认模式必须是 all（透视不得直接看到裸露在矿洞中的矿）");
-    assertEquals(12.0D, config.proximity().distance(), 1.0E-9D,
-        "显形距离默认回到 12 格（8 格拉不住矿洞视野，洞内可见矿会不显形）");
-    assertEquals(128, config.proximity().maxRevealsPerTick(),
-        "单次显形额度默认 128（mode=all 下候选极多，32 个不够）");
+    assertEquals(32.0D, config.proximity().distance(), 1.0E-9D,
+        "显形距离默认 32 格（原 12 太短；显形只在射线通畅时还原，放大距离不会隔墙泄露）");
+    assertEquals(256, config.proximity().maxRevealsPerTick(),
+        "单次显形额度默认 256（原 128；配合 32 格距离，候选更多，额度需相应放大）");
     assertEquals(5, config.proximity().intervalTicks(), "巡检周期保持 5 tick（约 0.25 秒一次）");
     assertTrue(config.proximity().raycastEnabled(), "射线可见性默认开启（隔着墙不显形）");
     assertEquals(4.0D, config.proximity().frustumMinDistance(), 1.0E-9D, "min-distance 保持 4 格");
-    assertEquals(65536, config.proximity().maxPositionsPerPlayer(),
-        "单玩家坐标上限默认 65536（2048 会被登录时的区块流在十几个区块内填满，身边坐标进不了索引）");
-    assertEquals(512000, config.proximity().maxPositions(),
-        "全服坐标上限默认 512000（约 8 个满配玩家，避免多玩家同时在线立刻触顶）");
+    assertEquals(262144, config.proximity().maxPositionsPerPlayer(),
+        "单玩家坐标上限默认 262144（原 65536 仍会被视距 10 的约 7.7 万坐标登录流填满）");
+    assertEquals(2097152, config.proximity().maxPositions(),
+        "全服坐标上限默认 2097152（原 512000，约 8 个满配玩家，避免多玩家同时在线立刻触顶）");
     assertEquals(300, config.proximity().expireSeconds(), "显形索引过期默认 300 秒（原为 120）");
   }
 

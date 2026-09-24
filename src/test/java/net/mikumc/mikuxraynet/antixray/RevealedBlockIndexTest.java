@@ -183,25 +183,42 @@ class RevealedBlockIndexTest {
     assertEquals(2, index.playerCount(), "被全局容量拒绝的记录不应留下空条目");
     assertEquals(2, index.chunkCount());
     assertEquals(3, index.droppedByCapacity(), "丢弃次数必须可诊断");
+    assertEquals(0L, index.evictedByCapacity(),
+        "这些记录都发生在「尚未拿到玩家位置」时，无法按远近淘汰，只能直接丢弃");
   }
 
   /**
-   * 登录规模回归（本 bug 的回归测试）：玩家重进服务器会连续收到数百个区块，
-   * {@code mode=all} 下每区块约 174 个坐标（约 7 万，超过单玩家上限 65536）。
-   * 即便发生容量淘汰，玩家身边 12 格内的坐标也必须仍能被选出——否则「走到裸露矿旁边永不还原」。
+   * 视距 10 规模回归（真机 bug 的回归测试）：玩家重进服务器会连续收到约 440 个区块，
+   * {@code mode=all} 下每区块约 174 个坐标 → 约 7.7 万个坐标。
+   * 默认单玩家上限 262144 必须完整容纳这一次登录，因此：
+   * <ul>
+   *   <li>不应发生任何<b>淘汰 / 丢弃</b>（D = 0）；</li>
+   *   <li>玩家身边 32 格内的坐标必须<b>全部</b>仍可选（含恰好 32 格的边界）。</li>
+   * </ul>
    */
   @Test
   void loginScaleKeepsNearbyCoordinatesSelectable() {
-    int maxPositionsPerPlayer = 65536;
-    int chunks = 400;
+    int maxPositionsPerPlayer = 262144;
+    int chunks = 440;
     int perChunk = 174;
-    RevealedBlockIndex index = index(512000, maxPositionsPerPlayer, 300 * SECOND_NANOS);
+    RevealedBlockIndex index = index(2097152, maxPositionsPerPlayer, 300 * SECOND_NANOS);
 
-    // 玩家站在 (8,64,8)：先记一个身边坐标并查询一次（真机上巡检每 5 tick 查询一次，会刷新玩家位置）
-    assertTrue(index.record(PLAYER, WORLD, 8, 64, 8));
-    assertEquals(1, index.candidates(PLAYER, WORLD, 8, 64, 8, 12.0D, 8).size());
+    // 玩家站在 (8,64,8)：先在 32 格内记录一批「身边的伪装坐标」（40/-24 为恰好 32 格的边界）
+    List<RevealedBlockIndex.Position> nearby = List.of(
+        new RevealedBlockIndex.Position(8, 64, 8),
+        new RevealedBlockIndex.Position(9, 64, 8),
+        new RevealedBlockIndex.Position(8, 65, 8),
+        new RevealedBlockIndex.Position(8, 64, 9),
+        new RevealedBlockIndex.Position(40, 64, 8),
+        new RevealedBlockIndex.Position(8, 64, 40),
+        new RevealedBlockIndex.Position(-24, 64, 8));
+    for (RevealedBlockIndex.Position position : nearby) {
+      assertTrue(index.record(PLAYER, WORLD, position.x(), position.y(), position.z()));
+    }
+    // 查询一次刷新玩家位置（真机上巡检每 5 tick 查询一次；用于容量淘汰判断远近）
+    assertFalse(index.candidates(PLAYER, WORLD, 8, 64, 8, 32.0D, 64).isEmpty());
 
-    // 连续写入 400 个远在 12 格之外的区块（每区块 174 个坐标，均落在 40..59 号区块）
+    // 连续写入 440 个远在 32 格之外的区块（每区块 174 个坐标）
     int[] locals = new int[perChunk];
     for (int i = 0; i < perChunk; i++) {
       locals[i] = i;
@@ -213,34 +230,38 @@ class RevealedBlockIndexTest {
       written += index.record(PLAYER, WORLD, chunkX, chunkZ, -64, locals);
     }
 
-    assertTrue(written > maxPositionsPerPlayer, "写入量必须超过单玩家上限，否则没覆盖淘汰路径：" + written);
-    assertTrue(index.droppedByCapacity() > 0, "超过上限必须累加丢弃计数");
-    assertTrue(index.size() <= maxPositionsPerPlayer, "总坐标数不得超过单玩家上限：" + index.size());
+    assertEquals(chunks * perChunk, written,
+        "视距 10 登录规模（约 7.7 万坐标）必须被单玩家上限完整容纳，不得有坐标被拒绝：" + written);
+    assertEquals(0L, index.droppedByCapacity(), "视距 10 规模下不应发生丢弃（D 必须为 0）");
+    assertEquals(0L, index.evictedByCapacity(), "视距 10 规模下不应发生淘汰（上限足够）");
 
-    List<RevealedBlockIndex.Position> nearby =
-        index.candidates(PLAYER, WORLD, 8, 64, 8, 12.0D, 8);
-    assertTrue(nearby.contains(new RevealedBlockIndex.Position(8, 64, 8)),
-        "登录规模下玩家身边的坐标必须仍在索引里（bug 根因）：" + nearby);
+    List<RevealedBlockIndex.Position> found =
+        index.candidates(PLAYER, WORLD, 8, 64, 8, 32.0D, 64);
+    for (RevealedBlockIndex.Position position : nearby) {
+      assertTrue(found.contains(position), "身边 32 格内的坐标必须仍可选（含边界）：" + position);
+    }
   }
 
   /**
-   * 容量上限触发时：计数必须增加，且「离玩家最近」的坐标不得被淘汰、新写入的近处坐标不得被立刻挤出。
+   * 容量上限触发时：淘汰计数必须增加、丢弃计数不得增加，且「离玩家最近」的坐标不得被淘汰、
+   * 新写入的坐标不得被立刻挤出。
    */
   @Test
   void capacityEvictionDropsFarthestAndKeepsNearCoordinates() {
     RevealedBlockIndex index = index(64, 8, 60 * SECOND_NANOS);
 
-    // 让索引知道玩家在 (0,64,0)（查询一次即刷新位置）
+    // 让索引知道玩家在 (0,64,0)（查询一次即刷新位置，使淘汰可以按远近判断）
     assertTrue(index.record(PLAYER, WORLD, 0, 64, 0));
     assertEquals(1, index.candidates(PLAYER, WORLD, 0, 64, 0, 1.0D, 4).size());
-    long droppedBefore = index.droppedByCapacity();
+    long evictedBefore = index.evictedByCapacity();
 
     // 单玩家上限 8：连续写入 20 个远处区块的坐标，最远的应先被淘汰、新记录必须被接受
     for (int i = 0; i < 20; i++) {
       assertTrue(index.record(PLAYER, WORLD, 100 + i, 64, 0), "新写入的坐标不得被立刻挤出（第 " + i + " 个）");
     }
 
-    assertTrue(index.droppedByCapacity() > droppedBefore, "容量上限触发必须累加丢弃计数");
+    assertTrue(index.evictedByCapacity() > evictedBefore, "容量上限触发必须累加淘汰计数");
+    assertEquals(0L, index.droppedByCapacity(), "有玩家位置可淘汰时不应直接丢弃");
     assertTrue(index.size() <= 8, "总坐标数不得超过单玩家上限：" + index.size());
     assertTrue(index.candidates(PLAYER, WORLD, 0, 64, 0, 1.0D, 4)
         .contains(new RevealedBlockIndex.Position(0, 64, 0)), "离玩家最近的坐标不得被淘汰");

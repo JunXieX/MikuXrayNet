@@ -77,6 +77,9 @@ public final class RevealedBlockIndex {
 
   private final ConcurrentHashMap<UUID, PlayerIndex> players = new ConcurrentHashMap<>();
   private final AtomicInteger totalPositions = new AtomicInteger();
+  /** 容量满时按「距玩家最远优先」淘汰掉的坐标数（属正常调优行为）。 */
+  private final LongAdder evictedByCapacity = new LongAdder();
+  /** 容量满且「拿不到玩家位置 / 淘汰也腾不出空间」时被直接放弃的新坐标数（属异常）。 */
   private final LongAdder droppedByCapacity = new LongAdder();
 
   private final int maxPositions;
@@ -206,7 +209,7 @@ public final class RevealedBlockIndex {
    * 淘汰玩家索引里「离玩家最远」的一个区块条目。
    *
    * <p>按区块中心与玩家的<b>水平距离</b>比较（区块是竖直列，同一列内不再区分远近）；
-   * 距离并列时取先遍历到的那个，不追求稳定顺序。淘汰掉的坐标数计入「容量丢弃」计数，保证可观测。
+   * 距离并列时取先遍历到的那个，不追求稳定顺序。淘汰掉的坐标数计入「淘汰」计数，保证可观测。
    *
    * <p>若「最远的」恰好是本次正在写入的区块，也照淘汰——随后 {@link #record} 会把新坐标重新写进去。
    * 这样语义始终是「保留离玩家最近的坐标」，不会因为「不淘汰正在写的区块」而反过来把身边坐标挤掉。
@@ -243,7 +246,7 @@ public final class RevealedBlockIndex {
     }
     subtract(playerIndex.positionCount, removed);
     subtract(totalPositions, removed);
-    droppedByCapacity.add(removed);
+    evictedByCapacity.add(removed);
     return true;
   }
 
@@ -508,7 +511,18 @@ public final class RevealedBlockIndex {
     return total;
   }
 
-  /** 因容量上限被丢弃或淘汰的坐标数（诊断用；含「满员时淘汰掉的远处坐标」与「确实无法腾出空间而放弃的新坐标」）。 */
+  /**
+   * 因容量满而按「距玩家最远优先」<b>淘汰</b>掉的坐标数（诊断用；属正常调优行为，不影响玩家身边的坐标）。
+   */
+  public long evictedByCapacity() {
+    return evictedByCapacity.sum();
+  }
+
+  /**
+   * 因容量满且「拿不到玩家位置 / 淘汰也腾不出空间」而<b>直接丢弃</b>的新坐标数（诊断用；属异常）。
+   *
+   * <p>与 {@link #evictedByCapacity()} 分开计数：淘汰是「用远的换近的」，丢弃是「新的根本进不来」。
+   */
   public long droppedByCapacity() {
     return droppedByCapacity.sum();
   }

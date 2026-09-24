@@ -208,23 +208,25 @@ public final class AntiXrayConfig {
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding"))),
         new Proximity(
             root.getBoolean("proximity.enabled", true),
-            // 默认 12（原为 8）：真机反馈「收紧到 8 后，矿洞里连裸露矿都不显形」——8 格拉不住矿洞视野，
-            // 玩家在洞内活动时可见矿往往就在 8~12 格外。12 是「走近就能看到矿」与原版观感的折中。
-            // 取舍：越大越及时（能覆盖更远的洞内视野），但显形越早、发包越多，也越早把远处矿物亮给透视端。
-            Math.max(0.0D, root.getDouble("proximity.distance", 12.0D)),
+            // 默认 32（原为 12）：真机反馈「12 格太短，很影响游戏体验」。因为显形只在射线通畅（视线真能看到）
+            // 时才还原，所以放大距离不会隔着墙泄露，只是把「本来就看得到的矿」更早、更远地还给玩家。
+            // 取舍：距离越大越及时、观感越接近原版，但候选越多、发包量与「每 tick 上限」越相关。
+            Math.max(0.0D, root.getDouble("proximity.distance", 32.0D)),
             Math.max(1, root.getInt("proximity.interval-ticks", 5)),
-            // 默认 128（原为 32）：mode=all 下每个区块的所有矿都被伪装，索引里候选极多，32 个/次明显不够
-            // （脚边的矿还没轮到就被远处候选挤占）。取舍：越大越及时但单次发包越多；5 tick 一次、128 个
-            // 约等于 512 个/秒的上限，仍远低于区块包流量，不会成为带宽瓶颈。
-            Math.max(1, root.getInt("proximity.max-reveals-per-tick", 128)),
+            // 默认 256（原为 128）：配合扩大到 32 格的距离，候选数量随之上升，单次额度也要相应放大，
+            // 否则脚边的矿会被远处候选挤到后面。5 tick 一次、256 个 ≈ 1024 个/秒，仍远低于区块包流量。
+            Math.max(1, root.getInt("proximity.max-reveals-per-tick", 256)),
             // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处，
             // 窗口太短会让「还没走到就被清掉」的坐标永不还原。
             Math.max(1, root.getInt("proximity.expire-seconds", 300)),
-            // 默认 512000（原为 65536）：约 8 个满配玩家（每人 65536 坐标）的量级，多玩家同时在线不立刻触顶。
-            Math.max(1, root.getInt("proximity.max-positions", 512000)),
-            // 默认 65536（原为 2048）：视距 10 的登录规模约 400+ 区块 × 每区块约 174 坐标 ≈ 7 万个坐标；
-            // 2048 在十几个区块内就被填满，玩家身边的坐标进不了索引（真机 bug 根因）。约 1 MB/玩家。
-            Math.max(1, root.getInt("proximity.max-positions-per-player", 65536)),
+            // 默认 2097152（原为 512000）：单玩家上限（262144）的 8 倍量级，多玩家同时在线不立刻触顶。
+            // 内存量级见 max-positions-per-player 注释：本项只是「上限」，不是预分配。
+            Math.max(1, root.getInt("proximity.max-positions", 2097152)),
+            // 默认 262144（原为 65536）：真机日志显示视距 10 的登录规模已达 7.7 万坐标，
+            // 65536 仍会在登录过程中被填满，玩家身边的坐标进不了索引。262144 约为 7.7 万的 3.4 倍，
+            // 留出「视距 12+ / 矿更密集」的余量。内存量级：坐标压实为 1 个 long（8 字节）、
+            // 数组按 2 倍扩容最坏约 16 字节/坐标 → 262144 × 16B ≈ 4 MB/玩家（上限，非预分配）。
+            Math.max(1, root.getInt("proximity.max-positions-per-player", 262144)),
             root.getBoolean("proximity.frustum.enabled", true),
             clampFov(root.getDouble("proximity.frustum.fov", 80.0D)),
             Math.max(0.0D, root.getDouble("proximity.frustum.min-distance", 4.0D)),
