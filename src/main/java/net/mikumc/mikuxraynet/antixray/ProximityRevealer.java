@@ -7,6 +7,7 @@ import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
@@ -39,7 +40,7 @@ import org.bukkit.util.Vector;
  * <ul>
  *   <li><b>视锥剔除</b>（默认开启，80°）：只显形玩家视野锥内的候选坐标；最小距离内豁免，
  *       避免「贴着走过的矿物不显形」；</li>
- *   <li><b>射线可见性</b>（默认开启）：从眼睛到方块做体素步进，被墙挡住的不显形，等玩家靠近再说。</li>
+ *   <li><b>射线可见性</b>（默认开启）：从眼睛到方块「最近点」做体素步进，被墙挡住的不显形，等玩家靠近再说。</li>
  * </ul>
  *
  * <p><b>线程纪律</b>：位置读取、方块读取与发包都在主线程 / Folia 区域线程（非 Folia 为统一主线程任务，
@@ -78,15 +79,27 @@ public final class ProximityRevealer implements Listener {
 
     private final int[] coordinates;
     private final int[][] paths;
+    /** 本次取到的候选总数与其中被视锥剔除的数量（仅供一次性诊断日志使用）。 */
+    private final int candidateCount;
+    private final int frustumCulled;
 
-    private Plan(int[] coordinates, int[][] paths) {
+    private Plan(int[] coordinates, int[][] paths, int candidateCount, int frustumCulled) {
       this.coordinates = coordinates;
       this.paths = paths;
+      this.candidateCount = candidateCount;
+      this.frustumCulled = frustumCulled;
     }
 
     private int count() {
       return coordinates.length / 3;
     }
+  }
+
+  /** 单次巡检的计数（射线剔除 / 实际发送），仅供一次性诊断日志使用。 */
+  private static final class PassTally {
+
+    private int rayCulled;
+    private int sent;
   }
 
   private final Plugin plugin;
@@ -99,6 +112,7 @@ public final class ProximityRevealer implements Listener {
   private final MikuWorkPool workPool;
   private final AtomicInteger errorCounter = new AtomicInteger();
   private final AtomicLong passes = new AtomicLong();
+  private final AtomicBoolean firstRevealDiagnosed = new AtomicBoolean();
 
   private BukkitTask globalTask;
 
@@ -277,7 +291,7 @@ public final class ProximityRevealer implements Listener {
       }
 
       if (raycast) {
-        paths[keptCount] = ProximitySelector.rayPath(eye, x, y, z, samples);
+        paths[keptCount] = ProximitySelector.visibilityPath(eye, x, y, z, samples);
       }
       kept[keptCount * 3] = x;
       kept[keptCount * 3 + 1] = y;
@@ -288,19 +302,26 @@ public final class ProximityRevealer implements Listener {
     int[] result = new int[keptCount * 3];
     System.arraycopy(kept, 0, result, 0, result.length);
     int[][] trimmedPaths = paths == null ? null : Arrays.copyOf(paths, keptCount);
-    return new Plan(result, trimmedPaths);
+    return new Plan(result, trimmedPaths, count, count - keptCount);
   }
 
   /** 直接发包路径（未启用筛选）：逐个候选发送并注销。 */
   private void sendCandidates(Player player, World world, List<RevealedBlockIndex.Position> candidates,
       Plan plan, Budget budget) {
+    PassTally tally = new PassTally();
+    int candidateCount = plan != null
+        ? plan.candidateCount
+        : (candidates == null ? 0 : candidates.size());
+    int frustumCulled = plan != null ? plan.frustumCulled : 0;
+
     if (candidates != null) {
       for (RevealedBlockIndex.Position position : candidates) {
         if (budget.remaining <= 0) {
-          return;
+          break;
         }
-        sendOne(player, world, position.x(), position.y(), position.z(), null, budget);
+        sendOne(player, world, position.x(), position.y(), position.z(), null, budget, tally);
       }
+      logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
       return;
     }
     if (plan == null) {
@@ -310,18 +331,20 @@ public final class ProximityRevealer implements Listener {
     int count = plan.count();
     for (int i = 0; i < count; i++) {
       if (budget.remaining <= 0) {
-        return;
+        break;
       }
       int x = plan.coordinates[i * 3];
       int y = plan.coordinates[i * 3 + 1];
       int z = plan.coordinates[i * 3 + 2];
       int[] path = plan.paths == null ? null : plan.paths[i];
-      sendOne(player, world, x, y, z, path, budget);
+      sendOne(player, world, x, y, z, path, budget, tally);
     }
+    logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
   }
 
   /** 单个坐标：区块未加载则跳过、射线被挡则跳过，否则读真实方块并发包、成功后注销。 */
-  private void sendOne(Player player, World world, int x, int y, int z, int[] path, Budget budget) {
+  private void sendOne(Player player, World world, int x, int y, int z, int[] path, Budget budget,
+      PassTally tally) {
     if (!world.isChunkLoaded(x >> 4, z >> 4)) {
       // 区块未加载：本次跳过，坐标留在索引里等玩家真正靠近
       stats.revealsSkipped.increment();
@@ -330,16 +353,39 @@ public final class ProximityRevealer implements Listener {
 
     if (path != null && isRayOccluded(world, path)) {
       stats.revealsRayCulled.increment();
+      tally.rayCulled++;
       return;
     }
 
     if (send(player, world, x, y, z)) {
       index.unregister(player.getUniqueId(), world.getName(), x, y, z);
       stats.revealsSent.increment();
+      tally.sent++;
       budget.remaining--;
     } else {
       stats.revealsSkipped.increment();
     }
+  }
+
+  /**
+   * 一次性诊断：首次进入显形流程（取到候选）时打印各层拦截数，绝不刷屏。
+   *
+   * <p><b>为什么要它</b>：真机反馈「矿洞里一个裸露矿物都看不到」，而「候选 0 个」与「候选很多但全被
+   * 视锥/射线拦掉」是完全不同的两种失效。这一行给出决定性判据：
+   * <ul>
+   *   <li>候选 N = 0 → 显形索引里根本没有该玩家的坐标（区块改写没记录 / 索引容量被占满）；</li>
+   *   <li>候选 N &gt; 0 但视锥剔除 X 很大 → 视锥太窄（fov/min-distance 需放宽）；</li>
+   *   <li>候选 N &gt; 0 但射线剔除 Y 很大 → 射线判定过严（射线目标点/参数需要复核）；</li>
+   *   <li>实际发送 Z 明显小于 N → 单次发包额度或区块未加载在拦（max-reveals-per-tick / 视距）。</li>
+   * </ul>
+   * 只在第一次显形尝试时打印一次（CAS 抢占），此后不再产生任何开销。
+   */
+  private void logFirstRevealDiagnostic(int candidateCount, int frustumCulled, PassTally tally) {
+    if (!firstRevealDiagnosed.compareAndSet(false, true)) {
+      return;
+    }
+    plugin.getLogger().info("首次显形诊断：候选 " + candidateCount + " 个，视锥剔除 " + frustumCulled
+        + "，射线剔除 " + tally.rayCulled + "，实际发送 " + tally.sent);
   }
 
   /** 主线程 / 区域线程读方块做射线遮挡判定；任何异常都按「可见」处理（fail-open，宁可多显形）。 */

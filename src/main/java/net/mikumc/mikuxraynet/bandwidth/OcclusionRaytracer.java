@@ -24,7 +24,7 @@ public final class OcclusionRaytracer {
   }
 
   /**
-   * 计算从眼睛到目标点的射线途经体素（不含终点所在体素）。
+   * 计算从眼睛到目标点的射线途经体素（<b>不含起点与终点所在体素</b>）。
    *
    * @param maxSamples 最多采样数，用于限制主线程读取方块的次数
    * @return 扁平坐标数组（x,y,z 依次排列）；长度可能为 0，表示相邻体素或距离过近
@@ -50,12 +50,21 @@ public final class OcclusionRaytracer {
     int lastY = Integer.MIN_VALUE;
     int lastZ = Integer.MIN_VALUE;
 
+    // 起点（眼睛/相机）所在体素必须排除：贴到角落时首个采样点可能仍落在「自己所在的那个方块」里，
+    // 若不排除就会把它当成遮挡物（自遮挡），导致任何方块都可能被误判为不可见。
+    int startX = floor(fromX);
+    int startY = floor(fromY);
+    int startZ = floor(fromZ);
+
     // 从 1 到 samples-1：跳过起点所在体素与终点（实体自身）所在体素
     for (int step = 1; step < samples; step++) {
       double ratio = (double) step / (double) samples;
       int x = floor(fromX + deltaX * ratio);
       int y = floor(fromY + deltaY * ratio);
       int z = floor(fromZ + deltaZ * ratio);
+      if (x == startX && y == startY && z == startZ) {
+        continue;
+      }
       if (x == lastX && y == lastY && z == lastZ) {
         continue;
       }

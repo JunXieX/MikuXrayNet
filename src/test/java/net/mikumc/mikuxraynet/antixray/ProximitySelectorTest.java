@@ -134,4 +134,126 @@ class ProximitySelectorTest {
     assertFalse(ProximitySelector.isRayOccluded(path, (x, y, z) -> false),
         "视线通畅 → 显形");
   }
+
+  // ---------------------------------------------------------------- 可见性射线（到方块最近点）
+
+  /** 站姿眼位（脚上方 1.62 格），面朝 +Z。 */
+  private static ProximitySelector.Eye standingEye() {
+    return ProximitySelector.eye(0.5D, 65.62D, 0.5D, 0.0D, 0.0D, 1.0D);
+  }
+
+  /** 1 宽 2 高隧道：x=0 且 y=64..65 为空气，其余为岩石。 */
+  private static boolean tunnelAir(int x, int y, int z) {
+    return x == 0 && (y == 64 || y == 65) && z >= 0 && z <= 12;
+  }
+
+  private static Set<String> voxelSet(int[] path) {
+    Set<String> voxels = new HashSet<>();
+    for (int index = 0; index < path.length; index += 3) {
+      voxels.add(path[index] + "," + path[index + 1] + "," + path[index + 2]);
+    }
+    return voxels;
+  }
+
+  /**
+   * 真机根因回归：矿洞里「嵌在岩壁上、只露出一面」的裸露矿必须判定可见。
+   *
+   * <p>到<b>方块中心</b>的射线会先钻进紧贴该面的岩石，于是被误判为遮挡（显形永不发生）；
+   * 到<b>最近点</b>的射线贴着可见面走，才判得对。这里同时锁住两个方向，防止旧逻辑回归。
+   */
+  @Test
+  void nearestPointRayRevealsOreExposedOnTunnelWall() {
+    ProximitySelector.Eye eye = standingEye();
+    ProximitySelector.RayQuery stone = (x, y, z) -> !tunnelAir(x, y, z);
+
+    for (int z = 2; z <= 8; z += 2) {
+      assertTrue(ProximitySelector.isRayOccluded(
+          ProximitySelector.rayPath(eye, 1, 64, z, 16), stone),
+          "对照：到方块中心的射线钻进相邻岩石，把 z=" + z + " 的裸露矿误判为被遮挡");
+      assertFalse(ProximitySelector.isRayOccluded(
+          ProximitySelector.visibilityPath(eye, 1, 64, z, 16), stone),
+          "到最近点的射线必须看到右墙上 z=" + z + " 的裸露矿");
+    }
+  }
+
+  /** 正前方 1~3 格、视线通畅的裸露矿必须判定可见（用户要的「走近就能看到矿」）。 */
+  @Test
+  void nearestPointRaySeesOreStraightAhead() {
+    ProximitySelector.Eye eye = standingEye();
+    ProximitySelector.RayQuery open = (x, y, z) -> false;
+
+    for (int z = 1; z <= 3; z++) {
+      assertFalse(ProximitySelector.isRayOccluded(
+          ProximitySelector.visibilityPath(eye, 0, 64, z, 16), open),
+          "正前方 " + z + " 格、视线通畅的裸露矿必须可见");
+    }
+  }
+
+  /** 目标方块背后/侧面被 2 格厚石墙挡住时必须判定不可见（不得为了「多显形」而穿墙）。 */
+  @Test
+  void nearestPointRayIsStillBlockedByTwoBlockThickWall() {
+    ProximitySelector.Eye eye = standingEye();
+    ProximitySelector.RayQuery wall = (x, y, z) -> z == 3 || z == 4;
+
+    assertTrue(ProximitySelector.isRayOccluded(
+        ProximitySelector.visibilityPath(eye, 0, 64, 5, 16), wall),
+        "2 格厚石墙后面的矿必须判为不可见");
+    assertTrue(ProximitySelector.isRayOccluded(
+        ProximitySelector.visibilityPath(eye, 0, 64, 6, 16), wall),
+        "同一射线更远处的矿同样不可见");
+    assertFalse(ProximitySelector.isRayOccluded(
+        ProximitySelector.visibilityPath(eye, 0, 64, 2, 16), wall),
+        "墙前面的方块不受这面墙影响");
+  }
+
+  /** 眼睛所在体素绝不参与遮挡判定（自遮挡）：否则站在方块棱角上时会「什么都看不见」。 */
+  @Test
+  void eyeVoxelNeverCountsAsOccluder() {
+    // 眼位正好落在方块棱角 (0,64,0) 上：修复前首个采样点会落回该体素并被当成遮挡物
+    ProximitySelector.Eye eye = ProximitySelector.eye(0.0D, 64.0D, 0.0D, 0.0D, 0.0D, 1.0D);
+    int[] path = ProximitySelector.rayPath(eye, 0, 66, 2, 16);
+
+    assertFalse(voxelSet(path).contains("0,64,0"), "眼睛所在体素必须排除在路径之外（自遮挡）");
+    assertFalse(ProximitySelector.isRayOccluded(path, (x, y, z) -> x == 0 && y == 64 && z == 0),
+        "眼睛所在体素即便被判为遮挡，也不得让目标变成不可见");
+  }
+
+  /** 目标方块自身绝不参与遮挡判定（终点体素排除）。 */
+  @Test
+  void targetVoxelNeverCountsAsOccluder() {
+    ProximitySelector.Eye eye = standingEye();
+
+    for (int z = 2; z <= 8; z++) {
+      int[] path = ProximitySelector.visibilityPath(eye, 0, 64, z, 16);
+      assertFalse(voxelSet(path).contains("0,64," + z),
+          "目标方块自身不得出现在路径中（z=" + z + "）");
+    }
+  }
+
+  /** 边界情形：眼位与目标同体素、相邻体素（没有中间体素）都视为可见，不能因「无路径」而漏显形。 */
+  @Test
+  void visibilityRayDegradesForSameAndAdjacentVoxels() {
+    ProximitySelector.Eye eye = standingEye();
+    ProximitySelector.RayQuery allSolid = (x, y, z) -> true;
+
+    assertFalse(ProximitySelector.isRayOccluded(
+        ProximitySelector.visibilityPath(eye, 0, 65, 0, 16), allSolid),
+        "眼位与目标同体素 → 可见");
+    assertFalse(ProximitySelector.isRayOccluded(
+        ProximitySelector.visibilityPath(eye, 0, 65, 1, 16), allSolid),
+        "相邻体素、无中间体素 → 可见");
+  }
+
+  /** 圆整（贴墙/贴地）时也必须能正确退化，不得抛异常或误判。 */
+  @Test
+  void visibilityRayDegradesWhenEyeIsExactlyOnBoundary() {
+    ProximitySelector.Eye eye = ProximitySelector.eye(1.0D, 65.0D, 1.0D, 0.0D, 0.0D, 1.0D);
+
+    assertFalse(ProximitySelector.isRayOccluded(
+        ProximitySelector.visibilityPath(eye, 1, 65, 1, 16), (x, y, z) -> true),
+        "眼位与目标同体素 → 可见");
+    assertFalse(ProximitySelector.isRayOccluded(
+        ProximitySelector.visibilityPath(eye, 1, 65, 2, 16), (x, y, z) -> true),
+        "相邻体素 → 可见");
+  }
 }

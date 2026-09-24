@@ -208,11 +208,15 @@ public final class AntiXrayConfig {
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding"))),
         new Proximity(
             root.getBoolean("proximity.enabled", true),
-            // 默认 8（原为 12）：真机反馈「离玩家近的、没有裸露的矿物也出现在透视范围内」——
-            // 显形距离越大，越早把远处矿物亮给透视客户端；8 格贴近「贴脸才发现」的原版观感。
-            Math.max(0.0D, root.getDouble("proximity.distance", 8.0D)),
+            // 默认 12（原为 8）：真机反馈「收紧到 8 后，矿洞里连裸露矿都不显形」——8 格拉不住矿洞视野，
+            // 玩家在洞内活动时可见矿往往就在 8~12 格外。12 是「走近就能看到矿」与原版观感的折中。
+            // 取舍：越大越及时（能覆盖更远的洞内视野），但显形越早、发包越多，也越早把远处矿物亮给透视端。
+            Math.max(0.0D, root.getDouble("proximity.distance", 12.0D)),
             Math.max(1, root.getInt("proximity.interval-ticks", 5)),
-            Math.max(1, root.getInt("proximity.max-reveals-per-tick", 32)),
+            // 默认 128（原为 32）：mode=all 下每个区块的所有矿都被伪装，索引里候选极多，32 个/次明显不够
+            // （脚边的矿还没轮到就被远处候选挤占）。取舍：越大越及时但单次发包越多；5 tick 一次、128 个
+            // 约等于 512 个/秒的上限，仍远低于区块包流量，不会成为带宽瓶颈。
+            Math.max(1, root.getInt("proximity.max-reveals-per-tick", 128)),
             Math.max(1, root.getInt("proximity.expire-seconds", 120)),
             Math.max(1, root.getInt("proximity.max-positions", 65536)),
             Math.max(1, root.getInt("proximity.max-positions-per-player", 2048)),

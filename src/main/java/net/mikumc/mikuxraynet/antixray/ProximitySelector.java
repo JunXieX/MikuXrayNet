@@ -13,8 +13,9 @@ import net.mikumc.mikuxraynet.bandwidth.OcclusionRaytracer;
  * 方块中心与视线的夹角不超过半角即在锥内；距离不超过 {@code minDistance} 时豁免视锥判定
  * （贴脸/脚下的方块即便在视野边缘也必须显形，否则会出现「贴着走过的矿物不显形」）。
  *
- * <p><b>射线</b>：从眼睛到目标方块中心做体素步进（复用 {@link OcclusionRaytracer}），
- * 路径上任一被遮挡的体素都视为「看不见」，此时不显形（留给玩家靠近后再显形）。
+ * <p><b>射线</b>：从眼睛到目标方块「最近点」（包围盒上离眼睛最近的那一点）做体素步进
+ * （复用 {@link OcclusionRaytracer}），路径上任一被遮挡的体素都视为「看不见」，此时不显形
+ * （留给玩家靠近后再显形）。起点（眼睛）与终点所在体素都排除在判定之外，避免自遮挡。
  * 采样数有限，宁可少判遮挡（多显形）也不漏放。
  */
 public final class ProximitySelector {
@@ -82,7 +83,11 @@ public final class ProximitySelector {
   }
 
   /**
-   * 从眼睛到目标方块中心的射线体素路径（不含起点与终点所在体素）。
+   * 从眼睛到目标方块「中心」的射线体素路径（不含起点与终点所在体素）。
+   *
+   * <p>中心射线更严格：它要求玩家能直视方块中心，因而更适合需要「完整可见」判定的场合。
+   * 显形判定请用 {@link #visibilityPath}——矿几乎总是嵌在岩石里，到中心的射线会先钻进
+   * 相邻岩石，把「明明看得到」的裸露矿误判为被遮挡。
    *
    * @param maxSamples 最多采样数（越小越省主线程读方块次数，但可能漏判薄墙）
    */
@@ -95,9 +100,32 @@ public final class ProximitySelector {
   }
 
   /**
+   * 从眼睛到目标方块<b>最近点</b>（包围盒上离眼睛最近的那一点，即朝向玩家一侧的面/棱/角）的射线体素路径。
+   *
+   * <p><b>为什么不用方块中心</b>：矿几乎总是嵌在岩石里（裸露 = 某一面朝着空气），而到中心的射线必须
+   * 先穿过紧贴该面的岩石才能抵达中心，于是那些岩石被当成遮挡物——表现为「看得到的裸露矿永不显形」。
+   * 打到最近点则让射线沿着朝向玩家的可见面走，只有真正挡在前面的方块才会被判为遮挡。
+   *
+   * <p>起点（眼睛）与终点所在体素由 {@link OcclusionRaytracer#voxelPath} 排除，因此贴墙、站在
+   * 方块棱角上、甚至眼位就在目标方块内（此时长度 0 → 空路径 → 视为可见）都能正确退化。
+   *
+   * @param maxSamples 最多采样数（越小越省主线程读方块次数，但可能漏判薄墙）
+   */
+  public static int[] visibilityPath(Eye eye, int blockX, int blockY, int blockZ, int maxSamples) {
+    if (eye == null) {
+      return new int[0];
+    }
+    // 把眼睛坐标夹进方块包围盒 → 得到「离眼睛最近的点」；眼睛本就在方块内时即眼睛自身
+    double toX = Math.min(Math.max(eye.x(), blockX), blockX + 1.0D);
+    double toY = Math.min(Math.max(eye.y(), blockY), blockY + 1.0D);
+    double toZ = Math.min(Math.max(eye.z(), blockZ), blockZ + 1.0D);
+    return OcclusionRaytracer.voxelPath(eye.x(), eye.y(), eye.z(), toX, toY, toZ, maxSamples);
+  }
+
+  /**
    * 给定遮挡查询，判定射线路径是否被挡住。
    *
-   * @param path  {@link #rayPath} 返回的扁平坐标数组（x,y,z 依次排列）
+   * @param path  {@link #visibilityPath}（或 {@link #rayPath}）返回的扁平坐标数组（x,y,z 依次排列）
    * @param query 遮挡查询；为 {@code null} 时不做判定（返回 false，即视为可见）
    * @return 是否被遮挡；路径为空时恒为 false（贴得太近，视为可见）
    */

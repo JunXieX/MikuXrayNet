@@ -33,7 +33,11 @@ class ConfigDefaultsTest {
 
     assertEquals(AntiXrayConfig.ObfuscationMode.ALL, config.obfuscationMode(),
         "默认模式必须是 all（透视不得直接看到裸露在矿洞中的矿）");
-    assertEquals(8.0D, config.proximity().distance(), 1.0E-9D, "显形距离默认收紧到 8 格");
+    assertEquals(12.0D, config.proximity().distance(), 1.0E-9D,
+        "显形距离默认回到 12 格（8 格拉不住矿洞视野，洞内可见矿会不显形）");
+    assertEquals(128, config.proximity().maxRevealsPerTick(),
+        "单次显形额度默认 128（mode=all 下候选极多，32 个不够）");
+    assertEquals(5, config.proximity().intervalTicks(), "巡检周期保持 5 tick（约 0.25 秒一次）");
     assertTrue(config.proximity().raycastEnabled(), "射线可见性默认开启（隔着墙不显形）");
     assertEquals(4.0D, config.proximity().frustumMinDistance(), 1.0E-9D, "min-distance 保持 4 格");
   }
