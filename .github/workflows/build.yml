@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    branches: [ "**" ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Compile with JDK 25
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Build and test
+        run: mvn -B -ntp verify
+
+      - name: Upload jar artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mikuxraynet-jar
+          path: target/MikuXrayNet-*.jar
+          if-no-files-found: error
+
+      - name: Resolve release title
+        if: startsWith(github.ref, 'refs/tags/')
+        id: title
+        run: echo "value=MikuXrayNet ${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ steps.title.outputs.value }}
+          files: target/MikuXrayNet-*.jar
+          prerelease: ${{ contains(github.ref_name, 'Beta') }}
+          generate_release_notes: true

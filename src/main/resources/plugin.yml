@@ -1,0 +1,60 @@
+name: MikuXrayNet
+version: '${project.version}'
+main: net.mikumc.mikuxraynet.MikuXrayNet
+api-version: '26.2'
+authors:
+  - JunXieX
+description: MikuMC 服务器原创插件
+
+# Folia（区域化多线程）兼容：世界访问一律走区域调度器
+folia-supported: true
+
+# PacketEvents 是硬依赖：启动期用它构建方块状态映射表与遮挡位图。
+# 缺失时插件禁用（不使用 PacketEvents 的封包事件，它只作为「库」提供状态映射）。
+depend:
+  - packetevents
+
+# ProtocolLib 是唯一封包拦截通道（真异步扣包）。缺失时插件禁用核心功能，
+# 仅保留配置与命令，便于管理员排查。
+softdepend:
+  - ProtocolLib
+  - ViaVersion
+  - ViaBackwards
+  - Geyser-Spigot
+
+commands:
+  mikuxraynet:
+    description: MikuXrayNet 管理命令
+    usage: /mikuxraynet <status|dump|reload>
+    aliases:
+      - mxnet
+      - mxr
+    permission: mikuxraynet.admin
+    permission-message: 你没有权限使用该命令
+
+permissions:
+  mikuxraynet.*:
+    description: MikuXrayNet 全部权限
+    default: false
+    children:
+      mikuxraynet.admin: true
+      mikuxraynet.bypass: true
+  mikuxraynet.admin:
+    description: 访问管理命令与查看统计
+    default: op
+    children:
+      mikuxraynet.status: true
+      mikuxraynet.dump: true
+      mikuxraynet.reload: true
+  mikuxraynet.status:
+    description: 查看运行状态与统计
+    default: op
+  mikuxraynet.dump:
+    description: 导出诊断转储文件
+    default: op
+  mikuxraynet.reload:
+    description: 热重载配置
+    default: op
+  mikuxraynet.bypass:
+    description: 绕过反矿透混淆，看到真实世界
+    default: false
