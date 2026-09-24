@@ -112,6 +112,30 @@ class ConfigDefaultsTest {
   }
 
   /**
+   * 实体剔除周期复检预算默认 12（建议区间 8~16）：必须有非零默认值，否则「先可见、之后才被挡住」的
+   * 实体在本轮轮转分片下会收敛过慢（预算过小）或每周期读方块次数失控（预算过大）。
+   */
+  @Test
+  void entityCullingRecheckBudgetDefaultsToTwelve() {
+    BandwidthConfig config = BandwidthConfig.from(yaml("enabled: true\n"));
+
+    assertEquals(12, config.entityCulling().recheckBudget(),
+        "周期复检预算默认 12（落在建议的 8~16 区间内）");
+    assertEquals(10, config.entityCulling().updateIntervalTicks(), "复检周期保持 10 tick");
+  }
+
+  /** 非法值（0 / 负数）必须保守钳制到至少 1，避免复检完全不推进。 */
+  @Test
+  void entityCullingRecheckBudgetIsClampedToAtLeastOne() {
+    assertEquals(1, BandwidthConfig.from(yaml("entity-culling:\n  recheck-budget: 0\n"))
+        .entityCulling().recheckBudget(), "recheck-budget: 0 必须钳制为 1");
+    assertEquals(1, BandwidthConfig.from(yaml("entity-culling:\n  recheck-budget: -5\n"))
+        .entityCulling().recheckBudget(), "recheck-budget 负数必须钳制为 1");
+    assertEquals(20, BandwidthConfig.from(yaml("entity-culling:\n  recheck-budget: 20\n"))
+        .entityCulling().recheckBudget(), "显式取值按原样解析");
+  }
+
+  /**
    * 新增的各模块总开关（{@code *.enabled}）默认必须为 true —— 补开关不得改变既有行为。
    * 同时锁住 {@code palette.reorder} 仍为 false（zlib/zstd 两种压缩口径实测均无收益）。
    */

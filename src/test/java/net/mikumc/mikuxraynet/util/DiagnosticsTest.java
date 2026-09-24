@@ -29,6 +29,7 @@ class DiagnosticsTest {
         20L, 30L,
         4L, 40L, 12L,
         6L, 5L, 4,
+        40L, 7L, 3L,
         2, 3L, 8L,
         9L, 4L,
         4, 2, 10, 2048,
@@ -70,6 +71,8 @@ class DiagnosticsTest {
             + "（否则「发送 N 但已显形 0」这类口径误读会静默发生）：" + text);
     assertTrue(text.contains("实体隐藏 6/恢复 5（当前隐藏中 4"),
         "实体隐藏/恢复必须附带实时「当前隐藏中」，否则 721 vs 299 这类不对称无法自证：" + text);
+    assertTrue(text.contains("实体复检 40（复检致隐藏 7，复检致恢复 3）"),
+        "状态面板必须单列周期复检口径，否则「先可见后被遮挡」是否被收敛到隐藏无法观测：" + text);
     assertTrue(text.contains("磁盘缓存"), text);
     assertTrue(text.contains("命中率 75.0%"), text);
     assertTrue(text.contains("带宽"), text);
@@ -110,6 +113,7 @@ class DiagnosticsTest {
         0L, 0L,
         0L, 0L, 0L,
         0L, 0L, 0,
+        0L, 0L, 0L,
         0, 0L, 0L,
         0L, 0L,
         0, 0, 0, 0,

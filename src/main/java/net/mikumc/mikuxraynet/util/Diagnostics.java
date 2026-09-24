@@ -67,6 +67,9 @@ public final class Diagnostics {
       long entitiesHidden,
       long entitiesShown,
       int entitiesHiddenNow,
+      long recheckSubmitted,
+      long recheckHidden,
+      long recheckShown,
       int afkPlayers,
       long afkEntered,
       long afkPacketsDropped,
@@ -168,6 +171,9 @@ public final class Diagnostics {
         throttleStats == null ? 0L : throttleStats.entitiesHidden.sum(),
         throttleStats == null ? 0L : throttleStats.entitiesShown.sum(),
         pipeline == null ? 0 : pipeline.hiddenEntityCount(),
+        throttleStats == null ? 0L : throttleStats.recheckSubmitted.sum(),
+        throttleStats == null ? 0L : throttleStats.recheckHidden.sum(),
+        throttleStats == null ? 0L : throttleStats.recheckShown.sum(),
         pipeline == null ? 0 : pipeline.afkPlayerCount(),
         throttleStats == null ? 0L : throttleStats.afkEntered.sum(),
         throttleStats == null ? 0L : throttleStats.afkPacketsDropped.sum(),
@@ -232,6 +238,10 @@ public final class Diagnostics {
         + "（合并 " + s.blockChangesMerged() + " 条），实体隐藏 " + s.entitiesHidden()
         + "/恢复 " + s.entitiesShown() + "（当前隐藏中 " + s.entitiesHiddenNow()
         + "；两者之差 = 死亡/卸载被服务端自然回收 + 仍在隐藏）");
+    // 「复检」单列：累计隐藏混合了「入场即被遮挡」与「周期复检发现新遮挡」两条来源，
+    // 只看总数无法判断「先可见、之后才被挡住」的实体是否真被收敛到隐藏（本次缺陷的观测口径）。
+    lines.add("带宽：实体复检 " + s.recheckSubmitted()
+        + "（复检致隐藏 " + s.recheckHidden() + "，复检致恢复 " + s.recheckShown() + "）");
     lines.add("带宽：AFK 玩家 " + s.afkPlayers() + "（累计进入 " + s.afkEntered() + "），AFK 丢包 "
         + s.afkPacketsDropped() + "，降视距 " + s.viewDistanceReduced()
         + "/还原 " + s.viewDistanceRestored());
@@ -367,6 +377,7 @@ public final class Diagnostics {
         .append("，force-visible-distance=").append(c.entityCulling().forceVisibleDistance())
         .append("，threads=").append(c.entityCulling().threads())
         .append("，update-interval-ticks=").append(c.entityCulling().updateIntervalTicks())
+        .append("，recheck-budget=").append(c.entityCulling().recheckBudget())
         .append("，ray-samples=").append(c.entityCulling().raySamples()).append('\n');
     sb.append("afk.enabled=").append(c.afk().enabled())
         .append("，seconds=").append(c.afk().seconds())

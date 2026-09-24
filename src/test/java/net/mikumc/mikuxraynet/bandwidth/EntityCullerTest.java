@@ -3,11 +3,15 @@ package net.mikumc.mikuxraynet.bandwidth;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.papermc.paper.event.player.PlayerTrackEntityEvent;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
@@ -126,9 +130,191 @@ class EntityCullerTest {
   }
 
   private static EntityCuller newCuller(ThrottleStats stats) {
+    return newCuller(stats, 12);
+  }
+
+  // ------------------------------------------------- 周期复检轮转分片（本次缺陷回归）
+
+  /**
+   * 轮转覆盖：每周期提交数不超过预算，且在 {@code ceil(追踪数 / budget)} 个周期内覆盖全部追踪实体。
+   *
+   * <p>这是「先可见、之后才被挡住」实体能被收敛到隐藏的前提——旧实现只复检「已隐藏」集合，
+   * 因此这类实体永远不会再被评估。
+   */
+  @Test
+  void rotationCoversEveryTrackedEntityWithinBudgetedCycles() {
+    EntityCuller.TrackedRotation rotation = new EntityCuller.TrackedRotation();
+    int total = 50;
+    int budget = 10;
+    for (int i = 0; i < total; i++) {
+      rotation.add(new EntityStub(1000 + i, new WorldStub()).proxy());
+    }
+    assertEquals(total, rotation.size(), "轮转队列必须登记全部追踪实体");
+
+    Set<Integer> covered = new HashSet<>();
+    int cycles = 0;
+    int maxCycles = (total + budget - 1) / budget;
+    while (covered.size() < total && cycles < maxCycles) {
+      List<Entity> batch = rotation.nextBatch(budget, Set.of());
+      assertTrue(batch.size() <= budget, "每周期复检数不得超过预算（实际 " + batch.size() + "）");
+      for (Entity entity : batch) {
+        covered.add(entity.getEntityId());
+      }
+      cycles++;
+    }
+
+    assertEquals(total, covered.size(),
+        "50 个追踪实体、预算 10 → 必须在 " + maxCycles + " 个周期内全部复检一次（实际 " + cycles + "）");
+  }
+
+  /** 已隐藏的实体不占用轮转预算配额：它们由「每周期全量复检」通道负责，不能因此挤掉可见实体的份额。 */
+  @Test
+  void rotationSkipsHiddenEntitiesButStillAdvancesTheCursor() {
+    EntityCuller.TrackedRotation rotation = new EntityCuller.TrackedRotation();
+    for (int i = 0; i < 6; i++) {
+      rotation.add(new EntityStub(2000 + i, new WorldStub()).proxy());
+    }
+    Set<Integer> hidden = Set.of(2000, 2001, 2002);
+
+    List<Entity> first = rotation.nextBatch(3, hidden);
+    assertEquals(0, first.size(), "本批位置全是已隐藏实体：不应产出可见复检项");
+    List<Entity> second = rotation.nextBatch(3, hidden);
+    assertEquals(Set.of(2003, 2004, 2005), idsOf(second), "游标必须照常推进到下一批（否则会饿死后面的实体）");
+  }
+
+  /**
+   * 本次缺陷的端到端回归：实体「先可见、之后才被墙挡住」→ 在有限周期内被隐藏。
+   *
+   * <p>用 {@link EntityCuller.TrackedRotation} 模拟周期复检的轮转推进（纯逻辑），评估仍走真实的
+   * {@link EntityCuller#evaluate} 账本，因此不依赖 Bukkit 调度。
+   */
+  @Test
+  void entityThatBecomesOccludedAfterBeingVisibleIsHiddenWithinBoundedCycles() {
+    ThrottleStats stats = new ThrottleStats();
+    int budget = 10;
+    EntityCuller culler = newCuller(stats, budget);
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+
+    EntityCuller.TrackedRotation rotation = new EntityCuller.TrackedRotation();
+    List<EntityStub> stubs = new ArrayList<>();
+    for (int i = 0; i < 50; i++) {
+      EntityStub stub = new EntityStub(3000 + i, world);
+      stubs.add(stub);
+      rotation.add(stub.proxy());
+    }
+
+    // 阶段一：实体刚入场、视线通畅 → 一轮完整轮转内不得隐藏任何实体
+    world.occluding = false;
+    runRotation(rotation, budget, player, culler);
+    assertEquals(0L, stats.entitiesHidden.sum(), "视线通畅时不得隐藏（先可见阶段的正常状态）");
+    assertEquals(0, culler.hiddenCount());
+
+    // 阶段二：之后才建墙遮挡 → 同一轮转在一个有限周期内必然再次覆盖到它并隐藏
+    world.occluding = true;
+    runRotation(rotation, budget, player, culler);
+    assertEquals(50L, stats.entitiesHidden.sum(),
+        "「先可见后被遮挡」的实体必须在有限周期内被隐藏（旧实现此处恒为 0）");
+    assertEquals(50, culler.hiddenCount());
+  }
+
+  /** 走一轮完整轮转：每个被选中的实体都用真实评估入口判定一次。 */
+  private static void runRotation(EntityCuller.TrackedRotation rotation, int budget, PlayerStub player,
+      EntityCuller culler) {
+    int cycles = 0;
+    int maxCycles = (rotation.size() + budget - 1) / budget;
+    while (cycles < maxCycles) {
+      for (Entity entity : rotation.nextBatch(budget, Set.of())) {
+        culler.evaluate(player.proxy(), entity, blockedPath());
+      }
+      cycles++;
+    }
+  }
+
+  /** 已隐藏实体每周期全量复检（不退化），可见追踪实体每周期只取预算分片。 */
+  @Test
+  void recheckSubmitsEveryHiddenEntityPlusABudgetedTrackedSlice() {
+    ThrottleStats stats = new ThrottleStats();
+    int budget = 3;
+    EntityCuller culler = newCuller(stats, budget);
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+
+    // 3 个「入场即被遮挡」的实体：只进隐藏账本，不占轮转队列
+    for (int i = 0; i < 3; i++) {
+      culler.evaluate(player.proxy(), new EntityStub(4000 + i, world).proxy(), blockedPath());
+    }
+    assertEquals(3, culler.hiddenCount());
+
+    // 10 个可见追踪实体：经真实 onTrack 路径登记进轮转队列
+    for (int i = 0; i < 10; i++) {
+      EntityStub stub = new EntityStub(5000 + i, world);
+      culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), stub.proxy()));
+    }
+
+    culler.recheck(player.proxy());
+    assertEquals(3L + budget, stats.recheckSubmitted.sum(),
+        "每周期 = 已隐藏实体全量复检（3）+ 可见追踪实体分片（≤ 预算 " + budget + "）");
+
+    culler.recheck(player.proxy());
+    assertEquals(2L * (3 + budget), stats.recheckSubmitted.sum(),
+        "已隐藏实体仍须每周期复检（行为不退化）");
+  }
+
+  /** 复检通道的计数归属：由遮挡新隐藏 / 恢复可见都要计入「复检致隐藏 / 复检致恢复」。 */
+  @Test
+  void recheckEvaluationsAttributeNewHidesAndRestores() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler = newCuller(stats, 12);
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub entity = new EntityStub(6001, world);
+
+    world.occluding = false;
+    culler.evaluate(player.proxy(), entity.proxy(), blockedPath(), true);
+    assertEquals(0L, stats.recheckHidden.sum(), "视线通畅时复检不得隐藏");
+    assertEquals(0, culler.hiddenCount());
+
+    world.occluding = true;
+    culler.evaluate(player.proxy(), entity.proxy(), blockedPath(), true);
+    assertEquals(1L, stats.recheckHidden.sum(), "复检发现新遮挡必须计入「复检致隐藏」");
+    assertEquals(1, culler.hiddenCount());
+
+    world.occluding = false;
+    culler.evaluate(player.proxy(), entity.proxy(), blockedPath(), true);
+    assertEquals(1L, stats.recheckShown.sum(), "复检重新可见必须计入「复检致恢复」");
+    assertEquals(0, culler.hiddenCount());
+  }
+
+  /** 红线：评估拿不到方块数据（异常）时不得隐藏，实体保持可见。 */
+  @Test
+  void failedBlockReadKeepsEntityVisible() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler = newCuller(stats, 12);
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    world.failBlockRead = true;
+    EntityStub entity = new EntityStub(7001, world);
+
+    culler.evaluate(player.proxy(), entity.proxy(), blockedPath(), true);
+
+    assertEquals(0, culler.hiddenCount(), "读方块失败必须按「保持可见」处理（fail-open，不得误藏）");
+    assertEquals(0L, stats.entitiesHidden.sum());
+    assertEquals(0L, stats.recheckHidden.sum());
+  }
+
+  private static Set<Integer> idsOf(List<Entity> entities) {
+    Set<Integer> ids = new HashSet<>();
+    for (Entity entity : entities) {
+      ids.add(entity.getEntityId());
+    }
+    return ids;
+  }
+
+  private static EntityCuller newCuller(ThrottleStats stats, int recheckBudget) {
     // 启用实体剔除与射线判定；强制可见距离 2 格、单工作线程，均为不影响本测试的取值
     return new EntityCuller(new PluginStub().proxy(),
-        new BandwidthConfig.EntityCulling(true, true, 2.0D, 1, 10, 24), stats);
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 1, 10, 24, recheckBudget), stats);
   }
 
   /** 接口方法的默认返回值（未显式打桩的方法一律走这里）。 */
@@ -251,6 +437,8 @@ class EntityCullerTest {
     private final World proxy = (World) Proxy.newProxyInstance(
         World.class.getClassLoader(), new Class<?>[] {World.class}, this);
     private volatile boolean occluding = true;
+    /** 为 true 时 getBlockData 抛异常，模拟「拿不到方块数据」（红线：此时不得隐藏）。 */
+    private volatile boolean failBlockRead;
 
     World proxy() {
       return proxy;
@@ -263,7 +451,12 @@ class EntityCullerTest {
             : ("equals".equals(method.getName()) ? proxy == args[0] : "WorldStub");
       }
       return switch (method.getName()) {
-        case "getBlockData" -> blockData;
+        case "getBlockData" -> {
+          if (failBlockRead) {
+            throw new IllegalStateException("模拟读方块失败");
+          }
+          yield blockData;
+        }
         case "isOccluding" -> occluding;
         default -> defaultValue(method.getReturnType());
       };

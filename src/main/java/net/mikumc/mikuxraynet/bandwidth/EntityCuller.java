@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
 import io.papermc.paper.event.player.PlayerTrackEntityEvent;
+import io.papermc.paper.event.player.PlayerUntrackEntityEvent;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -41,6 +42,15 @@ import org.bukkit.util.BoundingBox;
  *
  * <p>安全策略：强制可见距离内的实体一律可见；只有当包围盒的所有可见顶点射线都被遮挡时才隐藏
  * （宁可少隐藏，也不隐藏可见实体）；玩家自身、其它玩家与烟花不做剔除。
+ *
+ * <p><b>周期复检的两条通道</b>（修复「先可见、之后才被挡住」实体永不隐藏的缺陷）：
+ * <ol>
+ *   <li>已隐藏实体：<b>每周期全部复检</b>，可见即尽快恢复（既有行为，不退化）；</li>
+ *   <li>其余追踪实体：按<b>轮转分片</b>每周期只复检 {@code entity-culling.recheck-budget} 个，
+ *       游标推进，故 {@code ceil(追踪数 / budget)} 个周期内必然覆盖全部追踪实体——
+ *       这样实体入场时可见、之后才被墙/地形挡住的场景也能被收敛到隐藏。</li>
+ * </ol>
+ * 两条通道都复用同一套评估链路（worker 算射线、玩家所在线程读方块并 hide/show），不另写一套。
  */
 public final class EntityCuller implements Listener {
 
@@ -56,6 +66,8 @@ public final class EntityCuller implements Listener {
 
   /** 玩家 → 已被隐藏的实体（entityId → Entity）。 */
   private final ConcurrentHashMap<UUID, Map<Integer, Entity>> hidden = new ConcurrentHashMap<>();
+  /** 玩家 → 该玩家当前追踪的实体轮转队列（周期复检切分片用，见 {@link TrackedRotation}）。 */
+  private final ConcurrentHashMap<UUID, TrackedRotation> rotations = new ConcurrentHashMap<>();
   /** 正在计算的 (玩家, 实体) 组合，避免重复排队。 */
   private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
 
@@ -94,6 +106,7 @@ public final class EntityCuller implements Listener {
     HandlerList.unregisterAll(this);
     restoreAll();
     inFlight.clear();
+    rotations.clear();
     workers.shutdownNow();
   }
 
@@ -112,6 +125,7 @@ public final class EntityCuller implements Listener {
     for (Entity entity : drainPlayer(player.getUniqueId()).values()) {
       show(player, entity);
     }
+    rotations.remove(player.getUniqueId());
     purgeInFlight(player.getUniqueId());
   }
 
@@ -178,44 +192,76 @@ public final class EntityCuller implements Listener {
       return;
     }
     Entity entity = event.getEntity();
-    // 玩家可见性交给原版与其它插件，避免干扰 PvP
-    if (entity instanceof Player || entity.getEntityId() == player.getEntityId()) {
+    // 玩家可见性交给原版与其它插件，避免干扰 PvP；烟花被隐藏会破坏鞘翅飞行体验
+    if (entity instanceof Player || entity.getEntityId() == player.getEntityId()
+        || entity instanceof Firework) {
       return;
     }
-
-    try {
-      double distanceSquared = player.getLocation().distanceSquared(entity.getLocation());
-      if (distanceSquared <= forceVisibleSquared) {
-        showIfHidden(player, entity);
-        return;
-      }
-    } catch (Throwable throwable) {
-      logThrottled(throwable);
-      return;
-    }
-    submitRaycast(player, entity);
+    // 登记进轮转队列：这是「入场那一刻评估一次」之外的兜底，保证之后出现的遮挡也能被发现
+    rotation(player.getUniqueId()).add(entity);
+    submitRaycast(player, entity, false);
   }
 
-  /** 周期复检：对已隐藏的实体重新判定，可见即恢复。 */
-  private void recheck(Player player) {
+  /** 实体离开追踪范围时从轮转队列摘除（否则队列会无界增长，并浪费复检预算）。 */
+  @EventHandler(ignoreCancelled = true)
+  public void onUntrack(PlayerUntrackEntityEvent event) {
+    if (!config.raycast()) {
+      return;
+    }
+    TrackedRotation rotation = rotations.get(event.getPlayer().getUniqueId());
+    if (rotation != null) {
+      rotation.remove(event.getEntity().getEntityId());
+    }
+  }
+
+  private TrackedRotation rotation(UUID playerId) {
+    return rotations.computeIfAbsent(playerId, uuid -> new TrackedRotation());
+  }
+
+  /**
+   * 周期复检：① 已隐藏实体每周期全部复检（尽快恢复可见，行为不退化）；
+   * ② 其余追踪实体按轮转分片复检，每周期不超过 {@code recheck-budget} 个，
+   * 因此在 {@code ceil(追踪数 / budget)} 个周期内覆盖全部追踪实体。
+   *
+   * <p>包可见：供离线单测直接驱动「轮转分片 + 预算」账本行为（真实链路依赖 Bukkit 调度，离线不可用）。
+   */
+  void recheck(Player player) {
     if (!config.raycast() || !player.isOnline()) {
       return;
     }
-    Map<Integer, Entity> map = hidden.get(player.getUniqueId());
-    if (map == null || map.isEmpty()) {
+    UUID playerId = player.getUniqueId();
+
+    // ① 已隐藏实体：每周期全量复检（既有行为）
+    Map<Integer, Entity> hiddenMap = hidden.get(playerId);
+    if (hiddenMap != null && !hiddenMap.isEmpty()) {
+      for (Entity entity : new ArrayList<>(hiddenMap.values())) {
+        if (!entity.isValid()) {
+          hiddenMap.remove(entity.getEntityId());
+          continue;
+        }
+        stats.recheckSubmitted.increment();
+        submitRaycast(player, entity, true);
+      }
+    }
+
+    // ② 其余追踪实体：轮转分片，每周期只取一小批（已隐藏者由 ① 负责，这里跳过）
+    TrackedRotation rotation = rotations.get(playerId);
+    if (rotation == null) {
       return;
     }
-    for (Entity entity : new ArrayList<>(map.values())) {
+    Set<Integer> hiddenIds = hiddenMap == null ? Set.of() : hiddenMap.keySet();
+    for (Entity entity : rotation.nextBatch(config.recheckBudget(), hiddenIds)) {
       if (!entity.isValid()) {
-        map.remove(entity.getEntityId());
+        rotation.remove(entity.getEntityId());
         continue;
       }
-      submitRaycast(player, entity);
+      stats.recheckSubmitted.increment();
+      submitRaycast(player, entity, true);
     }
   }
 
-  /** 抓取纯数据后交给工作线程求体素序列。 */
-  private void submitRaycast(Player player, Entity entity) {
+  /** 抓取纯数据后交给工作线程求体素序列；{@code fromRecheck} 仅用于统计归属（不影响判定逻辑）。 */
+  private void submitRaycast(Player player, Entity entity, boolean fromRecheck) {
     // 烟花被隐藏会破坏鞘翅飞行体验，直接跳过
     if (entity instanceof Firework) {
       return;
@@ -228,6 +274,12 @@ public final class EntityCuller implements Listener {
     double[] eye;
     double[][] vertices;
     try {
+      // 强制可见距离内一律不剔除——复检通道同样适用，避免轮转复检把近处实体误藏
+      if (player.getLocation().distanceSquared(entity.getLocation()) <= forceVisibleSquared) {
+        inFlight.remove(key);
+        showIfHidden(player, entity);
+        return;
+      }
       Location eyeLocation = player.getEyeLocation();
       eye = new double[] {eyeLocation.getX(), eyeLocation.getY(), eyeLocation.getZ()};
       BoundingBox box = entity.getBoundingBox();
@@ -250,7 +302,7 @@ public final class EntityCuller implements Listener {
         }
         Schedulers.onEntity(plugin, player, () -> {
           try {
-            evaluate(player, entity, paths);
+            evaluate(player, entity, paths, fromRecheck);
           } finally {
             inFlight.remove(key);
           }
@@ -264,6 +316,15 @@ public final class EntityCuller implements Listener {
 
   /** 主线程/区域线程：读方块判定遮挡并执行隐藏/恢复（包可见：供离线单测直接驱动账本行为）。 */
   void evaluate(Player player, Entity entity, List<int[]> paths) {
+    evaluate(player, entity, paths, false);
+  }
+
+  /**
+   * 评估入口（包可见：供离线单测直接驱动「复检通道」的计数归属）。
+   *
+   * @param fromRecheck 是否来自周期复检：仅用于把计数归入「复检致隐藏 / 复检致恢复」，不影响判定逻辑
+   */
+  void evaluate(Player player, Entity entity, List<int[]> paths, boolean fromRecheck) {
     if (!entity.isValid() || !player.isOnline()) {
       Map<Integer, Entity> map = hidden.get(player.getUniqueId());
       if (map != null) {
@@ -272,7 +333,9 @@ public final class EntityCuller implements Listener {
       return;
     }
     if (paths.isEmpty()) {
-      showIfHidden(player, entity);
+      if (showIfHidden(player, entity) && fromRecheck) {
+        stats.recheckShown.increment();
+      }
       return;
     }
 
@@ -298,44 +361,53 @@ public final class EntityCuller implements Listener {
     }
 
     if (allBlocked) {
-      hide(player, entity);
-    } else {
-      showIfHidden(player, entity);
+      if (hide(player, entity) && fromRecheck) {
+        stats.recheckHidden.increment();
+      }
+    } else if (showIfHidden(player, entity) && fromRecheck) {
+      stats.recheckShown.increment();
     }
   }
 
-  private void hide(Player player, Entity entity) {
+  /** @return 是否真的新登记并执行了 hideEntity（已隐藏 / 失败时为 false）。 */
+  private boolean hide(Player player, Entity entity) {
     Map<Integer, Entity> map = hidden.computeIfAbsent(player.getUniqueId(),
         uuid -> new ConcurrentHashMap<>());
     if (map.containsKey(entity.getEntityId())) {
-      return;
+      return false;
     }
     try {
       player.hideEntity(plugin, entity);
       map.put(entity.getEntityId(), entity);
       stats.entitiesHidden.increment();
+      return true;
     } catch (Throwable throwable) {
       logThrottled(throwable);
+      return false;
     }
   }
 
-  private void showIfHidden(Player player, Entity entity) {
+  /** @return 是否真的从账本摘除并执行了 showEntity（未隐藏 / 实体已失效时为 false）。 */
+  private boolean showIfHidden(Player player, Entity entity) {
     Map<Integer, Entity> map = hidden.get(player.getUniqueId());
     if (map == null || map.remove(entity.getEntityId()) == null) {
-      return;
+      return false;
     }
-    show(player, entity);
+    return show(player, entity);
   }
 
-  private void show(Player player, Entity entity) {
+  /** @return 是否真的下发了 showEntity（实体已失效时为 false）。 */
+  private boolean show(Player player, Entity entity) {
     try {
       if (entity.isValid()) {
         player.showEntity(plugin, entity);
         stats.entitiesShown.increment();
+        return true;
       }
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
+    return false;
   }
 
   /** 停用时的兜底：把所有被隐藏的实体恢复显示，不留副作用。 */
@@ -370,6 +442,72 @@ public final class EntityCuller implements Listener {
   private void logThrottled(Throwable throwable) {
     if (errorCounter.incrementAndGet() <= MAX_ERROR_LOGS) {
       plugin.getLogger().log(Level.WARNING, "实体剔除判定失败，已按「保持可见」处理", throwable);
+    }
+  }
+
+  /**
+   * 单玩家的「追踪实体轮转队列」：按加入顺序保存该玩家正在追踪的实体，用游标把周期复检切成小分片。
+   *
+   * <p><b>覆盖保证</b>：每周期只推进 {@code min(budget, size)} 个<b>位置</b>（与是否已隐藏无关），
+   * 因此 {@code ceil(size / budget)} 个周期内必然遍历到所有位置——这正是「先可见、之后才被挡住」
+   * 的实体能被收敛到隐藏的原因；同时每周期真正提交的复检数不超过 {@code budget}。
+   *
+   * <p>线程模型：事件与周期任务都落在玩家所属线程上；加锁仅为防御两者线程不一致（Folia 区域线程）。
+   */
+  static final class TrackedRotation {
+
+    private final List<Entity> order = new ArrayList<>();
+    private int cursor;
+
+    /** 加入一个被追踪实体（按 entityId 去重）。 */
+    synchronized void add(Entity entity) {
+      int entityId = entity.getEntityId();
+      for (Entity existing : order) {
+        if (existing.getEntityId() == entityId) {
+          return;
+        }
+      }
+      order.add(entity);
+    }
+
+    /** 摘除一个不再被追踪的实体，并修正游标使「下一页」不被跳过。 */
+    synchronized void remove(int entityId) {
+      for (int i = 0; i < order.size(); i++) {
+        if (order.get(i).getEntityId() == entityId) {
+          order.remove(i);
+          if (cursor > i) {
+            cursor--;
+          }
+          return;
+        }
+      }
+    }
+
+    synchronized int size() {
+      return order.size();
+    }
+
+    /**
+     * 取出本轮要复检的一小批追踪实体（跳过已隐藏者——它们由「每周期全量复检」通道负责），
+     * 并把游标推进一批，保证有限周期内覆盖全部追踪实体。
+     */
+    synchronized List<Entity> nextBatch(int budget, Set<Integer> hiddenIds) {
+      int size = order.size();
+      if (size == 0) {
+        cursor = 0;
+        return List.of();
+      }
+      int step = Math.min(Math.max(1, budget), size);
+      int start = Math.floorMod(cursor, size);
+      List<Entity> batch = new ArrayList<>(step);
+      for (int i = 0; i < step; i++) {
+        Entity entity = order.get((start + i) % size);
+        if (!hiddenIds.contains(entity.getEntityId())) {
+          batch.add(entity);
+        }
+      }
+      cursor = (start + step) % size;
+      return batch;
     }
   }
 }

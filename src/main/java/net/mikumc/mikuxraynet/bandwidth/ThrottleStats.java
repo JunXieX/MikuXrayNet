@@ -25,6 +25,17 @@ public final class ThrottleStats {
   public final LongAdder entitiesHidden = new LongAdder();
   public final LongAdder entitiesShown = new LongAdder();
 
+  /**
+   * 实体剔除「周期复检」口径：复检提交数 / 复检致新隐藏数 / 复检致恢复数。
+   *
+   * <p><b>为什么单列</b>：{@code entitiesHidden} 混合了「入场即被遮挡」与「周期复检发现新遮挡」两条来源，
+   * 只看总数无法判断「先可见后被遮挡」这类实体是否真的被收敛到隐藏。本组计数正是本次缺陷的可观测指标：
+   * 复检提交数持续增长（轮转在推进）、复检致隐藏数随之 +1，即证明轮转分片生效。
+   */
+  public final LongAdder recheckSubmitted = new LongAdder();
+  public final LongAdder recheckHidden = new LongAdder();
+  public final LongAdder recheckShown = new LongAdder();
+
   /** AFK 降级：进入 AFK 次数 / 丢弃的低价值包数。 */
   public final LongAdder afkEntered = new LongAdder();
   public final LongAdder afkPacketsDropped = new LongAdder();
@@ -43,6 +54,9 @@ public final class ThrottleStats {
     map.put("变更原样放行", blockChangesPassed.sum());
     map.put("实体隐藏", entitiesHidden.sum());
     map.put("实体恢复", entitiesShown.sum());
+    map.put("复检提交", recheckSubmitted.sum());
+    map.put("复检致隐藏", recheckHidden.sum());
+    map.put("复检致恢复", recheckShown.sum());
     map.put("进入AFK", afkEntered.sum());
     map.put("AFK丢包", afkPacketsDropped.sum());
     map.put("降视距", viewDistanceReduced.sum());
