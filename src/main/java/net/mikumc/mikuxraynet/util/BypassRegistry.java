@@ -50,6 +50,7 @@ public final class BypassRegistry implements Listener {
     try {
       plugin.getServer().getPluginManager().registerEvents(this, plugin);
       refreshAll();
+      // GlobalRegionScheduler：Paper 上落在主线程；延迟与周期都以 tick 计（与旧 runTaskTimer 一致）
       this.refreshTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin,
           scheduled -> refreshAll(), REFRESH_INTERVAL_TICKS, REFRESH_INTERVAL_TICKS);
     } catch (Throwable throwable) {

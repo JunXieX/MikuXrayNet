@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
 import io.papermc.paper.event.player.PlayerTrackEntityEvent;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -12,7 +13,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
-import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
@@ -26,7 +26,6 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
-import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.BoundingBox;
 
 /**
@@ -59,7 +58,8 @@ public final class EntityCuller implements Listener {
   /** 正在计算的 (玩家, 实体) 组合，避免重复排队。 */
   private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
 
-  private BukkitTask globalTask;
+  /** 每个在线玩家的周期复检任务（Paper 与 Folia 同一套实体调度器；玩家退出即随实体退役失效）。 */
+  private final ConcurrentHashMap<UUID, ScheduledTask> recheckTasks = new ConcurrentHashMap<>();
 
   public EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats) {
     this.plugin = plugin;
@@ -80,23 +80,16 @@ public final class EntityCuller implements Listener {
   public void start() {
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     long interval = Math.max(1, config.updateIntervalTicks());
-    if (PlatformSupport.isFolia()) {
-      // Folia：每个玩家一条区域任务，玩家退役时自动失效
-      for (Player player : Bukkit.getOnlinePlayers()) {
-        Schedulers.repeatOnEntity(plugin, player, interval, interval, () -> recheck(player));
-      }
-    } else {
-      globalTask = Bukkit.getScheduler().runTaskTimer(plugin, this::recheckAll, interval, interval);
+    // 统一为「每个玩家一条实体调度任务」：Paper 上落在主线程、Folia 上落在区域线程（同一套 API，无需分支）
+    for (Player player : Bukkit.getOnlinePlayers()) {
+      scheduleRecheck(player, interval);
     }
     plugin.getLogger().info("带宽模块已启用：实体射线剔除（强制可见距离 " + config.forceVisibleDistance() + " 格）");
   }
 
   /** 注销监听、恢复全部被隐藏实体并关闭线程池。 */
   public void stop() {
-    if (globalTask != null) {
-      globalTask.cancel();
-      globalTask = null;
-    }
+    cancelRecheckTasks();
     HandlerList.unregisterAll(this);
     restoreAll();
     inFlight.clear();
@@ -105,17 +98,16 @@ public final class EntityCuller implements Listener {
 
   @EventHandler(ignoreCancelled = true)
   public void onJoin(PlayerJoinEvent event) {
-    if (!PlatformSupport.isFolia() || !config.raycast()) {
+    if (!config.raycast()) {
       return;
     }
-    long interval = Math.max(1, config.updateIntervalTicks());
-    Player player = event.getPlayer();
-    Schedulers.repeatOnEntity(plugin, player, interval, interval, () -> recheck(player));
+    scheduleRecheck(event.getPlayer(), Math.max(1, config.updateIntervalTicks()));
   }
 
   @EventHandler(ignoreCancelled = true)
   public void onQuit(PlayerQuitEvent event) {
     Player player = event.getPlayer();
+    cancelRecheckTask(player.getUniqueId());
     Map<Integer, Entity> map = hidden.remove(player.getUniqueId());
     if (map != null) {
       for (Entity entity : map.values()) {
@@ -123,6 +115,33 @@ public final class EntityCuller implements Listener {
       }
     }
     purgeInFlight(player.getUniqueId());
+  }
+
+  /** 为单个玩家登记周期复检任务；同一玩家重复登记时以最新任务为准（旧任务取消）。 */
+  private void scheduleRecheck(Player player, long interval) {
+    ScheduledTask task = Schedulers.repeatOnEntity(plugin, player, interval, interval,
+        () -> recheck(player));
+    if (task == null) {
+      return;
+    }
+    ScheduledTask previous = recheckTasks.put(player.getUniqueId(), task);
+    if (previous != null) {
+      previous.cancel();
+    }
+  }
+
+  private void cancelRecheckTask(UUID playerId) {
+    ScheduledTask task = recheckTasks.remove(playerId);
+    if (task != null) {
+      task.cancel();
+    }
+  }
+
+  private void cancelRecheckTasks() {
+    for (ScheduledTask task : recheckTasks.values()) {
+      task.cancel();
+    }
+    recheckTasks.clear();
   }
 
   @EventHandler(ignoreCancelled = true)
@@ -151,12 +170,6 @@ public final class EntityCuller implements Listener {
       return;
     }
     submitRaycast(player, entity);
-  }
-
-  private void recheckAll() {
-    for (Player player : Bukkit.getOnlinePlayers()) {
-      recheck(player);
-    }
   }
 
   /** 周期复检：对已隐藏的实体重新判定，可见即恢复。 */
@@ -309,11 +322,8 @@ public final class EntityCuller implements Listener {
         continue;
       }
       for (Entity entity : map.values()) {
-        if (PlatformSupport.isFolia()) {
-          Schedulers.onEntity(plugin, player, () -> show(player, entity));
-        } else {
-          show(player, entity);
-        }
+        // 一律回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
+        Schedulers.onEntity(plugin, player, () -> show(player, entity));
       }
     }
     hidden.clear();

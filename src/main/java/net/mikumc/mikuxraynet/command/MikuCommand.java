@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.logging.Level;
+import net.kyori.adventure.text.Component;
 import net.mikumc.mikuxraynet.MikuXrayNet;
 import net.mikumc.mikuxraynet.util.Diagnostics;
 import org.bukkit.command.Command;
@@ -51,51 +52,61 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
 
   private void status(CommandSender sender) {
     if (!sender.hasPermission(PERMISSION_STATUS)) {
-      sender.sendMessage("你没有权限查看运行状态");
+      message(sender, "你没有权限查看运行状态");
       return;
     }
     try {
       for (String line : diagnostics.statusLines()) {
-        sender.sendMessage(line);
+        message(sender, line);
       }
     } catch (Throwable throwable) {
       plugin.getLogger().log(Level.WARNING, "生成运行状态失败", throwable);
-      sender.sendMessage("生成运行状态失败，详见服务端日志");
+      message(sender, "生成运行状态失败，详见服务端日志");
     }
   }
 
   private void dump(CommandSender sender) {
     if (!sender.hasPermission(PERMISSION_DUMP)) {
-      sender.sendMessage("你没有权限导出诊断");
+      message(sender, "你没有权限导出诊断");
       return;
     }
     try {
       File file = diagnostics.writeDump();
-      sender.sendMessage("诊断转储已写入：" + file.getAbsolutePath());
+      message(sender, "诊断转储已写入：" + file.getAbsolutePath());
     } catch (Throwable throwable) {
       plugin.getLogger().log(Level.WARNING, "导出诊断转储失败", throwable);
-      sender.sendMessage("导出诊断转储失败，详见服务端日志");
+      message(sender, "导出诊断转储失败，详见服务端日志");
     }
   }
 
   private void reload(CommandSender sender) {
     if (!sender.hasPermission(PERMISSION_RELOAD)) {
-      sender.sendMessage("你没有权限热重载配置");
+      message(sender, "你没有权限热重载配置");
       return;
     }
     try {
       for (String line : plugin.reloadConfigs()) {
-        sender.sendMessage(line);
+        message(sender, line);
       }
     } catch (Throwable throwable) {
       plugin.getLogger().log(Level.WARNING, "热重载配置失败", throwable);
-      sender.sendMessage("热重载配置失败，详见服务端日志（原配置与运行状态未受影响）");
+      message(sender, "热重载配置失败，详见服务端日志（原配置与运行状态未受影响）");
     }
   }
 
   private void usage(CommandSender sender, String label) {
-    sender.sendMessage("用法：/" + label + " <status|dump|reload>");
-    sender.sendMessage("status 查看运行状态｜dump 导出诊断文件｜reload 热重载配置");
+    message(sender, "用法：/" + label + " <status|dump|reload>");
+    message(sender, "status 查看运行状态｜dump 导出诊断文件｜reload 热重载配置");
+  }
+
+  /**
+   * 向发送者回显一行文本（Paper 原生 Adventure {@link Component}，取代已废弃的 {@code sendMessage(String)}）。
+   *
+   * <p>仅做 {@code Component.text(text)} 包装，文本内容与旧实现逐字一致（不解析颜色/迷你消息标记，
+   * 避免已有文案中的字符被误当格式符）。控制台日志仍走 {@code getLogger()}，不在此列。
+   */
+  private static void message(CommandSender sender, String text) {
+    sender.sendMessage(Component.text(text));
   }
 
   @Override

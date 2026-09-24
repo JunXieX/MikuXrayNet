@@ -3,6 +3,8 @@ package net.mikumc.mikuxraynet;
 import com.comphenix.protocol.ProtocolManager;
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
+import io.papermc.paper.command.brigadier.Commands;
+import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import java.io.File;
 import java.util.Collection;
 import java.util.List;
@@ -80,7 +82,8 @@ public final class MikuXrayNet extends JavaPlugin {
       onLoad();
     }
 
-    // 平台判定必须最先做：它决定后续所有调度分支（常规 Bukkit vs 区域调度器）与实体枚举能力。
+    // 平台判定必须最先做：调度已统一走 Paper 调度器（不再分支），但平台判定仍决定
+    // 「能否安全枚举全服实体」（零位移包白名单）与「邻近显形的巡检策略」两处能力差异。
     // 依据是服务端品牌/版本标识（antixray.yml: advanced.platform 可手动指定），不再用「类存在性」，
     // 因为 Paper 及其下游分支（如 Leaf）都会自带 io.papermc.paper.threadedregions.* 的调度器 API 类。
     PlatformSupport.configure(config.antiXray().platform());
@@ -406,19 +409,21 @@ public final class MikuXrayNet extends JavaPlugin {
   /**
    * 注册管理命令（执行器与补全器）。
    *
-   * <p>双路径，因为本插件同时提供两份插件描述（paper-plugin.yml 优先、plugin.yml 回退）：
-   * <ul>
-   *   <li><b>传统路径</b>：核心按 plugin.yml 加载时，Bukkit 会依据 commands 段注册 PluginCommand，
-   *       这里取回来绑定执行器即可；</li>
-   *   <li><b>现代路径</b>：核心按 paper-plugin.yml 加载时，Paper 不会从 YAML 注册任何命令
-   *       （PaperPluginClassLoader#init 以 Map.of() 填充 PluginDescriptionFile#commands），
-   *       必须在 onEnable 内调用 {@link org.bukkit.plugin.java.JavaPlugin#registerCommand}。
-   *       判断方式：此路径下调用 {@code getCommand} 会抛 {@link UnsupportedOperationException}。</li>
-   * </ul>
+   * <p><b>现代路径（Paper / Folia）</b>：通过 Paper 生命周期事件 {@link LifecycleEvents#COMMANDS} 注册
+   * Brigadier 命令（Paper 官方推荐做法）。paper-plugin.yml 下 Paper 不会从 YAML 注册任何命令
+   * （PaperPluginClassLoader#init 以 Map.of() 填充 PluginDescriptionFile#commands），故命令只能由代码注册。
+   *
+   * <p><b>回退路径（纯 Bukkit/Spigot 或老核心）</b>：这些核心没有 {@code Plugin#getLifecycleManager()}，
+   * 调用会抛 {@link NoSuchMethodError}；此时退回按 plugin.yml 的 commands 段取回 {@link PluginCommand}
+   * 并绑定执行器（命令名 / 别名 / 权限 / 补全行为完全一致）。
    */
   private void registerCommand() {
     try {
       MikuCommand executor = new MikuCommand(this);
+      if (registerLifecycleCommand(executor)) {
+        getLogger().info("管理命令 /" + COMMAND_NAME + " 已按 paper-plugin.yml 现代方式注册");
+        return;
+      }
       PluginCommand legacyCommand = legacyPluginCommand();
       if (legacyCommand != null) {
         legacyCommand.setExecutor(executor);
@@ -426,11 +431,30 @@ public final class MikuXrayNet extends JavaPlugin {
         getLogger().info("管理命令 /" + COMMAND_NAME + " 已按 plugin.yml 传统方式注册");
         return;
       }
-      registerCommand(COMMAND_NAME, COMMAND_DESCRIPTION, COMMAND_ALIASES,
-          new PaperCommandBridge(executor));
-      getLogger().info("管理命令 /" + COMMAND_NAME + " 已按 paper-plugin.yml 现代方式注册");
+      getLogger().warning("注册管理命令失败（管理命令不可用）");
     } catch (Throwable throwable) {
       getLogger().log(Level.WARNING, "注册管理命令失败（管理命令不可用）", throwable);
+    }
+  }
+
+  /**
+   * 现代路径：在生命周期事件 {@code COMMANDS} 中注册命令（Paper 与 Folia 是同一套 API）。
+   *
+   * <p>返回 {@code false} 表示当前核心不是 Paper（{@code Plugin#getLifecycleManager()} 不可用），
+   * 由调用方退回 plugin.yml 传统路径。注意求值顺序：{@code getLifecycleManager()} 先于 lambda 求值，
+   * 因此非 Paper 核心上根本不会加载 {@link LifecycleEvents} / {@link Commands} / {@link BasicCommand} 等类。
+   */
+  private boolean registerLifecycleCommand(MikuCommand executor) {
+    try {
+      getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
+        Commands commands = event.registrar();
+        commands.register(COMMAND_NAME, COMMAND_DESCRIPTION, COMMAND_ALIASES,
+            new PaperCommandBridge(executor));
+      });
+      return true;
+    } catch (Throwable throwable) {
+      // 纯 Bukkit/Spigot：Plugin#getLifecycleManager 不存在（NoSuchMethodError），改走传统路径
+      return false;
     }
   }
 

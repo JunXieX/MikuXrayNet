@@ -12,7 +12,6 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
-import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
 import net.mikumc.mikuxraynet.cache.DiskPayload;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
@@ -406,12 +405,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     };
 
     try {
-      if (PlatformSupport.isFolia()) {
-        // Folia：在该区块所属的区域线程上抓取（跨区域读取失败会由 provider 按缺失降级）
-        Bukkit.getRegionScheduler().execute(getPlugin(), world, task.chunkX(), task.chunkZ(), capture);
-      } else {
-        Bukkit.getScheduler().runTask(getPlugin(), capture);
-      }
+      // RegionScheduler：Paper 上落在主线程、Folia 上落在该区块所属区域线程（同一套 API，无需分支）。
+      // 跨区域读取失败会由 provider 按缺失策略降级。
+      Bukkit.getRegionScheduler().execute(getPlugin(), world, task.chunkX(), task.chunkZ(), capture);
       return true;
     } catch (Throwable throwable) {
       logThrottled("邻区块抓取调度失败，已按缺失策略降级", throwable);

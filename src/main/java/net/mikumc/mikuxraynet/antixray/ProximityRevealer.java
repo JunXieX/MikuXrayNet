@@ -5,6 +5,7 @@ import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -26,7 +27,6 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
-import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.Vector;
 
 /**
@@ -116,7 +116,7 @@ public final class ProximityRevealer implements Listener {
   /** 「显形索引容量触顶」只提示一次（CAS 抢占），避免每轮巡检刷屏。 */
   private final AtomicBoolean capacityWarned = new AtomicBoolean();
 
-  private BukkitTask globalTask;
+  private ScheduledTask globalTask;
 
   public ProximityRevealer(Plugin plugin, ProtocolManager protocolManager, AntiXrayConfig config,
       RevealedBlockIndex index, ProximityStats stats, BypassRegistry bypassRegistry,
@@ -136,11 +136,16 @@ public final class ProximityRevealer implements Listener {
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     long interval = Math.max(1, proximity.intervalTicks());
     if (PlatformSupport.isFolia()) {
+      // 保留平台差异（策略分支，非 API 分支）：Folia 无法从全局线程安全读取玩家世界/位置，
+      // 因此每个玩家一条区域任务（实体调度器，延迟与周期都以 tick 计）。
       for (Player player : Bukkit.getOnlinePlayers()) {
         Schedulers.repeatOnEntity(plugin, player, interval, interval, () -> pass(player));
       }
     } else {
-      globalTask = Bukkit.getScheduler().runTaskTimer(plugin, this::passAll, interval, interval);
+      // Paper：单条全局任务，保留「全服共享发包额度」的既有语义（延迟与周期都以 tick 计）。
+      // 合并为每玩家任务会把 max-reveals-per-tick 从全服合计改成每玩家额度，属可观测的封包行为变化，故不合并。
+      globalTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, scheduled -> passAll(),
+          interval, interval);
     }
     plugin.getLogger().info("邻近显形已启用：距离 " + proximity.distance() + " 格，周期 " + interval
         + " tick，单次上限 " + proximity.maxRevealsPerTick() + " 个；视锥 "

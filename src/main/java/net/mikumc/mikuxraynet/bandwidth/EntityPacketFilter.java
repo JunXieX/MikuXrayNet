@@ -7,6 +7,7 @@ import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.reflect.StructureModifier;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -21,7 +22,6 @@ import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
 import org.bukkit.plugin.Plugin;
-import org.bukkit.scheduler.BukkitTask;
 
 /**
  * 零位移实体包抑制：出站的实体位置/朝向增量全为 0 时取消发送。
@@ -53,7 +53,7 @@ public final class EntityPacketFilter extends PacketAdapter {
 
   /** 实体 id → 归一化类型键（主线程刷新，网络线程只读）。 */
   private volatile Map<Integer, String> entityTypeIndex = Collections.emptyMap();
-  private BukkitTask indexTask;
+  private ScheduledTask indexTask;
 
   public EntityPacketFilter(Plugin plugin, ProtocolManager protocolManager,
       BandwidthConfig.EntityPackets config, ThrottleStats stats) {
@@ -71,11 +71,13 @@ public final class EntityPacketFilter extends PacketAdapter {
     protocolManager.addPacketListener(this);
     if (!whitelist.isEmpty()) {
       if (PlatformSupport.isFolia()) {
+        // 保留平台差异：Folia 下无法从单一线程安全枚举全服实体，因此不做类型索引（白名单退化为对所有实体生效）
         plugin.getLogger().warning("Folia 下无法安全枚举实体，零位移包白名单暂不生效（不影响其余逻辑）");
       } else {
         refreshEntityTypeIndex();
-        indexTask = Bukkit.getScheduler().runTaskTimer(plugin, this::refreshEntityTypeIndex,
-            INDEX_REFRESH_TICKS, INDEX_REFRESH_TICKS);
+        // GlobalRegionScheduler：Paper 上落在主线程；延迟与周期都以 tick 计（与旧 runTaskTimer 一致）
+        indexTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin,
+            scheduled -> refreshEntityTypeIndex(), INDEX_REFRESH_TICKS, INDEX_REFRESH_TICKS);
       }
     }
     plugin.getLogger().info("带宽模块已启用：零位移实体包取消（白名单 " + whitelist.size() + " 项）");

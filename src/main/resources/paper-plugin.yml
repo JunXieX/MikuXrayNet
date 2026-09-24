@@ -133,9 +133,10 @@ permissions:
 #     PaperPluginMeta 本身也没有 commands 字段。
 #   证据 3（源码）：PaperPluginInstanceManager#enablePlugin 只在
 #     plugin.getPluginMeta() instanceof PluginDescriptionFile（传统插件）时才解析 YAML 命令。
-#   应对（兼容写法）：命令改由 MikuXrayNet#registerCommand 在 onEnable 内用
-#     JavaPlugin#registerCommand(label, description, aliases, BasicCommand) 注册
-#     （该方法已在本项目编译目标 paper-api 26.2.build.129-stable 上用 javap 核实存在）。
+#   应对（现代写法）：命令改由 MikuXrayNet#registerCommand 在 onEnable 内经 Paper 生命周期事件
+#     LifecycleEvents.COMMANDS 注册（Commands#register(label, description, aliases, BasicCommand)），
+#     签名已在本项目编译目标 paper-api 26.2.build.129-stable 上用 javap 核实；
+#     纯 Bukkit/Spigot 无该生命周期 API，回退到 plugin.yml 的 commands 段 + PluginCommand#setExecutor。
 #   本段仅为「两份描述字段对齐」而保留；在纯 Bukkit/Spigot 上 paper-plugin.yml 不会被读取，
 #   那里由 plugin.yml 的 commands 段生效。
 # ---------------------------------------------------------------------------

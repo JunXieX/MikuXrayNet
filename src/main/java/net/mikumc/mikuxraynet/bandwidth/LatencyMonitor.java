@@ -1,9 +1,9 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
@@ -13,7 +13,6 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
-import org.bukkit.scheduler.BukkitTask;
 
 /**
  * 高延迟降视距：延迟持续超过阈值的玩家降低视距，降低其下游带宽占用；延迟恢复后还原。
@@ -21,8 +20,8 @@ import org.bukkit.scheduler.BukkitTask;
  * <p>判定为纯状态机 {@link PingState}（时钟可注入，可单测）：先连续观察，
  * 只有「不低于阈值且持续超过 sustain 秒」才触发一次降级。
  *
- * <p>视距的读写与还原全部在玩家所属线程执行（非 Folia 为统一主线程任务，Folia 为各玩家的
- * 区域任务）；原始视距只存内存，玩家退出即清理，插件停用时统一还原。
+ * <p>视距的读写与还原全部在玩家所属线程执行（统一走每个玩家一条实体调度任务：Paper 上落在主线程，
+ * Folia 上落在区域线程）；原始视距只存内存，玩家退出即清理，插件停用时统一还原。
  */
 public final class LatencyMonitor implements Listener {
 
@@ -34,7 +33,8 @@ public final class LatencyMonitor implements Listener {
   private final ConcurrentHashMap<UUID, PingState> watches = new ConcurrentHashMap<>();
   private final ConcurrentHashMap<UUID, Integer> originalViewDistance = new ConcurrentHashMap<>();
 
-  private BukkitTask globalTask;
+  /** 每个在线玩家的周期检查任务（Paper 与 Folia 同一套实体调度器；玩家退出即随实体退役失效）。 */
+  private final ConcurrentHashMap<UUID, ScheduledTask> checkTasks = new ConcurrentHashMap<>();
 
   public LatencyMonitor(Plugin plugin, BandwidthConfig.Latency config, ThrottleStats stats) {
     this.plugin = plugin;
@@ -47,13 +47,10 @@ public final class LatencyMonitor implements Listener {
   public void start() {
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     long period = Math.max(20L, config.checkIntervalSeconds() * 20L);
-    if (PlatformSupport.isFolia()) {
-      for (Player player : Bukkit.getOnlinePlayers()) {
-        watches.put(player.getUniqueId(), new PingState());
-        Schedulers.repeatOnEntity(plugin, player, period, period, () -> tick(player));
-      }
-    } else {
-      globalTask = Bukkit.getScheduler().runTaskTimer(plugin, this::tickAll, period, period);
+    // 统一为「每个玩家一条实体调度任务」：Paper 上落在主线程、Folia 上落在区域线程（同一套 API，无需分支）
+    for (Player player : Bukkit.getOnlinePlayers()) {
+      watches.put(player.getUniqueId(), new PingState());
+      scheduleCheck(player, period);
     }
     plugin.getLogger().info("带宽模块已启用：高延迟降视距（阈值 " + config.thresholdMillis() + "ms，持续 "
         + config.sustainSeconds() + " 秒，降 " + config.reduceViewDistance() + " 区块）");
@@ -61,10 +58,7 @@ public final class LatencyMonitor implements Listener {
 
   /** 停用：取消任务并还原所有被下调的视距。 */
   public void stop() {
-    if (globalTask != null) {
-      globalTask.cancel();
-      globalTask = null;
-    }
+    cancelCheckTasks();
     HandlerList.unregisterAll(this);
     restoreAll();
     watches.clear();
@@ -75,23 +69,42 @@ public final class LatencyMonitor implements Listener {
   public void onJoin(PlayerJoinEvent event) {
     Player player = event.getPlayer();
     watches.put(player.getUniqueId(), new PingState());
-    if (PlatformSupport.isFolia()) {
-      long period = Math.max(20L, config.checkIntervalSeconds() * 20L);
-      Schedulers.repeatOnEntity(plugin, player, period, period, () -> tick(player));
-    }
+    scheduleCheck(player, Math.max(20L, config.checkIntervalSeconds() * 20L));
   }
 
   @EventHandler(ignoreCancelled = true)
   public void onQuit(PlayerQuitEvent event) {
     UUID playerId = event.getPlayer().getUniqueId();
+    cancelCheckTask(playerId);
     watches.remove(playerId);
     originalViewDistance.remove(playerId);
   }
 
-  private void tickAll() {
-    for (Player player : Bukkit.getOnlinePlayers()) {
-      tick(player);
+  /** 为单个玩家登记周期检查任务（初始延迟与周期都以 tick 计）；同一玩家重复登记时以最新任务为准。 */
+  private void scheduleCheck(Player player, long periodTicks) {
+    ScheduledTask task = Schedulers.repeatOnEntity(plugin, player, periodTicks, periodTicks,
+        () -> tick(player));
+    if (task == null) {
+      return;
     }
+    ScheduledTask previous = checkTasks.put(player.getUniqueId(), task);
+    if (previous != null) {
+      previous.cancel();
+    }
+  }
+
+  private void cancelCheckTask(UUID playerId) {
+    ScheduledTask task = checkTasks.remove(playerId);
+    if (task != null) {
+      task.cancel();
+    }
+  }
+
+  private void cancelCheckTasks() {
+    for (ScheduledTask task : checkTasks.values()) {
+      task.cancel();
+    }
+    checkTasks.clear();
   }
 
   /** 单个玩家的采样与降级/还原（必须在玩家所属线程执行）。 */
@@ -155,11 +168,8 @@ public final class LatencyMonitor implements Listener {
         continue;
       }
       int original = entry.getValue();
-      if (PlatformSupport.isFolia()) {
-        Schedulers.onEntity(plugin, player, () -> setViewDistance(player, original));
-      } else {
-        setViewDistance(player, original);
-      }
+      // 一律回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
+      Schedulers.onEntity(plugin, player, () -> setViewDistance(player, original));
     }
     originalViewDistance.clear();
   }
