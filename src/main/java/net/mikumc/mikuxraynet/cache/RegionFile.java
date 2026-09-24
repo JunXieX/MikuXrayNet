@@ -86,12 +86,27 @@ final class RegionFile implements AutoCloseable {
 
     RegionFile file = new RegionFile(path, channel, hashSeed, bucketCacheSize);
     try {
-      file.loadIndex(size);
+      if (size <= 0L) {
+        // 新建（或刚被清空）的文件：必须先落「文件头 + 全零偏移表」，
+        // 否则后续 append 会从偏移 0 开始写，直接把头部与偏移表踩掉（重开时被判为损坏）。
+        file.writeHeaderAndEmptyTable();
+      } else {
+        file.loadIndex(size);
+      }
     } catch (IOException exception) {
       file.closeQuietly();
       throw exception;
     }
     return file;
+  }
+
+  /** 写入文件头与全零偏移表，并把数据区起始位置作为当前文件长度。 */
+  private void writeHeaderAndEmptyTable() throws IOException {
+    writeFully(channel, ByteBuffer.wrap(BufferedLinearV3Format.encodeHeader(hashSeed)), 0L);
+    writeFully(channel, ByteBuffer.wrap(BufferedLinearV3Format.encodePosTable(positions)),
+        BufferedLinearV3Format.POS_TABLE_OFFSET);
+    channel.force(false);
+    this.fileSize = BufferedLinearV3Format.DATA_AREA_OFFSET;
   }
 
   /** 读入偏移表并统计有效/垃圾字节数（损坏的引用按「空桶 + 垃圾」处理）。 */
@@ -202,6 +217,11 @@ final class RegionFile implements AutoCloseable {
 
   /** 追加写入单个 bucket（append-only：旧副本变成垃圾，由 {@link #compact} 回收）。 */
   private boolean flushBucket(int bucket) throws IOException {
+    if (fileSize < BufferedLinearV3Format.DATA_AREA_OFFSET) {
+      // 兜底不变式：数据区之前永远先有头部与偏移表，绝不把 bucket 写进元数据区
+      writeHeaderAndEmptyTable();
+    }
+
     byte[] raw = BufferedLinearV3Format.encodeBucket(slots[bucket], hashSeed);
     byte[] compressed = BufferedLinearV3Format.compress(raw);
     ByteBuffer buffer = ByteBuffer.allocate(8 + compressed.length);
