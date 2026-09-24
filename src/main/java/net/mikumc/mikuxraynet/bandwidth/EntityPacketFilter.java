@@ -33,8 +33,10 @@ import org.bukkit.scheduler.BukkitTask;
  * <p>字段读取一律走 {@code getSpecificModifier} 并做数量与类型容错：字段形态与预期不符
  * （不同服务端版本的字段布局差异）时直接放行原包，绝不误判取消。
  *
- * <p>白名单按实体类型生效，但实体 id → 类型 的索引需要 Bukkit 世界访问，因此只在主线程
- * 周期刷新；Folia 下不做索引（白名单退化为「对所有实体生效」），只影响保守性，不影响正确性。
+ * <p>白名单按实体类型生效，但实体 id → 类型 的索引需要 Bukkit 世界访问，因此只在主线程周期刷新：
+ * <b>Paper 系</b>（含 Leaf 等下游分支）在主线程建索引并周期刷新，白名单完整生效；
+ * <b>Folia 系</b>不做索引（无法跨区域安全枚举实体），白名单退化为「对所有实体生效」，
+ * 只影响保守性，不影响正确性。
  */
 public final class EntityPacketFilter extends PacketAdapter {
 

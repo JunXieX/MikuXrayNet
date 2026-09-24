@@ -5,7 +5,6 @@ import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
-import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -38,15 +37,18 @@ import org.bukkit.util.Vector;
  *
  * <p><b>筛选（可选、可配）</b>：
  * <ul>
- *   <li><b>视锥剔除</b>（默认开启，80°）：只显形玩家视野锥内的候选坐标；最小距离内豁免，
- *       避免「贴着走过的矿物不显形」；</li>
- *   <li><b>射线可见性</b>（默认开启）：从眼睛到方块「最近点」做体素步进，被墙挡住的不显形，等玩家靠近再说。</li>
+ *   <li><b>视锥剔除</b>（默认开启，80° 竖直全角）：只显形玩家视野锥内的候选坐标；
+ *       水平方向按 16:9 宽高比更宽（约 112° 全角），与客户端观感一致；最小距离内豁免；</li>
+ *   <li><b>可见性判定</b>（默认开启，多候选点采样）：先识别方块的暴露面，只在暴露面上取至多 5 个采样点
+ *       （正对玩家的面中心 → 包围盒最近点 → 面四角）分别做体素步进，任一条通畅即显形；六面全被遮挡
+ *       （完全掩埋）时一个点都不采 → 直接判不可见，绝不隔着墙还原。</li>
  * </ul>
  *
  * <p><b>线程纪律</b>：位置读取、方块读取与发包都在主线程 / Folia 区域线程（非 Folia 为统一主线程任务，
- * Folia 为各玩家的区域任务）；纯计算（视锥角度、射线体素路径）交给 {@link MikuWorkPool} 的工作线程，
- * 算完再回到玩家所属线程读方块——工作线程不触碰任何 Bukkit API。
- * 队列已满时退化为「主线程直接做纯计算且只做视锥」的保底路径（射线判定跳过），绝不阻塞。
+ * Folia 为各玩家的区域任务）；纯计算（视锥角度）交给 {@link MikuWorkPool} 的工作线程，
+ * 算完再回到玩家所属线程。可见性判定必须在主线程 / 区域线程做——它要先读 6 个邻块判暴露面，
+ * 因此不再像旧实现那样把射线路径预计算在工作线程（那时只有单点采样、无需读邻块）。
+ * 工作队列已满时退化为「主线程直接做纯计算」，功能不降级、绝不阻塞。
  *
  * <p><b>发包纪律</b>：ProtocolLib 是唯一封包通道，包用 {@code createPacket} 构造、用
  * {@code sendServerPacket(..., filters=false)} 发出，因此显形包不会再次进入本插件的出站监听器。
@@ -74,18 +76,16 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
-  /** 工作线程算出的显形计划：候选三元组 + 与之一一对应的射线路径（未做射线判定时为空数组）。 */
+  /** 工作线程算出的显形计划：仅含通过视锥剔除的候选三元组（可见性判定在主线程做，见类注释）。 */
   private static final class Plan {
 
     private final int[] coordinates;
-    private final int[][] paths;
     /** 本次取到的候选总数与其中被视锥剔除的数量（仅供一次性诊断日志使用）。 */
     private final int candidateCount;
     private final int frustumCulled;
 
-    private Plan(int[] coordinates, int[][] paths, int candidateCount, int frustumCulled) {
+    private Plan(int[] coordinates, int candidateCount, int frustumCulled) {
       this.coordinates = coordinates;
-      this.paths = paths;
       this.candidateCount = candidateCount;
       this.frustumCulled = frustumCulled;
     }
@@ -146,7 +146,8 @@ public final class ProximityRevealer implements Listener {
         + " tick，单次上限 " + proximity.maxRevealsPerTick() + " 个；视锥 "
         + (proximity.frustumEnabled() ? proximity.frustumFov() + "°（最小距离 "
             + proximity.frustumMinDistance() + " 格内豁免）" : "已关闭")
-        + "，射线可见性 " + (proximity.raycastEnabled() ? "已开启" : "已关闭"));
+        + "，可见性判定 " + (proximity.raycastEnabled()
+            ? "已开启（多候选点，暴露面上至多 5 点）" : "已关闭"));
   }
 
   /** 停用：注销任务与事件监听，并清空显形索引（不留副作用）。 */
@@ -260,30 +261,36 @@ public final class ProximityRevealer implements Listener {
     }
 
     if (!proximity.frustumEnabled() && !proximity.raycastEnabled()) {
-      sendCandidates(player, world, candidates, null, budget);
+      sendCandidates(player, world, candidates, null, null, budget);
       return;
     }
 
     // 只把纯值交给工作线程；这里的 Player 引用仅供「交回所属线程」调度使用，工作线程不对它做任何调用
     ProximitySelector.Eye eye = eyeOf(player);
+
+    if (!proximity.frustumEnabled()) {
+      // 只启用可见性判定：视锥的纯计算没有可做的，直接在当前线程逐个判定
+      sendCandidates(player, world, candidates, null, eye, budget);
+      return;
+    }
+
     int[] coordinates = flatten(candidates);
-    boolean raycast = proximity.raycastEnabled();
 
     if (workPool == null || !workPool.hasCapacity()) {
-      // 队列已满：保底路径——主线程直接做纯计算（射线判定跳过），不阻塞、不丢显形
+      // 队列已满：保底路径——主线程直接做纯计算（视锥剔除），可见性判定本来就在主线程做，功能不降级
       stats.revealsQueuedSkipped.increment();
-      sendCandidates(player, world, null, computePlan(eye, coordinates, false), budget);
+      sendCandidates(player, world, null, computePlan(eye, coordinates), eye, budget);
       return;
     }
 
     try {
       workPool.execute(() -> {
-        Plan plan = computePlan(eye, coordinates, raycast);
+        Plan plan = computePlan(eye, coordinates);
         // 读方块与发包必须回到玩家所属线程
         Schedulers.onEntity(plugin, player, () -> {
           try {
             if (player.isOnline()) {
-              sendCandidates(player, player.getWorld(), null, plan, budget);
+              sendCandidates(player, player.getWorld(), null, plan, eye, budget);
             }
           } catch (Throwable throwable) {
             logThrottled(throwable);
@@ -293,20 +300,18 @@ public final class ProximityRevealer implements Listener {
     } catch (Throwable throwable) {
       // 入队失败（线程池关闭等）：退化为主线程纯计算，绝不丢显形
       logThrottled(throwable);
-      sendCandidates(player, world, null, computePlan(eye, coordinates, false), budget);
+      sendCandidates(player, world, null, computePlan(eye, coordinates), eye, budget);
     }
   }
 
-  /** 工作线程：视锥剔除 + 射线路径计算（纯数学，不触碰任何 Bukkit API）。 */
-  private Plan computePlan(ProximitySelector.Eye eye, int[] coordinates, boolean raycast) {
+  /** 工作线程：视锥剔除（纯数学，不触碰任何 Bukkit API）。 */
+  private Plan computePlan(ProximitySelector.Eye eye, int[] coordinates) {
     boolean frustum = proximity.frustumEnabled();
     double minDistance = proximity.frustumMinDistance();
     double fov = proximity.frustumFov();
-    int samples = proximity.raycastSamples();
 
     int count = coordinates.length / 3;
     int[] kept = new int[coordinates.length];
-    int[][] paths = raycast ? new int[count][] : null;
     int keptCount = 0;
 
     for (int i = 0; i < count; i++) {
@@ -319,9 +324,6 @@ public final class ProximityRevealer implements Listener {
         continue;
       }
 
-      if (raycast) {
-        paths[keptCount] = ProximitySelector.visibilityPath(eye, x, y, z, samples);
-      }
       kept[keptCount * 3] = x;
       kept[keptCount * 3 + 1] = y;
       kept[keptCount * 3 + 2] = z;
@@ -330,13 +332,12 @@ public final class ProximityRevealer implements Listener {
 
     int[] result = new int[keptCount * 3];
     System.arraycopy(kept, 0, result, 0, result.length);
-    int[][] trimmedPaths = paths == null ? null : Arrays.copyOf(paths, keptCount);
-    return new Plan(result, trimmedPaths, count, count - keptCount);
+    return new Plan(result, count, count - keptCount);
   }
 
-  /** 直接发包路径（未启用筛选）：逐个候选发送并注销。 */
+  /** 逐个候选做可见性判定 → 发包 → 注销；{@code eye} 为 {@code null} 时不启用可见性判定。 */
   private void sendCandidates(Player player, World world, List<RevealedBlockIndex.Position> candidates,
-      Plan plan, Budget budget) {
+      Plan plan, ProximitySelector.Eye eye, Budget budget) {
     PassTally tally = new PassTally();
     int candidateCount = plan != null
         ? plan.candidateCount
@@ -348,7 +349,7 @@ public final class ProximityRevealer implements Listener {
         if (budget.remaining <= 0) {
           break;
         }
-        sendOne(player, world, position.x(), position.y(), position.z(), null, budget, tally);
+        sendOne(player, world, position.x(), position.y(), position.z(), eye, budget, tally);
       }
       logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
       return;
@@ -362,25 +363,22 @@ public final class ProximityRevealer implements Listener {
       if (budget.remaining <= 0) {
         break;
       }
-      int x = plan.coordinates[i * 3];
-      int y = plan.coordinates[i * 3 + 1];
-      int z = plan.coordinates[i * 3 + 2];
-      int[] path = plan.paths == null ? null : plan.paths[i];
-      sendOne(player, world, x, y, z, path, budget, tally);
+      sendOne(player, world, plan.coordinates[i * 3], plan.coordinates[i * 3 + 1],
+          plan.coordinates[i * 3 + 2], eye, budget, tally);
     }
     logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
   }
 
-  /** 单个坐标：区块未加载则跳过、射线被挡则跳过，否则读真实方块并发包、成功后注销。 */
-  private void sendOne(Player player, World world, int x, int y, int z, int[] path, Budget budget,
-      PassTally tally) {
+  /** 单个坐标：区块未加载则跳过、不可见则跳过，否则读真实方块并发包、成功后注销。 */
+  private void sendOne(Player player, World world, int x, int y, int z, ProximitySelector.Eye eye,
+      Budget budget, PassTally tally) {
     if (!world.isChunkLoaded(x >> 4, z >> 4)) {
       // 区块未加载：本次跳过，坐标留在索引里等玩家真正靠近
       stats.revealsSkipped.increment();
       return;
     }
 
-    if (path != null && isRayOccluded(world, path)) {
+    if (eye != null && proximity.raycastEnabled() && !isVisible(world, eye, x, y, z)) {
       stats.revealsRayCulled.increment();
       tally.rayCulled++;
       return;
@@ -417,16 +415,20 @@ public final class ProximityRevealer implements Listener {
         + "，射线剔除 " + tally.rayCulled + "，实际发送 " + tally.sent);
   }
 
-  /** 主线程 / 区域线程读方块做射线遮挡判定；任何异常都按「可见」处理（fail-open，宁可多显形）。 */
-  private boolean isRayOccluded(World world, int[] path) {
+  /**
+   * 主线程 / 区域线程读方块做可见性判定：先读 6 个邻块判暴露面，再对暴露面上的至多 5 个采样点做体素步进，
+   * 任一条通畅即可见。任何异常都按「可见」处理（fail-open，宁可多显形）。
+   */
+  private boolean isVisible(World world, ProximitySelector.Eye eye, int x, int y, int z) {
     try {
-      return ProximitySelector.isRayOccluded(path, (x, y, z) -> {
-        BlockData data = world.getBlockData(x, y, z);
+      int samples = proximity.raycastSamples();
+      return ProximitySelector.isVisible(eye, x, y, z, (blockX, blockY, blockZ) -> {
+        BlockData data = world.getBlockData(blockX, blockY, blockZ);
         return data != null && data.isOccluding();
-      });
+      }, samples);
     } catch (Throwable throwable) {
       logThrottled(throwable);
-      return false;
+      return true;
     }
   }
 

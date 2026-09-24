@@ -77,6 +77,10 @@ public final class MikuXrayNet extends JavaPlugin {
       onLoad();
     }
 
+    // 平台判定必须最先做：它决定后续所有调度分支（常规 Bukkit vs 区域调度器）与实体枚举能力。
+    // 依据是服务端品牌/版本标识（antixray.yml: advanced.platform 可手动指定），不再用「类存在性」，
+    // 因为 Paper 及其下游分支（如 Leaf）都会自带 io.papermc.paper.threadedregions.* 的调度器 API 类。
+    PlatformSupport.configure(config.antiXray().platform());
     getLogger().info("运行平台：" + PlatformSupport.platformDescription());
     startBypassRegistry();
     startAntiXray();
@@ -347,6 +351,8 @@ public final class MikuXrayNet extends JavaPlugin {
       @Override
       public void reloadConfiguration() {
         config.load();
+        // 平台判定可能与新配置的 advanced.platform 不同：先重新判定，随后的 restartPeriodicTasks 才会走对分支
+        PlatformSupport.configure(config.antiXray().platform());
       }
 
       @Override

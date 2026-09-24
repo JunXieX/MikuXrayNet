@@ -8,9 +8,14 @@ import org.bukkit.plugin.Plugin;
 /**
  * 线程调度助手：把所有 Bukkit API 调用收敛到「实体所属线程」执行。
  *
- * <p>非 Folia 时即服务端主线程（{@link Bukkit#getScheduler()}）；Folia 时即该实体所在区域的
- * 区域线程（{@link Entity#getScheduler()}）。工作线程只做纯计算，结果一律经此类回到所有者线程，
- * 因此 hideEntity / setViewDistance 等调用永远不会跨线程。
+ * <p>分支语义（平台判定见 {@code bootstrap.PlatformSupport}）：
+ * <ul>
+ *   <li><b>Paper 系</b>（默认，含 Leaf 等 Paper 下游分支）：实体所属线程就是服务端主线程，
+ *       直接用常规 Bukkit 调度（{@link Bukkit#getScheduler()} 的 {@code runTask} / {@code runTaskTimer}）；</li>
+ *   <li><b>Folia 系</b>：实体所属线程是该实体所在区域的区域线程，必须用
+ *       {@link Entity#getScheduler()} 的区域调度器。</li>
+ * </ul>
+ * 工作线程只做纯计算，结果一律经此类回到所有者线程，因此 hideEntity / setViewDistance 等调用永远不会跨线程。
  */
 public final class Schedulers {
 

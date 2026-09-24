@@ -9,13 +9,15 @@ import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 /**
- * 邻近显形「选择逻辑」测试：视锥内/外（正前方、背后、侧向边界）、最小距离豁免，
- * 以及射线体素路径与「被挡住则不显形」的纯逻辑部分（读方块由主线程注入，单测用内存表代替）。
+ * 邻近显形「选择逻辑」测试：视锥内/外（正前方、侧前方 30°、背后、竖直边界）、最小距离豁免，
+ * 以及可见性判定（暴露面识别、多候选点采样、被挡住则不显形）的纯逻辑部分
+ * （读方块由调用方注入，单测用内存表代替）。
  */
 class ProximitySelectorTest {
 
   private static final double DEFAULT_MIN_DISTANCE = 4.0D;
   private static final double DEFAULT_FOV = 80.0D;
+  private static final int SAMPLES = 16;
 
   /** 站在 (0.5, 64.5, 0.5) 面朝 +Z（与 Minecraft 视线方向约定一致）。 */
   private static ProximitySelector.Eye facingPositiveZ() {
@@ -46,15 +48,39 @@ class ProximitySelectorTest {
         DEFAULT_MIN_DISTANCE, DEFAULT_FOV), "远处正后方同样剔除");
   }
 
+  /**
+   * 侧前方：水平方向比竖直更宽（客户端 FOV 是「竖直全角」，水平按宽高比更宽）。
+   *
+   * <p>fov=80 → 竖直半角 40°、水平半角 ≈56.2°（16:9）。修正前按「圆锥半角 40°」判定，
+   * 真机日志显示 445/512 个候选被误剔（87%）。
+   */
   @Test
   void sideBoundaryFollowsConfiguredFov() {
     ProximitySelector.Eye eye = facingPositiveZ();
 
-    // 半角 40°（cos≈0.766）：约 39° 应命中，约 45° 应被剔除
+    // 约 39°（侧向偏 4 格、前方 5 格）：竖直与水平都在界内
     assertTrue(ProximitySelector.withinFrustum(eye, 4, 64, 5, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
-        "约 39°（侧向偏 4 格、前方 5 格）应在视锥内");
-    assertFalse(ProximitySelector.withinFrustum(eye, 5, 64, 5, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
-        "约 45° 应被剔除");
+        "约 39° 应在本视锥内");
+    // 侧前方 30°：用户明确要求必须可见
+    assertTrue(ProximitySelector.withinFrustum(eye, 3, 64, 6, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
+        "偏离视线约 30° 的侧前方目标必须可见");
+    // 水平 45°：仍在水平半角（≈56°）内 → 可见（旧实现按圆锥 40° 会误剔）
+    assertTrue(ProximitySelector.withinFrustum(eye, 5, 64, 5, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
+        "水平 45° 在水平半角内（客户端的水平视场更宽）");
+    // 水平约 60°：超出水平半角 → 剔除
+    assertFalse(ProximitySelector.withinFrustum(eye, 7, 64, 4, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
+        "水平约 60° 超出水平半角，应被剔除");
+  }
+
+  /** 竖直方向仍按 fov/2 = 40° 收紧：同样偏离 45° 时竖直超界、水平不超界（正是修正后的差异）。 */
+  @Test
+  void verticalBoundaryIsNarrowerThanHorizontal() {
+    ProximitySelector.Eye eye = facingPositiveZ();
+
+    assertFalse(ProximitySelector.withinFrustum(eye, 0, 70, 6, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
+        "竖直偏离约 45° 超出竖直半角 40°，应被剔除");
+    assertTrue(ProximitySelector.withinFrustum(eye, 6, 64, 6, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
+        "同样约 45°、但在水平方向 → 可见（水平半角更宽）");
   }
 
   @Test
@@ -255,5 +281,111 @@ class ProximitySelectorTest {
     assertFalse(ProximitySelector.isRayOccluded(
         ProximitySelector.visibilityPath(eye, 1, 65, 2, 16), (x, y, z) -> true),
         "相邻体素 → 可见");
+  }
+
+  // ---------------------------------------------------------------- 多候选点可见性（isVisible）
+
+  /** 1 宽 2 高、长 45 格的长隧道：x=0 且 y=64..65 为空气，其余为岩石。 */
+  private static final ProximitySelector.RayQuery LONG_TUNNEL =
+      (x, y, z) -> !(x == 0 && (y == 64 || y == 65) && z >= 0 && z <= 45);
+
+  /**
+   * <b>真机 bug 回归</b>：嵌在角落、只有一面（-X）暴露的矿石，在 20~40 格必须判为可见。
+   *
+   * <p>用户反馈「矿石的裸露面周围有方块时，经常需要靠得很近才能取消伪装」：单点采样（包围盒最近点）
+   * 一旦压在相邻方块那一侧就会被误判为被挡。现在先只看暴露面、再在暴露面上取至多 5 个候选点，
+   * 任一通畅即可见。
+   */
+  @Test
+  void cornerOreWithSingleExposedFaceIsVisibleFromFar() {
+    ProximitySelector.Eye eye = standingEye();
+
+    for (int z = 20; z <= 40; z += 10) {
+      assertEquals(ProximitySelector.FACE_NEG_X,
+          ProximitySelector.exposedFaces(1, 64, z, LONG_TUNNEL),
+          "+Y/±Z/±X(除 -X)/-Y 全被岩石包围，只应暴露 -X 面：" + z);
+      assertTrue(ProximitySelector.isVisible(eye, 1, 64, z, LONG_TUNNEL, SAMPLES),
+          z + " 格外「只有一面暴露」的角落矿必须判为可见（真机 bug 回归）");
+    }
+  }
+
+  /** <b>红线</b>：六面全被遮挡（完全掩埋）的方块绝不显形——从任何方向都不可能看到。 */
+  @Test
+  void fullyBuriedOreIsNeverVisible() {
+    ProximitySelector.Eye eye = standingEye();
+    ProximitySelector.RayQuery allSolid = (x, y, z) -> true;
+
+    assertEquals(0, ProximitySelector.exposedFaces(0, 64, 5, allSolid), "六面全遮挡 = 无暴露面");
+    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 5, allSolid, SAMPLES),
+        "完全掩埋的方块必须判为不可见（绝不能隔着墙还原）");
+  }
+
+  /** <b>红线</b>：完全被 2 格厚石墙挡住的矿石仍必须判为不可见。 */
+  @Test
+  void twoBlockThickWallStillHidesOre() {
+    ProximitySelector.Eye eye = standingEye();
+    ProximitySelector.RayQuery wall = (x, y, z) -> z == 3 || z == 4;
+
+    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 2, wall, SAMPLES),
+        "墙前面的方块必须仍然可见（不得因多候选点而误隐藏）");
+    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 5, wall, SAMPLES),
+        "2 格厚石墙后面的矿必须判为不可见");
+    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 6, wall, SAMPLES),
+        "同一射线更远处的矿同样不可见");
+  }
+
+  /** 多候选点全部被挡 → 判为不可见（单个暴露面存在但视线确实被挡）。 */
+  @Test
+  void allCandidatePointsBlockedMeansInvisible() {
+    ProximitySelector.Eye eye = standingEye();
+    // 只有 (0,64,4) 与 (0,64,5) 是空气：矿石的 -Z 面暴露在一个被封死的小口袋里，视线仍被 z=3 挡住
+    ProximitySelector.RayQuery pocket =
+        (x, y, z) -> !(x == 0 && y == 64 && (z == 4 || z == 5));
+
+    assertEquals(ProximitySelector.FACE_NEG_Z,
+        ProximitySelector.exposedFaces(0, 64, 5, pocket), "只应暴露 -Z 面");
+    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 5, pocket, SAMPLES),
+        "所有候选点的射线都被挡时必须判为不可见");
+  }
+
+  /** 暴露面识别只认「朝向非遮挡方块」的面：隧道壁上只有 -X 一面暴露，采样点也全部落在该面上。 */
+  @Test
+  void visibilityPointsOnlyOnExposedFacesAndCappedAtFive() {
+    ProximitySelector.Eye eye = standingEye();
+    int faces = ProximitySelector.exposedFaces(1, 64, 30, LONG_TUNNEL);
+
+    assertEquals(ProximitySelector.FACE_NEG_X, faces, "只应暴露 -X 面");
+    double[][] points = ProximitySelector.visibilityPoints(eye, 1, 64, 30, faces);
+
+    assertTrue(points.length > 0 && points.length <= ProximitySelector.MAX_SAMPLE_POINTS,
+        "候选点数量必须为正且不超过 " + ProximitySelector.MAX_SAMPLE_POINTS + "：" + points.length);
+    assertEquals(1.0D, points[0][0], 1.0E-9D, "首个候选点必须是暴露面的中心（x 固定在面平面上）");
+    assertEquals(64.5D, points[0][1], 1.0E-9D, "首个候选点是 -X 面中心");
+    assertEquals(30.5D, points[0][2], 1.0E-9D, "首个候选点是 -X 面中心");
+    for (double[] point : points) {
+      assertEquals(1.0D, point[0], 1.0E-9D,
+          "不暴露的面不采样：所有候选点的 x 都必须落在 -X 面平面上：" + point[0]);
+    }
+  }
+
+  /** 最近点落在非暴露面上时必须被丢弃（只采样暴露面）；六面全暴露时按与视线的正对程度选面。 */
+  @Test
+  void nearestPointOnBuriedFaceIsDiscarded() {
+    // 眼位正好在方块 x 区间内（x=1.5）：最近点不会落在 -X 面平面上 → 被暴露面闸门丢弃
+    ProximitySelector.Eye eye = ProximitySelector.eye(1.5D, 66.62D, 5.5D, 0.0D, 0.0D, 1.0D);
+    double[][] points = ProximitySelector.visibilityPoints(eye, 1, 65, 5,
+        ProximitySelector.FACE_NEG_X);
+
+    for (double[] point : points) {
+      assertEquals(1.0D, point[0], 1.0E-9D, "非暴露面（包围盒最近点落在 +Y 面）不得被采样");
+    }
+
+    // 六面全暴露：选面按「最正对视线」——面朝 +Z 的玩家应取 +Z 面中心
+    ProximitySelector.Eye plusZ = ProximitySelector.eye(0.5D, 64.5D, -3.5D, 0.0D, 0.0D, 1.0D);
+    double[][] all = ProximitySelector.visibilityPoints(plusZ, 0, 64, 0, ProximitySelector.ALL_FACES);
+
+    assertEquals(0.5D, all[0][0], 1.0E-9D);
+    assertEquals(64.5D, all[0][1], 1.0E-9D);
+    assertEquals(0.0D, all[0][2], 1.0E-9D, "正对 +Z 方向看时，应优先取 -Z 面（朝向玩家的那个面）中心");
   }
 }

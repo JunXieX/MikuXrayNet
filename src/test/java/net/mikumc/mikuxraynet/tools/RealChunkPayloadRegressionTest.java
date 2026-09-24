@@ -197,7 +197,8 @@ class RealChunkPayloadRegressionTest {
     }
     System.out.println("[真机负载] 状态种类数=" + frequency.size());
 
-    // ---- 4. 19 种目标矿在负载里各出现多少次（按方块名统计，避免只认默认状态 id）
+    // ---- 4. 21 种目标方块（19 种矿 + spawner + mossy_cobblestone）在负载里各出现多少次
+    //         （按方块名统计，避免只认默认状态 id）
     Map<String, Long> oreCounts = new LinkedHashMap<>();
     for (Map.Entry<Integer, Long> entry : frequency.entrySet()) {
       oreCounts.merge(blockName(entry.getKey()), entry.getValue(), Long::sum);
@@ -211,7 +212,7 @@ class RealChunkPayloadRegressionTest {
       oreTotal += count;
       oreLine.append(name).append('=').append(count).append(' ');
     }
-    System.out.println("[真机负载] 19 种目标矿在负载里的出现次数：" + oreLine.toString().trim());
+    System.out.println("[真机负载] 21 种目标方块在负载里的出现次数：" + oreLine.toString().trim());
     System.out.println("[真机负载] 目标矿合计 " + oreTotal + " 个");
 
     // ---- 5. 用生产同口径的遮挡表 + 目标集合跑一遍改写，报出「实际被替换的方块数」

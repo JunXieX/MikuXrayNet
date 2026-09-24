@@ -87,7 +87,7 @@ public final class ObfuscationProcessor {
    *
    * @param sectionCount  区块的 section 数
    * @param stateKinds    整块区块里出现过的不同方块状态种类数（0 表示解码出全空气）
-   * @param targetMatches 命中目标方块（配置的 19 种矿）的方块个数（<b>不看遮挡</b>）
+   * @param targetMatches 命中目标方块（配置的隐藏清单，默认 21 种）的方块个数（<b>不看遮挡</b>）
    */
   public record Diagnostic(int sectionCount, int stateKinds, int targetMatches) {
   }

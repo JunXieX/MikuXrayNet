@@ -227,7 +227,7 @@ public final class Diagnostics {
     sb.append("MikuXrayNet 诊断转储\n");
     sb.append("导出时间：").append(timestamp).append('\n');
     sb.append("服务端：").append(s.serverVersion())
-        .append(s.folia() ? "（Folia 区域化线程）" : "（非 Folia）").append('\n');
+        .append(s.folia() ? "（Folia 系，区域化多线程）" : "（Paper 系，单主线程）").append('\n');
     sb.append("JVM：").append(s.javaVersion()).append('\n');
     sb.append("配置指纹：").append(s.configFingerprint()).append('\n');
     sb.append('\n');

@@ -190,7 +190,7 @@ class RevealedBlockIndexTest {
   /**
    * 视距 10 规模回归（真机 bug 的回归测试）：玩家重进服务器会连续收到约 440 个区块，
    * {@code mode=all} 下每区块约 174 个坐标 → 约 7.7 万个坐标。
-   * 默认单玩家上限 262144 必须完整容纳这一次登录，因此：
+   * 默认单玩家上限 524288 必须完整容纳这一次登录（262144 在真机仍被顶到、淘汰 1400 个坐标），因此：
    * <ul>
    *   <li>不应发生任何<b>淘汰 / 丢弃</b>（D = 0）；</li>
    *   <li>玩家身边 32 格内的坐标必须<b>全部</b>仍可选（含恰好 32 格的边界）。</li>
@@ -198,10 +198,10 @@ class RevealedBlockIndexTest {
    */
   @Test
   void loginScaleKeepsNearbyCoordinatesSelectable() {
-    int maxPositionsPerPlayer = 262144;
+    int maxPositionsPerPlayer = 524288;
     int chunks = 440;
     int perChunk = 174;
-    RevealedBlockIndex index = index(2097152, maxPositionsPerPlayer, 300 * SECOND_NANOS);
+    RevealedBlockIndex index = index(4194304, maxPositionsPerPlayer, 300 * SECOND_NANOS);
 
     // 玩家站在 (8,64,8)：先在 32 格内记录一批「身边的伪装坐标」（40/-24 为恰好 32 格的边界）
     List<RevealedBlockIndex.Position> nearby = List.of(

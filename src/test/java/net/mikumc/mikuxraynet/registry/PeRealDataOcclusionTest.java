@@ -210,6 +210,14 @@ class PeRealDataOcclusionTest {
     }
     assertTrue(missing.isEmpty(),
         "配置的隐藏方块清单漏了 PE 真实存在的矿类方块：" + missing + "（应加入 antixray.yml 的 hide-blocks）");
+
+    // 默认清单必须含「与矿等价」的两种透视目标（真机 PE 26.2 注册名，上面已逐个解析过状态 id）
+    assertTrue(configured.contains("spawner"),
+        "默认清单必须含 spawner（刷怪笼：PE 26.2 里 mob_spawner 已改名为 spawner）：" + configured);
+    assertTrue(configured.contains("mossy_cobblestone"),
+        "默认清单必须含 mossy_cobblestone（苔石，地牢/要塞/矿洞结构的标志物）：" + configured);
+    assertEquals(21, configured.size(),
+        "打包的 antixray.yml 默认清单应为 21 种（19 种矿石 + spawner + mossy_cobblestone）：" + configured);
   }
 
   /**

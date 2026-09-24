@@ -8,6 +8,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.registry.OcclusionRules;
 import org.bukkit.configuration.ConfigurationSection;
 
@@ -22,13 +23,20 @@ import org.bukkit.configuration.ConfigurationSection;
  */
 public final class AntiXrayConfig {
 
-  /** 默认的矿透目标方块。 */
+  /**
+   * 默认的矿透目标方块。
+   *
+   * <p>共 21 种：19 种矿石（含深层变体）之外，另有与矿等价的两种透视目标——
+   * {@code spawner}（刷怪笼，真机 PE V_26_2 映射里就叫 {@code spawner}，{@code mob_spawner} 已不存在）
+   * 与 {@code mossy_cobblestone}（苔石，常被用来标记矿洞/要塞）。
+   */
   private static final List<String> DEFAULT_HIDE_BLOCKS = List.of(
       "coal_ore", "deepslate_coal_ore", "iron_ore", "deepslate_iron_ore",
       "copper_ore", "deepslate_copper_ore", "gold_ore", "deepslate_gold_ore",
       "redstone_ore", "deepslate_redstone_ore", "lapis_ore", "deepslate_lapis_ore",
       "diamond_ore", "deepslate_diamond_ore", "emerald_ore", "deepslate_emerald_ore",
-      "nether_gold_ore", "nether_quartz_ore", "ancient_debris");
+      "nether_gold_ore", "nether_quartz_ore", "ancient_debris",
+      "spawner", "mossy_cobblestone");
 
   private static final Map<String, Integer> DEFAULT_REPLACEMENT_WEIGHTS;
 
@@ -92,7 +100,9 @@ public final class AntiXrayConfig {
    * @param maxPositions          显形索引的全服坐标上限
    * @param maxPositionsPerPlayer 单个玩家的坐标上限
    * @param frustumEnabled        是否只显形玩家视野锥内的候选坐标
-   * @param frustumFov            视野锥全张开角（度）
+   * @param frustumFov            视野锥<b>竖直全张开角</b>（度）——与 Minecraft 客户端 FOV 设置同义；
+   *                              水平方向按 16:9 宽高比换算后更宽（约 1.4 倍），
+   *                              详见 {@code ProximitySelector#withinFrustum}
    * @param frustumMinDistance    该距离内的候选豁免视锥判定
    * @param raycastEnabled        是否做射线可见性判定（被墙挡住的不显形；<b>默认开启</b>）
    * @param raycastSamples        每条射线的最大采样体素数
@@ -133,6 +143,7 @@ public final class AntiXrayConfig {
   private final Occlusion occlusion;
   private final Proximity proximity;
   private final DiskCache diskCache;
+  private final PlatformSupport.Mode platform;
   private final int cacheMaximumSize;
   private final int cacheExpireAfterAccessSeconds;
   private final int threads;
@@ -143,8 +154,8 @@ public final class AntiXrayConfig {
   private AntiXrayConfig(boolean enabled, Set<String> worlds, List<String> hideBlocks,
       Map<String, Integer> replacementWeights, boolean layerObfuscation, ObfuscationMode obfuscationMode,
       boolean removeBlockEntities, Neighbors neighbors, Occlusion occlusion, Proximity proximity,
-      DiskCache diskCache, int cacheMaximumSize, int cacheExpireAfterAccessSeconds, int threads,
-      int timeoutMillis, int queueCapacity) {
+      DiskCache diskCache, PlatformSupport.Mode platform, int cacheMaximumSize,
+      int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis, int queueCapacity) {
     this.enabled = enabled;
     this.worlds = Set.copyOf(worlds);
     this.hideBlocks = List.copyOf(hideBlocks);
@@ -156,6 +167,7 @@ public final class AntiXrayConfig {
     this.occlusion = occlusion;
     this.proximity = proximity;
     this.diskCache = diskCache;
+    this.platform = platform == null ? PlatformSupport.Mode.AUTO : platform;
     this.cacheMaximumSize = Math.max(1, cacheMaximumSize);
     this.cacheExpireAfterAccessSeconds = Math.max(1, cacheExpireAfterAccessSeconds);
     this.threads = Math.max(0, threads);
@@ -208,25 +220,26 @@ public final class AntiXrayConfig {
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding"))),
         new Proximity(
             root.getBoolean("proximity.enabled", true),
-            // 默认 32（原为 12）：真机反馈「12 格太短，很影响游戏体验」。因为显形只在射线通畅（视线真能看到）
-            // 时才还原，所以放大距离不会隔着墙泄露，只是把「本来就看得到的矿」更早、更远地还给玩家。
-            // 取舍：距离越大越及时、观感越接近原版，但候选越多、发包量与「每 tick 上限」越相关。
-            Math.max(0.0D, root.getDouble("proximity.distance", 32.0D)),
+            // 默认 48（原为 32，更早为 12）：真机反馈「32 格仍然偏近，走到跟前才变回来」。显形只在射线通畅
+            // （视线真能看到、且只取暴露面上的采样点）时才还原，因此放大距离不会隔着墙泄露——它只是把
+            // 「本来就看得到的矿」更早、更远地还给玩家。取舍：距离越大越及时、观感越接近原版，但候选越多、
+            // 发包量与每 tick 上限（max-reveals-per-tick）越相关。
+            Math.max(0.0D, root.getDouble("proximity.distance", 48.0D)),
             Math.max(1, root.getInt("proximity.interval-ticks", 5)),
-            // 默认 256（原为 128）：配合扩大到 32 格的距离，候选数量随之上升，单次额度也要相应放大，
+            // 默认 256（原为 128）：配合扩大到 48 格的距离，候选数量随之上升，单次额度也要相应放大，
             // 否则脚边的矿会被远处候选挤到后面。5 tick 一次、256 个 ≈ 1024 个/秒，仍远低于区块包流量。
             Math.max(1, root.getInt("proximity.max-reveals-per-tick", 256)),
             // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处，
             // 窗口太短会让「还没走到就被清掉」的坐标永不还原。
             Math.max(1, root.getInt("proximity.expire-seconds", 300)),
-            // 默认 2097152（原为 512000）：单玩家上限（262144）的 8 倍量级，多玩家同时在线不立刻触顶。
+            // 默认 4194304（原为 2097152）：单玩家上限（524288）的 8 倍量级，多玩家同时在线不立刻触顶。
             // 内存量级见 max-positions-per-player 注释：本项只是「上限」，不是预分配。
-            Math.max(1, root.getInt("proximity.max-positions", 2097152)),
-            // 默认 262144（原为 65536）：真机日志显示视距 10 的登录规模已达 7.7 万坐标，
-            // 65536 仍会在登录过程中被填满，玩家身边的坐标进不了索引。262144 约为 7.7 万的 3.4 倍，
-            // 留出「视距 12+ / 矿更密集」的余量。内存量级：坐标压实为 1 个 long（8 字节）、
-            // 数组按 2 倍扩容最坏约 16 字节/坐标 → 262144 × 16B ≈ 4 MB/玩家（上限，非预分配）。
-            Math.max(1, root.getInt("proximity.max-positions-per-player", 262144)),
+            Math.max(1, root.getInt("proximity.max-positions", 4194304)),
+            // 默认 524288（原为 262144，更早为 65536）：真机日志显示 262144 仍被顶到（淘汰 1400 个坐标），
+            // 说明视距 10+ 的登录规模在 mode=all 下已超过该值。再翻倍到 524288，留出余量。
+            // 内存量级：坐标压实为 1 个 long（8 字节）、数组按 2 倍扩容最坏约 16 字节/坐标 →
+            // 524288 × 16B ≈ 8 MB/玩家（上限，非预分配；全服 4194304 × 16B ≈ 64 MB，同样只是上限）。
+            Math.max(1, root.getInt("proximity.max-positions-per-player", 524288)),
             root.getBoolean("proximity.frustum.enabled", true),
             clampFov(root.getDouble("proximity.frustum.fov", 80.0D)),
             Math.max(0.0D, root.getDouble("proximity.frustum.min-distance", 4.0D)),
@@ -245,6 +258,9 @@ public final class AntiXrayConfig {
             Math.max(1, root.getInt("disk-cache.compact-per-pass", 4)),
             Math.max(1, root.getInt("disk-cache.queue-capacity", 256)),
             Math.max(1, root.getInt("disk-cache.generation-tracker-size", 32768))),
+        // 平台兜底：auto（默认，按服务端品牌/版本标识判定）| paper | folia。
+        // 该值不影响改写结果，故不参与配置指纹。
+        PlatformSupport.Mode.parse(root.getString("advanced.platform", "auto")),
         root.getInt("cache.maximum-size", 4096),
         root.getInt("cache.expire-after-access-seconds", 60),
         root.getInt("advanced.threads", 0),
@@ -330,6 +346,17 @@ public final class AntiXrayConfig {
   /** 磁盘缓存相关配置。 */
   public DiskCache diskCache() {
     return diskCache;
+  }
+
+  /**
+   * 平台判定兜底（{@code advanced.platform}）：{@code AUTO}（默认，按服务端品牌/版本标识判定）
+   * 或手动指定 {@code PAPER}/{@code FOLIA}。
+   *
+   * <p>供 {@code MikuXrayNet} 在装配任何模块之前调用 {@code PlatformSupport.configure(...)}。
+   * 它同时影响反矿透与带宽两个模块的调度路径，因此虽然写在 antixray.yml 里也是全局生效的。
+   */
+  public PlatformSupport.Mode platform() {
+    return platform;
   }
 
   public int cacheMaximumSize() {
