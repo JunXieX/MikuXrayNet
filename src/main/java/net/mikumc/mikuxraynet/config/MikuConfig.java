@@ -42,7 +42,7 @@ public final class MikuConfig {
     } else {
       logger.info("反矿透配置已加载：功能处于关闭状态");
     }
-    logger.info("带宽配置已加载：总开关 " + (loadedBandwidth.enabled() ? "开启（M5 生效）" : "关闭"));
+    logger.info("带宽配置已加载：总开关 " + (loadedBandwidth.enabled() ? "开启" : "关闭"));
   }
 
   public AntiXrayConfig antiXray() {
