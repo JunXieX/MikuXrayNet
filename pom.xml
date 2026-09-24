@@ -6,7 +6,7 @@
 
     <groupId>net.mikumc</groupId>
     <artifactId>mikuxraynet</artifactId>
-    <version>0.1.0-Beta</version>
+    <version>0.2.0-Beta</version>
     <packaging>jar</packaging>
 
     <name>MikuXrayNet</name>
