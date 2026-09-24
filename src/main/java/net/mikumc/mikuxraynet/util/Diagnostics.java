@@ -9,6 +9,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import net.mikumc.mikuxraynet.AntiXrayRuntime;
 import net.mikumc.mikuxraynet.MikuXrayNet;
 import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ProximityStats;
@@ -19,7 +20,6 @@ import net.mikumc.mikuxraynet.bandwidth.ThrottleStats;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.bootstrap.ProtocolLibHook;
-import net.mikumc.mikuxraynet.cache.DiskCacheStats;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
@@ -40,65 +40,87 @@ public final class Diagnostics {
 
   private static final DateTimeFormatter FILE_STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
 
-  /** 全部指标与配置的不可变快照（测试可构造固定值断言格式）。 */
+  /**
+   * 全部指标与配置的不可变快照（测试可构造固定值断言格式）。
+   *
+   * <p><b>为什么拆嵌套 record</b>：旧的 53 参平铺构造在测试里只能靠「数逗号」对位，极易错位；
+   * 现按域分组（环境 / 改写 / 邻近显形 / 带宽 / 线程池 / 磁盘缓存），各组自带空对象兜底
+   * （{@code EMPTY}），来源模块未启用时快照直接复用零值组，不再逐字段写 {@code ? null : 0}。
+   * 格式化输出与拆分前逐字符一致（由 DiagnosticsTest 锁定）。
+   */
   public record Snapshot(
-      boolean packetEventsReady,
-      boolean protocolLibReady,
-      boolean folia,
-      boolean antiXrayActive,
-      int bypassPlayers,
-      long cacheHits,
-      long cacheMisses,
-      int cacheEntries,
-      long chunksRewritten,
-      long blocksReplaced,
-      long chunksSkipped,
-      long chunksFailed,
-      long writeBackFailures,
-      long chunksTimedOut,
-      long revealsSent,
-      long revealsSkipped,
-      long revealsUnregistered,
-      long entityPacketsCancelled,
-      long entityPacketsPassed,
-      long blockMergeBatches,
-      long blockChangesMerged,
-      long blockChangesPassed,
-      long entitiesHidden,
-      long entitiesShown,
-      int entitiesHiddenNow,
-      long recheckSubmitted,
-      long recheckHidden,
-      long recheckShown,
-      int afkPlayers,
-      long afkEntered,
-      long afkPacketsDropped,
-      long viewDistanceReduced,
-      long viewDistanceRestored,
-      int poolThreads,
-      int poolActive,
-      int queueSize,
-      int queueCapacity,
-      String serverVersion,
-      String javaVersion,
+      Env env,
+      Rewrite rewrite,
+      Proximity proximity,
+      Index index,
+      Throttle throttle,
+      Pool pool,
+      DiskCache diskCache,
       AntiXrayConfig antiXray,
-      BandwidthConfig bandwidth,
-      long proximityFrustumCulled,
-      long proximityRayCulled,
-      long diskCacheHits,
-      long diskCacheMisses,
-      int diskCacheEntries,
-      int diskCacheOpenFiles,
-      int obfuscatedChunkCount,
-      int obfuscatedPositionCount,
-      int revealedPositionCount,
-      long revealedRegisteredTotal,
-      long indexEvictedByCapacity,
-      long revealedDroppedByCapacity) {
+      BandwidthConfig bandwidth) {
 
     /** 配置指纹（取自反矿透配置；无配置时为 0）。 */
     public int configFingerprint() {
       return antiXray == null ? 0 : antiXray.configHash();
+    }
+
+    /** 依赖与运行环境（依赖就绪性、平台、直通玩家数、版本标识）。 */
+    public record Env(boolean packetEventsReady, boolean protocolLibReady, boolean folia,
+        boolean antiXrayActive, int bypassPlayers, String serverVersion, String javaVersion) {
+    }
+
+    /** 区块改写域：改写缓存（按区块共享）与改写计数。 */
+    public record Rewrite(long cacheHits, long cacheMisses, int cacheEntries,
+        long chunksRewritten, long blocksReplaced, long chunksSkipped, long chunksFailed,
+        long writeBackFailures, long chunksTimedOut) {
+
+      /** 反矿透未启用时的零值兜底。 */
+      public static final Rewrite EMPTY =
+          new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L);
+    }
+
+    /** 邻近显形域：显形发包与视锥/射线剔除计数。 */
+    public record Proximity(long revealsSent, long revealsSkipped, long revealsUnregistered,
+        long frustumCulled, long rayCulled) {
+
+      /** 邻近显形未启用时的零值兜底。 */
+      public static final Proximity EMPTY = new Proximity(0L, 0L, 0L, 0L, 0L);
+    }
+
+    /** 显形索引域：伪装区块索引（按区块共享）与按玩家的已显形集合的持有量与安全阀计数。 */
+    public record Index(int obfuscatedChunkCount, int obfuscatedPositionCount,
+        int revealedPositionCount, long revealedRegisteredTotal,
+        long indexEvictedByCapacity, long revealedDroppedByCapacity) {
+
+      /** 显形索引未启用时的零值兜底。 */
+      public static final Index EMPTY = new Index(0, 0, 0, 0L, 0L, 0L);
+    }
+
+    /** 带宽域：零位移取消、变更合并、实体剔除（含复检口径）与 AFK / 降视距计数。 */
+    public record Throttle(long entityPacketsCancelled, long entityPacketsPassed,
+        long blockMergeBatches, long blockChangesMerged, long blockChangesPassed,
+        long entitiesHidden, long entitiesShown, int entitiesHiddenNow,
+        long recheckSubmitted, long recheckHidden, long recheckShown,
+        int afkPlayers, long afkEntered, long afkPacketsDropped,
+        long viewDistanceReduced, long viewDistanceRestored) {
+
+      /** 带宽优化未启用时的零值兜底。 */
+      public static final Throttle EMPTY = new Throttle(
+          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L);
+    }
+
+    /** 工作线程池域：线程数、活动数与队列占用。 */
+    public record Pool(int threads, int active, int queueSize, int queueCapacity) {
+
+      /** 工作线程池未启用时的零值兜底。 */
+      public static final Pool EMPTY = new Pool(0, 0, 0, 0);
+    }
+
+    /** 磁盘缓存域：命中、持有量与打开的区域文件数。 */
+    public record DiskCache(long hits, long misses, int entries, int openFiles) {
+
+      /** 磁盘缓存未启用时的零值兜底。 */
+      public static final DiskCache EMPTY = new DiskCache(0L, 0L, 0, 0);
     }
   }
 
@@ -123,14 +145,14 @@ public final class Diagnostics {
 
   /** 单行运行摘要格式化（纯函数，恒为一行，不含换行）。 */
   public static String formatSummaryLine(Snapshot s) {
-    return "运行摘要：反矿透 " + (s.antiXrayActive() ? "生效" : "未生效")
-        + "｜区块改写 " + s.chunksRewritten() + "（异常 " + s.chunksFailed()
-        + "，超时放行 " + s.chunksTimedOut() + "）"
-        + "｜显形发送 " + s.revealsSent() + "，坐标跳过 " + s.revealsSkipped()
-        + "｜实体隐藏 " + s.entitiesHidden() + "/恢复 " + s.entitiesShown()
-        + "（当前隐藏中 " + s.entitiesHiddenNow() + "）"
-        + "｜磁盘缓存命中 " + s.diskCacheHits() + "，条目约 " + s.diskCacheEntries()
-        + "｜队列 " + s.queueSize() + "/" + s.queueCapacity();
+    return "运行摘要：反矿透 " + (s.env().antiXrayActive() ? "生效" : "未生效")
+        + "｜区块改写 " + s.rewrite().chunksRewritten() + "（异常 " + s.rewrite().chunksFailed()
+        + "，超时放行 " + s.rewrite().chunksTimedOut() + "）"
+        + "｜显形发送 " + s.proximity().revealsSent() + "，坐标跳过 " + s.proximity().revealsSkipped()
+        + "｜实体隐藏 " + s.throttle().entitiesHidden() + "/恢复 " + s.throttle().entitiesShown()
+        + "（当前隐藏中 " + s.throttle().entitiesHiddenNow() + "）"
+        + "｜磁盘缓存命中 " + s.diskCache().hits() + "，条目约 " + s.diskCache().entries()
+        + "｜队列 " + s.pool().queueSize() + "/" + s.pool().queueCapacity();
   }
 
   /** 拉取实时指标并生成转储文本。 */
@@ -150,124 +172,123 @@ public final class Diagnostics {
     return file;
   }
 
-  /** 从插件各模块拉取一次实时快照；任何缺失模块按 0 / 未启用处理。 */
+  /** 从插件各模块拉取一次实时快照；任何缺失模块按 0 / 未启用处理（各组空对象兜底）。 */
   public Snapshot snapshot() {
-    ProtocolLibHook hook = plugin.protocolLibHook();
-    RewriteStats rewriteStats = hook == null ? null : hook.stats();
+    // 反矿透侧组件集中在 AntiXrayRuntime（B1 拆分后主类不再直接持有这些字段）
+    AntiXrayRuntime runtime = plugin.antiXrayRuntime();
+    ProtocolLibHook hook = runtime == null ? null : runtime.protocolLibHook();
     ThrottlePipeline pipeline = plugin.bandwidthPipeline();
-    ThrottleStats throttleStats = pipeline == null ? null : pipeline.stats();
-    ProximityStats proximityStats = plugin.proximityStats();
-    BypassRegistry bypass = plugin.bypassRegistry();
-    MikuWorkPool pool = plugin.workPool();
-    DiskCacheStore diskCache = plugin.diskCacheStore();
-    DiskCacheStats diskStats = diskCache == null ? null : diskCache.stats();
-    ObfuscatedChunkIndex chunkIndex = plugin.obfuscatedChunkIndex();
-    RevealedSet revealedSet = plugin.revealedSet();
+    ProximityStats proximityStats = runtime == null ? null : runtime.proximityStats();
+    BypassRegistry bypass = runtime == null ? null : runtime.bypassRegistry();
+    MikuWorkPool pool = runtime == null ? null : runtime.workPool();
+    DiskCacheStore diskCache = runtime == null ? null : runtime.diskCacheStore();
+    ObfuscatedChunkIndex chunkIndex = runtime == null ? null : runtime.obfuscatedChunkIndex();
+    RevealedSet revealedSet = runtime == null ? null : runtime.revealedSet();
     MikuConfig config = plugin.mikuConfig();
+    ThrottleStats throttleStats = pipeline == null ? null : pipeline.stats();
+
+    // 各域来源未启用时直接复用空对象，快照构造里不再出现逐字段的「? null : 0」
+    RewriteStats rewriteStats = hook == null ? null : hook.stats();
+    Snapshot.Rewrite rewrite = hook == null ? Snapshot.Rewrite.EMPTY
+        : new Snapshot.Rewrite(hook.cacheHits(), hook.cacheMisses(), hook.cacheSize(),
+            rewriteStats.chunksRewritten.sum(), rewriteStats.blocksReplaced.sum(),
+            rewriteStats.chunksSkipped.sum(), rewriteStats.chunksFailed.sum(),
+            rewriteStats.writeBackFailures.sum(), rewriteStats.chunksTimedOut.sum());
+    Snapshot.Proximity proximity = proximityStats == null ? Snapshot.Proximity.EMPTY
+        : new Snapshot.Proximity(proximityStats.revealsSent.sum(), proximityStats.revealsSkipped.sum(),
+            proximityStats.unregistered.sum(), proximityStats.revealsFrustumCulled.sum(),
+            proximityStats.revealsRayCulled.sum());
+    Snapshot.Index index = chunkIndex == null && revealedSet == null ? Snapshot.Index.EMPTY
+        : new Snapshot.Index(
+            chunkIndex == null ? 0 : chunkIndex.chunkCount(),
+            chunkIndex == null ? 0 : chunkIndex.positionCount(),
+            revealedSet == null ? 0 : revealedSet.positionCount(),
+            revealedSet == null ? 0L : revealedSet.registeredTotal(),
+            chunkIndex == null ? 0L : chunkIndex.evictedByCapacity(),
+            revealedSet == null ? 0L : revealedSet.droppedByCapacity());
+    Snapshot.Throttle throttle = pipeline == null ? Snapshot.Throttle.EMPTY
+        : new Snapshot.Throttle(throttleStats.entityPacketsCancelled.sum(),
+            throttleStats.entityPacketsPassed.sum(), throttleStats.blockMergeBatches.sum(),
+            throttleStats.blockChangesMerged.sum(), throttleStats.blockChangesPassed.sum(),
+            throttleStats.entitiesHidden.sum(), throttleStats.entitiesShown.sum(),
+            pipeline.hiddenEntityCount(), throttleStats.recheckSubmitted.sum(),
+            throttleStats.recheckHidden.sum(), throttleStats.recheckShown.sum(),
+            pipeline.afkPlayerCount(), throttleStats.afkEntered.sum(),
+            throttleStats.afkPacketsDropped.sum(), throttleStats.viewDistanceReduced.sum(),
+            throttleStats.viewDistanceRestored.sum());
+    Snapshot.Pool poolSnapshot = pool == null ? Snapshot.Pool.EMPTY
+        : new Snapshot.Pool(pool.poolSize(), pool.activeCount(), pool.queueSize(),
+            pool.queueCapacity());
+    Snapshot.DiskCache diskCacheSnapshot = diskCache == null ? Snapshot.DiskCache.EMPTY
+        : new Snapshot.DiskCache(diskCache.stats().hits.sum(), diskCache.stats().misses.sum(),
+            diskCache.entries(), diskCache.openRegionFiles());
 
     return new Snapshot(
-        DependencyGuard.isPacketEventsPresent(),
-        DependencyGuard.isProtocolLibPresent(),
-        PlatformSupport.isFolia(),
-        plugin.antiXrayActive(),
-        bypass == null ? 0 : bypass.size(),
-        hook == null ? 0L : hook.cacheHits(),
-        hook == null ? 0L : hook.cacheMisses(),
-        hook == null ? 0 : hook.cacheSize(),
-        rewriteStats == null ? 0L : rewriteStats.chunksRewritten.sum(),
-        rewriteStats == null ? 0L : rewriteStats.blocksReplaced.sum(),
-        rewriteStats == null ? 0L : rewriteStats.chunksSkipped.sum(),
-        rewriteStats == null ? 0L : rewriteStats.chunksFailed.sum(),
-        rewriteStats == null ? 0L : rewriteStats.writeBackFailures.sum(),
-        rewriteStats == null ? 0L : rewriteStats.chunksTimedOut.sum(),
-        proximityStats == null ? 0L : proximityStats.revealsSent.sum(),
-        proximityStats == null ? 0L : proximityStats.revealsSkipped.sum(),
-        proximityStats == null ? 0L : proximityStats.unregistered.sum(),
-        throttleStats == null ? 0L : throttleStats.entityPacketsCancelled.sum(),
-        throttleStats == null ? 0L : throttleStats.entityPacketsPassed.sum(),
-        throttleStats == null ? 0L : throttleStats.blockMergeBatches.sum(),
-        throttleStats == null ? 0L : throttleStats.blockChangesMerged.sum(),
-        throttleStats == null ? 0L : throttleStats.blockChangesPassed.sum(),
-        throttleStats == null ? 0L : throttleStats.entitiesHidden.sum(),
-        throttleStats == null ? 0L : throttleStats.entitiesShown.sum(),
-        pipeline == null ? 0 : pipeline.hiddenEntityCount(),
-        throttleStats == null ? 0L : throttleStats.recheckSubmitted.sum(),
-        throttleStats == null ? 0L : throttleStats.recheckHidden.sum(),
-        throttleStats == null ? 0L : throttleStats.recheckShown.sum(),
-        pipeline == null ? 0 : pipeline.afkPlayerCount(),
-        throttleStats == null ? 0L : throttleStats.afkEntered.sum(),
-        throttleStats == null ? 0L : throttleStats.afkPacketsDropped.sum(),
-        throttleStats == null ? 0L : throttleStats.viewDistanceReduced.sum(),
-        throttleStats == null ? 0L : throttleStats.viewDistanceRestored.sum(),
-        pool == null ? 0 : pool.poolSize(),
-        pool == null ? 0 : pool.activeCount(),
-        pool == null ? 0 : pool.queueSize(),
-        pool == null ? 0 : pool.queueCapacity(),
-        Bukkit.getName() + " " + Bukkit.getMinecraftVersion(),
-        System.getProperty("java.version", "未知"),
+        new Snapshot.Env(DependencyGuard.isPacketEventsPresent(),
+            DependencyGuard.isProtocolLibPresent(), PlatformSupport.isFolia(),
+            runtime != null && runtime.antiXrayActive(), bypass == null ? 0 : bypass.size(),
+            Bukkit.getName() + " " + Bukkit.getMinecraftVersion(),
+            System.getProperty("java.version", "未知")),
+        rewrite,
+        proximity,
+        index,
+        throttle,
+        poolSnapshot,
+        diskCacheSnapshot,
         config == null ? null : config.antiXray(),
-        config == null ? null : config.bandwidth(),
-        proximityStats == null ? 0L : proximityStats.revealsFrustumCulled.sum(),
-        proximityStats == null ? 0L : proximityStats.revealsRayCulled.sum(),
-        diskStats == null ? 0L : diskStats.hits.sum(),
-        diskStats == null ? 0L : diskStats.misses.sum(),
-        diskCache == null ? 0 : diskCache.entries(),
-        diskCache == null ? 0 : diskCache.openRegionFiles(),
-        chunkIndex == null ? 0 : chunkIndex.chunkCount(),
-        chunkIndex == null ? 0 : chunkIndex.positionCount(),
-        revealedSet == null ? 0 : revealedSet.positionCount(),
-        revealedSet == null ? 0L : revealedSet.registeredTotal(),
-        chunkIndex == null ? 0L : chunkIndex.evictedByCapacity(),
-        revealedSet == null ? 0L : revealedSet.droppedByCapacity());
+        config == null ? null : config.bandwidth());
   }
 
   /** 状态面板格式化（纯函数）。 */
   public static List<String> formatStatus(Snapshot s) {
     List<String> lines = new ArrayList<>();
     lines.add("==== MikuXrayNet 运行状态 ====");
-    lines.add("依赖：PacketEvents " + (s.packetEventsReady() ? "就绪" : "缺失")
-        + "｜ProtocolLib " + (s.protocolLibReady() ? "就绪" : "缺失")
-        + "｜平台 " + (s.folia() ? "Folia" : "Paper/Spigot"));
-    lines.add("反矿透：" + (s.antiXrayActive() ? "已生效" : "未生效")
-        + "｜直通玩家 " + s.bypassPlayers() + " 名");
-    lines.add("改写缓存：命中 " + s.cacheHits() + "，未命中 " + s.cacheMisses()
-        + "，命中率 " + hitRate(s.cacheHits(), s.cacheMisses()) + "，条目 " + s.cacheEntries());
-    lines.add("区块改写：改写 " + s.chunksRewritten() + "，替换方块 " + s.blocksReplaced()
-        + "，跳过 " + s.chunksSkipped()
-        + "，异常 " + s.chunksFailed() + "，写回失败 " + s.writeBackFailures()
-        + "，超时放行 " + s.chunksTimedOut());
+    lines.add("依赖：PacketEvents " + (s.env().packetEventsReady() ? "就绪" : "缺失")
+        + "｜ProtocolLib " + (s.env().protocolLibReady() ? "就绪" : "缺失")
+        + "｜平台 " + (s.env().folia() ? "Folia" : "Paper/Spigot"));
+    lines.add("反矿透：" + (s.env().antiXrayActive() ? "已生效" : "未生效")
+        + "｜直通玩家 " + s.env().bypassPlayers() + " 名");
+    lines.add("改写缓存：命中 " + s.rewrite().cacheHits() + "，未命中 " + s.rewrite().cacheMisses()
+        + "，命中率 " + hitRate(s.rewrite().cacheHits(), s.rewrite().cacheMisses())
+        + "，条目 " + s.rewrite().cacheEntries());
+    lines.add("区块改写：改写 " + s.rewrite().chunksRewritten() + "，替换方块 " + s.rewrite().blocksReplaced()
+        + "，跳过 " + s.rewrite().chunksSkipped()
+        + "，异常 " + s.rewrite().chunksFailed() + "，写回失败 " + s.rewrite().writeBackFailures()
+        + "，超时放行 " + s.rewrite().chunksTimedOut());
     // 注意「坐标跳过」与「整块跳过」是两件事：前者是候选坐标因区块未加载 / 发包失败被跳过，
     // 后者是「整块都已显形」的区块被整体略过（只出现在一次性「首次显形诊断」日志里）。
     // 只写「跳过」会被误读成「整块跳过为 0 → 整块跳过没生效」，故此处写明「坐标跳过」。
-    lines.add("邻近显形：发送 " + s.revealsSent() + "，坐标跳过 " + s.revealsSkipped()
-        + "，变更注销 " + s.revealsUnregistered() + "，视锥剔除 " + s.proximityFrustumCulled()
-        + "，射线剔除 " + s.proximityRayCulled());
+    lines.add("邻近显形：发送 " + s.proximity().revealsSent() + "，坐标跳过 " + s.proximity().revealsSkipped()
+        + "，变更注销 " + s.proximity().revealsUnregistered() + "，视锥剔除 " + s.proximity().frustumCulled()
+        + "，射线剔除 " + s.proximity().rayCulled());
     // 口径说明：这里刻意分列「实时坐标数」与「累计登记数」——前者随登出 / 过期 / 区块失效归零，
     // 后者只增不减。若只显示实时值，玩家中途重登或走远后被清理时会看到「发送 N 但已显形 0」，
     // 极易被误读成「显形路径没有登记」（实际登记在发包成功后必然发生）。
-    lines.add("显形索引：伪装区块 " + s.obfuscatedChunkCount() + "（坐标 " + s.obfuscatedPositionCount()
-        + "）｜已显形 坐标 " + s.revealedPositionCount() + "（当前在线）｜累计登记 "
-        + s.revealedRegisteredTotal()
-        + "｜安全阀触发 " + s.indexEvictedByCapacity() + "/" + s.revealedDroppedByCapacity()
+    lines.add("显形索引：伪装区块 " + s.index().obfuscatedChunkCount() + "（坐标 "
+        + s.index().obfuscatedPositionCount()
+        + "）｜已显形 坐标 " + s.index().revealedPositionCount() + "（当前在线）｜累计登记 "
+        + s.index().revealedRegisteredTotal()
+        + "｜安全阀触发 " + s.index().indexEvictedByCapacity() + "/" + s.index().revealedDroppedByCapacity()
         + "（正常运营下应为 0，触发即说明有 bug）");
-    lines.add("磁盘缓存：" + (s.diskCacheOpenFiles() > 0 || s.diskCacheEntries() > 0 ? "已启用" : "无数据")
-        + "｜命中 " + s.diskCacheHits() + "，未命中 " + s.diskCacheMisses()
-        + "，命中率 " + hitRate(s.diskCacheHits(), s.diskCacheMisses())
-        + "，条目约 " + s.diskCacheEntries() + "，打开区域文件 " + s.diskCacheOpenFiles());
-    lines.add("带宽：零位移取消 " + s.entityPacketsCancelled() + "，合并批次 " + s.blockMergeBatches()
-        + "（合并 " + s.blockChangesMerged() + " 条），实体隐藏 " + s.entitiesHidden()
-        + "/恢复 " + s.entitiesShown() + "（当前隐藏中 " + s.entitiesHiddenNow()
+    lines.add("磁盘缓存：" + (s.diskCache().openFiles() > 0 || s.diskCache().entries() > 0 ? "已启用" : "无数据")
+        + "｜命中 " + s.diskCache().hits() + "，未命中 " + s.diskCache().misses()
+        + "，命中率 " + hitRate(s.diskCache().hits(), s.diskCache().misses())
+        + "，条目约 " + s.diskCache().entries() + "，打开区域文件 " + s.diskCache().openFiles());
+    lines.add("带宽：零位移取消 " + s.throttle().entityPacketsCancelled() + "，合并批次 "
+        + s.throttle().blockMergeBatches()
+        + "（合并 " + s.throttle().blockChangesMerged() + " 条），实体隐藏 " + s.throttle().entitiesHidden()
+        + "/恢复 " + s.throttle().entitiesShown() + "（当前隐藏中 " + s.throttle().entitiesHiddenNow()
         + "；两者之差 = 死亡/卸载被服务端自然回收 + 仍在隐藏）");
     // 「复检」单列：累计隐藏混合了「入场即被遮挡」与「周期复检发现新遮挡」两条来源，
     // 只看总数无法判断「先可见、之后才被挡住」的实体是否真被收敛到隐藏（本次缺陷的观测口径）。
-    lines.add("带宽：实体复检 " + s.recheckSubmitted()
-        + "（复检致隐藏 " + s.recheckHidden() + "，复检致恢复 " + s.recheckShown() + "）");
-    lines.add("带宽：AFK 玩家 " + s.afkPlayers() + "（累计进入 " + s.afkEntered() + "），AFK 丢包 "
-        + s.afkPacketsDropped() + "，降视距 " + s.viewDistanceReduced()
-        + "/还原 " + s.viewDistanceRestored());
+    lines.add("带宽：实体复检 " + s.throttle().recheckSubmitted()
+        + "（复检致隐藏 " + s.throttle().recheckHidden() + "，复检致恢复 " + s.throttle().recheckShown() + "）");
+    lines.add("带宽：AFK 玩家 " + s.throttle().afkPlayers() + "（累计进入 " + s.throttle().afkEntered()
+        + "），AFK 丢包 " + s.throttle().afkPacketsDropped() + "，降视距 " + s.throttle().viewDistanceReduced()
+        + "/还原 " + s.throttle().viewDistanceRestored());
     lines.add(bandwidthSwitches(s.bandwidth()));
-    lines.add("线程池：线程 " + s.poolThreads() + "，活动 " + s.poolActive()
-        + "，队列 " + s.queueSize() + "/" + s.queueCapacity());
+    lines.add("线程池：线程 " + s.pool().threads() + "，活动 " + s.pool().active()
+        + "，队列 " + s.pool().queueSize() + "/" + s.pool().queueCapacity());
     return lines;
   }
 
@@ -308,9 +329,9 @@ public final class Diagnostics {
     StringBuilder sb = new StringBuilder();
     sb.append("MikuXrayNet 诊断转储\n");
     sb.append("导出时间：").append(timestamp).append('\n');
-    sb.append("服务端：").append(s.serverVersion())
-        .append(s.folia() ? "（Folia 系，区域化多线程）" : "（Paper 系，单主线程）").append('\n');
-    sb.append("JVM：").append(s.javaVersion()).append('\n');
+    sb.append("服务端：").append(s.env().serverVersion())
+        .append(s.env().folia() ? "（Folia 系，区域化多线程）" : "（Paper 系，单主线程）").append('\n');
+    sb.append("JVM：").append(s.env().javaVersion()).append('\n');
     sb.append("配置指纹：").append(s.configFingerprint()).append('\n');
     sb.append('\n');
     for (String line : formatStatus(s)) {

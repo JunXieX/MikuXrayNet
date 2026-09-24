@@ -150,6 +150,44 @@ public final class DiskCacheStore implements AutoCloseable {
     } catch (Throwable throwable) {
       fail("磁盘缓存维护任务登记失败（缓存仍可用，仅失去周期落盘与回收）", throwable);
     }
+    cleanupCrashLeftoverTempFiles();
+  }
+
+  /**
+   * 启动清理：删除上次进程崩溃 / 被强杀时残留的 {@code *.tmp} 压缩临时文件。
+   *
+   * <p>压缩回收先把整文件写到 {@code r.X.Z.b_linear.tmp} 再原子替换正式文件
+   * （见 {@link RegionFile#compact}）；进程若在「tmp 已写出、正式文件尚未替换」之间崩溃，
+   * 孤儿 tmp 会永远残留在磁盘上（重启后无任何路径再认领它，而正式文件自身是一致的）。
+   * 因此在缓存初始化时按目录扫描一次：只删缓存目录（含世界子目录）下的 {@code *.tmp}，
+   * 删除失败只记日志（缓存可丢，链路不能断）。
+   */
+  private void cleanupCrashLeftoverTempFiles() {
+    if (!Files.isDirectory(rootDir)) {
+      // 全新安装还没有缓存目录：没有可清理的对象，静默跳过
+      return;
+    }
+    int removed = 0;
+    try (var paths = Files.walk(rootDir, 2)) {
+      for (Path path : paths.filter(Files::isRegularFile).toList()) {
+        if (!path.getFileName().toString().endsWith(".tmp")) {
+          continue;
+        }
+        try {
+          if (Files.deleteIfExists(path)) {
+            removed++;
+          }
+        } catch (Throwable throwable) {
+          logger.warning("清理磁盘缓存临时文件失败（不影响缓存功能）：" + path + "（" + throwable + "）");
+        }
+      }
+    } catch (Throwable throwable) {
+      logger.warning("扫描磁盘缓存临时文件失败（不影响缓存功能）：" + throwable);
+      return;
+    }
+    if (removed > 0) {
+      logger.info("已清理 " + removed + " 个上次崩溃残留的磁盘缓存临时文件（*.tmp）");
+    }
   }
 
   // ------------------------------------------------------------------ 对外 API

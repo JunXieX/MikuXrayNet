@@ -16,6 +16,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
@@ -53,9 +54,6 @@ import org.bukkit.util.BoundingBox;
  * 两条通道都复用同一套评估链路（worker 算射线、玩家所在线程读方块并 hide/show），不另写一套。
  */
 public final class EntityCuller implements Listener {
-
-  private static final String BYPASS_PERMISSION = "mikuxraynet.bypass";
-  private static final int MAX_ERROR_LOGS = 3;
 
   private final Plugin plugin;
   private final BandwidthConfig.EntityCulling config;
@@ -188,7 +186,7 @@ public final class EntityCuller implements Listener {
       return;
     }
     Player player = event.getPlayer();
-    if (player.hasPermission(BYPASS_PERMISSION)) {
+    if (player.hasPermission(Constants.BYPASS_PERMISSION)) {
       return;
     }
     Entity entity = event.getEntity();
@@ -347,14 +345,10 @@ public final class EntityCuller implements Listener {
         allBlocked = false;
         break;
       }
-      boolean blocked = false;
-      for (int i = 0; i + 2 < path.length; i += 3) {
-        if (isOccluding(world, path[i], path[i + 1], path[i + 2])) {
-          blocked = true;
-          break;
-        }
-      }
-      if (!blocked) {
+      // 遮挡判定下沉为公共纯函数（与显形可见性共用，见 OcclusionRaytracer#isPathOccluded）：
+      // 「任一体素是遮挡方块即被挡、空路径/异常 fail-open 判可见」的语义与旧内联循环逐字节等价
+      if (!OcclusionRaytracer.isPathOccluded(path,
+          (x, y, z) -> isOccluding(world, x, y, z))) {
         allBlocked = false;
         break;
       }
@@ -426,6 +420,15 @@ public final class EntityCuller implements Listener {
     hidden.clear();
   }
 
+  /**
+   * 清掉某玩家的全部「在途计算」标记。
+   *
+   * <p><b>覆盖面说明（无泄漏路径）</b>：{@code inFlight} 的键是 {@code 玩家UUID:实体id}，
+   * 玩家退役（退出）时本方法由 {@link #onQuit} 调用，把该玩家所有在途键一并摘除——即使某个
+   * 射线计算还悬在工作队列里，回调执行时也只会做一次多余的 {@code remove}（幂等），不会累积。
+   * 实体侧的退役（死亡/卸载）不产生键泄漏：键以玩家为前缀，玩家退出时已整体清理；
+   * 插件停用时 {@link #stop} 的 {@code inFlight.clear()} 兜底清空。
+   */
   private void purgeInFlight(UUID playerId) {
     String prefix = playerId + ":";
     inFlight.removeIf(key -> key.startsWith(prefix));
@@ -440,7 +443,7 @@ public final class EntityCuller implements Listener {
   }
 
   private void logThrottled(Throwable throwable) {
-    if (errorCounter.incrementAndGet() <= MAX_ERROR_LOGS) {
+    if (errorCounter.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
       plugin.getLogger().log(Level.WARNING, "实体剔除判定失败，已按「保持可见」处理", throwable);
     }
   }

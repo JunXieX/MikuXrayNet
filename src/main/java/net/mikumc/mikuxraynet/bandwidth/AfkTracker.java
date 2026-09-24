@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Location;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -38,9 +39,6 @@ import org.bukkit.plugin.Plugin;
  * 世界粒子与方块破坏动画。
  */
 public final class AfkTracker implements Listener {
-
-  private static final String BYPASS_PERMISSION = "mikuxraynet.bypass";
-  private static final int MAX_ERROR_LOGS = 3;
 
   private final Plugin plugin;
   private final ProtocolManager protocolManager;
@@ -164,7 +162,8 @@ public final class AfkTracker implements Listener {
       return;
     }
     Player player = event.getPlayer();
-    if (player.hasPermission(BYPASS_PERMISSION)) {
+    // 权限检查在封包线程执行：依赖权限插件自身线程安全（LuckPerms 支持异步查询，安全）
+    if (player.hasPermission(Constants.BYPASS_PERMISSION)) {
       return;
     }
     AfkState state = states.get(player.getUniqueId());
@@ -238,7 +237,7 @@ public final class AfkTracker implements Listener {
   }
 
   private void logThrottled(Throwable throwable) {
-    if (errorCounter.incrementAndGet() <= MAX_ERROR_LOGS) {
+    if (errorCounter.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
       plugin.getLogger().log(Level.WARNING, "AFK 距离判定失败，已按原包放行", throwable);
     }
   }

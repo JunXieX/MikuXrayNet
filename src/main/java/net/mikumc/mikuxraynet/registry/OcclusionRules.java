@@ -45,7 +45,7 @@ public final class OcclusionRules {
       "_sapling", "_sprouts", "_roots", "_fan", "_bush", "_shulker_box"};
 
   /**
-   * 实体但「形状小于整方块」的方块名称白名单。
+   * 实心但「形状小于整方块」的方块名称白名单。
    *
    * <p><b>为什么需要这张表</b>：PacketEvents 只提供 {@code exceedsCube}（形状<b>超出</b>整方块，如栅栏/墙），
    * <b>没有</b>「小于整方块」的标志位；箱子族这类方块在 PE 里 {@code isSolid=true}、材质也不是装饰性材质，
@@ -96,8 +96,8 @@ public final class OcclusionRules {
     return !hasThinSuffix(name);
   }
 
-  /** 该方块名是否为「薄片族」（仅按名称后缀近似，供判定与诊断复用）。 */
-  public static boolean hasThinSuffix(String name) {
+  /** 该方块名是否为「薄片族」（仅按名称后缀近似，内部判定用）。 */
+  private static boolean hasThinSuffix(String name) {
     String normalized = normalize(name);
     for (String suffix : THIN_NAME_SUFFIXES) {
       if (normalized.endsWith(suffix)) {

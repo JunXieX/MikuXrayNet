@@ -19,6 +19,7 @@ import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.concurrency.RewriteTask;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
+import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
@@ -44,7 +45,6 @@ import org.bukkit.plugin.Plugin;
  */
 public final class ProtocolLibAsyncListener extends PacketAdapter {
 
-  private static final int MAX_ERROR_LOGS = 3;
   /** 未配对的批次闸门数量上限（异常情况下防止无界增长）。 */
   private static final int MAX_PENDING_BATCHES = 256;
 
@@ -264,6 +264,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
             });
 
     ScheduledFuture<?> timeout;
+    // 延迟登记必须先于看门狗注册（与旧实现顺序对调，行为等价性说明）：
+    // 旧实现先 scheduleTimeout 再 incrementProcessingDelay——两步之间若调度线程抢先触发看门狗，
+    // task.releaseOnTimeout() 会立刻放行封包，而主线程随后才登记的 +1 延迟计数将无人归还，
+    // 在该玩家的异步队列里留下永不返还的延迟额度。对调后「已放行但延迟未登记」的窗口不复存在；
+    // 两步对调本身不改变任何成功路径的行为：看门狗在延迟登记后才可能触发，放行仍由
+    // RewriteTask#signalOnce 保证「恰好一次」。
+    marker.incrementProcessingDelay();
     try {
       timeout = workPool.scheduleTimeout(() -> {
         if (task.releaseOnTimeout()) {
@@ -271,13 +278,15 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         }
       }, config.timeoutMillis());
     } catch (Throwable throwable) {
-      // 尚未登记延迟，直接放行原包
+      // 已登记延迟但看门狗没注册成功（通常为插件停用中）：走一次放行动作把刚登记的延迟
+      // 「用掉」（signalPacketTransmission 即放行本封包），等价于旧实现的「未登记延迟直接放行」。
+      // 此时批次计数尚未登记（chunkStarted 在下一步才调用），release 动作里的 gate.chunkDone()
+      // 会被 ChunkBatchGate 的 max(0, ...) 防护钳回 0，无副作用。
       logThrottled("超时看门狗登记失败，已按原包放行", throwable);
+      task.signalOnce();
       return;
     }
 
-    // 延迟登记之后不再有任何可能失败的步骤，避免「登记了延迟却无人放行」
-    marker.incrementProcessingDelay();
     if (gate != null) {
       gate.chunkStarted();
     }
@@ -599,8 +608,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   }
 
   private void logThrottled(String message, Throwable throwable) {
-    if (errorLogs.incrementAndGet() <= MAX_ERROR_LOGS) {
-      getPlugin().getLogger().log(Level.WARNING, message + "（同类错误最多提示 " + MAX_ERROR_LOGS + " 次）", throwable);
+    if (errorLogs.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
+      getPlugin().getLogger().log(Level.WARNING, message + "（同类错误最多提示 "
+          + Constants.MAX_ERROR_LOGS + " 次）", throwable);
     }
   }
 

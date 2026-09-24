@@ -1,5 +1,6 @@
 package net.mikumc.mikuxraynet.antixray;
 
+import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -145,13 +146,13 @@ public final class ObfuscatedChunkIndex {
     chunks.computeIfPresent(key, (ignored, entry) -> {
       int local = ((y - entry.minHeight()) << 8) | ((z & 15) << 4) | (x & 15);
       int[] locals = entry.locals();
-      int found = -1;
-      for (int index = 0; index < locals.length; index++) {
-        if (locals[index] == local) {
-          found = index;
-          break;
-        }
-      }
+      // 二分查找依赖「locals 严格升序」不变式，该不变式已在写入路径核实成立：
+      // 唯一的生产写入方 ObfuscationProcessor#rewrite 按「section 升序 → 段内 index 升序」逐个登记，
+      // 编码 {@code 相对Y << 8 | z << 4 | x} 随遍历严格递增；摘除一个元素（保持其余相对顺序）
+      // 与重新 recordChunk（整表替换）都不破坏有序性。原线性查找 O(n) 改为二分 O(log n)。
+      // 注意：recordChunk 是公开 API、不校验顺序——若有外部调用方传入无序数组，二分可能漏摘
+      // （返回 false，即「未命中」），本项目内不存在这样的调用方。
+      int found = Arrays.binarySearch(locals, local);
       if (found < 0) {
         return entry;
       }

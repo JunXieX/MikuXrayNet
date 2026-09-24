@@ -130,6 +130,44 @@ public final class OcclusionRaytracer {
     return paths;
   }
 
+  /**
+   * 体素遮挡查询抽象：给定体素坐标回答「是否为遮挡方块」。
+   *
+   * <p>antixray 显形（主线程读世界方块）与 bandwidth 实体剔除（玩家所属线程读世界方块）共用；
+   * 单测可注入纯内存实现。包方向 antixray → bandwidth（已依赖），本抽象下沉到本类不产生环。
+   */
+  @FunctionalInterface
+  public interface OcclusionQuery {
+
+    boolean isOccluding(int x, int y, int z);
+  }
+
+  /**
+   * 判定一条体素路径是否被遮挡：途经的任一体素是遮挡方块即判「被挡」。
+   *
+   * <p><b>为什么下沉到这里</b>：{@code antixray.ProximitySelector#isRayOccluded}（显形可见性）与
+   * {@code bandwidth.EntityCuller} 的遮挡评估循环原本各写一份「逐体素判定」，语义相同、实现漂移
+   * 风险高，现收敛为本纯函数，两处调用方行为逐字节等价（判定顺序、fail-open 语义均不变）。
+   *
+   * <p>路径为 {@code null}、不足一个完整坐标（少于 3 个 int）或 {@code query} 为 {@code null} 时
+   * 恒判「未被遮挡」——与既有语义一致：宁可多显示/多显形，也不误隐藏。
+   *
+   * @param path  {@link #voxelPath} 返回的扁平坐标数组（x,y,z 依次排列；起点/终点体素已被排除）
+   * @param query 遮挡查询
+   * @return 是否被遮挡；空路径恒为 {@code false}（贴得太近，视为可见）
+   */
+  public static boolean isPathOccluded(int[] path, OcclusionQuery query) {
+    if (path == null || path.length < 3 || query == null) {
+      return false;
+    }
+    for (int index = 0; index + 2 < path.length; index += 3) {
+      if (query.isOccluding(path[index], path[index + 1], path[index + 2])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private static int floor(double value) {
     int truncated = (int) value;
     return value < truncated ? truncated - 1 : truncated;

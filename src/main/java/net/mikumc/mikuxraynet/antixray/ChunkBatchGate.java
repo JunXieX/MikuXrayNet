@@ -34,7 +34,11 @@ public final class ChunkBatchGate {
 
   /** 一个区块改写任务已结束（无论成功、异常还是被看门狗放行）。 */
   public void chunkDone() {
-    pending.decrementAndGet();
+    // 竞态防护：FINISHED 包与改写回调并发时（handleChunk 在「取到闸门」之后才调用 chunkStarted，
+    // 期间 FINISHED 可能已带着 pending=0 放行），迟到的 chunkDone 会把 pending 打成负数。
+    // 负数违反「pending = 未完成数」的不变式，还会让后续 maybeRelease 的判断失去意义——
+    // 这里钳回 0。对正常路径无影响：非负区间内 updateAndGet(max(0, n-1)) 与 decrementAndGet 等价。
+    pending.updateAndGet(current -> Math.max(0, current - 1));
     maybeRelease();
   }
 

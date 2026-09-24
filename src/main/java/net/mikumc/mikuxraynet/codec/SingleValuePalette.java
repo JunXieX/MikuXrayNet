@@ -32,11 +32,14 @@ public class SingleValuePalette implements Palette {
 
   @Override
   public int valueFor(int id) {
-    if (this.value != -1 && id == 0) {
-      return this.value;
-    } else {
+    if (this.value == -1) {
       throw new IllegalStateException("value isn't initialized");
     }
+    if (id != 0) {
+      // 单值调色板只有 id=0 一个条目：id≠0 说明上游索引越界，而非「未初始化」
+      throw new IndexOutOfBoundsException("single-value palette only has id 0, got " + id);
+    }
+    return this.value;
   }
 
   @Override

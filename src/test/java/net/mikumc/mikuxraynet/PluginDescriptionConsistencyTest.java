@@ -92,6 +92,34 @@ class PluginDescriptionConsistencyTest {
             + "隔离状态下否则会 NoClassDefFoundError");
   }
 
+  /**
+   * 代码命令常量 ↔ 两份插件描述的对照守门。
+   *
+   * <p>命令名 / 别名 / 权限在「两份 yml + {@link CommandRegistrar} 代码常量」三处重复：
+   * 旧版守门只对照两份 yml（它们互抄时可以一起漂移、与代码脱节），本测试补上代码这一极，
+   * 三处任何一处单方面改动都会立即失败。
+   */
+  @Test
+  void 代码命令常量与两份描述一致() {
+    for (String resource : List.of(LEGACY, MODERN)) {
+      Map<String, Object> commands = child(load(resource), "commands");
+      Map<String, Object> command = asMap(commands == null ? null : commands.get(CommandRegistrar.COMMAND_NAME));
+      assertNotNull(command, resource + " 缺少命令 " + CommandRegistrar.COMMAND_NAME
+          + "（请同步 CommandRegistrar 的代码常量与两份描述）");
+
+      assertEquals(CommandRegistrar.COMMAND_DESCRIPTION, String.valueOf(command.get("description")),
+          resource + " 的命令 description 与代码常量 COMMAND_DESCRIPTION 不一致");
+      assertEquals(CommandRegistrar.COMMAND_PERMISSION, String.valueOf(command.get("permission")),
+          resource + " 的命令 permission 与代码常量 COMMAND_PERMISSION 不一致");
+
+      Object aliases = command.get("aliases");
+      List<String> aliasList = aliases instanceof List<?> list
+          ? list.stream().map(String::valueOf).toList() : List.of();
+      assertEquals(CommandRegistrar.COMMAND_ALIASES, aliasList,
+          resource + " 的命令 aliases 与代码常量 COMMAND_ALIASES 不一致");
+    }
+  }
+
   // ---------------------------------------------------------------- 工具方法
 
   @SuppressWarnings("unchecked")

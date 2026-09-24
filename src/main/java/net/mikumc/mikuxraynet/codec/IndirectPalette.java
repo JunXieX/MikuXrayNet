@@ -58,8 +58,18 @@ public class IndirectPalette implements Palette {
   @Override
   public void read(ByteBuf buffer) {
     this.size = ByteBufUtil.readVarInt(buffer);
+    // 入参校验（损坏数据早失败，fail-open 由上层解码兜底）：调色板长度不得超过索引表容量，
+    // 方块状态 id 必须落在注册表范围内——否则会静默越界污染 byId / 复用的 byValue 缓冲。
+    if (this.size < 0 || this.size > this.byId.length) {
+      throw new IndexOutOfBoundsException(
+          "palette size out of range: " + this.size + " (capacity " + this.byId.length + ")");
+    }
     for (int id = 0; id < size; id++) {
       int value = ByteBufUtil.readVarInt(buffer);
+      if (value < 0 || value >= this.byValue.length) {
+        throw new IndexOutOfBoundsException(
+            "block state id out of range: " + value + " (registry " + this.byValue.length + ")");
+      }
       this.byId[id] = value;
       this.byValue[value] = (byte) id;
     }

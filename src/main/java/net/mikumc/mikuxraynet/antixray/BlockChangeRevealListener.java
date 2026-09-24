@@ -11,6 +11,7 @@ import com.comphenix.protocol.wrappers.BlockPosition;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
+import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
@@ -43,8 +44,6 @@ import org.bukkit.plugin.Plugin;
  * 别的插件取消，最坏结果也只是少发一个冗余显形包，不会丢失更新。
  */
 public final class BlockChangeRevealListener extends PacketAdapter {
-
-  private static final int MAX_ERROR_LOGS = 3;
 
   private final Plugin plugin;
   private final ProtocolManager protocolManager;
@@ -186,7 +185,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   }
 
   private void logThrottled(Throwable throwable) {
-    if (errorCounter.incrementAndGet() <= MAX_ERROR_LOGS) {
+    if (errorCounter.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
       plugin.getLogger().log(Level.WARNING, "方块变更注销解析失败，已按原包放行", throwable);
     }
   }

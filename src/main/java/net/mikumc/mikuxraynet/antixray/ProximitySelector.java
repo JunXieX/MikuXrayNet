@@ -41,8 +41,7 @@ public final class ProximitySelector {
 
   /** 世界坐标遮挡查询（显形流程用主线程读世界方块，单测可注入纯内存实现）。 */
   @FunctionalInterface
-  public interface RayQuery {
-    boolean isOccluding(int x, int y, int z);
+  public interface RayQuery extends OcclusionRaytracer.OcclusionQuery {
   }
 
   /** 各正交面的位掩码（{@link #exposedFaces} 的返回值）。 */
@@ -205,6 +204,9 @@ public final class ProximitySelector {
   /**
    * 给定遮挡查询，判定射线路径是否被挡住。
    *
+   * <p>实现下沉到 {@link OcclusionRaytracer#isPathOccluded}（与实体剔除的遮挡循环共用同一份
+   * 纯函数，避免两处实现漂移）；本方法保留原签名供既有调用方与单测使用。
+   *
    * <p>测试专用豁免：生产路径只有 {@link #isVisible} 内部复用它做逐路径判定，无其它生产调用方；
    * 保留为公开方法以免破坏单测。
    *
@@ -213,15 +215,7 @@ public final class ProximitySelector {
    * @return 是否被遮挡；路径为空时恒为 false（贴得太近，视为可见）
    */
   public static boolean isRayOccluded(int[] path, RayQuery query) {
-    if (path == null || path.length < 3 || query == null) {
-      return false;
-    }
-    for (int index = 0; index + 2 < path.length; index += 3) {
-      if (query.isOccluding(path[index], path[index + 1], path[index + 2])) {
-        return true;
-      }
-    }
-    return false;
+    return OcclusionRaytracer.isPathOccluded(path, query);
   }
 
   /**

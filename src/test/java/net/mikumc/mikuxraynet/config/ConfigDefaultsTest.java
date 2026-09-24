@@ -178,4 +178,106 @@ class ConfigDefaultsTest {
     assertFalse(config.afk().enabled());
     assertFalse(config.latency().enabled());
   }
+
+  // ------------------------------------------------------------ 缺省键全覆盖（antixray）
+
+  /**
+   * antixray.yml 其余各键的内置缺省（空配置触发回落路径）：断言逐键与 antixray.yml 的默认值一致，
+   * 防止「yml 注释写了 A、代码回落是 B」的注释失真。
+   */
+  @Test
+  void antiXrayRemainingKeysFallBackToDocumentedDefaults() {
+    AntiXrayConfig config = AntiXrayConfig.from(yaml(""));
+
+    assertTrue(config.enabled(), "反矿透总开关默认开启");
+    assertTrue(config.worlds().isEmpty(), "worlds 默认空 = 全部世界生效");
+    assertTrue(config.appliesTo("any_world"), "空 worlds 时对任意世界生效");
+    assertFalse(config.layerObfuscation(), "层状伪装默认关闭（逐方块独立随机，更不易被模式识别）");
+    assertTrue(config.removeBlockEntities(), "方块实体剔除默认开启（防幽灵刷怪笼/箱子）");
+
+    // occlusion 两键：覆盖表默认为空（内置规则兜底，由用户按需填写）
+    assertTrue(config.occlusion().extraOccluding().isEmpty(), "extra-occluding 默认为空");
+    assertTrue(config.occlusion().extraNonOccluding().isEmpty(), "extra-non-occluding 默认为空");
+
+    // neighbors 三键
+    assertTrue(config.neighbors().enabled(), "邻块贴边快照默认开启");
+    assertEquals(AntiXrayConfig.MissingPolicy.HIDE, config.neighbors().missingPolicy(),
+        "邻块缺失默认按遮挡处理（hide，宁可多伪装也不留边界透视口子）");
+    assertEquals(512, config.neighbors().cacheMaximumSize(), "邻块快照缓存默认 512 条（约 12 MB）");
+
+    // proximity 其余键
+    assertTrue(config.proximity().enabled(), "邻近显形默认开启");
+    assertTrue(config.proximity().frustumEnabled(), "视锥剔除默认开启");
+    assertEquals(80.0D, config.proximity().frustumFov(), 1.0E-9D, "视锥竖直全角默认 80°");
+    assertEquals(16, config.proximity().raycastSamples(), "射线采样默认 16（越大越准、越费主线程读方块）");
+
+    // disk-cache 全部 10 键
+    assertTrue(config.diskCache().enabled(), "磁盘缓存默认开启");
+    assertEquals(20000, config.diskCache().maxEntries(), "条目总数上限默认 20000");
+    assertEquals(16, config.diskCache().maxFileSizeMb(), "单区域文件上限默认 16 MB");
+    assertEquals(1800, config.diskCache().expireSeconds(), "条目过期默认 1800 秒（30 分钟）");
+    assertEquals(8, config.diskCache().bucketCacheSize(),
+        "bucket 缓存默认 8（原 2；真机命中率提升约 16~20 个百分点，依据见 antixray.yml 注释）");
+    assertEquals(300, config.diskCache().idleCloseSeconds(), "句柄闲置关闭默认 300 秒");
+    assertEquals(30, config.diskCache().maintenanceIntervalSeconds(), "后台维护周期默认 30 秒");
+    assertEquals(4, config.diskCache().compactPerPass(), "每轮最多压缩 4 个区域文件");
+    assertEquals(256, config.diskCache().queueCapacity(), "磁盘线程待处理任务上限默认 256");
+    assertEquals(32768, config.diskCache().generationTrackerSize(), "代次跟踪表默认 32768 条");
+
+    // cache 两键（改写结果的内存缓存）
+    assertEquals(4096, config.cacheMaximumSize(), "改写缓存条目上限默认 4096");
+    assertEquals(60, config.cacheExpireAfterAccessSeconds(), "改写缓存访问后过期默认 60 秒");
+
+    // advanced 三键
+    assertEquals(0, config.threads(), "工作线程数默认 0 = 按 CPU 自动推算（上限 4）");
+    assertEquals(2500, config.timeoutMillis(), "单区块包处理超时默认 2500 毫秒");
+    assertEquals(2048, config.queueCapacity(), "工作队列容量默认 2048");
+  }
+
+  // ------------------------------------------------------------ 缺省键全覆盖（bandwidth）
+
+  /** bandwidth.yml 其余各键的内置缺省（空配置触发回落路径），与 yml 默认值逐键对照。 */
+  @Test
+  void bandwidthRemainingKeysFallBackToDocumentedDefaults() {
+    BandwidthConfig config = BandwidthConfig.from(yaml(""));
+
+    assertTrue(config.enabled(), "带宽优化总开关默认开启");
+
+    // entity-packets：行为开关与白名单
+    assertTrue(config.entityPackets().skipZeroMovement(), "零位移取消默认开启");
+    assertTrue(config.entityPackets().whitelist().isEmpty(),
+        "白名单内置缺省为空（bandwidth.yml 随包文件里带 armor_stand 等 3 项，属配置文件值而非代码缺省）");
+
+    // block-changes 其余键
+    assertTrue(config.blockChanges().merge(), "邻域合并行为开关默认开启");
+    assertEquals(2, config.blockChanges().mergeRadius(), "合并邻域半径默认 2（曼哈顿距离）");
+    assertEquals(4096, config.blockChanges().maxPerPacket(), "单合并包上限默认 4096 条变更");
+    assertTrue(config.blockChanges().resendOnOverflow(), "超限拆分续发默认开启");
+    assertEquals(256, config.blockChanges().maxPendingEntries(), "待发缓冲上限默认 256 条");
+
+    // palette：strict-verify（reorder 默认已在既有测试锁定为 false）
+    assertFalse(config.palette().strictVerify(), "重排自检默认关闭（仅 reorder=true 时有意义）");
+
+    // entity-culling 其余键
+    assertTrue(config.entityCulling().raycast(), "实体射线判定默认开启");
+    assertEquals(32.0D, config.entityCulling().forceVisibleDistance(), 1.0E-9D, "强制可见距离默认 32 格");
+    assertEquals(0, config.entityCulling().threads(), "剔除线程数默认 0 = 按 CPU 自动推算（上限 2）");
+    assertEquals(24, config.entityCulling().raySamples(), "实体射线采样默认 24");
+
+    // afk 全部键
+    assertEquals(300, config.afk().seconds(), "AFK 判定默认 300 秒无操作");
+    assertEquals(16.0D, config.afk().distance(), 1.0E-9D, "AFK 低价值包丢弃距离默认 16 格");
+    assertTrue(config.afk().dropParticles(), "AFK 丢弃粒子包默认开启");
+    assertTrue(config.afk().dropBlockBreakAnimation(), "AFK 丢弃破坏动画包默认开启");
+
+    // latency 全部键
+    assertEquals(400, config.latency().thresholdMillis(), "延迟观察阈值默认 400 毫秒");
+    assertEquals(30, config.latency().sustainSeconds(), "持续超阈 30 秒才真正降视距");
+    assertEquals(2, config.latency().reduceViewDistance(), "触发后降视距默认 2");
+    assertEquals(4, config.latency().minViewDistance(), "视距下限默认 4");
+    assertEquals(5, config.latency().checkIntervalSeconds(), "延迟采样周期默认 5 秒");
+
+    // diagnostics
+    assertEquals(60, config.diagnostics().intervalSeconds(), "周期运行摘要默认 60 秒（0 = 关闭）");
+  }
 }

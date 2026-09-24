@@ -16,26 +16,27 @@ import org.junit.jupiter.api.Test;
  */
 class DiagnosticsTest {
 
-  /** 固定计数器快照（数值只用于断言关键字段与命中率，不参与业务逻辑）。 */
+  /**
+   * 固定计数器快照（数值只用于断言关键字段与命中率，不参与业务逻辑）。
+   *
+   * <p>Snapshot 已拆为按域分组的嵌套 record：这里的数值与拆分前的平铺构造逐一对位，
+   * 格式化输出必须逐字符不变（本测试即守门）。
+   */
   private static Diagnostics.Snapshot fixed() {
     return fixed(null);
   }
 
   private static Diagnostics.Snapshot fixed(BandwidthConfig bandwidth) {
     return new Diagnostics.Snapshot(
-        true, true, false, true, 1,
-        90L, 10L, 42,
-        100L, 331L, 5L, 2L, 1L, 2L,
-        7L, 3L, 1L,
-        20L, 30L,
-        4L, 40L, 12L,
-        6L, 5L, 4,
-        40L, 7L, 3L,
-        2, 3L, 8L,
-        9L, 4L,
-        4, 2, 10, 2048,
-        "Paper 1.20.4", "25", null, bandwidth,
-        3L, 2L, 30L, 10L, 12, 2, 7, 41, 12, 108L, 3L, 2L);
+        new Diagnostics.Snapshot.Env(true, true, false, true, 1, "Paper 1.20.4", "25"),
+        new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 100L, 331L, 5L, 2L, 1L, 2L),
+        new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L),
+        new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L),
+        new Diagnostics.Snapshot.Throttle(20L, 30L, 4L, 40L, 12L,
+            6L, 5L, 4, 40L, 7L, 3L, 2, 3L, 8L, 9L, 4L),
+        new Diagnostics.Snapshot.Pool(4, 2, 10, 2048),
+        new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2),
+        null, bandwidth);
   }
 
   private static BandwidthConfig bandwidth(String content) {
@@ -128,19 +129,14 @@ class DiagnosticsTest {
   @Test
   void hitRateHandlesNoSamples() {
     Diagnostics.Snapshot empty = new Diagnostics.Snapshot(
-        false, false, true, false, 0,
-        0L, 0L, 0,
-        0L, 0L, 0L, 0L, 0L, 0L,
-        0L, 0L, 0L,
-        0L, 0L,
-        0L, 0L, 0L,
-        0L, 0L, 0,
-        0L, 0L, 0L,
-        0, 0L, 0L,
-        0L, 0L,
-        0, 0, 0, 0,
-        "Folia 1.21", "21", null, null,
-        0L, 0L, 0L, 0L, 0, 0, 0, 0, 0, 0L, 0L, 0L);
+        new Diagnostics.Snapshot.Env(false, false, true, false, 0, "Folia 1.21", "21"),
+        Diagnostics.Snapshot.Rewrite.EMPTY,
+        Diagnostics.Snapshot.Proximity.EMPTY,
+        Diagnostics.Snapshot.Index.EMPTY,
+        Diagnostics.Snapshot.Throttle.EMPTY,
+        Diagnostics.Snapshot.Pool.EMPTY,
+        Diagnostics.Snapshot.DiskCache.EMPTY,
+        null, null);
     String text = String.join("\n", Diagnostics.formatStatus(empty));
     assertTrue(text.contains("命中率 0.0%"), text);
     assertTrue(text.contains("平台 Folia"), text);

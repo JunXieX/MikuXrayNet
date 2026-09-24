@@ -1,8 +1,9 @@
 package net.mikumc.mikuxraynet.antixray;
 
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.Arrays;
 import java.util.List;
+import java.util.PriorityQueue;
 import java.util.UUID;
 
 /**
@@ -35,11 +36,21 @@ final class ProximityScanner {
     int positionsEvaluated;
   }
 
+  /** 带距离与到达序号的候选（堆选择需要次级键来保持「等距候选先到者在前」的稳定顺序）。 */
+  private record Scored(ObfuscatedChunkIndex.Position position, long distanceSquared, int sequence) {
+  }
+
   private ProximityScanner() {
   }
 
   /**
    * 取距离玩家不超过 {@code maxDistance}（含等于）且尚未显形的候选坐标，按距离由近到远排序。
+   *
+   * <p>实现说明：取前 {@code limit} 条用「容量上限的最大堆」做部分选择（O(n·log limit)），
+   * 取代旧实现的全量排序（O(n·log n)）——limit 是调用方按「每 tick 上限 × 4」的超额口径传入的
+   * （见 {@code ProximityRevealer} 的 CANDIDATE_OVERSAMPLE，另有 512 硬顶），候选数可达数千，
+   * 绝大多数注定落在 limit 之外。语义与全量排序逐条等价：比较键同为距离平方；等距候选按
+   * 「先扫描者在前」稳定输出（次级键 sequence 即到达序号，等价于旧稳定排序保留的遍历序）。
    *
    * @param limit 返回条数上限；小于等于 0 时返回空列表
    * @param tally 计数收集器；可为 {@code null}
@@ -57,7 +68,12 @@ final class ProximityScanner {
     int centerX = x >> 4;
     int centerZ = z >> 4;
     double maxDistanceSquared = maxDistance * maxDistance;
-    List<ObfuscatedChunkIndex.Position> found = new ArrayList<>();
+    // 最大堆：堆顶是「最差」的候选——距离最大；等距时后到者优先（腾位置时保留先到者）
+    PriorityQueue<Scored> worst = new PriorityQueue<>((left, right) -> {
+      int byDistance = Long.compare(right.distanceSquared(), left.distanceSquared());
+      return byDistance != 0 ? byDistance : Integer.compare(right.sequence(), left.sequence());
+    });
+    int sequence = 0;
 
     for (int chunkX = centerX - radius; chunkX <= centerX + radius; chunkX++) {
       for (int chunkZ = centerZ - radius; chunkZ <= centerZ + radius; chunkZ++) {
@@ -96,17 +112,41 @@ final class ProximityScanner {
           if (revealed.contains(playerId, key, blockX, blockY, blockZ)) {
             continue;
           }
-          found.add(new ObfuscatedChunkIndex.Position(blockX, blockY, blockZ));
+          offer(worst, new ObfuscatedChunkIndex.Position(blockX, blockY, blockZ),
+              distanceSquared(blockX, blockY, blockZ, x, y, z), sequence++, limit);
         }
       }
     }
 
-    if (found.size() <= 1) {
-      return found;
+    // 按旧实现的输出契约还原：距离升序、等距按到达序
+    Scored[] ordered = worst.toArray(new Scored[0]);
+    Arrays.sort(ordered, (left, right) -> {
+      int byDistance = Long.compare(left.distanceSquared(), right.distanceSquared());
+      return byDistance != 0 ? byDistance : Integer.compare(left.sequence(), right.sequence());
+    });
+    List<ObfuscatedChunkIndex.Position> result = new ArrayList<>(ordered.length);
+    for (Scored scored : ordered) {
+      result.add(scored.position());
     }
-    found.sort(Comparator.comparingLong((ObfuscatedChunkIndex.Position position) ->
-        distanceSquared(position.x(), position.y(), position.z(), x, y, z)));
-    return found.size() > limit ? new ArrayList<>(found.subList(0, limit)) : found;
+    return result;
+  }
+
+  /** 往容量上限为 {@code limit} 的最大堆里放一个候选：堆满时淘汰堆顶（最差者）。 */
+  private static void offer(PriorityQueue<Scored> worst, ObfuscatedChunkIndex.Position position,
+      long distanceSquared, int sequence, int limit) {
+    Scored candidate = new Scored(position, distanceSquared, sequence);
+    if (worst.size() < limit) {
+      worst.add(candidate);
+      return;
+    }
+    Scored currentWorst = worst.peek();
+    // candidate 优于堆顶（距离更近；等距时更早到达）才值得挤掉它
+    if (Long.compare(distanceSquared, currentWorst.distanceSquared()) < 0
+        || (distanceSquared == currentWorst.distanceSquared()
+            && sequence < currentWorst.sequence())) {
+      worst.poll();
+      worst.add(candidate);
+    }
   }
 
   private static long distanceSquared(int x, int y, int z, int otherX, int otherY, int otherZ) {

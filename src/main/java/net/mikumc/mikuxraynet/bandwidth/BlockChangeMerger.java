@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Location;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -217,7 +218,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       return;
     }
     Player player = event.getPlayer();
-    if (player == null || player.hasPermission(BYPASS_PERMISSION)) {
+    // 权限检查在封包线程执行：依赖权限插件自身线程安全（LuckPerms 支持异步查询，安全）
+    if (player == null || player.hasPermission(Constants.BYPASS_PERMISSION)) {
       return;
     }
 
@@ -486,7 +488,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   }
 
   private void logThrottled(Throwable throwable) {
-    if (errorCounter.incrementAndGet() <= MAX_ERROR_LOGS) {
+    if (errorCounter.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
       plugin.getLogger().log(Level.WARNING, "方块变更合并失败，已按原包放行", throwable);
     }
   }

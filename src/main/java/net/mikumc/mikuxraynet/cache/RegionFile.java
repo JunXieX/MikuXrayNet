@@ -81,7 +81,9 @@ final class RegionFile implements AutoCloseable {
         if (size < BufferedLinearV3Format.DATA_AREA_OFFSET) {
           throw new IOException("区域文件过小（" + size + " 字节）");
         }
-        // 读取种子与压缩方案：旧文件可能是 0x01（Deflate），新文件是 0x02（Zstd），两者都要能读
+        // 读取种子与压缩方案：文件头里「格式版本」与「压缩方案」是两个独立字段——
+        // 格式版本当前为 0x04（0x03 等旧版本由 decodeHeaderInfo 明确拒绝）；
+        // 压缩方案 0x02(zstd) 为当前写入值，0x01(Deflate) 是历史格式，两者都要能读。
         BufferedLinearV3Format.Header header = BufferedLinearV3Format.decodeHeaderInfo(
             readAt(channel, 0, BufferedLinearV3Format.HEADER_SIZE));
         hashSeed = header.hashSeed();
@@ -236,7 +238,21 @@ final class RegionFile implements AutoCloseable {
     return true;
   }
 
-  /** 整文件重写，丢弃 {@code keep} 判定为不需要的条目；返回丢弃的条目数。 */
+  /**
+   * 整文件重写，丢弃 {@code keep} 判定为不需要的条目；返回丢弃的条目数。
+   *
+   * <p><b>内存尖峰</b>：本方法先把<b>全部 16 个 bucket（共 1024 个区块槽）</b>的条目一次性
+   * {@link #ensureLoaded} 进内存（{@code all} 数组持引用，加载后即使 LRU 淘汰也不释放），峰值内存约等于「整文件的未压缩负载」——
+   * 满文件（16MB 压缩）时可达数百 MB 级。这是刻意的取舍：压缩必须以「整文件一致」为前提，
+   * 不能边读边写（读着旧文件、写着新文件会踩坏尚未搬完的 bucket）。内存护栏由两层上游限制兜底：
+   * {@code max-file-size-mb}（单文件上限）与 {@code compact-per-pass}（每轮最多几个文件）。
+   *
+   * <p><b>写入放大</b>：追加写路径是 append-only——同一条目被反复 {@link #put} 时，每次都会在文件尾
+   * 追加一个新副本（旧副本变垃圾）；垃圾只有占比过半（{@code DiskCacheStore} 的阈值）才触发本方法，
+   * 触发后<b>整个文件的活动数据</b>会被重写一遍。因此「写入放大 = 最多约 2 倍」：一条数据最多被
+   * 写两次（一次追加 + 一次随压缩重写）。把压缩阈值从「每次落盘」放宽到「垃圾过半」，正是用
+   * 可控的放大换掉高频整文件重写。
+   */
   int compact(EntryFilter keep) throws IOException {
     compacting = true;
     try {

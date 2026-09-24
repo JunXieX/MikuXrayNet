@@ -18,6 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
@@ -40,8 +41,6 @@ import org.bukkit.plugin.Plugin;
  */
 public final class EntityPacketFilter extends PacketAdapter {
 
-  private static final String BYPASS_PERMISSION = "mikuxraynet.bypass";
-  private static final int MAX_ERROR_LOGS = 3;
   private static final long INDEX_REFRESH_TICKS = 100L;
 
   private final Plugin plugin;
@@ -101,7 +100,8 @@ public final class EntityPacketFilter extends PacketAdapter {
     if (!config.skipZeroMovement() || event.isCancelled() || event.getPlayer() == null) {
       return;
     }
-    if (event.getPlayer().hasPermission(BYPASS_PERMISSION)) {
+    // 权限检查在封包线程执行：依赖权限插件自身线程安全（LuckPerms 支持异步查询，安全）
+    if (event.getPlayer().hasPermission(Constants.BYPASS_PERMISSION)) {
       return;
     }
 
@@ -164,7 +164,14 @@ public final class EntityPacketFilter extends PacketAdapter {
       Map<Integer, String> index = new HashMap<>();
       for (World world : Bukkit.getWorlds()) {
         for (Entity entity : world.getEntities()) {
-          index.put(entity.getEntityId(), normalize(entity.getType().getKey().toString()));
+          String typeKey = normalize(entity.getType().getKey().toString());
+          // 索引瘦身：只收录「白名单命中」的类型（isWhitelisted 语义不变——不在索引里的实体
+          // 与「类型不在白名单」同样判 false，故查询结果与收录全部实体时完全一致）。
+          // 白名单通常只有个位数条目，全服实体动辄上千：把索引从 O(全服实体数) 压到 O(白名单实体数，
+          // 近零)，每 100 tick 的重建成本随之降到可忽略。
+          if (whitelist.contains(typeKey)) {
+            index.put(entity.getEntityId(), typeKey);
+          }
         }
       }
       this.entityTypeIndex = index;
@@ -191,7 +198,7 @@ public final class EntityPacketFilter extends PacketAdapter {
   }
 
   private void logThrottled(Throwable throwable) {
-    if (errorCounter.incrementAndGet() <= MAX_ERROR_LOGS) {
+    if (errorCounter.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
       plugin.getLogger().log(Level.WARNING, "零位移判定失败，已按原包放行", throwable);
     }
   }

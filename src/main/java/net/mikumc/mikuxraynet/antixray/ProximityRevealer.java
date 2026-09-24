@@ -18,6 +18,7 @@ import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
+import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Location;
@@ -68,7 +69,6 @@ import org.bukkit.util.Vector;
  */
 public final class ProximityRevealer implements Listener {
 
-  private static final int MAX_ERROR_LOGS = 3;
   /** 每多少次巡检清理一次过期条目（默认周期 4 tick 时约 4 秒一次）。 */
   private static final int EXPIRE_EVERY_PASSES = 20;
   /**
@@ -589,7 +589,7 @@ public final class ProximityRevealer implements Listener {
   }
 
   private void logThrottled(Throwable throwable) {
-    if (errorCounter.incrementAndGet() <= MAX_ERROR_LOGS) {
+    if (errorCounter.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
       plugin.getLogger().log(Level.WARNING,
           "邻近显形失败，已跳过本次处理（不影响反矿透主流程）", throwable);
     }
