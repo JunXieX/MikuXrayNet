@@ -131,7 +131,8 @@ class ChunkPathBenchmarkTest {
     String report = buildReport(fixtures.size(), rows, rounds, peUnavailableReason, allocationBean != null,
         System.nanoTime() - startedAt);
     Files.createDirectories(REPORT_PATH.getParent());
-    Files.writeString(REPORT_PATH, report, StandardCharsets.UTF_8);
+    // 保留另一个基准类已写入的「第 4 节 生产路径」，避免测试类执行顺序不同导致该节丢失
+    Files.writeString(REPORT_PATH, report + productionSectionOf(REPORT_PATH), StandardCharsets.UTF_8);
     System.out.println(report);
 
     // 4) 只断言「数值被成功采集」与「各路径都稳定完成」
@@ -144,6 +145,24 @@ class ChunkPathBenchmarkTest {
       if (allocationBean != null) {
         assertTrue(row.allocatedBytes() > 0, "分配量未成功采集：" + row);
       }
+    }
+  }
+
+  /**
+   * 读取已存在的报告里「第 4 节 生产路径」（由 {@link ProductionPathBenchmarkTest} 追加）；不存在返回空串。
+   *
+   * <p>用于让两个基准类的执行顺序不影响最终报告：无论谁先写，第 4 节都不会被覆盖丢失。
+   */
+  private static String productionSectionOf(Path path) {
+    try {
+      if (!Files.exists(path)) {
+        return "";
+      }
+      String content = Files.readString(path, StandardCharsets.UTF_8);
+      int marker = content.indexOf("## 4. 生产路径");
+      return marker < 0 ? "" : "\n" + content.substring(marker);
+    } catch (IOException exception) {
+      return "";
     }
   }
 

@@ -20,7 +20,13 @@ public final class BandwidthConfig {
       int mergeWindowMillis, int maxPendingEntries) {
   }
 
-  /** 调色板重排。 */
+  /**
+   * 调色板重排。
+   *
+   * <p>{@code reorder} 默认 {@code false}：CI 实测（zlib level 6 压缩后字节）表明开启重排使压缩字节
+   * 普遍变大（全实心 +2.9%、稀疏矿脉 +4.9%~+6.4%、乱序调色板 +1.4%~+2.3%，仅洞穴略优），且耗时明显增加。
+   * {@code strictVerify} 仅在 {@code reorder=true} 时有意义。
+   */
   public record Palette(boolean reorder, boolean strictVerify) {
   }
 
@@ -78,7 +84,8 @@ public final class BandwidthConfig {
             Math.max(1, root.getInt("block-changes.merge-window-millis", 50)),
             Math.max(1, root.getInt("block-changes.max-pending-entries", 256))),
         new Palette(
-            root.getBoolean("palette.reorder", true),
+            // 默认 false：实测开启重排会使压缩字节变大且耗时增加（见 Palette 的说明）
+            root.getBoolean("palette.reorder", false),
             root.getBoolean("palette.strict-verify", false)),
         new EntityCulling(
             root.getBoolean("entity-culling.raycast", true),

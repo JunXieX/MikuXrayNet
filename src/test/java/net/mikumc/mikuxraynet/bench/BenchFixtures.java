@@ -38,6 +38,8 @@ public final class BenchFixtures {
   public static final int AIR = 0;
   public static final int STONE = 1;
   public static final int DEEPSLATE = 2;
+  /** 水：仅用于「主世界地下」形态（含含水层），非遮挡、属流体。 */
+  public static final int WATER = 3;
   public static final int[] ORE_STATES = {100, 101, 102, 103, 104, 105};
 
   /** 改写目标状态：不在任何形态的调色板里，用于制造「新增调色板项」这一类真实改写代价。 */
@@ -102,6 +104,15 @@ public final class BenchFixtures {
 
   public static List<Fixture> all() {
     return List.of(solid(), sparseOres(), caves(), shuffledPalette());
+  }
+
+  /**
+   * 生产路径基准使用的形态集合：四种既有形态 + 更贴近真实的「主世界地下」形态。
+   *
+   * <p>与 {@link #all()} 分开，是为了不改变「解码 → 改 N 个方块 → 重编码」既有基准的形态集合与耗时口径。
+   */
+  public static List<Fixture> productionShapes() {
+    return List.of(solid(), sparseOres(), caves(), shuffledPalette(), realisticUnderground());
   }
 
   /** ① 全实心：24 个单值石头 section。 */
@@ -226,6 +237,91 @@ public final class BenchFixtures {
       builder.indirectSection(PALETTE_BITS, blockCount, 0, palette, indices, 3, BIOME_LIST);
     }
     return new Fixture("乱序调色板（合成）", builder.build());
+  }
+
+  /**
+   * ⑤ 主世界地下（更贴近真实）：石头 + 深板岩为主，空气与洞穴约占 20%（含少量含水层），矿物稀疏散布。
+   *
+   * <p>这是真实主世界地下的样子，也是反矿透生产路径真正面对的输入：绝大多数方块是实心的石头/深板岩，
+   * 矿脉稀疏且多被实心包裹（因此会被 6 面遮挡判定命中并伪装），只有贴近洞穴的矿块暴露。
+   * 分布按深度分带：下部（section 0..7，深板岩带）空气约 14%、深板岩为主、深板岩矿；
+   * 中部（8..15）空气约 20%、石头略多、石头矿；上部（16..23）空气约 26%、石头为主、矿极少。
+   * 三带平均空气占比恰为 20%，与任务给定的「空气与洞穴占 20%」一致。
+   *
+   * <p>调色板项：空气 / 石头 / 深板岩 / 水 + 6 种矿 = 至多 10 项，用 4 位间接调色板即可容纳。
+   */
+  public static Fixture realisticUnderground() {
+    TestChunkBuilder builder = new TestChunkBuilder(FLAGS);
+    for (int section = 0; section < SECTION_COUNT; section++) {
+      int[] states = new int[SECTION_VOLUME];
+      for (int index = 0; index < SECTION_VOLUME; index++) {
+        int roll = hash(section * SECTION_VOLUME + index) % 1000;
+        if (section < 8) {
+          // 深板岩带
+          if (roll < 140) {
+            states[index] = AIR;
+          } else if (roll < 150) {
+            states[index] = WATER;
+          } else if (roll < 165) {
+            states[index] = ORE_STATES[3 + roll % 3]; // 深板岩矿
+          } else if (roll < 640) {
+            states[index] = DEEPSLATE;
+          } else {
+            states[index] = STONE;
+          }
+        } else if (section < 16) {
+          // 石头—深板岩过渡带
+          if (roll < 200) {
+            states[index] = AIR;
+          } else if (roll < 208) {
+            states[index] = WATER;
+          } else if (roll < 220) {
+            states[index] = ORE_STATES[roll % 3]; // 石头矿
+          } else if (roll < 560) {
+            states[index] = DEEPSLATE;
+          } else {
+            states[index] = STONE;
+          }
+        } else {
+          // 浅层带（空气更多、矿极少）
+          if (roll < 260) {
+            states[index] = AIR;
+          } else if (roll < 268) {
+            states[index] = ORE_STATES[roll % 3];
+          } else if (roll < 420) {
+            states[index] = DEEPSLATE;
+          } else {
+            states[index] = STONE;
+          }
+        }
+      }
+
+      int[] palette = new int[16];
+      int[] indices = new int[SECTION_VOLUME];
+      int paletteSize = 0;
+      int blockCount = 0;
+      for (int index = 0; index < SECTION_VOLUME; index++) {
+        int state = states[index];
+        int id = -1;
+        for (int i = 0; i < paletteSize; i++) {
+          if (palette[i] == state) {
+            id = i;
+            break;
+          }
+        }
+        if (id < 0) {
+          id = paletteSize++;
+          palette[id] = state;
+        }
+        indices[index] = id;
+        if (state != AIR) {
+          blockCount++;
+        }
+      }
+
+      builder.indirectSection(PALETTE_BITS, blockCount, 0, Arrays.copyOf(palette, paletteSize), indices, 3, BIOME_LIST);
+    }
+    return new Fixture("主世界地下", builder.build());
   }
 
   /**
