@@ -10,6 +10,7 @@ import java.nio.ByteBuffer;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
@@ -61,6 +62,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final RewriteStats stats = new RewriteStats();
   private final ConcurrentHashMap<UUID, ChunkBatchGate> batches = new ConcurrentHashMap<>();
   private final AtomicInteger errorLogs = new AtomicInteger();
+  /** 「首次改写诊断」只打一次（CAS 抢占），避免每区块刷屏。 */
+  private final AtomicBoolean firstRewriteDiagnosed = new AtomicBoolean();
 
   /**
    * @param neighborProvider 邻区块贴边快照提供者；仅在 {@code neighbors.enabled} 时被使用
@@ -313,9 +316,12 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
     if (result.changed()) {
       stats.chunksRewritten.increment();
+      stats.blocksReplaced.add(result.obfuscatedPositions().length);
     } else {
       stats.chunksSkipped.increment();
     }
+
+    logFirstRewriteDiagnostic(task, source, result);
 
     CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions());
     cache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(), value);
@@ -325,6 +331,43 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
           encodeDiskPayload(sourceHash, result.obfuscatedPositions(), result.data()));
     }
     writeBack(accessor, task, value.data(), value.positions());
+  }
+
+  /**
+   * 「首次改写诊断」：只对<b>第一个进入改写流程的区块</b>打印一次（CAS 抢占），绝不刷屏。
+   *
+   * <p><b>为什么要它</b>：真机上出现过「自检全绿、计数器全有数，但玩家仍能透视看到真实矿物」。
+   * 光看「改写 670、跳过 0」无法区分两种失效，本行日志给出决定性判据：
+   * <ul>
+   *   <li><b>可能一（一个方块都没匹配到目标）</b>：解码出的状态 id 与配置目标 id 不匹配，
+   *       表现为「命中目标方块 0 个」，且「替换 0 个」「输出字节是否变化=否」；</li>
+   *   <li><b>可能二（算了但没写回真正的 NMS 对象）</b>：表现为「命中目标方块 K&gt;0」
+   *       且「替换 K'&gt;0」「输出字节是否变化=是」——说明匹配/判定/重编码全部正常，
+   *       失效只可能发生在写回侧（此时再看「写回失败」计数与客户端实际收到的字节）。</li>
+   * </ul>
+   *
+   * <p>统计走 {@link ObfuscationProcessor#diagnose}（会再解码一次区块），因此只在这一次执行。
+   */
+  private void logFirstRewriteDiagnostic(RewriteTask task, byte[] source,
+      ObfuscationProcessor.Result result) {
+    if (!firstRewriteDiagnosed.compareAndSet(false, true)) {
+      return;
+    }
+    try {
+      ObfuscationProcessor.Diagnostic diagnostic = processor.diagnose(source, task.sectionCount());
+      String sections = diagnostic == null
+          ? String.valueOf(task.sectionCount()) : String.valueOf(diagnostic.sectionCount());
+      String kinds = diagnostic == null ? "解码失败" : String.valueOf(diagnostic.stateKinds());
+      String matches = diagnostic == null ? "解码失败" : String.valueOf(diagnostic.targetMatches());
+      getPlugin().getLogger().info("首次改写诊断：区块 (" + task.chunkX() + "," + task.chunkZ()
+          + ") section 数 " + sections
+          + "；解码状态种类 " + kinds
+          + "；命中目标方块 " + matches + " 个"
+          + "；替换 " + result.obfuscatedPositions().length + " 个"
+          + "；输出字节是否变化=" + (result.data() != source ? "是" : "否"));
+    } catch (Throwable throwable) {
+      logThrottled("首次改写诊断生成失败（不影响改写主流程）", throwable);
+    }
   }
 
   /**

@@ -78,6 +78,16 @@ public final class ObfuscationProcessor {
   private final PaletteOptions paletteOptions;
 
   /**
+   * 「解码侧统计」诊断结果（{@link #diagnose}）：只回答「这次解码到底看到了什么」。
+   *
+   * @param sectionCount  区块的 section 数
+   * @param stateKinds    整块区块里出现过的不同方块状态种类数（0 表示解码出全空气）
+   * @param targetMatches 命中目标方块（配置的 19 种矿）的方块个数（<b>不看遮挡</b>）
+   */
+  public record Diagnostic(int sectionCount, int stateKinds, int targetMatches) {
+  }
+
+  /**
    * 直接用「已解析」的数据构造（供单测与显式装配使用）。
    *
    * @param occlusionTable    遮挡判定表：方块状态 id → 是否整块不透明
@@ -255,6 +265,53 @@ public final class ObfuscationProcessor {
       return new Result(chunk.finalizeOutput(), Arrays.copyOf(positions, count), null);
     } catch (RuntimeException exception) {
       return new Result(source, NO_POSITIONS, describe(exception));
+    } finally {
+      chunk.close();
+    }
+  }
+
+  /**
+   * 只做「解码侧统计」的诊断：section 数、出现过的方块状态种类数、命中目标方块的个数。
+   *
+   * <p><b>用途</b>：供「首次改写诊断」一次性日志区分两种失效——①解码出的状态 id 与目标 id 不匹配
+   * （目标命中数 = 0，即 {@code shouldObfuscate} 恒为 false）；②匹配与替换都正常但写回没生效。
+   * 因此本方法只回答「解码到底看到了什么」：不做遮挡判定、不改写任何字节。
+   *
+   * <p><b>开销</b>：会完整解码一次区块并遍历全部 4096×N 个方块状态，只允许在一次性诊断路径上调用，
+   * 绝不得进入封包热路径。
+   *
+   * @return 诊断结果；区块解码失败（布局与预期不符）时返回 {@code null}
+   */
+  public Diagnostic diagnose(byte[] source, int sectionCount) {
+    if (source == null || source.length == 0 || sectionCount <= 0) {
+      return new Diagnostic(0, 0, 0);
+    }
+
+    Chunk chunk;
+    try {
+      chunk = codec.decode(source, sectionCount);
+    } catch (RuntimeException exception) {
+      return null;
+    }
+
+    try {
+      BitSet seen = new BitSet();
+      int targetMatches = 0;
+      for (int sectionIndex = 0; sectionIndex < chunk.getSectionCount(); sectionIndex++) {
+        ChunkSection section = chunk.getSection(sectionIndex);
+        if (section == null) {
+          continue;
+        }
+        for (int state : section.readAllBlockStates()) {
+          seen.set(state);
+          if (targets.get(state)) {
+            targetMatches++;
+          }
+        }
+      }
+      return new Diagnostic(chunk.getSectionCount(), seen.cardinality(), targetMatches);
+    } catch (RuntimeException exception) {
+      return null;
     } finally {
       chunk.close();
     }

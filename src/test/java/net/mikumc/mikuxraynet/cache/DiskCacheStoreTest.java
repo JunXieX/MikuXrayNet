@@ -6,10 +6,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Random;
 import java.util.logging.Logger;
+import java.util.zip.Deflater;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -44,11 +47,32 @@ class DiskCacheStoreTest {
     return data;
   }
 
-  /** 互不相同的随机负载（同一 bucket 内多条内容各不相同，Deflater 无法把它压小）。 */
+  /** 互不相同的随机负载（同一 bucket 内多条内容各不相同，压缩器无法把它压小）。 */
   private static byte[] randomPayload(int length, long seed) {
     byte[] data = new byte[length];
     new Random(seed).nextBytes(data);
     return data;
+  }
+
+  /** 测试专用的旧格式压缩器（JDK Deflater.BEST_SPEED）：用于构造 0x01 的历史区域文件。 */
+  private static byte[] deflate(byte[] raw) {
+    Deflater deflater = new Deflater(Deflater.BEST_SPEED);
+    try {
+      deflater.setInput(raw);
+      deflater.finish();
+      ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(64, raw.length / 2 + 64));
+      byte[] chunk = new byte[8192];
+      while (!deflater.finished()) {
+        int produced = deflater.deflate(chunk);
+        if (produced <= 0) {
+          break;
+        }
+        out.write(chunk, 0, produced);
+      }
+      return out.toByteArray();
+    } finally {
+      deflater.end();
+    }
   }
 
   /**
@@ -215,6 +239,56 @@ class DiskCacheStoreTest {
       store.put(WORLD, 0, 0, 1, data);
       assertArrayEquals(data, store.get(WORLD, 0, 0, 1), "重建后应恢复正常读写");
       assertTrue(store.stats().errors.sum() >= 1L, "损坏文件应被计数");
+    }
+  }
+
+  /**
+   * 旧格式（方案字节 0x01 = Deflate）区域文件升级后仍必须可读——不得被当成损坏文件删除。
+   *
+   * <p>做法：手工拼一份「头部 0x01 + 偏移表 + 用 Deflater 压缩的 bucket」的 {@code .b_linear}，
+   * 再让当前实现（写入已改用 zstd）去读，验证读路径按头部方案字节选择解压器。
+   */
+  @Test
+  void legacyDeflateRegionFileIsReadableAfterUpgrade(@TempDir Path dir) throws Exception {
+    int seed = BufferedLinearV3Format.DEFAULT_HASH_SEED;
+    int chunkX = 0;
+    int chunkZ = 0;
+    int configHash = 42;
+    byte[] data = payload(1_024);
+
+    int chunkIndex = BufferedLinearV3Format.chunkIndex(chunkX, chunkZ);
+    int bucket = BufferedLinearV3Format.bucketIndex(chunkIndex);
+    int slot = chunkIndex & (BufferedLinearV3Format.BUCKET_SIZE - 1);
+
+    BufferedLinearV3Format.Entry[] slots =
+        new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
+    slots[slot] = new BufferedLinearV3Format.Entry(0L, System.currentTimeMillis(), configHash, data);
+    byte[] raw = BufferedLinearV3Format.encodeBucket(slots, seed);
+    byte[] deflated = deflate(raw);
+
+    long[] offsets = new long[BufferedLinearV3Format.BUCKET_COUNT];
+    offsets[bucket] = BufferedLinearV3Format.DATA_AREA_OFFSET;
+
+    byte[] header = BufferedLinearV3Format.encodeHeader(seed);
+    header[9] = BufferedLinearV3Format.COMPRESSION_DEFLATE;
+
+    ByteBuffer fileBytes =
+        ByteBuffer.allocate((int) BufferedLinearV3Format.DATA_AREA_OFFSET + 8 + deflated.length);
+    fileBytes.put(header);
+    fileBytes.put(BufferedLinearV3Format.encodePosTable(offsets));
+    fileBytes.putInt(raw.length);
+    fileBytes.putInt(deflated.length);
+    fileBytes.put(deflated);
+
+    Path file = dir.resolve(WORLD).resolve("r.0.0.b_linear");
+    Files.createDirectories(file.getParent());
+    Files.write(file, fileBytes.array());
+
+    try (DiskCacheStore store = store(dir, config(1024, 600, 600))) {
+      assertArrayEquals(data, store.get(WORLD, chunkX, chunkZ, configHash),
+          "旧 Deflate 缓存文件必须仍能正确读出（方案字节 0x01）");
+      assertEquals(1L, store.stats().hits.sum());
+      assertTrue(Files.isRegularFile(file), "旧文件不得被删除");
     }
   }
 }

@@ -49,6 +49,7 @@ public final class Diagnostics {
       long cacheMisses,
       int cacheEntries,
       long chunksRewritten,
+      long blocksReplaced,
       long chunksSkipped,
       long chunksFailed,
       long writeBackFailures,
@@ -140,6 +141,7 @@ public final class Diagnostics {
         hook == null ? 0L : hook.cacheMisses(),
         hook == null ? 0 : hook.cacheSize(),
         rewriteStats == null ? 0L : rewriteStats.chunksRewritten.sum(),
+        rewriteStats == null ? 0L : rewriteStats.blocksReplaced.sum(),
         rewriteStats == null ? 0L : rewriteStats.chunksSkipped.sum(),
         rewriteStats == null ? 0L : rewriteStats.chunksFailed.sum(),
         rewriteStats == null ? 0L : rewriteStats.writeBackFailures.sum(),
@@ -186,7 +188,8 @@ public final class Diagnostics {
         + "｜直通玩家 " + s.bypassPlayers() + " 名");
     lines.add("改写缓存：命中 " + s.cacheHits() + "，未命中 " + s.cacheMisses()
         + "，命中率 " + hitRate(s.cacheHits(), s.cacheMisses()) + "，条目 " + s.cacheEntries());
-    lines.add("区块改写：改写 " + s.chunksRewritten() + "，跳过 " + s.chunksSkipped()
+    lines.add("区块改写：改写 " + s.chunksRewritten() + "，替换方块 " + s.blocksReplaced()
+        + "，跳过 " + s.chunksSkipped()
         + "，异常 " + s.chunksFailed() + "，写回失败 " + s.writeBackFailures()
         + "，超时放行 " + s.chunksTimedOut());
     lines.add("邻近显形：发送 " + s.revealsSent() + "，跳过 " + s.revealsSkipped()

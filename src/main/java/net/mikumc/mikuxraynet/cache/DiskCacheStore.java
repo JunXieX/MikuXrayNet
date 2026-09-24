@@ -28,7 +28,8 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
  * 省掉重复的重解码与遮挡判定（CPU 开销）。
  *
  * <p><b>文件格式</b>：{@link BufferedLinearV3Format}（32×32 区块一区），
- * 压缩用 JDK 自带的 Deflater 而非 zstd——本项目<b>不新增第三方依赖</b>（详见该类的差异说明）。
+ * bucket 压缩用 zstd（服务端自带的 zstd-jni，{@code scope=provided}，不打进插件 jar；
+ * 运行期不可用时自动回退 JDK Deflater），旧 Deflate 缓存仍可读取（详见该类的压缩方案说明）。
  *
  * <p><b>缓存键与失效</b>：键 = {@code (世界名, chunkX, chunkZ, 配置指纹, 区块代次)}。
  * 配置指纹来自 {@code antixray.yml} 中影响改写结果的配置项；区块代次由本插件<b>已经拦截的方块变更</b>
@@ -384,7 +385,8 @@ public final class DiskCacheStore implements AutoCloseable {
   }
 
   private void flushAll() {
-    for (Handle handle : open.values()) {
+    for (Map.Entry<RegionKey, Handle> entry : open.entrySet()) {
+      Handle handle = entry.getValue();
       try {
         if (handle.file.isDirty()) {
           handle.file.flushDirty();
@@ -392,6 +394,17 @@ public final class DiskCacheStore implements AutoCloseable {
         // 无论是否真的写过，此刻内存里的负载都已（随 bucket 整块）落到文件：待落盘记账清零
         handle.pendingBytes = 0L;
       } catch (Throwable throwable) {
+        if (!handle.file.channelOpen()) {
+          // 通道已永久失效（FileChannel 一旦被线程中断或外部关闭就无法再用）。此时句柄留在表里、
+          // 脏标记还在，旧实现会「每轮维护都抛一次同样的异常」——真机上表现为每 30 秒一条
+          // ClosedChannelException。这里直接丢弃句柄并只提示一次，下次访问自动重建（fail-open）。
+          open.remove(entry.getKey(), handle);
+          closeHandleQuietly(handle);
+          stats.errors.increment();
+          logger.warning("磁盘缓存区域文件通道已失效，已丢弃句柄（下次访问自动重建）："
+              + handle.file.path() + "（原因：" + throwable + "）");
+          continue;
+        }
         fail("磁盘缓存落盘失败（该区域文件将在下次维护重试）", throwable);
       }
     }
@@ -636,7 +649,11 @@ public final class DiskCacheStore implements AutoCloseable {
     try {
       return future.get(timeoutMillis, TimeUnit.MILLISECONDS);
     } catch (TimeoutException exception) {
-      future.cancel(true);
+      // 只取消、不中断：磁盘线程是共享的单线程，interrupt=true 会打断它正在进行的 FileChannel IO，
+      // 而 FileChannel 一被中断就永久关闭（ClosedByInterruptException）→ 该区域文件句柄作废，
+      // 且脏 bucket 无法再落盘（真机上表现为每 30 秒一条 ClosedChannelException）。
+      // 读超时的语义本来就是「本次按未命中降级」，任务稍后自行跑完即可，无需打断。
+      future.cancel(false);
       stats.errors.increment();
       return null;
     } catch (ExecutionException exception) {

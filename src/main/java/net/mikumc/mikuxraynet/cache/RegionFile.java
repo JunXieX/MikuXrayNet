@@ -38,6 +38,8 @@ final class RegionFile implements AutoCloseable {
   private final Path path;
   private final int hashSeed;
   private final int bucketCacheSize;
+  /** 本文件使用的压缩方案字节（文件头偏移 9）；写入后与头部保持一致，读取时据此选择解压器。 */
+  private byte compression;
   private final long[] positions = new long[BufferedLinearV3Format.BUCKET_COUNT];
   private final long[] bucketSizes = new long[BufferedLinearV3Format.BUCKET_COUNT];
   private final BufferedLinearV3Format.Entry[][] slots =
@@ -54,10 +56,12 @@ final class RegionFile implements AutoCloseable {
   private boolean compacting;
   private boolean closed;
 
-  private RegionFile(Path path, FileChannel channel, int hashSeed, int bucketCacheSize) {
+  private RegionFile(Path path, FileChannel channel, int hashSeed, byte compression,
+      int bucketCacheSize) {
     this.path = path;
     this.channel = channel;
     this.hashSeed = hashSeed;
+    this.compression = compression;
     this.bucketCacheSize = Math.max(1, bucketCacheSize);
   }
 
@@ -70,21 +74,25 @@ final class RegionFile implements AutoCloseable {
     FileChannel channel = FileChannel.open(path,
         StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
     int hashSeed = BufferedLinearV3Format.DEFAULT_HASH_SEED;
+    byte compression = BufferedLinearV3Format.currentCompression();
     long size = channel.size();
     try {
       if (size > 0) {
         if (size < BufferedLinearV3Format.DATA_AREA_OFFSET) {
           throw new IOException("区域文件过小（" + size + " 字节）");
         }
-        hashSeed = BufferedLinearV3Format.decodeHeader(
+        // 读取种子与压缩方案：旧文件可能是 0x01（Deflate），新文件是 0x02（Zstd），两者都要能读
+        BufferedLinearV3Format.Header header = BufferedLinearV3Format.decodeHeaderInfo(
             readAt(channel, 0, BufferedLinearV3Format.HEADER_SIZE));
+        hashSeed = header.hashSeed();
+        compression = header.compression();
       }
     } catch (IOException exception) {
       closeQuietly(channel);
       throw exception;
     }
 
-    RegionFile file = new RegionFile(path, channel, hashSeed, bucketCacheSize);
+    RegionFile file = new RegionFile(path, channel, hashSeed, compression, bucketCacheSize);
     try {
       if (size <= 0L) {
         // 新建（或刚被清空）的文件：必须先落「文件头 + 全零偏移表」，
@@ -106,6 +114,8 @@ final class RegionFile implements AutoCloseable {
     writeFully(channel, ByteBuffer.wrap(BufferedLinearV3Format.encodePosTable(positions)),
         BufferedLinearV3Format.POS_TABLE_OFFSET);
     channel.force(false);
+    // 头部刚按当前方案重写，字段同步跟进，保证「声明的方案」与随后 bucket 的实际压缩一致
+    this.compression = BufferedLinearV3Format.currentCompression();
     this.fileSize = BufferedLinearV3Format.DATA_AREA_OFFSET;
   }
 
@@ -313,6 +323,8 @@ final class RegionFile implements AutoCloseable {
         loaded.remove(bucket);
       }
       slotsLoad(all);
+      // 整文件已按当前方案重写（头部 + 全部 bucket 都是 currentCompression），字段同步跟进
+      this.compression = BufferedLinearV3Format.currentCompression();
       fileSize = offset;
       liveBytes = offset - BufferedLinearV3Format.DATA_AREA_OFFSET;
       garbageBytes = 0L;
@@ -368,10 +380,34 @@ final class RegionFile implements AutoCloseable {
     }
     closed = true;
     try {
-      flushDirty();
+      // 通道已被关闭（被线程中断打断、或外部删除/关闭）时不再尝试写盘：
+      // 否则每次关闭都会再抛一次 ClosedChannelException，把「一次失效」放大成持续刷屏的 WARN。
+      if (channel.isOpen()) {
+        flushDirty();
+      }
     } finally {
       closeQuietly();
     }
+  }
+
+  /**
+   * 底层通道是否仍然可用。
+   *
+   * <p><b>为什么需要它</b>：{@code FileChannel} 一旦因线程被中断（{@code ClosedByInterruptException}）
+   * 或外部关闭而失效，就是<b>永久</b>失效；此时本就算「句柄还在、脏标记还在」，
+   * 每轮维护都会在同一条通道上再抛一次 {@code ClosedChannelException}。
+   * 调用方据此识别失效句柄并丢弃重建（fail-open：缓存可重建，但绝不静默刷屏）。
+   */
+  boolean channelOpen() {
+    return channel.isOpen();
+  }
+
+  /**
+   * <b>仅测试用</b>：直接关闭底层通道且不改动 {@code closed} 标志，用于复现「通道被中断/外部关闭后，
+   * 句柄仍留在维护队列里、脏 bucket 仍在」这一真机故障态（每 30 秒一条 ClosedChannelException）。
+   */
+  void killChannelForTest() throws IOException {
+    channel.close();
   }
 
   private void closeQuietly() {
@@ -431,7 +467,7 @@ final class RegionFile implements AutoCloseable {
             && positions[bucket] + 8L + compressedLength <= fileSize) {
           byte[] compressed = readAt(channel, positions[bucket] + 8L, compressedLength);
           bucketSlots = BufferedLinearV3Format.decodeBucket(
-              BufferedLinearV3Format.decompress(compressed, rawLength), hashSeed);
+              BufferedLinearV3Format.decompress(compressed, rawLength, compression), hashSeed);
         }
       } catch (IOException | RuntimeException exception) {
         // 结构损坏：整个 bucket 视为空（fail-open，绝不因此影响封包链路）

@@ -39,6 +39,13 @@
           由 CI 编译作为该硬约束的守门人。不要改用 SNAPSHOT（解析会抖动）。
         -->
         <protocolLib.version>5.3.0</protocolLib.version>
+
+        <!--
+          zstd-jni：服务端自带（Leaf/Paper 26.x 内置 zstd-jni，leaf.jar 的 META-INF/libraries 也捆绑同款），
+          插件类加载器在运行期可见，因此 scope=provided：编译可见、绝不打进插件 jar（插件 jar 体积不因它变化）。
+          版本取与本机 Maven 仓库一致、且 API 与运行期 1.5.7-15 兼容的 1.5.7-6，避免 CI 额外联网拉取。
+        -->
+        <zstd.version>1.5.7-6</zstd.version>
     </properties>
 
     <repositories>
@@ -90,6 +97,17 @@
             <groupId>io.netty</groupId>
             <artifactId>netty-buffer</artifactId>
             <version>4.1.115.Final</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+          区块磁盘缓存的压缩改用 zstd（服务端自带，见上方 zstd.version 注释）。
+          运行期若该库不可用，BufferedLinearV3Format 会自动回退 JDK Deflater（fail-open）。
+        -->
+        <dependency>
+            <groupId>com.github.luben</groupId>
+            <artifactId>zstd-jni</artifactId>
+            <version>${zstd.version}</version>
             <scope>provided</scope>
         </dependency>
 
