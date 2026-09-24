@@ -82,6 +82,17 @@
             <scope>provided</scope>
         </dependency>
 
+        <!--
+          Netty 缓冲区：Paper 服务端本身内置（ProtocolLib 也依赖它），故 scope=provided。
+          区块编解码直接复用 Netty ByteBuf，避免自造字节游标带来的越界风险。
+        -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-buffer</artifactId>
+            <version>4.1.115.Final</version>
+            <scope>provided</scope>
+        </dependency>
+
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
