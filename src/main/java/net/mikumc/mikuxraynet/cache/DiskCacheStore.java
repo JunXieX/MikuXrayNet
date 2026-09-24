@@ -27,7 +27,7 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
  * {@code plugins/MikuXrayNet/cache/<世界名>/r.<regionX>.<regionZ>.blin}，重启后可直接复用，
  * 省掉重复的重解码与遮挡判定（CPU 开销）。
  *
- * <p><b>文件格式</b>：{@link BufferedLinearV3Format}（移植自 MIT 许可的 linear 项目，32×32 区块一区），
+ * <p><b>文件格式</b>：{@link BufferedLinearV3Format}（32×32 区块一区），
  * 压缩用 JDK 自带的 Deflater 而非 zstd——本项目<b>不新增第三方依赖</b>（详见该类的差异说明）。
  *
  * <p><b>缓存键与失效</b>：键 = {@code (世界名, chunkX, chunkZ, 配置指纹, 区块代次)}。

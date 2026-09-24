@@ -1,7 +1,7 @@
 package net.mikumc.mikuxraynet.cache;
 
 /**
- * 纯 Java 实现的 XXHash32（xxhash 官方规范），移植自 MIT 许可的 linear 项目。
+ * 纯 Java 实现的 XXHash32（遵循 xxhash 官方规范）。
  *
  * <p>用于 {@link BufferedLinearV3Format} 的条目校验和（种子与格式头一致，默认 {@code 0x0721}），
  * 与参考实现（zstd/lz4-java/Rust xxhash）结果一致，因此理论上可与参考实现的文件互通

@@ -9,8 +9,8 @@ import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 
 /**
- * BufferedLinearV3 区域文件格式（移植自 MIT 许可的 linear 项目的 {@code BufferedLinearV3RegionFile}，
- * <b>只取格式与编解码</b>，不含其 Mixin / 平台耦合部分，也不使用 NMS 的 {@code ChunkPos}）。
+ * BufferedLinearV3 区域文件格式：自包含实现，<b>只做格式与编解码</b>，
+ * 不含任何平台耦合部分，也不使用 NMS 的 {@code ChunkPos}）。
  *
  * <p><b>文件布局（与参考实现一致）</b>
  * <pre>
