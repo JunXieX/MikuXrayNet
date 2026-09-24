@@ -23,12 +23,12 @@ public final class RewriteCache<V> {
   public record Key(String worldName, int x, int z, int configHash) {
   }
 
-  private static final class Entry<V> {
+  private static final class CacheEntry<V> {
 
     private final V value;
     private long lastAccessNanos;
 
-    private Entry(V value, long nowNanos) {
+    private CacheEntry(V value, long nowNanos) {
       this.value = value;
       this.lastAccessNanos = nowNanos;
     }
@@ -38,7 +38,7 @@ public final class RewriteCache<V> {
   private final long expireAfterAccessNanos;
   private final LongSupplier clock;
 
-  private final LinkedHashMap<Key, Entry<V>> entries;
+  private final LinkedHashMap<Key, CacheEntry<V>> entries;
 
   private long hits;
   private long misses;
@@ -58,7 +58,7 @@ public final class RewriteCache<V> {
     this.clock = clock;
     this.entries = new LinkedHashMap<>(16, 0.75f, true) {
       @Override
-      protected boolean removeEldestEntry(Map.Entry<Key, Entry<V>> eldest) {
+      protected boolean removeEldestEntry(Map.Entry<Key, CacheEntry<V>> eldest) {
         return size() > RewriteCache.this.maximumSize;
       }
     };
@@ -67,7 +67,7 @@ public final class RewriteCache<V> {
   /** 读取；未命中或已过期返回 {@code null}（过期条目会被立即移除）。 */
   public synchronized V get(String worldName, int x, int z, int configHash) {
     Key key = new Key(worldName, x, z, configHash);
-    Entry<V> entry = entries.get(key);
+    CacheEntry<V> entry = entries.get(key);
     long now = clock.getAsLong();
 
     if (entry == null) {
@@ -87,7 +87,7 @@ public final class RewriteCache<V> {
 
   /** 写入（覆盖同键旧值）。 */
   public synchronized void put(String worldName, int x, int z, int configHash, V value) {
-    entries.put(new Key(worldName, x, z, configHash), new Entry<>(value, clock.getAsLong()));
+    entries.put(new Key(worldName, x, z, configHash), new CacheEntry<>(value, clock.getAsLong()));
   }
 
   /** 使某个世界的全部条目失效（世界卸载时调用）。 */
