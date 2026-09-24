@@ -152,6 +152,18 @@ public final class AfkTracker implements Listener {
     return state != null && state.isTimedOut(System.currentTimeMillis(), timeoutMillis);
   }
 
+  /** 当前处于 AFK 状态的玩家数（诊断用，非热路径）。 */
+  public int afkCount() {
+    long now = System.currentTimeMillis();
+    int count = 0;
+    for (AfkState state : states.values()) {
+      if (state.isTimedOut(now, timeoutMillis)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
   /** AFK 期间按距离丢弃低价值包；字段读不出或异常一律放行。 */
   void handleLowValuePacket(PacketEvent event) {
     if (event.isCancelled() || event.getPlayer() == null) {

@@ -162,6 +162,11 @@ public final class AntiXrayConfig {
     return enabled;
   }
 
+  /** 生效世界名集合；空集表示全部世界生效（供诊断输出）。 */
+  public Set<String> worlds() {
+    return worlds;
+  }
+
   /** 世界是否在生效范围内；世界列表为空表示全部世界生效。 */
   public boolean appliesTo(String worldName) {
     return enabled && (worlds.isEmpty() || worlds.contains(worldName));

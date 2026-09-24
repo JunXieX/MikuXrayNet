@@ -15,6 +15,7 @@ import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.concurrency.RewriteTask;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
+import net.mikumc.mikuxraynet.util.BypassRegistry;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
@@ -36,7 +37,6 @@ import org.bukkit.plugin.Plugin;
  */
 public final class ProtocolLibAsyncListener extends PacketAdapter {
 
-  private static final String BYPASS_PERMISSION = "mikuxraynet.bypass";
   private static final int MAX_ERROR_LOGS = 3;
   /** 未配对的批次闸门数量上限（异常情况下防止无界增长）。 */
   private static final int MAX_PENDING_BATCHES = 256;
@@ -54,6 +54,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final boolean neighborsEnabled;
   private final boolean handleChunkBatch;
   private final RevealedBlockIndex revealedIndex;
+  private final BypassRegistry bypassRegistry;
+  private final RewriteStats stats = new RewriteStats();
   private final ConcurrentHashMap<UUID, ChunkBatchGate> batches = new ConcurrentHashMap<>();
   private final AtomicInteger errorLogs = new AtomicInteger();
 
@@ -61,11 +63,12 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * @param neighborProvider 邻区块贴边快照提供者；仅在 {@code neighbors.enabled} 时被使用
    * @param handleChunkBatch 是否拦截 1.20.2+ 的区块批量包（不可用时由装配方降级为 false）
    * @param revealedIndex    显形索引；{@code null} 表示不做邻近显形
+   * @param bypassRegistry   直通名单；{@code null} 表示退化为无直通（仍按世界范围判定）
    */
   public ProtocolLibAsyncListener(Plugin plugin, AntiXrayConfig config, ObfuscationProcessor processor,
       MikuWorkPool workPool, AsynchronousManager asynchronousManager,
       NeighborChunkProvider neighborProvider, boolean handleChunkBatch,
-      RevealedBlockIndex revealedIndex) {
+      RevealedBlockIndex revealedIndex, BypassRegistry bypassRegistry) {
     super(plugin, ListenerPriority.NORMAL, packetTypes(handleChunkBatch));
     this.config = config;
     this.processor = processor;
@@ -76,6 +79,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     this.neighborsEnabled = neighborProvider != null && config.neighbors().enabled();
     this.handleChunkBatch = handleChunkBatch;
     this.revealedIndex = revealedIndex;
+    this.bypassRegistry = bypassRegistry;
   }
 
   /** 与 MAP_CHUNK 同列白名单，才能让批次包走同一条「每玩家有序发送队列」。 */
@@ -144,7 +148,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     ScheduledFuture<?> timeout;
     try {
-      timeout = workPool.scheduleTimeout(task::releaseOnTimeout, config.timeoutMillis());
+      timeout = workPool.scheduleTimeout(() -> {
+        if (task.releaseOnTimeout()) {
+          stats.chunksTimedOut.increment();
+        }
+      }, config.timeoutMillis());
     } catch (Throwable throwable) {
       // 尚未登记延迟，直接放行原包
       logThrottled("超时看门狗登记失败，已按原包放行", throwable);
@@ -265,6 +273,12 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         seed(task.worldName(), task.chunkX(), task.chunkZ()), neighbors);
     task.markEncoded();
 
+    if (result.changed()) {
+      stats.chunksRewritten.increment();
+    } else {
+      stats.chunksSkipped.increment();
+    }
+
     CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions());
     cache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(), value);
     writeBack(accessor, task, value.data(), value.positions());
@@ -328,9 +342,38 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
   }
 
-  /** 该玩家是否受本模块影响（权限绕过 + 世界范围）。 */
+  /** 该玩家是否受本模块影响（直通名单绕过 + 世界范围）。 */
   private boolean appliesTo(Player player) {
-    return !player.hasPermission(BYPASS_PERMISSION) && config.appliesTo(player.getWorld().getName());
+    if (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId())) {
+      return false;
+    }
+    return config.appliesTo(player.getWorld().getName());
+  }
+
+  /** 使全部改写缓存、邻块快照与显形记录立即失效（配置热重载时调用）。 */
+  public void invalidateAll() {
+    cache.invalidateAll();
+    if (neighborProvider != null) {
+      neighborProvider.invalidateAll();
+    }
+    if (revealedIndex != null) {
+      revealedIndex.clear();
+    }
+  }
+
+  /** 改写统计计数（供诊断聚合）。 */
+  public RewriteStats stats() {
+    return stats;
+  }
+
+  /** 当前缓存命中数（诊断用）。 */
+  public long cacheHits() {
+    return cache.hitCount();
+  }
+
+  /** 当前缓存未命中数（诊断用）。 */
+  public long cacheMisses() {
+    return cache.missCount();
   }
 
   /** 使某个世界的缓存整体失效（世界卸载时调用），同时清掉该世界的显形记录。 */

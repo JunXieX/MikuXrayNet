@@ -133,6 +133,12 @@ public final class ThrottlePipeline {
     return stats;
   }
 
+  /** 当前处于 AFK 状态的玩家数（诊断用）；未启用 AFK 模块时为 0。 */
+  public int afkPlayerCount() {
+    AfkTracker tracker = afkTracker;
+    return tracker == null ? 0 : tracker.afkCount();
+  }
+
   /** 管线是否已装配。 */
   public boolean started() {
     return started;

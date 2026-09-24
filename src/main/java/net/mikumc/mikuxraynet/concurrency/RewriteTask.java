@@ -120,10 +120,16 @@ public final class RewriteTask {
     }
   }
 
-  /** 看门狗超时兜底：仅在写入尚未开始时放行；写入中/已完成的任务由工作线程负责放行。 */
-  public void releaseOnTimeout() {
+  /**
+   * 看门狗超时兜底：仅在写入尚未开始时放行；写入中/已完成的任务由工作线程负责放行。
+   *
+   * @return {@code true} 表示本次确实由看门狗放行了原包（供超时统计使用）
+   */
+  public boolean releaseOnTimeout() {
     if (gate.compareAndSet(GATE_OPEN, GATE_DONE)) {
       signalOnce();
+      return true;
     }
+    return false;
   }
 }

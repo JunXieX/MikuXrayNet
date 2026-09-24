@@ -12,6 +12,7 @@ import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.Schedulers;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
+import net.mikumc.mikuxraynet.util.BypassRegistry;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
@@ -41,7 +42,6 @@ import org.bukkit.scheduler.BukkitTask;
  */
 public final class ProximityRevealer implements Listener {
 
-  private static final String BYPASS_PERMISSION = "mikuxraynet.bypass";
   private static final int MAX_ERROR_LOGS = 3;
   /** 每多少次巡检清理一次过期条目（默认周期 5 tick 时约 5 秒一次）。 */
   private static final int EXPIRE_EVERY_PASSES = 20;
@@ -62,19 +62,21 @@ public final class ProximityRevealer implements Listener {
   private final AntiXrayConfig.Proximity proximity;
   private final RevealedBlockIndex index;
   private final ProximityStats stats;
+  private final BypassRegistry bypassRegistry;
   private final AtomicInteger errorCounter = new AtomicInteger();
   private final AtomicLong passes = new AtomicLong();
 
   private BukkitTask globalTask;
 
   public ProximityRevealer(Plugin plugin, ProtocolManager protocolManager, AntiXrayConfig config,
-      RevealedBlockIndex index, ProximityStats stats) {
+      RevealedBlockIndex index, ProximityStats stats, BypassRegistry bypassRegistry) {
     this.plugin = plugin;
     this.protocolManager = protocolManager;
     this.config = config;
     this.proximity = config.proximity();
     this.index = index;
     this.stats = stats;
+    this.bypassRegistry = bypassRegistry;
   }
 
   /** 启动巡检：非 Folia 为统一主线程任务；Folia 为各玩家的区域任务（玩家退役后自动失效）。 */
@@ -156,7 +158,10 @@ public final class ProximityRevealer implements Listener {
 
   /** 主线程 / 区域线程：取候选坐标 → 读真实方块 → 发包 → 注销该坐标。 */
   private void reveal(Player player, Budget budget) {
-    if (!player.isOnline() || player.hasPermission(BYPASS_PERMISSION)) {
+    if (!player.isOnline()) {
+      return;
+    }
+    if (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId())) {
       return;
     }
 

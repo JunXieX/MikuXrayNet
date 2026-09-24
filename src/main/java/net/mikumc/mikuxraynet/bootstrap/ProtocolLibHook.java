@@ -10,8 +10,10 @@ import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
 import net.mikumc.mikuxraynet.antixray.ProtocolLibAsyncListener;
 import net.mikumc.mikuxraynet.antixray.RevealedBlockIndex;
+import net.mikumc.mikuxraynet.antixray.RewriteStats;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
+import net.mikumc.mikuxraynet.util.BypassRegistry;
 import org.bukkit.plugin.Plugin;
 
 /**
@@ -43,12 +45,14 @@ public final class ProtocolLibHook {
    * （区块改写照常工作，只是失去批次闸门）。
    *
    * @param revealedIndex 显形索引；{@code null} 表示不做邻近显形
+   * @param bypassRegistry 直通名单；{@code null} 表示无直通
    * @return true 表示注册成功并已启动异步分发
    */
   public boolean register(AntiXrayConfig config, ObfuscationProcessor processor, MikuWorkPool workPool,
-      NeighborChunkProvider neighborProvider, RevealedBlockIndex revealedIndex) {
+      NeighborChunkProvider neighborProvider, RevealedBlockIndex revealedIndex,
+      BypassRegistry bypassRegistry) {
     Throwable batchFailure = tryRegister(config, processor, workPool, neighborProvider, revealedIndex,
-        true);
+        bypassRegistry, true);
     if (batchFailure == null) {
       return true;
     }
@@ -56,7 +60,7 @@ public final class ProtocolLibHook {
     logger.log(Level.WARNING,
         "区块批量包（CHUNK_BATCH_START/FINISHED）拦截注册失败，降级为仅拦截 MAP_CHUNK", batchFailure);
     Throwable fallbackFailure = tryRegister(config, processor, workPool, neighborProvider,
-        revealedIndex, false);
+        revealedIndex, bypassRegistry, false);
     if (fallbackFailure == null) {
       return true;
     }
@@ -68,12 +72,12 @@ public final class ProtocolLibHook {
   /** 单次注册尝试；成功返回 {@code null}，失败返回异常并回滚已注册的监听器。 */
   private Throwable tryRegister(AntiXrayConfig config, ObfuscationProcessor processor,
       MikuWorkPool workPool, NeighborChunkProvider neighborProvider, RevealedBlockIndex revealedIndex,
-      boolean handleChunkBatch) {
+      BypassRegistry bypassRegistry, boolean handleChunkBatch) {
     try {
       this.protocolManager = ProtocolLibrary.getProtocolManager();
       this.asynchronousManager = protocolManager.getAsynchronousManager();
       this.listener = new ProtocolLibAsyncListener(plugin, config, processor, workPool,
-          asynchronousManager, neighborProvider, handleChunkBatch, revealedIndex);
+          asynchronousManager, neighborProvider, handleChunkBatch, revealedIndex, bypassRegistry);
       this.asyncListenerHandler = asynchronousManager.registerAsyncHandler(listener);
       // 必须显式 start()，否则异步监听器不会真正开始分发封包
       this.asyncListenerHandler.start();
@@ -113,6 +117,32 @@ public final class ProtocolLibHook {
     if (current != null) {
       current.invalidateWorld(worldName);
     }
+  }
+
+  /** 整体失效改写缓存、邻块快照与显形记录（配置热重载时调用）。 */
+  public void invalidateAll() {
+    ProtocolLibAsyncListener current = listener;
+    if (current != null) {
+      current.invalidateAll();
+    }
+  }
+
+  /** 改写统计计数；未启用时为 {@code null}。 */
+  public RewriteStats stats() {
+    ProtocolLibAsyncListener current = listener;
+    return current == null ? null : current.stats();
+  }
+
+  /** 缓存命中数（诊断用）。 */
+  public long cacheHits() {
+    ProtocolLibAsyncListener current = listener;
+    return current == null ? 0L : current.cacheHits();
+  }
+
+  /** 缓存未命中数（诊断用）。 */
+  public long cacheMisses() {
+    ProtocolLibAsyncListener current = listener;
+    return current == null ? 0L : current.cacheMisses();
   }
 
   /** 缓存条目数（诊断用）。 */

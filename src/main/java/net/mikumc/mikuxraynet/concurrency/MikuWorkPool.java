@@ -22,6 +22,7 @@ public final class MikuWorkPool implements AutoCloseable {
 
   private final ThreadPoolExecutor executor;
   private final ScheduledExecutorService watchdog;
+  private final int queueCapacity;
 
   public MikuWorkPool(int threads, int queueCapacity) {
     int workerCount = threads > 0 ? threads : Math.min(4, Runtime.getRuntime().availableProcessors());
@@ -32,9 +33,10 @@ public final class MikuWorkPool implements AutoCloseable {
       return thread;
     };
 
+    this.queueCapacity = Math.max(1, queueCapacity);
     this.executor = new ThreadPoolExecutor(
         workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
-        new ArrayBlockingQueue<>(Math.max(1, queueCapacity)),
+        new ArrayBlockingQueue<>(this.queueCapacity),
         workerFactory,
         new ThreadPoolExecutor.AbortPolicy());
 
@@ -43,6 +45,26 @@ public final class MikuWorkPool implements AutoCloseable {
       thread.setDaemon(true);
       return thread;
     });
+  }
+
+  /** 工作线程数（诊断用）。 */
+  public int poolSize() {
+    return this.executor.getCorePoolSize();
+  }
+
+  /** 当前正在处理任务的线程数（诊断用）。 */
+  public int activeCount() {
+    return this.executor.getActiveCount();
+  }
+
+  /** 当前排队任务数（诊断用）。 */
+  public int queueSize() {
+    return this.executor.getQueue().size();
+  }
+
+  /** 队列容量上限（诊断用）。 */
+  public int queueCapacity() {
+    return this.queueCapacity;
   }
 
   /** 队列是否还有空位；false 表示此刻提交会被拒绝。 */

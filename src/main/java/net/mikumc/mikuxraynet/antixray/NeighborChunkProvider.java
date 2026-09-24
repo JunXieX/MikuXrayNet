@@ -169,6 +169,13 @@ public final class NeighborChunkProvider {
     }
   }
 
+  /** 使全部快照失效（配置热重载时调用）。 */
+  public void invalidateAll() {
+    synchronized (cache) {
+      cache.clear();
+    }
+  }
+
   /** 当前缓存条目数（诊断用）。 */
   public int size() {
     synchronized (cache) {
