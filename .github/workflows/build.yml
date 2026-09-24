@@ -27,6 +27,23 @@ jobs:
       - name: Build and test
         run: mvn -B -ntp verify
 
+      - name: Publish benchmark report
+        if: always()
+        run: |
+          if [ -f target/benchmark-report.md ]; then
+            cat target/benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "未生成 target/benchmark-report.md（离线基准未运行到报告步骤）" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-report
+          path: target/benchmark-report.md
+          if-no-files-found: ignore
+
       - name: Upload jar artifact
         uses: actions/upload-artifact@v7
         with:

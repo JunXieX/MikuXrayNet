@@ -9,18 +9,20 @@ import io.netty.buffer.Unpooled;
  *
  * <p>关键点：位打包独立实现（不复用 {@link SimpleVarBitBuffer}），这样「字节完全一致」才能同时验证
  * 生产代码与格式约定的位序、每 long 项数、数组长度都相符。
+ *
+ * <p>公开可见性是给 {@code net.mikumc.mikuxraynet.bench} 的离线基准复用同一套字节布局，避免两份造数实现漂移。
  */
-final class TestChunkBuilder {
+public final class TestChunkBuilder {
 
   private final ChunkVersionFlags flags;
   private final ByteBuf buffer = Unpooled.buffer();
 
-  TestChunkBuilder(ChunkVersionFlags flags) {
+  public TestChunkBuilder(ChunkVersionFlags flags) {
     this.flags = flags;
   }
 
   /** 追加单值调色板（bitsPerBlock=0）section；{@code biomeBits=0} 时用 {@code biomePalette[0]}。 */
-  TestChunkBuilder singleValueSection(int blockState, int blockCount, int fluidCount,
+  public TestChunkBuilder singleValueSection(int blockState, int blockCount, int fluidCount,
       int biomeBits, int[] biomePalette) {
     writeHeader(blockCount, fluidCount);
     this.buffer.writeByte(0);
@@ -33,7 +35,7 @@ final class TestChunkBuilder {
   }
 
   /** 追加间接调色板 section；{@code paletteIndices} 为 4096 个调色板索引。 */
-  TestChunkBuilder indirectSection(int bitsPerBlock, int blockCount, int fluidCount,
+  public TestChunkBuilder indirectSection(int bitsPerBlock, int blockCount, int fluidCount,
       int[] palette, int[] paletteIndices, int biomeBits, int[] biomePalette) {
     writeHeader(blockCount, fluidCount);
     this.buffer.writeByte(bitsPerBlock);
@@ -47,7 +49,7 @@ final class TestChunkBuilder {
   }
 
   /** 追加直接（direct）调色板 section；{@code blockStates} 为 4096 个方块状态 id，无调色板段。 */
-  TestChunkBuilder directSection(int bitsPerBlock, int blockCount, int fluidCount,
+  public TestChunkBuilder directSection(int bitsPerBlock, int blockCount, int fluidCount,
       int[] blockStates, int biomeBits, int[] biomePalette) {
     writeHeader(blockCount, fluidCount);
     this.buffer.writeByte(bitsPerBlock);
@@ -57,12 +59,12 @@ final class TestChunkBuilder {
   }
 
   /** 追加任意原始字节（例如 1.18 之前位于所有 section 之后的群系段）。 */
-  TestChunkBuilder trailing(byte[] bytes) {
+  public TestChunkBuilder trailing(byte[] bytes) {
     this.buffer.writeBytes(bytes);
     return this;
   }
 
-  byte[] build() {
+  public byte[] build() {
     byte[] out = new byte[this.buffer.readableBytes()];
     this.buffer.getBytes(this.buffer.readerIndex(), out);
     return out;
