@@ -1,0 +1,75 @@
+# ===========================================================================
+#  MikuXrayNet —— 反矿透配置
+# ---------------------------------------------------------------------------
+#  原理：出站区块封包改写。只有当某个目标方块（矿透目标）的 6 个正交方向
+#        全部被遮挡（即该方块在客户端「不可见」）时，才把它随机替换为常见的
+#        伪装方块；任何一个方向暴露（含区块边界、世界上下界）都保持原样，
+#        以免玩家看到凭空出现的方块。
+#
+#  注意：本文件带完整中文注释，插件不会回写本文件；
+#        修改后执行 /mikuxraynet reload 生效。
+# ===========================================================================
+
+# 反矿透总开关。false 时整个模块不加载，不注册任何封包拦截。
+enabled: true
+
+# 生效世界名列表（Bukkit 世界名，如 world / world_nether）。
+# 留空（[]）表示对所有世界生效。
+worlds: []
+
+obfuscation:
+  # 需要隐藏（伪装）的方块名称列表。
+  # 名称使用 Minecraft 注册名（小写、无需 minecraft: 前缀），对应方块及其
+  # 全部状态都会被识别为目标。
+  hide-blocks:
+    - coal_ore
+    - deepslate_coal_ore
+    - iron_ore
+    - deepslate_iron_ore
+    - copper_ore
+    - deepslate_copper_ore
+    - gold_ore
+    - deepslate_gold_ore
+    - redstone_ore
+    - deepslate_redstone_ore
+    - lapis_ore
+    - deepslate_lapis_ore
+    - diamond_ore
+    - deepslate_diamond_ore
+    - emerald_ore
+    - deepslate_emerald_ore
+    - nether_gold_ore
+    - nether_quartz_ore
+    - ancient_debris
+
+  # 伪装方块与随机权重（权重越大概率越高，必须为正整数）。
+  # 建议只填地下常见方块，避免出现违和感。
+  replacement-weights:
+    stone: 10
+    deepslate: 8
+    netherrack: 6
+
+  # true：同一高度层统一使用同一种伪装方块（层状伪装，观感更整齐）；
+  # false：逐方块独立随机（更不易被模式识别）。
+  layer-obfuscation: false
+
+  # true：被替换掉的方块若原本带有方块实体（如箱子/刷怪笼），则从区块封包中
+  #       一并剔除其方块实体数据，防止客户端残留幽灵方块实体。
+  remove-block-entities: true
+
+cache:
+  # 改写结果缓存的条目上限（每条约等于一个区块的字节数）。
+  maximum-size: 4096
+
+  # 缓存条目在最后一次访问后多久过期（秒）。
+  expire-after-access-seconds: 60
+
+advanced:
+  # 工作线程数；0 表示按 CPU 核数自动推算（上限 4）。
+  threads: 0
+
+  # 单个区块包的处理超时（毫秒）。超时立即放行原包，避免客户端卡在加载界面。
+  timeout-millis: 2500
+
+  # 工作队列容量（条）。队列满时直接放行原包，不阻塞网络线程。
+  queue-capacity: 2048
