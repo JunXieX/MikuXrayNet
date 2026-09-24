@@ -17,6 +17,7 @@ import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import org.bukkit.Bukkit;
+import org.bukkit.Chunk;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.block.data.BlockData;
@@ -26,6 +27,8 @@ import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.world.ChunkUnloadEvent;
+import org.bukkit.event.world.WorldUnloadEvent;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.util.Vector;
 
@@ -34,6 +37,11 @@ import org.bukkit.util.Vector;
  *
  * <p><b>为什么需要</b>：被完全掩埋的方块在区块封包里已被替换为伪装方块，客户端会一直看到伪装结果；
  * 只有服务端下发方块变更时才会纠正。主动把玩家附近的真实方块发回去，体验才与原版一致。
+ *
+ * <p><b>局部扫描</b>：候选来自「玩家身边 {@code ceil(distance/16)} 个区块半径」内的
+ * {@link ObfuscatedChunkIndex}（按区块共享、只存一份），再减去该玩家 {@link RevealedSet} 里已显形的
+ * 坐标。整块已全部显形的区块直接跳过，因此单周期候选评估量与「该玩家的探索历史」脱钩，
+ * 只与「身边区块的伪装坐标数」相关（旧实现遍历全部历史坐标，是真机上评估量暴涨的根因）。
  *
  * <p><b>筛选（可选、可配）</b>：
  * <ul>
@@ -52,7 +60,9 @@ import org.bukkit.util.Vector;
  *
  * <p><b>发包纪律</b>：ProtocolLib 是唯一封包通道，包用 {@code createPacket} 构造、用
  * {@code sendServerPacket(..., filters=false)} 发出，因此显形包不会再次进入本插件的出站监听器。
- * 同一坐标只显形一次（发送成功后立即从索引中注销）；单个坐标失败只记日志并跳过，绝不中断整体。
+ * 同一坐标只显形一次（发送成功后立即写入该玩家的 {@link RevealedSet}）；区块被重新下发或被卸载时
+ * 该区块的已显形标记一并失效（客户端又会看到伪装结果，必须重新显形）。单个坐标失败只记日志并跳过，
+ * 绝不中断整体。
  */
 public final class ProximityRevealer implements Listener {
 
@@ -95,9 +105,12 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
-  /** 单次巡检的计数（射线剔除 / 实际发送），仅供一次性诊断日志使用。 */
+  /** 单次巡检的计数（局部扫描 / 射线剔除 / 实际发送），仅供一次性诊断日志使用。 */
   private static final class PassTally {
 
+    private int chunksScanned;
+    private int chunksSkipped;
+    private int positionsEvaluated;
     private int rayCulled;
     private int sent;
   }
@@ -106,26 +119,28 @@ public final class ProximityRevealer implements Listener {
   private final ProtocolManager protocolManager;
   private final AntiXrayConfig config;
   private final AntiXrayConfig.Proximity proximity;
-  private final RevealedBlockIndex index;
+  private final ObfuscatedChunkIndex chunkIndex;
+  private final RevealedSet revealedSet;
   private final ProximityStats stats;
   private final BypassRegistry bypassRegistry;
   private final MikuWorkPool workPool;
   private final AtomicInteger errorCounter = new AtomicInteger();
   private final AtomicLong passes = new AtomicLong();
   private final AtomicBoolean firstRevealDiagnosed = new AtomicBoolean();
-  /** 「显形索引容量触顶」只提示一次（CAS 抢占），避免每轮巡检刷屏。 */
+  /** 「显形索引安全阀触发」只提示一次（CAS 抢占），避免每轮巡检刷屏。 */
   private final AtomicBoolean capacityWarned = new AtomicBoolean();
 
   private ScheduledTask globalTask;
 
   public ProximityRevealer(Plugin plugin, ProtocolManager protocolManager, AntiXrayConfig config,
-      RevealedBlockIndex index, ProximityStats stats, BypassRegistry bypassRegistry,
-      MikuWorkPool workPool) {
+      ObfuscatedChunkIndex chunkIndex, RevealedSet revealedSet, ProximityStats stats,
+      BypassRegistry bypassRegistry, MikuWorkPool workPool) {
     this.plugin = plugin;
     this.protocolManager = protocolManager;
     this.config = config;
     this.proximity = config.proximity();
-    this.index = index;
+    this.chunkIndex = chunkIndex;
+    this.revealedSet = revealedSet;
     this.stats = stats;
     this.bypassRegistry = bypassRegistry;
     this.workPool = workPool;
@@ -155,14 +170,15 @@ public final class ProximityRevealer implements Listener {
             ? "已开启（多候选点，暴露面上至多 5 点）" : "已关闭"));
   }
 
-  /** 停用：注销任务与事件监听，并清空显形索引（不留副作用）。 */
+  /** 停用：注销任务与事件监听，并清空两个显形索引（不留副作用）。 */
   public void stop() {
     if (globalTask != null) {
       globalTask.cancel();
       globalTask = null;
     }
     HandlerList.unregisterAll(this);
-    index.clear();
+    chunkIndex.clear();
+    revealedSet.clear();
   }
 
   @EventHandler(ignoreCancelled = true)
@@ -175,15 +191,41 @@ public final class ProximityRevealer implements Listener {
     Schedulers.repeatOnEntity(plugin, player, interval, interval, () -> pass(player));
   }
 
-  /** 玩家登出即清理其索引条目，避免为离线玩家保留坐标。 */
+  /** 玩家登出即清理其已显形标记，避免为离线玩家保留坐标。 */
   @EventHandler(ignoreCancelled = true)
   public void onQuit(PlayerQuitEvent event) {
-    index.clearPlayer(event.getPlayer().getUniqueId());
+    revealedSet.clearPlayer(event.getPlayer().getUniqueId());
   }
 
-  /** 显形索引（供诊断读取持有量）。 */
-  public RevealedBlockIndex index() {
-    return index;
+  /**
+   * 区块卸载：该区块的伪装清单与各玩家的已显形标记一并失效。
+   *
+   * <p>区块重新加载时会被重新编译（并重新进入伪装清单），此时旧清单里的坐标已不可信；
+   * 已显形标记同理必须清掉，否则玩家会在「区块重载后早已显示为伪装」的位置漏显形。
+   * 本回调在主线程 / Folia 区域线程执行，只做两个索引的失效，不读世界内容、不做任何计算。
+   */
+  @EventHandler(ignoreCancelled = true)
+  public void onChunkUnload(ChunkUnloadEvent event) {
+    try {
+      Chunk chunk = event.getChunk();
+      String worldName = chunk.getWorld().getName();
+      chunkIndex.invalidateChunk(worldName, chunk.getX(), chunk.getZ());
+      revealedSet.clearChunk(new ChunkKey(worldName, chunk.getX(), chunk.getZ()));
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /** 世界卸载：整体清理该世界的已显形标记（伪装清单由改写链路一并失效）。 */
+  @EventHandler(ignoreCancelled = true)
+  public void onWorldUnload(WorldUnloadEvent event) {
+    try {
+      String worldName = event.getWorld().getName();
+      chunkIndex.invalidateWorld(worldName);
+      revealedSet.clearWorld(worldName);
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
   }
 
   /** 统计计数（供 {@code /mikuxraynet status} 读取）。 */
@@ -220,31 +262,25 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 显形索引容量触顶时提示<b>一次</b>。
+   * 显形索引安全阀触发时提示<b>一次</b>。
    *
-   * <p>把「淘汰」与「丢弃」分开说清楚：<b>淘汰</b>是容量满时按「距玩家最远优先」换掉的坐标，
-   * 属正常调优行为（玩家身边的坐标不受影响）；<b>丢弃</b>是拿不到玩家位置或淘汰也腾不出空间而
-   * 直接放弃的新坐标，属异常。只读两个 {@code LongAdder} 与一次 CAS，无热路径开销。
+   * <p>新结构下不再有「按玩家容量淘汰」这种正常调优行为：伪装坐标按区块共享、已显形集合只记
+   * 实际发过包的坐标，两者天然有界（分别随「已加载的伪装区块数」与「玩家身边的显形数」增长）。
+   * 因此 {@code proximity.max-positions*} 只剩<b>安全阀</b>作用——正常运营下这两个计数恒为 0，
+   * 一旦非 0 就说明索引管理有 bug（而不是「需要调大上限」）。只读两个 {@code LongAdder} 与一次 CAS。
    */
   private void warnIfCapacityExceeded() {
-    long evicted = index.evictedByCapacity();
-    long dropped = index.droppedByCapacity();
+    long evicted = chunkIndex.evictedByCapacity();
+    long dropped = revealedSet.droppedByCapacity();
     if ((evicted <= 0L && dropped <= 0L) || !capacityWarned.compareAndSet(false, true)) {
       return;
     }
-    StringBuilder message = new StringBuilder();
-    message.append("显形索引容量已达上限：已按「距玩家最远优先」淘汰 ").append(evicted)
-        .append(" 个坐标（属正常调优，玩家身边的坐标不受影响）");
-    if (dropped > 0L) {
-      message.append("；另有 ").append(dropped).append(" 个坐标因拿不到玩家位置或腾不出空间被直接丢弃（异常）");
-    }
-    message.append("。若希望更远区域也能还原，可调大 antixray.yml 的 proximity.max-positions-per-player（当前 ")
-        .append(proximity.maxPositionsPerPlayer()).append("）与 proximity.max-positions（当前 ")
-        .append(proximity.maxPositions()).append("）。");
-    plugin.getLogger().warning(message.toString());
+    plugin.getLogger().warning("显形索引安全阀触发：伪装坐标淘汰 " + evicted + " 个、已显形丢弃 "
+        + dropped + " 个。正常运营下两者都应恒为 0——触发说明索引管理存在 bug，请连同 /mxnet dump "
+        + "一并反馈（调大 antixray.yml 的 proximity.max-positions* 只是掩盖问题，不是解决办法）。");
   }
 
-  /** 主线程 / 区域线程：取候选坐标 → （可选）工作线程筛选 → 读真实方块 → 发包 → 注销该坐标。 */
+  /** 主线程 / 区域线程：局部扫描取候选 → （可选）工作线程筛选 → 读真实方块 → 发包 → 标记已显形。 */
   private void reveal(Player player, Budget budget) {
     if (!player.isOnline()
         || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
@@ -258,15 +294,16 @@ public final class ProximityRevealer implements Listener {
     }
 
     Location location = player.getLocation();
-    List<RevealedBlockIndex.Position> candidates = index.candidates(player.getUniqueId(), worldName,
-        location.getBlockX(), location.getBlockY(), location.getBlockZ(), proximity.distance(),
-        fetchLimit(budget.remaining));
+    ProximityScanner.Tally scanTally = new ProximityScanner.Tally();
+    List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex,
+        revealedSet, player.getUniqueId(), worldName, location.getBlockX(), location.getBlockY(),
+        location.getBlockZ(), proximity.distance(), fetchLimit(budget.remaining), scanTally);
     if (candidates.isEmpty()) {
       return;
     }
 
     if (!proximity.frustumEnabled() && !proximity.raycastEnabled()) {
-      sendCandidates(player, world, candidates, null, null, budget);
+      sendCandidates(player, world, candidates, null, null, budget, scanTally);
       return;
     }
 
@@ -275,7 +312,7 @@ public final class ProximityRevealer implements Listener {
 
     if (!proximity.frustumEnabled()) {
       // 只启用可见性判定：视锥的纯计算没有可做的，直接在当前线程逐个判定
-      sendCandidates(player, world, candidates, null, eye, budget);
+      sendCandidates(player, world, candidates, null, eye, budget, scanTally);
       return;
     }
 
@@ -284,7 +321,7 @@ public final class ProximityRevealer implements Listener {
     if (workPool == null || !workPool.hasCapacity()) {
       // 队列已满：保底路径——主线程直接做纯计算（视锥剔除），可见性判定本来就在主线程做，功能不降级
       stats.revealsQueuedSkipped.increment();
-      sendCandidates(player, world, null, computePlan(eye, coordinates), eye, budget);
+      sendCandidates(player, world, null, computePlan(eye, coordinates), eye, budget, scanTally);
       return;
     }
 
@@ -295,7 +332,7 @@ public final class ProximityRevealer implements Listener {
         Schedulers.onEntity(plugin, player, () -> {
           try {
             if (player.isOnline()) {
-              sendCandidates(player, player.getWorld(), null, plan, eye, budget);
+              sendCandidates(player, player.getWorld(), null, plan, eye, budget, scanTally);
             }
           } catch (Throwable throwable) {
             logThrottled(throwable);
@@ -305,7 +342,7 @@ public final class ProximityRevealer implements Listener {
     } catch (Throwable throwable) {
       // 入队失败（线程池关闭等）：退化为主线程纯计算，绝不丢显形
       logThrottled(throwable);
-      sendCandidates(player, world, null, computePlan(eye, coordinates), eye, budget);
+      sendCandidates(player, world, null, computePlan(eye, coordinates), eye, budget, scanTally);
     }
   }
 
@@ -340,17 +377,21 @@ public final class ProximityRevealer implements Listener {
     return new Plan(result, count, count - keptCount);
   }
 
-  /** 逐个候选做可见性判定 → 发包 → 注销；{@code eye} 为 {@code null} 时不启用可见性判定。 */
-  private void sendCandidates(Player player, World world, List<RevealedBlockIndex.Position> candidates,
-      Plan plan, ProximitySelector.Eye eye, Budget budget) {
+  /** 逐个候选做可见性判定 → 发包 → 标记已显形；{@code eye} 为 {@code null} 时不启用可见性判定。 */
+  private void sendCandidates(Player player, World world,
+      List<ObfuscatedChunkIndex.Position> candidates, Plan plan, ProximitySelector.Eye eye,
+      Budget budget, ProximityScanner.Tally scanTally) {
     PassTally tally = new PassTally();
+    tally.chunksScanned = scanTally.chunksScanned;
+    tally.chunksSkipped = scanTally.chunksSkipped;
+    tally.positionsEvaluated = scanTally.positionsEvaluated;
     int candidateCount = plan != null
         ? plan.candidateCount
         : (candidates == null ? 0 : candidates.size());
     int frustumCulled = plan != null ? plan.frustumCulled : 0;
 
     if (candidates != null) {
-      for (RevealedBlockIndex.Position position : candidates) {
+      for (ObfuscatedChunkIndex.Position position : candidates) {
         if (budget.remaining <= 0) {
           break;
         }
@@ -374,7 +415,7 @@ public final class ProximityRevealer implements Listener {
     logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
   }
 
-  /** 单个坐标：区块未加载则跳过、不可见则跳过，否则读真实方块并发包、成功后注销。 */
+  /** 单个坐标：区块未加载则跳过、不可见则跳过，否则读真实方块并发包、成功后标记该玩家已显形。 */
   private void sendOne(Player player, World world, int x, int y, int z, ProximitySelector.Eye eye,
       Budget budget, PassTally tally) {
     if (!world.isChunkLoaded(x >> 4, z >> 4)) {
@@ -390,7 +431,7 @@ public final class ProximityRevealer implements Listener {
     }
 
     if (send(player, world, x, y, z)) {
-      index.unregister(player.getUniqueId(), world.getName(), x, y, z);
+      revealedSet.mark(player.getUniqueId(), ChunkKey.ofBlock(world.getName(), x, z), x, y, z);
       stats.revealsSent.increment();
       tally.sent++;
       budget.remaining--;
@@ -405,7 +446,9 @@ public final class ProximityRevealer implements Listener {
    * <p><b>为什么要它</b>：真机反馈「矿洞里一个裸露矿物都看不到」，而「候选 0 个」与「候选很多但全被
    * 视锥/射线拦掉」是完全不同的两种失效。这一行给出决定性判据：
    * <ul>
-   *   <li>候选 N = 0 → 显形索引里根本没有该玩家的坐标（区块改写没记录 / 索引容量被占满）；</li>
+   *   <li>扫描区块 / 整块跳过 → 局部扫描是否生效、稳态下是否真的「只处理新进入视野的区块」；</li>
+   *   <li>坐标评估 N → 本周期实际评估的候选量（应与「身边区块的伪装坐标数」同量级）；</li>
+   *   <li>候选 N = 0 → 显形索引里根本没有该玩家身边的坐标（区块改写没记录 / 索引已被清理）；</li>
    *   <li>候选 N &gt; 0 但视锥剔除 X 很大 → 视锥太窄（fov/min-distance 需放宽）；</li>
    *   <li>候选 N &gt; 0 但射线剔除 Y 很大 → 射线判定过严（射线目标点/参数需要复核）；</li>
    *   <li>实际发送 Z 明显小于 N → 单次发包额度或区块未加载在拦（max-reveals-per-tick / 视距）。</li>
@@ -416,8 +459,10 @@ public final class ProximityRevealer implements Listener {
     if (!firstRevealDiagnosed.compareAndSet(false, true)) {
       return;
     }
-    plugin.getLogger().info("首次显形诊断：候选 " + candidateCount + " 个，视锥剔除 " + frustumCulled
-        + "，射线剔除 " + tally.rayCulled + "，实际发送 " + tally.sent);
+    plugin.getLogger().info("首次显形诊断：扫描区块 " + tally.chunksScanned + " 个（整块跳过 "
+        + tally.chunksSkipped + "），坐标评估 " + tally.positionsEvaluated + " 个，候选 " + candidateCount
+        + " 个，视锥剔除 " + frustumCulled + "，射线剔除 " + tally.rayCulled
+        + "，实际发送 " + tally.sent);
   }
 
   /**
@@ -465,11 +510,16 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
-  /** 周期清理过期条目，避免长期不触发显形的坐标一直留在索引里。 */
+  /**
+   * 周期清理过期条目（区块卸载未触发时的兜底）：伪装清单与已显形标记都要清，避免长期堆积。
+   *
+   * <p>两个结构的活跃时间都会在扫描到该区块时刷新，因此玩家身边的条目不会被误清。
+   */
   private void maybeExpire() {
     if (passes.incrementAndGet() % EXPIRE_EVERY_PASSES == 0L) {
       try {
-        index.expire();
+        chunkIndex.expire();
+        revealedSet.expire();
       } catch (Throwable throwable) {
         logThrottled(throwable);
       }
@@ -493,10 +543,10 @@ public final class ProximityRevealer implements Listener {
         direction.getX(), direction.getY(), direction.getZ());
   }
 
-  private static int[] flatten(List<RevealedBlockIndex.Position> candidates) {
+  private static int[] flatten(List<ObfuscatedChunkIndex.Position> candidates) {
     int[] coordinates = new int[candidates.size() * 3];
     for (int i = 0; i < candidates.size(); i++) {
-      RevealedBlockIndex.Position position = candidates.get(i);
+      ObfuscatedChunkIndex.Position position = candidates.get(i);
       coordinates[i * 3] = position.x();
       coordinates[i * 3 + 1] = position.y();
       coordinates[i * 3 + 2] = position.z();

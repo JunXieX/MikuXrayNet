@@ -96,9 +96,9 @@ public final class AntiXrayConfig {
    * @param distance              触发显形的距离（格，三维欧氏距离，等于阈值也算命中）
    * @param intervalTicks         巡检周期（tick）
    * @param maxRevealsPerTick     单次巡检的发包上限（普通服务端为全服合计，Folia 为每玩家）
-   * @param expireSeconds         显形索引条目的过期秒数
-   * @param maxPositions          显形索引的全服坐标上限
-   * @param maxPositionsPerPlayer 单个玩家的坐标上限
+   * @param expireSeconds         显形索引条目的过期秒数（区块卸载未触发时的兜底）
+   * @param maxPositions          伪装区块索引的坐标总量<b>安全阀</b>（正常运营下不应触发）
+   * @param maxPositionsPerPlayer 单玩家已显形坐标的<b>安全阀</b>（正常运营下不应触发）
    * @param frustumEnabled        是否只显形玩家视野锥内的候选坐标
    * @param frustumFov            视野锥<b>竖直全张开角</b>（度）——与 Minecraft 客户端 FOV 设置同义；
    *                              水平方向按 16:9 宽高比换算后更宽（约 1.4 倍），
@@ -232,13 +232,11 @@ public final class AntiXrayConfig {
             // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处，
             // 窗口太短会让「还没走到就被清掉」的坐标永不还原。
             Math.max(1, root.getInt("proximity.expire-seconds", 300)),
-            // 默认 4194304（原为 2097152）：单玩家上限（524288）的 8 倍量级，多玩家同时在线不立刻触顶。
-            // 内存量级见 max-positions-per-player 注释：本项只是「上限」，不是预分配。
+            // 安全阀（原为「容量上限」）：伪装坐标按区块共享、已显形集合只记实际发过包的坐标，
+            // 两者天然有界（分别随「已加载的伪装区块数」与「玩家身边的显形数」增长），不再需要
+            // 「按玩家容量淘汰」。本项只在索引管理出 bug 时兜底——正常运营下淘汰数应恒为 0。
             Math.max(1, root.getInt("proximity.max-positions", 4194304)),
-            // 默认 524288（原为 262144，更早为 65536）：真机日志显示 262144 仍被顶到（淘汰 1400 个坐标），
-            // 说明视距 10+ 的登录规模在 mode=all 下已超过该值。再翻倍到 524288，留出余量。
-            // 内存量级：坐标压实为 1 个 long（8 字节）、数组按 2 倍扩容最坏约 16 字节/坐标 →
-            // 524288 × 16B ≈ 8 MB/玩家（上限，非预分配；全服 4194304 × 16B ≈ 64 MB，同样只是上限）。
+            // 安全阀（原为「单玩家坐标上限」）：含义同 max-positions，作用于单玩家的已显形坐标数。
             Math.max(1, root.getInt("proximity.max-positions-per-player", 524288)),
             root.getBoolean("proximity.frustum.enabled", true),
             clampFov(root.getDouble("proximity.frustum.fov", 80.0D)),

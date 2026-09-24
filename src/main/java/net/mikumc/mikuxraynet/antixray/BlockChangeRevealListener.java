@@ -8,7 +8,6 @@ import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.wrappers.BlockPosition;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
@@ -17,11 +16,12 @@ import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 
 /**
- * 出站方块变更监听：服务端自己下发了某个「曾被伪装的坐标」的变更时，把该坐标从显形索引中注销；
+ * 出站方块变更监听：服务端自己下发了某个「曾被伪装的坐标」的变更时，把该坐标从伪装区块索引中注销；
  * 同时把「该区块内容已变」这件事告知磁盘缓存（递增区块代次，使旧代次缓存条目自然失效）。
  *
- * <p><b>为什么需要注销</b>：玩家挖掉一个伪装方块时，服务端会下发真实的变更包；若该坐标仍留在索引里，
- * 邻近显形稍后还会用陈旧数据重复发包（多花带宽，观感也可能闪一下）。所以命中即注销。
+ * <p><b>为什么需要注销</b>：玩家挖掉一个伪装方块时，服务端会下发真实的变更包；若该坐标仍留在
+ * 伪装清单里，邻近显形稍后还会用陈旧数据重复发包（多花带宽，观感也可能闪一下）。所以命中即注销。
+ * 这里只摘除<b>变更的那一个坐标</b>（与既有行为一致），该区块其它坐标照常显形。
  *
  * <p><b>为什么需要代次</b>：已改写完成的区块负载会按 {@code (世界名, 区块坐标, 配置指纹, 区块代次)}
  * 落到磁盘（见 {@code cache.DiskCacheStore}）。区块内容一旦变化，旧代次的条目就不该再被复用；
@@ -39,9 +39,8 @@ import org.bukkit.plugin.Plugin;
  * 本类<b>不</b>登记处理延迟、不取消、不改包，纯观察，因此不会与合并时间窗互相打架。
  *
  * <p><b>线程与内存纪律</b>：回调里只做「读包内坐标 + 查内存索引 + 递增内存代次」，不读 World 的方块；
- * 注销按「区块坐标 + 相对坐标」匹配，因此不需要世界名（索引键里本来也只有世界名与整数）；
- * 代次递增需要世界名，只做一次 {@code getWorld().getName()}（与反矿透主监听器一致的做法）。
- * 不检查取消状态：即使原包被别的插件取消，最坏结果也只是少发一个冗余显形包，不会丢失更新。
+ * 注销按「世界名 + 坐标」精确定位，因此不需要扫描全部玩家或全部区块。不检查取消状态：即使原包被
+ * 别的插件取消，最坏结果也只是少发一个冗余显形包，不会丢失更新。
  */
 public final class BlockChangeRevealListener extends PacketAdapter {
 
@@ -49,7 +48,8 @@ public final class BlockChangeRevealListener extends PacketAdapter {
 
   private final Plugin plugin;
   private final ProtocolManager protocolManager;
-  private final RevealedBlockIndex index;
+  private final ObfuscatedChunkIndex obfuscatedChunkIndex;
+  private final RevealedSet revealedSet;
   private final ProximityStats stats;
   private final DiskCacheStore diskCache;
   private final AtomicInteger errorCounter = new AtomicInteger();
@@ -57,17 +57,20 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private AsyncListenerHandler handler;
 
   /**
-   * @param index     显形索引；{@code null} 表示不做邻近显形（只做代次递增）
-   * @param stats     显形统计；{@code null} 表示不统计
-   * @param diskCache 磁盘缓存；{@code null} 表示不做代次递增
+   * @param obfuscatedChunkIndex 伪装区块索引；{@code null} 表示不做邻近显形（只做代次递增）
+   * @param revealedSet          已显形集合；{@code null} 表示不做邻近显形
+   * @param stats                显形统计；{@code null} 表示不统计
+   * @param diskCache            磁盘缓存；{@code null} 表示不做代次递增
    */
   public BlockChangeRevealListener(Plugin plugin, ProtocolManager protocolManager,
-      RevealedBlockIndex index, ProximityStats stats, DiskCacheStore diskCache) {
+      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
+      DiskCacheStore diskCache) {
     super(plugin, ListenerPriority.HIGHEST, PacketType.Play.Server.BLOCK_CHANGE,
         PacketType.Play.Server.MULTI_BLOCK_CHANGE);
     this.plugin = plugin;
     this.protocolManager = protocolManager;
-    this.index = index;
+    this.obfuscatedChunkIndex = obfuscatedChunkIndex;
+    this.revealedSet = revealedSet;
     this.stats = stats;
     this.diskCache = diskCache;
   }
@@ -100,14 +103,13 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       return;
     }
 
-    UUID playerId = player.getUniqueId();
     try {
       String worldName = worldNameOf(player);
       PacketType type = event.getPacketType();
       if (type == PacketType.Play.Server.BLOCK_CHANGE) {
-        unregisterSingle(playerId, event.getPacket(), worldName);
+        unregisterSingle(event.getPacket(), worldName);
       } else if (type == PacketType.Play.Server.MULTI_BLOCK_CHANGE) {
-        unregisterMulti(playerId, event.getPacket(), worldName);
+        unregisterMulti(event.getPacket(), worldName);
       }
     } catch (Throwable throwable) {
       // fail-open：解析失败只跳过本次注销，绝不取消或改写原包
@@ -116,20 +118,17 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   }
 
   /** 单方块变更：坐标即绝对方块坐标。 */
-  private void unregisterSingle(UUID playerId, PacketContainer packet, String worldName) {
+  private void unregisterSingle(PacketContainer packet, String worldName) {
     BlockPosition position = packet.getBlockPositionModifier().readSafely(0);
     if (position == null) {
       return;
     }
-    if (index != null && index.unregister(playerId, position.getX(), position.getY(), position.getZ())
-        && stats != null) {
-      stats.unregistered.increment();
-    }
+    unregisterCoordinate(worldName, position.getX(), position.getY(), position.getZ());
     markChanged(worldName, position.getX(), position.getZ());
   }
 
   /** 多方块变更：section 坐标 + 区块内相对坐标（与本插件合并包一致的位置编码）。 */
-  private void unregisterMulti(UUID playerId, PacketContainer packet, String worldName) {
+  private void unregisterMulti(PacketContainer packet, String worldName) {
     BlockPosition section = packet.getSectionPositions().readSafely(0);
     short[] positions = packet.getShortArrays().readSafely(0);
     if (section == null || positions == null) {
@@ -143,10 +142,29 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       int x = baseX + (packed >> 8 & 15);
       int z = baseZ + (packed >> 4 & 15);
       int y = baseY + (packed & 15);
-      if (index != null && index.unregister(playerId, x, y, z) && stats != null) {
-        stats.unregistered.increment();
-      }
+      unregisterCoordinate(worldName, x, y, z);
       markChanged(worldName, x, z);
+    }
+  }
+
+  /**
+   * 命中即从「伪装区块清单」与「各玩家的已显形标记」中摘除该坐标。
+   *
+   * <p>两者必须同步摘除，才能维持「已显形坐标 ⊆ 区块伪装清单」这一不变式——「整块已全部显形
+   * 则跳过该区块」的判断依赖它。只摘变更的那一个坐标，该区块其它坐标照常显形（与既有行为一致）。
+   */
+  private void unregisterCoordinate(String worldName, int x, int y, int z) {
+    if (worldName == null || obfuscatedChunkIndex == null) {
+      return;
+    }
+    if (!obfuscatedChunkIndex.removePosition(worldName, x, y, z)) {
+      return;
+    }
+    if (revealedSet != null) {
+      revealedSet.removePosition(worldName, x, y, z);
+    }
+    if (stats != null) {
+      stats.unregistered.increment();
     }
   }
 

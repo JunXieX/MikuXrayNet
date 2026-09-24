@@ -26,7 +26,7 @@ class DiagnosticsTest {
         9L, 4L,
         4, 2, 10, 2048,
         "Paper 1.20.4", "25", null, null,
-        3L, 2L, 30L, 10L, 12, 2, 7, 41L, 3L);
+        3L, 2L, 30L, 10L, 12, 2, 7, 41, 12, 3L, 2L);
   }
 
   @Test
@@ -46,8 +46,9 @@ class DiagnosticsTest {
     assertTrue(text.contains("邻近显形"), text);
     assertTrue(text.contains("视锥剔除 3"), text);
     assertTrue(text.contains("射线剔除 2"), text);
-    assertTrue(text.contains("显形索引：条目 7，淘汰 41，丢弃 3"),
-        "状态面板必须分列显形索引条目数、淘汰数与丢弃数（否则容量触顶会静默发生）：" + text);
+    assertTrue(text.contains("显形索引：伪装区块 7（坐标 41）｜已显形 条目 12｜安全阀触发 3/2"),
+        "状态面板必须分列伪装区块数、伪装坐标数、已显形条目数与安全阀触发数（否则结构异常会静默发生）："
+            + text);
     assertTrue(text.contains("磁盘缓存"), text);
     assertTrue(text.contains("命中率 75.0%"), text);
     assertTrue(text.contains("带宽"), text);
@@ -92,7 +93,7 @@ class DiagnosticsTest {
         0L, 0L,
         0, 0, 0, 0,
         "Folia 1.21", "21", null, null,
-        0L, 0L, 0L, 0L, 0, 0, 0, 0L, 0L);
+        0L, 0L, 0L, 0L, 0, 0, 0, 0, 0, 0L, 0L);
     String text = String.join("\n", Diagnostics.formatStatus(empty));
     assertTrue(text.contains("命中率 0.0%"), text);
     assertTrue(text.contains("平台 Folia"), text);

@@ -55,7 +55,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final NeighborChunkProvider neighborProvider;
   private final boolean neighborsEnabled;
   private final boolean handleChunkBatch;
-  private final RevealedBlockIndex revealedIndex;
+  private final ObfuscatedChunkIndex obfuscatedChunkIndex;
+  private final RevealedSet revealedSet;
   private final BypassRegistry bypassRegistry;
   private final DiskCacheStore diskCache;
   private final RewriteStats stats = new RewriteStats();
@@ -67,14 +68,16 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /**
    * @param neighborProvider 邻区块贴边快照提供者；仅在 {@code neighbors.enabled} 时被使用
    * @param handleChunkBatch 是否拦截 1.20.2+ 的区块批量包（不可用时由装配方降级为 false）
-   * @param revealedIndex    显形索引；{@code null} 表示不做邻近显形
+   * @param obfuscatedChunkIndex 伪装区块索引；{@code null} 表示不做邻近显形
+   * @param revealedSet      已显形集合；{@code null} 表示不做邻近显形
    * @param bypassRegistry   直通名单；{@code null} 表示退化为无直通（仍按世界范围判定）
    * @param diskCache        磁盘缓存；{@code null} 表示只用内存缓存
    */
   public ProtocolLibAsyncListener(Plugin plugin, AntiXrayConfig config, ObfuscationProcessor processor,
       MikuWorkPool workPool, AsynchronousManager asynchronousManager,
       NeighborChunkProvider neighborProvider, boolean handleChunkBatch,
-      RevealedBlockIndex revealedIndex, BypassRegistry bypassRegistry, DiskCacheStore diskCache) {
+      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, BypassRegistry bypassRegistry,
+      DiskCacheStore diskCache) {
     super(plugin, ListenerPriority.NORMAL, packetTypes(handleChunkBatch));
     this.config = config;
     this.processor = processor;
@@ -84,7 +87,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     this.neighborProvider = neighborProvider;
     this.neighborsEnabled = neighborProvider != null && config.neighbors().enabled();
     this.handleChunkBatch = handleChunkBatch;
-    this.revealedIndex = revealedIndex;
+    this.obfuscatedChunkIndex = obfuscatedChunkIndex;
+    this.revealedSet = revealedSet;
     this.bypassRegistry = bypassRegistry;
     this.diskCache = diskCache;
   }
@@ -425,10 +429,15 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       logThrottled("区块改写结果未能写回封包（setBuffer 回读不一致），本轮按原包内容放行", null);
     }
 
-    // 记录「该玩家在这个区块里被伪装过的坐标」，供邻近显形使用（纯内存写入，可在工作线程执行）
-    if (revealedIndex != null) {
-      revealedIndex.record(task.playerId(), task.worldName(), task.chunkX(), task.chunkZ(),
+    // 记录「这个区块被伪装过的坐标」（按区块共享，只存一份；纯内存写入，可在工作线程执行）
+    if (obfuscatedChunkIndex != null) {
+      obfuscatedChunkIndex.recordChunk(task.worldName(), task.chunkX(), task.chunkZ(),
           task.minHeight(), positions);
+      if (revealedSet != null) {
+        // 区块被重新下发 → 客户端又拿回了伪装结果，该区块的已显形标记必须作废（与旧行为一致：
+        // 重新记录后这些坐标会再次被显形）
+        revealedSet.clearChunk(new ChunkKey(task.worldName(), task.chunkX(), task.chunkZ()));
+      }
     }
   }
 
@@ -440,14 +449,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     return config.appliesTo(player.getWorld().getName());
   }
 
-  /** 使全部改写缓存、邻块快照与显形记录立即失效（配置热重载时调用）。 */
+  /** 使全部改写缓存、邻块快照与显形结构立即失效（配置热重载时调用）。 */
   public void invalidateAll() {
     cache.invalidateAll();
     if (neighborProvider != null) {
       neighborProvider.invalidateAll();
     }
-    if (revealedIndex != null) {
-      revealedIndex.clear();
+    if (obfuscatedChunkIndex != null) {
+      obfuscatedChunkIndex.clear();
+    }
+    if (revealedSet != null) {
+      revealedSet.clear();
     }
   }
 
@@ -466,14 +478,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     return cache.missCount();
   }
 
-  /** 使某个世界的缓存整体失效（世界卸载时调用），同时清掉该世界的显形记录。 */
+  /** 使某个世界的缓存整体失效（世界卸载时调用），同时清掉该世界的显形结构。 */
   public void invalidateWorld(String worldName) {
     cache.invalidateWorld(worldName);
     if (neighborProvider != null) {
       neighborProvider.invalidateWorld(worldName);
     }
-    if (revealedIndex != null) {
-      revealedIndex.clearWorld(worldName);
+    if (obfuscatedChunkIndex != null) {
+      obfuscatedChunkIndex.invalidateWorld(worldName);
+    }
+    if (revealedSet != null) {
+      revealedSet.clearWorld(worldName);
     }
   }
 

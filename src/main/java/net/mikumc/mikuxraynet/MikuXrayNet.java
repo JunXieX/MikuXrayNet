@@ -11,10 +11,11 @@ import java.util.List;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.antixray.BlockChangeRevealListener;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
+import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
 import net.mikumc.mikuxraynet.antixray.ProximityRevealer;
 import net.mikumc.mikuxraynet.antixray.ProximityStats;
-import net.mikumc.mikuxraynet.antixray.RevealedBlockIndex;
+import net.mikumc.mikuxraynet.antixray.RevealedSet;
 import net.mikumc.mikuxraynet.bandwidth.ThrottlePipeline;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
 import net.mikumc.mikuxraynet.bootstrap.PacketEventsHook;
@@ -62,7 +63,10 @@ public final class MikuXrayNet extends JavaPlugin {
   private ThrottlePipeline throttlePipeline;
   private ProximityRevealer proximityRevealer;
   private BlockChangeRevealListener blockChangeRevealListener;
-  private RevealedBlockIndex revealedIndex;
+  /** 按区块共享的伪装坐标索引（内存 = O(有伪装的已加载区块数)）。 */
+  private ObfuscatedChunkIndex obfuscatedChunkIndex;
+  /** 按玩家的已显形集合（内存 = O(玩家身边确实显形过的坐标数)）。 */
+  private RevealedSet revealedSet;
   private ProximityStats proximityStats;
   private DiskCacheStore diskCacheStore;
   private BypassRegistry bypassRegistry;
@@ -176,11 +180,14 @@ public final class MikuXrayNet extends JavaPlugin {
         ? new NeighborChunkProvider(antiXray.neighbors().cacheMaximumSize())
         : null;
 
-    // 邻近显形索引：关闭该功能时传 null，改写路径完全不做任何额外记录
+    // 邻近显形索引：拆成「按区块共享的伪装清单」+「按玩家的已显形集合」两个结构。
+    // 关闭该功能时都传 null，改写路径完全不做任何额外记录。
     AntiXrayConfig.Proximity proximity = antiXray.proximity();
-    RevealedBlockIndex index = proximity.enabled()
-        ? new RevealedBlockIndex(proximity.maxPositions(), proximity.maxPositionsPerPlayer(),
-            proximity.expireSeconds())
+    ObfuscatedChunkIndex chunkIndex = proximity.enabled()
+        ? new ObfuscatedChunkIndex(proximity.maxPositions(), proximity.expireSeconds())
+        : null;
+    RevealedSet revealed = proximity.enabled()
+        ? new RevealedSet(proximity.maxPositionsPerPlayer(), proximity.expireSeconds())
         : null;
 
     // 磁盘缓存：关闭时为 null，改写路径退化为纯内存缓存
@@ -191,7 +198,8 @@ public final class MikuXrayNet extends JavaPlugin {
 
     MikuWorkPool pool = new MikuWorkPool(antiXray.threads(), antiXray.queueCapacity());
     ProtocolLibHook hook = new ProtocolLibHook(this);
-    if (!hook.register(antiXray, processor, pool, neighborProvider, index, bypassRegistry, diskCache)) {
+    if (!hook.register(antiXray, processor, pool, neighborProvider, chunkIndex, revealed,
+        bypassRegistry, diskCache)) {
       pool.close();
       closeDiskCache(diskCache);
       return;
@@ -199,12 +207,13 @@ public final class MikuXrayNet extends JavaPlugin {
 
     this.workPool = pool;
     this.protocolLibHook = hook;
-    this.revealedIndex = index;
+    this.obfuscatedChunkIndex = chunkIndex;
+    this.revealedSet = revealed;
     this.diskCacheStore = diskCache;
     this.proximityStats = new ProximityStats();
     this.antiXrayActive = true;
     registerWorldUnloadInvalidation();
-    startProximity(antiXray, index, proximityStats);
+    startProximity(antiXray, chunkIndex, revealed, proximityStats);
 
     getLogger().info("反矿透已启用：目标方块 " + antiXray.hideBlocks().size() + " 种，伪装方块 "
         + antiXray.replacementWeights().size() + " 种；伪装模式 " + antiXray.obfuscationMode()
@@ -220,29 +229,29 @@ public final class MikuXrayNet extends JavaPlugin {
    * <p>方块变更观察监听器在「显形索引或磁盘缓存任一启用」时都会注册：它既负责注销已显形的坐标，
    * 也负责把「区块已变更」告诉磁盘缓存（递增区块代次）。
    */
-  private void startProximity(AntiXrayConfig antiXray, RevealedBlockIndex revealedIndex,
-      ProximityStats stats) {
+  private void startProximity(AntiXrayConfig antiXray, ObfuscatedChunkIndex chunkIndex,
+      RevealedSet revealed, ProximityStats stats) {
     ProtocolManager protocolManager = protocolLibHook == null ? null : protocolLibHook.protocolManager();
     if (protocolManager == null) {
       getLogger().warning("未取得 ProtocolLib 协议管理器，邻近显形停用");
       return;
     }
 
-    if (revealedIndex == null) {
+    if (chunkIndex == null || revealed == null) {
       getLogger().info("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
     }
 
-    if (diskCacheStore == null && revealedIndex == null) {
+    if (diskCacheStore == null && chunkIndex == null) {
       return;
     }
 
-    this.blockChangeRevealListener = new BlockChangeRevealListener(this, protocolManager, revealedIndex,
-        stats, diskCacheStore);
+    this.blockChangeRevealListener = new BlockChangeRevealListener(this, protocolManager, chunkIndex,
+        revealed, stats, diskCacheStore);
     try {
       blockChangeRevealListener.start();
-      if (revealedIndex != null) {
-        this.proximityRevealer = new ProximityRevealer(this, protocolManager, antiXray, revealedIndex,
-            stats, bypassRegistry, workPool);
+      if (chunkIndex != null && revealed != null) {
+        this.proximityRevealer = new ProximityRevealer(this, protocolManager, antiXray, chunkIndex,
+            revealed, stats, bypassRegistry, workPool);
         proximityRevealer.start();
       }
     } catch (Throwable throwable) {
@@ -291,9 +300,14 @@ public final class MikuXrayNet extends JavaPlugin {
     return proximityRevealer;
   }
 
-  /** 显形索引（供诊断读取条目数与容量丢弃数）；未启用邻近显形时为 null。 */
-  public RevealedBlockIndex revealedIndex() {
-    return revealedIndex;
+  /** 伪装区块索引（供诊断读取区块数 / 坐标数与安全阀计数）；未启用邻近显形时为 null。 */
+  public ObfuscatedChunkIndex obfuscatedChunkIndex() {
+    return obfuscatedChunkIndex;
+  }
+
+  /** 已显形集合（供诊断读取条目数与安全阀计数）；未启用邻近显形时为 null。 */
+  public RevealedSet revealedSet() {
+    return revealedSet;
   }
 
   /** 邻近显形统计计数；反矿透未启用时为 null。 */
@@ -385,12 +399,12 @@ public final class MikuXrayNet extends JavaPlugin {
     });
   }
 
-  /** 按新配置重建邻近显形（复用同一显形索引与统计对象，避免与改写链路脱钩）。 */
+  /** 按新配置重建邻近显形（复用同一套显形结构，避免与改写链路脱钩）。 */
   private void restartProximity() {
     stopProximity();
     if (antiXrayActive && proximityStats != null
-        && (revealedIndex != null || diskCacheStore != null)) {
-      startProximity(config.antiXray(), revealedIndex, proximityStats);
+        && (obfuscatedChunkIndex != null || diskCacheStore != null)) {
+      startProximity(config.antiXray(), obfuscatedChunkIndex, revealedSet, proximityStats);
     }
   }
 
