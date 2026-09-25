@@ -49,11 +49,17 @@ import org.bukkit.util.Vector;
  * {@link ObfuscatedChunkIndex}（按区块共享、只存一份），再减去该玩家 {@link RevealedSet} 里已显形的
  * 坐标。整块已全部显形的区块直接跳过，因此单周期候选评估量与「该玩家的探索历史」脱钩，
  * 只与「身边区块的伪装坐标数」相关（旧实现遍历全部历史坐标，是真机上评估量暴涨的根因）。
+ * 附近区块还会按稳定哈希分成 {@value #SCAN_SHARDS} 片轮转评估（见 {@link #SCAN_SHARDS}）：
+ * 被候选窗口截断在外的坐标不再被「永远看不见的坐标」长期挤掉，窗口覆盖范围随之扩大约
+ * {@value #SCAN_SHARDS} 倍。
  *
  * <p><b>筛选（可选、可配）</b>：
  * <ul>
- *   <li><b>视锥剔除</b>（默认开启，80° 竖直全角）：只显形玩家视野锥内的候选坐标；
- *       水平方向按 16:9 宽高比更宽（约 112° 全角），与客户端观感一致；最小距离内豁免；</li>
+ *   <li><b>视锥剔除</b>（默认开启，110° 竖直全角，16 格内豁免）：只显形玩家视野锥内的候选坐标；
+ *       默认值取「客户端 FOV 上限 + 16:9」的可视范围，因此<b>玩家看得见的方向不会被剔除</b>；
+ *       两项配置都有安全下限（配得更窄会被抬升并 WARN，见 {@code AntiXrayConfig}），
+ *       因为「看得见却是假的方块」是本功能最严重的失效模式（真机反馈：点击/挖掘才变回来）。
+ *       水平方向按 16:9 宽高比换算（110° → 水平半角约 68°），与客户端观感一致；</li>
  *   <li><b>可见性判定</b>（默认开启，多候选点 + Paper 原生射线）：先识别方块的暴露面，只在暴露面上取
  *       候选点（正对玩家的面中心 → 包围盒最近点 → 面四角），每个候选点用
  *       {@code World#rayTraceBlocks} 做原生射线检测，任一条通畅即显形；候选点数由
@@ -94,6 +100,22 @@ public final class ProximityRevealer implements Listener {
   private static final int CANDIDATE_OVERSAMPLE = 4;
   private static final int MAX_CANDIDATES = 512;
 
+  /**
+   * 附近区块的分片数：每次巡检只看其中一片（{@link ProximityScanner#shardOf} 决定某个区块属于哪片）。
+   *
+   * <p><b>为什么必须分片</b>：被视锥/射线剔除的候选不发包也不记已显形，而候选窗口又有硬上限
+   * （{@link #MAX_CANDIDATES}）。若每次都从「最近的 N 个」里挑，玩家身边一旦有大量永远看不见的伪装
+   * 坐标（整块埋住、上方是流体等），这批坐标就会<b>每个周期</b>重复占满窗口，窗口外的坐标一直轮不到
+   * 评估——真机表现为「明明在眼前的方块一直是假的，点一下才变回来」。分片后同一批坐标改为每
+   * {@value #SCAN_SHARDS} 个周期才重复占用一次，窗口的有效覆盖范围因此扩大到约
+   * {@value #SCAN_SHARDS} 倍，每个分片每 {@value #SCAN_SHARDS} 个周期至少被访问一次。
+   *
+   * <p>取 4 是「覆盖速度」与「及时性」的折中：分片越多，单周期覆盖的范围越窄（脚边的坐标最多晚到
+   * 一个分片周期 = 默认 4 tick × 4 = 0.8 秒），越少则窗口外坐标轮到的越慢。真正被玩家触碰到的方块由
+   * 事件显形当 tick 还原，因此这里宁可偏向覆盖速度。
+   */
+  private static final int SCAN_SHARDS = 4;
+
   /** 单次巡检的发包额度（非 Folia 为全服合计，Folia 为每个玩家各自的巡检）。 */
   private static final class Budget {
 
@@ -128,6 +150,7 @@ public final class ProximityRevealer implements Listener {
 
     private int chunksScanned;
     private int chunksSkipped;
+    private int chunksDeferred;
     private int positionsEvaluated;
     private int rayCulled;
     private int sent;
@@ -337,13 +360,15 @@ public final class ProximityRevealer implements Listener {
   private void passAll() {
     warnIfCapacityExceeded();
     maybeExpire();
+    // 本轮看哪一片：同一轮里所有玩家看同一片（分片轮转的节奏只与巡检次数有关，见 SCAN_SHARDS）
+    int shard = scanShard();
     Budget budget = new Budget(limit());
     for (Player player : Bukkit.getOnlinePlayers()) {
       if (budget.remaining <= 0) {
         return;
       }
       try {
-        reveal(player, budget);
+        reveal(player, budget, shard);
       } catch (Throwable throwable) {
         logThrottled(throwable);
       }
@@ -355,10 +380,15 @@ public final class ProximityRevealer implements Listener {
     warnIfCapacityExceeded();
     maybeExpire();
     try {
-      reveal(player, new Budget(limit()));
+      reveal(player, new Budget(limit()), scanShard());
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
+  }
+
+  /** 本轮的分片下标（按巡检次数轮转；{@code passes} 每轮恰好自增一次，见 {@link #maybeExpire}）。 */
+  private int scanShard() {
+    return (int) Math.floorMod(passes.get(), (long) SCAN_SHARDS);
   }
 
   /**
@@ -381,7 +411,7 @@ public final class ProximityRevealer implements Listener {
   }
 
   /** 主线程 / 区域线程：局部扫描取候选 → （可选）工作线程筛选 → 读真实方块 → 发包 → 标记已显形。 */
-  private void reveal(Player player, Budget budget) {
+  private void reveal(Player player, Budget budget, int shard) {
     if (!player.isOnline()
         || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
       return;
@@ -398,7 +428,8 @@ public final class ProximityRevealer implements Listener {
     ProximityScanner.Tally scanTally = new ProximityScanner.Tally();
     List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex,
         revealedSet, player.getUniqueId(), worldName, location.getBlockX(), location.getBlockY(),
-        location.getBlockZ(), proximity.distance(), fetchLimit(budget.remaining), scanTally);
+        location.getBlockZ(), proximity.distance(), fetchLimit(budget.remaining), shard,
+        SCAN_SHARDS, scanTally);
     if (candidates.isEmpty()) {
       return;
     }
@@ -484,6 +515,7 @@ public final class ProximityRevealer implements Listener {
     PassTally tally = new PassTally();
     tally.chunksScanned = scanTally.chunksScanned;
     tally.chunksSkipped = scanTally.chunksSkipped;
+    tally.chunksDeferred = scanTally.chunksDeferred;
     tally.positionsEvaluated = scanTally.positionsEvaluated;
     int candidateCount = plan != null
         ? plan.candidateCount
@@ -667,7 +699,8 @@ public final class ProximityRevealer implements Listener {
       return;
     }
     plugin.getLogger().info("首次显形诊断：扫描区块 " + tally.chunksScanned + " 个（整块跳过 "
-        + tally.chunksSkipped + "），坐标评估 " + tally.positionsEvaluated + " 个，候选 " + candidateCount
+        + tally.chunksSkipped + "，分片推迟 " + tally.chunksDeferred + "／共 " + SCAN_SHARDS
+        + " 片），坐标评估 " + tally.positionsEvaluated + " 个，候选 " + candidateCount
         + " 个，视锥剔除 " + frustumCulled + "，射线剔除 " + tally.rayCulled
         + "，实际发送 " + tally.sent);
   }

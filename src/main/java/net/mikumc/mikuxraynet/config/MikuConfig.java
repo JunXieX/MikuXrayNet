@@ -22,6 +22,8 @@ public final class MikuConfig {
   private final Logger logger;
   /** 「缺 dimensions 段」WARN 的进程级一次性闸门（重复 reload 不重复刷屏）。 */
   private final AtomicBoolean dimensionsWarned = new AtomicBoolean();
+  /** 「视锥两键低于安全下限」WARN 的进程级一次性闸门。 */
+  private final AtomicBoolean frustumFloorWarned = new AtomicBoolean();
 
   private AntiXrayConfig antiXray;
   private BandwidthConfig bandwidth;
@@ -54,6 +56,8 @@ public final class MikuConfig {
     }
     // 缺 dimensions 段（旧版 worlds / 顶层 obfuscation 结构）时用内置默认运行并一次性提示
     loadedAntiXray.warnIfDimensionsMissing(logger, dimensionsWarned);
+    // 视锥两键低于安全下限（会让玩家看得见的方块保持伪装）时按下限生效并一次性提示
+    loadedAntiXray.warnIfFrustumBelowFloor(logger, frustumFloorWarned);
     // tag(...) 展开失败的条目已按「忽略」处理（不猜成员），这里提示管理员改正
     if (!loadedAntiXray.unresolvedTags().isEmpty()) {
       logger.warning("配置里的 tag(...) 无法识别（不在内置 tag 映射表中），对应条目已忽略："

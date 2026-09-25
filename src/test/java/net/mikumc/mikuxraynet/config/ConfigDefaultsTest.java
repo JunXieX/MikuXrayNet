@@ -3,6 +3,8 @@ package net.mikumc.mikuxraynet.config;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
@@ -44,12 +46,63 @@ class ConfigDefaultsTest {
         "单次显形额度默认 256（原 128；配合 64 格距离，候选更多，额度需相应放大）");
     assertEquals(4, config.proximity().intervalTicks(), "巡检周期收紧为 4 tick（0.2 秒一次，显形更及时）");
     assertTrue(config.proximity().raycastEnabled(), "可见性判定默认开启（隔着墙不显形）");
-    assertEquals(4.0D, config.proximity().frustumMinDistance(), 1.0E-9D, "min-distance 保持 4 格");
+    assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_FLOOR, config.proximity().frustumMinDistance(),
+        1.0E-9D, "min-distance 默认为安全下限 16 格（原 4 格盖不住眼前方块：门的顶部在 3 格距离就有 40°+ 仰角）");
     assertEquals(524288, config.proximity().maxPositionsPerPlayer(),
         "单玩家坐标上限默认 524288（262144 在真机仍被顶到、淘汰 1400 个坐标）");
     assertEquals(4194304, config.proximity().maxPositions(),
         "全服坐标上限默认 4194304（原 2097152，约 8 个满配玩家，避免多玩家同时在线立刻触顶）");
     assertEquals(300, config.proximity().expireSeconds(), "显形索引过期默认 300 秒（原为 120）");
+  }
+
+  /**
+   * 视锥两键的<b>安全下限</b>：旧配置（fov=80 / min-distance=4）也必须被抬升到下限并留下 WARN 明细。
+   *
+   * <p>真机回归：视锥配得比客户端可视范围窄时，被剔除的坐标既不发包也不记已显形，玩家会看到
+   * 「站在门正前方，一半方块一直是伪装，点一下才变回来」。因此下限不是「建议值」而是硬约束，
+   * 且必须能被加载路径显式提示（绝不静默改用户配置）。
+   */
+  @Test
+  void frustumOptionsBelowSafetyFloorAreRaisedAndReported() {
+    AntiXrayConfig raised = AntiXrayConfig.from(yaml("""
+        proximity:
+          frustum:
+            fov: 80.0
+            min-distance: 4.0
+        """));
+
+    assertEquals(AntiXrayConfig.FRUSTUM_FOV_FLOOR, raised.proximity().frustumFov(), 1.0E-9D,
+        "旧默认 80° 必须被抬升到下限 110°");
+    assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_FLOOR, raised.proximity().frustumMinDistance(),
+        1.0E-9D, "旧默认 4 格必须被抬升到下限 16 格");
+    assertNotNull(raised.frustumFloorDetail(), "抬升必须留下明细，供加载时一次性 WARN");
+    assertTrue(raised.frustumFloorDetail().contains("proximity.frustum.fov=80.0"),
+        "明细必须点名被抬升的键：" + raised.frustumFloorDetail());
+    assertTrue(raised.frustumFloorDetail().contains("proximity.frustum.min-distance=4.0"),
+        "明细必须列出全部被抬升的键：" + raised.frustumFloorDetail());
+
+    // 高于下限的值原样生效（下限只挡更窄的配置），且不产生明细
+    AntiXrayConfig kept = AntiXrayConfig.from(yaml("""
+        proximity:
+          frustum:
+            fov: 120.0
+            min-distance: 24.0
+        """));
+    assertEquals(120.0D, kept.proximity().frustumFov(), 1.0E-9D, "高于下限的 fov 原样生效");
+    assertEquals(24.0D, kept.proximity().frustumMinDistance(), 1.0E-9D, "高于下限的 min-distance 原样生效");
+    assertNull(kept.frustumFloorDetail(), "未抬升时不得产生明细（否则会误导性 WARN）");
+
+    // 非法值：fov 的 0/-1/大于 360 一律回落默认（= 下限）；min-distance 负数按 0 处理后同样抬升到下限
+    AntiXrayConfig invalid = AntiXrayConfig.from(yaml("""
+        proximity:
+          frustum:
+            fov: 0.0
+            min-distance: -5.0
+        """));
+    assertEquals(AntiXrayConfig.FRUSTUM_FOV_FLOOR, invalid.proximity().frustumFov(), 1.0E-9D,
+        "fov 非法值回落默认（即下限）");
+    assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_FLOOR,
+        invalid.proximity().frustumMinDistance(), 1.0E-9D, "min-distance 负数按下限处理");
   }
 
   /**
@@ -350,7 +403,9 @@ class ConfigDefaultsTest {
     // proximity 其余键
     assertTrue(config.proximity().enabled(), "邻近显形默认开启");
     assertTrue(config.proximity().frustumEnabled(), "视锥剔除默认开启");
-    assertEquals(80.0D, config.proximity().frustumFov(), 1.0E-9D, "视锥竖直全角默认 80°");
+    assertEquals(AntiXrayConfig.FRUSTUM_FOV_FLOOR, config.proximity().frustumFov(), 1.0E-9D,
+        "视锥竖直全角默认为安全下限 110°（客户端 FOV 上限；配窄会让玩家看得见的方块保持伪装）");
+    assertNull(config.frustumFloorDetail(), "默认值不触发安全下限抬升（不产生误导性 WARN）");
     assertEquals(4, config.proximity().raycastSamples(),
         "候选点数默认 4（原生射线改造后语义为「每方块最多尝试的候选点数」，钳制 1..8）");
     assertTrue(config.proximity().batchRevealSends(),

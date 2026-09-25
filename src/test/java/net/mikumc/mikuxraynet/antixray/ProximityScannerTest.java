@@ -5,14 +5,18 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /**
  * 局部扫描测试：只遍历玩家身边 {@code ceil(distance/16)} 个区块半径内的区块、整块已显形则跳过、
- * 玩家之间互不影响、候选按距离由近到远排序并受上限约束。
+ * 玩家之间互不影响、候选按距离由近到远排序并受上限约束、附近区块按分片轮转（窗口外的坐标不被永久饿死）。
  *
  * <p>计数用 {@link ProximityScanner.Tally} 断言「扫描了几个区块、跳过了几个区块、评估了几个坐标」，
  * 这正是重构后「每周期候选评估量」的可观测口径。
@@ -50,7 +54,15 @@ class ProximityScannerTest {
 
   private static List<ObfuscatedChunkIndex.Position> scan(ObfuscatedChunkIndex index,
       RevealedSet revealed, UUID player, double distance, int limit, ProximityScanner.Tally tally) {
-    return ProximityScanner.candidates(index, revealed, player, WORLD, 8, 64, 8, distance, limit, tally);
+    // 不分片（shards=1）：既有断言的语义都是「一次扫描看到全部候选」，与分片轮转互不干扰
+    return scanShard(index, revealed, player, distance, limit, 0, 1, tally);
+  }
+
+  private static List<ObfuscatedChunkIndex.Position> scanShard(ObfuscatedChunkIndex index,
+      RevealedSet revealed, UUID player, double distance, int limit, int shard, int shards,
+      ProximityScanner.Tally tally) {
+    return ProximityScanner.candidates(index, revealed, player, WORLD, 8, 64, 8, distance, limit,
+        shard, shards, tally);
   }
 
   // ------------------------------------------------------------------ 局部扫描边界
@@ -268,5 +280,102 @@ class ProximityScannerTest {
     assertEquals(new ObfuscatedChunkIndex.Position(8, 64, 9), found.get(0), "先返回最近的坐标");
     assertEquals(new ObfuscatedChunkIndex.Position(8, 64, 11), found.get(1));
     assertEquals(new ObfuscatedChunkIndex.Position(8, 64, 12), found.get(2));
+  }
+
+  // ------------------------------------------------------------------ 分片轮转（候选窗口不被永久占满）
+
+  /**
+   * 核心回归：候选窗口被「永远看不见的坐标」长期占满时，分片轮转必须让每个分片都能轮到。
+   *
+   * <p>构造：每个分片各挑一个区块、各放 1 个坐标，窗口（limit）只有 1 条。不分片时每次扫描只看最近的
+   * 那一个（其余永远轮不到）；分片后每次看一片，{@code shards} 个周期内每片的坐标都会被评估到
+   * （分片只摊薄「重复占用窗口」，不改变片内「近的先评估」）。
+   */
+  @Test
+  void everyShardIsVisitedWithinShardCountPasses() {
+    int shards = 4;
+    // 反查每个分片在扫描半径内的一个区块（分片由区块坐标散列决定，逐个查而不是假设某几个区块互不相同）；
+    // 距离过滤必须与扫描一致（玩家在 (8,64,8)、distance=64），否则挑到半径外的区块会得到空结果
+    Map<Integer, int[]> chunkOfShard = new HashMap<>();
+    for (int chunkX = -3; chunkX <= 3 && chunkOfShard.size() < shards; chunkX++) {
+      for (int chunkZ = -3; chunkZ <= 3 && chunkOfShard.size() < shards; chunkZ++) {
+        int x = (chunkX << 4) | 1;
+        int z = (chunkZ << 4) | 1;
+        if (Math.hypot(x - 8, z - 8) > 64.0D) {
+          continue;
+        }
+        chunkOfShard.putIfAbsent(ProximityScanner.shardOf(chunkX, chunkZ, shards),
+            new int[] {x, z});
+      }
+    }
+    assertEquals(shards, chunkOfShard.size(), "半径内必须能凑齐全部 " + shards + " 片：" + chunkOfShard);
+
+    ObfuscatedChunkIndex index = index();
+    RevealedSet revealed = revealed();
+    Set<ObfuscatedChunkIndex.Position> expected = new HashSet<>();
+    for (int[] block : chunkOfShard.values()) {
+      index.recordChunk(WORLD, block[0] >> 4, block[1] >> 4, MIN_HEIGHT,
+          new int[] {local(block[0], 64, block[1])});
+      expected.add(new ObfuscatedChunkIndex.Position(block[0], 64, block[1]));
+    }
+
+    Set<ObfuscatedChunkIndex.Position> seen = new HashSet<>();
+    for (int pass = 0; pass < shards; pass++) {
+      // 窗口 = 1 条：每周期只可能评估一个坐标，覆盖完全依赖分片轮转
+      seen.addAll(scanShard(index, revealed, PLAYER, 64.0D, 1, pass, shards, null));
+    }
+
+    assertEquals(expected, seen, "每个分片的坐标都必须在其分片周期内被评估到：" + seen);
+  }
+
+  /** 分片只改变「本次看哪一片」：每片各自返回属于它的区块候选，且并集等于不分片的结果。 */
+  @Test
+  void shardsPartitionChunksWithoutLosingAnyCandidate() {
+    ObfuscatedChunkIndex index = index();
+    RevealedSet revealed = revealed();
+    Set<ObfuscatedChunkIndex.Position> all = new HashSet<>();
+    for (int chunkX = -1; chunkX <= 1; chunkX++) {
+      for (int chunkZ = -1; chunkZ <= 1; chunkZ++) {
+        index.recordChunk(WORLD, chunkX, chunkZ, MIN_HEIGHT,
+            new int[] {local((chunkX << 4) + 1, 64, (chunkZ << 4) + 1),
+                local((chunkX << 4) + 2, 64, (chunkZ << 4) + 1)});
+        all.add(new ObfuscatedChunkIndex.Position((chunkX << 4) + 1, 64, (chunkZ << 4) + 1));
+        all.add(new ObfuscatedChunkIndex.Position((chunkX << 4) + 2, 64, (chunkZ << 4) + 1));
+      }
+    }
+
+    int shards = 4;
+    Set<ObfuscatedChunkIndex.Position> union = new HashSet<>();
+    for (int shard = 0; shard < shards; shard++) {
+      ProximityScanner.Tally tally = new ProximityScanner.Tally();
+      List<ObfuscatedChunkIndex.Position> part =
+          scanShard(index, revealed, PLAYER, 64.0D, 512, shard, shards, tally);
+      assertTrue(union.addAll(part), "同一次巡检内不得重复评估同一个坐标（分片必须互斥）");
+      assertTrue(tally.chunksDeferred > 0, "本片之外还有区块，必须计入「分片推迟」：" + tally.chunksDeferred);
+    }
+
+    assertEquals(all, union, "各片并集必须等于全部候选（分片不丢坐标）");
+  }
+
+  /** 分片只由区块坐标决定（同一区块永远属于同一片），否则「几个周期内必轮到」的保证不成立。 */
+  @Test
+  void shardAssignmentIsStableAndSplitsEvenly() {
+    for (int shards = 2; shards <= 4; shards++) {
+      Map<Integer, Integer> perShard = new HashMap<>();
+      for (int chunkX = -8; chunkX < 8; chunkX++) {
+        for (int chunkZ = -8; chunkZ < 8; chunkZ++) {
+          int shard = ProximityScanner.shardOf(chunkX, chunkZ, shards);
+          assertTrue(shard >= 0 && shard < shards, "分片下标必须在 0..shards-1：" + shard);
+          assertEquals(shard, ProximityScanner.shardOf(chunkX, chunkZ, shards), "同一区块的分片必须稳定");
+          perShard.merge(shard, 1, Integer::sum);
+        }
+      }
+      assertEquals(shards, perShard.size(), "每片都应有区块（256 个区块按 " + shards + " 片散列）");
+      for (int count : perShard.values()) {
+        assertTrue(count >= 256 / (shards * 2),
+            "分片必须大致均匀（否则某一片会长期占满窗口）：shards=" + shards + " → " + perShard);
+      }
+    }
+    assertEquals(0, ProximityScanner.shardOf(-3, 7, 1), "shards<=1 等价于不分片");
   }
 }

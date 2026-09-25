@@ -458,6 +458,10 @@ public final class Diagnostics {
         .append("，min-distance=").append(c.proximity().frustumMinDistance())
         .append("，raycast.enabled=").append(c.proximity().raycastEnabled())
         .append("，raycast.samples=").append(c.proximity().raycastSamples()).append('\n');
+    // 视锥两键被安全下限抬升时明示（否则管理员会以为 dump 里的值是自己配的，或怀疑读错配置）
+    if (c.frustumFloorDetail() != null) {
+      sb.append("proximity.frustum 低于安全下限已抬升：").append(c.frustumFloorDetail()).append('\n');
+    }
     sb.append("disk-cache.enabled=").append(c.diskCache().enabled())
         .append("，max-entries=").append(c.diskCache().maxEntries())
         .append("，max-file-size-mb=").append(c.diskCache().maxFileSizeMb())

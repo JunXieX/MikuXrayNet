@@ -49,7 +49,9 @@ class ProximitySelectionTest {
   }
 
   private List<ObfuscatedChunkIndex.Position> scan(double distance, int limit) {
-    return ProximityScanner.candidates(index, revealed, PLAYER, WORLD, 0, 64, 0, distance, limit, null);
+    // shard=0 / shards=1：不分片（分片轮转的语义由 ProximityScannerTest 单独覆盖）
+    return ProximityScanner.candidates(index, revealed, PLAYER, WORLD, 0, 64, 0, distance, limit,
+        0, 1, null);
   }
 
   /** 把若干绝对方块坐标登记为「曾被伪装」（按所在区块分组，同一区块共用一条条目）。 */

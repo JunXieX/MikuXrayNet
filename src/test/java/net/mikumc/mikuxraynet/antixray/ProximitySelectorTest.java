@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.HashSet;
 import java.util.Set;
+import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -103,6 +104,54 @@ class ProximitySelectorTest {
         "脚下/同格坐标豁免");
     assertTrue(ProximitySelector.withinFrustum(eye, 3, 64, -7, 12.0D, DEFAULT_FOV),
         "豁免距离可配");
+  }
+
+  // ---------------------------------------------------------------- 打包默认值的安全保证（真机回归）
+
+  /** 打包 antixray.yml 的视锥默认值：竖直全角 110°、16 格内豁免。 */
+  private static final double PACKED_FOV = AntiXrayConfig.FRUSTUM_FOV_FLOOR;
+  private static final double PACKED_MIN_DISTANCE = AntiXrayConfig.FRUSTUM_MIN_DISTANCE_FLOOR;
+
+  /**
+   * 真机回归：站在黑曜石门正前方时，「门的上半部分」在 3 格距离上就有 40° 以上的仰角。
+   *
+   * <p>旧默认（fov=80 / min-distance=4）会把它们判为视锥外 → 不发包也不记已显形 → 玩家看到的
+   * 一直是伪装方块，直到点一下/挖一下（事件显形不做视锥判定）才变回来。
+   * 打包默认值下，16 格内的任何方向都必须保留，因此这类「看得见却是假的」不再发生。
+   */
+  @Test
+  void packedDefaultsKeepBlocksInFrontOfThePlayer() {
+    ProximitySelector.Eye eye = standingEye();
+
+    // 门顶部：前方 3 格、比眼睛高 3 格（仰角约 45°）——旧配置在这里被剔除
+    assertTrue(ProximitySelector.withinFrustum(eye, 0, 69, 3, PACKED_MIN_DISTANCE, PACKED_FOV),
+        "眼前 3 格、仰角约 45° 的门顶必须保留（16 格内一律豁免视锥）");
+    assertTrue(ProximitySelector.withinFrustum(eye, -4, 68, 2, PACKED_MIN_DISTANCE, PACKED_FOV),
+        "近处侧上方同样保留");
+    assertTrue(ProximitySelector.withinFrustum(eye, 0, 66, -8, PACKED_MIN_DISTANCE, PACKED_FOV),
+        "16 格内的背后/脚下也豁免（贴脸不管朝向都必须显形）");
+    assertTrue(ProximitySelector.withinFrustum(eye, 3, 64, 14, PACKED_MIN_DISTANCE, PACKED_FOV),
+        "水平偏 12° 左右、14 格远仍在锥内");
+  }
+
+  /**
+   * 默认 110° 覆盖「客户端 FOV 上限 110 + 16:9」的整个可视区：竖直 55°、水平约 68°。
+   *
+   * <p>即：客户端的 FOV 无论怎么调，玩家屏幕上的方块都不会被误剔；更宽的屏幕见 yml 注释。
+   */
+  @Test
+  void packedFovCoversClientMaximumFieldOfView() {
+    ProximitySelector.Eye eye = facingPositiveZ();
+
+    // 仰角约 50°（与视线俯仰之差 50° > 旧默认的竖直半角 40°，但在新的 55° 内）→ 必须在锥内
+    assertTrue(ProximitySelector.withinFrustum(eye, 0, 90, 22, PACKED_MIN_DISTANCE, PACKED_FOV),
+        "仰角约 50° 在 55° 半角内（客户端 FOV=100 时屏幕顶部可见）");
+    // 水平约 65°（16:9 客户端 FOV=110 时屏幕侧边；旧默认的水平半角是 56°）→ 必须在锥内
+    assertTrue(ProximitySelector.withinFrustum(eye, 43, 64, 20, PACKED_MIN_DISTANCE, PACKED_FOV),
+        "水平约 65° 在 68° 半角内（16:9、FOV=110 的屏幕边缘）");
+    // 远超客户端可视范围（水平约 84°）→ 仍然剔除（视锥的省流作用保留）
+    assertFalse(ProximitySelector.withinFrustum(eye, 20, 64, 2, PACKED_MIN_DISTANCE, PACKED_FOV),
+        "水平约 84° 超出 68° 半角，仍应剔除（侧后方继续省流）");
   }
 
   @Test

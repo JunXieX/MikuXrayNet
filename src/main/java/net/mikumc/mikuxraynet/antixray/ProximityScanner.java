@@ -21,6 +21,22 @@ import java.util.UUID;
  * <p><b>活跃时间刷新</b>：只要区块在扫描半径内，无论它是否被「整块跳过」，都会刷新该玩家在此区块的
  * 已显形标记活跃时间——否则整块显形的区块会因长期未被刷新而被过期清掉，「整块跳过」随之周期性失效。
  *
+ * <p><b>区块分片轮转（为什么必须有）</b>：单次扫描的候选被截断到 {@code limit} 条（见调用方的
+ * {@code CANDIDATE_OVERSAMPLE} / {@code MAX_CANDIDATES}），窗口按距离由近到远取。被视锥/射线剔除的
+ * 候选<b>不发包也不记已显形</b>，于是「永远看不见的坐标」（整块埋住、上方是流体等）会长期占住窗口名额：
+ * 玩家身边的伪装坐标一旦超过窗口，被挤在窗口之外的那批坐标就一直轮不到评估——真机表现为「明明在眼前的
+ * 方块一直是假的，点一下（事件显形不做窗口截断）才变回来」。
+ *
+ * <p>分片的做法与保证：把附近区块按稳定哈希分成 {@code shards} 片，每次巡检只看其中一片。
+ * <ul>
+ *   <li>每片内部仍然「近的先评估」（分片不改变任何判定语义）；</li>
+ *   <li>同一批被占用的窗口名额不再<b>每个</b>周期重复占用，而是每 {@code shards} 个周期才重复一次，
+ *       因此窗口的有效覆盖范围扩大到约 {@code shards} 倍，每个分片每 {@code shards} 个周期至少被访问一次；</li>
+ *   <li>分片由区块坐标散列决定（不随巡检次数变化），因此覆盖是轮转的、不会遗漏某个方向。</li>
+ * </ul>
+ * 注意：分片是「摊薄重复占用」，不是「无视窗口的硬保证」——某片自己的候选数超过窗口时，该片内同样按距离
+ * 优先取最近的若干条（这是刻意的：脚边的矿必须先还原）。
+ *
  * <p>纯计算，不触碰任何 Bukkit API，可在任意线程调用、可离线单测。
  */
 final class ProximityScanner {
@@ -32,6 +48,8 @@ final class ProximityScanner {
     int chunksScanned;
     /** 因整块已显形而直接跳过的区块数。 */
     int chunksSkipped;
+    /** 属于其它分片、本周期不看的区块数（下一个周期轮到它们）。 */
+    int chunksDeferred;
     /** 逐坐标评估（距离筛选）的次数，即「每周期候选评估量」。 */
     int positionsEvaluated;
   }
@@ -53,16 +71,20 @@ final class ProximityScanner {
    * 「先扫描者在前」稳定输出（次级键 sequence 即到达序号，等价于旧稳定排序保留的遍历序）。
    *
    * @param limit 返回条数上限；小于等于 0 时返回空列表
+   * @param shard 本次巡检看的分片下标（{@code 0 <= shard < shards}）
+   * @param shards 分片总数；小于等于 1 时等价于「不分片」（旧行为，全部区块都看）
    * @param tally 计数收集器；可为 {@code null}
    * @return 候选坐标（不超过 limit 条）；无候选时返回空列表
    */
   static List<ObfuscatedChunkIndex.Position> candidates(ObfuscatedChunkIndex index,
       RevealedSet revealed, UUID playerId, String worldName, int x, int y, int z,
-      double maxDistance, int limit, Tally tally) {
+      double maxDistance, int limit, int shard, int shards, Tally tally) {
     if (index == null || revealed == null || playerId == null || worldName == null
         || limit <= 0 || maxDistance < 0.0D) {
       return List.of();
     }
+    int totalShards = Math.max(1, shards);
+    int currentShard = Math.floorMod(shard, totalShards);
 
     int radius = (int) Math.ceil(maxDistance / 16.0D);
     int centerX = x >> 4;
@@ -80,6 +102,15 @@ final class ProximityScanner {
         ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
         ObfuscatedChunkIndex.ChunkEntry entry = index.entry(key);
         if (entry == null) {
+          continue;
+        }
+        // 分片轮转：本周期只处理属于本片的区块，其余留给后面的周期（见类注释「区块分片轮转」）。
+        // 放在「整块跳过」判定之前：不属于本片的区块连清单都不读，本片单周期的评估量因此不随
+        // 「身边伪装坐标总量」增长——它只与本片的坐标数相关。
+        if (totalShards > 1 && shardOf(chunkX, chunkZ, totalShards) != currentShard) {
+          if (tally != null) {
+            tally.chunksDeferred++;
+          }
           continue;
         }
         // 刷新该玩家在此区块的活跃时间必须放在「整块跳过」判定之前：整块已显形的区块不再逐坐标评估，
@@ -129,6 +160,23 @@ final class ProximityScanner {
       result.add(scored.position());
     }
     return result;
+  }
+
+  /**
+   * 区块所属的分片下标：把区块坐标按两个大素数散列后取模，分布均匀且与巡检次数无关。
+   *
+   * <p><b>为什么用哈希而不是「区块坐标取模」</b>：取模会把分片按切片/条带划分，同一片的区块在空间上
+   * 连成一片，玩家沿一个方向走时容易长时间落在同一片里（另一片被反复推迟）；散列让每片都均匀散布在
+   * 玩家周围，任意方向的坐标都能在 {@code shards} 个周期内轮到。
+   *
+   * <p>纯函数、可离线单测；{@code shards <= 1} 时恒为 0（等价于不分片）。
+   */
+  static int shardOf(int chunkX, int chunkZ, int shards) {
+    if (shards <= 1) {
+      return 0;
+    }
+    int hash = chunkX * 73856093 ^ chunkZ * 19349663;
+    return Math.floorMod(hash, shards);
   }
 
   /** 往容量上限为 {@code limit} 的最大堆里放一个候选：堆满时淘汰堆顶（最差者）。 */

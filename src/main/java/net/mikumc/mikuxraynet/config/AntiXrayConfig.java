@@ -257,6 +257,28 @@ public final class AntiXrayConfig {
   }
 
   /**
+   * 视锥竖直全角的<b>安全下限</b>（度）：等于 Minecraft 客户端 FOV 设置的上限 110。
+   *
+   * <p><b>为什么设下限而不是只写默认值</b>：客户端的 FOV 是纯本地设置、服务端拿不到，而视锥剔除
+   * 的代价是「被剔除的坐标不发包、也不记已显形」——配得比客户端真实视场更窄，就会让玩家<b>明明看得见</b>
+   * 的方块一直保持伪装（真机反馈：「站在黑曜石门正前方，一半方块始终是石头/泥土，点一下才变回来」
+   * ——周期性显形走视锥判定、点击走的事件显形不走，两者只差这一道闸门）。
+   * 取 110° 时，16:9 屏幕下竖直半角 55°、水平半角 68.4°，恰好覆盖「客户端 FOV 开到上限 + 16:9」
+   * 的整个可视区，因此<b>任何合法客户端能看到的方向都不会被剔除</b>（更宽的屏幕见 yml 注释）。
+   * 想省带宽应当关掉整个视锥剔除（{@code proximity.frustum.enabled=false}），而不是把角度配窄。
+   */
+  public static final double FRUSTUM_FOV_FLOOR = 110.0D;
+
+  /**
+   * 视锥「最小豁免距离」的<b>安全下限</b>（格）：该距离内的候选完全不参与视锥判定。
+   *
+   * <p>贴脸/脚边的方块应当「看得见就一定是真的」——角度再偏也必须显形，否则会出现
+   * 「站在门/墙正前方，近处那半边是伪装、点一下才变回来」的现象（门的顶部在 3 格距离上就有
+   * 40° 以上的仰角，配 4 格豁免必然被剔除）。16 格 = 一个区块的距离，覆盖玩家「在跟前」的全部观感。
+   */
+  public static final double FRUSTUM_MIN_DISTANCE_FLOOR = 16.0D;
+
+  /**
    * 邻近显形：玩家靠近曾被伪装的坐标时，主动把该坐标的真实方块发回客户端。
    *
    * @param distance              触发显形的距离（格，三维欧氏距离，等于阈值也算命中）
@@ -268,8 +290,10 @@ public final class AntiXrayConfig {
    * @param frustumEnabled        是否只显形玩家视野锥内的候选坐标
    * @param frustumFov            视野锥<b>竖直全张开角</b>（度）——与 Minecraft 客户端 FOV 设置同义；
    *                              水平方向按 16:9 宽高比换算后更宽（约 1.4 倍），
-   *                              详见 {@code ProximitySelector#withinFrustum}
-   * @param frustumMinDistance    该距离内的候选豁免视锥判定
+   *                              详见 {@code ProximitySelector#withinFrustum}；
+   *                              <b>不低于 {@link #FRUSTUM_FOV_FLOOR}</b>（低于下限会被抬升并 WARN）
+   * @param frustumMinDistance    该距离内的候选豁免视锥判定；
+   *                              <b>不低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR}</b>（低于下限会被抬升并 WARN）
    * @param raycastEnabled        是否做射线可见性判定（被墙挡住的不显形；<b>默认开启</b>）
    * @param raycastSamples        <b>每方块最多尝试的候选点数</b>（射线改用 Paper 原生
    *                              {@code World#rayTraceBlocks} 后不再表示采样数）；钳制 1..8，默认 4
@@ -388,6 +412,11 @@ public final class AntiXrayConfig {
   private final boolean[] dimensionEnabled;
   /** 配置是否缺少 {@code dimensions} 段（缺段时用内置默认运行并一次性 WARN）。 */
   private final boolean dimensionsMissing;
+  /**
+   * 视锥两键被安全下限（{@link #FRUSTUM_FOV_FLOOR} / {@link #FRUSTUM_MIN_DISTANCE_FLOOR}）抬升的明细；
+   * {@code null} 表示未抬升。加载时由 {@link #warnIfFrustumBelowFloor} 一次性 WARN。
+   */
+  private final String frustumFloorDetail;
   private final boolean layerObfuscation;
   private final boolean removeBlockEntities;
   private final Neighbors neighbors;
@@ -419,7 +448,8 @@ public final class AntiXrayConfig {
       boolean removeBlockEntities, Neighbors neighbors, Occlusion occlusion, Proximity proximity,
       DiskCache diskCache, PlatformSupport.Mode platform, int cacheMaximumSize,
       int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis, int queueCapacity,
-      Set<String> unresolvedTags, List<WorldOverride> worldOverrides, List<String> worldBlacklist) {
+      Set<String> unresolvedTags, List<WorldOverride> worldOverrides, List<String> worldBlacklist,
+      String frustumFloorDetail) {
     this.enabled = enabled;
     this.dimensionEffectives = dimensionEffectives.clone();
     this.dimensionEnabled = dimensionEnabled.clone();
@@ -440,6 +470,8 @@ public final class AntiXrayConfig {
     this.worldOverrides = List.copyOf(worldOverrides);
     // 黑名单在构造期拆分并预编译通配匹配器：热路径只有短线性扫描，绝不逐包编译正则（列表通常 1~10 项）。
     this.worldBlacklist = List.copyOf(worldBlacklist);
+    // 视锥两键被安全下限抬升的明细（null = 未抬升）；加载时由 warnIfFrustumBelowFloor 一次性提示
+    this.frustumFloorDetail = frustumFloorDetail;
     List<String> blacklistExactNames = new ArrayList<>(this.worldBlacklist.size());
     List<Pattern> blacklistGlobPatterns = new ArrayList<>(this.worldBlacklist.size());
     for (String pattern : this.worldBlacklist) {
@@ -563,6 +595,9 @@ public final class AntiXrayConfig {
     List<WorldOverride> overrides =
         parseWorldOverrides(root.getConfigurationSection("world-overrides"), unknownTags);
 
+    // ---- proximity.frustum 的安全下限：被抬升的键记进 detail，加载时一次性 WARN（解析侧不持日志）----
+    StringBuilder frustumFloorDetail = new StringBuilder();
+
     return new AntiXrayConfig(
         root.getBoolean("enabled", true),
         effectives,
@@ -596,8 +631,13 @@ public final class AntiXrayConfig {
             Math.max(1, root.getInt("proximity.max-positions", 4194304)),
             Math.max(1, root.getInt("proximity.max-positions-per-player", 524288)),
             root.getBoolean("proximity.frustum.enabled", true),
-            clampFov(root.getDouble("proximity.frustum.fov", 80.0D)),
-            Math.max(0.0D, root.getDouble("proximity.frustum.min-distance", 4.0D)),
+            // 视锥两键都有安全下限（见 FRUSTUM_FOV_FLOOR / FRUSTUM_MIN_DISTANCE_FLOOR）：
+            // 配得比客户端可视范围更窄会让「玩家看得见的方块」保持伪装，因此低于下限时按下限生效，
+            // 并把被抬升的键记进 frustumFloorDetail，由加载时一次性 WARN 显式告知（绝不静默改配置）。
+            frustumFov(root.getDouble("proximity.frustum.fov", FRUSTUM_FOV_FLOOR), frustumFloorDetail),
+            frustumMinDistance(
+                root.getDouble("proximity.frustum.min-distance", FRUSTUM_MIN_DISTANCE_FLOOR),
+                frustumFloorDetail),
             root.getBoolean("proximity.raycast.enabled", true),
             // 语义已变：原生射线改造后本键表示「每方块最多尝试的候选点数」（不再表示采样数）。
             // 钳制 1..8，默认 4；候选点的选择只在暴露面上（面中心 → 最近点 → 面四角），命中即止。
@@ -634,7 +674,8 @@ public final class AntiXrayConfig {
         root.getInt("advanced.queue-capacity", 2048),
         unknownTags,
         overrides,
-        worldBlacklist);
+        worldBlacklist,
+        frustumFloorDetail.isEmpty() ? null : frustumFloorDetail.toString());
   }
 
   /**
@@ -847,12 +888,40 @@ public final class AntiXrayConfig {
     return null;
   }
 
-  /** 视野角钳制到合法区间；非法值回落到默认 80°。 */
-  private static double clampFov(double value) {
-    if (value <= 0.0D || value > 360.0D) {
-      return 80.0D;
+  /**
+   * 视锥竖直全角的生效值：非法值（{@code <=0} / {@code >360}）回落默认，低于
+   * {@link #FRUSTUM_FOV_FLOOR} 时抬升到下限并把明细写入 {@code floorDetail}。
+   *
+   * <p>升到下限而不是照配置生效的原因见 {@link #FRUSTUM_FOV_FLOOR}：配窄了会让玩家看得见的方块
+   * 一直保持伪装（显形判定里只有这一道闸门会「看得见却不发」）。要省带宽请关掉整个视锥剔除。
+   */
+  private static double frustumFov(double configured, StringBuilder floorDetail) {
+    if (Double.isNaN(configured) || configured <= 0.0D || configured > 360.0D) {
+      return FRUSTUM_FOV_FLOOR;
     }
-    return value;
+    if (configured >= FRUSTUM_FOV_FLOOR) {
+      return configured;
+    }
+    floorDetail.append("proximity.frustum.fov=").append(configured).append("（下限 ")
+        .append(FRUSTUM_FOV_FLOOR).append("°）");
+    return FRUSTUM_FOV_FLOOR;
+  }
+
+  /** 最小豁免距离的生效值：低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR} 时抬升到下限并记录明细。 */
+  private static double frustumMinDistance(double configured, StringBuilder floorDetail) {
+    if (Double.isNaN(configured)) {
+      return FRUSTUM_MIN_DISTANCE_FLOOR;
+    }
+    double value = Math.max(0.0D, configured);
+    if (value >= FRUSTUM_MIN_DISTANCE_FLOOR) {
+      return value;
+    }
+    if (!floorDetail.isEmpty()) {
+      floorDetail.append('、');
+    }
+    floorDetail.append("proximity.frustum.min-distance=").append(value).append("（下限 ")
+        .append(FRUSTUM_MIN_DISTANCE_FLOOR).append(" 格）");
+    return FRUSTUM_MIN_DISTANCE_FLOOR;
   }
 
   /** 解析缺失策略；取值非法时回落到最安全的 {@link MissingPolicy#HIDE}。 */
@@ -906,6 +975,31 @@ public final class AntiXrayConfig {
     }
     logger.warning("antixray.yml 缺少 dimensions 段：已使用内置默认（按维度）反矿透规则运行。"
         + "旧版 worlds / 顶层 obfuscation 键已不再解析且不会自动迁移，请删除旧配置并让插件重新生成 antixray.yml。");
+  }
+
+  /**
+   * 视锥两键被安全下限抬升时的<b>一次性</b>中文 WARN（进程级闸门 {@code once} 保证只提示一次）。
+   *
+   * <p><b>为什么必须提示</b>：生效值与管理员的 yml 不一致，若不说明，管理员会以为「配的还是我写的值」，
+   * 或反过来怀疑插件读错配置。这里明确给出被抬升的键与原因，并指出正确的省带宽出口
+   * （关掉整个视锥剔除，而不是把角度/距离配窄）。
+   *
+   * @param once 进程级一次性闸门（同一实例重复 reload 不会重复刷屏）
+   */
+  public void warnIfFrustumBelowFloor(Logger logger, AtomicBoolean once) {
+    if (frustumFloorDetail == null || logger == null || !once.compareAndSet(false, true)) {
+      return;
+    }
+    logger.warning("antixray.yml 的 " + frustumFloorDetail + " 低于安全下限，已按下限生效"
+        + "（当前：fov=" + proximity.frustumFov() + "°、min-distance=" + proximity.frustumMinDistance()
+        + " 格）。客户端 FOV 是纯本地设置、服务端拿不到，视锥配得比它更窄会让玩家「看得见的方块」"
+        + "一直保持伪装（表现为要点一下或挖一下才变回来）；确实想省带宽请把 proximity.frustum.enabled"
+        + " 设为 false（完全不做视锥剔除），而不是缩小角度。");
+  }
+
+  /** 视锥两键被安全下限抬升的明细（{@code null} = 未抬升）；供诊断回显。 */
+  public String frustumFloorDetail() {
+    return frustumFloorDetail;
   }
 
   /** 逐世界覆盖段（声明序）；空列表 = 无覆盖。 */
