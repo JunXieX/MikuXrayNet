@@ -111,11 +111,35 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
 
   @Override
   public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
-    if (args.length != 1) {
+    return suggestSubcommands(args);
+  }
+
+  /**
+   * 子命令补全（纯函数，可离线单测）。
+   *
+   * <p><b>为什么要兼容两种调用约定</b>：本命令在 Paper/Folia 上走 Brigadier（{@code BasicCommand#suggest}），
+   * 在纯 Bukkit/Spigot 上走传统 {@link TabCompleter}，两者对「只敲了命令、还没输入任何字符」这一情形的
+   * 入参不同：
+   * <ul>
+   *   <li>Paper：{@code PaperCommands#register(label, description, aliases, basicCommand)} 里
+   *       {@code String[] args = StringUtils.split(suggestionsBuilder.getRemaining())}，
+   *       此时 remaining 为空串 → 传入<b>长度 0 的数组</b>（源码见 paper-server 的 PaperCommands）；</li>
+   *   <li>Bukkit：{@code args} 的最后一项是「正在输入的那一段」，空前缀时即 {@code [""]}，
+   *       且长度始终 ≥ 1（所以下面按「长度 0 或 1 = 正在输入第一个参数」归一化）。</li>
+   * </ul>
+   * 真机反馈的「TAB 补全不能用」正是前者：旧实现在长度不为 1 时直接返回空列表，
+   * 于是 Paper/Folia 上 {@code /mxnet <TAB>} 一个候选都出不来（输入了首字母反而有）。
+   *
+   * <p>权限不在这里过滤：命令本身要求 {@code mikuxraynet.admin}，各子命令的权限在真正执行时判定，
+   * 补全只做「有哪些子命令」这一件事（与旧行为一致）。
+   */
+  static List<String> suggestSubcommands(String[] args) {
+    if (args != null && args.length > 1) {
+      // 已有第二个参数：本命令没有二级参数，不补全（Paper 在「首个参数后跟空格」时会传 ["status", ""]）
       return List.of();
     }
-    String prefix = args[0].toLowerCase(Locale.ROOT);
-    List<String> matches = new ArrayList<>();
+    String prefix = args == null || args.length == 0 ? "" : args[0].toLowerCase(Locale.ROOT);
+    List<String> matches = new ArrayList<>(SUBCOMMANDS.size());
     for (String sub : SUBCOMMANDS) {
       if (sub.startsWith(prefix)) {
         matches.add(sub);

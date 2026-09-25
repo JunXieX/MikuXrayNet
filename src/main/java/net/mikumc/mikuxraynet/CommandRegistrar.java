@@ -120,6 +120,10 @@ final class CommandRegistrar {
 
     @Override
     public Collection<String> suggest(CommandSourceStack source, String[] args) {
+      // 入参约定（Paper 源码 paper-server：PaperCommands#register(label, description, aliases, basicCommand)）：
+      //   args = StringUtils.split(suggestionsBuilder.getRemaining())，且 remaining 以空格结尾时补一个空串。
+      // 因此「只敲了 /mxnet、还没输入字符」时 args 是空数组（传统 Bukkit TabCompleter 那里是 [""]）；
+      // 归一化交给 MikuCommand#suggestSubcommands 做，两条注册路径共用同一份补全语义。
       List<String> suggestions = delegate.onTabComplete(source.getSender(), null, COMMAND_NAME, args);
       return suggestions == null ? List.of() : suggestions;
     }
