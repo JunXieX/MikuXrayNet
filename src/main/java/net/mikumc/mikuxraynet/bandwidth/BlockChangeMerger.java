@@ -39,7 +39,7 @@ import org.bukkit.plugin.Plugin;
 
 /**
  * 方块变更合并：把同一玩家在短时间窗内的多条 {@code BLOCK_CHANGE} / {@code MULTI_BLOCK_CHANGE}
- * 按「曼哈顿距离 2 的邻域」聚簇，并按 section 分组重建成更少的合并包。
+ * 按配置 {@code block-changes.merge-radius}（默认 2）的曼哈顿邻域聚簇，并按 section 分组重建成更少的合并包。
  *
  * <p><b>同步监听无法延迟放行</b>，因此走 ProtocolLib 异步通道：
  * {@code incrementProcessingDelay()} 登记延迟 → 变更入有界缓冲 → 时间窗到期（或条目超限）时冲刷 →
@@ -61,9 +61,6 @@ import org.bukkit.plugin.Plugin;
  * <em>同时</em>保留原包（重复下发相同方块状态是无害幂等操作），校验通过后才开始取消原包。
  */
 public final class BlockChangeMerger extends PacketAdapter implements Listener {
-
-  private static final String BYPASS_PERMISSION = "mikuxraynet.bypass";
-  private static final int MAX_ERROR_LOGS = 3;
 
   /** 冲刷批次内的 section 分组键。 */
   private record SectionKey(int x, int y, int z) {
@@ -414,7 +411,15 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
 
     try {
-      boolean mergeable = held.size() >= 2 && clusters.stream().anyMatch(cluster -> cluster.size() >= 2);
+      boolean mergeable = false;
+      if (held.size() >= 2) {
+        for (List<Update<WrappedBlockData>> cluster : clusters) {
+          if (cluster.size() >= 2) {
+            mergeable = true;
+            break;
+          }
+        }
+      }
       if (mergeable) {
         boolean wasVerified = verified;
         if (trySendMerged(held.get(0).event.getPlayer(), clusters)) {

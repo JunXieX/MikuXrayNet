@@ -178,11 +178,6 @@ public final class BlockStateRegistry implements RegistryAccessor {
     return blockId >= 0 && blockId < uniqueBlockStateCount && fluidCoverStates.get(blockId);
   }
 
-  /** 被判定为「流体覆盖」的状态数（启动自检用）。 */
-  public int fluidCoverStateCount() {
-    return fluidCoverStates.cardinality();
-  }
-
   /** 该状态是否为「整块不透明」（可作为遮挡面）。 */
   public boolean isOccluding(int blockId) {
     return blockId >= 0 && blockId < uniqueBlockStateCount && occludingStates.get(blockId);

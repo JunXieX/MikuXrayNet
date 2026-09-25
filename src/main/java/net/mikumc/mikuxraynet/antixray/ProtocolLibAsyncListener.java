@@ -31,7 +31,8 @@ import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 
 /**
- * ProtocolLib 异步区块监听器：反矿透唯一的封包拦截入口。
+ * ProtocolLib 异步区块监听器：反矿透区块改写链路的封包拦截入口
+ * （另有 {@link BlockChangeRevealListener} 注册异步出站方块变更监听，用于注销伪装坐标与推进缓存代次）。
  *
  * <p>线程模型：网络线程（本监听回调）只做「读坐标 → 建任务 → 登记延迟 → 入队」，
  * 解码/判定/重编码全部交给 {@link MikuWorkPool} 的工作线程；工作线程不触碰任何 Bukkit API。

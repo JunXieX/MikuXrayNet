@@ -202,7 +202,6 @@ public final class DiskCacheStore implements AutoCloseable {
     if (!usable() || worldName == null) {
       return null;
     }
-    stats.requests.increment();
     long generation = generation(worldName, chunkX, chunkZ);
     byte[] payload = submit(() -> doGet(worldName, chunkX, chunkZ, configHash, generation),
         readTimeoutMillis);
@@ -232,7 +231,6 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
     if (pendingOps.get() >= config.queueCapacity()) {
-      stats.droppedByBacklog.increment();
       return;
     }
 
@@ -398,7 +396,6 @@ public final class DiskCacheStore implements AutoCloseable {
     }
     // 该负载会在 flushDirty 时随所属 bucket 整块 append；bucket 重写产生的旧副本计入垃圾，由压缩回收
     handle.pendingBytes += payload.length;
-    stats.puts.increment();
   }
 
   /** 维护任务：落盘 → 压缩回收 → 关闭闲置句柄（全部在磁盘线程执行）。 */
@@ -469,7 +466,6 @@ public final class DiskCacheStore implements AutoCloseable {
         }
         // 压缩会把内存里的全部 bucket（含脏的）整文件重写：待落盘记账随之清零
         handle.pendingBytes = 0L;
-        stats.compactions.increment();
         done++;
       } catch (Throwable throwable) {
         // 压缩失败：句柄可能已不可用（例如文件被外部删除），直接关闭并让它下次重新打开
@@ -670,7 +666,6 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
     if (pendingOps.get() >= config.queueCapacity()) {
-      stats.droppedByBacklog.increment();
       return;
     }
     pendingOps.incrementAndGet();
@@ -704,7 +699,6 @@ public final class DiskCacheStore implements AutoCloseable {
       }
     }
     if (pendingOps.get() >= config.queueCapacity()) {
-      stats.droppedByBacklog.increment();
       return null;
     }
 

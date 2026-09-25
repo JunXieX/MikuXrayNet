@@ -13,7 +13,12 @@ public final class PingState {
   private long highSinceMillis = NO_TIME;
   private boolean reduced;
 
-  /** 是否处于已降级状态。 */
+  /**
+   * 是否处于已降级状态。
+   *
+   * <p>测试专用豁免：生产路径只用 {@link #shouldReduce} / {@link #shouldRestore} 的返回值，
+   * 本方法当前仅单测在用，保留以免破坏测试。
+   */
   public boolean reduced() {
     return reduced;
   }

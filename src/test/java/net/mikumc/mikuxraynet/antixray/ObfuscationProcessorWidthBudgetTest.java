@@ -80,7 +80,7 @@ class ObfuscationProcessorWidthBudgetTest {
         false, true,
         widthBudget
             ? new ObfuscationProcessor.PaletteOptions(false, false, true)
-            : new ObfuscationProcessor.PaletteOptions(false, false),
+            : new ObfuscationProcessor.PaletteOptions(false, false, false),
         true);
   }
 

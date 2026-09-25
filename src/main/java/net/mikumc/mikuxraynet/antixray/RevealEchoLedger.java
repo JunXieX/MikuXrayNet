@@ -88,7 +88,11 @@ final class RevealEchoLedger {
     }
   }
 
-  /** 当前在账条目数（诊断与单测用）。 */
+  /**
+   * 当前在账条目数。
+   *
+   * <p>测试专用豁免：生产路径不读该值，本方法当前仅单测在用，保留以免破坏测试。
+   */
   int size() {
     synchronized (pending) {
       return pending.size();

@@ -38,6 +38,9 @@ public final class RewriteTask {
   /**
    * 兼容构造：维度按主世界处理（供旧调用方与既有测试使用）。
    *
+   * <p>测试专用豁免：生产路径一律调 8 参完整构造（显式传维度），本构造当前仅单测在用，
+   * 保留以免破坏测试。
+   *
    * @param minHeight    该世界最低建筑高度，用于与封包中绝对 Y 坐标的方块实体对齐
    * @param sectionCount 该世界的 section 数量（高度 / 16）
    * @param timeoutMillis 处理超时（毫秒）

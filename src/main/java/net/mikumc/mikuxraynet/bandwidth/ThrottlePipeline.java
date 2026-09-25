@@ -23,7 +23,8 @@ import org.bukkit.plugin.Plugin;
  *   <li>{@link LatencyMonitor} 高延迟降视距（{@code latency.enabled}，需持续超阈值）。</li>
  * </ul>
  * 任一模块的 {@code enabled=false} 都意味着它<b>完全不注册</b>（不建监听器、不起任务、不产生任何开销），
- * 而不是「注册了但不生效」。不具备 ProtocolLib 时，零位移取消、变更合并与 AFK 丢包自动停用，其余模块仍可用。
+ * 而不是「注册了但不生效」。不具备 ProtocolLib 时：变更合并在 {@link #start()} 里被显式停用，
+ * 零位移取消与 AFK 丢包则由 {@link #register} 捕获构造期异常兜底停用，其余模块仍可用。
  */
 public final class ThrottlePipeline {
 
@@ -42,7 +43,8 @@ public final class ThrottlePipeline {
 
   /**
    * 依配置推导各子模块的注册决策：总开关或模块 {@code enabled} 关闭（以及其行为开关关闭）时，
-   * 对应模块<b>不会注册</b>，因此不产生任何开销。依赖可用性（ProtocolLib）不在此判定，由 {@link #start()} 处理。
+   * 对应模块<b>不会注册</b>，因此不产生任何开销。依赖可用性（ProtocolLib）不在此判定：由
+ * {@link #start()} 对变更合并显式停用，零位移取消 / AFK 则靠 {@link #register} 捕获构造异常兜底停用。
    */
   public static ModulePlan plan(BandwidthConfig config) {
     boolean master = config.enabled();

@@ -10,7 +10,8 @@ import io.netty.buffer.Unpooled;
  *
  * <p>构造时按 {@code sectionsPresent} 逐段解析：为 false 的 section 视为「缓冲区中不含其字节」
  * （1.18+ 原版格式下所有 section 都存在且依次排列，末尾没有独立群系段），其视图为 {@code null}。
- * 1.18+ 每个 section 尾部的生物群系容器按不透明字节整体跳过并原样搬运。
+ * 1.18+ 每个 section 尾部的生物群系容器会先结构化解析其头部（bitsPerValue 字节、调色板条目，
+ * 以及旧版格式的长度字段）再整体跳过载荷，重编码时原样搬运。
  *
  * <p>用法：{@link #getSection(int)} 取得 section 后改写方块状态，最后调用 {@link #finalizeOutput()}
  * 得到重编码后的完整字节数组（未改动部分原样搬运）。用毕必须 {@link #close()}。

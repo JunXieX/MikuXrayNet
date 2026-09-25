@@ -117,7 +117,8 @@ public final class MikuWorkPool implements AutoCloseable {
 
   /**
    * 关闭线程池。关闭前先「排空队列 + 放行兜底」：
-   * 对每个已登记、尚未开始写入的 {@link RewriteTask} 调 {@link RewriteTask#signalOnce()} 放行，
+   * 对每个已登记、尚未开始写入的 {@link RewriteTask} 调 {@link RewriteTask#releaseOnTimeout()}
+   * 放行（其内部经 CAS 抢到写入权后转调 {@code signalOnce()}），
    * 否则 shutdownNow 丢弃的排队任务会让对应封包永远无人放行（客户端卡加载界面）。
    *
    * <p>放行顺序上先 {@code shutdownNow} 再兜底：队列一旦排空就不会再有排队任务被启动，

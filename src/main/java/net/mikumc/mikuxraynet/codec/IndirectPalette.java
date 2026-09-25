@@ -7,8 +7,10 @@ import io.netty.buffer.ByteBuf;
 /**
  * 间接调色板（bitsPerBlock 4..8）：按首次出现顺序为方块状态分配本地索引，索引表长度为 {@code 1 << bitsPerValue}。
  *
- * <p>关键约束：索引表写满（或索引达到 0xFF 哨兵值）时调用 {@link ChunkSection#grow(int, int)}
- * 升位到 bitsPerValue+1；{@code byValue} 以方块状态 id 直接下标，故长度必须覆盖注册表全部方块状态
+ * <p>关键约束：索引表写满（或索引达到 0xFF 哨兵值）时调用 {@link ChunkSection#grow(int, int)} 升位——
+ * bitsPerValue 为 4~7 时升到 bitsPerValue+1 的间接调色板；8 位写满时 {@code grow(9)} 会直接切换为
+ * 直接调色板（位宽取注册表上限），不再有「+1 位」的间接档位。
+ * {@code byValue} 以方块状态 id 直接下标，故长度必须覆盖注册表全部方块状态
  * （由 {@link ChunkScratch} 按线程复用，避免每个 section 都新建这张 32 KB 级反查表）。
  */
 public class IndirectPalette implements Palette {

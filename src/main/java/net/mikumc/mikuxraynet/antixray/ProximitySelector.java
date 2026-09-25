@@ -233,6 +233,9 @@ public final class ProximitySelector {
    * @param query     遮挡查询；为 {@code null} 时视为可见（fail-open）
    * @param maxPoints 每方块最多尝试的候选点数（由配置 {@code proximity.raycast.samples} 提供，已钳制 1..8）
    * @param probe     射线探针；为 {@code null} 时视为可见（fail-open）
+   *
+   * <p>测试专用豁免：生产路径一律调 8 参重载（多传 {@code fluidCover}），本重载当前仅单测在用，
+   * 保留以免破坏测试。
    */
   public static boolean isVisible(Eye eye, int blockX, int blockY, int blockZ, RayQuery query,
       int maxPoints, RayProbe probe) {

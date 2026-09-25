@@ -56,7 +56,8 @@ import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
  *   <li>非目标方块只做一次位图查询即跳过，不做任何邻居判定；</li>
  *   <li>整块区块无任何改动时直接返回原字节数组，完全不触发重编码；</li>
  *   <li>只有真正被改动的 section 才重编码（未改动的 section 由 codec 原样搬运原始字节）；</li>
- *   <li>无逐世界覆盖时按世界名取档案不走任何 Map；预算充足时候选表直接共享预构建数组（零分配）。</li>
+ *   <li>无逐世界覆盖时按世界名取档案不走任何 Map；预算充足时各候选表直接共享预构建数组
+ *       （表本身不拷贝，只分配一次候选表容器数组）。</li>
  * </ul>
  *
  * <p>本类不做任何 Bukkit 访问，可在工作线程安全运行。
@@ -71,11 +72,6 @@ public final class ObfuscationProcessor {
 
     /** 全关（保持 P0-1 之前的行为：不重排、不封顶、不裁剪）。 */
     public static final PaletteOptions DISABLED = new PaletteOptions(false, false, false);
-
-    /** 旧两参构造（兼容既有调用）：不启用位宽预算封顶。 */
-    public PaletteOptions(boolean reorder, boolean strictVerify) {
-      this(reorder, strictVerify, false);
-    }
   }
 
   /**
@@ -317,6 +313,8 @@ public final class ObfuscationProcessor {
    * @param layerObfuscation  true 时同一高度层统一使用同一种伪装方块
    * @param missingPolicyHide 邻块数据缺失时是否视为遮挡（true=宁可多伪装）
    * @param paletteOptions    调色板重排选项
+   *
+   * <p>测试专用豁免：生产装配一律走 {@link #create}，本构造当前仅单测在用，保留以免破坏测试。
    */
   public ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, BitSet targets,
       int[] replacementIds, int[] cumulativeWeights, boolean layerObfuscation,
@@ -331,6 +329,8 @@ public final class ObfuscationProcessor {
    * @param obfuscateAll {@code true} 即 {@code obfuscation.mode: all}——所有目标矿一律伪装，
    *                     跳过 6 面遮挡判定（靠邻近显形在玩家靠近可见时还原）；
    *                     {@code false} 即 {@code enclosed}——只伪装 6 面全遮挡的掩埋矿。
+   *
+   * <p>测试专用豁免：生产装配一律走 {@link #create}，本构造当前仅单测在用，保留以免破坏测试。
    */
   public ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, BitSet targets,
       int[] replacementIds, int[] cumulativeWeights, boolean layerObfuscation,
@@ -345,6 +345,8 @@ public final class ObfuscationProcessor {
    * @param useBlockBelow true = 命中伪装时若「下方紧邻方块」可用，优先用它当伪装方块（观感自然，
    *                      同竞品思路）；false = 完全保持既有行为（按权重随机 / 层状）。
    * @param belowUsable   下方方块可用性过滤器（非空气/非流体等）；null 时退回用遮挡表判定可用性
+   *
+   * <p>测试专用豁免：生产装配一律走 {@link #create}，本构造当前仅单测在用，保留以免破坏测试。
    */
   public ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, BitSet targets,
       int[] replacementIds, int[] cumulativeWeights, boolean layerObfuscation,
@@ -360,6 +362,8 @@ public final class ObfuscationProcessor {
   /**
    * 兼容构造（测试用手工档案）：逐世界覆盖档案对所有维度一致，且 {@code useBlockBelow} 统一施加到
    * 全部档案（档案自带值时以参数为准——参数即旧版的「全局 use-block-below」）。
+   *
+   * <p>测试专用豁免：生产装配一律走 {@link #create}，本构造当前仅单测在用，保留以免破坏测试。
    */
   ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, boolean layerObfuscation,
       boolean missingPolicyHide, PaletteOptions paletteOptions, boolean useBlockBelow,
@@ -488,7 +492,12 @@ public final class ObfuscationProcessor {
     return false;
   }
 
-  /** 改写一个区块（不含邻块快照，缺失策略会生效）。 */
+  /**
+   * 改写一个区块（不含邻块快照，缺失策略会生效）。
+   *
+   * <p>测试专用豁免：生产路径走 7 参完整入口（带世界名与维度），本重载当前仅单测在用，
+   * 保留以免破坏测试。
+   */
   public Result rewrite(byte[] source, int sectionCount, long seed) {
     return rewrite(source, sectionCount, seed, null);
   }
@@ -501,6 +510,9 @@ public final class ObfuscationProcessor {
    * @param seed         伪装随机种子；同种子同输入必然得到同结果（缓存可安全复用）
    * @param neighbors    4 个水平邻块的贴边快照；{@code null} 表示缺失，按缺失策略处理
    * @return 改写结果；解码/重编码异常都回退为「原字节 + 空位置 + 异常摘要」（fail-open）
+   *
+   * <p>测试专用豁免：生产路径走 7 参完整入口（带世界名与维度），本重载当前仅单测在用，
+   * 保留以免破坏测试。
    */
   public Result rewrite(byte[] source, int sectionCount, long seed, NeighborEdges neighbors) {
     return rewrite(source, sectionCount, seed, neighbors, null, 0);
@@ -512,6 +524,9 @@ public final class ObfuscationProcessor {
    * @param worldName 区块所在世界名；{@code null} 表示用主世界档案（无逐世界覆盖）
    * @param worldMinY 该世界最低方块 Y（世界坐标系），用于把 section 内相对 Y 换算成绝对 Y
    *                  （min-y/max-y 过滤与分区伪装表都按绝对 Y 判定）
+   *
+   * <p>测试专用豁免：生产路径走 7 参完整入口（显式传维度），本重载当前仅单测在用，
+   * 保留以免破坏测试。
    */
   public Result rewrite(byte[] source, int sectionCount, long seed, NeighborEdges neighbors,
       String worldName, int worldMinY) {
@@ -752,7 +767,7 @@ public final class ObfuscationProcessor {
    * 多个表只算一次），超出当前剩余容量（{@code (1 << bitsPerBlock) − 调色板条目数}）即为超预算。
    * 超预算时各表只保留已在调色板内的候选（保持声明顺序与相对权重）；某表剔除后为空则保留原表
    * （逃生口：调色板内完全无候选才允许 grow）。预算关闭或预算充足时直接共享 profile 预构建表
-   * （零分配、零拷贝）。候选总量为个位数～几十，O(n²) 去重代价可忽略。
+   * （表本身不拷贝，仅分配一次候选表容器数组）。候选总量为个位数～几十，O(n²) 去重代价可忽略。
    *
    * @param freeAfterOut 单元素输出：候选表占用预算后的剩余调色板空位（供 use-block-below
    *                     判断「下方方块不在调色板内时还能否无升位写入」；预算关闭时为最大值）

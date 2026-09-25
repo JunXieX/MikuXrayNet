@@ -7,8 +7,8 @@ import java.util.concurrent.atomic.LongAdder;
 /**
  * 反矿透区块改写统计计数，供 {@code /mikuxraynet status} 与诊断转储读取。
  *
- * <p>字段均为无锁 {@link LongAdder}：网络线程（建任务、超时放行）与工作线程（改写）都会累加，
- * 读取时用 {@link #snapshot()} 取得一致的可读快照。计数器只做累加，不参与任何判定，因而不引入高频开销。
+ * <p>字段均为无锁 {@link LongAdder}：网络线程（建任务、超时放行）与工作线程（改写）都会累加；
+ * 读取方（诊断面板）逐字段 {@code sum()} 直读，无需一致快照。计数器只做累加，不参与任何判定，因而不引入高频开销。
  */
 public final class RewriteStats {
 
@@ -63,7 +63,7 @@ public final class RewriteStats {
    * 改写 section 的 bitsPerBlock 直方图（P0-1 诊断，下标 = 位宽）。
    *
    * <p>供 dump 观察「封顶/裁剪/降位」的实际效果：开启 width-budget 后应看到高位宽槽不再增长、
-   * 低位宽槽增多。只在改写发生时累加，读取方用 {@link #paletteBitsAt(int)}。
+   * 低位宽槽增多。只在改写发生时累加，读取方（dump）用 {@link #paletteBitsSummary()} 生成摘要。
    */
   private final LongAdder[] paletteBits = new LongAdder[BITS_SLOTS];
 
@@ -78,7 +78,8 @@ public final class RewriteStats {
     paletteBits[Math.min(Math.max(bits, 0), BITS_SLOTS - 1)].increment();
   }
 
-  /** 读取某位宽槽位的累计计数（诊断/转储用）。 */
+  /** 读取某位宽槽位的累计计数。测试专用豁免：生产诊断走 {@link #paletteBitsSummary()}，
+   * 本方法当前仅单测在用，保留以免破坏测试。 */
   public long paletteBitsAt(int bits) {
     return paletteBits[Math.min(Math.max(bits, 0), BITS_SLOTS - 1)].sum();
   }
@@ -98,7 +99,12 @@ public final class RewriteStats {
     return sb.length() == 0 ? "无采样" : sb.toString();
   }
 
-  /** 生成中文可读快照（顺序稳定，便于命令输出）。 */
+  /**
+   * 生成中文可读快照（顺序稳定，便于命令输出）。
+   *
+   * <p>测试专用豁免：生产诊断直接逐字段读取（见 {@code Diagnostics}），
+   * 本方法当前仅单测在用，保留以免破坏测试。
+   */
   public Map<String, Long> snapshot() {
     Map<String, Long> map = new LinkedHashMap<>();
     map.put("改写", chunksRewritten.sum());

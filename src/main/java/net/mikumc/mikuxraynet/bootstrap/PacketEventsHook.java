@@ -82,9 +82,4 @@ public final class PacketEventsHook {
   public BlockStateRegistry registry() {
     return registry;
   }
-
-  /** PacketEvents 上报的服务端版本名，仅用于日志。 */
-  public String releaseName() {
-    return releaseName;
-  }
 }

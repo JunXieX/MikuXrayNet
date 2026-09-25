@@ -29,8 +29,8 @@ import org.bukkit.plugin.Plugin;
  */
 public final class BypassRegistry implements Listener {
 
-  /** 绕过反矿透所必需的权限节点。 */
-  public static final String PERMISSION = "mikuxraynet.bypass";
+  /** 绕过反矿透所必需的权限节点（唯一出处见 {@link Constants#BYPASS_PERMISSION}）。 */
+  public static final String PERMISSION = Constants.BYPASS_PERMISSION;
 
   /** 在线玩家权限巡检周期（tick）：约 2 秒一次，用于捕捉运行期的权限变更。 */
   private static final long REFRESH_INTERVAL_TICKS = 40L;

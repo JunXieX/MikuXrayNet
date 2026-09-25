@@ -108,7 +108,7 @@ public final class BufferedLinearV3Format {
   /** 单个条目负载的上限（防止损坏数据造成超大分配）：16 MiB。 */
   public static final int MAX_PAYLOAD_SIZE = 16 * 1024 * 1024;
 
-  /** 单个 bucket 解压后原始数据的上限（64 个槽位）：512 MiB。 */
+  /** 单个 bucket 解压后原始数据的上限（防御损坏数据造成超大分配）：512 MiB；理论值为 64 个槽位 × 单条负载上限 {@link #MAX_PAYLOAD_SIZE}（16 MiB）= 1024 MiB。 */
   public static final int MAX_RAW_SIZE = 512 * 1024 * 1024;
 
   /**
@@ -185,7 +185,12 @@ public final class BufferedLinearV3Format {
     return buffer.array();
   }
 
-  /** 解析文件头，返回校验种子（兼容 0x01/0x02 两种压缩方案）；等价于 {@link #decodeHeaderInfo(byte[])} 的种子。 */
+  /**
+   * 解析文件头，返回校验种子（兼容 0x01/0x02 两种压缩方案）；等价于 {@link #decodeHeaderInfo(byte[])} 的种子。
+   *
+   * <p>测试专用豁免：生产路径只用 {@link #decodeHeaderInfo(byte[])}（还需压缩方案字节），
+   * 本方法当前仅单测在用，保留以免破坏测试。
+   */
   public static int decodeHeader(byte[] raw) throws IOException {
     return decodeHeaderInfo(raw).hashSeed();
   }

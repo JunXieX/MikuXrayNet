@@ -85,7 +85,7 @@ public final class AntiXrayConfig {
     }
   }
 
-  /** 10 种容器/功能方块（透视端可凭轮廓与方块实体数据定位地下基地与矿洞入口）。 */
+  /** 11 种容器/功能方块（透视端可凭轮廓与方块实体数据定位地下基地与矿洞入口）。 */
   private static final List<String> CONTAINER_BLOCKS = List.of(
       "chest", "trapped_chest", "ender_chest", "barrel",
       "furnace", "blast_furnace", "smoker",
@@ -283,14 +283,6 @@ public final class AntiXrayConfig {
       boolean frustumEnabled, double frustumFov, double frustumMinDistance,
       boolean raycastEnabled, int raycastSamples,
       InstantReveal instantReveal, int overRevealSampling, boolean batchRevealSends) {
-
-    /** 邻近显形相关配置的兼容读取入口缺失时的兜底值（仅供旧构造方使用）。 */
-    public Proximity {
-      if (instantReveal == null) {
-        instantReveal = new InstantReveal(false, 2, 16);
-      }
-      overRevealSampling = Math.max(0, overRevealSampling);
-    }
   }
 
   /**

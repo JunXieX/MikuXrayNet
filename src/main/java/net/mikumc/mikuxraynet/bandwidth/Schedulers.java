@@ -12,8 +12,8 @@ import org.bukkit.plugin.Plugin;
  * Paper 上实体所属线程就是服务端主线程，Folia 上则是该实体所在区域的区域线程，因此不再需要
  * 「按平台二选一」（旧实现是 {@code if (isFolia()) entity.getScheduler() else Bukkit.getScheduler()}）。
  *
- * <p>工作线程只做纯计算，结果一律经此类回到所有者线程，因此 hideEntity / setViewDistance 等调用
- * 永远不会跨线程。
+ * <p>本类只剩「回到实体所属线程执行」的两个入口（{@link #onEntity} / {@link #repeatOnEntity}）：
+ * 带宽侧已无工作线程路径，hideEntity / setViewDistance 等调用全部落在所有者线程，永不跨线程。
  *
  * <p><b>单位</b>：{@link io.papermc.paper.threadedregions.scheduler.EntityScheduler} 的延迟与周期
  * 都以 <b>tick</b> 计，与旧的 {@code BukkitScheduler#runTaskTimer(delayTicks, periodTicks)} 完全一致

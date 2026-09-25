@@ -72,7 +72,11 @@ final class PlayerPositionSnapshots {
     positions.clear();
   }
 
-  /** 当前快照数（仅诊断用）。 */
+  /**
+   * 当前快照数。
+   *
+   * <p>测试专用豁免：生产路径不读该值，本方法当前仅单测在用，保留以免破坏测试。
+   */
   int size() {
     return positions.size();
   }

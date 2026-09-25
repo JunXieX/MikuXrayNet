@@ -31,7 +31,8 @@ import org.bukkit.Bukkit;
  * 诊断聚合入口：把反矿透与带宽各模块暴露的计数器、依赖状态与配置有效值汇总为中文状态面板与转储文件。
  *
  * <p><b>零额外开销</b>：各模块只维护 {@code LongAdder}-类轻量计数，本类仅在 {@code status}/{@code dump}
- * 被执行时做一次拉取与字符串拼接，不在封包热路径上做任何统计工作。
+ * 被执行、以及周期运行摘要（{@link #summaryLine()}）定时触发时做一次拉取与字符串拼接，
+ * 不在封包热路径上做任何统计工作。
  *
  * <p><b>可测</b>：状态/转储的格式化是纯函数 {@link #formatStatus(Snapshot)} /
  * {@link #formatDump(Snapshot, String)}，可给定固定计数直接断言输出；实例方法只负责拉取实时快照。

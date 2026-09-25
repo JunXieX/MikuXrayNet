@@ -291,7 +291,8 @@ public final class EntityCuller implements Listener {
    * 实体所属线程：用 Paper 原生射线判定实体是否被完全遮挡。
    *
    * <p>把包围盒「朝向玩家一侧」的可见顶点逐一射向玩家眼睛，任一条通畅即判「未被完全遮挡」；
-   * 顶点数上限由 {@code entity-culling.ray-samples} 提供（已钳制 1..8）。
+ * 可见顶点由 {@code visibleVertices} 给出（包围盒至多 7 个），再由 {@code entity-culling.ray-samples}
+ * （已钳制 1..8）截断实际尝试的顶点数。
    *
    * <p><b>失败语义 fail-open</b>：任何异常都返回 {@code false}（不遮挡）——绝不误藏实体。
    *
@@ -379,7 +380,12 @@ public final class EntityCuller implements Listener {
     };
   }
 
-  /** 主线程/区域线程：按遮挡结论执行隐藏/恢复（包可见：供离线单测直接驱动账本行为）。 */
+  /**
+   * 主线程/区域线程：按遮挡结论执行隐藏/恢复（包可见：供离线单测直接驱动账本行为）。
+   *
+   * <p>测试专用豁免：生产路径一律传入 {@code fromRecheck}（调 4 参重载），本重载当前仅单测在用，
+   * 保留以免破坏测试。
+   */
   void evaluate(Player player, Entity entity, boolean allBlocked) {
     evaluate(player, entity, allBlocked, false);
   }
@@ -523,6 +529,12 @@ public final class EntityCuller implements Listener {
       }
     }
 
+    /**
+     * 当前轮转队列里的追踪实体数。
+     *
+     * <p>测试专用豁免：生产路径不读该值（复检只走 {@link #nextBatch(int, Set)}），
+     * 本方法当前仅单测在用，保留以免破坏测试。
+     */
     synchronized int size() {
       return order.size();
     }

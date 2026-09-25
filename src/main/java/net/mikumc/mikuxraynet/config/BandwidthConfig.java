@@ -50,11 +50,6 @@ public final class BandwidthConfig {
    *                     升到 5 位、包体膨胀约 25%」的问题，兼得降位宽收益。关闭时走原路径（只升不降）。
    */
   public record Palette(boolean enabled, boolean reorder, boolean strictVerify, boolean widthBudget) {
-
-    /** 旧三参构造（兼容既有调用）：widthBudget 默认开启（P0-1 新开关的默认值）。 */
-    public Palette(boolean enabled, boolean reorder, boolean strictVerify) {
-      this(enabled, reorder, strictVerify, true);
-    }
   }
 
   /**

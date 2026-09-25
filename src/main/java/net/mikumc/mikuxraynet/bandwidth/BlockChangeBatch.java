@@ -27,10 +27,21 @@ public final class BlockChangeBatch<V> {
     this.maxEntries = Math.max(1, maxEntries);
   }
 
+  /**
+   * 当前待发条目数。
+   *
+   * <p>测试专用豁免：生产路径不读该值（只依 {@link #add} 的返回值与 {@link #drainClusters} 驱动），
+   * 本方法当前仅单测在用，保留以免破坏测试。
+   */
   public int size() {
     return pending.size();
   }
 
+  /**
+   * 待发缓冲是否为空。
+   *
+   * <p>测试专用豁免：生产路径不读该值，本方法当前仅单测在用，保留以免破坏测试。
+   */
   public boolean isEmpty() {
     return pending.isEmpty();
   }

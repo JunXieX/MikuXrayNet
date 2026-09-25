@@ -364,11 +364,6 @@ public final class AntiXrayRuntime {
     return diskCacheStore;
   }
 
-  /** 邻近显形（供命令与诊断读取统计计数与索引持有量）；未启用时为 null。 */
-  public ProximityRevealer proximityRevealer() {
-    return proximityRevealer;
-  }
-
   /** 伪装区块索引（供诊断读取区块数 / 坐标数与安全阀计数）；未启用邻近显形时为 null。 */
   public ObfuscatedChunkIndex obfuscatedChunkIndex() {
     return obfuscatedChunkIndex;

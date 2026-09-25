@@ -333,11 +333,6 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
-  /** 统计计数（供 {@code /mikuxraynet status} 读取）。 */
-  public ProximityStats stats() {
-    return stats;
-  }
-
   /** 全服巡检（非 Folia：主线程，遍历在线玩家并共享本次发包额度）。 */
   private void passAll() {
     warnIfCapacityExceeded();
@@ -426,7 +421,6 @@ public final class ProximityRevealer implements Listener {
 
     if (workPool == null || !workPool.hasCapacity()) {
       // 队列已满：保底路径——主线程直接做纯计算（视锥剔除），可见性判定本来就在主线程做，功能不降级
-      stats.revealsQueuedSkipped.increment();
       sendCandidates(player, world, null, computePlan(eye, coordinates), eye, budget, scanTally);
       return;
     }

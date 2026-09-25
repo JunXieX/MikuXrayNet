@@ -126,7 +126,12 @@ public final class ZstdSupport {
     return artifact + "-" + version + suffix + ".jar";
   }
 
-  /** 构造下载 URL（全平台包）；{@code baseUrl} 为空时回落到 Maven Central，末尾多余的 {@code /} 会被去掉。 */
+  /**
+   * 构造下载 URL（全平台包）；{@code baseUrl} 为空时回落到 Maven Central，末尾多余的 {@code /} 会被去掉。
+   *
+   * <p>测试专用豁免：生产路径一律调 5 参重载（多传平台分类器），本方法当前仅单测在用，
+   * 保留以免破坏测试。
+   */
   public static String downloadUrl(String baseUrl, String group, String artifact, String version) {
     return downloadUrl(baseUrl, group, artifact, version, "");
   }
