@@ -437,6 +437,39 @@ disk-cache:
   # 最多多一次未命中、不会返回脏数据（读写双方还会校验原始字节指纹与配置指纹）。
   generation-tracker-size: 32768
 
+  # ---------------------------------------------------------------------------
+  # zstd 前置（压缩算法库）的自动识别与自动下载。
+  #
+  # 磁盘缓存的 bucket 压缩用 zstd（比内置 Deflater 压缩率更好）。它是一个「前置库」，
+  # 开服时会按以下顺序自动解析（见 cache/ZstdSupport）：
+  #   ① 服务端自带（Leaf/Paper 26.x 内置 zstd-jni，插件类加载器直接可见）——真机走这一条，无需下载；
+  #   ② plugins/MikuXrayNet/lib/ 下上次启动已下载的 jar；
+  #   ③ 按下面三键自动下载到 plugins/MikuXrayNet/lib/；
+  #   ④ 都不可用 → 自动回退内置 Deflater（磁盘缓存仍可用，只是压缩率略低，属 fail-open）。
+  # 三种来源都会在启动日志里明确打印「已检测到 ZSTD（来源：…）」。
+  # ---------------------------------------------------------------------------
+
+  # zstd 前置缺失时是否自动下载（默认开启）。关闭后只尝试①②，都没有就用内置压缩。
+  # 下载与加载都在启动期一次完成，失败只告警、绝不影响插件加载与封包链路。
+  zstd:
+    auto-download: true
+
+    # zstd 下载源根地址（Maven 仓库根，末尾不要带 /）。
+    # 默认 Maven Central（https://repo1.maven.org/maven2）。
+    # 【国内服务器建议换成阿里云镜像】（本机 Leaf 启动参数 -DLeaf.library-download-repo 用的就是它）：
+    #   download-url: https://maven.aliyun.com/repository/public
+    # 也可以换成 Paper 的官方镜像：
+    #   download-url: https://maven-central.storage-download.googleapis.com/maven2
+    # 下载的坐标固定为 com.github.luben:zstd-jni:1.5.7-15（与真机 Leaf 26.2 自带版本一致，
+    # 因此绝大多数服务器会命中①②，根本不会发起下载）。
+    # 下载时优先取「平台专用包」（如 linux_amd64，实测 401 KB），取不到再退「全平台包」（实测 6.15 MB）：
+    # 两者类与 API 完全一致，只是全平台包多带了各系统的原生库。
+    download-url: https://repo1.maven.org/maven2
+
+    # 下载的总等待上限（秒）：连接超时、读取超时与总等待都受它约束。
+    # 超时即视为失败并回退内置压缩（fail-open，绝不长时间阻塞开服）。
+    timeout-seconds: 10
+
 cache:
   # 改写结果缓存的条目上限（每条约等于一个区块的字节数）。
   maximum-size: 4096

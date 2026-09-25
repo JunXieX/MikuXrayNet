@@ -318,7 +318,7 @@ class ConfigDefaultsTest {
     assertEquals(80.0D, config.proximity().frustumFov(), 1.0E-9D, "视锥竖直全角默认 80°");
     assertEquals(16, config.proximity().raycastSamples(), "射线采样默认 16（越大越准、越费主线程读方块）");
 
-    // disk-cache 全部 10 键
+    // disk-cache 全部 13 键
     assertTrue(config.diskCache().enabled(), "磁盘缓存默认开启");
     assertEquals(20000, config.diskCache().maxEntries(), "条目总数上限默认 20000");
     assertEquals(16, config.diskCache().maxFileSizeMb(), "单区域文件上限默认 16 MB");
@@ -330,6 +330,11 @@ class ConfigDefaultsTest {
     assertEquals(4, config.diskCache().compactPerPass(), "每轮最多压缩 4 个区域文件");
     assertEquals(256, config.diskCache().queueCapacity(), "磁盘线程待处理任务上限默认 256");
     assertEquals(32768, config.diskCache().generationTrackerSize(), "代次跟踪表默认 32768 条");
+    // zstd 前置三键（自动识别 / 自动下载）
+    assertTrue(config.diskCache().zstdAutoDownload(), "zstd 自动下载默认开启");
+    assertEquals(AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, config.diskCache().zstdDownloadUrl(),
+        "zstd 下载源默认 Maven Central");
+    assertEquals(10, config.diskCache().zstdTimeoutSeconds(), "zstd 下载超时默认 10 秒");
 
     // cache 两键（改写结果的内存缓存）
     assertEquals(4096, config.cacheMaximumSize(), "改写缓存条目上限默认 4096");

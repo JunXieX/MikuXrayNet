@@ -1,6 +1,5 @@
 package net.mikumc.mikuxraynet.cache;
 
-import com.github.luben.zstd.Zstd;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -36,13 +35,14 @@ import java.util.zip.Inflater;
  *
  * <p><b>压缩方案（偏移 9 的那个字节）</b>：该字节决定整个文件里所有 bucket 的压缩算法。
  * 当前写入统一使用 <b>zstd</b>（{@code 0x02}），用的是服务端自带的 zstd-jni（{@code scope=provided}，
- * 不 shade、不进插件 jar）；历史文件里的 Deflate（{@code 0x01}）仍被完整支持，因此老的
- * {@code .b_linear} 缓存不会被当成损坏文件删除。读路径按该字节选择解压器：
+ * 不 shade、不进插件 jar；服务端若没有则由 {@link ZstdSupport} 在启动期自动下载到
+ * {@code plugins/MikuXrayNet/lib}，详见该类的来源解析顺序）；历史文件里的 Deflate（{@code 0x01}）
+ * 仍被完整支持，因此老的 {@code .b_linear} 缓存不会被当成损坏文件删除。读路径按该字节选择解压器：
  * {@code 0x01} 走 JDK {@link Inflater}，{@code 0x02} 走 zstd。
  *
- * <p><b>fail-open</b>：运行期若 zstd 不可用（原生库缺失导致类初始化抛 {@link Throwable} 等），
- * 压缩自动回退 JDK {@link Deflater}（{@link #currentCompression()} 因此返回 {@code 0x01}，
- * 保证「头部方案字节」与实际写入的压缩算法始终一致），并只提示一次中文日志。
+ * <p><b>fail-open</b>：运行期若 zstd 不可用（服务端没有该库、自动下载失败、或原生库缺失导致类初始化抛
+ * {@link Throwable} 等），压缩自动回退 JDK {@link Deflater}（{@link #currentCompression()} 因此返回
+ * {@code 0x01}，保证「头部方案字节」与实际写入的压缩算法始终一致），并只提示一次中文日志。
  * 任何压缩/解压异常都只记日志并降级，绝不影响封包链路。
  */
 public final class BufferedLinearV3Format {
@@ -50,7 +50,7 @@ public final class BufferedLinearV3Format {
   /** 与格式头一致的日志通道（本类为纯格式工具，不依赖外部注入的 Logger）。 */
   private static final Logger LOGGER = Logger.getLogger("MikuXrayNet");
 
-  /** 仅提示一次的「zstd 回退 Deflater」日志开关。 */
+  /** 仅提示一次的「zstd 回退 Deflater」日志开关（运行期压缩/解压抛异常的路径）。 */
   private static final AtomicBoolean ZSTD_FALLBACK_WARNED = new AtomicBoolean();
 
   /** 仅提示一次的「旧版（0x03）区域文件已被拒绝、将重建」日志开关。 */
@@ -112,15 +112,8 @@ public final class BufferedLinearV3Format {
   public static final int MAX_RAW_SIZE = 512 * 1024 * 1024;
 
   /**
-   * zstd 在本进程内是否可用（只在类初始化时探测一次）。
-   *
-   * <p>探测用一个最小往返（{@code compress} → {@code decompress}），既能覆盖「原生库缺失导致
-   * zstd-jni 类初始化抛 {@link UnsatisfiedLinkError} / {@link NoClassDefFoundError}」，
-   * 也能覆盖「库在但实现异常」两种情况；任何 {@link Throwable} 都视为不可用并回退 Deflater。
+   * 单条缓存条目：区块代次 + 写入时间 + 配置指纹 + 负载。
    */
-  private static final boolean ZSTD_AVAILABLE = probeZstd();
-
-  /** 单条缓存条目：区块代次 + 写入时间 + 配置指纹 + 负载。 */
   public record Entry(long generation, long writtenAtMillis, int configHash, byte[] payload) {
   }
 
@@ -133,22 +126,15 @@ public final class BufferedLinearV3Format {
 
   // ------------------------------------------------------------------ 压缩方案
 
-  /** 探测 zstd 可用性；不可用时提示一次并返回 false。 */
-  private static boolean probeZstd() {
-    try {
-      byte[] probe = Zstd.compress(new byte[] {0});
-      byte[] restored = Zstd.decompress(probe, 1);
-      return restored != null && restored.length == 1;
-    } catch (Throwable throwable) {
-      warnZstdFallbackOnce(throwable);
-      return false;
-    }
-  }
-
-  /** zstd 不可用/异常时的唯一一次中文提示（并发安全）。 */
+  /**
+   * zstd 不可用/异常时的唯一一次中文提示（并发安全）。
+   *
+   * <p>启动期的「是否可用」结论由 {@link ZstdSupport} 负责（它有三种来源，并会输出检测结果日志）；
+   * 这里的提示只针对「zstd 明明可用却在运行期抛了异常」这一路径，避免同一件事刷两遍屏。
+   */
   private static void warnZstdFallbackOnce(Throwable throwable) {
     if (ZSTD_FALLBACK_WARNED.compareAndSet(false, true)) {
-      LOGGER.warning("zstd（zstd-jni）不可用，磁盘缓存区块压缩已自动回退 JDK Deflater："
+      LOGGER.warning("zstd（zstd-jni）运行期异常，磁盘缓存区块压缩已自动回退 JDK Deflater："
           + throwable + "（缓存读写不受影响，绝不阻塞封包链路）");
     }
   }
@@ -167,7 +153,7 @@ public final class BufferedLinearV3Format {
    * <p>{@link #encodeHeader(int)} 与实际压缩都取此值，因此「头部声明的方案」与「bucket 实际算法」永远一致。
    */
   public static byte currentCompression() {
-    return ZSTD_AVAILABLE ? COMPRESSION_ZSTD : COMPRESSION_DEFLATE;
+    return ZstdSupport.available() ? COMPRESSION_ZSTD : COMPRESSION_DEFLATE;
   }
 
   // ------------------------------------------------------------------ 坐标换算
@@ -262,9 +248,9 @@ public final class BufferedLinearV3Format {
    * zstd 不可用或其抛异常时回退 {@link Deflater#BEST_SPEED}（fail-open）。
    */
   public static byte[] compress(byte[] raw) {
-    if (ZSTD_AVAILABLE) {
+    if (ZstdSupport.available()) {
       try {
-        return Zstd.compress(raw, ZSTD_LEVEL);
+        return ZstdSupport.compress(raw, ZSTD_LEVEL);
       } catch (Throwable throwable) {
         warnZstdFallbackOnce(throwable);
       }
@@ -322,11 +308,11 @@ public final class BufferedLinearV3Format {
 
   /** zstd 解压（已知原始长度）。任何缺失/损坏都转成 {@link IOException}，交由调用方 fail-open。 */
   private static byte[] zstdInflate(byte[] compressed, int rawLength) throws IOException {
-    if (!ZSTD_AVAILABLE) {
+    if (!ZstdSupport.available()) {
       throw new IOException("文件声明使用 zstd，但当前环境无 zstd（zstd-jni 不可用）");
     }
     try {
-      byte[] out = Zstd.decompress(compressed, rawLength);
+      byte[] out = ZstdSupport.decompress(compressed, rawLength);
       if (out == null || out.length != rawLength) {
         throw new IOException("zstd 解压长度不符：期望 " + rawLength + "，实际 "
             + (out == null ? -1 : out.length));

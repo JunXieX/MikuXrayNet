@@ -33,7 +33,7 @@ class DiskCacheStoreTest {
   private static AntiXrayConfig.DiskCache config(int maxEntries, int expireSeconds,
       int idleCloseSeconds) {
     return new AntiXrayConfig.DiskCache(true, maxEntries, 16, expireSeconds, 2, idleCloseSeconds,
-        3600, 4, 256, 4096);
+        3600, 4, 256, 4096, false, AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, 10);
   }
 
   /** 测试用构造：把读取预算放宽到 10 秒，避免 CI 磁盘抖动被误判为「未命中」。 */
@@ -85,7 +85,7 @@ class DiskCacheStoreTest {
   @Test
   void regionFileSizeLimitCountsUnflushedData(@TempDir Path dir) throws Exception {
     AntiXrayConfig.DiskCache limit1Mb = new AntiXrayConfig.DiskCache(true, 20000, 1, 600, 2, 600,
-        3600, 4, 256, 4096);
+        3600, 4, 256, 4096, false, AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, 10);
     try (DiskCacheStore store = store(dir, limit1Mb)) {
       for (int chunkX = 0; chunkX < 32; chunkX++) {
         store.put(WORLD, chunkX, 0, 1, randomPayload(64 * 1024, chunkX));
@@ -247,7 +247,7 @@ class DiskCacheStoreTest {
   @Test
   void disabledConfigIsInert(@TempDir Path dir) {
     AntiXrayConfig.DiskCache disabled = new AntiXrayConfig.DiskCache(false, 1024, 16, 600, 2, 600,
-        3600, 4, 256, 4096);
+        3600, 4, 256, 4096, false, AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, 10);
     try (DiskCacheStore store = store(dir, disabled)) {
       assertFalse(store.usable());
       store.put(WORLD, 0, 0, 1, payload(64));

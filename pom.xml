@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -156,6 +156,46 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.13.0</version>
                 <!-- release 目标版本由 properties 的 maven.compiler.release 统一提供，不再重复声明 -->
+                <configuration>
+                    <!--
+                      体积优化（依据见文件末尾 <properties> 下方的说明）：只保留行号与源文件名，
+                      去掉局部变量表（LocalVariableTable）。
+                      写法依据（本机 javap 核实 maven-compiler-plugin 3.13.0 的 AbstractCompilerMojo）：
+                        · 参数有三个相关项：debug(boolean, 默认 true)、debuglevel(String)、compilerArgs(List)。
+                        · debug 默认 true 时会自动注入 `-g`（= lines,vars,source 全量），故这里显式 debug=false
+                          关掉自动注入，再用 compilerArgs 指定 `-g:lines,source`：
+                          最终 javac 参数只有一个 `-g:lines,source`，不会出现 `-g` 与 `-g:lines,source` 并存。
+                        · 备选写法 debug=true + <debuglevel>lines,source</debuglevel> 同样可用
+                          （debuglevel 在 debug=true 时经 plexus-compiler-javac 2.15.0 生成 `-g:<debuglevel>`），
+                          此处取 compilerArgs 是因为它不依赖 debug 开关语义，更直观。
+                      实测：-g → -g:lines,source 后 .class 未压缩总量 671767 → 572511 字节（-14.78%），
+                      jar 压缩后 354985 → 318943 字节（-10.15%）；堆栈仍显示 (RegionFile.java:484)。
+                    -->
+                    <debug>false</debug>
+                    <compilerArgs>
+                        <arg>-g:lines,source</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.2</version>
+                <configuration>
+                    <!--
+                      体积优化：不再写入 META-INF/maven/**/pom.xml 与 pom.properties（对运行期无用）。
+                      键名依据（本机核实）：
+                        · 反编译 maven-jar-plugin 3.4.2 的 META-INF/maven/plugin.xml，参数清单里
+                          **没有**顶层 addMavenDescriptor；唯一相关参数是 archive
+                          （类型 org.apache.maven.archiver.MavenArchiveConfiguration）。
+                        · MavenArchiveConfiguration 的公开方法正是 setAddMavenDescriptor(boolean) /
+                          isAddMavenDescriptor()（默认 true），故必须写成 <archive><addMavenDescriptor>。
+                      实测：这两个文件压缩后约占 3111 字节（本仓库 pom.xml 实测）。
+                    -->
+                    <archive>
+                        <addMavenDescriptor>false</addMavenDescriptor>
+                    </archive>
+                </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

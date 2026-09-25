@@ -15,6 +15,7 @@ import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
 import net.mikumc.mikuxraynet.bootstrap.PacketEventsHook;
 import net.mikumc.mikuxraynet.bootstrap.ProtocolLibHook;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
+import net.mikumc.mikuxraynet.cache.ZstdSupport;
 import net.mikumc.mikuxraynet.codec.ChunkCodec;
 import net.mikumc.mikuxraynet.codec.ChunkVersionFlags;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
@@ -126,11 +127,18 @@ public final class AntiXrayRuntime {
         ? new RevealedSet(proximity.maxPositionsPerPlayer(), proximity.expireSeconds())
         : null;
 
-    // 磁盘缓存：关闭时为 null，改写路径退化为纯内存缓存
-    DiskCacheStore diskCache = antiXray.diskCache().enabled()
-        ? new DiskCacheStore(new File(plugin.getDataFolder(), "cache").toPath(),
-            antiXray.diskCache(), logger)
-        : null;
+    // 磁盘缓存：关闭时为 null，改写路径退化为纯内存缓存。
+    // 启用前先解析 zstd（服务端自带 → 本地已下载 → 按配置自动下载 → 回退 Deflater），
+    // 必须早于 DiskCacheStore 创建：文件头的「压缩方案字节」在首次写入时就要定下来。
+    AntiXrayConfig.DiskCache diskCacheConfig = antiXray.diskCache();
+    DiskCacheStore diskCache = null;
+    if (diskCacheConfig.enabled()) {
+      ZstdSupport.initialize(new File(plugin.getDataFolder(), "lib").toPath(),
+          diskCacheConfig.zstdAutoDownload(), diskCacheConfig.zstdDownloadUrl(),
+          diskCacheConfig.zstdTimeoutSeconds(), logger);
+      diskCache = new DiskCacheStore(new File(plugin.getDataFolder(), "cache").toPath(),
+          diskCacheConfig, logger);
+    }
 
     MikuWorkPool pool = new MikuWorkPool(antiXray.threads(), antiXray.queueCapacity());
     ProtocolLibHook hook = new ProtocolLibHook(plugin);

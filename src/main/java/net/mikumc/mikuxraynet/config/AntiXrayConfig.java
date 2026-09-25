@@ -313,10 +313,14 @@ public final class AntiXrayConfig {
    * @param compactPerPass             每轮维护最多压缩回收的区域文件数
    * @param queueCapacity              磁盘线程待处理任务上限（超出即丢弃，保网络路径）
    * @param generationTrackerSize      区块代次跟踪表的条目上限（有界 LRU）
+   * @param zstdAutoDownload           zstd 前置缺失时是否自动下载（默认 true）
+   * @param zstdDownloadUrl            zstd 下载源根地址（默认 Maven Central；可换阿里云镜像）
+   * @param zstdTimeoutSeconds         zstd 下载的总等待上限（秒；超时即失败并回退，默认 10）
    */
   public record DiskCache(boolean enabled, int maxEntries, int maxFileSizeMb, int expireSeconds,
       int bucketCacheSize, int idleCloseSeconds, int maintenanceIntervalSeconds, int compactPerPass,
-      int queueCapacity, int generationTrackerSize) {
+      int queueCapacity, int generationTrackerSize, boolean zstdAutoDownload, String zstdDownloadUrl,
+      int zstdTimeoutSeconds) {
   }
 
   /**
@@ -520,6 +524,15 @@ public final class AntiXrayConfig {
         Integer.MIN_VALUE, Integer.MAX_VALUE, ObfuscationMode.ALL, false);
   }
 
+  /** zstd 下载源缺省值：Maven Central 根地址（国内服务器建议在 antixray.yml 里换成阿里云镜像）。 */
+  public static final String DEFAULT_ZSTD_DOWNLOAD_URL = "https://repo1.maven.org/maven2";
+
+  /** zstd 下载源：缺失/空白/只有斜杠时回落到 {@link #DEFAULT_ZSTD_DOWNLOAD_URL}。 */
+  private static String zstdDownloadUrl(ConfigurationSection root) {
+    String url = root.getString("disk-cache.zstd.download-url", DEFAULT_ZSTD_DOWNLOAD_URL);
+    return url == null || url.isBlank() ? DEFAULT_ZSTD_DOWNLOAD_URL : url.trim();
+  }
+
   /** 从配置根节点解析。 */
   public static AntiXrayConfig from(ConfigurationSection root) {
     Set<String> unknownTags = new LinkedHashSet<>();
@@ -601,7 +614,11 @@ public final class AntiXrayConfig {
             Math.max(1, root.getInt("disk-cache.maintenance-interval-seconds", 30)),
             Math.max(1, root.getInt("disk-cache.compact-per-pass", 4)),
             Math.max(1, root.getInt("disk-cache.queue-capacity", 256)),
-            Math.max(1, root.getInt("disk-cache.generation-tracker-size", 32768))),
+            Math.max(1, root.getInt("disk-cache.generation-tracker-size", 32768)),
+            // zstd 前置：服务端自带则直接用；没有则按这三键决定是否自动下载（见 ZstdSupport）
+            root.getBoolean("disk-cache.zstd.auto-download", true),
+            zstdDownloadUrl(root),
+            Math.max(1, root.getInt("disk-cache.zstd.timeout-seconds", 10))),
         PlatformSupport.Mode.parse(root.getString("advanced.platform", "auto")),
         root.getInt("cache.maximum-size", 4096),
         root.getInt("cache.expire-after-access-seconds", 60),
