@@ -295,9 +295,10 @@ class ProductionPathBenchmarkTest {
    *
    * <p>真实抓取由 {@code NeighborChunkProvider#capture} 完成，发生在主线程 / Folia 区域线程，
    * 并用 {@code world.getBlockData(...).isOccluding()} 读方块——离线不可用（需要 Bukkit 世界）。
-   * 因此这里用<b>纯计算的布尔平面模拟</b>：以确定性的纯函数代替「读方块是否遮挡」，
-   * 但保持与 {@code capturePlane} 完全相同的循环形状（4 侧 × 16 × 高度 次查询，每侧写出 height×16 bit），
-   * 并用真实的 {@link NeighborEdges} 承载结果。该模拟是真实抓取耗时的下界（不含缓存查找、加载检查与 Bukkit 读块）。
+   * 因此这里用<b>纯计算的布尔平面模拟</b>：以确定性的纯函数代替「读方块是否遮挡」与
+   * 「列高度上界查询」，但保持与 {@code capturePlane} 相同的循环形状（4 侧 × 16 列，
+   * 每列只读到该列的模拟上界为止，每侧写出 height×16 bit），并用真实的 {@link NeighborEdges} 承载结果。
+   * 该模拟是真实抓取耗时的下界（不含缓存查找、加载检查与 Bukkit 读块）。
    */
   private static SnapshotRow measureNeighborSnapshot(ThreadMXBean allocationBean) {
     long threadId = Thread.currentThread().getId();
@@ -338,13 +339,21 @@ class ProductionPathBenchmarkTest {
   private static long[] buildPlane(int height, NeighborEdges.Side side) {
     long[] plane = new long[NeighborEdges.planeLongCount(height)];
     for (int local = 0; local < 16; local++) {
-      for (int y = 0; y < height; y++) {
+      for (int y = 0; y <= simulatedColumnTop(height, side, local); y++) {
         if (simulatedOccluding(side, local, y)) {
           NeighborEdges.setOccluding(plane, y << 4 | local);
         }
       }
     }
     return plane;
+  }
+
+  /**
+   * 代替 {@code World#getHighestBlockYAt(...)} 的确定性「列高度上界」模拟：地表放在世界高度的 2/5 处
+   * （模拟主世界「只有下半部分有方块」），逐列略起伏；与真实抓取一样，上界之上一位都不读。
+   */
+  private static int simulatedColumnTop(int height, NeighborEdges.Side side, int local) {
+    return Math.min(height - 1, height * 2 / 5 + local % 3 + side.ordinal());
   }
 
   /** 代替 {@code world.getBlockData(...).isOccluding()} 的确定性纯计算谓词（约 7/8 遮挡）。 */
@@ -439,9 +448,10 @@ class ProductionPathBenchmarkTest {
     report.append("\n### 4.3 邻块贴边快照（单独测量，不计入每区块热路径）\n\n");
     report.append("- 抓取发生在主线程 / Folia 区域线程，**不在** worker 热路径，故单独成列\n");
     report.append("- 真实抓取读 Bukkit 世界（离线不可用），这里用**纯计算的布尔平面模拟**："
-        + "以确定性纯函数代替 `world.getBlockData(...).isOccluding()`，"
-        + "循环形状与 `NeighborChunkProvider#capturePlane` 一致（4 侧 × 16 × 高度 次查询，每侧写出 height×16 bit），"
-        + "结果用真实 `NeighborEdges` 承载；是真实耗时的**下界**（不含缓存查找、加载检查与 Bukkit 读块）\n");
+        + "以确定性纯函数代替 `world.getBlockData(...).isOccluding()` 与列高度上界查询，"
+        + "循环形状与 `NeighborChunkProvider#capturePlane` 一致（4 侧 × 16 列，每列读到该列模拟上界为止，"
+        + "每侧写出 height×16 bit），结果用真实 `NeighborEdges` 承载；"
+        + "是真实耗时的**下界**（不含缓存查找、加载检查与 Bukkit 读块）\n");
     report.append("| 指标 | 值 |\n| --- | --- |\n");
     report.append("| 构造一次 4 邻块快照中位耗时(ms) | ").append(millis(snapshot.medianNanos())).append(" |\n");
     report.append("| 最小/最大(ms) | ").append(millis(snapshot.minNanos())).append(" / ")

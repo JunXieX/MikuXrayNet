@@ -162,10 +162,27 @@ public final class AntiXrayRuntime {
     plugin.registerWorldUnloadInvalidation();
     startProximity(antiXray, chunkIndex, revealed, proximityStats);
     logger.info("反矿透已启用（按维度分段）：" + dimensionSummary(antiXray)
-        + "；区块边界邻块快照 "
-        + (neighborProvider != null ? "已启用" : "已关闭") + "；磁盘缓存 "
+        + "；区块边界邻块快照 " + neighborState(neighborProvider, processor) + "；磁盘缓存 "
         + (diskCache != null ? "已启用（" + new File(plugin.getDataFolder(), "cache").getPath() + "）"
             : "已关闭"));
+  }
+
+  /**
+   * 启动摘要里的「邻块快照」状态：已关闭 / 已启用 / 当前模式不抓取。
+   *
+   * <p>{@code mode=all}（默认）下改写不做 6 面遮挡判定，邻块数据一位都用不到，因此连抓取都省掉
+   * （判定见 {@code ObfuscationProcessor#needsNeighbors}）——这一句让「邻块缓存为什么一直是空的」可见。
+   */
+  private static String neighborState(NeighborChunkProvider provider, ObfuscationProcessor processor) {
+    if (provider == null) {
+      return "已关闭";
+    }
+    for (AntiXrayConfig.Dimension dimension : AntiXrayConfig.Dimension.values()) {
+      if (processor.needsNeighbors(null, dimension)) {
+        return "已启用";
+      }
+    }
+    return "不抓取（各维度 mode 都是 all，改写不做 6 面遮挡判定）";
   }
 
   /** 各维度一句话摘要（启用状态、隐藏项数与伪装方块数），供启动日志核对。 */

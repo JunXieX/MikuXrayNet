@@ -309,7 +309,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     // 邻块快照未命中：先转主线程 / Folia 区域线程抓取，抓完再交给工作线程
     // （写入权仍在看门狗手里，抓取期间超时照样会放行原包）
-    if (neighborsEnabled
+    // 只在真的需要时才抓：mode=all 的世界改写不做 6 面遮挡判定（见 ObfuscationProcessor#rewrite），
+    // 邻块数据用不到，抓取与随之而来的区域线程调度都是纯开销。
+    if (neighborsNeeded(world.getName(), dimension)
         && neighborProvider.cached(world.getName(), accessor.chunkX(), accessor.chunkZ()) == null
         && scheduleCaptureThenRewrite(task, accessor, world, timeout)) {
       return;
@@ -394,7 +396,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         if (cached != null) {
           writeBack(accessor, task, cached.data(), cached.positions());
         } else {
-          NeighborEdges neighbors = neighborsEnabled
+          NeighborEdges neighbors = neighborsNeeded(task.worldName(), task.dimension())
               ? neighborProvider.cached(task.worldName(), task.chunkX(), task.chunkZ())
               : null;
           rewrite(task, accessor, source, sourceHash, neighbors);
@@ -583,6 +585,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         revealedSet.clearChunk(new ChunkKey(task.worldName(), task.chunkX(), task.chunkZ()));
       }
     }
+  }
+
+  /**
+   * 该（世界, 维度）的改写是否需要邻块贴边快照。
+   *
+   * <p>{@code mode=all}（默认）的档案在改写里<b>不做</b> 6 面遮挡判定，邻块数据一位都用不到：
+   * 此时连抓取都省掉——抓取要在主线程 / Folia 区域线程逐格读世界，还会让区块封包多一次
+   * 区域线程调度往返。{@code mode=enclosed} 的世界照常抓取。
+   */
+  private boolean neighborsNeeded(String worldName, AntiXrayConfig.Dimension dimension) {
+    return neighborsEnabled && processor.needsNeighbors(worldName, dimension);
   }
 
   /** 该玩家是否受本模块影响（直通名单绕过 + 反矿透世界判定）。 */

@@ -580,7 +580,8 @@ public final class AntiXrayConfig {
             root.getBoolean("neighbors.enabled", true),
             missingPolicy(root.getString("neighbors.missing-policy", "hide")),
             // 默认 2048（原为 512）：快照已按位打包（每格 1 bit，主世界 384 高度约 3 KB/条），
-            // 2048 条约 6 MB；512 条时缓存接近饱和、抓取次数随玩家移动抖动（单次抓取约 0.776 ms）。
+            // 2048 条约 6 MB；512 条时缓存接近饱和、抓取次数随玩家移动抖动
+            //（单次抓取实测约 0.776 ms，现按列高度上界裁剪后更少）。
             root.getInt("neighbors.cache-maximum-size", 2048)),
         new Occlusion(
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-occluding")),

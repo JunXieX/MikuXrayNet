@@ -15,6 +15,7 @@ import net.mikumc.mikuxraynet.codec.Chunk;
 import net.mikumc.mikuxraynet.codec.ChunkCodec;
 import net.mikumc.mikuxraynet.codec.ChunkVersionFlags;
 import net.mikumc.mikuxraynet.codec.RegistryAccessor;
+import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -264,6 +265,22 @@ class ObfuscationProcessorTest {
         "all 模式下邻块数据不影响伪装坐标");
   }
 
+  /**
+   * 「是否需要邻块贴边快照」严格跟着伪装模式走：只有 {@code mode=enclosed}（要做 6 面遮挡判定）
+   * 才需要；{@code mode=all}（默认）一律伪装、不做面判定，邻块数据一位都用不到——调用方据此省掉抓取。
+   */
+  @Test
+  void needsNeighborsOnlyWhenOcclusionIsConsulted() {
+    assertTrue(processor().needsNeighbors(null, AntiXrayConfig.Dimension.NORMAL),
+        "enclosed 模式要做 6 面遮挡判定，必须抓邻块快照");
+    assertFalse(processorAll().needsNeighbors(null, AntiXrayConfig.Dimension.NORMAL),
+        "all 模式不做面判定，不需要邻块快照");
+    assertFalse(processorAll().needsNeighbors(null, AntiXrayConfig.Dimension.NETHER),
+        "逐维度一致：各维度档案都是 all");
+    assertFalse(inactiveProcessor().needsNeighbors(null, AntiXrayConfig.Dimension.NORMAL),
+        "未生效档案（没有隐藏方块）直接跳过改写，同样不需要邻块快照");
+  }
+
   private static int[] filled(int state) {
     int[] states = new int[4096];
     Arrays.fill(states, state);
@@ -305,6 +322,13 @@ class ObfuscationProcessorTest {
     return new ObfuscationProcessor(new ChunkCodec(registry(), MODERN), blockId -> blockId != AIR,
         targets, new int[] {STONE}, new int[] {1}, false, false,
         ObfuscationProcessor.PaletteOptions.DISABLED, true);
+  }
+
+  /** 未生效档案（没有隐藏方块）：改写整体跳过。 */
+  private static ObfuscationProcessor inactiveProcessor() {
+    return new ObfuscationProcessor(new ChunkCodec(registry(), MODERN), blockId -> blockId != AIR,
+        new BitSet(), new int[] {STONE}, new int[] {1}, false, false,
+        ObfuscationProcessor.PaletteOptions.DISABLED);
   }
 
   private static int index(int x, int y, int z) {

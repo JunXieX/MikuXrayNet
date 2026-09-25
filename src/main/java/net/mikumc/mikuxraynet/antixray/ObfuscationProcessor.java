@@ -678,6 +678,23 @@ public final class ObfuscationProcessor {
   }
 
   /**
+   * 该（世界名, 维度）下的改写是否需要邻块贴边快照。
+   *
+   * <p>{@code mode=all} 的档案在 {@link #rewrite} 里<b>不做任何遮挡判定</b>（所有目标方块一律伪装，
+   * 由邻近显形还原），邻块数据一位都用不到；据此调用方可以连「抓取贴边快照」都省掉——
+   * 那是一次<em>在主线程 / Folia 区域线程</em>上逐格读世界的操作。{@code mode=enclosed} 时才需要。
+   *
+   * <p>档案在启动期固化（{@code mode} 与隐藏方块表一样不在热重载范围内），因此本判定是稳定的。
+   *
+   * @param worldName 世界名；{@code null} 表示按维度档案判定（不看逐世界覆盖）
+   */
+  public boolean needsNeighbors(String worldName, AntiXrayConfig.Dimension dimension) {
+    WorldProfile profile = profileFor(worldName,
+        dimension == null ? AntiXrayConfig.Dimension.NORMAL : dimension);
+    return profile.active() && !profile.obfuscateAll;
+  }
+
+  /**
    * 取「世界名 + 维度」对应的改写档案（解析优先级：world-overrides &gt; dimensions.&lt;维度&gt;）。
    *
    * <p>无覆盖段（或测试构造）直接返回维度档案（O(1)，零分配）；有覆盖段时按世界名在<b>该维度的缓存表</b>
