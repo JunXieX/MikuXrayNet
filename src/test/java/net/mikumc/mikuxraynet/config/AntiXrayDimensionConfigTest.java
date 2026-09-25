@@ -118,9 +118,9 @@ class AntiXrayDimensionConfigTest {
 
     assertTrue(config.dimensionsMissing(), "旧版结构（缺 dimensions 段）必须被识别");
     // 内置默认仍然生效（绝不让保护静默失效）
-    assertEquals(35, config.dimensionEffective(Dimension.NORMAL).hideBlocks().size(),
+    assertEquals(22, config.dimensionEffective(Dimension.NORMAL).hideBlocks().size(),
         "缺段时必须回落内置默认的主世界清单（而非旧配置里的 diamond_ore）");
-    assertEquals(15, config.dimensionEffective(Dimension.NETHER).hideBlocks().size());
+    assertEquals(4, config.dimensionEffective(Dimension.NETHER).hideBlocks().size());
     assertTrue(config.dimensionEffective(Dimension.NETHER).hideBlocks().contains("ancient_debris"));
 
     List<String> warnings = new ArrayList<>();

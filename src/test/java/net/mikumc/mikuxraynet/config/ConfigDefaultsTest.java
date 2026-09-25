@@ -53,7 +53,7 @@ class ConfigDefaultsTest {
   }
 
   /**
-   * 默认隐藏清单按维度独立：主世界 35 种、地狱 15 种（<b>不含 nether_quartz_ore</b>）、末地 12 种。
+   * 默认隐藏清单按维度独立：主世界 22 种、地狱 4 种（<b>不含 nether_quartz_ore</b>）、末地 1 种。
    *
    * <p>回归用户核心诉求：地狱分布极广、价值极低的石英矿默认不隐藏（否则玩家在地狱到处挖到假石头）。
    */
@@ -68,18 +68,24 @@ class ConfigDefaultsTest {
     List<String> end =
         config.dimensionEffective(AntiXrayConfig.Dimension.THE_END).hideBlocks();
 
-    assertEquals(35, normal.size(), "主世界默认隐藏清单 35 种（16 矿 + 3 粗金属块 + 11 容器 + 5）：" + normal);
-    assertEquals(15, nether.size(), "地狱默认隐藏清单 15 种（残骸 + 金矿 + 11 容器 + 基岩 + 刷怪笼）：" + nether);
-    assertEquals(12, end.size(), "末地默认隐藏清单 12 种（11 容器 + 基岩）：" + end);
+    assertEquals(22, normal.size(),
+        "主世界默认隐藏清单 22 种（16 矿 + 3 粗金属块 + chest + spawner + mossy_cobblestone）：" + normal);
+    assertEquals(4, nether.size(), "地狱默认隐藏清单 4 种（残骸 + 金矿 + chest + 刷怪笼）：" + nether);
+    assertEquals(1, end.size(), "末地默认隐藏清单 1 种（chest）：" + end);
 
     assertTrue(normal.contains("spawner"),
         "主世界必须隐藏刷怪笼（真机 PE 26.2 注册名就是 spawner）：" + normal);
     assertTrue(normal.contains("mossy_cobblestone"),
         "主世界必须隐藏苔石（地牢/要塞/矿洞结构的标志物）：" + normal);
-    for (String name : new String[] {"chest", "trapped_chest", "ender_chest", "barrel", "furnace",
-        "blast_furnace", "smoker", "hopper", "dropper", "dispenser", "shulker_box",
-        "bedrock", "raw_iron_block", "raw_gold_block", "raw_copper_block", "obsidian", "clay"}) {
+    for (String name : new String[] {"chest", "raw_iron_block", "raw_gold_block", "raw_copper_block"}) {
       assertTrue(normal.contains(name), "主世界清单必须包含 " + name + "：" + normal);
+    }
+    // 本轮默认值收紧：这些方块不再默认隐藏（可制造 / 自然结构方块，藏它们只换来到处「假方块」与更高替换量）
+    for (String name : new String[] {"trapped_chest", "ender_chest", "barrel", "furnace",
+        "blast_furnace", "smoker", "hopper", "dropper", "dispenser", "shulker_box",
+        "bedrock", "obsidian", "clay"}) {
+      assertFalse(normal.contains(name), "主世界默认清单不得再含 " + name + "：" + normal);
+      assertFalse(nether.contains(name), "地狱默认清单不得再含 " + name + "：" + nether);
     }
 
     // 地狱：含残骸与金矿、明确不含石英矿
@@ -369,8 +375,9 @@ class ConfigDefaultsTest {
     assertEquals(10, config.diskCache().zstdTimeoutSeconds(), "zstd 下载超时默认 10 秒");
 
     // cache 两键（改写结果的内存缓存）
-    assertEquals(4096, config.cacheMaximumSize(), "改写缓存条目上限默认 4096");
-    assertEquals(60, config.cacheExpireAfterAccessSeconds(), "改写缓存访问后过期默认 60 秒");
+    assertEquals(40960, config.cacheMaximumSize(),
+        "改写缓存条目上限默认 40960（约 0.8~1 GB 上限；条目只在真遇到新区块时增长）");
+    assertEquals(600, config.cacheExpireAfterAccessSeconds(), "改写缓存访问后过期默认 600 秒");
 
     // advanced 三键
     assertEquals(0, config.threads(), "工作线程数默认 0 = 按 CPU 自动推算（上限 4）");

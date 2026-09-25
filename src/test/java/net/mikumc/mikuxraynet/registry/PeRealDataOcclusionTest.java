@@ -199,9 +199,9 @@ class PeRealDataOcclusionTest {
     List<String> normal = byDimension.get("normal");
     List<String> nether = byDimension.get("nether");
     List<String> end = byDimension.get("the_end");
-    assertEquals(35, normal.size(), "主世界默认清单应为 35 种：" + normal);
-    assertEquals(15, nether.size(), "地狱默认清单应为 15 种：" + nether);
-    assertEquals(12, end.size(), "末地默认清单应为 12 种：" + end);
+    assertEquals(22, normal.size(), "主世界默认清单应为 22 种：" + normal);
+    assertEquals(4, nether.size(), "地狱默认清单应为 4 种：" + nether);
+    assertEquals(1, end.size(), "末地默认清单应为 1 种：" + end);
 
     for (List<String> names : byDimension.values()) {
       for (String name : names) {

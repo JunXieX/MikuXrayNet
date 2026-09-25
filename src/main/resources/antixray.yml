@@ -64,10 +64,13 @@ dimensions:
     mode: all                # all=全部目标方块一律伪装；enclosed=仅伪装被完全包住的
     # min-y: -64             # 可选：只在此高度范围内伪装（不写=不限制）
     # max-y: 320
-    # 共 35 种：16 种主世界矿石（含深层变体）+ 3 种粗金属块 + 11 种容器族 + 基岩/黑曜石/黏土
+    # 共 22 种：16 种主世界矿石（含深层变体）+ 3 种粗金属块 + chest（箱子）
     #          + spawner（刷怪笼，真机 PE 26.2 注册名就是 spawner，旧的 mob_spawner 已不存在）
     #          + mossy_cobblestone（苔石，地牢/要塞/矿洞结构的标志物）。
-    # 容器/功能方块多为方块实体：被伪装 section 内它们的方块实体本就会被 remove-block-entities
+    # 刻意不再默认隐藏：桶/熔炉族/漏斗/发射器/投掷器/潜影盒/末影箱/陷阱箱（可制造、遍布建筑，藏它们只会
+    # 换来到处「假方块」的观感与更高替换量）与 基岩/黑曜石/黏土（自然结构方块，透视价值低）。
+    # 需要时把对应注册名加回下面清单即可。
+    # chest 为方块实体：被伪装 section 内它的方块实体本就会被 remove-block-entities
     # 剔除，与伪装逻辑不冲突（名称已用真机 PE 26.2 状态表逐一核实）。
     hide-blocks:
       - coal_ore
@@ -89,22 +92,9 @@ dimensions:
       - raw_iron_block
       - raw_gold_block
       - raw_copper_block
-      # —— 容器/功能方块（多为方块实体，remove-block-entities 会一并剔除其数据）——
+      # —— 容器（箱子：透视端最想找的目标）——
       - chest
-      - trapped_chest
-      - ender_chest
-      - barrel
-      - furnace
-      - blast_furnace
-      - smoker
-      - hopper
-      - dropper
-      - dispenser
-      - shulker_box
       # —— 结构暴露型方块 ——
-      - bedrock
-      - obsidian
-      - clay
       - spawner
       - mossy_cobblestone
     # 伪装方块与随机权重（权重越大概率越高，必须为正整数）。建议只填地下常见方块，避免违和感。
@@ -131,7 +121,8 @@ dimensions:
   nether:                    # 地狱（NETHER）
     enabled: true
     mode: all
-    # 共 15 种：ancient_debris（下界残骸）、nether_gold_ore（下界金矿）+ 11 种容器族 + 基岩 + 刷怪笼。
+    # 共 4 种：ancient_debris（下界残骸）、nether_gold_ore（下界金矿）+ chest + 刷怪笼。
+    # 桶、基岩与熔炉族等容器不再默认隐藏（可制造 / 自然方块，透视价值低）。
     #
     # 【本清单明确不含 nether_quartz_ore（地狱石英矿）】
     #   理由：地狱石英分布极广、单块价值极低。若把它也全藏，玩家在地狱挖矿时会到处挖到「假石头」，
@@ -140,19 +131,8 @@ dimensions:
     hide-blocks:
       - ancient_debris
       - nether_gold_ore
-      # —— 容器/功能方块 ——
+      # —— 容器（箱子）——
       - chest
-      - trapped_chest
-      - ender_chest
-      - barrel
-      - furnace
-      - blast_furnace
-      - smoker
-      - hopper
-      - dropper
-      - dispenser
-      - shulker_box
-      - bedrock
       - spawner
     replacement-weights:
       netherrack: 10
@@ -163,20 +143,9 @@ dimensions:
   the_end:                   # 末地（THE_END）——默认关闭：末地本身无矿物，
     enabled: false           # 如需隐藏末地城的箱子/潜影盒再把它改为 true。
     mode: all
-    # 共 12 种：11 种容器族 + 基岩。
+    # 共 1 种：chest。其余容器与基岩不再默认隐藏。
     hide-blocks:
       - chest
-      - trapped_chest
-      - ender_chest
-      - barrel
-      - furnace
-      - blast_furnace
-      - smoker
-      - hopper
-      - dropper
-      - dispenser
-      - shulker_box
-      - bedrock
     replacement-weights:
       end_stone: 10
     use-block-below: false
@@ -507,11 +476,16 @@ disk-cache:
     timeout-seconds: 10
 
 cache:
-  # 改写结果缓存的条目上限（每条约等于一个区块的字节数）。
-  maximum-size: 4096
+  # 改写结果缓存的条目上限（每条约等于一个区块的改写后字节数 + 被伪装坐标表）。
+  # 【内存代价】真机实测每条约 20~25 KB（输出字节/改写区块 ≈ 20.6 KB，坐标表 ≈ 4.8 KB），
+  # 因此 40960 条饱和时约 0.8~1 GB 堆内存。注意这是**上限**：条目只在真的遇到新区块时增长，
+  # 且受下面的过期时间约束，实际占用通常低于上限；若插件堆内存吃紧，把它调小即可（例如 16384 ≈ 340 MB）。
+  maximum-size: 40960
 
-  # 缓存条目在最后一次访问后多久过期（秒）。
-  expire-after-access-seconds: 60
+  # 缓存条目在最后一次访问后多久过期（秒）。默认 600（10 分钟）：
+  # 玩家在同一片区域来回走动/挖矿时会持续命中同一批区块，过期时间越长命中率越高，
+  # 代价是这些条目在内存里驻留更久（配合上面的条目上限共同决定内存上界）。
+  expire-after-access-seconds: 600
 
 advanced:
   # 平台判定兜底：auto | paper | folia（默认 auto，最高优先级）。

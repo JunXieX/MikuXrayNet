@@ -61,13 +61,13 @@ class WorldOverrideConfigTest {
     assertEquals(ObfuscationMode.ENCLOSED, normal.mode(), "维度段显式模式生效");
     assertEquals(-32, normal.minY(), "维度段显式高度下界生效");
     assertEquals(Integer.MAX_VALUE, normal.maxY(), "未配置的 max-y 回落内置默认（不限制）");
-    assertEquals(35, normal.hideBlocks().size(), "未配置的 hide-blocks 回落内置默认（主世界 35 种）");
+    assertEquals(22, normal.hideBlocks().size(), "未配置的 hide-blocks 回落内置默认（主世界 22 种）");
     assertFalse(config.dimensionEnabled(Dimension.NORMAL), "维度段可显式关闭本维度");
     // 未出现的维度段整体回落内置默认
-    assertEquals(15, config.dimensionEffective(Dimension.NETHER).hideBlocks().size(),
-        "未配置的地狱段回落内置默认（15 种）");
-    assertEquals(12, config.dimensionEffective(Dimension.THE_END).hideBlocks().size(),
-        "未配置的末地段回落内置默认（12 种）");
+    assertEquals(4, config.dimensionEffective(Dimension.NETHER).hideBlocks().size(),
+        "未配置的地狱段回落内置默认（4 种）");
+    assertEquals(1, config.dimensionEffective(Dimension.THE_END).hideBlocks().size(),
+        "未配置的末地段回落内置默认（1 种）");
     assertFalse(config.dimensionEnabled(Dimension.THE_END), "末地内置默认关闭");
     assertFalse(config.dimensionsMissing(), "至少存在一个维度段 → 不算缺 dimensions 段");
   }

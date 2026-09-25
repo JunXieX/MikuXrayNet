@@ -85,11 +85,13 @@ public final class AntiXrayConfig {
     }
   }
 
-  /** 11 种容器/功能方块（透视端可凭轮廓与方块实体数据定位地下基地与矿洞入口）。 */
-  private static final List<String> CONTAINER_BLOCKS = List.of(
-      "chest", "trapped_chest", "ender_chest", "barrel",
-      "furnace", "blast_furnace", "smoker",
-      "hopper", "dropper", "dispenser", "shulker_box");
+  /**
+   * 默认隐藏的容器方块：只保留箱子 {@code chest}（透视端最想找的地下基地/矿洞标志物）。
+   *
+   * <p>桶/熔炉族/漏斗/发射器/投掷器/潜影盒/末影箱/陷阱箱<b>不再默认隐藏</b>：它们可制造、遍布建筑，
+   * 藏它们换来的是到处「假方块」的观感与更高的替换量（按需自行加回 {@code hide-blocks} 即可）。
+   */
+  private static final List<String> CONTAINER_BLOCKS = List.of("chest");
 
   /** 16 种主世界矿石（含深层变体）。 */
   private static final List<String> OVERWORLD_ORES = List.of(
@@ -99,25 +101,26 @@ public final class AntiXrayConfig {
       "diamond_ore", "deepslate_diamond_ore", "emerald_ore", "deepslate_emerald_ore");
 
   /**
-   * 主世界默认隐藏清单（共 35 种）：16 种主世界矿石 + 3 种粗金属块 + 11 种容器族 + 基岩/黑曜石/黏土
+   * 主世界默认隐藏清单（共 22 种）：16 种主世界矿石 + 3 种粗金属块 + {@code chest}
    * + {@code spawner}（刷怪笼）+ {@code mossy_cobblestone}（苔石）。
    *
-   * <p>容器族多为方块实体，被伪装 section 内它们的方块实体本就会被 {@code remove-block-entities}
-   * 剔除，与伪装不冲突；基岩层与黏土斑块可反推坐标与地形结构，粗金属块直接对应富矿脉。
+   * <p>箱子为方块实体，被伪装 section 内它的方块实体本就会被 {@code remove-block-entities} 剔除，
+   * 与伪装不冲突；粗金属块直接对应富矿脉。刻意不再隐藏：桶/熔炉族/漏斗/发射器/投掷器/潜影盒/末影箱/
+   * 陷阱箱（可制造、遍布建筑）与基岩/黑曜石/黏土（自然结构方块，透视价值低）。
    * 全部名称已在真机 PE 2.13.0（V_26_2）状态表逐一核实可解析（见 PeRealDataOcclusionTest）。
    */
   private static final List<String> DEFAULT_NORMAL_HIDE_BLOCKS;
   /**
-   * 地狱默认隐藏清单（共 15 种）：{@code ancient_debris}、{@code nether_gold_ore} + 11 种容器族
-   * + 基岩 + 刷怪笼。
+   * 地狱默认隐藏清单（共 4 种）：{@code ancient_debris}、{@code nether_gold_ore}、{@code chest}、
+   * {@code spawner}。桶/基岩不再默认隐藏（可制造 / 自然方块，透视价值低）。
    *
    * <p><b>明确不含 {@code nether_quartz_ore}</b>：地狱石英分布极广、单块价值极低，若把它也全藏，
    * 玩家在地狱会挖到大量「假石头」，观感与效率都不可接受（用户明确要求地狱不隐藏石英矿）。
    */
   private static final List<String> DEFAULT_NETHER_HIDE_BLOCKS;
   /**
-   * 末地默认隐藏清单（共 12 种）：11 种容器族 + 基岩。末地本身无矿物，默认维度整体关闭；
-   * 如需隐藏末地城的箱子/潜影盒再开启 {@code dimensions.the_end.enabled}。
+   * 末地默认隐藏清单（共 1 种）：{@code chest}。末地本身无矿物，默认维度整体关闭；
+   * 如需隐藏末地城的箱子再开启 {@code dimensions.the_end.enabled}。
    */
   private static final List<String> DEFAULT_THE_END_HIDE_BLOCKS;
 
@@ -144,16 +147,15 @@ public final class AntiXrayConfig {
     List<String> normal = new ArrayList<>(OVERWORLD_ORES);
     normal.addAll(List.of("raw_iron_block", "raw_gold_block", "raw_copper_block"));
     normal.addAll(CONTAINER_BLOCKS);
-    normal.addAll(List.of("bedrock", "obsidian", "clay", "spawner", "mossy_cobblestone"));
+    normal.addAll(List.of("spawner", "mossy_cobblestone"));
     DEFAULT_NORMAL_HIDE_BLOCKS = List.copyOf(normal);
 
     List<String> nether = new ArrayList<>(List.of("ancient_debris", "nether_gold_ore"));
     nether.addAll(CONTAINER_BLOCKS);
-    nether.addAll(List.of("bedrock", "spawner"));
+    nether.addAll(List.of("spawner"));
     DEFAULT_NETHER_HIDE_BLOCKS = List.copyOf(nether);
 
     List<String> end = new ArrayList<>(CONTAINER_BLOCKS);
-    end.add("bedrock");
     DEFAULT_THE_END_HIDE_BLOCKS = List.copyOf(end);
 
     Map<Dimension, Boolean> enabled = new LinkedHashMap<>();
@@ -624,8 +626,9 @@ public final class AntiXrayConfig {
             zstdDownloadUrl(root),
             Math.max(1, root.getInt("disk-cache.zstd.timeout-seconds", 10))),
         PlatformSupport.Mode.parse(root.getString("advanced.platform", "auto")),
-        root.getInt("cache.maximum-size", 4096),
-        root.getInt("cache.expire-after-access-seconds", 60),
+        // 未配置时的内置兜底必须与打包 antixray.yml 的默认值保持一致（有单测对照）
+        root.getInt("cache.maximum-size", 40960),
+        root.getInt("cache.expire-after-access-seconds", 600),
         root.getInt("advanced.threads", 0),
         root.getInt("advanced.timeout-millis", 2500),
         root.getInt("advanced.queue-capacity", 2048),
