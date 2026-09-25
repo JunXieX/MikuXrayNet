@@ -500,7 +500,6 @@ public final class Diagnostics {
     sb.append("entity-culling.enabled=").append(c.entityCulling().enabled())
         .append("，raycast=").append(c.entityCulling().raycast())
         .append("，force-visible-distance=").append(c.entityCulling().forceVisibleDistance())
-        .append("，threads=").append(c.entityCulling().threads())
         .append("，update-interval-ticks=").append(c.entityCulling().updateIntervalTicks())
         .append("，recheck-budget=").append(c.entityCulling().recheckBudget())
         .append("，ray-samples=").append(c.entityCulling().raySamples()).append('\n');

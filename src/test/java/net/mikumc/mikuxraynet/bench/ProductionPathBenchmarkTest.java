@@ -124,7 +124,8 @@ class ProductionPathBenchmarkTest {
         assertTrue(row.allocatedBytes() > 0, "分配量未成功采集：" + row);
       }
     }
-    assertTrue(snapshot.medianNanos() > 0 && snapshot.planeBytes() == 4 * NEIGHBOR_HEIGHT * 16,
+    assertTrue(snapshot.medianNanos() > 0
+        && snapshot.planeBytes() == 4L * NeighborEdges.planeLongCount(NEIGHBOR_HEIGHT) * 8L,
         "邻块快照未成功采集：" + snapshot);
   }
 
@@ -295,7 +296,7 @@ class ProductionPathBenchmarkTest {
    * <p>真实抓取由 {@code NeighborChunkProvider#capture} 完成，发生在主线程 / Folia 区域线程，
    * 并用 {@code world.getBlockData(...).isOccluding()} 读方块——离线不可用（需要 Bukkit 世界）。
    * 因此这里用<b>纯计算的布尔平面模拟</b>：以确定性的纯函数代替「读方块是否遮挡」，
-   * 但保持与 {@code capturePlane} 完全相同的循环形状（4 侧 × 16 × 高度 次查询，每侧写出 height×16 字节），
+   * 但保持与 {@code capturePlane} 完全相同的循环形状（4 侧 × 16 × 高度 次查询，每侧写出 height×16 bit），
    * 并用真实的 {@link NeighborEdges} 承载结果。该模拟是真实抓取耗时的下界（不含缓存查找、加载检查与 Bukkit 读块）。
    */
   private static SnapshotRow measureNeighborSnapshot(ThreadMXBean allocationBean) {
@@ -312,7 +313,7 @@ class ProductionPathBenchmarkTest {
       durations[i] = System.nanoTime() - start;
       allocations[i] = allocationBean == null ? 0L
           : allocationBean.getThreadAllocatedBytes(threadId) - allocatedBefore;
-      planeBytes = edges.height() << 4;
+      planeBytes = NeighborEdges.planeLongCount(edges.height()) << 3;
       last = edges;
     }
 
@@ -333,12 +334,14 @@ class ProductionPathBenchmarkTest {
         buildPlane(height, NeighborEdges.Side.Z_PLUS));
   }
 
-  /** 单个侧面的贴边层：下标为 {@code y << 4 | localOther}，与 {@code NeighborChunkProvider#capturePlane} 一致。 */
-  private static byte[] buildPlane(int height, NeighborEdges.Side side) {
-    byte[] plane = new byte[height << 4];
+  /** 单个侧面的贴边层：位下标为 {@code y << 4 | localOther}，与 {@code NeighborChunkProvider#capturePlane} 一致。 */
+  private static long[] buildPlane(int height, NeighborEdges.Side side) {
+    long[] plane = new long[NeighborEdges.planeLongCount(height)];
     for (int local = 0; local < 16; local++) {
       for (int y = 0; y < height; y++) {
-        plane[y << 4 | local] = (byte) (simulatedOccluding(side, local, y) ? 1 : 0);
+        if (simulatedOccluding(side, local, y)) {
+          NeighborEdges.setOccluding(plane, y << 4 | local);
+        }
       }
     }
     return plane;
@@ -437,7 +440,7 @@ class ProductionPathBenchmarkTest {
     report.append("- 抓取发生在主线程 / Folia 区域线程，**不在** worker 热路径，故单独成列\n");
     report.append("- 真实抓取读 Bukkit 世界（离线不可用），这里用**纯计算的布尔平面模拟**："
         + "以确定性纯函数代替 `world.getBlockData(...).isOccluding()`，"
-        + "循环形状与 `NeighborChunkProvider#capturePlane` 一致（4 侧 × 16 × 高度 次查询，每侧写出 height×16 字节），"
+        + "循环形状与 `NeighborChunkProvider#capturePlane` 一致（4 侧 × 16 × 高度 次查询，每侧写出 height×16 bit），"
         + "结果用真实 `NeighborEdges` 承载；是真实耗时的**下界**（不含缓存查找、加载检查与 Bukkit 读块）\n");
     report.append("| 指标 | 值 |\n| --- | --- |\n");
     report.append("| 构造一次 4 邻块快照中位耗时(ms) | ").append(millis(snapshot.medianNanos())).append(" |\n");

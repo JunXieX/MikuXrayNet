@@ -314,7 +314,7 @@ class EntityCullerTest {
   private static EntityCuller newCuller(ThrottleStats stats, int recheckBudget) {
     // 启用实体剔除与射线判定；强制可见距离 2 格，均为不影响本测试的取值
     return new EntityCuller(new PluginStub().proxy(),
-        new BandwidthConfig.EntityCulling(true, true, 2.0D, 1, 10, 8, recheckBudget), stats);
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, recheckBudget), stats);
   }
 
   /** 接口方法的默认返回值（未显式打桩的方法一律走这里）。 */

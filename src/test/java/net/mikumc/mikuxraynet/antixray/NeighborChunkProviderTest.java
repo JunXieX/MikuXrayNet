@@ -48,14 +48,14 @@ class NeighborChunkProviderTest {
   @Test
   void planeValuesFollowWorldQuery() {
     for (Side side : Side.values()) {
-      byte[] plane = NeighborChunkProvider.capturePlane(0, HEIGHT, side, 4, 7, QUERY);
-      assertEquals(HEIGHT * 16, plane.length);
+      long[] plane = NeighborChunkProvider.capturePlane(0, HEIGHT, side, 4, 7, QUERY);
+      assertEquals(NeighborEdges.planeLongCount(HEIGHT), plane.length, "平面按位打包（每格 1 bit）");
 
       for (int local = 0; local < 16; local++) {
         int[] position = NeighborChunkProvider.worldPosition(side, 4, 7, local);
         for (int y = 0; y < HEIGHT; y++) {
-          int expected = QUERY.isOccluding(position[0], y, position[1]) ? 1 : 0;
-          assertEquals(expected, plane[y << 4 | local],
+          boolean expected = QUERY.isOccluding(position[0], y, position[1]);
+          assertEquals(expected, NeighborEdges.isOccludingAt(plane, y << 4 | local),
               "side=" + side + " y=" + y + " local=" + local);
         }
       }

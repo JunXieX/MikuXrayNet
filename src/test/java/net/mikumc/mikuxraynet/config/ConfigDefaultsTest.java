@@ -235,6 +235,21 @@ class ConfigDefaultsTest {
   }
 
   /**
+   * 旧配置里残留已删除的 {@code entity-culling.threads} 键时，解析必须<b>静默忽略</b>该未知键
+   * （不报警、不影响同段其它键、不影响默认值）：射线已改用 Paper 原生 {@code rayTraceBlocks}，
+   * 判定直接在实体所属线程完成，该键自 1.1.x 起不再生效、现已彻底删除。
+   */
+  @Test
+  void removedEntityCullingThreadsKeyIsSilentlyIgnored() {
+    BandwidthConfig config = BandwidthConfig.from(yaml(
+        "entity-culling:\n  threads: 4\n  ray-samples: 6\n"));
+
+    assertTrue(config.entityCulling().raycast(), "同段其它键照常生效（不受已删除键影响）");
+    assertEquals(6, config.entityCulling().raySamples(), "同段其它键仍按显式取值解析");
+    assertEquals(10, config.entityCulling().updateIntervalTicks(), "未写的键仍回落默认值");
+  }
+
+  /**
    * 新增的各模块总开关（{@code *.enabled}）默认必须为 true —— 补开关不得改变既有行为。
    * 同时锁住 {@code palette.reorder} 仍为 false（zlib/zstd 两种压缩口径实测均无收益）。
    */
@@ -310,7 +325,8 @@ class ConfigDefaultsTest {
     assertTrue(config.neighbors().enabled(), "邻块贴边快照默认开启");
     assertEquals(AntiXrayConfig.MissingPolicy.HIDE, config.neighbors().missingPolicy(),
         "邻块缺失默认按遮挡处理（hide，宁可多伪装也不留边界透视口子）");
-    assertEquals(512, config.neighbors().cacheMaximumSize(), "邻块快照缓存默认 512 条（约 12 MB）");
+    assertEquals(2048, config.neighbors().cacheMaximumSize(),
+        "邻块快照缓存默认 2048 条（快照按位打包，每条约 3 KB → 共约 6 MB）");
 
     // proximity 其余键
     assertTrue(config.proximity().enabled(), "邻近显形默认开启");
@@ -373,11 +389,9 @@ class ConfigDefaultsTest {
     // palette：strict-verify（reorder 默认已在既有测试锁定为 false）
     assertFalse(config.palette().strictVerify(), "重排自检默认关闭（仅 reorder=true 时有意义）");
 
-    // entity-culling 其余键
+    // entity-culling 其余键（threads 键已彻底删除，其残留配置的兼容性见下方专项测试）
     assertTrue(config.entityCulling().raycast(), "实体射线判定默认开启");
     assertEquals(32.0D, config.entityCulling().forceVisibleDistance(), 1.0E-9D, "强制可见距离默认 32 格");
-    assertEquals(0, config.entityCulling().threads(),
-        "剔除线程数键保留（原生射线后已废弃、不再生效），默认仍解析为 0");
     assertEquals(8, config.entityCulling().raySamples(),
         "候选顶点数默认 8（原生射线改造后语义为「每实体最多尝试的候选顶点数」，钳制 1..8）");
 

@@ -62,8 +62,6 @@ public final class BandwidthConfig {
    *
    * @param enabled  模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
    * @param raycast  行为开关：依据视线射线剔除被遮挡实体；仅在 {@code enabled=true} 时生效。
-   * @param threads  <b>已废弃</b>：射线改用 Paper 原生 {@code World#rayTraceBlocks} 后，判定直接在实体
-   *                 所属线程完成，不再需要工作线程池；本项仅为兼容旧配置保留，设置后不再生效。
    * @param recheckBudget 周期复检预算：除「已隐藏实体每周期全部复检」外，每周期额外按轮转分片
    *                      复检的「可见追踪实体」条数上限（默认 12，建议 8~16）。
    *                      <p>为什么需要它：实体进入追踪范围那一刻（{@code PlayerTrackEntityEvent}）只评估一次，
@@ -76,7 +74,7 @@ public final class BandwidthConfig {
    *                   {@code World#rayTraceBlocks} 后不再表示采样数）；钳制 1..8，默认 8
    *                   （包围盒至多 7 个可见顶点，故 8 即「全部顶点都试」）。
    */
-  public record EntityCulling(boolean enabled, boolean raycast, double forceVisibleDistance, int threads,
+  public record EntityCulling(boolean enabled, boolean raycast, double forceVisibleDistance,
       int updateIntervalTicks, int raySamples, int recheckBudget) {
   }
 
@@ -147,7 +145,6 @@ public final class BandwidthConfig {
             root.getBoolean("entity-culling.enabled", true),
             root.getBoolean("entity-culling.raycast", true),
             Math.max(0.0D, root.getDouble("entity-culling.force-visible-distance", 32.0D)),
-            Math.max(0, root.getInt("entity-culling.threads", 0)),
             Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),
             // 语义已变：原生射线改造后本键表示「每个实体最多尝试的候选顶点数」（不再表示采样数）。
             // 钳制 1..8，默认 8（包围盒至多 7 个可见顶点 → 8 即全部顶点都试）。

@@ -15,9 +15,9 @@ import org.bukkit.World;
  * 区域线程调用；{@link #cached(String, int, int)} 与返回的 {@link NeighborEdges} 是纯数据，可在工作线程
  * 任意读取。本类不持有 World / Chunk / Player 引用（键只有世界名与两个整数），世界卸载时整体失效即可。
  *
- * <p><b>容量</b>：LRU 有界缓存，键为 {@code (世界名, chunkX, chunkZ)}；每条约
- * {@code 4 × 16 × 世界高度} 字节（主世界 384 高度约 24 KB），默认上限见 {@code antixray.yml}
- * 的 {@code neighbors.cache-maximum-size}。
+ * <p><b>容量</b>：LRU 有界缓存，键为 {@code (世界名, chunkX, chunkZ)}；每格只占 1 bit，
+ * 故每条约 {@code 4 × 16 × 世界高度 / 8} 字节 = {@code 4 × 高度 / 2} 字节
+ * （主世界 384 高度约 3 KB），默认上限见 {@code antixray.yml} 的 {@code neighbors.cache-maximum-size}。
  */
 public final class NeighborChunkProvider {
 
@@ -104,7 +104,7 @@ public final class NeighborChunkProvider {
     return edges;
   }
 
-  private byte[] captureSide(int baseY, int height, int chunkX, int chunkZ, NeighborEdges.Side side,
+  private long[] captureSide(int baseY, int height, int chunkX, int chunkZ, NeighborEdges.Side side,
       ChunkLoadedCheck chunkLoaded, OcclusionQuery query) {
     try {
       int[] neighborChunk = neighborChunk(side, chunkX, chunkZ);
@@ -121,15 +121,17 @@ public final class NeighborChunkProvider {
   /**
    * 抓取请求方某一侧的贴边层（纯逻辑；坐标换算见 {@link #worldPosition}）。
    *
-   * @return 长度为 {@code height × 16} 的遮挡平面，下标为 {@code y << 4 | localOther}
+   * @return 位打包的遮挡平面（长度为 {@code ceil(height × 16 / 64)}），位下标为 {@code y << 4 | localOther}
    */
-  static byte[] capturePlane(int baseY, int height, NeighborEdges.Side side, int chunkX, int chunkZ,
+  static long[] capturePlane(int baseY, int height, NeighborEdges.Side side, int chunkX, int chunkZ,
       OcclusionQuery query) {
-    byte[] plane = new byte[height << 4];
+    long[] plane = new long[NeighborEdges.planeLongCount(height)];
     for (int local = 0; local < SIDE_LENGTH; local++) {
       int[] position = worldPosition(side, chunkX, chunkZ, local);
       for (int y = 0; y < height; y++) {
-        plane[y << 4 | local] = (byte) (query.isOccluding(position[0], baseY + y, position[1]) ? 1 : 0);
+        if (query.isOccluding(position[0], baseY + y, position[1])) {
+          NeighborEdges.setOccluding(plane, y << 4 | local);
+        }
       }
     }
     return plane;

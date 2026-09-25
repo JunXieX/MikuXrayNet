@@ -270,20 +270,22 @@ class ObfuscationProcessorTest {
     return states;
   }
 
-  private static byte[] plane(int height, boolean occluding) {
-    byte[] plane = new byte[height << 4];
+  private static long[] plane(int height, boolean occluding) {
+    long[] plane = new long[NeighborEdges.planeLongCount(height)];
     if (occluding) {
-      Arrays.fill(plane, (byte) 1);
+      for (int index = 0; index < NeighborEdges.planeBitCount(height); index++) {
+        NeighborEdges.setOccluding(plane, index);
+      }
     }
     return plane;
   }
 
   private static NeighborEdges uniformEdges(int height, boolean occluding) {
-    byte[] plane = plane(height, occluding);
+    long[] plane = plane(height, occluding);
     return new NeighborEdges(height, plane, plane, plane, plane);
   }
 
-  private static NeighborEdges edges(int height, byte[] xMinus, byte[] xPlus, byte[] zMinus, byte[] zPlus) {
+  private static NeighborEdges edges(int height, long[] xMinus, long[] xPlus, long[] zMinus, long[] zPlus) {
     return new NeighborEdges(height, xMinus, xPlus, zMinus, zPlus);
   }
 
