@@ -23,7 +23,9 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
@@ -182,21 +184,42 @@ class PeRealDataOcclusionTest {
   }
 
   /**
-   * 真机配置里的目标矿必须能解析成状态 id，且覆盖 PE 已知的<b>全部</b>矿类方块。
+   * 打包 antixray.yml 的<b>按维度</b>隐藏清单必须在 PE 真实映射里逐一可解析，且覆盖全部真实矿类。
    *
-   * <p>这条断言专门防「只匹配到普通矿石、漏了深层变体」这类静默失效：即使规则正确，
-   * 目标集合漏项也会让对应矿物照常下发。
+   * <p><b>唯一例外</b>：{@code nether_quartz_ore} 按设计不隐藏（地狱分布极广、价值极低，
+   * 全藏会让玩家到处挖到假石头）——这里把这一例外显式断言出来，防止「漏项」与「有意排除」被混淆。
    */
   @Test
-  void shippedHideBlocksCoverEveryRealOre() throws IOException {
-    List<String> configured = shippedHideBlocks();
-    System.out.println("[目标方块清单] 配置共 " + configured.size() + " 种 → " + configured);
+  void shippedHideBlocksCoverEveryRealOreWithQuartzIntentionalException() throws IOException {
+    Map<String, List<String>> byDimension = shippedHideBlocksByDimension();
+    System.out.println("[按维度隐藏清单] " + byDimension);
 
-    for (String name : configured) {
-      int stateId = BlockStateRegistry.resolveStateId(version, name);
-      assertTrue(stateId >= 0 && stateId < registry.getUniqueBlockStateCount(),
-          "配置里的目标方块必须在 PE 真实映射里可解析：" + name + "（解析结果 " + stateId + "）");
+    assertEquals(Set.of("normal", "nether", "the_end"), byDimension.keySet(),
+        "打包配置必须含 normal / nether / the_end 三个维度段");
+    List<String> normal = byDimension.get("normal");
+    List<String> nether = byDimension.get("nether");
+    List<String> end = byDimension.get("the_end");
+    assertEquals(35, normal.size(), "主世界默认清单应为 35 种：" + normal);
+    assertEquals(15, nether.size(), "地狱默认清单应为 15 种：" + nether);
+    assertEquals(12, end.size(), "末地默认清单应为 12 种：" + end);
+
+    for (List<String> names : byDimension.values()) {
+      for (String name : names) {
+        int stateId = BlockStateRegistry.resolveStateId(version, name);
+        assertTrue(stateId >= 0 && stateId < registry.getUniqueBlockStateCount(),
+            "配置里的隐藏方块必须在 PE 真实映射里可解析：" + name + "（解析结果 " + stateId + "）");
+      }
     }
+
+    // 用户核心诉求：地狱默认不隐藏石英矿
+    assertFalse(nether.contains("nether_quartz_ore"),
+        "地狱默认清单不得含 nether_quartz_ore（用户明确要求不隐藏石英矿）：" + nether);
+    assertTrue(nether.contains("ancient_debris") && nether.contains("nether_gold_ore"),
+        "地狱默认清单必须含下界残骸与下界金矿：" + nether);
+    assertTrue(normal.contains("spawner"),
+        "主世界清单必须含 spawner（刷怪笼：PE 26.2 里 mob_spawner 已改名为 spawner）：" + normal);
+    assertTrue(normal.contains("mossy_cobblestone"),
+        "主世界清单必须含 mossy_cobblestone（苔石，地牢/要塞/矿洞结构的标志物）：" + normal);
 
     Set<String> realOres = new TreeSet<>();
     for (StateType type : StateTypes.values()) {
@@ -207,22 +230,122 @@ class PeRealDataOcclusionTest {
     }
     System.out.println("[PE 真实矿类] 共 " + realOres.size() + " 种 → " + realOres);
 
+    Set<String> union = new TreeSet<>();
+    union.addAll(normal);
+    union.addAll(nether);
+    union.addAll(end);
     List<String> missing = new ArrayList<>();
     for (String ore : realOres) {
-      if (!configured.contains(ore)) {
+      if (!union.contains(ore)) {
         missing.add(ore);
       }
     }
-    assertTrue(missing.isEmpty(),
-        "配置的隐藏方块清单漏了 PE 真实存在的矿类方块：" + missing + "（应加入 antixray.yml 的 hide-blocks）");
+    assertEquals(List.of("nether_quartz_ore"), missing,
+        "打包配置应覆盖全部 PE 真实矿类，唯一例外是 nether_quartz_ore（按设计不隐藏）：" + missing);
+  }
 
-    // 默认清单必须含「与矿等价」的两种透视目标（真机 PE 26.2 注册名，上面已逐个解析过状态 id）
-    assertTrue(configured.contains("spawner"),
-        "默认清单必须含 spawner（刷怪笼：PE 26.2 里 mob_spawner 已改名为 spawner）：" + configured);
-    assertTrue(configured.contains("mossy_cobblestone"),
-        "默认清单必须含 mossy_cobblestone（苔石，地牢/要塞/矿洞结构的标志物）：" + configured);
-    assertEquals(38, configured.size(),
-        "打包的 antixray.yml 默认清单应为 38 种（21 种原有 + 17 种 P1-5 扩展）：" + configured);
+  /**
+   * 要求核实的关键方块名（26.2 状态表）：{@code nether_quartz_ore}、{@code blackstone}、
+   * {@code basalt}、{@code end_stone} 等必须可解析（不猜名称）。
+   */
+  @Test
+  void netherAndEndBlockNamesResolveAgainstRealMapping() {
+    String[] names = {
+        "nether_quartz_ore", "nether_gold_ore", "ancient_debris", "netherrack", "basalt",
+        "blackstone", "end_stone", "soul_sand", "magma_block"};
+    for (String name : names) {
+      int stateId = BlockStateRegistry.resolveStateId(version, name);
+      assertTrue(stateId >= 0 && stateId < registry.getUniqueBlockStateCount(),
+          "PE 真实映射（V_26_2）里必须能解析出状态 id：" + name + "（解析结果 " + stateId + "）");
+      System.out.println("[名称核实] " + name + " → id=" + stateId);
+    }
+  }
+
+  /**
+   * 流体覆盖掩码必须与真机 PE 材质语义一致：只认水/岩浆（含流动变体）与水柱，
+   * <b>排除含水方块</b>（真机 PE 的 {@code isFluid()} 把 11728 个含水状态也算作流体，二者不可混用）。
+   */
+  @Test
+  void fluidCoverMaskExcludesWaterloggedStates() {
+    assertTrue(registry.isFluidCover(requireStateId("water")), "水必须是流体覆盖");
+    assertTrue(registry.isFluidCover(requireStateId("lava")), "岩浆必须是流体覆盖");
+    // 这些方块本体不是流体（即便某些状态下 can be waterlogged）→ 不算流体覆盖
+    for (String name : new String[] {"oak_fence", "oak_stairs", "oak_slab", "chest", "stone",
+        "netherrack", "end_stone"}) {
+      assertFalse(registry.isFluidCover(requireStateId(name)), name + " 本体不是流体，不算流体覆盖");
+    }
+
+    int fluidTotal = 0;
+    int coverTotal = 0;
+    int waterloggedOnly = 0;
+    for (int id = 0; id < registry.getUniqueBlockStateCount(); id++) {
+      if (registry.isFluid(id)) {
+        fluidTotal++;
+      }
+      if (registry.isFluidCover(id)) {
+        coverTotal++;
+      }
+      if (registry.isFluid(id) && !registry.isFluidCover(id)) {
+        waterloggedOnly++;
+      }
+    }
+    System.out.println("[流体掩码] isFluid=" + fluidTotal + "，isFluidCover=" + coverTotal
+        + "，仅 isFluid（含水状态）=" + waterloggedOnly);
+    assertTrue(waterloggedOnly > 0,
+        "真机 PE 的 isFluid 把含水状态也算作流体，必须被流体覆盖掩码排除（否则上方是含水台阶也会保持伪装）");
+    assertTrue(coverTotal > 0 && coverTotal <= 64,
+        "流体覆盖掩码只应包含水/岩浆/水柱这类「本体即流体」的少数状态：" + coverTotal);
+  }
+
+  /** 读取打包 antixray.yml 里各维度的 hide-blocks（不依赖 Bukkit YAML）。 */
+  private static Map<String, List<String>> shippedHideBlocksByDimension() throws IOException {
+    try (InputStream input = PeRealDataOcclusionTest.class.getResourceAsStream("/antixray.yml")) {
+      assertNotNull(input, "classpath 里必须有打包的 antixray.yml（src/main/resources）");
+      Map<String, List<String>> result = new LinkedHashMap<>();
+      boolean inDimensions = false;
+      String currentDimension = null;
+      boolean inHideBlocks = false;
+      List<String> rawLines = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))
+          .lines().toList();
+      for (String raw : rawLines) {
+        String line = raw.trim();
+        if (line.isEmpty() || line.startsWith("#")) {
+          continue;
+        }
+        int indent = raw.indexOf(line.charAt(0));
+        // 去掉行尾注释后再做键判断（维度键后面常带中文说明）
+        int comment = line.indexOf('#');
+        String code = (comment >= 0 ? line.substring(0, comment) : line).trim();
+        if (code.startsWith("dimensions:")) {
+          inDimensions = true;
+          continue;
+        }
+        if (!inDimensions) {
+          continue;
+        }
+        if (indent == 0) {
+          break; // 离开 dimensions 段（下一个顶层键）
+        }
+        if (indent == 2 && code.endsWith(":")) {
+          currentDimension = code.substring(0, code.length() - 1).trim();
+          result.put(currentDimension, new ArrayList<>());
+          inHideBlocks = false;
+          continue;
+        }
+        if (code.startsWith("hide-blocks:")) {
+          inHideBlocks = true;
+          continue;
+        }
+        if (inHideBlocks && code.startsWith("- ")) {
+          result.get(currentDimension).add(code.substring(2).trim());
+          continue;
+        }
+        if (inHideBlocks) {
+          inHideBlocks = false; // 下一个键：隐藏清单结束
+        }
+      }
+      return result;
+    }
   }
 
   /**
@@ -322,42 +445,5 @@ class PeRealDataOcclusionTest {
 
   private static int index(int x, int y, int z) {
     return y << 8 | z << 4 | x;
-  }
-
-  /** 读取随插件打包的 {@code antixray.yml} 里的 {@code obfuscation.hide-blocks}（不依赖 Bukkit YAML）。 */
-  private static List<String> shippedHideBlocks() throws IOException {
-    try (InputStream input = PeRealDataOcclusionTest.class.getResourceAsStream("/antixray.yml")) {
-      assertNotNull(input, "classpath 里必须有打包的 antixray.yml（src/main/resources）");
-      List<String> names = new ArrayList<>();
-      boolean inObfuscationSection = false;
-      boolean inHideBlocks = false;
-      List<String> rawLines = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))
-          .lines().toList();
-      for (String raw : rawLines) {
-        String line = raw.trim();
-        if (line.isEmpty() || line.startsWith("#")) {
-          continue;
-        }
-        if (raw.startsWith("obfuscation:")) {
-          inObfuscationSection = true;
-          continue;
-        }
-        if (!inObfuscationSection) {
-          continue;
-        }
-        if (line.startsWith("hide-blocks:")) {
-          inHideBlocks = true;
-          continue;
-        }
-        if (inHideBlocks && line.startsWith("- ")) {
-          names.add(line.substring(2).trim());
-          continue;
-        }
-        if (!line.startsWith("- ")) {
-          break; // 离开列表（下一个键）
-        }
-      }
-      return names;
-    }
   }
 }

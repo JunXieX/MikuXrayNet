@@ -9,9 +9,12 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.registry.OcclusionRules;
+import org.bukkit.World;
 import org.bukkit.configuration.ConfigurationSection;
 
 /**
@@ -20,42 +23,106 @@ import org.bukkit.configuration.ConfigurationSection;
  * <p>本类只承载「已解析的纯数据」，不含任何 Bukkit 世界引用，可安全地在工作线程读取。
  * 方块名称到方块状态 id 的解析在 {@code registry.BlockStateRegistry} 中完成。
  *
- * <p>若配置项缺失（例如管理员删掉了整段），会回落到本类内置的默认值，避免出现
- * 「配置损坏 → 什么都不隐藏」的静默失效。
+ * <p><b>按维度分段（本版重构）</b>：旧的顶层 {@code worlds}（世界白名单）与顶层 {@code obfuscation}
+ * 已合并为 {@code dimensions.<维度>} 段——主世界 / 地狱 / 末地各自独立指定要隐藏的方块、伪装方块、
+ * 伪装模式（all/enclosed）、高度范围与按 Y 分区伪装表。**旧键干净替换、不做迁移**；
+ * 若运行期发现配置缺少 {@code dimensions} 段，则用内置默认运行并一次性 WARN（绝不让保护静默失效）。
+ *
+ * <p><b>解析优先级（高 → 低）</b>：
+ * <ol>
+ *   <li>{@code world-overrides}（按世界名，精确名 &gt; 通配；保留为手动出口，默认空）；</li>
+ *   <li>{@code dimensions.<维度>}（维度由 {@link Dimension#of(World.Environment)} 判定，与世界名无关）；</li>
+ *   <li>内置默认（本类常量）。</li>
+ * </ol>
+ *
+ * <p>任何一段缺失都回落到更安全的默认值，避免「配置损坏 → 什么都不隐藏」的静默失效。
  */
 public final class AntiXrayConfig {
 
   /**
-   * 默认的矿透目标方块。
-   *
-   * <p>前 21 种：19 种矿石（含深层变体）之外，另有与矿等价的两种透视目标——
-   * {@code spawner}（刷怪笼，真机 PE V_26_2 映射里就叫 {@code spawner}，{@code mob_spawner} 已不存在）
-   * 与 {@code mossy_cobblestone}（苔石，常被用来标记矿洞/要塞）。
-   *
-   * <p>后 17 种为 P1-5 扩展（对齐 Paper 默认 hidden-blocks 与 Orebfuscator 的目标面）：
-   * <ul>
-   *   <li><b>容器/功能方块</b>（箱子族、熔炉族、漏斗/发射器等）：多为方块实体，透视端能借此定位
-   *       地下基地与矿洞入口；被伪装 section 内它们的方块实体本就会被
-   *       {@code remove-block-entities} 剔除，与伪装不冲突；</li>
-   *   <li><b>基岩/黑曜石/粗金属块/黏土</b>：基岩层与黏土斑块的形状特征可直接暴露坐标与地形结构，
-   *       粗金属块则直接对应富矿脉。</li>
-   * </ul>
-   * 全部名称已在真机 PE 2.13.0（V_26_2）状态表逐一核实可解析（见 PeRealDataOcclusionTest）。
+   * 配置维度段：由 {@code World#getEnvironment()} 判定，**不依赖世界名**（CUSTOM 归入 normal）。
    */
-  private static final List<String> DEFAULT_HIDE_BLOCKS = List.of(
+  public enum Dimension {
+    NORMAL("normal", "主世界"),
+    NETHER("nether", "地狱"),
+    THE_END("the_end", "末地");
+
+    private final String key;
+    private final String label;
+
+    Dimension(String key, String label) {
+      this.key = key;
+      this.label = label;
+    }
+
+    /** {@code antixray.yml} 里的段名（normal / nether / the_end）。 */
+    public String key() {
+      return key;
+    }
+
+    /** 中文名（日志与诊断回显用）。 */
+    public String label() {
+      return label;
+    }
+
+    /**
+     * 环境归类：{@code NETHER} → 地狱、{@code THE_END} → 末地、其余（含 {@code CUSTOM}、null）→ 主世界。
+     */
+    public static Dimension of(World.Environment environment) {
+      if (environment == World.Environment.NETHER) {
+        return NETHER;
+      }
+      if (environment == World.Environment.THE_END) {
+        return THE_END;
+      }
+      return NORMAL;
+    }
+  }
+
+  /** 10 种容器/功能方块（透视端可凭轮廓与方块实体数据定位地下基地与矿洞入口）。 */
+  private static final List<String> CONTAINER_BLOCKS = List.of(
+      "chest", "trapped_chest", "ender_chest", "barrel",
+      "furnace", "blast_furnace", "smoker",
+      "hopper", "dropper", "dispenser", "shulker_box");
+
+  /** 16 种主世界矿石（含深层变体）。 */
+  private static final List<String> OVERWORLD_ORES = List.of(
       "coal_ore", "deepslate_coal_ore", "iron_ore", "deepslate_iron_ore",
       "copper_ore", "deepslate_copper_ore", "gold_ore", "deepslate_gold_ore",
       "redstone_ore", "deepslate_redstone_ore", "lapis_ore", "deepslate_lapis_ore",
-      "diamond_ore", "deepslate_diamond_ore", "emerald_ore", "deepslate_emerald_ore",
-      "nether_gold_ore", "nether_quartz_ore", "ancient_debris",
-      "spawner", "mossy_cobblestone",
-      // —— P1-5 扩展：容器/功能方块（多为方块实体，remove-block-entities 会一并剔除其数据）——
-      "chest", "trapped_chest", "ender_chest", "barrel",
-      "furnace", "blast_furnace", "smoker",
-      "hopper", "dropper", "dispenser", "shulker_box",
-      // —— P1-5 扩展：结构暴露型方块 ——
-      "bedrock", "raw_iron_block", "raw_gold_block", "raw_copper_block",
-      "obsidian", "clay");
+      "diamond_ore", "deepslate_diamond_ore", "emerald_ore", "deepslate_emerald_ore");
+
+  /**
+   * 主世界默认隐藏清单（共 35 种）：16 种主世界矿石 + 3 种粗金属块 + 11 种容器族 + 基岩/黑曜石/黏土
+   * + {@code spawner}（刷怪笼）+ {@code mossy_cobblestone}（苔石）。
+   *
+   * <p>容器族多为方块实体，被伪装 section 内它们的方块实体本就会被 {@code remove-block-entities}
+   * 剔除，与伪装不冲突；基岩层与黏土斑块可反推坐标与地形结构，粗金属块直接对应富矿脉。
+   * 全部名称已在真机 PE 2.13.0（V_26_2）状态表逐一核实可解析（见 PeRealDataOcclusionTest）。
+   */
+  private static final List<String> DEFAULT_NORMAL_HIDE_BLOCKS;
+  /**
+   * 地狱默认隐藏清单（共 15 种）：{@code ancient_debris}、{@code nether_gold_ore} + 11 种容器族
+   * + 基岩 + 刷怪笼。
+   *
+   * <p><b>明确不含 {@code nether_quartz_ore}</b>：地狱石英分布极广、单块价值极低，若把它也全藏，
+   * 玩家在地狱会挖到大量「假石头」，观感与效率都不可接受（用户明确要求地狱不隐藏石英矿）。
+   */
+  private static final List<String> DEFAULT_NETHER_HIDE_BLOCKS;
+  /**
+   * 末地默认隐藏清单（共 12 种）：11 种容器族 + 基岩。末地本身无矿物，默认维度整体关闭；
+   * 如需隐藏末地城的箱子/潜影盒再开启 {@code dimensions.the_end.enabled}。
+   */
+  private static final List<String> DEFAULT_THE_END_HIDE_BLOCKS;
+
+  /** 各维度内置默认是否启用：末地无矿物，默认关闭。 */
+  private static final Map<Dimension, Boolean> DEFAULT_ENABLED;
+
+  /** 各维度内置默认伪装权重表（回落表）。 */
+  private static final Map<Dimension, Map<String, Integer>> DEFAULT_WEIGHTS;
+
+  /** 各维度内置默认按 Y 分区伪装表（仅主世界给默认；空表 = 不启用分区）。 */
+  private static final Map<Dimension, List<ReplacementBand>> DEFAULT_BANDS;
 
   /**
    * 内置 tag 静态映射（{@code tag(...)} 语法用）。
@@ -66,10 +133,45 @@ public final class AntiXrayConfig {
    */
   private static final Map<String, List<String>> STATIC_TAG_MEMBERS;
 
-
-  private static final Map<String, Integer> DEFAULT_REPLACEMENT_WEIGHTS;
-
   static {
+    // ---- 默认隐藏清单（顺序与打包 antixray.yml 保持一致，便于人工对照）----
+    List<String> normal = new ArrayList<>(OVERWORLD_ORES);
+    normal.addAll(List.of("raw_iron_block", "raw_gold_block", "raw_copper_block"));
+    normal.addAll(CONTAINER_BLOCKS);
+    normal.addAll(List.of("bedrock", "obsidian", "clay", "spawner", "mossy_cobblestone"));
+    DEFAULT_NORMAL_HIDE_BLOCKS = List.copyOf(normal);
+
+    List<String> nether = new ArrayList<>(List.of("ancient_debris", "nether_gold_ore"));
+    nether.addAll(CONTAINER_BLOCKS);
+    nether.addAll(List.of("bedrock", "spawner"));
+    DEFAULT_NETHER_HIDE_BLOCKS = List.copyOf(nether);
+
+    List<String> end = new ArrayList<>(CONTAINER_BLOCKS);
+    end.add("bedrock");
+    DEFAULT_THE_END_HIDE_BLOCKS = List.copyOf(end);
+
+    Map<Dimension, Boolean> enabled = new LinkedHashMap<>();
+    enabled.put(Dimension.NORMAL, true);
+    enabled.put(Dimension.NETHER, true);
+    enabled.put(Dimension.THE_END, false);
+    DEFAULT_ENABLED = Collections.unmodifiableMap(enabled);
+
+    Map<Dimension, Map<String, Integer>> weights = new LinkedHashMap<>();
+    weights.put(Dimension.NORMAL, weightsOf("stone", 10, "deepslate", 8));
+    weights.put(Dimension.NETHER, weightsOf("netherrack", 10, "basalt", 4, "blackstone", 3));
+    weights.put(Dimension.THE_END, weightsOf("end_stone", 10));
+    DEFAULT_WEIGHTS = Collections.unmodifiableMap(weights);
+
+    Map<Dimension, List<ReplacementBand>> bands = new LinkedHashMap<>();
+    // 主世界按 Y 分区：深层深板岩系、浅层石头系（伪装观感与真实地层一致，抗统计识别更强）。
+    bands.put(Dimension.NORMAL, List.of(
+        new ReplacementBand(-64, -1, weightsOf("deepslate", 10, "tuff", 4, "stone", 2)),
+        new ReplacementBand(0, 320, weightsOf("stone", 10, "andesite", 3, "dirt", 2))));
+    bands.put(Dimension.NETHER, List.of());
+    bands.put(Dimension.THE_END, List.of());
+    DEFAULT_BANDS = Collections.unmodifiableMap(bands);
+
+    // ---- tag(...) 静态映射 ----
     Map<String, List<String>> tags = new LinkedHashMap<>();
     tags.put("coal_ores", List.of("coal_ore", "deepslate_coal_ore"));
     tags.put("copper_ores", List.of("copper_ore", "deepslate_copper_ore"));
@@ -90,12 +192,15 @@ public final class AntiXrayConfig {
     tags.put("base_stone_nether", List.of("netherrack", "basalt", "blackstone"));
     tags.put("base_stone_end", List.of("end_stone"));
     STATIC_TAG_MEMBERS = Map.copyOf(tags);
+  }
 
+  /** 便捷构造「方块名 → 权重」的有序表（保持声明序）。 */
+  private static Map<String, Integer> weightsOf(Object... pairs) {
     Map<String, Integer> weights = new LinkedHashMap<>();
-    weights.put("stone", 10);
-    weights.put("deepslate", 8);
-    weights.put("netherrack", 6);
-    DEFAULT_REPLACEMENT_WEIGHTS = Collections.unmodifiableMap(weights);
+    for (int i = 0; i + 1 < pairs.length; i += 2) {
+      weights.put(String.valueOf(pairs[i]), (Integer) pairs[i + 1]);
+    }
+    return Collections.unmodifiableMap(weights);
   }
 
   /** 邻块数据缺失（未加载、跨区域、已清理）时的降级策略。 */
@@ -107,18 +212,17 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 伪装范围模式（{@code obfuscation.mode}）。
+   * 伪装范围模式（{@code dimensions.<维度>.mode}，**按维度独立**）。
    *
    * <p><b>enclosed</b>：只伪装「6 面全被遮挡」的方块（掩埋矿）。矿洞壁上的裸露矿保持原样，
    * 因此透视端能直接看到裸露矿；好处是玩家几乎不会看到「假方块」。
    *
    * <p><b>all</b>（默认）：所有目标矿一律伪装（不看 6 面遮挡），靠邻近显形在玩家靠近且可见时还原。
    * 透视端看不到任何真实矿物（含矿洞壁上的裸露矿）；代价是矿洞壁上的矿会暂时显示为伪装方块，
-   * 玩家靠近可见后才变回真实矿物——若显形不及时，可能挖到「看起来是石头、其实是矿」的方块，
-   * 这是该模式的固有代价。CPU 略降（省去逐方块的 6 面遮挡判定）。
+   * 玩家靠近可见后才变回真实矿物。
    */
   public enum ObfuscationMode {
-    /** 只伪装被完全掩埋的矿（旧行为）。 */
+    /** 只伪装被完全掩埋的矿。 */
     ENCLOSED,
     /** 所有目标矿一律伪装，靠邻近显形还原（默认，最防透视）。 */
     ALL
@@ -129,15 +233,19 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 遮挡判定的用户覆盖表（用户自行纠正判定的出口）。
+   * 遮挡判定的用户覆盖表（用户自行纠正判定的出口）与流体覆盖开关。
    *
    * <p>{@code extraNonOccluding} 优先级最高（显式声明不遮挡），{@code extraOccluding} 次之
    * （可覆盖内置的空气/形状/材质/薄片规则）。名称用方块注册名（无需 {@code minecraft:} 前缀）。
    *
-   * <p>该表影响启动期构建的遮挡位图，因此<b>只在启动时生效</b>（修改后需重启服务端）；
-   * 但它参与配置指纹，重启后磁盘缓存也会随之失效，不会复用按旧判定写出的负载。
+   * <p>{@code fluidCover}（默认开）：目标方块「上方紧邻方块是流体」时按遮挡处理（隐藏侧），
+   * 且显形侧不显形——让刷在岩浆里的下界残骸保持伪装，透视端看不到。它只作用于目标方块的判定，
+   * **不改动全局遮挡表**（避免影响非目标方块）。
+   *
+   * <p>本表影响启动期构建的遮挡位图与流体规则，因此<b>只在启动时生效</b>（修改后需重启服务端），
+   * 且参与配置指纹——重启后磁盘缓存也会随之失效。
    */
-  public record Occlusion(Set<String> extraOccluding, Set<String> extraNonOccluding) {
+  public record Occlusion(Set<String> extraOccluding, Set<String> extraNonOccluding, boolean fluidCover) {
   }
 
   /**
@@ -158,8 +266,7 @@ public final class AntiXrayConfig {
    * @param raycastSamples        每条射线的最大采样体素数
    * @param instantReveal         事件驱动即时显形（周期巡检的补充，见 {@link InstantReveal}）
    * @param overRevealSampling    过度显形抽样统计的抽样率分母 N（1/N 抽样，只计数不改行为；
-   *                              0 表示关闭）。口径：发包前若 {@link net.mikumc.mikuxraynet.antixray.RevealedSet}
-   *                              已含该坐标，说明客户端应已可见，该显形包按「过度」计数
+   *                              0 表示关闭）
    */
   public record Proximity(boolean enabled, double distance, int intervalTicks, int maxRevealsPerTick,
       int expireSeconds, int maxPositions, int maxPositionsPerPlayer,
@@ -180,12 +287,8 @@ public final class AntiXrayConfig {
    * 事件驱动即时显形：观测到玩家身边（曼哈顿距离 ≤ {@code radius}）的出站方块变更时，
    * <b>当 tick</b>（不经周期巡检）把变更邻域内「已伪装且视线可见」的坐标显形。
    *
-   * <p><b>与周期巡检的关系</b>：事件触发是<b>补充</b>（把「挖开/爆炸后要等最多 0.2 秒」的窗口压到 0），
-   * 周期巡检兜底不变（覆盖变更落在半径外、玩家移动等事件路径触不到的场景）。两者共用同一套显形链路
-   * （射线判定、已显形标记、统计），同一坐标当 tick 只发一次，不会重复。
-   *
    * @param enabled    总开关（默认开启）
-   * @param radius     曼哈顿半径（格），变更必须落在玩家身边该半径内才触发（默认 2，与竞品 updateRadius 一致）
+   * @param radius     曼哈顿半径（格），变更必须落在玩家身边该半径内才触发（默认 2）
    * @param maxPerTick 每玩家每 tick 事件显形限额（防爆刷；默认 16，0 表示关闭事件显形）
    */
   public record InstantReveal(boolean enabled, int radius, int maxPerTick) {
@@ -211,7 +314,7 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 按 Y 分区的伪装权重段（{@code obfuscation.replacement-bands} 的一项，P0-3）。
+   * 按 Y 分区的伪装权重段（{@code dimensions.<维度>.replacement-bands} 的一项）。
    *
    * @param minY    覆盖高度下界（含）
    * @param maxY    覆盖高度上界（含）
@@ -221,10 +324,10 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 逐世界覆盖段（{@code world-overrides} 的一项，P0-2）。
+   * 逐世界覆盖段（{@code world-overrides} 的一项，最高优先级）。
    *
    * <p>{@code pattern} 为世界名模式：精确名或含 {@code *} 的通配（如 {@code world_*}）。
-   * 各覆盖值为 {@code null} 表示「该键未覆盖，回落全局默认」。
+   * 各覆盖值为 {@code null} 表示「该键未覆盖，回落该世界所属<b>维度</b>的生效值」。
    *
    * @param glob               由 {@code pattern} 预编译的通配匹配器（不含 {@code *} 时为 null，走精确名比较）
    * @param hideBlocks         覆盖的隐藏方块清单；null = 回落
@@ -233,10 +336,11 @@ public final class AntiXrayConfig {
    * @param minY               覆盖的高度下界；null = 回落
    * @param maxY               覆盖的高度上界；null = 回落
    * @param mode               覆盖的伪装模式；null = 回落
+   * @param useBlockBelow      覆盖的 use-block-below；null = 回落
    */
   public record WorldOverride(String pattern, Pattern glob, List<String> hideBlocks,
       Map<String, Integer> replacementWeights, List<ReplacementBand> replacementBands,
-      Integer minY, Integer maxY, ObfuscationMode mode) {
+      Integer minY, Integer maxY, ObfuscationMode mode, Boolean useBlockBelow) {
 
     /** 是否与某世界名精确相等（精确名优先级高于通配）。 */
     public boolean exactMatches(String worldName) {
@@ -250,36 +354,34 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 单个世界最终生效的混淆视图（P0-2）：全局默认值与该世界覆盖段合并后的纯数据。
+   * 单个维度（或某个世界覆盖段在该维度上）最终生效的混淆视图：隐藏清单、伪装权重表、分区表、
+   * 高度范围、伪装模式与 use-block-below。
    *
-   * <p>反矿透处理器按世界取用本视图构建「目标位图 + 伪装权重表 + 高度范围」，未覆盖的键回落全局。
-   * 高度范围用哨兵值表示「不限制」：{@code minY == Integer.MIN_VALUE} / {@code maxY == Integer.MAX_VALUE}。
+   * <p>高度范围用哨兵值表示「不限制」：{@code minY == Integer.MIN_VALUE} /
+   * {@code maxY == Integer.MAX_VALUE}。
    *
    * @param hideBlocks         生效的隐藏方块清单
    * @param replacementWeights 生效的伪装权重表（回落表：无 band 覆盖该高度时使用）
-   * @param replacementBands   生效的按 Y 分区伪装表（bands 优先于 {@code replacementWeights}；空表 = 不启用分区）
+   * @param replacementBands   生效的按 Y 分区伪装表（bands 优先于 {@code replacementWeights}；空表 = 不分区）
    * @param minY               生效高度下界（含；{@code Integer.MIN_VALUE} = 不限制）
    * @param maxY               生效高度上界（含；{@code Integer.MAX_VALUE} = 不限制）
    * @param mode               生效的伪装模式
+   * @param useBlockBelow      命中伪装时是否优先用「下方紧邻方块」当伪装方块
    */
   public record EffectiveObfuscation(List<String> hideBlocks, Map<String, Integer> replacementWeights,
-      List<ReplacementBand> replacementBands, int minY, int maxY, ObfuscationMode mode) {
+      List<ReplacementBand> replacementBands, int minY, int maxY, ObfuscationMode mode,
+      boolean useBlockBelow) {
   }
 
   private final boolean enabled;
-  private final Set<String> worlds;
-  private final List<String> hideBlocks;
-  private final Map<String, Integer> replacementWeights;
-  /** 按 Y 分区的伪装权重段（P0-3，声明序；空表 = 不启用分区，回落 replacement-weights）。 */
-  private final List<ReplacementBand> replacementBands;
-  /** 全局高度范围（obfuscation.min-y/max-y）；null = 不限制。 */
-  private final Integer obfuscationMinY;
-  private final Integer obfuscationMaxY;
+  /** 各维度生效视图（下标 = {@link Dimension#ordinal()}）。 */
+  private final EffectiveObfuscation[] dimensionEffectives;
+  /** 各维度是否启用（下标 = {@link Dimension#ordinal()}）。 */
+  private final boolean[] dimensionEnabled;
+  /** 配置是否缺少 {@code dimensions} 段（缺段时用内置默认运行并一次性 WARN）。 */
+  private final boolean dimensionsMissing;
   private final boolean layerObfuscation;
-  private final ObfuscationMode obfuscationMode;
   private final boolean removeBlockEntities;
-  /** use-block-below：命中伪装时优先用「下方紧邻方块」当伪装方块（默认关闭，行为不变）。 */
-  private final boolean useBlockBelow;
   private final Neighbors neighbors;
   private final Occlusion occlusion;
   private final Proximity proximity;
@@ -293,32 +395,23 @@ public final class AntiXrayConfig {
   /** 解析时无法识别而被忽略的 tag 名（启动期由调用方 WARN 提醒）。 */
   private final Set<String> unresolvedTags;
   private final int configHash;
-  /** 逐世界覆盖段（声明序，P0-2）；空列表 = 无覆盖。 */
+  /** 逐世界覆盖段（声明序）；空列表 = 无覆盖。 */
   private final List<WorldOverride> worldOverrides;
-  /** 无覆盖时的生效视图（构造期预计算，热路径直接复用）。 */
-  private final EffectiveObfuscation globalEffective;
-  /** 与 {@link #worldOverrides} 平行的各覆盖段生效视图（构造期预计算）。 */
-  private final List<EffectiveObfuscation> overrideEffectives;
+  /** 与 {@link #worldOverrides} 平行的生效视图：{@code [覆盖段下标][维度下标]}（构造期预计算）。 */
+  private final EffectiveObfuscation[][] overrideEffectives;
 
-  private AntiXrayConfig(boolean enabled, Set<String> worlds, List<String> hideBlocks,
-      Map<String, Integer> replacementWeights, List<ReplacementBand> replacementBands,
-      Integer obfuscationMinY, Integer obfuscationMaxY, boolean layerObfuscation,
-      ObfuscationMode obfuscationMode, boolean removeBlockEntities, boolean useBlockBelow,
-      Neighbors neighbors, Occlusion occlusion, Proximity proximity, DiskCache diskCache,
-      PlatformSupport.Mode platform, int cacheMaximumSize, int cacheExpireAfterAccessSeconds,
-      int threads, int timeoutMillis, int queueCapacity, Set<String> unresolvedTags,
-      List<WorldOverride> worldOverrides) {
+  private AntiXrayConfig(boolean enabled, EffectiveObfuscation[] dimensionEffectives,
+      boolean[] dimensionEnabled, boolean dimensionsMissing, boolean layerObfuscation,
+      boolean removeBlockEntities, Neighbors neighbors, Occlusion occlusion, Proximity proximity,
+      DiskCache diskCache, PlatformSupport.Mode platform, int cacheMaximumSize,
+      int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis, int queueCapacity,
+      Set<String> unresolvedTags, List<WorldOverride> worldOverrides) {
     this.enabled = enabled;
-    this.worlds = Set.copyOf(worlds);
-    this.hideBlocks = List.copyOf(hideBlocks);
-    this.replacementWeights = Collections.unmodifiableMap(new LinkedHashMap<>(replacementWeights));
-    this.replacementBands = List.copyOf(replacementBands);
-    this.obfuscationMinY = obfuscationMinY;
-    this.obfuscationMaxY = obfuscationMaxY;
+    this.dimensionEffectives = dimensionEffectives.clone();
+    this.dimensionEnabled = dimensionEnabled.clone();
+    this.dimensionsMissing = dimensionsMissing;
     this.layerObfuscation = layerObfuscation;
-    this.obfuscationMode = obfuscationMode;
     this.removeBlockEntities = removeBlockEntities;
-    this.useBlockBelow = useBlockBelow;
     this.neighbors = neighbors;
     this.occlusion = occlusion;
     this.proximity = proximity;
@@ -331,44 +424,49 @@ public final class AntiXrayConfig {
     this.queueCapacity = Math.max(1, queueCapacity);
     this.unresolvedTags = unresolvedTags == null ? Set.of() : Set.copyOf(unresolvedTags);
     this.worldOverrides = List.copyOf(worldOverrides);
-    // 预计算各世界的生效视图：合并只在构造期做一次，运行期 matchOverride 命中后直接取用（O(1)）。
-    // 高度范围按「覆盖值 > 全局值 > 不限制」回落。
-    this.globalEffective = new EffectiveObfuscation(this.hideBlocks, this.replacementWeights,
-        this.replacementBands, normalizeMin(obfuscationMinY), normalizeMax(obfuscationMaxY),
-        obfuscationMode);
-    List<EffectiveObfuscation> effectives = new ArrayList<>(this.worldOverrides.size());
-    for (WorldOverride override : this.worldOverrides) {
-      effectives.add(new EffectiveObfuscation(
-          override.hideBlocks() == null ? this.hideBlocks : List.copyOf(override.hideBlocks()),
-          override.replacementWeights() == null ? this.replacementWeights
-              : Collections.unmodifiableMap(new LinkedHashMap<>(override.replacementWeights())),
-          override.replacementBands() == null ? this.replacementBands
-              : List.copyOf(override.replacementBands()),
-          normalizeMin(override.minY() == null ? obfuscationMinY : override.minY()),
-          normalizeMax(override.maxY() == null ? obfuscationMaxY : override.maxY()),
-          override.mode() == null ? obfuscationMode : override.mode()));
+    // 预计算各覆盖段在「每个维度」上的生效视图：合并只在构造期做一次，运行期命中后直接取用（O(1)）。
+    EffectiveObfuscation[][] merged = new EffectiveObfuscation[this.worldOverrides.size()][Dimension.values().length];
+    for (int i = 0; i < this.worldOverrides.size(); i++) {
+      WorldOverride override = this.worldOverrides.get(i);
+      for (Dimension dimension : Dimension.values()) {
+        merged[i][dimension.ordinal()] = merge(override, this.dimensionEffectives[dimension.ordinal()]);
+      }
     }
-    this.overrideEffectives = List.copyOf(effectives);
-    // 影响改写结果的全部配置项都参与哈希（含遮挡覆盖表与伪装模式）；顺序敏感，故用有序列表。
+    this.overrideEffectives = merged;
+    // 影响改写结果的全部配置项都参与哈希（含遮挡/流体覆盖表与各维度生效值）；顺序敏感，故用有序列表。
     // 伪装模式必须参与：否则「enclosed 写出的缓存」会在切换到 all 后被复用，导致裸露矿泄漏。
-    // use-block-below 必须参与：它决定伪装方块的取值，切换后旧缓存不得复用。
-    // P0-2/P0-3 新增：高度范围、按 Y 分区伪装表与逐世界覆盖都影响改写结果，一并纳入指纹
-    //（逐世界段的指纹 = 模式名 + 合并后的生效值；配合缓存键里的世界名，不同世界互不串包）。
+    // use-block-below / 高度范围 / 分区表 / 维度启用 都影响改写结果，一并纳入指纹。
+    List<Object> dimensionFingerprints = new ArrayList<>(Dimension.values().length);
+    for (Dimension dimension : Dimension.values()) {
+      dimensionFingerprints.add(List.of(dimension.key(), this.dimensionEnabled[dimension.ordinal()],
+          this.dimensionEffectives[dimension.ordinal()]));
+    }
     List<Object> overrideFingerprints = new ArrayList<>(this.worldOverrides.size());
     for (int i = 0; i < this.worldOverrides.size(); i++) {
-      EffectiveObfuscation effective = this.overrideEffectives.get(i);
-      overrideFingerprints.add(List.of(this.worldOverrides.get(i).pattern(),
-          effective.hideBlocks(),
-          new ArrayList<>(effective.replacementWeights().entrySet()),
-          effective.replacementBands(),
-          effective.minY(), effective.maxY(), effective.mode()));
+      List<Object> perDimension = new ArrayList<>(Dimension.values().length);
+      for (Dimension dimension : Dimension.values()) {
+        perDimension.add(this.overrideEffectives[i][dimension.ordinal()]);
+      }
+      overrideFingerprints.add(List.of(this.worldOverrides.get(i).pattern(), perDimension));
     }
-    this.configHash = Objects.hash(this.hideBlocks, new ArrayList<>(replacementWeights.entrySet()),
-        this.replacementBands, this.globalEffective.minY(), this.globalEffective.maxY(),
-        layerObfuscation, obfuscationMode, useBlockBelow, neighbors.enabled(), neighbors.missingPolicy(),
+    this.configHash = Objects.hash(dimensionFingerprints, overrideFingerprints, layerObfuscation,
+        neighbors.enabled(), neighbors.missingPolicy(),
         OcclusionRules.sortedList(this.occlusion.extraOccluding()),
-        OcclusionRules.sortedList(this.occlusion.extraNonOccluding()),
-        overrideFingerprints);
+        OcclusionRules.sortedList(this.occlusion.extraNonOccluding()), this.occlusion.fluidCover());
+  }
+
+  /** 把某覆盖段合并到某维度的生效值上（覆盖值优先，未覆盖回落维度值）。 */
+  private static EffectiveObfuscation merge(WorldOverride override, EffectiveObfuscation base) {
+    return new EffectiveObfuscation(
+        override.hideBlocks() == null ? base.hideBlocks() : List.copyOf(override.hideBlocks()),
+        override.replacementWeights() == null ? base.replacementWeights()
+            : Collections.unmodifiableMap(new LinkedHashMap<>(override.replacementWeights())),
+        override.replacementBands() == null ? base.replacementBands()
+            : List.copyOf(override.replacementBands()),
+        normalizeMin(override.minY() == null ? base.minY() : override.minY()),
+        normalizeMax(override.maxY() == null ? base.maxY() : override.maxY()),
+        override.mode() == null ? base.mode() : override.mode(),
+        override.useBlockBelow() == null ? base.useBlockBelow() : override.useBlockBelow());
   }
 
   /** 高度下界归一：null（未配置）→ {@code Integer.MIN_VALUE}（不限制）。 */
@@ -381,118 +479,97 @@ public final class AntiXrayConfig {
     return value == null ? Integer.MAX_VALUE : value;
   }
 
+  /** 某维度的内置默认生效视图。 */
+  private static EffectiveObfuscation builtinDefault(Dimension dimension) {
+    return new EffectiveObfuscation(
+        switch (dimension) {
+          case NORMAL -> DEFAULT_NORMAL_HIDE_BLOCKS;
+          case NETHER -> DEFAULT_NETHER_HIDE_BLOCKS;
+          case THE_END -> DEFAULT_THE_END_HIDE_BLOCKS;
+        },
+        DEFAULT_WEIGHTS.get(dimension),
+        DEFAULT_BANDS.get(dimension),
+        Integer.MIN_VALUE, Integer.MAX_VALUE, ObfuscationMode.ALL, false);
+  }
+
   /** 从配置根节点解析。 */
   public static AntiXrayConfig from(ConfigurationSection root) {
     Set<String> unknownTags = new LinkedHashSet<>();
-    List<String> hideBlocks = root.getStringList("obfuscation.hide-blocks");
-    if (hideBlocks.isEmpty()) {
-      hideBlocks = DEFAULT_HIDE_BLOCKS;
-    }
-    // tag(...) 在启动期展开为该 tag 下全部方块（内置静态映射；识别不了的 tag 记入 unknownTags 供 WARN）
-    hideBlocks = expandTags(hideBlocks, unknownTags);
 
-    Map<String, Integer> weights = new LinkedHashMap<>();
-    ConfigurationSection weightSection = root.getConfigurationSection("obfuscation.replacement-weights");
-    if (weightSection != null) {
-      for (String key : weightSection.getKeys(false)) {
-        int weight = weightSection.getInt(key, 0);
-        if (weight <= 0) {
-          continue;
-        }
-        for (String name : expandTags(List.of(key), unknownTags)) {
-          weights.put(OcclusionRules.normalize(name), weight);
-        }
+    // ---- dimensions：按维度分段（新结构；缺段则全部回落内置默认并标记，供调用方一次性 WARN）----
+    ConfigurationSection dimensions = root.getConfigurationSection("dimensions");
+    boolean anyDimensionSection = false;
+    EffectiveObfuscation[] effectives = new EffectiveObfuscation[Dimension.values().length];
+    boolean[] dimensionEnabled = new boolean[Dimension.values().length];
+    for (Dimension dimension : Dimension.values()) {
+      EffectiveObfuscation fallback = builtinDefault(dimension);
+      ConfigurationSection section =
+          dimensions == null ? null : dimensions.getConfigurationSection(dimension.key());
+      if (section == null) {
+        effectives[dimension.ordinal()] = fallback;
+        dimensionEnabled[dimension.ordinal()] = Boolean.TRUE.equals(DEFAULT_ENABLED.get(dimension));
+        continue;
       }
+      anyDimensionSection = true;
+      dimensionEnabled[dimension.ordinal()] =
+          section.getBoolean("enabled", Boolean.TRUE.equals(DEFAULT_ENABLED.get(dimension)));
+      effectives[dimension.ordinal()] = parseDimensionSection(section, fallback, unknownTags);
     }
-    if (weights.isEmpty()) {
-      weights.putAll(DEFAULT_REPLACEMENT_WEIGHTS);
-    }
 
-    // P0-3：按 Y 分区的伪装权重段（bands 优先于 replacement-weights；空表 = 不启用分区）
-    List<ReplacementBand> bands = parseBands(root.getMapList("obfuscation.replacement-bands"));
-
-    // P0-2：全局高度范围（可选，缺省不限制——判定与替换都跳过范围外的方块）
-    Integer globalMinY = root.contains("obfuscation.min-y") ? root.getInt("obfuscation.min-y") : null;
-    Integer globalMaxY = root.contains("obfuscation.max-y") ? root.getInt("obfuscation.max-y") : null;
-
-    // P0-2：逐世界覆盖段（未列出的世界用全局默认；每个段可覆盖 obfuscation 的任意子键）
-    List<WorldOverride> overrides = parseWorldOverrides(root.getConfigurationSection("world-overrides"));
+    // ---- world-overrides：最高优先级（按世界名；默认空）----
+    List<WorldOverride> overrides =
+        parseWorldOverrides(root.getConfigurationSection("world-overrides"), unknownTags);
 
     return new AntiXrayConfig(
         root.getBoolean("enabled", true),
-        Set.copyOf(root.getStringList("worlds")),
-        hideBlocks,
-        weights,
-        bands,
-        globalMinY,
-        globalMaxY,
+        effectives,
+        dimensionEnabled,
+        !anyDimensionSection,
         root.getBoolean("obfuscation.layer-obfuscation", false),
-        // 默认 all：用户明确要求「透视不能直接看到裸露在矿洞中的矿物」，故默认对所有目标矿一律伪装。
-        obfuscationMode(root.getString("obfuscation.mode", "all")),
         root.getBoolean("obfuscation.remove-block-entities", true),
-        // use-block-below（默认关）：命中伪装时优先用「下方紧邻方块」当伪装方块（观感更自然）。
-        // 下方方块须可用（非空气/非流体）且不得是目标方块（enclosed 模式下未伪装的裸矿不能被复制）。
-        root.getBoolean("obfuscation.use-block-below", false),
         new Neighbors(
             root.getBoolean("neighbors.enabled", true),
             missingPolicy(root.getString("neighbors.missing-policy", "hide")),
             root.getInt("neighbors.cache-maximum-size", 512)),
         new Occlusion(
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-occluding")),
-            OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding"))),
+            OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding")),
+            // 流体覆盖默认开启：刷在岩浆里的下界残骸若不按遮挡处理，会裸露在矿洞里被透视看到。
+            root.getBoolean("occlusion.fluid-cover", true)),
         new Proximity(
             root.getBoolean("proximity.enabled", true),
-            // 默认 64（原为 48，更早为 32/12）：真机反馈「48 格仍然偏近，走到跟前才变回来」。显形只在射线通畅
-            // （视线真能看到、且只取暴露面上的采样点）时才还原，因此放大距离不会隔着墙泄露——它只是把
-            // 「本来就看得到的矿」更早、更远地还给玩家。取舍：距离越大越及时、观感越接近原版，但候选越多、
-            // 发包量与每 tick 上限（max-reveals-per-tick）越相关。
+            // 默认 64：真机反馈「48 格仍然偏近，走到跟前才变回来」。显形只在射线通畅时才还原，
+            // 因此放大距离不会隔着墙泄露——它只是把「本来就看得到的矿」更早、更远地还给玩家。
             Math.max(0.0D, root.getDouble("proximity.distance", 64.0D)),
-            // 默认 4（原为 5）：显形周期越短、玩家转身后「石头还没变回来」的窗口越小；局部扫描已把
-            // 单周期开销与探索历史脱钩（整块显形完的区块直接跳过），4 tick 的额外扫描量可忽略。
+            // 默认 4（原为 5）：显形周期越短，「石头还没变回来」的窗口越小。
             Math.max(1, root.getInt("proximity.interval-ticks", 4)),
-            // 默认 256（原为 128）：配合扩大到 64 格的距离，候选数量随之上升，单次额度也要相应放大，
-            // 否则脚边的矿会被远处候选挤到后面。4 tick 一次、256 个 ≈ 1280 个/秒，仍远低于区块包流量。
+            // 默认 256（原为 128）：配合扩大到 64 格的距离，候选数量随之上升，单次额度也要相应放大。
             Math.max(1, root.getInt("proximity.max-reveals-per-tick", 256)),
-            // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处，
-            // 窗口太短会让「还没走到就被清掉」的坐标永不还原。
+            // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处。
             Math.max(1, root.getInt("proximity.expire-seconds", 300)),
-            // 安全阀（原为「容量上限」）：伪装坐标按区块共享、已显形集合只记实际发过包的坐标，
-            // 两者天然有界（分别随「已加载的伪装区块数」与「玩家身边的显形数」增长），不再需要
-            // 「按玩家容量淘汰」。本项只在索引管理出 bug 时兜底——正常运营下淘汰数应恒为 0。
             Math.max(1, root.getInt("proximity.max-positions", 4194304)),
-            // 安全阀（原为「单玩家坐标上限」）：含义同 max-positions，作用于单玩家的已显形坐标数。
             Math.max(1, root.getInt("proximity.max-positions-per-player", 524288)),
             root.getBoolean("proximity.frustum.enabled", true),
             clampFov(root.getDouble("proximity.frustum.fov", 80.0D)),
             Math.max(0.0D, root.getDouble("proximity.frustum.min-distance", 4.0D)),
-            // 默认 true（原为 false）：真机 dump 显示为 false，导致「隔着墙也把矿物亮给透视客户端」。
-            // 改为 true 后只在射线无遮挡时才发真实方块，代价是每个候选多几次主线程读方块。
             root.getBoolean("proximity.raycast.enabled", true),
             Math.max(2, root.getInt("proximity.raycast.samples", 16)),
-            // 事件驱动即时显形（周期巡检的补充，周期兜底不变）：玩家身边的出站方块变更当 tick 补发邻域。
             new InstantReveal(
                 root.getBoolean("proximity.instant-reveal.enabled", true),
                 Math.max(1, Math.min(8, root.getInt("proximity.instant-reveal.radius", 2))),
                 Math.max(0, root.getInt("proximity.instant-reveal.max-per-tick", 16))),
-            // 过度显形抽样统计（1/N，只计数不改行为；0 = 关闭）
             Math.max(0, root.getInt("proximity.over-reveal-sampling", 20))),
         new DiskCache(
             root.getBoolean("disk-cache.enabled", true),
             Math.max(1, root.getInt("disk-cache.max-entries", 20000)),
             Math.max(1, root.getInt("disk-cache.max-file-size-mb", 16)),
             Math.max(1, root.getInt("disk-cache.expire-seconds", 1800)),
-            // 默认 8（原为 2）：真机负载下 bucket 缓存命中率随容量提升约 16~20 个百分点——
-            // 热点区块集中在少数 bucket 里，2 个 bucket 的 LRU 装不下「同一区域文件里的邻区块」，
-            // 频繁互相驱逐导致重复重解码。8 个 bucket 的额外内存（≈8×64 槽）受
-            // idle-close-seconds 与 max-file-size-mb 双重护栏约束，可控。
             Math.max(1, root.getInt("disk-cache.bucket-cache-size", 8)),
             Math.max(1, root.getInt("disk-cache.idle-close-seconds", 300)),
             Math.max(1, root.getInt("disk-cache.maintenance-interval-seconds", 30)),
             Math.max(1, root.getInt("disk-cache.compact-per-pass", 4)),
             Math.max(1, root.getInt("disk-cache.queue-capacity", 256)),
             Math.max(1, root.getInt("disk-cache.generation-tracker-size", 32768))),
-        // 平台兜底：auto（默认，按服务端品牌/版本标识判定）| paper | folia。
-        // 该值不影响改写结果，故不参与配置指纹。
         PlatformSupport.Mode.parse(root.getString("advanced.platform", "auto")),
         root.getInt("cache.maximum-size", 4096),
         root.getInt("cache.expire-after-access-seconds", 60),
@@ -503,12 +580,61 @@ public final class AntiXrayConfig {
         overrides);
   }
 
+  /** 解析某个维度段（未出现的键回落该维度的内置默认）。 */
+  private static EffectiveObfuscation parseDimensionSection(ConfigurationSection section,
+      EffectiveObfuscation fallback, Set<String> unknownTags) {
+    List<String> hideBlocks = fallback.hideBlocks();
+    if (section.contains("hide-blocks")) {
+      List<String> raw = section.getStringList("hide-blocks");
+      // 显式配了空清单 → 仍回落内置默认（避免「配了但配空 → 该维度完全不伪装」的静默失效）
+      if (!raw.isEmpty()) {
+        hideBlocks = List.copyOf(expandTags(raw, unknownTags));
+      }
+    }
+    Map<String, Integer> weights = parseWeights(
+        section.getConfigurationSection("replacement-weights"), unknownTags);
+    if (weights.isEmpty()) {
+      weights = fallback.replacementWeights();
+    }
+    List<ReplacementBand> bands = section.contains("replacement-bands")
+        ? parseBands(section.getMapList("replacement-bands")) : fallback.replacementBands();
+    int minY = section.contains("min-y") ? section.getInt("min-y") : fallback.minY();
+    int maxY = section.contains("max-y") ? section.getInt("max-y") : fallback.maxY();
+    ObfuscationMode mode = section.contains("mode")
+        ? obfuscationMode(section.getString("mode")) : fallback.mode();
+    boolean useBlockBelow = section.contains("use-block-below")
+        ? section.getBoolean("use-block-below") : fallback.useBlockBelow();
+    return new EffectiveObfuscation(hideBlocks, weights, bands, minY, maxY, mode, useBlockBelow);
+  }
+
   /**
-   * 解析按 Y 分区的伪装权重段（P0-3）。
+   * 解析「方块名 → 权重」表（支持 {@code tag(...)}，权重非正的条目被丢弃）。
+   *
+   * @return 有序表；无有效条目时为空表
+   */
+  private static Map<String, Integer> parseWeights(ConfigurationSection section,
+      Set<String> unknownTags) {
+    if (section == null) {
+      return Map.of();
+    }
+    Map<String, Integer> weights = new LinkedHashMap<>();
+    for (String key : section.getKeys(false)) {
+      int weight = section.getInt(key, 0);
+      if (weight <= 0) {
+        continue;
+      }
+      for (String name : expandTags(List.of(key), unknownTags)) {
+        weights.put(OcclusionRules.normalize(name), weight);
+      }
+    }
+    return weights;
+  }
+
+  /**
+   * 解析按 Y 分区的伪装权重段。
    *
    * <p>每段形如 {@code {min-y: -64, max-y: -1, weights: {deepslate: 10, ...}}}；min-y/max-y 缺省时
-   * 分别视为「负无穷/正无穷」。min &gt; max 的段（矛盾配置）直接丢弃——空段比错误段更安全
-   * （回落 replacement-weights，不会静默漏伪装）。
+   * 分别视为「负无穷/正无穷」。min &gt; max 的段（矛盾配置）直接丢弃——空段比错误段更安全。
    */
   private static List<ReplacementBand> parseBands(List<Map<?, ?>> raw) {
     if (raw == null || raw.isEmpty()) {
@@ -538,10 +664,12 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 解析逐世界覆盖段（P0-2）：每个键是世界名模式（精确名或含 {@code *} 的通配），
-   * 值是 {@code obfuscation} 的覆盖子键。未出现的键保持 {@code null}（回落全局默认）。
+   * 解析逐世界覆盖段（最高优先级）：每个键是世界名模式（精确名或含 {@code *} 的通配），
+   * 值直接是该世界要覆盖的子键（hide-blocks / replacement-weights / replacement-bands /
+   * min-y / max-y / mode / use-block-below）。未出现的键保持 {@code null}（回落该世界所属维度）。
    */
-  private static List<WorldOverride> parseWorldOverrides(ConfigurationSection section) {
+  private static List<WorldOverride> parseWorldOverrides(ConfigurationSection section,
+      Set<String> unknownTags) {
     if (section == null) {
       return List.of();
     }
@@ -557,37 +685,29 @@ public final class AntiXrayConfig {
           : null;
 
       List<String> hideBlocks = null;
-      if (world.contains("obfuscation.hide-blocks")) {
-        hideBlocks = world.getStringList("obfuscation.hide-blocks");
-        hideBlocks = hideBlocks.isEmpty() ? List.of() : List.copyOf(expandTags(hideBlocks, null));
+      if (world.contains("hide-blocks")) {
+        List<String> raw = world.getStringList("hide-blocks");
+        hideBlocks = raw.isEmpty() ? List.of() : List.copyOf(expandTags(raw, unknownTags));
       }
       Map<String, Integer> replacementWeights = null;
-      ConfigurationSection weightSection = world.getConfigurationSection("obfuscation.replacement-weights");
-      if (weightSection != null) {
-        replacementWeights = new LinkedHashMap<>();
-        for (String key : weightSection.getKeys(false)) {
-          int weight = weightSection.getInt(key, 0);
-          if (weight > 0) {
-            for (String name : expandTags(List.of(key), null)) {
-              replacementWeights.put(OcclusionRules.normalize(name), weight);
-            }
-          }
-        }
-        if (replacementWeights.isEmpty()) {
-          replacementWeights = null; // 空覆盖回落全局，避免「配了但配错 → 不伪装」的静默失效
+      if (world.contains("replacement-weights")) {
+        Map<String, Integer> parsed = parseWeights(
+            world.getConfigurationSection("replacement-weights"), unknownTags);
+        if (!parsed.isEmpty()) {
+          replacementWeights = parsed; // 空覆盖回落维度值，避免「配了但配错 → 不伪装」的静默失效
         }
       }
-      List<ReplacementBand> replacementBands = null;
-      if (world.contains("obfuscation.replacement-bands")) {
-        replacementBands = parseBands(world.getMapList("obfuscation.replacement-bands"));
-      }
-      Integer minY = world.contains("obfuscation.min-y") ? world.getInt("obfuscation.min-y") : null;
-      Integer maxY = world.contains("obfuscation.max-y") ? world.getInt("obfuscation.max-y") : null;
-      ObfuscationMode mode = world.contains("obfuscation.mode")
-          ? obfuscationMode(world.getString("obfuscation.mode")) : null;
+      List<ReplacementBand> replacementBands = world.contains("replacement-bands")
+          ? parseBands(world.getMapList("replacement-bands")) : null;
+      Integer minY = world.contains("min-y") ? world.getInt("min-y") : null;
+      Integer maxY = world.contains("max-y") ? world.getInt("max-y") : null;
+      ObfuscationMode mode = world.contains("mode")
+          ? obfuscationMode(world.getString("mode")) : null;
+      Boolean useBlockBelow = world.contains("use-block-below")
+          ? world.getBoolean("use-block-below") : null;
 
       overrides.add(new WorldOverride(pattern, glob, hideBlocks, replacementWeights,
-          replacementBands, minY, maxY, mode));
+          replacementBands, minY, maxY, mode, useBlockBelow));
     }
     return List.copyOf(overrides);
   }
@@ -658,7 +778,7 @@ public final class AntiXrayConfig {
         : MissingPolicy.HIDE;
   }
 
-  /** 解析伪装模式；只有显式填写 {@code enclosed} 才回到旧行为，其它（含非法值、null）一律取更安全的 {@link ObfuscationMode#ALL}。 */
+  /** 解析伪装模式；只有显式填写 {@code enclosed} 才回到旧行为，其它一律取更安全的 {@link ObfuscationMode#ALL}。 */
   private static ObfuscationMode obfuscationMode(String value) {
     if (value != null && "enclosed".equals(value.trim().toLowerCase(Locale.ROOT))) {
       return ObfuscationMode.ENCLOSED;
@@ -670,85 +790,63 @@ public final class AntiXrayConfig {
     return enabled;
   }
 
-  /** 生效世界名集合；空集表示全部世界生效（供诊断输出）。 */
-  public Set<String> worlds() {
-    return worlds;
-  }
-
-  /** 世界是否在生效范围内；世界列表为空表示全部世界生效。 */
+  /**
+   * 世界是否在生效范围内。
+   *
+   * <p>旧的世界白名单（{@code worlds}）已随按维度分段重构移除：本方法现在只反映总开关，
+   * 逐维度是否启用由 {@link #dimensionEnabled(Dimension)} 决定。
+   */
   public boolean appliesTo(String worldName) {
-    return enabled && (worlds.isEmpty() || worlds.contains(worldName));
+    return enabled;
   }
 
-  public List<String> hideBlocks() {
-    return hideBlocks;
+  /** 某维度是否启用（末地默认关闭）。 */
+  public boolean dimensionEnabled(Dimension dimension) {
+    return dimensionEnabled[dimension.ordinal()];
   }
 
-  public Map<String, Integer> replacementWeights() {
-    return replacementWeights;
+  /** 某维度的生效视图（不受 {@code enabled} 影响；调用方按 {@link #dimensionEnabled} 决定是否使用）。 */
+  public EffectiveObfuscation dimensionEffective(Dimension dimension) {
+    return dimensionEffectives[dimension.ordinal()];
   }
 
-  public boolean layerObfuscation() {
-    return layerObfuscation;
-  }
-
-  /** 伪装范围模式（enclosed = 只藏掩埋矿；all = 所有目标矿一律伪装）。 */
-  public ObfuscationMode obfuscationMode() {
-    return obfuscationMode;
-  }
-
-  public boolean removeBlockEntities() {
-    return removeBlockEntities;
+  /** 配置是否缺少 {@code dimensions} 段（缺段时用内置默认运行）。 */
+  public boolean dimensionsMissing() {
+    return dimensionsMissing;
   }
 
   /**
-   * use-block-below：命中伪装时若「下方紧邻方块」可用（非空气/非流体、非目标方块），优先用它当伪装方块。
-   * 默认关闭；开启会改变改写结果（已参与配置指纹，切换后缓存整体失效）。
+   * 缺少 {@code dimensions} 段时输出<b>一次性</b>中文 WARN（进程级闸门 {@code once} 保证只提示一次）。
+   *
+   * <p><b>为什么必须提示</b>：旧配置（{@code worlds} / 顶层 {@code obfuscation}）已不再解析，
+   * 若管理员仍用旧文件且我们不提示，管理员会以为「配置还在生效」，而实际用的是内置默认——
+   * 保护虽未失效，但管理员的意图被静默忽略，必须显式告知。
+   *
+   * @param once 进程级一次性闸门（同一实例重复 reload 不会重复刷屏）
    */
-  public boolean useBlockBelow() {
-    return useBlockBelow;
+  public void warnIfDimensionsMissing(Logger logger, AtomicBoolean once) {
+    if (!dimensionsMissing || logger == null || !once.compareAndSet(false, true)) {
+      return;
+    }
+    logger.warning("antixray.yml 缺少 dimensions 段：已使用内置默认（按维度）反矿透规则运行。"
+        + "旧版 worlds / 顶层 obfuscation 键已不再解析且不会自动迁移，请删除旧配置并让插件重新生成 antixray.yml。");
   }
 
-  /** 解析时无法识别而被忽略的 tag 名（供启动日志 WARN 提醒管理员）；无则空集。 */
-  public Set<String> unresolvedTags() {
-    return unresolvedTags;
-  }
-
-  /** 按 Y 分区的伪装权重段（P0-3；空表 = 未配置，回落 replacement-weights）。 */
-  public List<ReplacementBand> replacementBands() {
-    return replacementBands;
-  }
-
-  /** 全局高度范围下界（{@code obfuscation.min-y}）；null = 不限制（供诊断输出）。 */
-  public Integer obfuscationMinY() {
-    return obfuscationMinY;
-  }
-
-  /** 全局高度范围上界（{@code obfuscation.max-y}）；null = 不限制（供诊断输出）。 */
-  public Integer obfuscationMaxY() {
-    return obfuscationMaxY;
-  }
-
-  /** 逐世界覆盖段（P0-2，声明序）；空列表 = 无覆盖。 */
+  /** 逐世界覆盖段（声明序）；空列表 = 无覆盖。 */
   public List<WorldOverride> worldOverrides() {
     return worldOverrides;
   }
 
-  /** 无覆盖时的生效视图（全局默认值；供处理器构建默认档案）。 */
-  public EffectiveObfuscation globalEffective() {
-    return globalEffective;
-  }
-
-  /** 第 {@code index} 个覆盖段的生效视图（与 {@link #worldOverrides()} 平行）。 */
-  public EffectiveObfuscation overrideEffective(int index) {
-    return overrideEffectives.get(index);
+  /** 第 {@code index} 个覆盖段在 {@code dimension} 维度上的生效视图。 */
+  public EffectiveObfuscation overrideEffective(int index, Dimension dimension) {
+    return overrideEffectives[index][dimension.ordinal()];
   }
 
   /**
-   * 匹配某世界名对应的覆盖段下标（P0-2）。
+   * 匹配某世界名对应的覆盖段下标。
    *
    * <p>匹配规则：<b>精确名 &gt; 通配</b>（如 {@code world_*}）；多个通配同时命中时取模式最长的
-   * （最具体），同长取声明序靠前的。无匹配返回 {@code -1}（该世界用全局默认）。
+   * （最具体），同长取声明序靠前的。无匹配返回 {@code -1}（该世界用其维度的生效值）。
    */
   public int matchOverride(String worldName) {
     if (worldName == null || worldOverrides.isEmpty()) {
@@ -769,12 +867,26 @@ public final class AntiXrayConfig {
     return best;
   }
 
+  /** 是否对同一高度层统一使用同一种伪装方块。 */
+  public boolean layerObfuscation() {
+    return layerObfuscation;
+  }
+
+  public boolean removeBlockEntities() {
+    return removeBlockEntities;
+  }
+
+  /** 解析时无法识别而被忽略的 tag 名（供启动日志 WARN 提醒管理员）；无则空集。 */
+  public Set<String> unresolvedTags() {
+    return unresolvedTags;
+  }
+
   /** 邻区块贴边快照相关配置。 */
   public Neighbors neighbors() {
     return neighbors;
   }
 
-  /** 遮挡判定覆盖表（启动期构建位图时消费，修改需重启）。 */
+  /** 遮挡判定覆盖表 + 流体覆盖开关（启动期构建位图时消费，修改需重启）。 */
   public Occlusion occlusion() {
     return occlusion;
   }
@@ -790,10 +902,7 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 平台判定兜底（{@code advanced.platform}）：{@code AUTO}（默认，按服务端品牌/版本标识判定）
-   * 或手动指定 {@code PAPER}/{@code FOLIA}。
-   *
-   * <p>供 {@code MikuXrayNet} 在装配任何模块之前调用 {@code PlatformSupport.configure(...)}。
+   * 平台判定兜底（{@code advanced.platform}）：{@code AUTO}（默认）或手动 {@code PAPER}/{@code FOLIA}。
    * 它同时影响反矿透与带宽两个模块的调度路径，因此虽然写在 antixray.yml 里也是全局生效的。
    */
   public PlatformSupport.Mode platform() {

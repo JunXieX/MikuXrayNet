@@ -19,7 +19,7 @@ import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
  * 反矿透核心：对单个区块做「6 面正交遮挡判定 + 按权重随机替换」，并可顺带做调色板压缩重排、
  * 位宽预算封顶与失效条目裁剪。
  *
- * <p><b>判定语义</b>：由 {@code antixray.yml: obfuscation.mode} 选择——
+ * <p><b>判定语义</b>：由 {@code dimensions.<维度>.mode} 选择（<b>按维度独立</b>）——
  * <ul>
  *   <li>{@code enclosed}（旧行为）：只有当目标方块的上下左右前后 6 个正交方向全部被遮挡
  *       （即该方块在客户端「不可见」）时才替换为伪装方块；任一方向未遮挡——包括世界上下界之外、
@@ -32,10 +32,12 @@ import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
  * 邻块数据缺失时按 {@code antixray.yml: neighbors.missing-policy} 处理，默认 {@code hide}
  * （宁可多伪装，也不留下沿 16×16 网格线的泄漏）。
  *
- * <p><b>逐世界配置（P0-2）</b>：{@code world-overrides} 里每个世界段可覆盖 hide-blocks /
- * replacement-weights / replacement-bands / min-y / max-y / mode，未覆盖的键回落全局默认。
- * 各覆盖段在启动期解析为 {@link WorldProfile}（含方块状态 id 解析与权重表预构建），运行期按
- * 世界名匹配一次（精确名 &gt; 通配，结果缓存），热路径 O(1) 取用。
+ * <p><b>按维度配置</b>：{@code dimensions.<维度>} 为主世界/地狱/末地各自指定 hide-blocks /
+ * replacement-weights / replacement-bands / min-y / max-y / mode / use-block-below；
+ * {@code world-overrides}（按世界名，最高优先级）可覆盖其中任意键。维度由
+ * {@code World#getEnvironment()} 判定（不依赖世界名）。各维度档案与覆盖档案在启动期解析为
+ * {@link WorldProfile}（含方块状态 id 解析与权重表预构建），运行期按（世界名 + 维度）取用：
+ * 无覆盖段时 O(1) 直取维度档案，有覆盖段时按世界名在该维度的缓存表里解析一次。
  *
  * <p><b>按 Y 分区伪装（P0-3）</b>：{@code replacement-bands} 按「第一个覆盖该高度的分段」选择
  * 候选表，无覆盖时回落 {@code replacement-weights}；每段的累计权重表启动期预构建为 int 数组，
@@ -119,10 +121,19 @@ public final class ObfuscationProcessor {
     final int minY;
     final int maxY;
     final boolean obfuscateAll;
+    /** use-block-below：命中伪装时优先用「下方紧邻方块」当伪装方块（按档案独立，逐维度可不同）。 */
+    final boolean useBlockBelow;
 
     WorldProfile(BitSet targets, int[] replacementIds, int[] replacementCum,
         int[] bandMinY, int[] bandMaxY, int[][] bandIds, int[][] bandCum,
         int minY, int maxY, boolean obfuscateAll) {
+      this(targets, replacementIds, replacementCum, bandMinY, bandMaxY, bandIds, bandCum,
+          minY, maxY, obfuscateAll, false);
+    }
+
+    WorldProfile(BitSet targets, int[] replacementIds, int[] replacementCum,
+        int[] bandMinY, int[] bandMaxY, int[][] bandIds, int[][] bandCum,
+        int minY, int maxY, boolean obfuscateAll, boolean useBlockBelow) {
       this.targets = targets;
       this.replacementIds = replacementIds.clone();
       this.replacementCum = replacementCum.clone();
@@ -133,6 +144,21 @@ public final class ObfuscationProcessor {
       this.minY = minY;
       this.maxY = maxY;
       this.obfuscateAll = obfuscateAll;
+      this.useBlockBelow = useBlockBelow;
+    }
+
+    /** 空档案：不具备生效条件（用于「维度整体关闭」）。 */
+    static final WorldProfile EMPTY = new WorldProfile(new BitSet(), new int[0], new int[0],
+        new int[0], new int[0], new int[0][], new int[0][],
+        Integer.MIN_VALUE, Integer.MAX_VALUE, true);
+
+    /** 返回把 use-block-below 设为指定值的副本（相同则原样返回）；供兼容构造统一施加该开关。 */
+    WorldProfile withUseBlockBelow(boolean value) {
+      if (this.useBlockBelow == value) {
+        return this;
+      }
+      return new WorldProfile(targets, replacementIds, replacementCum, bandMinY, bandMaxY,
+          bandIds, bandCum, minY, maxY, obfuscateAll, value);
     }
 
     /** 是否具备生效条件（有目标方块，且回落表或任一 band 表有候选）。 */
@@ -200,7 +226,8 @@ public final class ObfuscationProcessor {
 
       boolean obfuscateAll = effective.mode() == AntiXrayConfig.ObfuscationMode.ALL;
       return new WorldProfile(targets, fallback[0], fallback[1], bandMinY, bandMaxY,
-          bandIds, bandCum, effective.minY(), effective.maxY(), obfuscateAll);
+          bandIds, bandCum, effective.minY(), effective.maxY(), obfuscateAll,
+          effective.useBlockBelow());
     }
 
     /**
@@ -247,21 +274,36 @@ public final class ObfuscationProcessor {
   private final boolean layerObfuscation;
   private final boolean missingPolicyHide;
   private final PaletteOptions paletteOptions;
-  /** use-block-below（P2-6a，默认 false）：命中伪装时优先用「下方紧邻方块」当伪装方块。 */
-  private final boolean useBlockBelow;
   /**
    * 「下方方块可用性」过滤器：true = 可以拿它当伪装方块（非空气/非流体等）。
    * {@code null} 表示未提供（use-block-below 只能退回按遮挡语义判定）。
    */
   private final IntPredicate belowUsable;
-  /** 无覆盖世界（或世界名为 null）时使用的档案。 */
+  /**
+   * 流体覆盖开关（{@code occlusion.fluid-cover}，默认开）：enclosed 模式下目标方块<b>上方是流体</b>
+   * 时按遮挡处理（刷在岩浆里的残骸由此被伪装）。只作用于目标方块的判定，不改动全局遮挡表。
+   */
+  private final boolean fluidCover;
+  /** 流体覆盖掩码（水/岩浆/水柱；不含含水方块）；{@code null} = 不可用（流体规则整体不生效）。 */
+  private final IntPredicate fluidTable;
+  /** 无覆盖世界（或世界名为 null）时使用的档案（= 主世界档案，供解码侧诊断用）。 */
   private final WorldProfile defaultProfile;
-  /** 与 {@code config.worldOverrides()} 平行的各覆盖段档案。 */
-  private final WorldProfile[] overrideProfiles;
-  /** 逐世界配置来源；{@code null} 表示无逐世界支持（测试构造），一律用默认档案。 */
+  /** 各维度档案（下标 = {@link AntiXrayConfig.Dimension#ordinal()}）。 */
+  private final WorldProfile[] dimensionProfiles;
+  /** 与 {@code config.worldOverrides()} 平行的各覆盖段档案：{@code [覆盖段下标][维度下标]}。 */
+  private final WorldProfile[][] overrideProfiles;
+  /** 逐世界配置来源；{@code null} 表示无逐世界支持（测试构造），一律用维度档案。 */
   private final AntiXrayConfig config;
-  /** 世界名 → 档案缓存（首个该世界的区块解析一次，此后 O(1)；值不可变，多线程安全）。 */
-  private final ConcurrentHashMap<String, WorldProfile> profileCache = new ConcurrentHashMap<>();
+  /**
+   * 逐维度的「世界名 → 已匹配档案」缓存（首个该世界的区块解析一次，此后 O(1)）。
+   *
+   * <p><b>为什么按维度分开</b>：覆盖段的生效值回落「该世界所属维度」，同一世界名在不同维度下
+   * 应命中不同档案；分表后既避免键拼接产生新分配，也不会因同名世界跨维度而串档。
+   * 值不可变（含 {@link #NO_OVERRIDE} 哨兵），多线程安全。
+   */
+  private final ConcurrentHashMap<String, WorldProfile>[] overrideCache;
+  /** 「未命中任何覆盖段」的哨兵值（避免用 null 表示「已查询但无覆盖」而反复匹配）。 */
+  private static final WorldProfile NO_OVERRIDE = WorldProfile.EMPTY;
 
   /**
    * 直接用「已解析」的数据构造（供单测与显式装配使用）；伪装模式为 {@code enclosed}
@@ -314,21 +356,67 @@ public final class ObfuscationProcessor {
         new WorldProfile[0], null);
   }
 
-  /** 包级完整构造：档案由调用方构建（create 走配置解析路径，测试构造走参数直传路径）。 */
+  /**
+   * 兼容构造（测试用手工档案）：逐世界覆盖档案对所有维度一致，且 {@code useBlockBelow} 统一施加到
+   * 全部档案（档案自带值时以参数为准——参数即旧版的「全局 use-block-below」）。
+   */
   ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, boolean layerObfuscation,
       boolean missingPolicyHide, PaletteOptions paletteOptions, boolean useBlockBelow,
       IntPredicate belowUsable, WorldProfile defaultProfile, WorldProfile[] overrideProfiles,
       AntiXrayConfig config) {
+    this(codec, occlusionTable, layerObfuscation, missingPolicyHide, paletteOptions, belowUsable,
+        defaultProfile.withUseBlockBelow(useBlockBelow),
+        new WorldProfile[] {defaultProfile.withUseBlockBelow(useBlockBelow),
+            defaultProfile.withUseBlockBelow(useBlockBelow),
+            defaultProfile.withUseBlockBelow(useBlockBelow)},
+        expandOverrides(overrideProfiles, useBlockBelow), config, false, null);
+  }
+
+  /** 逐世界覆盖档案展开为「各覆盖段 × 各维度」（兼容构造用：同一档案施加到全部维度）。 */
+  private static WorldProfile[][] expandOverrides(WorldProfile[] overrides, boolean useBlockBelow) {
+    WorldProfile[][] expanded = new WorldProfile[overrides.length][AntiXrayConfig.Dimension.values().length];
+    for (int i = 0; i < overrides.length; i++) {
+      WorldProfile profile = overrides[i].withUseBlockBelow(useBlockBelow);
+      for (int d = 0; d < expanded[i].length; d++) {
+        expanded[i][d] = profile;
+      }
+    }
+    return expanded;
+  }
+
+  /**
+   * 包级完整构造：档案由调用方构建（{@code create} 走配置解析路径，测试构造走参数直传路径）。
+   *
+   * @param defaultProfile   无覆盖世界默认档案（= 主世界档案，供解码侧诊断使用）
+   * @param dimensionProfiles 各维度档案（下标 = {@code Dimension#ordinal()}）
+   * @param overrideProfiles  各覆盖段档案：{@code [覆盖段下标][维度下标]}
+   * @param fluidCover        流体覆盖开关（{@code occlusion.fluid-cover}）
+   * @param fluidTable        流体覆盖掩码；null 表示不可用（流体规则不生效）
+   */
+  @SuppressWarnings("unchecked")
+  ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, boolean layerObfuscation,
+      boolean missingPolicyHide, PaletteOptions paletteOptions, IntPredicate belowUsable,
+      WorldProfile defaultProfile, WorldProfile[] dimensionProfiles,
+      WorldProfile[][] overrideProfiles, AntiXrayConfig config, boolean fluidCover,
+      IntPredicate fluidTable) {
     this.codec = codec;
     this.occlusionTable = occlusionTable;
     this.layerObfuscation = layerObfuscation;
     this.missingPolicyHide = missingPolicyHide;
     this.paletteOptions = paletteOptions;
-    this.useBlockBelow = useBlockBelow;
     this.belowUsable = belowUsable;
+    this.fluidCover = fluidCover;
+    this.fluidTable = fluidTable;
     this.defaultProfile = defaultProfile;
+    this.dimensionProfiles = dimensionProfiles;
     this.overrideProfiles = overrideProfiles;
     this.config = config;
+    ConcurrentHashMap<String, WorldProfile>[] caches =
+        new ConcurrentHashMap[AntiXrayConfig.Dimension.values().length];
+    for (int d = 0; d < caches.length; d++) {
+      caches[d] = new ConcurrentHashMap<>();
+    }
+    this.overrideCache = caches;
   }
 
   /**
@@ -344,40 +432,56 @@ public final class ObfuscationProcessor {
   }
 
   /**
-   * 用配置 + 注册表解析出目标与伪装方块（含逐世界覆盖段与分区伪装表，均启动期预构建）。
+   * 用配置 + 注册表解析出目标与伪装方块（各维度档案 + 逐世界覆盖段 + 分区伪装表，均启动期预构建）。
    * 未识别的名称会被记录并跳过。
    *
    * @return 已装配的处理器；若未解析到任何有效目标或伪装方块，{@link #isActive()} 为 false
    */
   public static ObfuscationProcessor create(ChunkCodec codec, BlockStateRegistry registry,
       AntiXrayConfig config, Logger logger, PaletteOptions paletteOptions) {
-    WorldProfile defaultProfile = WorldProfile.resolve(registry, config.globalEffective(), logger,
-        "反矿透");
+    AntiXrayConfig.Dimension[] dimensions = AntiXrayConfig.Dimension.values();
+    WorldProfile[] dimensionProfiles = new WorldProfile[dimensions.length];
+    for (AntiXrayConfig.Dimension dimension : dimensions) {
+      // 维度整体关闭（如默认关闭的末地）→ 空档案（该维度任何方块都不伪装），但仍打印一行以便核对
+      dimensionProfiles[dimension.ordinal()] = config.dimensionEnabled(dimension)
+          ? WorldProfile.resolve(registry, config.dimensionEffective(dimension), logger,
+              "反矿透（" + dimension.label() + "）")
+          : WorldProfile.EMPTY;
+    }
     List<AntiXrayConfig.WorldOverride> overrides = config.worldOverrides();
-    WorldProfile[] overrideProfiles = new WorldProfile[overrides.size()];
+    WorldProfile[][] overrideProfiles = new WorldProfile[overrides.size()][dimensions.length];
     for (int i = 0; i < overrides.size(); i++) {
-      overrideProfiles[i] = WorldProfile.resolve(registry, config.overrideEffective(i), logger,
-          "反矿透（世界覆盖 " + overrides.get(i).pattern() + "）");
+      for (AntiXrayConfig.Dimension dimension : dimensions) {
+        // 覆盖段是最高优先级的手动出口：即便该维度整体关闭也照常解析（用户显式配置的世界应当生效）
+        overrideProfiles[i][dimension.ordinal()] = WorldProfile.resolve(registry,
+            config.overrideEffective(i, dimension), logger,
+            "反矿透（世界覆盖 " + overrides.get(i).pattern() + " / " + dimension.label() + "）");
+      }
     }
 
     boolean missingPolicyHide = config.neighbors().missingPolicy() == AntiXrayConfig.MissingPolicy.HIDE;
-    // use-block-below（P2-6a，默认关）：「下方方块可用」= 非空气/非流体（注册表语义）。
+    // use-block-below（默认关）：「下方方块可用」= 非空气/非流体（注册表语义）。
     // 是否是目标方块的检查在改写循环里做（targets 位图），这里只提供空气/流体过滤器。
     IntPredicate belowUsable = state -> !(registry.isAir(state) || registry.isFluid(state));
 
     return new ObfuscationProcessor(codec, registry::isOccluding, config.layerObfuscation(),
-        missingPolicyHide, paletteOptions, config.useBlockBelow(), belowUsable,
-        defaultProfile, overrideProfiles, config);
+        missingPolicyHide, paletteOptions, belowUsable,
+        dimensionProfiles[AntiXrayConfig.Dimension.NORMAL.ordinal()], dimensionProfiles,
+        overrideProfiles, config, config.occlusion().fluidCover(), registry::isFluidCover);
   }
 
-  /** 是否具备生效条件（默认档案或任一世界覆盖档案的目标与伪装候选都已解析）。 */
+  /** 是否具备生效条件（任一维度档案或任一世界覆盖档案的目标与伪装候选都已解析）。 */
   public boolean isActive() {
-    if (defaultProfile.active()) {
-      return true;
-    }
-    for (WorldProfile profile : overrideProfiles) {
+    for (WorldProfile profile : dimensionProfiles) {
       if (profile.active()) {
         return true;
+      }
+    }
+    for (WorldProfile[] perDimension : overrideProfiles) {
+      for (WorldProfile profile : perDimension) {
+        if (profile.active()) {
+          return true;
+        }
       }
     }
     return false;
@@ -402,18 +506,35 @@ public final class ObfuscationProcessor {
   }
 
   /**
-   * 改写一个区块（完整入口：按世界取配置，高度坐标按 {@code worldMinY} 对齐为绝对 Y）。
+   * 改写一个区块（按世界取配置；维度按主世界处理，供既有调用方与旧测试使用）。
    *
-   * @param worldName 区块所在世界名；{@code null} 表示用全局默认档案（无逐世界覆盖）
+   * @param worldName 区块所在世界名；{@code null} 表示用主世界档案（无逐世界覆盖）
    * @param worldMinY 该世界最低方块 Y（世界坐标系），用于把 section 内相对 Y 换算成绝对 Y
    *                  （min-y/max-y 过滤与分区伪装表都按绝对 Y 判定）
    */
   public Result rewrite(byte[] source, int sectionCount, long seed, NeighborEdges neighbors,
       String worldName, int worldMinY) {
+    return rewrite(source, sectionCount, seed, neighbors, worldName,
+        AntiXrayConfig.Dimension.NORMAL, worldMinY);
+  }
+
+  /**
+   * 改写一个区块（完整入口：按「世界名 + 维度」取配置）。
+   *
+   * <p>解析优先级：{@code world-overrides}（按世界名）&gt; {@code dimensions.<维度>}。
+   *
+   * @param worldName 区块所在世界名；{@code null} 表示无逐世界覆盖（用维度档案）
+   * @param dimension 该世界所属维度（由 {@code World#getEnvironment()} 判定，见
+   *                  {@link AntiXrayConfig.Dimension#of(org.bukkit.World.Environment)}）
+   * @param worldMinY 该世界最低方块 Y（世界坐标系），用于把 section 内相对 Y 换算成绝对 Y
+   */
+  public Result rewrite(byte[] source, int sectionCount, long seed, NeighborEdges neighbors,
+      String worldName, AntiXrayConfig.Dimension dimension, int worldMinY) {
     if (!isActive() || sectionCount <= 0 || source.length == 0) {
       return new Result(source, NO_POSITIONS, null, null);
     }
-    WorldProfile profile = profileFor(worldName);
+    WorldProfile profile = profileFor(worldName, dimension == null
+        ? AntiXrayConfig.Dimension.NORMAL : dimension);
     if (!profile.active()) {
       return new Result(source, NO_POSITIONS, null, null);
     }
@@ -489,7 +610,7 @@ public final class ObfuscationProcessor {
           }
 
           int replacement = -1;
-          if (useBlockBelow) {
+          if (profile.useBlockBelow) {
             int below = camouflageFromBelow(chunk, profile, baseY, index);
             // 预算联动（P0-1 × P2-6a）：下方方块可能不在本 section 调色板内（跨 section 读到的
             // 状态、或候选表已把空位用满）——此时引入它会新增调色板条目、有升位风险，只有在
@@ -556,15 +677,25 @@ public final class ObfuscationProcessor {
     }
   }
 
-  /** 取某世界的改写档案：无覆盖（或测试构造）直接用默认档案；有覆盖时按世界名解析并缓存。 */
-  private WorldProfile profileFor(String worldName) {
+  /**
+   * 取「世界名 + 维度」对应的改写档案（解析优先级：world-overrides &gt; dimensions.&lt;维度&gt;）。
+   *
+   * <p>无覆盖段（或测试构造）直接返回维度档案（O(1)，零分配）；有覆盖段时按世界名在<b>该维度的缓存表</b>
+   * 里解析一次并缓存（稳态 O(1)，热路径零新增分配）。
+   */
+  private WorldProfile profileFor(String worldName, AntiXrayConfig.Dimension dimension) {
+    int dimensionIndex = dimension.ordinal();
     if (overrideProfiles.length == 0 || worldName == null || config == null) {
-      return defaultProfile;
+      return dimensionProfiles[dimensionIndex];
     }
-    return profileCache.computeIfAbsent(worldName, name -> {
-      int index = config.matchOverride(name);
-      return index < 0 ? defaultProfile : overrideProfiles[index];
-    });
+    ConcurrentHashMap<String, WorldProfile> cache = overrideCache[dimensionIndex];
+    WorldProfile matched = cache.get(worldName);
+    if (matched == null) {
+      int index = config.matchOverride(worldName);
+      matched = index < 0 ? NO_OVERRIDE : overrideProfiles[index][dimensionIndex];
+      cache.put(worldName, matched);
+    }
+    return matched == NO_OVERRIDE ? dimensionProfiles[dimensionIndex] : matched;
   }
 
   /**
@@ -772,7 +903,13 @@ public final class ObfuscationProcessor {
   }
 
   /**
-   * 6 面正交遮挡判定。
+   * 6 面正交遮挡判定（enclosed 模式）。
+   *
+   * <p><b>流体覆盖规则</b>：目标方块的<b>上方（y+1）</b>紧邻方块是流体（水/岩浆）时，该方向按「遮挡」
+   * 处理——下界残骸常刷在岩浆里，若把上方岩浆当作「暴露面」，残骸就不会被伪装，透视端会看到它。
+   * 只加在「上方」这一面（用户要求只判上方）：流体几乎总是从上方覆盖目标（残骸/矿脉被岩浆淹没），
+   * 而侧面的流体要么极罕见、要么本身就在裸露矿洞里——若把侧面也当作遮挡反而会隐藏「本应显形」的矿。
+   * 该规则只在目标方块的判定里生效，**不改动全局遮挡表**（避免影响非目标方块）。
    *
    * @param baseY 该 section 的起始 Y（区块内相对坐标）
    * @param index 该 section 内的元素序号（{@code y << 8 | z << 4 | x}）
@@ -782,12 +919,39 @@ public final class ObfuscationProcessor {
     int z = index >> 4 & 15;
     int y = baseY | (index >> 8 & 15);
 
-    return isOccluding(chunk, y + 1, x, z, neighbors)
+    boolean above = isOccluding(chunk, y + 1, x, z, neighbors)
+        || isFluidCoverAt(chunk, y + 1, x, z);
+    return above
         && isOccluding(chunk, y - 1, x, z, neighbors)
         && isOccluding(chunk, y, x + 1, z, neighbors)
         && isOccluding(chunk, y, x - 1, z, neighbors)
         && isOccluding(chunk, y, x, z + 1, neighbors)
         && isOccluding(chunk, y, x, z - 1, neighbors);
+  }
+
+  /**
+   * 「上方紧邻方块是否是流体」（流体覆盖规则用）。
+   *
+   * <p><b>跨 section</b>：{@code y} 可能落在相邻 section（当前方块处于 section 顶部 localY=15 时），
+   * 也可能越出区块上边界（最顶 section 的顶部方块）——前者在 {@link Chunk} 内纯数据读取
+   * （section 顺序与索引计算与 {@link #isOccluding} 完全一致），后者按「越界非流体」处理
+   * （世界上下界之外不可能是流体，与 {@link #isOccluding} 的越界语义一致）。
+   *
+   * <p>x/z 恒在 {@code [0,15]}（只判 y+1 不改横向坐标），因此无需查邻块快照。
+   */
+  private boolean isFluidCoverAt(Chunk chunk, int y, int x, int z) {
+    if (!fluidCover || fluidTable == null || y < 0) {
+      return false;
+    }
+    int sectionIndex = y >> 4;
+    if (sectionIndex >= chunk.getSectionCount()) {
+      return false;
+    }
+    ChunkSection section = chunk.getSection(sectionIndex);
+    if (section == null) {
+      return false;
+    }
+    return fluidTable.test(section.getBlockState((y & 15) << 8 | z << 4 | x));
   }
 
   /** 区块内相对坐标处的方块是否遮挡；越出世界上下界视为未遮挡，越出本区块改查邻块贴边快照。 */

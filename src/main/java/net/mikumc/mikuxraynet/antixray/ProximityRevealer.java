@@ -22,6 +22,7 @@ import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
@@ -53,6 +54,8 @@ import org.bukkit.util.Vector;
  *   <li><b>可见性判定</b>（默认开启，多候选点采样）：先识别方块的暴露面，只在暴露面上取至多 5 个采样点
  *       （正对玩家的面中心 → 包围盒最近点 → 面四角）分别做体素步进，任一条通畅即显形；六面全被遮挡
  *       （完全掩埋）时一个点都不采 → 直接判不可见，绝不隔着墙还原。</li>
+ *   <li><b>流体覆盖</b>（默认开启，{@code occlusion.fluid-cover}）：目标方块上方紧邻方块是流体
+ *       （水/岩浆）时不显形——刷在岩浆里的下界残骸本就被伪装，显形侧若还原就等于把它亮给玩家。</li>
  * </ul>
  *
  * <p><b>线程纪律</b>：位置读取、方块读取与发包都在主线程 / Folia 区域线程（非 Folia 为统一主线程任务，
@@ -122,6 +125,8 @@ public final class ProximityRevealer implements Listener {
   private final AntiXrayConfig config;
   private final AntiXrayConfig.Proximity proximity;
   private final AntiXrayConfig.InstantReveal instant;
+  /** 流体覆盖开关（{@code occlusion.fluid-cover}）：上方是流体时不显形（保持伪装）。 */
+  private final boolean fluidCover;
   private final ObfuscatedChunkIndex chunkIndex;
   private final RevealedSet revealedSet;
   private final ProximityStats stats;
@@ -156,6 +161,7 @@ public final class ProximityRevealer implements Listener {
     this.config = config;
     this.proximity = config.proximity();
     this.instant = proximity.instantReveal();
+    this.fluidCover = config.occlusion().fluidCover();
     this.overRevealSampler = new OverRevealSampler(Math.max(0, proximity.overRevealSampling()));
     this.chunkIndex = chunkIndex;
     this.revealedSet = revealedSet;
@@ -518,16 +524,28 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 主线程 / 区域线程读方块做可见性判定：先读 6 个邻块判暴露面，再对暴露面上的至多 5 个采样点做体素步进，
-   * 任一条通畅即可见。任何异常都按「可见」处理（fail-open，宁可多显形）。
+   * 主线程 / 区域线程读方块做可见性判定：先判「上方是否流体」（流体覆盖开启时，是则不显形），
+   * 再读 6 个邻块判暴露面，然后对暴露面上的至多 5 个采样点做体素步进，任一条通畅即可见。
+   * 任何异常都按「可见」处理（fail-open，宁可多显形）。
    */
   private boolean isVisible(World world, ProximitySelector.Eye eye, int x, int y, int z) {
     try {
       int samples = proximity.raycastSamples();
-      return ProximitySelector.isVisible(eye, x, y, z, (blockX, blockY, blockZ) -> {
-        BlockData data = world.getBlockData(blockX, blockY, blockZ);
-        return data != null && data.isOccluding();
-      }, samples);
+      return ProximitySelector.isVisible(eye, x, y, z, new ProximitySelector.RayQuery() {
+        @Override
+        public boolean isOccluding(int blockX, int blockY, int blockZ) {
+          BlockData data = world.getBlockData(blockX, blockY, blockZ);
+          return data != null && data.isOccluding();
+        }
+
+        @Override
+        public boolean isFluid(int blockX, int blockY, int blockZ) {
+          // 只认本体就是流体的材质（水/岩浆/水柱）：含水的台阶/栅栏等不算（与注册表的流体覆盖掩码同义）。
+          Material material = world.getBlockData(blockX, blockY, blockZ).getMaterial();
+          return material == Material.WATER || material == Material.LAVA
+              || material == Material.BUBBLE_COLUMN;
+        }
+      }, samples, fluidCover);
     } catch (Throwable throwable) {
       logThrottled(throwable);
       return true;

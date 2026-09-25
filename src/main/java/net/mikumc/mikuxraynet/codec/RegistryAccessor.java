@@ -16,5 +16,19 @@ public interface RegistryAccessor {
 
   boolean isAir(int blockId);
 
+  /**
+   * 该状态是否为流体（<b>方块计数口径</b>：含含水方块，与客户端区块 section 的 fluidCount 一致）。
+   * 仅供 codec 统计使用，绝不可擅自改成「只有水/岩浆」——那会让改写后的 section 流体计数与客户端不符。
+   */
   boolean isFluid(int blockId);
+
+  /**
+   * 「流体覆盖」判定用的流体掩码（水/岩浆，含静止与流动变体；含水的台阶/栅栏等<b>不算</b>）。
+   *
+   * <p>只用于反矿透的「目标方块上方是流体则按遮挡处理 / 不显形」规则，与 {@link #isFluid} 的
+   * 方块计数口径解耦。默认回落 {@link #isFluid}，使测试桩（只实现了 isFluid）行为与既有语义一致。
+   */
+  default boolean isFluidCover(int blockId) {
+    return isFluid(blockId);
+  }
 }

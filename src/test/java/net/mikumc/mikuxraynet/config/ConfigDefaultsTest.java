@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.List;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -33,7 +34,8 @@ class ConfigDefaultsTest {
   void antiXrayDefaultsFollowRealWorldFeedback() {
     AntiXrayConfig config = AntiXrayConfig.from(yaml("enabled: true\n"));
 
-    assertEquals(AntiXrayConfig.ObfuscationMode.ALL, config.obfuscationMode(),
+    assertEquals(AntiXrayConfig.ObfuscationMode.ALL,
+        config.dimensionEffective(AntiXrayConfig.Dimension.NORMAL).mode(),
         "默认模式必须是 all（透视不得直接看到裸露在矿洞中的矿）");
     assertEquals(64.0D, config.proximity().distance(), 1.0E-9D,
         "显形距离默认 64 格（48 仍偏近；显形只在视线通畅且方块有暴露面时还原，放大距离不会隔墙泄露；"
@@ -50,34 +52,63 @@ class ConfigDefaultsTest {
     assertEquals(300, config.proximity().expireSeconds(), "显形索引过期默认 300 秒（原为 120）");
   }
 
-  /** 默认隐藏清单必须是 38 种：21 种原有（19 矿 + spawner + 苔石）+ 17 种 P1-5 扩展。 */
+  /**
+   * 默认隐藏清单按维度独立：主世界 35 种、地狱 15 种（<b>不含 nether_quartz_ore</b>）、末地 12 种。
+   *
+   * <p>回归用户核心诉求：地狱分布极广、价值极低的石英矿默认不隐藏（否则玩家在地狱到处挖到假石头）。
+   */
   @Test
-  void defaultHideBlocksIncludeSpawnerAndMossyCobblestone() {
+  void defaultHideBlocksArePerDimension() {
     AntiXrayConfig config = AntiXrayConfig.from(yaml("enabled: true\n"));
 
-    assertEquals(38, config.hideBlocks().size(),
-        "默认隐藏清单 38 种（19 种矿石 + spawner + mossy_cobblestone + 17 种 P1-5 扩展）："
-            + config.hideBlocks());
-    assertTrue(config.hideBlocks().contains("spawner"),
-        "必须隐藏刷怪笼（真机 PE 26.2 注册名就是 spawner）：" + config.hideBlocks());
-    assertTrue(config.hideBlocks().contains("mossy_cobblestone"),
-        "必须隐藏苔石（地牢/要塞/矿洞结构的标志物）：" + config.hideBlocks());
-    assertTrue(config.hideBlocks().contains("ancient_debris"), "原有矿种不得丢失");
-    // P1-5 扩展：容器/功能方块 + 结构暴露型
-    String[] expanded = {"chest", "trapped_chest", "ender_chest", "barrel", "furnace",
+    List<String> normal =
+        config.dimensionEffective(AntiXrayConfig.Dimension.NORMAL).hideBlocks();
+    List<String> nether =
+        config.dimensionEffective(AntiXrayConfig.Dimension.NETHER).hideBlocks();
+    List<String> end =
+        config.dimensionEffective(AntiXrayConfig.Dimension.THE_END).hideBlocks();
+
+    assertEquals(35, normal.size(), "主世界默认隐藏清单 35 种（16 矿 + 3 粗金属块 + 11 容器 + 5）：" + normal);
+    assertEquals(15, nether.size(), "地狱默认隐藏清单 15 种（残骸 + 金矿 + 11 容器 + 基岩 + 刷怪笼）：" + nether);
+    assertEquals(12, end.size(), "末地默认隐藏清单 12 种（11 容器 + 基岩）：" + end);
+
+    assertTrue(normal.contains("spawner"),
+        "主世界必须隐藏刷怪笼（真机 PE 26.2 注册名就是 spawner）：" + normal);
+    assertTrue(normal.contains("mossy_cobblestone"),
+        "主世界必须隐藏苔石（地牢/要塞/矿洞结构的标志物）：" + normal);
+    for (String name : new String[] {"chest", "trapped_chest", "ender_chest", "barrel", "furnace",
         "blast_furnace", "smoker", "hopper", "dropper", "dispenser", "shulker_box",
-        "bedrock", "raw_iron_block", "raw_gold_block", "raw_copper_block", "obsidian", "clay"};
-    for (String name : expanded) {
-      assertTrue(config.hideBlocks().contains(name),
-          "P1-5 扩展清单必须包含 " + name + "：" + config.hideBlocks());
+        "bedrock", "raw_iron_block", "raw_gold_block", "raw_copper_block", "obsidian", "clay"}) {
+      assertTrue(normal.contains(name), "主世界清单必须包含 " + name + "：" + normal);
     }
+
+    // 地狱：含残骸与金矿、明确不含石英矿
+    assertTrue(nether.contains("ancient_debris"), "地狱必须隐藏下界残骸：" + nether);
+    assertTrue(nether.contains("nether_gold_ore"), "地狱必须隐藏下界金矿：" + nether);
+    assertFalse(nether.contains("nether_quartz_ore"),
+        "地狱默认不得隐藏石英矿（分布极广、价值极低，全藏会让玩家到处挖到假石头）：" + nether);
+    // 主世界默认也不含地狱三矿（它们不会出现在主世界，放进去只是噪音）
+    for (String name : new String[] {"nether_gold_ore", "nether_quartz_ore", "ancient_debris"}) {
+      assertFalse(normal.contains(name), "主世界清单不得含地狱矿 " + name + "：" + normal);
+    }
+
+    // 默认权重：地狱为 netherrack/basalt/blackstone
+    assertEquals("{netherrack=10, basalt=4, blackstone=3}",
+        config.dimensionEffective(AntiXrayConfig.Dimension.NETHER).replacementWeights().toString(),
+        "地狱默认伪装权重必须是下界岩/玄武岩/黑石");
+    assertEquals(2,
+        config.dimensionEffective(AntiXrayConfig.Dimension.NORMAL).replacementBands().size(),
+        "主世界默认带 2 段按 Y 分区伪装表（深层深板岩系 / 浅层石头系）");
   }
 
-  /** 新增配置键的默认值：use-block-below 关（行为不变）、事件显形开且限额保守、抽样 1/20。 */
+  /** 新增配置键的默认值：use-block-below 关（行为不变）、事件显形开且限额保守、抽样 1/20、流体覆盖开。 */
   @Test
   void newFeatureDefaultsAreConservative() {
     AntiXrayConfig config = AntiXrayConfig.from(yaml("enabled: true\n"));
-    assertFalse(config.useBlockBelow(), "use-block-below 默认关闭（行为不变）");
+    assertFalse(config.dimensionEffective(AntiXrayConfig.Dimension.NORMAL).useBlockBelow(),
+        "use-block-below 默认关闭（行为不变）");
+    assertTrue(config.occlusion().fluidCover(),
+        "流体覆盖默认开启（刷在岩浆里的下界残骸若不按遮挡处理会裸露在矿洞里被透视看到）");
     assertTrue(config.proximity().instantReveal().enabled(), "事件驱动即时显形默认开启");
     assertEquals(2, config.proximity().instantReveal().radius(), "事件显形曼哈顿半径默认 2");
     assertEquals(16, config.proximity().instantReveal().maxPerTick(), "事件显形每玩家每 tick 限额默认 16");
@@ -86,19 +117,21 @@ class ConfigDefaultsTest {
         && config.proximity().instantReveal().maxPerTick() <= 0, "开启时限额必须为正");
   }
 
-  /** use-block-below / 事件显形配置可显式解析，非法/极端值被钳制。 */
+  /** use-block-below / 事件显形 / 流体覆盖等配置可显式解析，非法/极端值被钳制。 */
   @Test
   void newFeatureKeysParseAndClamp() {
     AntiXrayConfig on = AntiXrayConfig.from(yaml(
-        "obfuscation:\n"
-        + "  use-block-below: true\n"
+        "dimensions:\n"
+        + "  normal:\n"
+        + "    use-block-below: true\n"
         + "proximity:\n"
         + "  instant-reveal:\n"
         + "    enabled: false\n"
         + "    radius: 99\n"
         + "    max-per-tick: 0\n"
         + "  over-reveal-sampling: 1\n"));
-    assertTrue(on.useBlockBelow(), "use-block-below 可显式开启");
+    assertTrue(on.dimensionEffective(AntiXrayConfig.Dimension.NORMAL).useBlockBelow(),
+        "use-block-below 可显式开启");
     assertFalse(on.proximity().instantReveal().enabled(), "事件显形可显式关闭");
     assertEquals(8, on.proximity().instantReveal().radius(), "radius 超限钳制到 8");
     assertEquals(0, on.proximity().instantReveal().maxPerTick(), "max-per-tick=0 即关闭事件显形");
@@ -111,13 +144,16 @@ class ConfigDefaultsTest {
         + "  over-reveal-sampling: -3\n"));
     assertEquals(1, negative.proximity().instantReveal().radius(), "radius 负值钳制到 1");
     assertEquals(0, negative.proximity().overRevealSampling(), "抽样负值归 0（关闭）");
+
+    AntiXrayConfig fluidOff = AntiXrayConfig.from(yaml("occlusion:\n  fluid-cover: false\n"));
+    assertFalse(fluidOff.occlusion().fluidCover(), "流体覆盖可显式关闭（两处规则都不生效）");
   }
 
   /** 配置指纹：影响改写结果的 use-block-below 切换必须使指纹变化（缓存不得复用）。 */
   @Test
   void configHashChangesWhenUseBlockBelowFlips() {
     AntiXrayConfig off = AntiXrayConfig.from(yaml("enabled: true\n"));
-    AntiXrayConfig on = AntiXrayConfig.from(yaml("obfuscation:\n  use-block-below: true\n"));
+    AntiXrayConfig on = AntiXrayConfig.from(yaml("dimensions:\n  normal:\n    use-block-below: true\n"));
     assertNotEquals(off.configHash(), on.configHash(),
         "use-block-below 改变改写结果，必须参与配置指纹");
   }
@@ -143,18 +179,22 @@ class ConfigDefaultsTest {
   @Test
   void obfuscationModeParsesExplicitValues() {
     assertEquals(AntiXrayConfig.ObfuscationMode.ENCLOSED,
-        AntiXrayConfig.from(yaml("obfuscation:\n  mode: enclosed\n")).obfuscationMode());
+        AntiXrayConfig.from(yaml("dimensions:\n  normal:\n    mode: enclosed\n"))
+            .dimensionEffective(AntiXrayConfig.Dimension.NORMAL).mode());
     assertEquals(AntiXrayConfig.ObfuscationMode.ALL,
-        AntiXrayConfig.from(yaml("obfuscation:\n  mode: all\n")).obfuscationMode());
+        AntiXrayConfig.from(yaml("dimensions:\n  normal:\n    mode: all\n"))
+            .dimensionEffective(AntiXrayConfig.Dimension.NORMAL).mode());
     assertEquals(AntiXrayConfig.ObfuscationMode.ALL,
-        AntiXrayConfig.from(yaml("obfuscation:\n  mode: nonsense\n")).obfuscationMode(),
+        AntiXrayConfig.from(yaml("dimensions:\n  normal:\n    mode: nonsense\n"))
+            .dimensionEffective(AntiXrayConfig.Dimension.NORMAL).mode(),
         "非法取值一律回落为最安全的 all");
   }
 
   @Test
   void obfuscationModeParticipatesInConfigHash() {
-    AntiXrayConfig enclosed = AntiXrayConfig.from(yaml("obfuscation:\n  mode: enclosed\n"));
-    AntiXrayConfig all = AntiXrayConfig.from(yaml("obfuscation:\n  mode: all\n"));
+    AntiXrayConfig enclosed =
+        AntiXrayConfig.from(yaml("dimensions:\n  normal:\n    mode: enclosed\n"));
+    AntiXrayConfig all = AntiXrayConfig.from(yaml("dimensions:\n  normal:\n    mode: all\n"));
 
     assertNotEquals(enclosed.configHash(), all.configHash(),
         "模式必须参与配置指纹，否则切换后旧缓存会被复用而泄漏裸露矿");
@@ -248,14 +288,20 @@ class ConfigDefaultsTest {
     AntiXrayConfig config = AntiXrayConfig.from(yaml(""));
 
     assertTrue(config.enabled(), "反矿透总开关默认开启");
-    assertTrue(config.worlds().isEmpty(), "worlds 默认空 = 全部世界生效");
-    assertTrue(config.appliesTo("any_world"), "空 worlds 时对任意世界生效");
+    assertTrue(config.appliesTo("any_world"), "总开关开启时对任意世界生效（世界白名单已随按维度分段重构移除）");
+    // 维度启用：主世界/地狱默认启用，末地默认关闭（末地无矿物）
+    assertTrue(config.dimensionEnabled(AntiXrayConfig.Dimension.NORMAL), "主世界默认启用");
+    assertTrue(config.dimensionEnabled(AntiXrayConfig.Dimension.NETHER), "地狱默认启用");
+    assertFalse(config.dimensionEnabled(AntiXrayConfig.Dimension.THE_END), "末地默认关闭");
+    assertTrue(config.dimensionsMissing(),
+        "空配置缺少 dimensions 段 → 用内置默认运行并会一次性 WARN（绝不让保护静默失效）");
     assertFalse(config.layerObfuscation(), "层状伪装默认关闭（逐方块独立随机，更不易被模式识别）");
     assertTrue(config.removeBlockEntities(), "方块实体剔除默认开启（防幽灵刷怪笼/箱子）");
 
-    // occlusion 两键：覆盖表默认为空（内置规则兜底，由用户按需填写）
+    // occlusion 三键：覆盖表默认为空（内置规则兜底，由用户按需填写），流体覆盖默认开
     assertTrue(config.occlusion().extraOccluding().isEmpty(), "extra-occluding 默认为空");
     assertTrue(config.occlusion().extraNonOccluding().isEmpty(), "extra-non-occluding 默认为空");
+    assertTrue(config.occlusion().fluidCover(), "fluid-cover 默认开启");
 
     // neighbors 三键
     assertTrue(config.neighbors().enabled(), "邻块贴边快照默认开启");

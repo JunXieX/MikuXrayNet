@@ -385,12 +385,13 @@ class RealChunkPayloadRegressionTest {
         false, true, ObfuscationProcessor.PaletteOptions.DISABLED);
   }
 
-  /** 读取随插件打包的 {@code antixray.yml} 里的 {@code obfuscation.hide-blocks}（不依赖 Bukkit YAML）。 */
+  /** 读取随插件打包的 {@code antixray.yml} 里主世界维度的 {@code hide-blocks}（不依赖 Bukkit YAML）。 */
   private static List<String> shippedHideBlocks() throws IOException {
     try (InputStream input = RealChunkPayloadRegressionTest.class.getResourceAsStream("/antixray.yml")) {
       assertNotNull(input, "classpath 里必须有打包的 antixray.yml（src/main/resources）");
       List<String> names = new ArrayList<>();
-      boolean inObfuscation = false;
+      boolean inDimensions = false;
+      boolean inNormal = false;
       boolean inHideBlocks = false;
       List<String> lines = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))
           .lines().toList();
@@ -399,19 +400,33 @@ class RealChunkPayloadRegressionTest {
         if (line.isEmpty() || line.startsWith("#")) {
           continue;
         }
-        if (raw.startsWith("obfuscation:")) {
-          inObfuscation = true;
+        int indent = raw.indexOf(line.charAt(0));
+        int comment = line.indexOf('#');
+        String code = (comment >= 0 ? line.substring(0, comment) : line).trim();
+        if (code.startsWith("dimensions:")) {
+          inDimensions = true;
           continue;
         }
-        if (!inObfuscation) {
+        if (!inDimensions) {
           continue;
         }
-        if (line.startsWith("hide-blocks:")) {
+        if (indent == 0) {
+          break; // 离开 dimensions 段
+        }
+        if (indent == 2 && code.endsWith(":")) {
+          inNormal = "normal".equals(code.substring(0, code.length() - 1).trim());
+          inHideBlocks = false;
+          continue;
+        }
+        if (!inNormal) {
+          continue;
+        }
+        if (code.startsWith("hide-blocks:")) {
           inHideBlocks = true;
           continue;
         }
-        if (inHideBlocks && line.startsWith("- ")) {
-          names.add(line.substring(2).trim());
+        if (inHideBlocks && code.startsWith("- ")) {
+          names.add(code.substring(2).trim());
           continue;
         }
         if (inHideBlocks) {

@@ -39,9 +39,19 @@ public final class ProximitySelector {
   public record Eye(double x, double y, double z, double dirX, double dirY, double dirZ) {
   }
 
-  /** 世界坐标遮挡查询（显形流程用主线程读世界方块，单测可注入纯内存实现）。 */
+  /** 世界坐标遮挡/流体查询（显形流程用主线程读世界方块，单测可注入纯内存实现）。 */
   @FunctionalInterface
   public interface RayQuery extends OcclusionRaytracer.OcclusionQuery {
+
+    /**
+     * 该坐标是否为流体（水/岩浆；含水的台阶/栅栏等不算）。
+     *
+     * <p>默认实现返回 {@code false}（= 不启用流体规则），因此既有单测的 lambda 无需改动；
+     * 生产路径由 {@code ProximityRevealer} 注入真实的方块材质判定。
+     */
+    default boolean isFluid(int x, int y, int z) {
+      return false;
+    }
   }
 
   /** 各正交面的位掩码（{@link #exposedFaces} 的返回值）。 */
@@ -262,8 +272,28 @@ public final class ProximitySelector {
    */
   public static boolean isVisible(Eye eye, int blockX, int blockY, int blockZ, RayQuery query,
       int maxSamples) {
+    return isVisible(eye, blockX, blockY, blockZ, query, maxSamples, false);
+  }
+
+  /**
+   * 方块是否对玩家可见（追加「上方是流体则保持伪装」的显形侧规则）。
+   *
+   * <p><b>流体规则（显形侧）</b>：目标方块<b>上方（y+1）</b>紧邻方块是流体（水/岩浆）时，
+   * 本次<b>不显形</b>（保持伪装）——与隐藏侧的规则对称：刷在岩浆里的下界残骸本就被伪装，
+   * 显形侧若把它还原，玩家一眼就能看到岩浆里的残骸，透视端同样能看到。
+   * 流体被挖开/流走后，服务端会下发方块变更，{@code ProximityRevealer} 的周期巡检或事件显形
+   * 随后按正常流程还原（该坐标仍在伪装清单里）。
+   *
+   * @param fluidCover true = 启用「上方是流体则不显形」；false = 完全保持既有行为（两处规则都不生效）
+   */
+  public static boolean isVisible(Eye eye, int blockX, int blockY, int blockZ, RayQuery query,
+      int maxSamples, boolean fluidCover) {
     if (eye == null || query == null) {
       return true;
+    }
+    if (fluidCover && query.isFluid(blockX, blockY + 1, blockZ)) {
+      // 上方是流体：保持伪装，不显形（等流体被移除后由变更事件触发正常显形流程）
+      return false;
     }
     int faces = exposedFaces(blockX, blockY, blockZ, query);
     if (faces == 0) {

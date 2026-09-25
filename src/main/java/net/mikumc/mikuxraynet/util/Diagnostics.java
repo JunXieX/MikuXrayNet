@@ -387,34 +387,45 @@ public final class Diagnostics {
       return;
     }
     sb.append("enabled=").append(c.enabled()).append('\n');
-    sb.append("worlds=").append(c.worlds()).append('\n');
-    sb.append("hide-blocks=").append(c.hideBlocks().size()).append(" 种：")
-        .append(String.join(", ", c.hideBlocks())).append('\n');
-    sb.append("replacement-weights=").append(c.replacementWeights()).append('\n');
-    // P0-2/P0-3 新增配置的回显：高度范围、分区伪装表与逐世界覆盖段
-    sb.append("obfuscation.min-y=").append(c.obfuscationMinY() == null ? "不限制" : c.obfuscationMinY())
-        .append("，obfuscation.max-y=").append(c.obfuscationMaxY() == null ? "不限制" : c.obfuscationMaxY())
-        .append('\n');
-    sb.append("replacement-bands=").append(c.replacementBands().isEmpty()
-        ? "未配置（回落 replacement-weights）" : c.replacementBands()).append('\n');
+    if (c.dimensionsMissing()) {
+      sb.append("dimensions=缺少该段（已使用内置默认运行，请重新生成配置）\n");
+    }
+    // 各维度生效值（mode / 隐藏项数 / 伪装表 / 是否启用 / 高度范围 / use-block-below）
+    for (AntiXrayConfig.Dimension dimension : AntiXrayConfig.Dimension.values()) {
+      AntiXrayConfig.EffectiveObfuscation effective = c.dimensionEffective(dimension);
+      sb.append("dimensions.").append(dimension.key())
+          .append("（").append(dimension.label()).append("）：启用=").append(c.dimensionEnabled(dimension))
+          .append("，mode=").append(effective.mode())
+          .append("，hide-blocks=").append(effective.hideBlocks().size()).append(" 种：")
+          .append(String.join(", ", effective.hideBlocks()))
+          .append("，replacement-weights=").append(effective.replacementWeights())
+          .append("，replacement-bands=").append(effective.replacementBands().isEmpty()
+              ? "未配置（回落 replacement-weights）" : effective.replacementBands())
+          .append("，min-y=").append(effective.minY() == Integer.MIN_VALUE ? "不限制" : effective.minY())
+          .append("，max-y=").append(effective.maxY() == Integer.MAX_VALUE ? "不限制" : effective.maxY())
+          .append("，use-block-below=").append(effective.useBlockBelow())
+          .append('\n');
+    }
     if (c.worldOverrides().isEmpty()) {
-      sb.append("world-overrides=未配置（所有世界用全局默认）\n");
+      sb.append("world-overrides=未配置（各世界用其维度的生效值）\n");
     } else {
-      sb.append("world-overrides:\n");
+      sb.append("world-overrides（最高优先级，按世界名）：\n");
       for (int i = 0; i < c.worldOverrides().size(); i++) {
-        sb.append("  ").append(c.worldOverrides().get(i).pattern()).append(" → ")
-            .append(c.overrideEffective(i)).append('\n');
+        sb.append("  ").append(c.worldOverrides().get(i).pattern()).append('\n');
+        for (AntiXrayConfig.Dimension dimension : AntiXrayConfig.Dimension.values()) {
+          sb.append("    ").append(dimension.key()).append(" → ")
+              .append(c.overrideEffective(i, dimension)).append('\n');
+        }
       }
     }
     sb.append("layer-obfuscation=").append(c.layerObfuscation())
-        .append("，remove-block-entities=").append(c.removeBlockEntities())
-        .append("，obfuscation.mode=").append(c.obfuscationMode()).append('\n');
+        .append("，remove-block-entities=").append(c.removeBlockEntities()).append('\n');
+    sb.append("occlusion.extra-occluding=").append(c.occlusion().extraOccluding())
+        .append("，extra-non-occluding=").append(c.occlusion().extraNonOccluding())
+        .append("，fluid-cover=").append(c.occlusion().fluidCover()).append('\n');
     sb.append("neighbors.enabled=").append(c.neighbors().enabled())
         .append("，missing-policy=").append(c.neighbors().missingPolicy())
         .append("，cache-maximum-size=").append(c.neighbors().cacheMaximumSize()).append('\n');
-    sb.append("occlusion.extra-occluding=").append(c.occlusion().extraOccluding())
-        .append("，extra-non-occluding=").append(c.occlusion().extraNonOccluding()).append('\n');
-    sb.append("obfuscation.use-block-below=").append(c.useBlockBelow()).append('\n');
     sb.append("proximity.instant-reveal.enabled=").append(c.proximity().instantReveal().enabled())
         .append("，radius=").append(c.proximity().instantReveal().radius())
         .append("，max-per-tick=").append(c.proximity().instantReveal().maxPerTick()).append('\n');

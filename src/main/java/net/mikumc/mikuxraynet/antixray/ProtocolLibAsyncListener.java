@@ -252,10 +252,14 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     ChunkBatchGate gate = batches.get(player.getUniqueId());
 
+    // 与 world.getMinHeight() 同一处安全取数点：这两个值都必须在此（网络线程读 Bukkit）取出，
+    // 之后只传纯值给任务；worker 线程严禁触碰 Bukkit API。
     int minHeight = world.getMinHeight();
     int sectionCount = (world.getMaxHeight() - minHeight) / 16;
+    // 维度由 World#getEnvironment() 判定（不依赖世界名；CUSTOM 归入 normal），决定用哪段 dimensions 配置。
+    AntiXrayConfig.Dimension dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
     RewriteTask task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
-        world.getName(), minHeight, sectionCount, config.timeoutMillis(),
+        world.getName(), dimension, minHeight, sectionCount, config.timeoutMillis(),
         gate == null
             ? () -> asynchronousManager.signalPacketTransmission(event)
             : () -> {
@@ -422,11 +426,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** 改写并回填内存缓存与磁盘缓存。 */
   private void rewrite(RewriteTask task, ChunkPacketAccessor accessor, byte[] source, long sourceHash,
       NeighborEdges neighbors) {
-    // 世界名与最低 Y 一并传入：逐世界覆盖（P0-2）按世界取档案，min-y/max-y 过滤与
-    // 分区伪装表（P0-3）需要把 section 内相对 Y 换算成绝对 Y。
+    // 世界名 + 维度 + 最低 Y 一并传入：world-overrides（按世界名）优先于 dimensions.<维度>，
+    // min-y/max-y 过滤与分区伪装表需要把 section 内相对 Y 换算成绝对 Y。
     ObfuscationProcessor.Result result = processor.rewrite(source, task.sectionCount(),
         seed(task.worldName(), task.chunkX(), task.chunkZ()), neighbors,
-        task.worldName(), task.minHeight());
+        task.worldName(), task.dimension(), task.minHeight());
 
     if (result.failed()) {
       // 解码/重编码异常：必须可观测——否则「本该伪装却失败」会被并进「跳过」里，看起来一切正常

@@ -152,12 +152,30 @@ public final class AntiXrayRuntime {
     // 注册时机（反矿透装配成功后、邻近显形装配前）与拆分前一致。
     plugin.registerWorldUnloadInvalidation();
     startProximity(antiXray, chunkIndex, revealed, proximityStats);
-    logger.info("反矿透已启用：目标方块 " + antiXray.hideBlocks().size() + " 种，伪装方块 "
-        + antiXray.replacementWeights().size() + " 种；伪装模式 " + antiXray.obfuscationMode()
+    logger.info("反矿透已启用（按维度分段）：" + dimensionSummary(antiXray)
         + "；区块边界邻块快照 "
         + (neighborProvider != null ? "已启用" : "已关闭") + "；磁盘缓存 "
         + (diskCache != null ? "已启用（" + new File(plugin.getDataFolder(), "cache").getPath() + "）"
             : "已关闭"));
+  }
+
+  /** 各维度一句话摘要（启用状态、隐藏项数与伪装方块数），供启动日志核对。 */
+  private static String dimensionSummary(AntiXrayConfig config) {
+    StringBuilder sb = new StringBuilder();
+    for (AntiXrayConfig.Dimension dimension : AntiXrayConfig.Dimension.values()) {
+      if (!sb.isEmpty()) {
+        sb.append("｜");
+      }
+      sb.append(dimension.label());
+      if (!config.dimensionEnabled(dimension)) {
+        sb.append(" 未启用");
+        continue;
+      }
+      AntiXrayConfig.EffectiveObfuscation effective = config.dimensionEffective(dimension);
+      sb.append(" 目标 ").append(effective.hideBlocks().size()).append(" 种 / 伪装 ")
+          .append(effective.replacementWeights().size()).append(" 种 / 模式 ").append(effective.mode());
+    }
+    return sb.toString();
   }
 
   /**

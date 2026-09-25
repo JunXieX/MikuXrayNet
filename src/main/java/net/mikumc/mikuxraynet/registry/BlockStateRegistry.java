@@ -52,14 +52,17 @@ public final class BlockStateRegistry implements RegistryAccessor {
   private final int maxBitsPerBlockState;
   private final BitSet airStates;
   private final BitSet fluidStates;
+  /** 「流体覆盖」掩码：只有水/岩浆（含流动变体）与水柱，**不含含水方块**（见 {@link #isFluidCover}）。 */
+  private final BitSet fluidCoverStates;
   private final BitSet occludingStates;
 
   private BlockStateRegistry(int uniqueBlockStateCount, int maxBitsPerBlockState, BitSet airStates,
-      BitSet fluidStates, BitSet occludingStates) {
+      BitSet fluidStates, BitSet fluidCoverStates, BitSet occludingStates) {
     this.uniqueBlockStateCount = uniqueBlockStateCount;
     this.maxBitsPerBlockState = maxBitsPerBlockState;
     this.airStates = airStates;
     this.fluidStates = fluidStates;
+    this.fluidCoverStates = fluidCoverStates;
     this.occludingStates = occludingStates;
   }
 
@@ -83,6 +86,7 @@ public final class BlockStateRegistry implements RegistryAccessor {
 
     BitSet airStates = new BitSet(count);
     BitSet fluidStates = new BitSet(count);
+    BitSet fluidCoverStates = new BitSet(count);
     BitSet occludingStates = new BitSet(count);
 
     for (int id = 0; id < count; id++) {
@@ -97,13 +101,28 @@ public final class BlockStateRegistry implements RegistryAccessor {
       if (state.isFluid() || type.getMaterialType() == MaterialType.BUBBLE_COLUMN) {
         fluidStates.set(id);
       }
+      // 流体覆盖掩码：只认「本体就是流体」的材质（WATER / LAVA / 水柱）。
+      // 真机 PE 实测：isFluid() 把含水状态也算作流体（32366 个状态里 11760 个 isFluid=true，
+      // 其中 11728 个是含水的台阶/栅栏/告示牌等，二者不可混用）——含水方块本体不是流体，
+      // 上方放一块含水台阶不应让下方矿「保持伪装」。
+      if (isFluidMaterial(type.getMaterialType())) {
+        fluidCoverStates.set(id);
+      }
       if (OcclusionRules.isOccluding(facts(type, name, state), occludingOverrides,
           nonOccludingOverrides)) {
         occludingStates.set(id);
       }
     }
 
-    return new BlockStateRegistry(count, ceilLog2(count), airStates, fluidStates, occludingStates);
+    return new BlockStateRegistry(count, ceilLog2(count), airStates, fluidStates, fluidCoverStates,
+        occludingStates);
+  }
+
+  /** 本体即流体的材质：水（含流动变体与水柱）与岩浆。 */
+  private static boolean isFluidMaterial(MaterialType material) {
+    return material == MaterialType.WATER
+        || material == MaterialType.LAVA
+        || material == MaterialType.BUBBLE_COLUMN;
   }
 
   /** 方块名称 → 默认状态的全局 id；未知名称返回 -1。仅启动期用于解析配置。 */
@@ -147,6 +166,21 @@ public final class BlockStateRegistry implements RegistryAccessor {
   @Override
   public boolean isFluid(int blockId) {
     return blockId >= 0 && blockId < uniqueBlockStateCount && fluidStates.get(blockId);
+  }
+
+  /**
+   * 流体覆盖掩码查询（水/岩浆/水柱；<b>不含含水方块</b>）：供反矿透「目标方块上方是流体则按遮挡处理、
+   * 且显形侧不显形」的规则使用。与 {@link #isFluid}（方块计数口径，含含水方块）刻意分开——
+   * 见 {@link #build} 中的实测说明。
+   */
+  @Override
+  public boolean isFluidCover(int blockId) {
+    return blockId >= 0 && blockId < uniqueBlockStateCount && fluidCoverStates.get(blockId);
+  }
+
+  /** 被判定为「流体覆盖」的状态数（启动自检用）。 */
+  public int fluidCoverStateCount() {
+    return fluidCoverStates.cardinality();
   }
 
   /** 该状态是否为「整块不透明」（可作为遮挡面）。 */

@@ -388,4 +388,58 @@ class ProximitySelectorTest {
     assertEquals(64.5D, all[0][1], 1.0E-9D);
     assertEquals(0.0D, all[0][2], 1.0E-9D, "正对 +Z 方向看时，应优先取 -Z 面（朝向玩家的那个面）中心");
   }
+
+  // ---------------------------------------------------------------- 流体覆盖（显形侧）
+
+  /**
+   * 流体覆盖（显形侧）回归：目标方块<b>上方是流体</b>时不显形（保持伪装）；关闭该规则时恢复显形。
+   *
+   * <p>场景与隐藏侧对称：刷在岩浆里的下界残骸本就被伪装，显形侧若把它还原，就等于把它亮给玩家。
+   * 流体被移除后（服务端下发变更）重查，应恢复显形。
+   */
+  @Test
+  void fluidAboveKeepsTargetDisguisedOnlyWhenFluidCoverEnabled() {
+    ProximitySelector.Eye eye = standingEye();
+    // 目标 (0,64,5) 四周空气（视线通畅），其上方 (0,65,5) 是岩浆
+    ProximitySelector.RayQuery lavaAbove = new ProximitySelector.RayQuery() {
+      @Override
+      public boolean isOccluding(int x, int y, int z) {
+        return false;
+      }
+
+      @Override
+      public boolean isFluid(int x, int y, int z) {
+        return x == 0 && y == 65 && z == 5;
+      }
+    };
+
+    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 5, lavaAbove, SAMPLES, true),
+        "上方是岩浆且流体覆盖开启 → 保持伪装，不显形");
+    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, lavaAbove, SAMPLES, false),
+        "流体覆盖关闭 → 规则不生效，视线通畅即显形（行为回到原状）");
+
+    // 上方不是流体：两种设置都正常显形
+    ProximitySelector.RayQuery open = (x, y, z) -> false;
+    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, open, SAMPLES, true),
+        "上方非流体 → 正常显形");
+
+    // 流体被移除（变更事件后的重查）→ 恢复显形
+    ProximitySelector.RayQuery lavaRemoved = new ProximitySelector.RayQuery() {
+      @Override
+      public boolean isOccluding(int x, int y, int z) {
+        return false;
+      }
+
+      @Override
+      public boolean isFluid(int x, int y, int z) {
+        return false;
+      }
+    };
+    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, lavaRemoved, SAMPLES, true),
+        "流体被移除 → 恢复显形（由方块变更事件触发正常显形流程）");
+
+    // 兼容：旧的 6 参重载默认不启用流体规则（既有调用方行为不变）
+    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, lavaAbove, SAMPLES),
+        "6 参重载默认 fluidCover=false，行为不变");
+  }
 }

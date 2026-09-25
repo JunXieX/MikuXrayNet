@@ -2,9 +2,10 @@ package net.mikumc.mikuxraynet.concurrency;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 
 /**
- * 单个区块封包的改写任务：只承载「基本类型 / 不可变标识 + 世界名」与放行状态机，
+ * 单个区块封包的改写任务：只承载「基本类型 / 不可变标识 + 世界名 + 维度」与放行状态机，
  * 不持有任何 Bukkit / 封包对象。
  *
  * <p>放行（{@code signalOnce()}）必须恰好一次：重复放行会让客户端卡在加载界面，漏放行则永久卡包。
@@ -24,6 +25,8 @@ public final class RewriteTask {
   private final int chunkX;
   private final int chunkZ;
   private final String worldName;
+  /** 该世界所属维度（网络线程读 {@code World#getEnvironment()} 后传入；工作线程不碰 Bukkit）。 */
+  private final AntiXrayConfig.Dimension dimension;
   private final int minHeight;
   private final int sectionCount;
   private final long deadlineNanos;
@@ -33,6 +36,8 @@ public final class RewriteTask {
   private final AtomicBoolean signaled = new AtomicBoolean();
 
   /**
+   * 兼容构造：维度按主世界处理（供旧调用方与既有测试使用）。
+   *
    * @param minHeight    该世界最低建筑高度，用于与封包中绝对 Y 坐标的方块实体对齐
    * @param sectionCount 该世界的 section 数量（高度 / 16）
    * @param timeoutMillis 处理超时（毫秒）
@@ -40,9 +45,23 @@ public final class RewriteTask {
    */
   public RewriteTask(int chunkX, int chunkZ, String worldName, int minHeight,
       int sectionCount, long timeoutMillis, Runnable delivery) {
+    this(chunkX, chunkZ, worldName, AntiXrayConfig.Dimension.NORMAL, minHeight, sectionCount,
+        timeoutMillis, delivery);
+  }
+
+  /**
+   * @param dimension    该世界所属维度（决定用哪一段 {@code dimensions.<维度>} 配置改写）
+   * @param minHeight    该世界最低建筑高度，用于与封包中绝对 Y 坐标的方块实体对齐
+   * @param sectionCount 该世界的 section 数量（高度 / 16）
+   * @param timeoutMillis 处理超时（毫秒）
+   * @param delivery     放行动作（通常是 ProtocolLib 的 {@code signalPacketTransmission}）
+   */
+  public RewriteTask(int chunkX, int chunkZ, String worldName, AntiXrayConfig.Dimension dimension,
+      int minHeight, int sectionCount, long timeoutMillis, Runnable delivery) {
     this.chunkX = chunkX;
     this.chunkZ = chunkZ;
     this.worldName = worldName;
+    this.dimension = dimension == null ? AntiXrayConfig.Dimension.NORMAL : dimension;
     this.minHeight = minHeight;
     this.sectionCount = sectionCount;
     this.deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
@@ -59,6 +78,11 @@ public final class RewriteTask {
 
   public String worldName() {
     return worldName;
+  }
+
+  /** 该世界所属维度（配置分段依据）。 */
+  public AntiXrayConfig.Dimension dimension() {
+    return dimension;
   }
 
   public int minHeight() {
