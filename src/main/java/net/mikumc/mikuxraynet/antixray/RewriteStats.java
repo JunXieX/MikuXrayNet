@@ -33,6 +33,15 @@ public final class RewriteStats {
   public final LongAdder writeBackFailures = new LongAdder();
 
   /**
+   * 磁盘缓存「读到了负载但被拒」的次数：负载里的原始区块字节指纹与本次要改写的字节不符（或信封损坏）。
+   *
+   * <p><b>为什么必须有这个计数器</b>：这是磁盘缓存唯一「命中计数 +1 但实际用不上」的出口——
+   * 命中率会显示正常，可玩家仍在重写。真机排查时若没有它，「命中率高但没生效」与
+   * 「命中率低」会被混在一起，无法定位到是<b>内容指纹</b>在拦还是<b>配置指纹</b>在拦。
+   */
+  public final LongAdder diskPayloadRejected = new LongAdder();
+
+  /**
    * 累计被替换（伪装）的方块个数——即「实际匹配到目标矿并完成替换」的方块总数。
    *
    * <p><b>为什么必须有这个计数器</b>：原先只有「区块数」维度的计数（改写/跳过），

@@ -26,9 +26,6 @@ public final class DiskCacheStats {
   /** 因单文件大小上限被拒绝的写入数。 */
   public final LongAdder rejectedBySize = new LongAdder();
 
-  /** 观测到的方块变更次数（用于推导区块代次）。 */
-  public final LongAdder generationBumps = new LongAdder();
-
   /** 读写异常次数（异常只会降级，不影响封包链路）。 */
   public final LongAdder errors = new LongAdder();
 }

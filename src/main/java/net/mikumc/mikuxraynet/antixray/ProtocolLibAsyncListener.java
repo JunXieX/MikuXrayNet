@@ -423,10 +423,16 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return null;
     }
     try {
-      DiskPayload.Decoded decoded = DiskPayload.decode(
-          diskCache.get(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash()),
-          sourceHash);
+      byte[] payload = diskCache.get(task.worldName(), task.chunkX(), task.chunkZ(),
+          config.configHash());
+      if (payload == null) {
+        return null;
+      }
+      DiskPayload.Decoded decoded = DiskPayload.decode(payload, sourceHash);
       if (decoded == null) {
+        // 读到了负载但用不上（信封损坏或原始字节指纹不符）：这是「命中率正常但仍在重写」的唯一出口，
+        // 必须计数——否则它会被混进普通未命中里，无法区分是内容指纹在拦还是配置指纹在拦。
+        stats.diskPayloadRejected.increment();
         return null;
       }
       CachedChunk fromDisk = new CachedChunk(decoded.sourceHash(), decoded.data(), decoded.positions());

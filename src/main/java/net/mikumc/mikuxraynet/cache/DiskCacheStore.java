@@ -4,8 +4,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -32,12 +30,18 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
  * bucket 压缩用 zstd（服务端自带的 zstd-jni，{@code scope=provided}，不打进插件 jar；
  * 运行期不可用时自动回退 JDK Deflater），旧 Deflate 缓存仍可读取（详见该类的压缩方案说明）。
  *
- * <p><b>缓存键与失效</b>：键 = {@code (世界名, chunkX, chunkZ, 配置指纹, 区块代次)}。
- * 配置指纹来自 {@code antixray.yml} 中影响改写结果的配置项；区块代次由本插件<b>已经拦截的方块变更</b>
- * 驱动（{@link #markBlockChange}，出站 {@code BLOCK_CHANGE}/{@code MULTI_BLOCK_CHANGE} 封包路径），
- * 某区块观测到变更即递增 → 该区块的旧代次条目在读取时自然失效并被惰性清理。
- * 代次跟踪表是有界 LRU（可配 {@code generation-tracker-size}），被挤出的键退化为「代次 0」，
- * 只会多一次未命中、不会返回脏数据（读写双方还都会校验原始字节指纹与配置指纹）。
+ * <p><b>缓存键与失效</b>：键 = {@code (世界名, chunkX, chunkZ, 配置指纹)}。
+ * 配置指纹来自 {@code antixray.yml} 中影响改写结果的配置项，且只用「哈希有规范定义」的稳定分量
+ * （字符串/数字/列表/映射/枚举名），因此同一份配置在<b>任意进程</b>上都算出同一个指纹。
+ *
+ * <p><b>内容新鲜度由负载自己证明</b>：条目负载里带着原始区块字节指纹，与本次要改写的字节不符即视为
+ * 未命中（见 {@code DiskPayload}）。这是唯一的「内容是否过期」判据——它天然覆盖「区块被挖过/被重建」
+ * 等一切修改，且跨进程成立。
+ *
+ * <p>历史包袱说明：本类曾用「区块代次」（{@code markBlockChange} + 一个内存 LRU）参与键，
+ * 但代次表只在进程内存在：重启后所有代次归零，于是<b>上一进程写下的、代次非 0 的条目会被逐条判为
+ * 过期并删除</b>（真机实测：重启后命中 0／未命中 586、过期清理 0、异常 0，磁盘上 665 条对不上号）。
+ * 而它的唯一价值（「区块内容变了」）本就由原始字节指纹覆盖，因此该机制已整体移除。
  *
  * <p><b>生命周期（本项目最看重的一点）</b>：绝不持有 {@code World / Chunk / Player} 引用（键只有
  * 字符串与整数）；世界卸载 → {@link #invalidateWorld} 落盘并关闭该世界的全部句柄；插件停用 →
@@ -68,10 +72,6 @@ public final class DiskCacheStore implements AutoCloseable {
 
   /** 区域坐标键（只含不可变类型，不可能钉住世界对象）。 */
   private record RegionKey(String worldName, int regionX, int regionZ) {
-  }
-
-  /** 区块坐标键（用于区块代次跟踪的有界 LRU）。 */
-  private record ChunkRef(String worldName, int chunkX, int chunkZ) {
   }
 
   /** 已打开的区域文件句柄（仅磁盘线程改动，诊断读取只取近似值）。 */
@@ -105,7 +105,6 @@ public final class DiskCacheStore implements AutoCloseable {
   private final Logger logger;
   private final DiskCacheStats stats = new DiskCacheStats();
   private final ConcurrentHashMap<RegionKey, Handle> open = new ConcurrentHashMap<>();
-  private final Map<ChunkRef, Long> generations = new LinkedHashMap<>(1024, 0.75f, true);
   private final AtomicInteger pendingOps = new AtomicInteger();
   private final AtomicInteger approximateEntries = new AtomicInteger();
   /**
@@ -196,15 +195,13 @@ public final class DiskCacheStore implements AutoCloseable {
    * 读取一个区块的缓存负载。
    *
    * @param configHash 配置指纹（参与键，配置变了就自然不命中）
-   * @return 负载字节；未命中、过期、代次不符或任何异常时返回 {@code null}
+   * @return 负载字节；未命中、过期或任何异常时返回 {@code null}
    */
   public byte[] get(String worldName, int chunkX, int chunkZ, int configHash) {
     if (!usable() || worldName == null) {
       return null;
     }
-    long generation = generation(worldName, chunkX, chunkZ);
-    byte[] payload = submit(() -> doGet(worldName, chunkX, chunkZ, configHash, generation),
-        readTimeoutMillis);
+    byte[] payload = submit(() -> doGet(worldName, chunkX, chunkZ, configHash), readTimeoutMillis);
     if (payload == null || payload.length == 0) {
       stats.misses.increment();
       return null;
@@ -234,46 +231,13 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
 
-    long generation = generation(worldName, chunkX, chunkZ);
     long writtenAt = System.currentTimeMillis();
-    execute(() -> doPut(worldName, chunkX, chunkZ, configHash, generation, writtenAt, payload));
+    execute(() -> doPut(worldName, chunkX, chunkZ, configHash, writtenAt, payload));
   }
 
-  /**
-   * 记录「该区块发生了方块变更」：递增其区块代次，使旧代次缓存条目在读取时失效。
-   *
-   * <p>由出站方块变更封包路径驱动（服务端已下发变更 = 该区块内容已变），不做任何磁盘操作。
-   */
-  public void markBlockChange(String worldName, int chunkX, int chunkZ) {
-    if (!usable() || worldName == null) {
-      return;
-    }
-    ChunkRef ref = new ChunkRef(worldName, chunkX, chunkZ);
-    synchronized (generations) {
-      Long current = generations.get(ref);
-      generations.put(ref, current == null ? 1L : current + 1L);
-      int cap = Math.max(1, config.generationTrackerSize());
-      while (generations.size() > cap) {
-        Iterator<ChunkRef> iterator = generations.keySet().iterator();
-        if (!iterator.hasNext()) {
-          break;
-        }
-        iterator.next();
-        iterator.remove();
-      }
-    }
-    stats.generationBumps.increment();
-  }
-
-  /** 世界卸载：清掉该世界的代次跟踪，并落盘 + 关闭该世界的全部句柄（文件保留，下次加载可复用）。 */
+  /** 世界卸载：落盘 + 关闭该世界的全部句柄（文件保留，下次加载可复用）。 */
   public void invalidateWorld(String worldName) {
-    if (worldName == null) {
-      return;
-    }
-    synchronized (generations) {
-      generations.keySet().removeIf(ref -> ref.worldName().equals(worldName));
-    }
-    if (!usable()) {
+    if (worldName == null || !usable()) {
       return;
     }
     submit(() -> {
@@ -314,9 +278,6 @@ public final class DiskCacheStore implements AutoCloseable {
     }
     closed = true;
     executor.shutdownNow();
-    synchronized (generations) {
-      generations.clear();
-    }
   }
 
   /** 计数（命中率、拒绝与异常等）。 */
@@ -341,7 +302,7 @@ public final class DiskCacheStore implements AutoCloseable {
 
   // ------------------------------------------------------------------ 磁盘线程执行体
 
-  private byte[] doGet(String worldName, int chunkX, int chunkZ, int configHash, long generation)
+  private byte[] doGet(String worldName, int chunkX, int chunkZ, int configHash)
       throws IOException {
     int regionX = BufferedLinearV3Format.regionCoordinate(chunkX);
     int regionZ = BufferedLinearV3Format.regionCoordinate(chunkZ);
@@ -355,8 +316,8 @@ public final class DiskCacheStore implements AutoCloseable {
     if (entry == null) {
       return null;
     }
-    if (entry.configHash() != configHash || entry.generation() != generation) {
-      // 配置变了或该区块已发生变更：惰性清理，绝不返回脏数据
+    if (entry.configHash() != configHash) {
+      // 配置变了：惰性清理，绝不返回旧配置改写的负载
       removeEntry(handle, chunkIndex);
       return null;
     }
@@ -376,8 +337,8 @@ public final class DiskCacheStore implements AutoCloseable {
     }
   }
 
-  private void doPut(String worldName, int chunkX, int chunkZ, int configHash, long generation,
-      long writtenAt, byte[] payload) throws IOException {
+  private void doPut(String worldName, int chunkX, int chunkZ, int configHash, long writtenAt,
+      byte[] payload) throws IOException {
     int regionX = BufferedLinearV3Format.regionCoordinate(chunkX);
     int regionZ = BufferedLinearV3Format.regionCoordinate(chunkZ);
     Handle handle = handle(worldName, regionX, regionZ, true);
@@ -389,7 +350,7 @@ public final class DiskCacheStore implements AutoCloseable {
     }
 
     BufferedLinearV3Format.Entry entry =
-        new BufferedLinearV3Format.Entry(generation, writtenAt, configHash, payload);
+        new BufferedLinearV3Format.Entry(0L, writtenAt, configHash, payload);
     boolean replaced = handle.file.put(BufferedLinearV3Format.chunkIndex(chunkX, chunkZ), entry);
     if (!replaced) {
       approximateEntries.incrementAndGet();
@@ -459,8 +420,7 @@ public final class DiskCacheStore implements AutoCloseable {
       RegionKey key = candidate.getKey();
       Handle handle = candidate.getValue();
       try {
-        int dropped = handle.file.compact((chunkIndex, entry) ->
-            keepEntry(key.worldName(), key.regionX(), key.regionZ(), chunkIndex, entry));
+        int dropped = handle.file.compact((chunkIndex, entry) -> keepEntry(entry));
         if (dropped > 0) {
           approximateEntries.updateAndGet(value -> Math.max(0, value - dropped));
         }
@@ -476,16 +436,13 @@ public final class DiskCacheStore implements AutoCloseable {
     }
   }
 
-  /** 条目保留判定：过期或代次不符即丢弃（惰性清理的另一半，配合读取时的清理）。 */
-  private boolean keepEntry(String worldName, int regionX, int regionZ, int chunkIndex,
-      BufferedLinearV3Format.Entry entry) {
+  /** 条目保留判定：只按过期时间丢弃（内容新鲜度由负载里的原始字节指纹保证，见类注释）。 */
+  private boolean keepEntry(BufferedLinearV3Format.Entry entry) {
     if (isExpired(entry)) {
       stats.expiredRemoved.increment();
       return false;
     }
-    int chunkX = (regionX << 5) | (chunkIndex & 31);
-    int chunkZ = (regionZ << 5) | (chunkIndex >>> 5);
-    return entry.generation() == generation(worldName, chunkX, chunkZ);
+    return true;
   }
 
   /** 关闭长时间未使用的句柄，避免打开的文件描述符与内存随世界规模增长。 */
@@ -647,15 +604,7 @@ public final class DiskCacheStore implements AutoCloseable {
     return builder.length() == 0 ? "unknown" : builder.toString().toLowerCase(Locale.ROOT);
   }
 
-  // ------------------------------------------------------------------ 代次与调度
-
-  private long generation(String worldName, int chunkX, int chunkZ) {
-    ChunkRef ref = new ChunkRef(worldName, chunkX, chunkZ);
-    synchronized (generations) {
-      Long value = generations.get(ref);
-      return value == null ? 0L : value;
-    }
-  }
+  // ------------------------------------------------------------------ 调度
 
   /** 提交一个不等待结果的任务（写入、落盘等）。 */
   private void execute(ThrowingRunnable task) {

@@ -45,7 +45,7 @@ class DiskCacheChannelFailureTest {
 
   /** 维护周期设得很大，避免后台任务干扰断言；需要落盘的用例显式调用 flush()。 */
   private static AntiXrayConfig.DiskCache config(int idleCloseSeconds) {
-    return new AntiXrayConfig.DiskCache(true, 1024, 16, 600, 2, idleCloseSeconds, 3600, 4, 256, 4096,
+    return new AntiXrayConfig.DiskCache(true, 1024, 16, 600, 2, idleCloseSeconds, 3600, 4, 256,
         false, AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, 10);
   }
 

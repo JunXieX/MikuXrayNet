@@ -33,7 +33,7 @@ class DiskCacheStoreTest {
   private static AntiXrayConfig.DiskCache config(int maxEntries, int expireSeconds,
       int idleCloseSeconds) {
     return new AntiXrayConfig.DiskCache(true, maxEntries, 16, expireSeconds, 2, idleCloseSeconds,
-        3600, 4, 256, 4096, false, AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, 10);
+        3600, 4, 256, false, AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, 10);
   }
 
   /** 测试用构造：把读取预算放宽到 10 秒，避免 CI 磁盘抖动被误判为「未命中」。 */
@@ -85,7 +85,7 @@ class DiskCacheStoreTest {
   @Test
   void regionFileSizeLimitCountsUnflushedData(@TempDir Path dir) throws Exception {
     AntiXrayConfig.DiskCache limit1Mb = new AntiXrayConfig.DiskCache(true, 20000, 1, 600, 2, 600,
-        3600, 4, 256, 4096, false, AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, 10);
+        3600, 4, 256, false, AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, 10);
     try (DiskCacheStore store = store(dir, limit1Mb)) {
       for (int chunkX = 0; chunkX < 32; chunkX++) {
         store.put(WORLD, chunkX, 0, 1, randomPayload(64 * 1024, chunkX));
@@ -133,26 +133,31 @@ class DiskCacheStoreTest {
     }
   }
 
+  /**
+   * 跨进程复用（真机回归）：上一进程写下的条目，必须能被「新进程」（新实例、配置指纹相同）读回。
+   *
+   * <p>历史缺陷：磁盘键里曾包含「区块代次」，而代次表只在进程内存在——重启后所有代次归零，
+   * 于是上一进程写下的、代次非 0 的条目会被逐条判为过期并删除。真机表现为「重启后命中 0／未命中 586、
+   * 过期清理 0、异常 0，磁盘上 665 条对不上号」。现在内容新鲜度只由负载里的原始字节指纹判定，
+   * 代次不参与键，因此这里断言：<b>新实例读回上一实例写入的条目必须命中</b>。
+   */
   @Test
-  void blockChangeBumpsGenerationAndInvalidatesOldEntry(@TempDir Path dir) {
-    try (DiskCacheStore store = store(dir, config(1024, 600, 600))) {
-      byte[] first = payload(512);
-      store.put(WORLD, 8, 9, 5, first);
-      assertArrayEquals(first, store.get(WORLD, 8, 9, 5));
-
-      // 观测到该区块的方块变更 → 代次递增 → 旧代次条目失效
-      store.markBlockChange(WORLD, 8, 9);
-      assertEquals(1L, store.stats().generationBumps.sum());
-      assertNull(store.get(WORLD, 8, 9, 5), "代次变化后旧条目必须失效");
-
-      // 重新写入后按新代次命中，且与第一次的内容互不干扰
-      byte[] second = payload(640);
-      store.put(WORLD, 8, 9, 5, second);
-      assertArrayEquals(second, store.get(WORLD, 8, 9, 5), "新代次条目必须可命中");
-
-      // 其它区块不受影响
-      store.put(WORLD, 8, 10, 5, first);
-      assertArrayEquals(first, store.get(WORLD, 8, 10, 5));
+  void entriesSurviveAcrossStoreInstances(@TempDir Path dir) {
+    byte[] first = payload(512);
+    byte[] second = payload(640);
+    try (DiskCacheStore writer = store(dir, config(1024, 600, 600))) {
+      writer.put(WORLD, 8, 9, 5, first);
+      writer.put(WORLD, 8, 10, 5, second);
+      writer.flush();
+      writer.invalidateWorld(WORLD);
+      assertEquals(0, writer.openRegionFiles());
+    }
+    try (DiskCacheStore reader = store(dir, config(1024, 600, 600))) {
+      assertArrayEquals(first, reader.get(WORLD, 8, 9, 5), "新实例必须能读回上一实例的条目");
+      assertArrayEquals(second, reader.get(WORLD, 8, 10, 5));
+      assertEquals(2L, reader.stats().hits.sum());
+      assertEquals(0L, reader.stats().misses.sum(), "旧条目不允许多余的一次未命中");
+      assertNull(reader.get(WORLD, 8, 9, 6), "配置指纹不同仍然必须未命中");
     }
   }
 
@@ -247,7 +252,7 @@ class DiskCacheStoreTest {
   @Test
   void disabledConfigIsInert(@TempDir Path dir) {
     AntiXrayConfig.DiskCache disabled = new AntiXrayConfig.DiskCache(false, 1024, 16, 600, 2, 600,
-        3600, 4, 256, 4096, false, AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, 10);
+        3600, 4, 256, false, AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, 10);
     try (DiskCacheStore store = store(dir, disabled)) {
       assertFalse(store.usable());
       store.put(WORLD, 0, 0, 1, payload(64));

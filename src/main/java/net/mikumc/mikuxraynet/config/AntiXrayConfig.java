@@ -349,14 +349,13 @@ public final class AntiXrayConfig {
    * @param maintenanceIntervalSeconds 后台维护周期（落盘 + 压缩回收 + 关闭闲置句柄）
    * @param compactPerPass             每轮维护最多压缩回收的区域文件数
    * @param queueCapacity              磁盘线程待处理任务上限（超出即丢弃，保网络路径）
-   * @param generationTrackerSize      区块代次跟踪表的条目上限（有界 LRU）
    * @param zstdAutoDownload           zstd 前置缺失时是否自动下载（默认 true）
    * @param zstdDownloadUrl            zstd 下载源根地址（默认 Maven Central；可换阿里云镜像）
    * @param zstdTimeoutSeconds         zstd 下载的总等待上限（秒；超时即失败并回退，默认 10）
    */
   public record DiskCache(boolean enabled, int maxEntries, int maxFileSizeMb, int expireSeconds,
       int bucketCacheSize, int idleCloseSeconds, int maintenanceIntervalSeconds, int compactPerPass,
-      int queueCapacity, int generationTrackerSize, boolean zstdAutoDownload, String zstdDownloadUrl,
+      int queueCapacity, boolean zstdAutoDownload, String zstdDownloadUrl,
       int zstdTimeoutSeconds) {
   }
 
@@ -418,6 +417,21 @@ public final class AntiXrayConfig {
   public record EffectiveObfuscation(List<String> hideBlocks, Map<String, Integer> replacementWeights,
       List<ReplacementBand> replacementBands, int minY, int maxY, ObfuscationMode mode,
       boolean useBlockBelow) {
+
+    /**
+     * 参与<b>配置指纹</b>的稳定表示（绝不能用本记录自身的 {@code hashCode}）。
+     *
+     * <p><b>为什么必须单独给一份</b>：记录默认的 {@code hashCode} 会把 {@code mode}（枚举）按 identity hash
+     * 计入，而 identity hash 每个 JVM 进程随机 → 同一份 antixray.yml 在两次启动上算出<b>不同</b>的
+     * configHash，磁盘缓存条目会被逐条判为「配置已变」而丢弃，重启后命中率恒为 0
+     * （真机实测：同一配置两次启动 configHash 分别为 335527235 与 -1449763053）。
+     * 这里改用 {@code mode.name()}（{@link String#hashCode} 有规范定义，跨进程/跨版本稳定），
+     * 其余分量（{@code List} / {@code Map} / {@code int} / {@code boolean}）的哈希也都有规范定义。
+     */
+    public List<Object> fingerprint() {
+      return List.of(hideBlocks, replacementWeights, replacementBands, minY, maxY, mode.name(),
+          useBlockBelow);
+    }
   }
 
   private final boolean enabled;
@@ -512,21 +526,24 @@ public final class AntiXrayConfig {
     // 影响改写结果的全部配置项都参与哈希（含遮挡/流体覆盖表与各维度生效值）；顺序敏感，故用有序列表。
     // 伪装模式必须参与：否则「enclosed 写出的缓存」会在切换到 all 后被复用，导致裸露矿泄漏。
     // use-block-below / 高度范围 / 分区表 / 维度启用 都影响改写结果，一并纳入指纹。
+    // ⚠ 所有分量都必须是「哈希有规范定义」的稳定表示（字符串/数字/列表/映射/枚举名），
+    //   绝不能让枚举的 identity hash 混进来——那会让指纹随进程变化，磁盘缓存重启后永不命中
+    //   （见 EffectiveObfuscation#fingerprint 的说明）。
     List<Object> dimensionFingerprints = new ArrayList<>(Dimension.values().length);
     for (Dimension dimension : Dimension.values()) {
       dimensionFingerprints.add(List.of(dimension.key(), this.dimensionEnabled[dimension.ordinal()],
-          this.dimensionEffectives[dimension.ordinal()]));
+          this.dimensionEffectives[dimension.ordinal()].fingerprint()));
     }
     List<Object> overrideFingerprints = new ArrayList<>(this.worldOverrides.size());
     for (int i = 0; i < this.worldOverrides.size(); i++) {
       List<Object> perDimension = new ArrayList<>(Dimension.values().length);
       for (Dimension dimension : Dimension.values()) {
-        perDimension.add(this.overrideEffectives[i][dimension.ordinal()]);
+        perDimension.add(this.overrideEffectives[i][dimension.ordinal()].fingerprint());
       }
       overrideFingerprints.add(List.of(this.worldOverrides.get(i).pattern(), perDimension));
     }
     this.configHash = Objects.hash(dimensionFingerprints, overrideFingerprints, layerObfuscation,
-        neighbors.enabled(), neighbors.missingPolicy(),
+        neighbors.enabled(), neighbors.missingPolicy().name(),
         OcclusionRules.sortedList(this.occlusion.extraOccluding()),
         OcclusionRules.sortedList(this.occlusion.extraNonOccluding()), this.occlusion.fluidCover(),
         // 黑名单决定「哪些世界完全不改写」，参与指纹：切换黑名单后旧缓存（该世界已改写结果）不再复用。
@@ -679,7 +696,6 @@ public final class AntiXrayConfig {
             Math.max(1, root.getInt("disk-cache.maintenance-interval-seconds", 30)),
             Math.max(1, root.getInt("disk-cache.compact-per-pass", 4)),
             Math.max(1, root.getInt("disk-cache.queue-capacity", 256)),
-            Math.max(1, root.getInt("disk-cache.generation-tracker-size", 32768)),
             // zstd 前置：服务端自带则直接用；没有则按这三键决定是否自动下载（见 ZstdSupport）
             root.getBoolean("disk-cache.zstd.auto-download", true),
             zstdDownloadUrl(root),

@@ -10,7 +10,6 @@ import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.wrappers.BlockPosition;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
-import net.mikumc.mikuxraynet.cache.DiskCacheStore;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.World;
@@ -18,16 +17,12 @@ import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 
 /**
- * 出站方块变更监听：服务端自己下发了某个「曾被伪装的坐标」的变更时，把该坐标从伪装区块索引中注销；
- * 同时把「该区块内容已变」这件事告知磁盘缓存（递增区块代次，使旧代次缓存条目自然失效）。
+ * 出站方块变更监听：服务端自己下发了某个「曾被伪装的坐标」的变更时，把该坐标从伪装区块索引中注销，
+ * 并（可选）触发事件驱动即时显形。
  *
  * <p><b>为什么需要注销</b>：玩家挖掉一个伪装方块时，服务端会下发真实的变更包；若该坐标仍留在
  * 伪装清单里，邻近显形稍后还会用陈旧数据重复发包（多花带宽，观感也可能闪一下）。所以命中即注销。
  * 这里只摘除<b>变更的那一个坐标</b>（与既有行为一致），该区块其它坐标照常显形。
- *
- * <p><b>为什么需要代次</b>：已改写完成的区块负载会按 {@code (世界名, 区块坐标, 配置指纹, 区块代次)}
- * 落到磁盘（见 {@code cache.DiskCacheStore}）。区块内容一旦变化，旧代次的条目就不该再被复用；
- * 用「已拦截的方块变更」驱动代次递增，既零额外拦截成本，又能让旧条目被惰性清理。
  *
  * <p><b>为什么走异步通道（而不是同步监听）</b>：
  * <ol>
@@ -40,16 +35,15 @@ import org.bukkit.plugin.Plugin;
  * </ol>
  * 本类<b>不</b>登记处理延迟、不取消、不改包，纯观察，因此不会与合并时间窗互相打架。
  *
- * <p><b>线程与内存纪律</b>：回调里只做「读包内坐标 + 查内存索引 + 递增内存代次」，不读 World 的方块；
+ * <p><b>线程与内存纪律</b>：回调里只做「读包内坐标 + 查内存索引」，不读 World 的方块；
  * 注销按「世界名 + 坐标」精确定位，因此不需要扫描全部玩家或全部区块。不检查取消状态：即使原包被
  * 别的插件取消，最坏结果也只是少发一个冗余显形包，不会丢失更新。
  *
  * <p><b>自己发的显形包也会被看到（1.1.6 起）</b>：显形发包改用 Paper 原生
  * {@code Player#sendMultiBlockChange} / {@code Player#sendBlockChange}，这些包同样进入本监听器
- * （实测「变更注销」增量与「显形发送」增量逐次相等即为此证据）。因此观察方必须先问一次
- * {@link ProximityRevealer#consumeSelfSentEcho}：命中说明这是本插件自己的回显——回显不改变服务端
- * 内容，<b>只摘索引、不推进磁盘缓存代次</b>（否则每次显形都会作废该区块的缓存条目）；
- * 服务端真实方块变更的语义完全不变（照常推进代次）。
+ * （实测「变更注销」增量与「显形发送」增量逐次相等即为此证据）。两条路径对「注销索引」的处理完全
+ * 相同（回显不改变服务端内容，但该坐标确实已被我们发回真实方块，摘掉索引是正确的）；
+ * 磁盘缓存的有效性则完全由负载里的原始区块字节指纹判定，与本文观察无关。
  *
  * <p><b>事件驱动即时显形（P1-4，可选）</b>：构造时传入 {@link ProximityRevealer} 后，每次观测到
  * 变更还会调用 {@link ProximityRevealer#onBlockChangeObserved}——变更邻域内仍有伪装坐标时，
@@ -63,7 +57,6 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private final ObfuscatedChunkIndex obfuscatedChunkIndex;
   private final RevealedSet revealedSet;
   private final ProximityStats stats;
-  private final DiskCacheStore diskCache;
   /**
    * 反矿透配置：用于世界黑名单判定。本监听器随热重载重建（见 {@code AntiXrayRuntime#restartProximity}），
    * 因此持有的引用始终是「当前」配置，黑名单改动即时生效。{@code null} 表示不做黑名单判定。
@@ -71,7 +64,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private final AntiXrayConfig config;
   /**
    * 事件驱动即时显形（P1-4，可选）：观测到方块变更时交给邻近显形做「当 tick 补发邻域」。
-   * {@code null} 表示不启用（只做注销与代次递增，行为与旧版完全一致）。
+   * {@code null} 表示不启用（只做索引注销，行为与旧版一致）。
    */
   private final ProximityRevealer instantRevealer;
   private final AtomicInteger errorCounter = new AtomicInteger();
@@ -79,15 +72,13 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private AsyncListenerHandler handler;
 
   /**
-   * @param obfuscatedChunkIndex 伪装区块索引；{@code null} 表示不做邻近显形（只做代次递增）
+   * @param obfuscatedChunkIndex 伪装区块索引；{@code null} 表示不做邻近显形（只做索引注销）
    * @param revealedSet          已显形集合；{@code null} 表示不做邻近显形
    * @param stats                显形统计；{@code null} 表示不统计
-   * @param diskCache            磁盘缓存；{@code null} 表示不做代次递增
    */
   public BlockChangeRevealListener(Plugin plugin, ProtocolManager protocolManager,
-      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
-      DiskCacheStore diskCache) {
-    this(plugin, protocolManager, null, obfuscatedChunkIndex, revealedSet, stats, diskCache, null);
+      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats) {
+    this(plugin, protocolManager, null, obfuscatedChunkIndex, revealedSet, stats, null);
   }
 
   /**
@@ -98,7 +89,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    */
   public BlockChangeRevealListener(Plugin plugin, ProtocolManager protocolManager,
       AntiXrayConfig config, ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet,
-      ProximityStats stats, DiskCacheStore diskCache, ProximityRevealer instantRevealer) {
+      ProximityStats stats, ProximityRevealer instantRevealer) {
     super(plugin, ListenerPriority.HIGHEST, PacketType.Play.Server.BLOCK_CHANGE,
         PacketType.Play.Server.MULTI_BLOCK_CHANGE);
     this.plugin = plugin;
@@ -107,7 +98,6 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     this.obfuscatedChunkIndex = obfuscatedChunkIndex;
     this.revealedSet = revealedSet;
     this.stats = stats;
-    this.diskCache = diskCache;
     this.instantRevealer = instantRevealer;
   }
 
@@ -115,7 +105,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   public void start() {
     handler = protocolManager.getAsynchronousManager().registerAsyncHandler(this);
     handler.start();
-    plugin.getLogger().info("方块变更观察已启用：命中已伪装坐标即从显形索引移除，并驱动磁盘缓存区块代次");
+    plugin.getLogger().info("方块变更观察已启用：命中已伪装坐标即从显形索引移除");
   }
 
   /** 注销监听器；可重复调用，异常安全。 */
@@ -189,20 +179,15 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * 内部完成，未启用时只有一个空引用判断的开销。
    */
   private void observeChange(Player player, String worldName, int x, int y, int z) {
-    // 黑名单世界不做任何反矿透工作：不注销显形、不驱动磁盘缓存代次、不触发事件即时显形。
+    // 黑名单世界不做任何反矿透工作：不注销显形、不触发事件即时显形。
     if (isBlacklisted(config, worldName)) {
       return;
     }
     // 1.1.6 起显形包走 Paper 原生通道（sendMultiBlockChange / sendBlockChange），因此本监听器
-    // 也会看到「我们自己发出的显形回显」。回显不改变服务端内容：只摘索引，绝不推进区块代次
-    // （否则每次显形都会作废该区块的磁盘缓存条目，玩家身边等于没有磁盘缓存）。
-    // 消费是一次性的：同坐标随后的服务端真实变更仍照常推进代次。
-    boolean selfSentEcho = instantRevealer != null
-        && instantRevealer.consumeSelfSentEcho(player.getUniqueId(), worldName, x, y, z);
+    // 也会看到「我们自己发出的显形回显」。回显不改变服务端内容，因此只摘索引（与真实变更相同），
+    // 不再有任何「磁盘缓存失效」动作——磁盘条目的有效性由负载里的原始区块字节指纹判定
+    // （见 DiskCacheStore 类注释），回显不改变区块字节，天然不需要作废任何缓存条目。
     unregisterCoordinate(worldName, x, y, z);
-    if (!selfSentEcho) {
-      markChanged(worldName, x, z);
-    }
     if (instantRevealer != null) {
       instantRevealer.onBlockChangeObserved(player, worldName, x, y, z);
     }
@@ -234,13 +219,6 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
     if (stats != null) {
       stats.unregistered.increment();
-    }
-  }
-
-  /** 通知磁盘缓存该区块内容已变（只递增内存代次，不做任何磁盘操作）。 */
-  private void markChanged(String worldName, int x, int z) {
-    if (diskCache != null && worldName != null) {
-      diskCache.markBlockChange(worldName, x >> 4, z >> 4);
     }
   }
 

@@ -112,7 +112,11 @@ public final class BufferedLinearV3Format {
   public static final int MAX_RAW_SIZE = 512 * 1024 * 1024;
 
   /**
-   * 单条缓存条目：区块代次 + 写入时间 + 配置指纹 + 负载。
+   * 单条缓存条目：区块代次（<b>已废弃，恒为 0，仅为格式兼容保留</b>）+ 写入时间 + 配置指纹 + 负载。
+   *
+   * <p>代次字段曾是「该区块内容已变」的判据，但它只在进程内有效（重启归零），反而让上一进程写下的
+   * 条目在重启后被逐条误判失效；内容新鲜度现由负载里的原始字节指纹判定（见 {@code DiskCacheStore}）。
+   * 字段继续保留是为了让文件布局与历史版本一致（读写都走同一偏移），不再承载任何语义。
    */
   public record Entry(long generation, long writtenAtMillis, int configHash, byte[] payload) {
   }

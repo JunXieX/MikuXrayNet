@@ -208,8 +208,8 @@ public final class AntiXrayRuntime {
    * 邻近显形装配：索引为 null（配置关闭）或拿不到 ProtocolLib 协议管理器时只跳过该子模块，
    * 反矿透主体照常工作。
    *
-   * <p>方块变更观察监听器在「显形索引或磁盘缓存任一启用」时都会注册：它既负责注销已显形的坐标，
-   * 也负责把「区块已变更」告诉磁盘缓存（递增区块代次）。
+   * <p>方块变更观察监听器在「显形索引或磁盘缓存任一启用」时都会注册：它负责注销已显形的坐标
+   * （服务端自己下发了该坐标的变更 → 索引里那条记录不再可信）。
    */
   private void startProximity(AntiXrayConfig antiXray, ObfuscatedChunkIndex chunkIndex,
       RevealedSet revealed, ProximityStats stats) {
@@ -233,7 +233,7 @@ public final class AntiXrayRuntime {
             bypassRegistry, workPool)
         : null;
     this.blockChangeRevealListener = new BlockChangeRevealListener(plugin, protocolManager,
-        antiXray, chunkIndex, revealed, stats, diskCacheStore, revealer);
+        antiXray, chunkIndex, revealed, stats, revealer);
     try {
       blockChangeRevealListener.start();
       if (revealer != null) {

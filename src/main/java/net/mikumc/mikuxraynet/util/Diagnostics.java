@@ -126,14 +126,15 @@ public final class Diagnostics {
     }
 
     /**
-     * 磁盘缓存域：命中、持有量、打开的区域文件数与「为什么没命中」的拆解计数。
+     * 磁盘缓存域：命中、持有量、打开的区域文件数与「为什么没命中 / 命中了却没用上」的拆解计数。
      *
-     * <p>{@code expiredRemoved} / {@code generationBumps} / {@code rejectedBy*} 是排查「命中率恒为 0」
-     * 的关键：过期清理说明条目活不过配置的 expire-seconds（配短了等于关掉缓存），
-     * 写入被拒说明容量/文件大小上限在拦，代次递增说明该区块被观测到方块变更。
+     * <p>{@code expiredRemoved} / {@code payloadRejected} / {@code rejectedBy*} 是排查「命中率异常」的关键：
+     * 过期清理说明条目活不过配置的 expire-seconds（配短了等于关掉缓存），
+     * 写入被拒说明容量/文件大小上限在拦，{@code payloadRejected} 说明读到的负载与本次要改写的字节不符
+     * （内容真变了，或信封损坏）。
      */
     public record DiskCache(long hits, long misses, int entries, int openFiles,
-        long expiredRemoved, long generationBumps, long rejectedByCapacity, long rejectedBySize,
+        long expiredRemoved, long payloadRejected, long rejectedByCapacity, long rejectedBySize,
         long errors) {
 
       /** 磁盘缓存未启用时的零值兜底。 */
@@ -243,7 +244,9 @@ public final class Diagnostics {
     Snapshot.DiskCache diskCacheSnapshot = diskCache == null ? Snapshot.DiskCache.EMPTY
         : new Snapshot.DiskCache(diskCache.stats().hits.sum(), diskCache.stats().misses.sum(),
             diskCache.entries(), diskCache.openRegionFiles(),
-            diskCache.stats().expiredRemoved.sum(), diskCache.stats().generationBumps.sum(),
+            diskCache.stats().expiredRemoved.sum(),
+            // 「读到但被拒」由改写侧统计（负载解封与字节指纹比对在那里做）：此处借用同一次快照的数值
+            rewriteStats == null ? 0L : rewriteStats.diskPayloadRejected.sum(),
             diskCache.stats().rejectedByCapacity.sum(), diskCache.stats().rejectedBySize.sum(),
             diskCache.stats().errors.sum());
 
@@ -302,15 +305,16 @@ public final class Diagnostics {
         + s.index().revealedRegisteredTotal()
         + "｜安全阀触发 " + s.index().indexEvictedByCapacity() + "/" + s.index().revealedDroppedByCapacity()
         + "（正常运营下应为 0，触发即说明有 bug）");
-    // 「过期清理 / 代次递增 / 写入被拒 / 异常」是「命中率为什么是 0」的自证口径：
+    // 「过期清理 / 负载被拒 / 写入被拒 / 异常」是「命中率为什么异常」的自证口径：
     // 过期清理 > 0 说明文件的 expire-seconds 比两次启动的间隔还短（条目全死），
+    // 负载被拒 > 0 说明读到的负载与本次要改写的字节不符（内容真变了或信封损坏），
     // 写入被拒 > 0 说明容量/单文件上限在拦（新区块没进缓存），异常 > 0 见日志。
     lines.add("磁盘缓存：" + (s.diskCache().openFiles() > 0 || s.diskCache().entries() > 0 ? "已启用" : "无数据")
         + "｜命中 " + s.diskCache().hits() + "，未命中 " + s.diskCache().misses()
         + "，命中率 " + hitRate(s.diskCache().hits(), s.diskCache().misses())
         + "，条目约 " + s.diskCache().entries() + "，打开区域文件 " + s.diskCache().openFiles()
         + "｜过期清理 " + s.diskCache().expiredRemoved()
-        + "，代次递增 " + s.diskCache().generationBumps()
+        + "，负载被拒 " + s.diskCache().payloadRejected()
         + "，写入被拒 " + (s.diskCache().rejectedByCapacity() + s.diskCache().rejectedBySize())
         + "，异常 " + s.diskCache().errors());
     lines.add("带宽：零位移取消 " + s.throttle().entityPacketsCancelled() + "，合并批次 "
@@ -514,8 +518,7 @@ public final class Diagnostics {
         .append("，idle-close-seconds=").append(c.diskCache().idleCloseSeconds())
         .append("，maintenance-interval-seconds=").append(c.diskCache().maintenanceIntervalSeconds())
         .append("，compact-per-pass=").append(c.diskCache().compactPerPass())
-        .append("，queue-capacity=").append(c.diskCache().queueCapacity())
-        .append("，generation-tracker-size=").append(c.diskCache().generationTrackerSize()).append('\n');
+        .append("，queue-capacity=").append(c.diskCache().queueCapacity()).append('\n');
     sb.append("cache.maximum-size=").append(c.cacheMaximumSize())
         .append("，expire-after-access-seconds=").append(c.cacheExpireAfterAccessSeconds()).append('\n');
     sb.append("advanced.threads=").append(c.threads())

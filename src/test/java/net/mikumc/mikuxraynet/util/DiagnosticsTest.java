@@ -148,9 +148,9 @@ class DiagnosticsTest {
         "状态面板必须单列周期复检口径，否则「先可见后被遮挡」是否被收敛到隐藏无法观测：" + text);
     assertTrue(text.contains("磁盘缓存"), text);
     assertTrue(text.contains("命中率 75.0%"), text);
-    // 「命中率为什么是 0」的自证口径：过期清理 / 代次递增 / 写入被拒 / 异常必须可见
-    assertTrue(text.contains("过期清理 4，代次递增 5，写入被拒 7，异常 0"),
-        "磁盘缓存必须分列过期清理、代次递增、写入被拒与异常，否则「命中率恒为 0」无法自证：" + text);
+    // 「命中率为什么异常」的自证口径：过期清理 / 负载被拒 / 写入被拒 / 异常必须可见
+    assertTrue(text.contains("过期清理 4，负载被拒 5，写入被拒 7，异常 0"),
+        "磁盘缓存必须分列过期清理、负载被拒、写入被拒与异常，否则「命中率异常」无法自证：" + text);
     assertTrue(text.contains("==== MikuXrayNet 运行状态（v1.2.5） ===="),
         "状态面板首行必须回显插件版本（区分不同构建的日志靠它）：" + text);
     assertTrue(text.contains("带宽"), text);

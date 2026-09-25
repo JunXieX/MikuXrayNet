@@ -120,6 +120,37 @@ class ConfigDefaultsTest {
   }
 
   /**
+   * 配置指纹必须是<b>跨进程稳定</b>的固定值（真机回归：磁盘缓存重启后命中率恒为 0 的根因）。
+   *
+   * <p>指纹曾被「枚举的 identity hash」污染（{@code EffectiveObfuscation.mode} / {@code missingPolicy}），
+   * 而 identity hash 每个 JVM 进程随机 → 同一份配置两次启动算出不同指纹 → 上一进程写下的磁盘条目全部
+   * 判为「配置已变」而被丢弃。真机实测：同一配置两次启动分别为 335527235 与 -1449763053。
+   *
+   * <p>因此这里把指纹<b>钉成常量</b>：它在任何 JVM 上都应相同（本测试在两次独立进程的测试运行中都要通过）。
+   * 若将来故意调整了指纹的组成（例如新增一个影响改写结果的配置项），改动者是<b>有意</b>的，
+   * 请一并更新下面的期望值并在提交信息里说明「旧磁盘缓存会一次性失效重建」。
+   */
+  @Test
+  void configFingerprintIsStableAcrossProcesses() {
+    AntiXrayConfig config = AntiXrayConfig.from(yaml("""
+        dimensions:
+          normal:
+            hide-blocks: [diamond_ore, emerald_ore]
+            mode: all
+        """));
+
+    assertEquals(144724291, config.configHash(),
+        "配置指纹必须是跨进程稳定的固定值（不得混入枚举 identity hash / 随机值）");
+    // 同一份内容重复解析必须得到同一个值（同一进程内的自洽性）
+    assertEquals(config.configHash(), AntiXrayConfig.from(yaml("""
+        dimensions:
+          normal:
+            hide-blocks: [diamond_ore, emerald_ore]
+            mode: all
+        """)).configHash(), "同一份配置重复解析必须得到同一个指纹");
+  }
+
+  /**
    * 默认隐藏清单按维度独立：主世界 22 种、地狱 4 种（<b>不含 nether_quartz_ore</b>）、末地 1 种。
    *
    * <p>回归用户核心诉求：地狱分布极广、价值极低的石英矿默认不隐藏（否则玩家在地狱到处挖到假石头）。
@@ -439,7 +470,6 @@ class ConfigDefaultsTest {
     assertEquals(30, config.diskCache().maintenanceIntervalSeconds(), "后台维护周期默认 30 秒");
     assertEquals(4, config.diskCache().compactPerPass(), "每轮最多压缩 4 个区域文件");
     assertEquals(256, config.diskCache().queueCapacity(), "磁盘线程待处理任务上限默认 256");
-    assertEquals(32768, config.diskCache().generationTrackerSize(), "代次跟踪表默认 32768 条");
     // zstd 前置三键（自动识别 / 自动下载）
     assertTrue(config.diskCache().zstdAutoDownload(), "zstd 自动下载默认开启");
     assertEquals(AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, config.diskCache().zstdDownloadUrl(),
