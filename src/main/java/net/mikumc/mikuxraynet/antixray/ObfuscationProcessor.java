@@ -4,7 +4,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.IntPredicate;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.codec.Chunk;
@@ -14,7 +16,8 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
 
 /**
- * 反矿透核心：对单个区块做「6 面正交遮挡判定 + 按权重随机替换」，并可顺带做调色板压缩重排。
+ * 反矿透核心：对单个区块做「6 面正交遮挡判定 + 按权重随机替换」，并可顺带做调色板压缩重排、
+ * 位宽预算封顶与失效条目裁剪。
  *
  * <p><b>判定语义</b>：由 {@code antixray.yml: obfuscation.mode} 选择——
  * <ul>
@@ -29,12 +32,28 @@ import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
  * 邻块数据缺失时按 {@code antixray.yml: neighbors.missing-policy} 处理，默认 {@code hide}
  * （宁可多伪装，也不留下沿 16×16 网格线的泄漏）。
  *
+ * <p><b>逐世界配置（P0-2）</b>：{@code world-overrides} 里每个世界段可覆盖 hide-blocks /
+ * replacement-weights / replacement-bands / min-y / max-y / mode，未覆盖的键回落全局默认。
+ * 各覆盖段在启动期解析为 {@link WorldProfile}（含方块状态 id 解析与权重表预构建），运行期按
+ * 世界名匹配一次（精确名 &gt; 通配，结果缓存），热路径 O(1) 取用。
+ *
+ * <p><b>按 Y 分区伪装（P0-3）</b>：{@code replacement-bands} 按「第一个覆盖该高度的分段」选择
+ * 候选表，无覆盖时回落 {@code replacement-weights}；每段的累计权重表启动期预构建为 int 数组，
+ * 热路径零装箱、零 HashMap。
+ *
+ * <p><b>位宽预算封顶（P0-1）</b>：改写每个 section 前把「所有候选表合计将引入的新状态数」与当前
+ * 位宽容量（{@code 1 << bitsPerBlock} − 已有条目数）对账，超预算时各候选表只保留已在调色板内的
+ * 伪装方块（避免升位）；改写后裁剪引用计数为 0 的失效条目（被替换掉的矿）并在可能时降位宽，
+ * 位宽<b>单调不增</b>。仅当调色板内候选完全耗尽才允许 grow（逃生口）——
+ * <b>红线：宁可包体大，不可漏伪装</b>；任何裁剪失败只放弃体积优化，不回滚已完成的替换。
+ *
  * <p><b>关键优化</b>：
  * <ul>
  *   <li>全空气 section 直接跳过；</li>
  *   <li>非目标方块只做一次位图查询即跳过，不做任何邻居判定；</li>
  *   <li>整块区块无任何改动时直接返回原字节数组，完全不触发重编码；</li>
- *   <li>只有真正被改动的 section 才重编码（未改动的 section 由 codec 原样搬运原始字节）。</li>
+ *   <li>只有真正被改动的 section 才重编码（未改动的 section 由 codec 原样搬运原始字节）；</li>
+ *   <li>无逐世界覆盖时按世界名取档案不走任何 Map；预算充足时候选表直接共享预构建数组（零分配）。</li>
  * </ul>
  *
  * <p>本类不做任何 Bukkit 访问，可在工作线程安全运行。
@@ -44,11 +63,16 @@ public final class ObfuscationProcessor {
   private static final int SECTION_VOLUME = 4096;
   private static final int[] NO_POSITIONS = new int[0];
 
-  /** 调色板压缩重排开关。 */
-  public record PaletteOptions(boolean reorder, boolean strictVerify) {
+  /** 调色板选项：压缩重排 + 自检 + 位宽预算封顶。 */
+  public record PaletteOptions(boolean reorder, boolean strictVerify, boolean widthBudget) {
 
-    /** 关闭重排（保持既有行为）。 */
-    public static final PaletteOptions DISABLED = new PaletteOptions(false, false);
+    /** 全关（保持 P0-1 之前的行为：不重排、不封顶、不裁剪）。 */
+    public static final PaletteOptions DISABLED = new PaletteOptions(false, false, false);
+
+    /** 旧两参构造（兼容既有调用）：不启用位宽预算封顶。 */
+    public PaletteOptions(boolean reorder, boolean strictVerify) {
+      this(reorder, strictVerify, false);
+    }
   }
 
   /**
@@ -58,8 +82,10 @@ public final class ObfuscationProcessor {
    * @param obfuscatedPositions 被伪装的方块位置，编码为 {@code y << 8 | z << 4 | x}（区块内相对坐标）
    * @param failure             {@code null} 表示正常；非 null 为「解码/重编码异常」的摘要
    *                            （此时已 fail-open 放行原包，调用方应计数并告警，勿与「无目标方块」混淆）
+   * @param sectionBits         各 section 改写后的每方块位宽（未改写的 section 为 -1；无任何改写为 null）。
+   *                            供「位宽直方图」诊断观察封顶/降位效果
    */
-  public record Result(byte[] data, int[] obfuscatedPositions, String failure) {
+  public record Result(byte[] data, int[] obfuscatedPositions, String failure, int[] sectionBits) {
 
     /** 是否真的改动了字节。 */
     public boolean changed() {
@@ -72,25 +98,170 @@ public final class ObfuscationProcessor {
     }
   }
 
-  private final ChunkCodec codec;
-  private final IntPredicate occlusionTable;
-  private final BitSet targets;
-  private final int[] replacementIds;
-  private final int[] cumulativeWeights;
-  private final boolean layerObfuscation;
-  private final boolean missingPolicyHide;
-  private final PaletteOptions paletteOptions;
-  private final boolean obfuscateAll;
+  /**
+   * 单个世界的改写档案（P0-2/P0-3）：目标位图、伪装候选表（回落表 + 各 band）与生效范围。
+   *
+   * <p>全部字段在启动期解析预构建（方块名 → 状态 id、权重表 → 累计权重 int 数组），
+   * 热路径只做数组读取，零装箱、零 HashMap。包级可见供同包测试构造固定档案。
+   */
+  static final class WorldProfile {
+
+    final BitSet targets;
+    /** 回落候选表（{@code replacement-weights}）：无 band 覆盖该高度时使用。 */
+    final int[] replacementIds;
+    final int[] replacementCum;
+    /** band 候选表（{@code replacement-bands}，bands 优先于回落表；空表段已在构建期丢弃）。 */
+    final int[] bandMinY;
+    final int[] bandMaxY;
+    final int[][] bandIds;
+    final int[][] bandCum;
+    /** 生效高度范围（含端点）；{@code Integer.MIN_VALUE}/{@code Integer.MAX_VALUE} = 不限制。 */
+    final int minY;
+    final int maxY;
+    final boolean obfuscateAll;
+
+    WorldProfile(BitSet targets, int[] replacementIds, int[] replacementCum,
+        int[] bandMinY, int[] bandMaxY, int[][] bandIds, int[][] bandCum,
+        int minY, int maxY, boolean obfuscateAll) {
+      this.targets = targets;
+      this.replacementIds = replacementIds.clone();
+      this.replacementCum = replacementCum.clone();
+      this.bandMinY = bandMinY.clone();
+      this.bandMaxY = bandMaxY.clone();
+      this.bandIds = bandIds.clone();
+      this.bandCum = bandCum.clone();
+      this.minY = minY;
+      this.maxY = maxY;
+      this.obfuscateAll = obfuscateAll;
+    }
+
+    /** 是否具备生效条件（有目标方块，且回落表或任一 band 表有候选）。 */
+    boolean active() {
+      return !targets.isEmpty() && (replacementIds.length > 0 || bandIds.length > 0);
+    }
+
+    /**
+     * 用生效视图 + 注册表解析出本世界的档案（启动期调用；未识别的名称记录并跳过）。
+     *
+     * @param label 日志前缀（如「反矿透」或「反矿透（世界覆盖 world_nether）」）
+     */
+    static WorldProfile resolve(BlockStateRegistry registry, AntiXrayConfig.EffectiveObfuscation effective,
+        Logger logger, String label) {
+      BitSet targets = new BitSet(registry.getUniqueBlockStateCount());
+      List<String> resolvedTargets = new ArrayList<>();
+      for (String name : effective.hideBlocks()) {
+        int stateId = BlockStateRegistry.resolveStateId(name);
+        if (stateId < 0) {
+          logger.warning(label + "配置中的隐藏方块名称无法识别，已跳过：" + name);
+        } else {
+          targets.set(stateId);
+          resolvedTargets.add(name);
+        }
+      }
+      // 启动自检：把「实际匹配到的目标方块清单」打出来，便于一眼看出是否漏了深层矿变体
+      logger.info(label + "目标方块解析完成：" + resolvedTargets.size() + '/' + effective.hideBlocks().size()
+          + " 种 → " + resolvedTargets);
+
+      int[][] fallback = weightedTable(effective.replacementWeights(), logger, label);
+      if (fallback[0].length == 0 && !effective.replacementBands().isEmpty()) {
+        logger.warning(label + "的 replacement-weights 未解析到任何有效伪装方块（仅有分区段可用，"
+            + "未被分区覆盖的高度将不伪装，请检查伪装方块名称）");
+      }
+
+      // band 表构建：无有效候选的段直接丢弃，使该高度回落下一覆盖段或回落表（运行期无需空表分支）
+      List<AntiXrayConfig.ReplacementBand> validBands = new ArrayList<>();
+      List<int[][]> validTables = new ArrayList<>();
+      for (AntiXrayConfig.ReplacementBand band : effective.replacementBands()) {
+        int[][] table = weightedTable(band.weights(), logger,
+            label + "的伪装分区段 [y " + band.minY() + ".." + band.maxY() + "]");
+        if (table[0].length == 0) {
+          continue;
+        }
+        validBands.add(band);
+        validTables.add(table);
+      }
+      int bandCount = validBands.size();
+      int[] bandMinY = new int[bandCount];
+      int[] bandMaxY = new int[bandCount];
+      int[][] bandIds = new int[bandCount][];
+      int[][] bandCum = new int[bandCount][];
+      for (int i = 0; i < bandCount; i++) {
+        AntiXrayConfig.ReplacementBand band = validBands.get(i);
+        bandMinY[i] = band.minY();
+        bandMaxY[i] = band.maxY();
+        bandIds[i] = validTables.get(i)[0];
+        bandCum[i] = validTables.get(i)[1];
+      }
+
+      if (effective.minY() > effective.maxY()) {
+        logger.warning(label + "的 min-y(" + effective.minY() + ") 大于 max-y(" + effective.maxY()
+            + ")，该世界范围内不会伪装任何方块（请修正配置）");
+      }
+
+      boolean obfuscateAll = effective.mode() == AntiXrayConfig.ObfuscationMode.ALL;
+      return new WorldProfile(targets, fallback[0], fallback[1], bandMinY, bandMaxY,
+          bandIds, bandCum, effective.minY(), effective.maxY(), obfuscateAll);
+    }
+
+    /**
+     * 把「方块名 → 权重」解析为「状态 id → 累计权重」表（保持声明顺序，累计权重严格递增）。
+     *
+     * @return {@code {ids, cum}}；两个数组等长（可能为空）
+     */
+    private static int[][] weightedTable(Map<String, Integer> weights, Logger logger, String label) {
+      int[] ids = new int[weights.size()];
+      int[] cum = new int[ids.length];
+      int index = 0;
+      int cumulative = 0;
+      for (Map.Entry<String, Integer> entry : weights.entrySet()) {
+        int stateId = BlockStateRegistry.resolveStateId(entry.getKey());
+        if (stateId < 0) {
+          logger.warning(label + "配置中的伪装方块名称无法识别，已跳过：" + entry.getKey());
+          continue;
+        }
+        cumulative += entry.getValue();
+        ids[index] = stateId;
+        cum[index] = cumulative;
+        index++;
+      }
+      if (index != ids.length) {
+        ids = Arrays.copyOf(ids, index);
+        cum = Arrays.copyOf(cum, index);
+      }
+      return new int[][] {ids, cum};
+    }
+  }
 
   /**
    * 「解码侧统计」诊断结果（{@link #diagnose}）：只回答「这次解码到底看到了什么」。
    *
    * @param sectionCount  区块的 section 数
    * @param stateKinds    整块区块里出现过的不同方块状态种类数（0 表示解码出全空气）
-   * @param targetMatches 命中目标方块（配置的隐藏清单，默认 21 种）的方块个数（<b>不看遮挡</b>）
+   * @param targetMatches 命中目标方块（配置的隐藏清单）的方块个数（<b>不看遮挡</b>）
    */
   public record Diagnostic(int sectionCount, int stateKinds, int targetMatches) {
   }
+
+  private final ChunkCodec codec;
+  private final IntPredicate occlusionTable;
+  private final boolean layerObfuscation;
+  private final boolean missingPolicyHide;
+  private final PaletteOptions paletteOptions;
+  /** use-block-below（P2-6a，默认 false）：命中伪装时优先用「下方紧邻方块」当伪装方块。 */
+  private final boolean useBlockBelow;
+  /**
+   * 「下方方块可用性」过滤器：true = 可以拿它当伪装方块（非空气/非流体等）。
+   * {@code null} 表示未提供（use-block-below 只能退回按遮挡语义判定）。
+   */
+  private final IntPredicate belowUsable;
+  /** 无覆盖世界（或世界名为 null）时使用的档案。 */
+  private final WorldProfile defaultProfile;
+  /** 与 {@code config.worldOverrides()} 平行的各覆盖段档案。 */
+  private final WorldProfile[] overrideProfiles;
+  /** 逐世界配置来源；{@code null} 表示无逐世界支持（测试构造），一律用默认档案。 */
+  private final AntiXrayConfig config;
+  /** 世界名 → 档案缓存（首个该世界的区块解析一次，此后 O(1)；值不可变，多线程安全）。 */
+  private final ConcurrentHashMap<String, WorldProfile> profileCache = new ConcurrentHashMap<>();
 
   /**
    * 直接用「已解析」的数据构造（供单测与显式装配使用）；伪装模式为 {@code enclosed}
@@ -121,15 +292,43 @@ public final class ObfuscationProcessor {
   public ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, BitSet targets,
       int[] replacementIds, int[] cumulativeWeights, boolean layerObfuscation,
       boolean missingPolicyHide, PaletteOptions paletteOptions, boolean obfuscateAll) {
+    this(codec, occlusionTable, targets, replacementIds, cumulativeWeights, layerObfuscation,
+        missingPolicyHide, paletteOptions, obfuscateAll, false, null);
+  }
+
+  /**
+   * 完整构造（追加 use-block-below，P2-6a）。
+   *
+   * @param useBlockBelow true = 命中伪装时若「下方紧邻方块」可用，优先用它当伪装方块（观感自然，
+   *                      同竞品思路）；false = 完全保持既有行为（按权重随机 / 层状）。
+   * @param belowUsable   下方方块可用性过滤器（非空气/非流体等）；null 时退回用遮挡表判定可用性
+   */
+  public ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, BitSet targets,
+      int[] replacementIds, int[] cumulativeWeights, boolean layerObfuscation,
+      boolean missingPolicyHide, PaletteOptions paletteOptions, boolean obfuscateAll,
+      boolean useBlockBelow, IntPredicate belowUsable) {
+    this(codec, occlusionTable, layerObfuscation, missingPolicyHide, paletteOptions, useBlockBelow,
+        belowUsable, new WorldProfile(targets, replacementIds, cumulativeWeights,
+            new int[0], new int[0], new int[0][], new int[0][],
+            Integer.MIN_VALUE, Integer.MAX_VALUE, obfuscateAll),
+        new WorldProfile[0], null);
+  }
+
+  /** 包级完整构造：档案由调用方构建（create 走配置解析路径，测试构造走参数直传路径）。 */
+  ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, boolean layerObfuscation,
+      boolean missingPolicyHide, PaletteOptions paletteOptions, boolean useBlockBelow,
+      IntPredicate belowUsable, WorldProfile defaultProfile, WorldProfile[] overrideProfiles,
+      AntiXrayConfig config) {
     this.codec = codec;
     this.occlusionTable = occlusionTable;
-    this.targets = targets;
-    this.replacementIds = replacementIds.clone();
-    this.cumulativeWeights = cumulativeWeights.clone();
     this.layerObfuscation = layerObfuscation;
     this.missingPolicyHide = missingPolicyHide;
     this.paletteOptions = paletteOptions;
-    this.obfuscateAll = obfuscateAll;
+    this.useBlockBelow = useBlockBelow;
+    this.belowUsable = belowUsable;
+    this.defaultProfile = defaultProfile;
+    this.overrideProfiles = overrideProfiles;
+    this.config = config;
   }
 
   /**
@@ -145,58 +344,43 @@ public final class ObfuscationProcessor {
   }
 
   /**
-   * 用配置 + 注册表解析出目标与伪装方块。未识别的名称会被记录并跳过。
+   * 用配置 + 注册表解析出目标与伪装方块（含逐世界覆盖段与分区伪装表，均启动期预构建）。
+   * 未识别的名称会被记录并跳过。
    *
    * @return 已装配的处理器；若未解析到任何有效目标或伪装方块，{@link #isActive()} 为 false
    */
   public static ObfuscationProcessor create(ChunkCodec codec, BlockStateRegistry registry,
       AntiXrayConfig config, Logger logger, PaletteOptions paletteOptions) {
-    BitSet targets = new BitSet(registry.getUniqueBlockStateCount());
-    List<String> resolvedTargets = new ArrayList<>();
-    for (String name : config.hideBlocks()) {
-      int stateId = BlockStateRegistry.resolveStateId(name);
-      if (stateId < 0) {
-        logger.warning("反矿透配置中的隐藏方块名称无法识别，已跳过：" + name);
-      } else {
-        targets.set(stateId);
-        resolvedTargets.add(name);
-      }
-    }
-    // 启动自检：把「实际匹配到的目标方块清单」打出来，便于一眼看出是否漏了深层矿变体
-    logger.info("反矿透目标方块解析完成：" + resolvedTargets.size() + '/' + config.hideBlocks().size()
-        + " 种 → " + resolvedTargets);
-
-    int[] replacementIds = new int[config.replacementWeights().size()];
-    int[] cumulativeWeights = new int[replacementIds.length];
-    int index = 0;
-    int cumulative = 0;
-    for (var entry : config.replacementWeights().entrySet()) {
-      int stateId = BlockStateRegistry.resolveStateId(entry.getKey());
-      if (stateId < 0) {
-        logger.warning("反矿透配置中的伪装方块名称无法识别，已跳过：" + entry.getKey());
-        continue;
-      }
-      cumulative += entry.getValue();
-      replacementIds[index] = stateId;
-      cumulativeWeights[index] = cumulative;
-      index++;
-    }
-
-    if (index != replacementIds.length) {
-      replacementIds = Arrays.copyOf(replacementIds, index);
-      cumulativeWeights = Arrays.copyOf(cumulativeWeights, index);
+    WorldProfile defaultProfile = WorldProfile.resolve(registry, config.globalEffective(), logger,
+        "反矿透");
+    List<AntiXrayConfig.WorldOverride> overrides = config.worldOverrides();
+    WorldProfile[] overrideProfiles = new WorldProfile[overrides.size()];
+    for (int i = 0; i < overrides.size(); i++) {
+      overrideProfiles[i] = WorldProfile.resolve(registry, config.overrideEffective(i), logger,
+          "反矿透（世界覆盖 " + overrides.get(i).pattern() + "）");
     }
 
     boolean missingPolicyHide = config.neighbors().missingPolicy() == AntiXrayConfig.MissingPolicy.HIDE;
-    boolean obfuscateAll = config.obfuscationMode() == AntiXrayConfig.ObfuscationMode.ALL;
+    // use-block-below（P2-6a，默认关）：「下方方块可用」= 非空气/非流体（注册表语义）。
+    // 是否是目标方块的检查在改写循环里做（targets 位图），这里只提供空气/流体过滤器。
+    IntPredicate belowUsable = state -> !(registry.isAir(state) || registry.isFluid(state));
 
-    return new ObfuscationProcessor(codec, registry::isOccluding, targets, replacementIds,
-        cumulativeWeights, config.layerObfuscation(), missingPolicyHide, paletteOptions, obfuscateAll);
+    return new ObfuscationProcessor(codec, registry::isOccluding, config.layerObfuscation(),
+        missingPolicyHide, paletteOptions, config.useBlockBelow(), belowUsable,
+        defaultProfile, overrideProfiles, config);
   }
 
-  /** 是否具备生效条件（目标与伪装方块都已解析）。 */
+  /** 是否具备生效条件（默认档案或任一世界覆盖档案的目标与伪装候选都已解析）。 */
   public boolean isActive() {
-    return !targets.isEmpty() && replacementIds.length > 0;
+    if (defaultProfile.active()) {
+      return true;
+    }
+    for (WorldProfile profile : overrideProfiles) {
+      if (profile.active()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** 改写一个区块（不含邻块快照，缺失策略会生效）。 */
@@ -214,24 +398,45 @@ public final class ObfuscationProcessor {
    * @return 改写结果；解码/重编码异常都回退为「原字节 + 空位置 + 异常摘要」（fail-open）
    */
   public Result rewrite(byte[] source, int sectionCount, long seed, NeighborEdges neighbors) {
+    return rewrite(source, sectionCount, seed, neighbors, null, 0);
+  }
+
+  /**
+   * 改写一个区块（完整入口：按世界取配置，高度坐标按 {@code worldMinY} 对齐为绝对 Y）。
+   *
+   * @param worldName 区块所在世界名；{@code null} 表示用全局默认档案（无逐世界覆盖）
+   * @param worldMinY 该世界最低方块 Y（世界坐标系），用于把 section 内相对 Y 换算成绝对 Y
+   *                  （min-y/max-y 过滤与分区伪装表都按绝对 Y 判定）
+   */
+  public Result rewrite(byte[] source, int sectionCount, long seed, NeighborEdges neighbors,
+      String worldName, int worldMinY) {
     if (!isActive() || sectionCount <= 0 || source.length == 0) {
-      return new Result(source, NO_POSITIONS, null);
+      return new Result(source, NO_POSITIONS, null, null);
+    }
+    WorldProfile profile = profileFor(worldName);
+    if (!profile.active()) {
+      return new Result(source, NO_POSITIONS, null, null);
     }
 
     Random random = new Random(seed);
     int[] positions = new int[16];
     int count = 0;
     boolean changed = false;
+    // 改写 section 的最终位宽（位宽直方图诊断用；null = 无任何改写，不分配）
+    int[] sectionBits = null;
 
     Chunk chunk;
     try {
       chunk = codec.decode(source, sectionCount);
     } catch (RuntimeException exception) {
       // 解码失败：多半是区块二进制布局与预期不符（版本/第三方改写），必须可观测，不能静默当作「无改动」
-      return new Result(source, NO_POSITIONS, describe(exception));
+      return new Result(source, NO_POSITIONS, describe(exception), null);
     }
 
     try {
+      boolean rangeLimited = profile.minY != Integer.MIN_VALUE || profile.maxY != Integer.MAX_VALUE;
+      boolean bandDriven = profile.bandMinY.length > 0;
+
       for (int sectionIndex = 0; sectionIndex < chunk.getSectionCount(); sectionIndex++) {
         ChunkSection section = chunk.getSection(sectionIndex);
         if (section == null || section.isEmpty()) {
@@ -242,26 +447,69 @@ public final class ObfuscationProcessor {
         int layerY = Integer.MIN_VALUE;
         int layerState = -1;
         boolean sectionChanged = false;
+        // 本 section 的候选表（含联合位宽预算筛选），首次替换时惰性构建（无目标的 section 零开销）
+        int[][] sectionTables = null;
+        // 候选表占用预算后的剩余调色板空位（use-block-below × 预算联动用；见 buildSectionTables）
+        int[] freeAfterTables = {Integer.MAX_VALUE};
 
         for (int index = 0; index < SECTION_VOLUME; index++) {
-          if (!targets.get(section.getBlockState(index))) {
-            continue;
-          }
-          // mode=all：所有目标矿一律伪装（不看 6 面遮挡）；mode=enclosed：只伪装 6 面全遮挡的掩埋矿。
-          if (!obfuscateAll && !isFullyOccluded(chunk, baseY, index, neighbors)) {
+          int state = section.getBlockState(index);
+          if (!profile.targets.get(state)) {
             continue;
           }
 
-          int replacement;
-          if (layerObfuscation) {
-            int y = baseY | (index >> 8 & 15);
-            if (layerY != y) {
-              layerY = y;
-              layerState = nextReplacement(random);
+          // 绝对 Y：min-y/max-y 过滤与分区伪装表都按世界坐标判定
+          int blockY = 0;
+          if (rangeLimited || bandDriven) {
+            blockY = worldMinY + baseY + (index >> 8 & 15);
+            // min-y/max-y（P0-2）：范围外的方块判定与替换都跳过
+            if (rangeLimited && (blockY < profile.minY || blockY > profile.maxY)) {
+              continue;
             }
-            replacement = layerState;
+          }
+
+          // mode=all：所有目标矿一律伪装（不看 6 面遮挡）；mode=enclosed：只伪装 6 面全遮挡的掩埋矿。
+          if (!profile.obfuscateAll && !isFullyOccluded(chunk, baseY, index, neighbors)) {
+            continue;
+          }
+
+          if (sectionTables == null) {
+            sectionTables = buildSectionTables(section, profile, freeAfterTables);
+          }
+          // 分区伪装表（P0-3）：按「第一个覆盖该高度的 band」取表；无覆盖回落 replacement-weights
+          int table = bandDriven ? bandIndexFor(profile, blockY) : -1;
+          int[] ids;
+          int[] cum;
+          if (table < 0) {
+            ids = sectionTables[0];
+            cum = sectionTables[1];
           } else {
-            replacement = nextReplacement(random);
+            ids = sectionTables[(table + 1) << 1];
+            cum = sectionTables[((table + 1) << 1) | 1];
+          }
+
+          int replacement = -1;
+          if (useBlockBelow) {
+            int below = camouflageFromBelow(chunk, profile, baseY, index);
+            // 预算联动（P0-1 × P2-6a）：下方方块可能不在本 section 调色板内（跨 section 读到的
+            // 状态、或候选表已把空位用满）——此时引入它会新增调色板条目、有升位风险，只有在
+            // 「候选表占用后仍有空位」或「已在调色板内」时才取用，否则退回候选表随机伪装，
+            // 绝不绕过位宽封顶（预算关闭时 freeAfterTables 为最大值，行为与旧版一致）。
+            if (below >= 0 && (freeAfterTables[0] > 0 || section.paletteContains(below))) {
+              replacement = below;
+            }
+          }
+          if (replacement < 0) {
+            if (layerObfuscation) {
+              int y = baseY | (index >> 8 & 15);
+              if (layerY != y) {
+                layerY = y;
+                layerState = pick(ids, cum, random);
+              }
+              replacement = layerState;
+            } else {
+              replacement = pick(ids, cum, random);
+            }
           }
 
           section.setBlockState(index, replacement);
@@ -274,22 +522,198 @@ public final class ObfuscationProcessor {
           positions[count++] = index + (baseY << 8);
         }
 
-        // 调色板压缩重排只作用于被改动的 section：未改动的 section 保持原字节（选择性重编码的前提）
-        if (sectionChanged && paletteOptions.reorder()) {
-          section.reorderPaletteByFrequency(paletteOptions.strictVerify());
+        if (sectionChanged) {
+          if (sectionBits == null) {
+            sectionBits = new int[sectionCount];
+            Arrays.fill(sectionBits, -1);
+          }
+          // 位宽预算封顶收尾（P0-1）：裁剪引用计数为 0 的失效条目并在可能时降位宽。
+          // 失败只放弃体积优化，绝不回滚已完成的替换（宁可包体大，不可漏伪装）。
+          if (paletteOptions.widthBudget()) {
+            try {
+              section.compactPalette(false);
+            } catch (RuntimeException pruneFailure) {
+              // 裁剪失败：保留替换结果原样（可能已 grow），伪装正确性不受影响
+            }
+          }
+          // 调色板压缩重排只作用于被改动的 section：未改动的 section 保持原字节（选择性重编码的前提）
+          if (paletteOptions.reorder()) {
+            section.reorderPaletteByFrequency(paletteOptions.strictVerify());
+          }
+          sectionBits[sectionIndex] = section.bitsPerBlock();
         }
       }
 
       if (!changed) {
         // 无改动：直接复用原字节，跳过整次重编码
-        return new Result(source, NO_POSITIONS, null);
+        return new Result(source, NO_POSITIONS, null, null);
       }
-      return new Result(chunk.finalizeOutput(), Arrays.copyOf(positions, count), null);
+      return new Result(chunk.finalizeOutput(), Arrays.copyOf(positions, count), null, sectionBits);
     } catch (RuntimeException exception) {
-      return new Result(source, NO_POSITIONS, describe(exception));
+      return new Result(source, NO_POSITIONS, describe(exception), null);
     } finally {
       chunk.close();
     }
+  }
+
+  /** 取某世界的改写档案：无覆盖（或测试构造）直接用默认档案；有覆盖时按世界名解析并缓存。 */
+  private WorldProfile profileFor(String worldName) {
+    if (overrideProfiles.length == 0 || worldName == null || config == null) {
+      return defaultProfile;
+    }
+    return profileCache.computeIfAbsent(worldName, name -> {
+      int index = config.matchOverride(name);
+      return index < 0 ? defaultProfile : overrideProfiles[index];
+    });
+  }
+
+  /**
+   * 为单个 section 构建候选表（下标布局：{@code 0/1 = 回落表，2/3 = band 0，4/5 = band 1 …}），
+   * 并做「位宽预算」联合筛选（P0-1）。
+   *
+   * <p>联合口径：统计<b>所有表合计</b>将引入的「不在调色板内」的不同新状态数（同一状态出现在
+   * 多个表只算一次），超出当前剩余容量（{@code (1 << bitsPerBlock) − 调色板条目数}）即为超预算。
+   * 超预算时各表只保留已在调色板内的候选（保持声明顺序与相对权重）；某表剔除后为空则保留原表
+   * （逃生口：调色板内完全无候选才允许 grow）。预算关闭或预算充足时直接共享 profile 预构建表
+   * （零分配、零拷贝）。候选总量为个位数～几十，O(n²) 去重代价可忽略。
+   *
+   * @param freeAfterOut 单元素输出：候选表占用预算后的剩余调色板空位（供 use-block-below
+   *                     判断「下方方块不在调色板内时还能否无升位写入」；预算关闭时为最大值）
+   */
+  private int[][] buildSectionTables(ChunkSection section, WorldProfile profile, int[] freeAfterOut) {
+    int bandCount = profile.bandIds.length;
+    int[][] out = new int[(bandCount + 1) << 1][];
+    if (!paletteOptions.widthBudget()) {
+      sharePrebuiltTables(out, profile);
+      freeAfterOut[0] = Integer.MAX_VALUE;
+      return out;
+    }
+
+    int total = profile.replacementIds.length;
+    for (int[] ids : profile.bandIds) {
+      total += ids.length;
+    }
+    boolean overBudget = false;
+    int free = 0;
+    int distinctNew = 0;
+    if (total > 0) {
+      int[] all = new int[total];
+      int filled = 0;
+      filled = appendAll(all, filled, profile.replacementIds);
+      for (int[] ids : profile.bandIds) {
+        filled = appendAll(all, filled, ids);
+      }
+      free = (1 << section.bitsPerBlock()) - section.paletteSize();
+      for (int i = 0; i < filled; i++) {
+        if (section.paletteContains(all[i])) {
+          continue;
+        }
+        boolean duplicate = false;
+        for (int j = 0; j < i; j++) {
+          if (all[j] == all[i]) {
+            duplicate = true;
+            break;
+          }
+        }
+        if (!duplicate) {
+          distinctNew++;
+        }
+      }
+      overBudget = distinctNew > free;
+    }
+
+    if (!overBudget) {
+      // 预算充足：调色板装得下所有新状态，共享预构建表即可
+      sharePrebuiltTables(out, profile);
+      freeAfterOut[0] = Math.max(0, free - distinctNew);
+      return out;
+    }
+
+    // 超预算：逐表剔除不在调色板内的候选；剔除后为空的表保留原表（逃生口，允许 grow）
+    freeAfterOut[0] = 0;
+    int[][] fallback = filterTable(profile.replacementIds, profile.replacementCum, section);
+    out[0] = fallback[0];
+    out[1] = fallback[1];
+    for (int b = 0; b < bandCount; b++) {
+      int[][] filtered = filterTable(profile.bandIds[b], profile.bandCum[b], section);
+      out[(b + 1) << 1] = filtered[0];
+      out[((b + 1) << 1) | 1] = filtered[1];
+    }
+    return out;
+  }
+
+  /** 把 profile 预构建的回落表与各 band 表直接共享进输出数组（零拷贝）。 */
+  private static void sharePrebuiltTables(int[][] out, WorldProfile profile) {
+    out[0] = profile.replacementIds;
+    out[1] = profile.replacementCum;
+    for (int b = 0; b < profile.bandIds.length; b++) {
+      out[(b + 1) << 1] = profile.bandIds[b];
+      out[((b + 1) << 1) | 1] = profile.bandCum[b];
+    }
+  }
+
+  /** 把 ids 追加到 all 的 {@code from} 位置，返回新的写游标。 */
+  private static int appendAll(int[] all, int from, int[] ids) {
+    for (int id : ids) {
+      all[from++] = id;
+    }
+    return from;
+  }
+
+  /**
+   * 剔除表中「不在调色板内」的候选（保持声明顺序与相对权重）。
+   *
+   * @return 筛选后的 {@code {ids, cum}}；无候选可留（全被剔除）时原样返回——逃生口：
+   *         调色板内完全无候选才允许 grow，保防护优先于包体
+   */
+  private static int[][] filterTable(int[] ids, int[] cum, ChunkSection section) {
+    int kept = 0;
+    for (int id : ids) {
+      if (section.paletteContains(id)) {
+        kept++;
+      }
+    }
+    if (kept == 0 || kept == ids.length) {
+      return new int[][] {ids, cum};
+    }
+    int[] outIds = new int[kept];
+    int[] outCum = new int[kept];
+    int n = 0;
+    int running = 0;
+    for (int i = 0; i < ids.length; i++) {
+      if (section.paletteContains(ids[i])) {
+        running += cum[i] - (i == 0 ? 0 : cum[i - 1]);
+        outIds[n] = ids[i];
+        outCum[n] = running;
+        n++;
+      }
+    }
+    return new int[][] {outIds, outCum};
+  }
+
+  /**
+   * 返回覆盖该绝对高度的第一个 band 下标（声明序优先，P0-3 语义）。
+   *
+   * @return band 下标；无覆盖返回 {@code -1}（回落 {@code replacement-weights}）
+   */
+  private static int bandIndexFor(WorldProfile profile, int blockY) {
+    for (int b = 0; b < profile.bandMinY.length; b++) {
+      if (blockY >= profile.bandMinY[b] && blockY <= profile.bandMaxY[b]) {
+        return b;
+      }
+    }
+    return -1;
+  }
+
+  /** 按累计权重随机挑选一个伪装方块状态 id（表来自 profile 预构建或本 section 的预算筛选结果）。 */
+  private static int pick(int[] ids, int[] cum, Random random) {
+    int roll = random.nextInt(cum[cum.length - 1]);
+    for (int i = 0; i < cum.length; i++) {
+      if (roll < cum[i]) {
+        return ids[i];
+      }
+    }
+    return ids[ids.length - 1];
   }
 
   /**
@@ -326,7 +750,7 @@ public final class ObfuscationProcessor {
         }
         for (int state : section.readAllBlockStates()) {
           seen.set(state);
-          if (targets.get(state)) {
+          if (defaultProfile.targets.get(state)) {
             targetMatches++;
           }
         }
@@ -418,14 +842,49 @@ public final class ObfuscationProcessor {
     return missingPolicyHide;
   }
 
-  /** 按累计权重随机挑选一个伪装方块状态 id。 */
-  private int nextReplacement(Random random) {
-    int roll = random.nextInt(cumulativeWeights[cumulativeWeights.length - 1]);
-    for (int i = 0; i < cumulativeWeights.length; i++) {
-      if (roll < cumulativeWeights[i]) {
-        return replacementIds[i];
+  /**
+   * use-block-below（P2-6a）：取「下方紧邻方块」当伪装方块；不可用时返回 -1（退回既有策略）。
+   *
+   * <p><b>跨 section 读取</b>：y-1 可能在邻 section（当前 section 的 localY=0 时），读取在
+   * {@link Chunk} 内完成（纯数据操作，section 顺序遍历保证下方 section 已处理完），不触碰 Bukkit。
+   *
+   * <p><b>为什么不会泄露真实矿物</b>：遍历按「section 升序 → 段内 index 升序」，下方方块（y 更小）
+   * 一定先于当前方块处理——若下方是目标方块且已被伪装，读到的是伪装结果（伪装自然向上延续）；
+   * 若下方是目标方块但<b>未被伪装</b>（enclosed 模式下暴露的矿），本方法显式拒绝复制目标状态，
+   * 绝不把「真矿」当伪装方块写上去（不漏伪装红线）。目标判定用<b>当前世界的档案</b>
+   * {@code profile.targets}——逐世界覆盖段新增的目标方块同样受保护（P0-2 × P2-6a 交叉）。
+   *
+   * <p><b>与位宽预算的关系</b>：下方方块状态可能不在本 section 调色板内（跨 section 读取）——
+   * 引入它会新增调色板条目、有升位风险，是否放行由调用方按「候选表占用后的剩余空位」判定
+   * （见 rewrite 循环），本方法只负责取值与可用性过滤。
+   *
+   * <p><b>可用性</b>：下方为空气/流体（无 section、越出世界下界同理）时不可用——
+   * 用 {@code belowUsable} 过滤器判定（未提供时退回遮挡表判定，同样排除空气与流体）。
+   *
+   * @return 可用的伪装状态 id；不可用返回 -1
+   */
+  private int camouflageFromBelow(Chunk chunk, WorldProfile profile, int baseY, int index) {
+    int localY = index >> 8 & 15;
+    int belowState;
+    if (localY > 0) {
+      belowState = chunk.getSection(baseY >> 4).getBlockState(index - 256);
+    } else {
+      int belowSection = (baseY >> 4) - 1;
+      if (belowSection < 0) {
+        return -1;
       }
+      ChunkSection section = chunk.getSection(belowSection);
+      if (section == null) {
+        return -1; // 全空气/缺失的 section：下方是空气，不可用
+      }
+      belowState = section.getBlockState((15 << 8) | (index & 0xFF));
     }
-    return replacementIds[replacementIds.length - 1];
+    if (belowState < 0 || profile.targets.get(belowState)) {
+      return -1;
+    }
+    boolean usable = belowUsable != null
+        ? belowUsable.test(belowState)
+        : occlusionTable.test(belowState);
+    return usable ? belowState : -1;
   }
 }

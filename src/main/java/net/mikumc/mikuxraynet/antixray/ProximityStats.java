@@ -30,6 +30,18 @@ public final class ProximityStats {
   /** 因工作队列已满而退化为「主线程直接做视锥剔除」的次数（纯计算不再占用工作线程）。 */
   public final LongAdder revealsQueuedSkipped = new LongAdder();
 
+  /**
+   * 过度显形抽样中被复核的显形包数（按 1/N 抽样；默认 N=20，只计数不改行为）。
+   *
+   * <p><b>口径</b>：发包前若 {@link RevealedSet} 已含该坐标，说明客户端应已可见（或刚被其它路径显形过），
+   * 这个显形包是浪费的。抽样计数让「过度显形」从定性描述变成可读数字：
+   * {@code wasted / sampled} 即浪费占比的无偏估计（样本足够大时）。
+   */
+  public final LongAdder overRevealSampled = new LongAdder();
+
+  /** 抽样复核中被判为「过度」（RevealedSet 已含该坐标）的显形包数。 */
+  public final LongAdder overRevealWasted = new LongAdder();
+
   /** 生成中文可读快照（顺序稳定，便于命令输出）。 */
   public Map<String, Long> snapshot() {
     Map<String, Long> map = new LinkedHashMap<>();
@@ -39,6 +51,8 @@ public final class ProximityStats {
     map.put("视锥剔除", revealsFrustumCulled.sum());
     map.put("射线剔除", revealsRayCulled.sum());
     map.put("降级次数", revealsQueuedSkipped.sum());
+    map.put("过度显形（抽样）", overRevealWasted.sum());
+    map.put("过度显形抽样数", overRevealSampled.sum());
     return map;
   }
 }

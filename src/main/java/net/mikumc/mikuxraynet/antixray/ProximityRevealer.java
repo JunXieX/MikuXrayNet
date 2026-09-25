@@ -121,6 +121,7 @@ public final class ProximityRevealer implements Listener {
   private final ProtocolManager protocolManager;
   private final AntiXrayConfig config;
   private final AntiXrayConfig.Proximity proximity;
+  private final AntiXrayConfig.InstantReveal instant;
   private final ObfuscatedChunkIndex chunkIndex;
   private final RevealedSet revealedSet;
   private final ProximityStats stats;
@@ -131,6 +132,10 @@ public final class ProximityRevealer implements Listener {
   private final AtomicBoolean firstRevealDiagnosed = new AtomicBoolean();
   /** 「显形索引安全阀触发」只提示一次（CAS 抢占），避免每轮巡检刷屏。 */
   private final AtomicBoolean capacityWarned = new AtomicBoolean();
+  /** 事件显形的每玩家每 tick 限额（默认 16，防爆刷；见 {@link TickQuota}）。 */
+  private final TickQuota instantQuota = new TickQuota();
+  /** 过度显形抽样器（1/N，只计数不改行为；N=0 关闭）。 */
+  private final OverRevealSampler overRevealSampler;
 
   private ScheduledTask globalTask;
 
@@ -150,6 +155,8 @@ public final class ProximityRevealer implements Listener {
     this.protocolManager = protocolManager;
     this.config = config;
     this.proximity = config.proximity();
+    this.instant = proximity.instantReveal();
+    this.overRevealSampler = new OverRevealSampler(Math.max(0, proximity.overRevealSampling()));
     this.chunkIndex = chunkIndex;
     this.revealedSet = revealedSet;
     this.stats = stats;
@@ -229,6 +236,7 @@ public final class ProximityRevealer implements Listener {
       }
     }
     revealedSet.clearPlayer(event.getPlayer().getUniqueId());
+    instantQuota.clear(event.getPlayer().getUniqueId());
   }
 
   /**
@@ -464,6 +472,16 @@ public final class ProximityRevealer implements Listener {
       return;
     }
 
+    // 过度显形量化（P2-6b，只计数不改行为）：发包前按 1/N 抽样，若 RevealedSet 已含该坐标，
+    // 说明客户端应已可见（或刚被其它路径显形过），本次显形包按「过度」计数。
+    if (overRevealSampler.sample()) {
+      stats.overRevealSampled.increment();
+      if (revealedSet.contains(player.getUniqueId(),
+          ChunkKey.ofBlock(world.getName(), x, z), x, y, z)) {
+        stats.overRevealWasted.increment();
+      }
+    }
+
     if (send(player, world, x, y, z)) {
       revealedSet.mark(player.getUniqueId(), ChunkKey.ofBlock(world.getName(), x, z), x, y, z);
       stats.revealsSent.increment();
@@ -586,6 +604,208 @@ public final class ProximityRevealer implements Listener {
       coordinates[i * 3 + 2] = position.z();
     }
     return coordinates;
+  }
+
+  // ============================== 事件驱动即时显形（P1-4）==============================
+
+  /**
+   * 出站方块变更回调（由 {@link BlockChangeRevealListener} 在封包解析线程调用）：
+   * 玩家收到某个方块变更包时，若变更坐标的邻域内（曼哈顿 ≤ {@code instant-reveal.radius}）
+   * 仍有伪装坐标，则调度到玩家所属线程当 tick 补发显形。
+   *
+   * <p><b>为什么只在这里做初筛</b>：封包线程不能读 World / 玩家位置，但伪装索引是纯内存并发结构，
+   * 「邻域内是否还有伪装坐标」的初筛可以安全地在这一步完成——邻域内全是非伪装方块时
+   * （如在地表插火把）不产生任何调度；命中时也只调度一次，最终判定（身边半径、射线、限额、去重）
+   * 全部在玩家所属线程的 {@link #revealImmediately} 里做。
+   *
+   * <p><b>与周期巡检的关系</b>：事件触发是<b>补充</b>（把「挖开/爆炸后要等最多一个周期」的窗口压到 0），
+   * 周期巡检兜底不变；两者共用 {@link #sendOne} 与已显形标记，同一坐标当 tick 只发一次。
+   */
+  public void onBlockChangeObserved(Player player, String worldName, int x, int y, int z) {
+    if (player == null || worldName == null
+        || !instant.enabled() || instant.maxPerTick() <= 0) {
+      return;
+    }
+    if (chunkIndex == null || revealedSet == null) {
+      return;
+    }
+    if (hasDisguisedNearby(chunkIndex, worldName, x, y, z, instant.radius())) {
+      Schedulers.onEntity(plugin, player, () -> revealImmediately(player, worldName, x, y, z));
+    }
+  }
+
+  /**
+   * 初筛（纯函数，可离线单测）：变更坐标的曼哈顿邻域内是否仍有伪装坐标。
+   * 只读并发索引，供封包线程在调度前过滤「邻域内全是非伪装方块」的无效变更。
+   */
+  static boolean hasDisguisedNearby(ObfuscatedChunkIndex index, String worldName,
+      int x, int y, int z, int radius) {
+    for (int[] offset : instantOffsets(radius)) {
+      if (index.containsPosition(worldName, x + offset[0], y + offset[1], z + offset[2])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 玩家所属线程：事件显形的最终判定与发包。
+   *
+   * <p>顺序：直通/在线 → 世界生效 → 曼哈顿半径（变更不在身边则交给周期兜底）→ 区块已加载 →
+   * 取本 tick 剩余额度 → 逐偏移「仍在伪装清单 + 该玩家未显形过」→ 复用 {@link #sendOne}
+   * （射线判定、发包、标记、统计全在既有链路里）。失败只记日志，绝不抛出。
+   */
+  private void revealImmediately(Player player, String worldName, int cx, int cy, int cz) {
+    try {
+      if (!player.isOnline()
+          || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
+        return;
+      }
+      World world = player.getWorld();
+      if (!config.appliesTo(world.getName())) {
+        return;
+      }
+      int radius = instant.radius();
+      Location location = player.getLocation();
+      if (!withinManhattanRadius(location.getBlockX(), location.getBlockY(), location.getBlockZ(),
+          cx, cy, cz, radius)) {
+        return;
+      }
+      if (!world.isChunkLoaded(cx >> 4, cz >> 4)) {
+        return;
+      }
+
+      UUID playerId = player.getUniqueId();
+      long tick = Bukkit.getCurrentTick();
+      Budget budget = new Budget(instantQuota.remaining(playerId, tick, instant.maxPerTick()));
+      if (budget.remaining <= 0) {
+        return;
+      }
+
+      ProximitySelector.Eye eye = proximity.raycastEnabled() ? eyeOf(player) : null;
+      PassTally tally = new PassTally();
+      String liveWorld = world.getName();
+      for (int[] offset : instantOffsets(radius)) {
+        if (budget.remaining <= 0) {
+          break;
+        }
+        int x = cx + offset[0];
+        int y = cy + offset[1];
+        int z = cz + offset[2];
+        if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
+          continue;
+        }
+        sendOne(player, world, x, y, z, eye, budget, tally);
+      }
+      instantQuota.setRemaining(playerId, tick, Math.max(0, budget.remaining));
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /** 纯数据判定：坐标仍在伪装清单（已伪装）且该玩家尚未显形过（与周期显形不重复、同 tick 不重复）。 */
+  boolean isInstantCandidate(UUID playerId, String worldName, int x, int y, int z) {
+    if (!chunkIndex.containsPosition(worldName, x, y, z)) {
+      return false;
+    }
+    return !revealedSet.contains(playerId, ChunkKey.ofBlock(worldName, x, z), x, y, z);
+  }
+
+  /** 曼哈顿距离 ≤ radius 即命中（含恰好等于；纯函数，供触发判定与单测复用）。 */
+  static boolean withinManhattanRadius(int px, int py, int pz, int cx, int cy, int cz, int radius) {
+    return Math.abs(px - cx) + Math.abs(py - cy) + Math.abs(pz - cz) <= radius;
+  }
+
+  /** 曼哈顿半径偏移表的缓存（键为钳制后的半径；表只建一次，热路径零分配）。 */
+  private static final ConcurrentHashMap<Integer, int[][]> INSTANT_OFFSETS_CACHE =
+      new ConcurrentHashMap<>();
+
+  /**
+   * 曼哈顿半径内全部偏移（含原点，按距离由近到远排序），按半径缓存。
+   * 半径在配置解析时已钳制到 1~8，这里再兜底一次，防止异常配置撑爆偏移表。
+   */
+  static int[][] instantOffsets(int radius) {
+    int clamped = Math.max(1, Math.min(8, radius));
+    int[][] cached = INSTANT_OFFSETS_CACHE.get(clamped);
+    if (cached != null) {
+      return cached;
+    }
+    java.util.List<int[]> offsets = new java.util.ArrayList<>();
+    for (int dx = -clamped; dx <= clamped; dx++) {
+      for (int dy = -clamped; dy <= clamped; dy++) {
+        for (int dz = -clamped; dz <= clamped; dz++) {
+          int distance = Math.abs(dx) + Math.abs(dy) + Math.abs(dz);
+          if (distance <= clamped) {
+            offsets.add(new int[] {dx, dy, dz, distance});
+          }
+        }
+      }
+    }
+    // 由近到远：限额不够时优先显形离变更点最近的坐标（排序只在构建缓存时做一次）
+    offsets.sort(java.util.Comparator.comparingInt(offset -> offset[3]));
+    int[][] table = offsets.toArray(new int[0][]);
+    INSTANT_OFFSETS_CACHE.putIfAbsent(clamped, table);
+    return INSTANT_OFFSETS_CACHE.get(clamped);
+  }
+
+  /**
+   * 每玩家每 tick 的事件显形限额（纯数据结构，可离线单测）。
+   *
+   * <p>槽位 {@code long[2] = [tick, 剩余额度]}，tick 变化即自动重置为满额；额度按「事件显形实际
+   * 发包数」扣减（读剩余 → 发包 → 写回剩余），因此限额是「每玩家每 tick 真实发包数」的口径。
+   * 条目随玩家退出精确清理（见 {@link #onQuit}）。
+   */
+  static final class TickQuota {
+
+    private final ConcurrentHashMap<UUID, long[]> slots = new ConcurrentHashMap<>();
+
+    /** 本 tick 的剩余额度；本 tick 尚未使用过或已进入下一 tick 时返回满额。 */
+    int remaining(UUID player, long tick, int maxPerTick) {
+      long[] slot = slots.get(player);
+      if (slot == null) {
+        return maxPerTick;
+      }
+      synchronized (slot) {
+        return slot[0] == tick ? (int) slot[1] : maxPerTick;
+      }
+    }
+
+    /** 写回本 tick 的剩余额度（发包后调用；tick 变化时写回值即新 tick 的满额起点）。 */
+    void setRemaining(UUID player, long tick, int remaining) {
+      long[] slot = slots.computeIfAbsent(player, ignored -> new long[2]);
+      synchronized (slot) {
+        slot[0] = tick;
+        slot[1] = remaining;
+      }
+    }
+
+    /** 玩家退出时精确清理其槽位。 */
+    void clear(UUID player) {
+      slots.remove(player);
+    }
+  }
+
+  /**
+   * 过度显形抽样器（P2-6b，纯逻辑，可离线单测）：按 1/{@code rate} 抽样。
+   * {@code rate <= 0} 表示关闭（永不抽样）。只决定「是否复核一次」，不影响任何发包行为。
+   */
+  static final class OverRevealSampler {
+
+    private final java.util.concurrent.atomic.AtomicLong counter = new AtomicLong();
+    private final int rate;
+
+    OverRevealSampler(int rate) {
+      this.rate = Math.max(0, rate);
+    }
+
+    boolean enabled() {
+      return rate > 0;
+    }
+
+    /** 本显形包是否被抽样复核（第 1、N+1、2N+1… 个命中）。 */
+    boolean sample() {
+      return enabled() && counter.getAndIncrement() % rate == 0L;
+    }
   }
 
   private void logThrottled(Throwable throwable) {

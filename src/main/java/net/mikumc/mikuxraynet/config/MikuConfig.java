@@ -42,6 +42,11 @@ public final class MikuConfig {
     } else {
       logger.info("反矿透配置已加载：功能处于关闭状态");
     }
+    // tag(...) 展开失败的条目已按「忽略」处理（不猜成员），这里提示管理员改正
+    if (!loadedAntiXray.unresolvedTags().isEmpty()) {
+      logger.warning("配置里的 tag(...) 无法识别（不在内置 tag 映射表中），对应条目已忽略："
+          + loadedAntiXray.unresolvedTags());
+    }
     logger.info("带宽配置已加载：总开关 " + (loadedBandwidth.enabled() ? "开启" : "关闭"));
   }
 

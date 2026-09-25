@@ -184,9 +184,24 @@ public class ChunkSection {
     }
   }
 
-  /** 该 section 是否被外部通过 {@link #setBlockState}（或调色板重排）改写。 */
+  /** 该 section 是否被外部通过 {@link #setBlockState}（或调色板重排/裁剪）改写。 */
   public boolean isModified() {
     return this.modified;
+  }
+
+  /** 当前每方块位宽（0=单值，4..8=间接，&gt;8=直接；供位宽预算与直方图诊断读取）。 */
+  public int bitsPerBlock() {
+    return this.bitsPerBlock;
+  }
+
+  /** 当前调色板条目数（单值 1、间接 0..容量、直接 0）。 */
+  public int paletteSize() {
+    return this.palette.size();
+  }
+
+  /** 调色板是否已包含某方块状态（预算筛选「替换方块是否已在调色板内」用；直接调色板恒 true）。 */
+  public boolean paletteContains(int stateId) {
+    return this.palette.contains(stateId);
   }
 
   /** 按序号读出全部 4096 个方块状态（供重排自检与单测；不改变任何状态）。 */
@@ -257,6 +272,91 @@ public class ChunkSection {
 
     if (verify && !Arrays.equals(before, readAllBlockStates())) {
       throw new IllegalStateException("调色板重排自检失败：方块序列发生变化");
+    }
+    return true;
+  }
+
+  /**
+   * 裁剪调色板里「引用计数为 0」的失效条目（被伪装替换掉的矿等）并压缩索引；若裁剪后条目数
+   * 降到更低位宽阈值内，则连位宽一并下调（如 5 位 17 条 → 裁到 15 条 → 4 位）。
+   *
+   * <p>这是「调色板位宽预算封顶」的收尾步骤：替换只会往调色板里加伪装方块，被替换掉的目标方块
+   * 条目失去全部引用后仍占着调色板与位打包位宽。本方法按出现频次统计引用计数，只保留被引用的
+   * 条目（<b>按原索引顺序压缩</b>，保证结果确定），再按压缩后的条目数计算最小位宽
+   * {@code max(4, ceil(log2(kept)))} 重建位打包数据——方块状态语义完全不变，位宽<b>单调不增</b>。
+   *
+   * <p>只对间接调色板生效（单值没有失效条目可言，直接调色板没有调色板段）；无可裁剪条目时
+   * 返回 false 且不做任何修改。失败（理论上只会是内部不变量被破坏）由调用方兜底：放弃裁剪、
+   * 保留已完成替换的结果（宁可包体大，不可漏伪装）。
+   *
+   * @param verify true 时对裁剪前后的方块序列做自检，不一致即抛 {@link IllegalStateException}
+   *               （会额外分配两份 4096 长数组，仅在排查问题时开启）
+   * @return 是否实际发生了裁剪（含降位宽）
+   */
+  public boolean compactPalette(boolean verify) {
+    if (!(this.palette instanceof IndirectPalette indirectPalette)) {
+      return false;
+    }
+
+    int size = indirectPalette.paletteSize();
+    if (size <= 1) {
+      return false;
+    }
+
+    int[] before = verify ? readAllBlockStates() : null;
+
+    // 1) 统计每个调色板条目的引用计数
+    int[] frequency = new int[size];
+    for (int i = 0; i < SECTION_VOLUME; i++) {
+      frequency[this.data.get(i)]++;
+    }
+
+    // 2) 保留引用非 0 的条目（按原索引顺序压缩，同输入必然同输出，缓存可复用）
+    int kept = 0;
+    for (int id = 0; id < size; id++) {
+      if (frequency[id] > 0) {
+        kept++;
+      }
+    }
+    if (kept == size) {
+      return false;
+    }
+
+    int[] remap = new int[size];
+    int[] values = new int[kept];
+    int newId = 0;
+    for (int id = 0; id < size; id++) {
+      if (frequency[id] > 0) {
+        remap[id] = newId;
+        values[newId] = indirectPalette.valueAt(id);
+        newId++;
+      }
+    }
+
+    // 3) 计算裁剪后的最小位宽并重建：kept ≤ size ⇒ targetBits ≤ bitsPerBlock，位宽单调不增
+    //   （间接调色板下限 4 位；kept=1 时也保持 4 位间接，不迁移到单值调色板）
+    int targetBits = Math.max(4, 32 - Integer.numberOfLeadingZeros(kept - 1));
+
+    if (targetBits == this.bitsPerBlock) {
+      // 位宽不变：原地压缩索引，只更新调色板
+      for (int i = 0; i < SECTION_VOLUME; i++) {
+        this.data.set(i, remap[this.data.get(i)]);
+      }
+      indirectPalette.retain(values);
+    } else {
+      // 降位宽：换更窄的位打包缓冲与更小容量的调色板，再按压缩索引重写全部 4096 项。
+      // 旧调色板/旧缓冲的取值已先提取到 values/remap，setBitsPerBlock 换掉引用后再整体写入。
+      VarBitBuffer oldData = this.data;
+      this.setBitsPerBlock(targetBits, true);
+      for (int i = 0; i < SECTION_VOLUME; i++) {
+        this.data.set(i, remap[oldData.get(i)]);
+      }
+      ((IndirectPalette) this.palette).retain(values);
+    }
+    this.modified = true;
+
+    if (verify && !Arrays.equals(before, readAllBlockStates())) {
+      throw new IllegalStateException("调色板裁剪自检失败：方块序列发生变化");
     }
     return true;
   }

@@ -69,22 +69,29 @@ public final class Diagnostics {
         boolean antiXrayActive, int bypassPlayers, String serverVersion, String javaVersion) {
     }
 
-    /** 区块改写域：改写缓存（按区块共享）与改写计数。 */
+    /**
+     * 区块改写域：改写缓存（按区块共享）、改写计数与字节口径统计（P0-1）。
+     *
+     * <p>字节口径只统计真正改写的区块：{@code bytesSaved = bytesOriginal − bytesOutput}，
+     * 可能为负（升位/扩容时输出更大）。{@code paletteBitsSummary} 为改写 section 的
+     * bitsPerBlock 直方图摘要（dump 展示封顶/裁剪/降位效果；无采样为「无采样」）。
+     */
     public record Rewrite(long cacheHits, long cacheMisses, int cacheEntries,
         long chunksRewritten, long blocksReplaced, long chunksSkipped, long chunksFailed,
-        long writeBackFailures, long chunksTimedOut) {
+        long writeBackFailures, long chunksTimedOut,
+        long bytesOriginal, long bytesOutput, long bytesSaved, String paletteBitsSummary) {
 
       /** 反矿透未启用时的零值兜底。 */
       public static final Rewrite EMPTY =
-          new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L);
+          new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, "无采样");
     }
 
-    /** 邻近显形域：显形发包与视锥/射线剔除计数。 */
+    /** 邻近显形域：显形发包与视锥/射线剔除计数，以及过度显形的抽样统计。 */
     public record Proximity(long revealsSent, long revealsSkipped, long revealsUnregistered,
-        long frustumCulled, long rayCulled) {
+        long frustumCulled, long rayCulled, long overRevealSampled, long overRevealWasted) {
 
       /** 邻近显形未启用时的零值兜底。 */
-      public static final Proximity EMPTY = new Proximity(0L, 0L, 0L, 0L, 0L);
+      public static final Proximity EMPTY = new Proximity(0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     /** 显形索引域：伪装区块索引（按区块共享）与按玩家的已显形集合的持有量与安全阀计数。 */
@@ -189,15 +196,18 @@ public final class Diagnostics {
 
     // 各域来源未启用时直接复用空对象，快照构造里不再出现逐字段的「? null : 0」
     RewriteStats rewriteStats = hook == null ? null : hook.stats();
-    Snapshot.Rewrite rewrite = hook == null ? Snapshot.Rewrite.EMPTY
+    Snapshot.Rewrite rewrite = rewriteStats == null ? Snapshot.Rewrite.EMPTY
         : new Snapshot.Rewrite(hook.cacheHits(), hook.cacheMisses(), hook.cacheSize(),
             rewriteStats.chunksRewritten.sum(), rewriteStats.blocksReplaced.sum(),
             rewriteStats.chunksSkipped.sum(), rewriteStats.chunksFailed.sum(),
-            rewriteStats.writeBackFailures.sum(), rewriteStats.chunksTimedOut.sum());
+            rewriteStats.writeBackFailures.sum(), rewriteStats.chunksTimedOut.sum(),
+            rewriteStats.bytesOriginal.sum(), rewriteStats.bytesOutput.sum(),
+            rewriteStats.bytesSaved.sum(), rewriteStats.paletteBitsSummary());
     Snapshot.Proximity proximity = proximityStats == null ? Snapshot.Proximity.EMPTY
         : new Snapshot.Proximity(proximityStats.revealsSent.sum(), proximityStats.revealsSkipped.sum(),
             proximityStats.unregistered.sum(), proximityStats.revealsFrustumCulled.sum(),
-            proximityStats.revealsRayCulled.sum());
+            proximityStats.revealsRayCulled.sum(), proximityStats.overRevealSampled.sum(),
+            proximityStats.overRevealWasted.sum());
     Snapshot.Index index = chunkIndex == null && revealedSet == null ? Snapshot.Index.EMPTY
         : new Snapshot.Index(
             chunkIndex == null ? 0 : chunkIndex.chunkCount(),
@@ -255,12 +265,17 @@ public final class Diagnostics {
         + "，跳过 " + s.rewrite().chunksSkipped()
         + "，异常 " + s.rewrite().chunksFailed() + "，写回失败 " + s.rewrite().writeBackFailures()
         + "，超时放行 " + s.rewrite().chunksTimedOut());
+    // 字节口径（P0-1）：只统计真正改写的区块（未改动/失败放行的原样字节不采样，避免稀释比例）。
+    // 节省比例 = 节省字节 / 原始字节；开启 palette.width-budget 后这一行应体现「封顶+裁剪」的收益。
+    lines.add(bytesLine(s.rewrite()));
     // 注意「坐标跳过」与「整块跳过」是两件事：前者是候选坐标因区块未加载 / 发包失败被跳过，
     // 后者是「整块都已显形」的区块被整体略过（只出现在一次性「首次显形诊断」日志里）。
     // 只写「跳过」会被误读成「整块跳过为 0 → 整块跳过没生效」，故此处写明「坐标跳过」。
     lines.add("邻近显形：发送 " + s.proximity().revealsSent() + "，坐标跳过 " + s.proximity().revealsSkipped()
         + "，变更注销 " + s.proximity().revealsUnregistered() + "，视锥剔除 " + s.proximity().frustumCulled()
-        + "，射线剔除 " + s.proximity().rayCulled());
+        + "，射线剔除 " + s.proximity().rayCulled()
+        + "，过度显形（抽样） " + s.proximity().overRevealWasted() + " / 抽样 "
+        + s.proximity().overRevealSampled());
     // 口径说明：这里刻意分列「实时坐标数」与「累计登记数」——前者随登出 / 过期 / 区块失效归零，
     // 后者只增不减。若只显示实时值，玩家中途重登或走远后被清理时会看到「发送 N 但已显形 0」，
     // 极易被误读成「显形路径没有登记」（实际登记在发包成功后必然发生）。
@@ -290,6 +305,26 @@ public final class Diagnostics {
     lines.add("线程池：线程 " + s.pool().threads() + "，活动 " + s.pool().active()
         + "，队列 " + s.pool().queueSize() + "/" + s.pool().queueCapacity());
     return lines;
+  }
+
+  /**
+   * 字节口径行（P0-1）：「区块字节：原始 X → 输出 Y（省 Z 字节 / P.P%）」。
+   * 无采样（尚无改写区块）与零/负节省（升位或扩容）都有明确的中文表述，避免被误读成统计失效。
+   */
+  private static String bytesLine(Snapshot.Rewrite rewrite) {
+    if (rewrite.bytesOriginal() <= 0L) {
+      return "区块字节：无采样（尚无改写区块）";
+    }
+    if (rewrite.bytesSaved() > 0L) {
+      return "区块字节：原始 " + rewrite.bytesOriginal() + " → 输出 " + rewrite.bytesOutput()
+          + "（省 " + rewrite.bytesSaved() + " 字节 / "
+          + String.format(Locale.ROOT, "%.1f%%", rewrite.bytesSaved() * 100.0D / rewrite.bytesOriginal())
+          + "）";
+    }
+    return "区块字节：原始 " + rewrite.bytesOriginal() + " → 输出 " + rewrite.bytesOutput()
+        + "（无节省" + (rewrite.bytesSaved() < 0L
+            ? "，增加 " + (-rewrite.bytesSaved()) + " 字节（升位/扩容）" : "")
+        + "）";
   }
 
   /** 带宽各模块开关回显（一行，供 status/dump 看出每个开关的实际取值）。 */
@@ -337,6 +372,8 @@ public final class Diagnostics {
     for (String line : formatStatus(s)) {
       sb.append(line).append('\n');
     }
+    // 位宽直方图（P0-1 可选项）：改写 section 的 bitsPerBlock 分布，观察「封顶+裁剪」的降位效果
+    sb.append("调色板位宽分布（改写 section 累计）：").append(s.rewrite().paletteBitsSummary()).append('\n');
     sb.append('\n').append("---- 配置项有效值 ----\n");
     appendAntiXray(sb, s.antiXray());
     appendBandwidth(sb, s.bandwidth());
@@ -354,6 +391,21 @@ public final class Diagnostics {
     sb.append("hide-blocks=").append(c.hideBlocks().size()).append(" 种：")
         .append(String.join(", ", c.hideBlocks())).append('\n');
     sb.append("replacement-weights=").append(c.replacementWeights()).append('\n');
+    // P0-2/P0-3 新增配置的回显：高度范围、分区伪装表与逐世界覆盖段
+    sb.append("obfuscation.min-y=").append(c.obfuscationMinY() == null ? "不限制" : c.obfuscationMinY())
+        .append("，obfuscation.max-y=").append(c.obfuscationMaxY() == null ? "不限制" : c.obfuscationMaxY())
+        .append('\n');
+    sb.append("replacement-bands=").append(c.replacementBands().isEmpty()
+        ? "未配置（回落 replacement-weights）" : c.replacementBands()).append('\n');
+    if (c.worldOverrides().isEmpty()) {
+      sb.append("world-overrides=未配置（所有世界用全局默认）\n");
+    } else {
+      sb.append("world-overrides:\n");
+      for (int i = 0; i < c.worldOverrides().size(); i++) {
+        sb.append("  ").append(c.worldOverrides().get(i).pattern()).append(" → ")
+            .append(c.overrideEffective(i)).append('\n');
+      }
+    }
     sb.append("layer-obfuscation=").append(c.layerObfuscation())
         .append("，remove-block-entities=").append(c.removeBlockEntities())
         .append("，obfuscation.mode=").append(c.obfuscationMode()).append('\n');
@@ -362,6 +414,11 @@ public final class Diagnostics {
         .append("，cache-maximum-size=").append(c.neighbors().cacheMaximumSize()).append('\n');
     sb.append("occlusion.extra-occluding=").append(c.occlusion().extraOccluding())
         .append("，extra-non-occluding=").append(c.occlusion().extraNonOccluding()).append('\n');
+    sb.append("obfuscation.use-block-below=").append(c.useBlockBelow()).append('\n');
+    sb.append("proximity.instant-reveal.enabled=").append(c.proximity().instantReveal().enabled())
+        .append("，radius=").append(c.proximity().instantReveal().radius())
+        .append("，max-per-tick=").append(c.proximity().instantReveal().maxPerTick()).append('\n');
+    sb.append("proximity.over-reveal-sampling=").append(c.proximity().overRevealSampling()).append('\n');
     sb.append("proximity.enabled=").append(c.proximity().enabled())
         .append("，distance=").append(c.proximity().distance())
         .append("，interval-ticks=").append(c.proximity().intervalTicks())
@@ -412,7 +469,8 @@ public final class Diagnostics {
         .append("，max-pending-entries=").append(c.blockChanges().maxPendingEntries()).append('\n');
     sb.append("palette.enabled=").append(c.palette().enabled())
         .append("，reorder=").append(c.palette().reorder())
-        .append("，strict-verify=").append(c.palette().strictVerify()).append('\n');
+        .append("，strict-verify=").append(c.palette().strictVerify())
+        .append("，width-budget=").append(c.palette().widthBudget()).append('\n');
     sb.append("entity-culling.enabled=").append(c.entityCulling().enabled())
         .append("，raycast=").append(c.entityCulling().raycast())
         .append("，force-visible-distance=").append(c.entityCulling().forceVisibleDistance())

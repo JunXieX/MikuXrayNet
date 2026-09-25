@@ -146,7 +146,10 @@ class PeRealDataOcclusionTest {
 
     String[] mustOcclude = {
         "stone", "deepslate", "dirt", "grass_block", "netherrack", "end_stone", "obsidian",
-        "granite", "diorite", "andesite", "tuff", "calcite", "anvil", "deepslate_diamond_ore"};
+        "granite", "diorite", "andesite", "tuff", "calcite", "anvil", "deepslate_diamond_ore",
+        // P1-5：结构暴露型隐藏方块必须判为遮挡（否则显形射线会误判其可见性）
+        "bedrock", "raw_iron_block", "raw_gold_block", "raw_copper_block", "clay", "barrel",
+        "furnace", "blast_furnace", "smoker", "hopper", "dropper", "dispenser"};
     for (String name : mustOcclude) {
       assertTrue(registry.isOccluding(requireStateId(name)),
           name + " 必须判为遮挡（真机 PE 2.13.0 / V_26_2）");
@@ -154,7 +157,9 @@ class PeRealDataOcclusionTest {
 
     String[] mustNotOcclude = {
         "air", "cave_air", "water", "lava", "glass", "oak_leaves", "oak_stairs", "oak_fence",
-        "torch", "chest"};
+        "torch", "chest",
+        // P1-5：箱子族为「实心但形状小于整方块」，白名单判非遮挡（1.0.x 既有行为，保持）
+        "trapped_chest", "ender_chest", "shulker_box"};
     for (String name : mustNotOcclude) {
       assertFalse(registry.isOccluding(requireStateId(name)),
           name + " 必须判为不遮挡（真机 PE 2.13.0 / V_26_2）");
@@ -216,8 +221,27 @@ class PeRealDataOcclusionTest {
         "默认清单必须含 spawner（刷怪笼：PE 26.2 里 mob_spawner 已改名为 spawner）：" + configured);
     assertTrue(configured.contains("mossy_cobblestone"),
         "默认清单必须含 mossy_cobblestone（苔石，地牢/要塞/矿洞结构的标志物）：" + configured);
-    assertEquals(21, configured.size(),
-        "打包的 antixray.yml 默认清单应为 21 种（19 种矿石 + spawner + mossy_cobblestone）：" + configured);
+    assertEquals(38, configured.size(),
+        "打包的 antixray.yml 默认清单应为 38 种（21 种原有 + 17 种 P1-5 扩展）：" + configured);
+  }
+
+  /**
+   * P1-5 扩展清单必须在真机 PE 状态映射里逐一可解析（<b>核实而非猜测</b>）：
+   * 17 个新目标方块的注册名以 PE 2.13.0 / V_26_2 的映射数据为准。
+   */
+  @Test
+  void expandedHideBlocksResolveAgainstRealPacketEventsMapping() {
+    String[] expanded = {
+        // 容器/功能方块（多为方块实体）
+        "chest", "trapped_chest", "ender_chest", "barrel",
+        "furnace", "blast_furnace", "smoker", "hopper", "dropper", "dispenser", "shulker_box",
+        // 结构暴露型
+        "bedrock", "raw_iron_block", "raw_gold_block", "raw_copper_block", "obsidian", "clay"};
+    for (String name : expanded) {
+      int stateId = BlockStateRegistry.resolveStateId(version, name);
+      assertTrue(stateId >= 0 && stateId < registry.getUniqueBlockStateCount(),
+          "P1-5 扩展目标方块必须在 PE 真实映射（V_26_2）里可解析：" + name + "（解析结果 " + stateId + "）");
+    }
   }
 
   /**

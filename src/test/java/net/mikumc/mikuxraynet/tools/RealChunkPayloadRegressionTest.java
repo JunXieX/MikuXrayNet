@@ -254,7 +254,10 @@ class RealChunkPayloadRegressionTest {
 
     ChunkCodec codec = new ChunkCodec(registry, ChunkVersionFlags.PAPER_26_2);
     int sectionCount = detectSectionCount(codec, chunkBytes);
-    ObfuscationProcessor processor = processor(codec, shippedHideBlocks());
+    // 真机负载由「P1-5 清单扩展前」的 21 种目标清单产出；按产出当时的口径复跑，
+    // 才能回答「改写结果是否已落进缓存字节」——用新清单复跑会把负载里本就不在旧清单中的
+    // 箱子/基岩等方块算成「可替换」，比例判据随之失真（清单本身的对错由注册表测试核实）。
+    ObfuscationProcessor processor = processor(codec, LEGACY_HIDE_BLOCKS);
 
     // 这份负载是「已改写」的结果：若改写结果真的落进了字节，则再跑一遍应当几乎无可替换
     // （只有区块边界因缺少邻块快照、按 missing-policy=hide 多算的几个可能被再次替换）。
@@ -341,7 +344,23 @@ class RealChunkPayloadRegressionTest {
     }
   }
 
-  /** 按真机配置装配处理器：目标取自打包的 antixray.yml，伪装权重=stone 10/deepslate 8/netherrack 6。 */
+  /**
+   * 产出本负载当时的 21 种目标清单（P1-5 扩展前）。
+   *
+   * <p>负载 {@code real-chunk-payload.bin} 由打包了旧清单的插件版本写进磁盘缓存；复跑判据
+   * （「再跑一遍应几乎无可替换」）只有在<b>与产出方相同的目标集合</b>下才成立，故此处显式固化旧清单，
+   * 不随打包 antixray.yml 的后续扩展漂移。扩展清单本身的可解析性与覆盖面由
+   * {@code PeRealDataOcclusionTest} / {@code ConfigDefaultsTest} 核实。
+   */
+  private static final List<String> LEGACY_HIDE_BLOCKS = List.of(
+      "coal_ore", "deepslate_coal_ore", "iron_ore", "deepslate_iron_ore",
+      "copper_ore", "deepslate_copper_ore", "gold_ore", "deepslate_gold_ore",
+      "redstone_ore", "deepslate_redstone_ore", "lapis_ore", "deepslate_lapis_ore",
+      "diamond_ore", "deepslate_diamond_ore", "emerald_ore", "deepslate_emerald_ore",
+      "nether_gold_ore", "nether_quartz_ore", "ancient_debris",
+      "spawner", "mossy_cobblestone");
+
+  /** 按真机配置装配处理器：目标取传入清单，伪装权重=stone 10/deepslate 8/netherrack 6。 */
   private static ObfuscationProcessor processor(ChunkCodec codec, List<String> hideBlocks) {
     BitSet targets = new BitSet(registry.getUniqueBlockStateCount());
     for (String name : hideBlocks) {

@@ -106,4 +106,33 @@ public class IndirectPalette implements Palette {
       this.byValue[values[id]] = (byte) id;
     }
   }
+
+  /**
+   * 用保留的值<b>子集</b>重建索引表（裁剪掉未列出的旧条目）。
+   *
+   * <p>与 {@link #rebuild(int[])}（全量排列）不同，本方法允许 {@code values} 只包含原值集合的一部分：
+   * 被裁剪条目的 {@code byValue} 反查记录会被清回哨兵值，之后再次遇到这些方块状态时会作为
+   * 新条目重新登记，不会命中残留的旧索引——这是「引用计数为 0 的失效条目裁剪」的正确性前提。
+   */
+  void retain(int[] values) {
+    // 先按旧 size 清空全部反查记录，再登记保留条目（顺序不能反，否则清空会抹掉新登记）
+    for (int id = 0; id < this.size; id++) {
+      this.byValue[this.byId[id]] = (byte) 0xFF;
+    }
+    this.size = values.length;
+    for (int id = 0; id < values.length; id++) {
+      this.byId[id] = values[id];
+      this.byValue[values[id]] = (byte) id;
+    }
+  }
+
+  @Override
+  public int size() {
+    return this.size;
+  }
+
+  @Override
+  public boolean contains(int value) {
+    return value >= 0 && value < this.byValue.length && (this.byValue[value] & 0xFF) != 0xFF;
+  }
 }

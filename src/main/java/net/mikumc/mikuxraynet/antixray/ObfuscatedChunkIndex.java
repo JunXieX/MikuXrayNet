@@ -170,6 +170,25 @@ public final class ObfuscatedChunkIndex {
   }
 
   /**
+   * 查询一个绝对方块坐标当前是否仍在伪装清单里（只读，不修改任何状态）。
+   *
+   * <p>供事件驱动即时显形的触发判定使用：出站方块变更包的解析线程会调用本方法做
+   * 「邻域内是否还有伪装坐标」的初筛，因此实现必须是线程安全的纯读（与 {@link #removePosition}
+   * 使用同一套编码与查找逻辑）。
+   */
+  public boolean containsPosition(String worldName, int x, int y, int z) {
+    if (worldName == null) {
+      return false;
+    }
+    ChunkEntry entry = chunks.get(new ChunkKey(worldName, x >> 4, z >> 4));
+    if (entry == null) {
+      return false;
+    }
+    int local = ((y - entry.minHeight()) << 8) | ((z & 15) << 4) | (x & 15);
+    return Arrays.binarySearch(entry.locals(), local) >= 0;
+  }
+
+  /**
    * 使一个区块的伪装清单失效（区块卸载时调用）。
    *
    * @return 是否命中并移除

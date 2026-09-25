@@ -18,14 +18,47 @@ enabled: true
 # 留空（[]）表示对所有世界生效。
 worlds: []
 
+# ---------------------------------------------------------------------------
+# 逐世界覆盖（world-overrides，P0-2 新增）：
+#   为单个世界（或一批世界）覆盖 obfuscation 的任意子键，未覆盖的键回落上方全局默认。
+#   · 键名是世界名「模式」：精确名（world_nether）或通配（world_*，* 匹配任意字符）；
+#   · 匹配优先级：精确名 > 通配；多个通配同时命中时取「模式最长」的（最具体）；
+#   · 每个世界段下都挂一层 obfuscation:，可覆盖的子键与全局 obfuscation 相同：
+#       hide-blocks / replacement-weights / replacement-bands / min-y / max-y / mode；
+#   · 只写需要覆盖的键即可（例如下界只换伪装方块清单，其余全部沿用全局）；
+#   · 本段影响改写结果并参与缓存指纹（不同世界各自生效，缓存互不串包）；
+#     修改后执行 /mikuxraynet reload 生效。
+# 下方为完整示例（默认全部注释，不覆盖任何世界）：
+# world-overrides:
+#   world_nether:                       # 下界：换目标与伪装清单 + 限定高度
+#     obfuscation:
+#       hide-blocks: [nether_gold_ore, nether_quartz_ore, ancient_debris]
+#       replacement-weights: {netherrack: 10, basalt: 4, blackstone: 2}
+#       min-y: 0                        # 该世界的高度范围（可选，缺省不限制；判定与替换都跳过范围外方块）
+#       max-y: 120
+#   world_the_end:                      # 末地：只覆盖隐藏清单，其余回落全局
+#     obfuscation:
+#       hide-blocks: [end_stone_bricks, purpur_block]
+#   resource_*:                         # 通配：所有 resource_ 前缀的世界用 enclosed 模式
+#     obfuscation:
+#       mode: enclosed
+
+
 obfuscation:
   # 需要隐藏（伪装）的方块名称列表。
   # 名称使用 Minecraft 注册名（小写、无需 minecraft: 前缀），对应方块及其
-  # 全部状态都会被识别为目标。
-  # 共 21 种：19 种矿石（含深层变体）之外，另含两种与矿等价的透视目标——
+  # 全部状态都会被识别为目标。也支持 tag(...) 语法（见下方说明）。
+  # 共 38 种：
+  # 【21 种原有】19 种矿石（含深层变体）之外，另含两种与矿等价的透视目标——
   #   spawner          刷怪笼：透视端常用来定位地牢/要塞（真机 PE 26.2 映射里注册名就是 spawner，
   #                    旧的 mob_spawner 已不存在，填错名字会在启动日志里提示「无法识别」）。
   #   mossy_cobblestone 苔石：天然只出现在地牢/要塞/矿洞结构里，是透视定位结构的标志物。
+  # 【17 种扩展】对齐 Paper 默认 hidden-blocks 与 Orebfuscator 的目标面：
+  #   · 容器/功能方块：透视端可凭箱子/熔炉等的轮廓与方块实体数据定位地下基地与矿洞入口；
+  #     这些方块多带方块实体，被伪装 section 内其方块实体本就会被 remove-block-entities 剔除，
+  #     与伪装逻辑不冲突（名称已用真机 PE 26.2 状态表逐一核实）。
+  #   · 结构暴露型：基岩层与黏土斑块可反推坐标与地形，粗金属块直接对应富矿脉，
+  #     黑曜石是折跃门/灌溉结构的标志物。
   hide-blocks:
     - coal_ore
     - deepslate_coal_ore
@@ -48,6 +81,35 @@ obfuscation:
     - ancient_debris
     - spawner
     - mossy_cobblestone
+    # —— 容器/功能方块（多为方块实体，remove-block-entities 会一并剔除其数据）——
+    - chest
+    - trapped_chest
+    - ender_chest
+    - barrel
+    - furnace
+    - blast_furnace
+    - smoker
+    - hopper
+    - dropper
+    - dispenser
+    - shulker_box
+    # —— 结构暴露型方块 ——
+    - bedrock
+    - raw_iron_block
+    - raw_gold_block
+    - raw_copper_block
+    - obsidian
+    - clay
+  #
+  # tag(...) 语法（可选）：条目写成 tag(名称) 时会在启动期展开为该 tag 下的全部方块，
+  # 例如 tag(diamond_ores) = diamond_ore + deepslate_diamond_ore。
+  # 离线无法查 Bukkit 的 tag 注册表，因此内置了一张「常用 tag 静态映射表」（_ores 系列、
+  # base_stone_overworld / base_stone_nether / base_stone_end 等）；映射表之外的 tag 名
+  # 会在启动日志 WARN 提示并忽略该条目（不猜测成员、绝不误藏）。普通名称与 tag(...) 可混用。
+  #
+  # 示例（默认不启用，需要时自行改写上面的清单）：
+  #   - tag(diamond_ores)      # = diamond_ore + deepslate_diamond_ore
+  #   - tag(base_stone_nether) # = netherrack + basalt + blackstone
 
   # 伪装范围模式：enclosed | all（非法值一律按 all 处理）。
   #   all（默认）——所有目标矿一律伪装，不看 6 面遮挡。透视端看不到任何真实矿物（含矿洞壁上
@@ -62,10 +124,35 @@ obfuscation:
 
   # 伪装方块与随机权重（权重越大概率越高，必须为正整数）。
   # 建议只填地下常见方块，避免出现违和感。
+  # 这是「回落表」：当 replacement-bands 未启用、或某高度未被任何分段覆盖时使用。
   replacement-weights:
     stone: 10
     deepslate: 8
     netherrack: 6
+
+  # 按 Y 分区的加权伪装表（P0-3 新增，默认不启用）：
+  # 每个分段声明一个高度区间（min-y/max-y，含端点）与该区间内的伪装权重表；
+  # 改写时按方块绝对 Y 找「第一个覆盖它的分段」取伪装候选，未落在任何分段内的高度
+  # 回落上方 replacement-weights。分段优先于 replacement-weights（配了即生效）。
+  # 用途：深层用深板岩系、浅层用石头系，伪装观感与真实地层一致，抗统计识别更强。
+  # 性能：每段的累计权重表都在启动期预构建为 int 数组，热路径只有一次小数组线性扫描，
+  #       无逐方块 HashMap / 装箱；段内候选还会与「调色板位宽预算」联动（见 bandwidth.yml
+  #       的 palette.width-budget）——调色板写满时优先选用已在调色板内的候选避免升位。
+  # 示例（默认注释，需要时取消注释）：
+  # replacement-bands:
+  #   - min-y: -64
+  #     max-y: -1
+  #     weights: {deepslate: 10, tuff: 4, stone: 2}
+  #   - min-y: 0
+  #     max-y: 320
+  #     weights: {stone: 10, andesite: 3, dirt: 2}
+
+  # 高度范围（P0-2 新增，可选；min-y/max-y 缺省即不限制）：
+  # 只伪装该绝对高度范围内的目标方块，范围外的方块判定与替换都跳过（如地表 y>=60 不伪装）。
+  # 逐世界可用 world-overrides 覆盖（见文件顶部说明）。
+  # 示例（默认注释）：
+  # min-y: -64
+  # max-y: 60
 
   # true：同一高度层统一使用同一种伪装方块（层状伪装，观感更整齐）；
   # false：逐方块独立随机（更不易被模式识别）。
@@ -75,6 +162,13 @@ obfuscation:
   #       则从区块封包中一并剔除其方块实体数据，防止客户端残留幽灵方块实体（如隐形箱子/刷怪笼）。
   # false：跳过剔除（省一次逐方块实体的比对），封包保留服务端原发的全部方块实体数据。
   remove-block-entities: true
+
+  # use-block-below（默认 false，保持既有行为）：命中伪装时，若该方块「下方紧邻方块」可用
+  # （非空气/非流体、且不是目标方块），优先用它当伪装方块（观感更自然：伪装方块与脚下地层一致，
+  # 不会出现「石头层里冒出深板岩」这类违和拼接；同竞品 ObfuscationProcessor 的思路）。
+  # 下方不可用（空气/流体/真矿）时自动退回 replacement-weights 随机伪装，绝不漏伪装。
+  # 注意：本项改变改写结果，参与缓存指纹；切换后（含磁盘缓存）会整体失效重建。
+  use-block-below: false
 
 occlusion:
   # 遮挡判定的「人工纠正表」。内置判定用 PacketEvents 的方块语义近似：
@@ -201,6 +295,30 @@ proximity:
 
     # 每条射线最多采样的体素数：越大越准、越费 CPU（每个采样点 = 主线程一次读方块）。
     samples: 16
+
+  # 事件驱动即时显形（周期巡检的「补充」，周期兜底不变）：插件在出站封包里观测到方块变更
+  #（挖开/爆炸/活塞等，服务端自己下发的 BLOCK_CHANGE / MULTI_BLOCK_CHANGE）时，若该变更落在
+  # 玩家身边（曼哈顿距离 ≤ radius）且变更邻域内仍有伪装坐标，就「当 tick」把邻域内
+  # 「已伪装且视线可见」的坐标显形——不再等最多 interval-ticks（0.2 秒）的巡检窗口。
+  # 与周期巡检共用同一套显形链路（射线判定 / 已显形标记 / 统计）：同一坐标当 tick 只发一次，
+  # 周期巡检也会跳过已显形坐标，两者不会重复发包；变更在半径外等事件路径触不到的场景仍由周期兜底。
+  instant-reveal:
+    # 总开关（默认开启；关闭后完全回到纯周期巡检行为）。
+    enabled: true
+
+    # 曼哈顿半径（格）：变更必须落在玩家身边该半径内才触发（默认 2，与竞品 updateRadius 一致）。
+    # 半径越大，越远处的爆炸也能即时修复，但单次邻域评估量按立方增长；钳制范围 1~8。
+    radius: 2
+
+    # 每玩家每 tick 事件显形限额（默认 16，防爆刷：TNT 连爆时最多每 tick 补发 16 个真实方块）。
+    # 未轮到的坐标保留在伪装清单里，由下一 tick 的限额或周期巡检继续显形，不会丢失。0 = 关闭事件显形。
+    max-per-tick: 16
+
+  # 过度显形量化（只计数、不改任何行为）：显形发包前按 1/N 抽样，若「已显形集合」已含该坐标
+  #（说明客户端应已可见，该包是浪费的），按「过度」计数。/mxnet status 与 dump 会显示
+  # 「过度显形（抽样） X / 抽样 Y」——X/Y 即浪费占比的无偏估计（样本足够大时），
+  # 用于评估是否需要收紧显形策略。默认 20（1/20 抽样，开销可忽略）；0 = 关闭统计。
+  over-reveal-sampling: 20
 
 disk-cache:
   # 磁盘缓存：把「已改写完成的区块负载」持久化到

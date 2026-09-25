@@ -72,6 +72,7 @@ public final class AntiXrayRuntime {
 
   /** 反矿透装配：任一环节不可用都只停用该模块并打印中文原因，不影响其它功能。 */
   void startAntiXray() {
+    logDependencyAdvice();
     MikuConfig config = plugin.mikuConfig();
     AntiXrayConfig antiXray = config.antiXray();
     if (!antiXray.enabled()) {
@@ -92,13 +93,15 @@ public final class AntiXrayRuntime {
 
     BlockStateRegistry registry = packetEventsHook.registry();
     ChunkCodec codec = new ChunkCodec(registry, versionFlags());
-    // 调色板压缩重排由 bandwidth.yml 的 palette 段控制（与反矿透共用同一次编码）。
-    // palette.enabled=false（或带宽总开关关闭）时取 DISABLED，即完全不重排、零开销。
+    // 调色板压缩重排/位宽预算封顶由 bandwidth.yml 的 palette 段控制（与反矿透共用同一次编码）。
+    // palette.enabled=false（或带宽总开关关闭）时取 DISABLED，即完全不重排、不封顶，零开销。
     BandwidthConfig.Palette palette = config.bandwidth().palette();
     boolean paletteUsable = config.bandwidth().enabled() && palette.enabled();
     ObfuscationProcessor processor = ObfuscationProcessor.create(codec, registry, antiXray, logger,
         new ObfuscationProcessor.PaletteOptions(paletteUsable && palette.reorder(),
-            paletteUsable && palette.strictVerify()));
+            paletteUsable && palette.strictVerify(),
+            // P0-1 位宽预算封顶（默认开）：修包体膨胀 + 拿降位宽收益
+            paletteUsable && palette.widthBudget()));
     if (!processor.isActive()) {
       logger.warning("未解析到有效的隐藏方块或伪装方块，反矿透模块停用（请检查 antixray.yml）");
       return;
@@ -149,7 +152,6 @@ public final class AntiXrayRuntime {
     // 注册时机（反矿透装配成功后、邻近显形装配前）与拆分前一致。
     plugin.registerWorldUnloadInvalidation();
     startProximity(antiXray, chunkIndex, revealed, proximityStats);
-
     logger.info("反矿透已启用：目标方块 " + antiXray.hideBlocks().size() + " 种，伪装方块 "
         + antiXray.replacementWeights().size() + " 种；伪装模式 " + antiXray.obfuscationMode()
         + "；区块边界邻块快照 "
@@ -181,18 +183,36 @@ public final class AntiXrayRuntime {
       return;
     }
 
+    // 先建邻近显形器（持有显形链路），再把它交给方块变更观察监听器做事件驱动即时显形（P1-4）。
+    ProximityRevealer revealer = chunkIndex != null && revealed != null
+        ? new ProximityRevealer(plugin, protocolManager, antiXray, chunkIndex, revealed, stats,
+            bypassRegistry, workPool)
+        : null;
     this.blockChangeRevealListener = new BlockChangeRevealListener(plugin, protocolManager,
-        chunkIndex, revealed, stats, diskCacheStore);
+        chunkIndex, revealed, stats, diskCacheStore, revealer);
     try {
       blockChangeRevealListener.start();
-      if (chunkIndex != null && revealed != null) {
-        this.proximityRevealer = new ProximityRevealer(plugin, protocolManager, antiXray,
-            chunkIndex, revealed, stats, bypassRegistry, workPool);
-        proximityRevealer.start();
+      if (revealer != null) {
+        this.proximityRevealer = revealer;
+        revealer.start();
       }
     } catch (Throwable throwable) {
       logger.warning("邻近显形装配失败（不影响反矿透主体）：" + throwable.getMessage());
       stopProximity();
+    }
+  }
+
+  /**
+   * 依赖守卫增强提示（P2-6d，启动期调用一次，只提示不阻断）：
+   * a) 前置版本低于建议下限时提示「可能不兼容」（版本号从插件描述文件读取，读不到跳过）；
+   * b) 环境里有其它反矿透插件时提示「双重改写区块包，建议只留一个」。
+   */
+  private void logDependencyAdvice() {
+    try {
+      DependencyGuard.logVersionCompatibilityWarning(logger);
+      DependencyGuard.logConflictingAntiXrayWarning(logger);
+    } catch (Throwable throwable) {
+      logger.log(Level.WARNING, "依赖守卫提示输出失败（不影响启动）", throwable);
     }
   }
 

@@ -422,8 +422,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** 改写并回填内存缓存与磁盘缓存。 */
   private void rewrite(RewriteTask task, ChunkPacketAccessor accessor, byte[] source, long sourceHash,
       NeighborEdges neighbors) {
+    // 世界名与最低 Y 一并传入：逐世界覆盖（P0-2）按世界取档案，min-y/max-y 过滤与
+    // 分区伪装表（P0-3）需要把 section 内相对 Y 换算成绝对 Y。
     ObfuscationProcessor.Result result = processor.rewrite(source, task.sectionCount(),
-        seed(task.worldName(), task.chunkX(), task.chunkZ()), neighbors);
+        seed(task.worldName(), task.chunkX(), task.chunkZ()), neighbors,
+        task.worldName(), task.minHeight());
 
     if (result.failed()) {
       // 解码/重编码异常：必须可观测——否则「本该伪装却失败」会被并进「跳过」里，看起来一切正常
@@ -433,6 +436,21 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     if (result.changed()) {
       stats.chunksRewritten.increment();
       stats.blocksReplaced.add(result.obfuscatedPositions().length);
+      // 字节口径统计（P0-1）：只对真正改写的区块采样，原始字节 → 输出字节（节省 = 两者之差）。
+      // 未改动/失败放行的区块原样字节恒等，计入只会稀释「省了多少」的比例。
+      long originalBytes = source.length;
+      long outputBytes = result.data().length;
+      stats.bytesOriginal.add(originalBytes);
+      stats.bytesOutput.add(outputBytes);
+      stats.bytesSaved.add(originalBytes - outputBytes);
+      // 位宽直方图（P0-1 诊断）：观察封顶/裁剪/降位的实际效果
+      if (result.sectionBits() != null) {
+        for (int bits : result.sectionBits()) {
+          if (bits >= 0) {
+            stats.recordPaletteBits(bits);
+          }
+        }
+      }
     } else {
       stats.chunksSkipped.increment();
     }

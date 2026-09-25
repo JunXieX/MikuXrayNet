@@ -42,6 +42,11 @@ import org.bukkit.plugin.Plugin;
  * <p><b>线程与内存纪律</b>：回调里只做「读包内坐标 + 查内存索引 + 递增内存代次」，不读 World 的方块；
  * 注销按「世界名 + 坐标」精确定位，因此不需要扫描全部玩家或全部区块。不检查取消状态：即使原包被
  * 别的插件取消，最坏结果也只是少发一个冗余显形包，不会丢失更新。
+ *
+ * <p><b>事件驱动即时显形（P1-4，可选）</b>：构造时传入 {@link ProximityRevealer} 后，每次观测到
+ * 变更还会调用 {@link ProximityRevealer#onBlockChangeObserved}——变更邻域内仍有伪装坐标时，
+ * 由邻近显形当 tick 补发「玩家身边、已伪装且视线可见」的坐标（周期巡检兜底不变）。
+ * 未传入（{@code null}）时行为与旧版完全一致。
  */
 public final class BlockChangeRevealListener extends PacketAdapter {
 
@@ -51,6 +56,11 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private final RevealedSet revealedSet;
   private final ProximityStats stats;
   private final DiskCacheStore diskCache;
+  /**
+   * 事件驱动即时显形（P1-4，可选）：观测到方块变更时交给邻近显形做「当 tick 补发邻域」。
+   * {@code null} 表示不启用（只做注销与代次递增，行为与旧版完全一致）。
+   */
+  private final ProximityRevealer instantRevealer;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
   private AsyncListenerHandler handler;
@@ -64,6 +74,17 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   public BlockChangeRevealListener(Plugin plugin, ProtocolManager protocolManager,
       ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
       DiskCacheStore diskCache) {
+    this(plugin, protocolManager, obfuscatedChunkIndex, revealedSet, stats, diskCache, null);
+  }
+
+  /**
+   * 完整构造（追加事件驱动即时显形）。
+   *
+   * @param instantRevealer 邻近显形器；{@code null} 表示不启用事件显形
+   */
+  public BlockChangeRevealListener(Plugin plugin, ProtocolManager protocolManager,
+      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
+      DiskCacheStore diskCache, ProximityRevealer instantRevealer) {
     super(plugin, ListenerPriority.HIGHEST, PacketType.Play.Server.BLOCK_CHANGE,
         PacketType.Play.Server.MULTI_BLOCK_CHANGE);
     this.plugin = plugin;
@@ -72,6 +93,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     this.revealedSet = revealedSet;
     this.stats = stats;
     this.diskCache = diskCache;
+    this.instantRevealer = instantRevealer;
   }
 
   /** 注册异步监听器（真异步扣包，与合并模块同一条链路）。 */
@@ -106,9 +128,9 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       String worldName = worldNameOf(player);
       PacketType type = event.getPacketType();
       if (type == PacketType.Play.Server.BLOCK_CHANGE) {
-        unregisterSingle(event.getPacket(), worldName);
+        unregisterSingle(player, event.getPacket(), worldName);
       } else if (type == PacketType.Play.Server.MULTI_BLOCK_CHANGE) {
-        unregisterMulti(event.getPacket(), worldName);
+        unregisterMulti(player, event.getPacket(), worldName);
       }
     } catch (Throwable throwable) {
       // fail-open：解析失败只跳过本次注销，绝不取消或改写原包
@@ -117,17 +139,16 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   }
 
   /** 单方块变更：坐标即绝对方块坐标。 */
-  private void unregisterSingle(PacketContainer packet, String worldName) {
+  private void unregisterSingle(Player player, PacketContainer packet, String worldName) {
     BlockPosition position = packet.getBlockPositionModifier().readSafely(0);
     if (position == null) {
       return;
     }
-    unregisterCoordinate(worldName, position.getX(), position.getY(), position.getZ());
-    markChanged(worldName, position.getX(), position.getZ());
+    observeChange(player, worldName, position.getX(), position.getY(), position.getZ());
   }
 
   /** 多方块变更：section 坐标 + 区块内相对坐标（与本插件合并包一致的位置编码）。 */
-  private void unregisterMulti(PacketContainer packet, String worldName) {
+  private void unregisterMulti(Player player, PacketContainer packet, String worldName) {
     BlockPosition section = packet.getSectionPositions().readSafely(0);
     short[] positions = packet.getShortArrays().readSafely(0);
     if (section == null || positions == null) {
@@ -141,8 +162,22 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       int x = baseX + (packed >> 8 & 15);
       int z = baseZ + (packed >> 4 & 15);
       int y = baseY + (packed & 15);
-      unregisterCoordinate(worldName, x, y, z);
-      markChanged(worldName, x, z);
+      observeChange(player, worldName, x, y, z);
+    }
+  }
+
+  /**
+   * 统一的变更观察入口：先注销（既有行为），再触发事件显形（P1-4，可选）。
+   *
+   * <p>两个动作共用同一次坐标解析，热路径上不产生任何额外分配；事件显形的全部筛选
+   * （邻域初筛、身边半径、射线、限额、去重）都在 {@link ProximityRevealer#onBlockChangeObserved}
+   * 内部完成，未启用时只有一个空引用判断的开销。
+   */
+  private void observeChange(Player player, String worldName, int x, int y, int z) {
+    unregisterCoordinate(worldName, x, y, z);
+    markChanged(worldName, x, z);
+    if (instantRevealer != null) {
+      instantRevealer.onBlockChangeObserved(player, worldName, x, y, z);
     }
   }
 

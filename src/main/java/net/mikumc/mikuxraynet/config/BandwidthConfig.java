@@ -43,8 +43,18 @@ public final class BandwidthConfig {
    *                     乱序调色板 +1.4%~+2.3%；ZSTD level 3（磁盘缓存口径）下全实心 +8.3%、
    *                     稀疏矿脉 +1.6%~+11.0%、乱序调色板 +6.4%~+8.4%。仅洞穴与主世界地下略优（约 -0.3%~-3.6%），
    *                     而耗时普遍增至约 4~6 倍。故默认关闭；{@code strictVerify} 亦仅在 {@code reorder=true} 时有意义。
+   * @param strictVerify 重排自检（仅在 {@code reorder=true} 时有意义）。
+   * @param widthBudget  位宽预算封顶（P0-1，默认 {@code true}）：改写前把「可能引入的新状态数」与当前位宽
+   *                     容量对账，优先选用已在调色板内的伪装方块避免升位；改写后裁剪引用计数为 0 的
+   *                     失效条目并在可能时降位宽（位宽单调不增）。修复「4 位 section 被替换成下界岩后
+   *                     升到 5 位、包体膨胀约 25%」的问题，兼得降位宽收益。关闭时走原路径（只升不降）。
    */
-  public record Palette(boolean enabled, boolean reorder, boolean strictVerify) {
+  public record Palette(boolean enabled, boolean reorder, boolean strictVerify, boolean widthBudget) {
+
+    /** 旧三参构造（兼容既有调用）：widthBudget 默认开启（P0-1 新开关的默认值）。 */
+    public Palette(boolean enabled, boolean reorder, boolean strictVerify) {
+      this(enabled, reorder, strictVerify, true);
+    }
   }
 
   /**
@@ -125,7 +135,9 @@ public final class BandwidthConfig {
             root.getBoolean("palette.enabled", true),
             // 默认 false：实测开启重排会使压缩字节变大且耗时增加（见 Palette 的说明）
             root.getBoolean("palette.reorder", false),
-            root.getBoolean("palette.strict-verify", false)),
+            root.getBoolean("palette.strict-verify", false),
+            // P0-1 位宽预算封顶，默认 true：修复「调色板写满后替换升位 → 包体膨胀」并拿降位宽收益
+            root.getBoolean("palette.width-budget", true)),
         new EntityCulling(
             root.getBoolean("entity-culling.enabled", true),
             root.getBoolean("entity-culling.raycast", true),

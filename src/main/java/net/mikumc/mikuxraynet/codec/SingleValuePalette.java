@@ -55,4 +55,14 @@ public class SingleValuePalette implements Palette {
       ByteBufUtil.writeVarInt(buffer, this.value);
     }
   }
+
+  @Override
+  public int size() {
+    return this.value == -1 ? 0 : 1;
+  }
+
+  @Override
+  public boolean contains(int value) {
+    return this.value == value;
+  }
 }

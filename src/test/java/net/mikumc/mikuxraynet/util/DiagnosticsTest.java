@@ -29,8 +29,9 @@ class DiagnosticsTest {
   private static Diagnostics.Snapshot fixed(BandwidthConfig bandwidth) {
     return new Diagnostics.Snapshot(
         new Diagnostics.Snapshot.Env(true, true, false, true, 1, "Paper 1.20.4", "25"),
-        new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 100L, 331L, 5L, 2L, 1L, 2L),
-        new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L),
+        new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 100L, 331L, 5L, 2L, 1L, 2L,
+            0L, 0L, 0L, "无采样"),
+        new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 40L, 6L),
         new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L),
         new Diagnostics.Snapshot.Throttle(20L, 30L, 4L, 40L, 12L,
             6L, 5L, 4, 40L, 7L, 3L, 2, 3L, 8L, 9L, 4L),
@@ -68,6 +69,8 @@ class DiagnosticsTest {
         "「跳过」必须写明是「坐标跳过」，否则会被误读成「整块跳过 = 0 → 整块跳过没生效」：" + text);
     assertTrue(text.contains("视锥剔除 3"), text);
     assertTrue(text.contains("射线剔除 2"), text);
+    assertTrue(text.contains("过度显形（抽样） 6 / 抽样 40"),
+        "过度显形量化必须显示「浪费数 / 抽样数」，否则无法评估显形策略是否需要收紧：" + text);
     assertTrue(text.contains("显形索引：伪装区块 7（坐标 41）｜已显形 坐标 12（当前在线）｜累计登记 108｜安全阀触发 3/2"),
         "状态面板必须分列伪装区块数、伪装坐标数、实时已显形坐标数、累计登记数与安全阀触发数"
             + "（否则「发送 N 但已显形 0」这类口径误读会静默发生）：" + text);

@@ -50,18 +50,76 @@ class ConfigDefaultsTest {
     assertEquals(300, config.proximity().expireSeconds(), "显形索引过期默认 300 秒（原为 120）");
   }
 
-  /** 默认隐藏清单必须是 21 种，含新加入的两种「与矿等价」的透视目标。 */
+  /** 默认隐藏清单必须是 38 种：21 种原有（19 矿 + spawner + 苔石）+ 17 种 P1-5 扩展。 */
   @Test
   void defaultHideBlocksIncludeSpawnerAndMossyCobblestone() {
     AntiXrayConfig config = AntiXrayConfig.from(yaml("enabled: true\n"));
 
-    assertEquals(21, config.hideBlocks().size(),
-        "默认隐藏清单 21 种（19 种矿石 + spawner + mossy_cobblestone）：" + config.hideBlocks());
+    assertEquals(38, config.hideBlocks().size(),
+        "默认隐藏清单 38 种（19 种矿石 + spawner + mossy_cobblestone + 17 种 P1-5 扩展）："
+            + config.hideBlocks());
     assertTrue(config.hideBlocks().contains("spawner"),
         "必须隐藏刷怪笼（真机 PE 26.2 注册名就是 spawner）：" + config.hideBlocks());
     assertTrue(config.hideBlocks().contains("mossy_cobblestone"),
         "必须隐藏苔石（地牢/要塞/矿洞结构的标志物）：" + config.hideBlocks());
     assertTrue(config.hideBlocks().contains("ancient_debris"), "原有矿种不得丢失");
+    // P1-5 扩展：容器/功能方块 + 结构暴露型
+    String[] expanded = {"chest", "trapped_chest", "ender_chest", "barrel", "furnace",
+        "blast_furnace", "smoker", "hopper", "dropper", "dispenser", "shulker_box",
+        "bedrock", "raw_iron_block", "raw_gold_block", "raw_copper_block", "obsidian", "clay"};
+    for (String name : expanded) {
+      assertTrue(config.hideBlocks().contains(name),
+          "P1-5 扩展清单必须包含 " + name + "：" + config.hideBlocks());
+    }
+  }
+
+  /** 新增配置键的默认值：use-block-below 关（行为不变）、事件显形开且限额保守、抽样 1/20。 */
+  @Test
+  void newFeatureDefaultsAreConservative() {
+    AntiXrayConfig config = AntiXrayConfig.from(yaml("enabled: true\n"));
+    assertFalse(config.useBlockBelow(), "use-block-below 默认关闭（行为不变）");
+    assertTrue(config.proximity().instantReveal().enabled(), "事件驱动即时显形默认开启");
+    assertEquals(2, config.proximity().instantReveal().radius(), "事件显形曼哈顿半径默认 2");
+    assertEquals(16, config.proximity().instantReveal().maxPerTick(), "事件显形每玩家每 tick 限额默认 16");
+    assertEquals(20, config.proximity().overRevealSampling(), "过度显形抽样默认 1/20");
+    assertFalse(config.proximity().instantReveal().enabled()
+        && config.proximity().instantReveal().maxPerTick() <= 0, "开启时限额必须为正");
+  }
+
+  /** use-block-below / 事件显形配置可显式解析，非法/极端值被钳制。 */
+  @Test
+  void newFeatureKeysParseAndClamp() {
+    AntiXrayConfig on = AntiXrayConfig.from(yaml(
+        "obfuscation:\n"
+        + "  use-block-below: true\n"
+        + "proximity:\n"
+        + "  instant-reveal:\n"
+        + "    enabled: false\n"
+        + "    radius: 99\n"
+        + "    max-per-tick: 0\n"
+        + "  over-reveal-sampling: 1\n"));
+    assertTrue(on.useBlockBelow(), "use-block-below 可显式开启");
+    assertFalse(on.proximity().instantReveal().enabled(), "事件显形可显式关闭");
+    assertEquals(8, on.proximity().instantReveal().radius(), "radius 超限钳制到 8");
+    assertEquals(0, on.proximity().instantReveal().maxPerTick(), "max-per-tick=0 即关闭事件显形");
+    assertEquals(1, on.proximity().overRevealSampling(), "抽样率 1 表示全量复核");
+
+    AntiXrayConfig negative = AntiXrayConfig.from(yaml(
+        "proximity:\n"
+        + "  instant-reveal:\n"
+        + "    radius: -5\n"
+        + "  over-reveal-sampling: -3\n"));
+    assertEquals(1, negative.proximity().instantReveal().radius(), "radius 负值钳制到 1");
+    assertEquals(0, negative.proximity().overRevealSampling(), "抽样负值归 0（关闭）");
+  }
+
+  /** 配置指纹：影响改写结果的 use-block-below 切换必须使指纹变化（缓存不得复用）。 */
+  @Test
+  void configHashChangesWhenUseBlockBelowFlips() {
+    AntiXrayConfig off = AntiXrayConfig.from(yaml("enabled: true\n"));
+    AntiXrayConfig on = AntiXrayConfig.from(yaml("obfuscation:\n  use-block-below: true\n"));
+    assertNotEquals(off.configHash(), on.configHash(),
+        "use-block-below 改变改写结果，必须参与配置指纹");
   }
 
   /** 平台判定兜底：缺失/非法值回落 auto，显式值可解析（手动指定的唯一出口）。 */

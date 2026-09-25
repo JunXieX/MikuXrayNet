@@ -19,4 +19,18 @@ public interface Palette {
   void read(ByteBuf buffer);
 
   void write(ByteBuf buffer);
+
+  /**
+   * 当前调色板条目数（单值调色板为 1，直接调色板为 0）。
+   *
+   * <p>供反矿透的「位宽预算封顶」计算剩余空位：间接调色板的容量为 {@code 1 << bitsPerBlock}。
+   */
+  int size();
+
+  /**
+   * 调色板是否已包含某方块状态（供预算筛选判断「替换方块是否已在调色板内」）。
+   *
+   * <p>直接调色板没有容量限制，恒返回 {@code true}。
+   */
+  boolean contains(int value);
 }

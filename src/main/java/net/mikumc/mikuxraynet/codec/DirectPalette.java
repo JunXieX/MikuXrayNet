@@ -28,4 +28,16 @@ public class DirectPalette implements Palette {
   @Override
   public void write(ByteBuf buffer) {
   }
+
+  /** 直接调色板没有调色板段，条目数为 0。 */
+  @Override
+  public int size() {
+    return 0;
+  }
+
+  /** 直接调色板的位宽即注册表位宽、不存在「塞不下新状态」，预算筛选对它恒放行。 */
+  @Override
+  public boolean contains(int value) {
+    return true;
+  }
 }
