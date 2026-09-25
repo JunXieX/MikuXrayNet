@@ -134,8 +134,9 @@ public final class AntiXrayRuntime {
 
     MikuWorkPool pool = new MikuWorkPool(antiXray.threads(), antiXray.queueCapacity());
     ProtocolLibHook hook = new ProtocolLibHook(plugin);
+    // 传实时配置源：世界黑名单热重载后必须即时生效（否则纳入黑名单的世界仍会被改写）。
     if (!hook.register(antiXray, processor, pool, neighborProvider, chunkIndex, revealed,
-        bypassRegistry, diskCache)) {
+        bypassRegistry, diskCache, () -> plugin.mikuConfig().antiXray())) {
       pool.close();
       closeDiskCache(diskCache);
       return;
@@ -207,7 +208,7 @@ public final class AntiXrayRuntime {
             bypassRegistry, workPool)
         : null;
     this.blockChangeRevealListener = new BlockChangeRevealListener(plugin, protocolManager,
-        chunkIndex, revealed, stats, diskCacheStore, revealer);
+        antiXray, chunkIndex, revealed, stats, diskCacheStore, revealer);
     try {
       blockChangeRevealListener.start();
       if (revealer != null) {

@@ -28,8 +28,14 @@ import org.bukkit.configuration.ConfigurationSection;
  * 伪装模式（all/enclosed）、高度范围与按 Y 分区伪装表。**旧键干净替换、不做迁移**；
  * 若运行期发现配置缺少 {@code dimensions} 段，则用内置默认运行并一次性 WARN（绝不让保护静默失效）。
  *
+ * <p><b>世界黑名单（{@code world-blacklist}，优先级最高）</b>：名单内的世界<b>不使用任何反矿透功能</b>
+ * （区块改写、邻近显形、方块变更观察、邻块快照、磁盘缓存全部跳过）；它<b>高于 {@code world-overrides}</b>
+ * ——某世界既在黑名单又被 {@code world-overrides} 显式启用，仍以黑名单为准（要重新启用必须从黑名单移除）。
+ * 带宽模块（实体剔除 / 变更合并 / AFK / 降视距 / 零位移取消）<b>不受</b>影响，继续在这些世界生效。
+ *
  * <p><b>解析优先级（高 → 低）</b>：
  * <ol>
+ *   <li>{@code world-blacklist}（按世界名，精确名 &gt; 通配；默认空）；</li>
  *   <li>{@code world-overrides}（按世界名，精确名 &gt; 通配；保留为手动出口，默认空）；</li>
  *   <li>{@code dimensions.<维度>}（维度由 {@link Dimension#of(World.Environment)} 判定，与世界名无关）；</li>
  *   <li>内置默认（本类常量）。</li>
@@ -399,13 +405,19 @@ public final class AntiXrayConfig {
   private final List<WorldOverride> worldOverrides;
   /** 与 {@link #worldOverrides} 平行的生效视图：{@code [覆盖段下标][维度下标]}（构造期预计算）。 */
   private final EffectiveObfuscation[][] overrideEffectives;
+  /** 反矿透世界黑名单原始模式（声明序；诊断/日志回显用）。空列表 = 未配置。 */
+  private final List<String> worldBlacklist;
+  /** 黑名单中的精确世界名（启动期拆分，热路径短线性扫描）。 */
+  private final List<String> blacklistExact;
+  /** 黑名单中的通配匹配器（启动期预编译，热路径不做正则编译）。 */
+  private final List<Pattern> blacklistGlobs;
 
   private AntiXrayConfig(boolean enabled, EffectiveObfuscation[] dimensionEffectives,
       boolean[] dimensionEnabled, boolean dimensionsMissing, boolean layerObfuscation,
       boolean removeBlockEntities, Neighbors neighbors, Occlusion occlusion, Proximity proximity,
       DiskCache diskCache, PlatformSupport.Mode platform, int cacheMaximumSize,
       int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis, int queueCapacity,
-      Set<String> unresolvedTags, List<WorldOverride> worldOverrides) {
+      Set<String> unresolvedTags, List<WorldOverride> worldOverrides, List<String> worldBlacklist) {
     this.enabled = enabled;
     this.dimensionEffectives = dimensionEffectives.clone();
     this.dimensionEnabled = dimensionEnabled.clone();
@@ -424,6 +436,20 @@ public final class AntiXrayConfig {
     this.queueCapacity = Math.max(1, queueCapacity);
     this.unresolvedTags = unresolvedTags == null ? Set.of() : Set.copyOf(unresolvedTags);
     this.worldOverrides = List.copyOf(worldOverrides);
+    // 黑名单在构造期拆分并预编译通配匹配器：热路径只有短线性扫描，绝不逐包编译正则（列表通常 1~10 项）。
+    this.worldBlacklist = List.copyOf(worldBlacklist);
+    List<String> blacklistExactNames = new ArrayList<>(this.worldBlacklist.size());
+    List<Pattern> blacklistGlobPatterns = new ArrayList<>(this.worldBlacklist.size());
+    for (String pattern : this.worldBlacklist) {
+      Pattern glob = compileGlob(pattern);
+      if (glob == null) {
+        blacklistExactNames.add(pattern);
+      } else {
+        blacklistGlobPatterns.add(glob);
+      }
+    }
+    this.blacklistExact = List.copyOf(blacklistExactNames);
+    this.blacklistGlobs = List.copyOf(blacklistGlobPatterns);
     // 预计算各覆盖段在「每个维度」上的生效视图：合并只在构造期做一次，运行期命中后直接取用（O(1)）。
     EffectiveObfuscation[][] merged = new EffectiveObfuscation[this.worldOverrides.size()][Dimension.values().length];
     for (int i = 0; i < this.worldOverrides.size(); i++) {
@@ -452,7 +478,9 @@ public final class AntiXrayConfig {
     this.configHash = Objects.hash(dimensionFingerprints, overrideFingerprints, layerObfuscation,
         neighbors.enabled(), neighbors.missingPolicy(),
         OcclusionRules.sortedList(this.occlusion.extraOccluding()),
-        OcclusionRules.sortedList(this.occlusion.extraNonOccluding()), this.occlusion.fluidCover());
+        OcclusionRules.sortedList(this.occlusion.extraNonOccluding()), this.occlusion.fluidCover(),
+        // 黑名单决定「哪些世界完全不改写」，参与指纹：切换黑名单后旧缓存（该世界已改写结果）不再复用。
+        this.worldBlacklist);
   }
 
   /** 把某覆盖段合并到某维度的生效值上（覆盖值优先，未覆盖回落维度值）。 */
@@ -495,6 +523,10 @@ public final class AntiXrayConfig {
   /** 从配置根节点解析。 */
   public static AntiXrayConfig from(ConfigurationSection root) {
     Set<String> unknownTags = new LinkedHashSet<>();
+
+    // ---- world-blacklist：反矿透世界黑名单（最高优先级；默认空）----
+    // 名单内的世界不使用任何反矿透功能（改写/显形/变更观察/邻块快照/磁盘缓存全跳过），带宽模块不受影响。
+    List<String> worldBlacklist = parseWorldBlacklist(root.getStringList("world-blacklist"));
 
     // ---- dimensions：按维度分段（新结构；缺段则全部回落内置默认并标记，供调用方一次性 WARN）----
     ConfigurationSection dimensions = root.getConfigurationSection("dimensions");
@@ -577,7 +609,39 @@ public final class AntiXrayConfig {
         root.getInt("advanced.timeout-millis", 2500),
         root.getInt("advanced.queue-capacity", 2048),
         unknownTags,
-        overrides);
+        overrides,
+        worldBlacklist);
+  }
+
+  /**
+   * 解析 {@code world-blacklist}：世界名模式列表（精确名或含 {@code *} 的通配）。
+   *
+   * <p>去空白、跳过空条目并按声明序去重（保留首个），其余原样保留（世界名大小写敏感，与
+   * {@code world-overrides} 的匹配语义一致）。
+   */
+  private static List<String> parseWorldBlacklist(List<String> raw) {
+    if (raw == null || raw.isEmpty()) {
+      return List.of();
+    }
+    List<String> patterns = new ArrayList<>(raw.size());
+    for (String entry : raw) {
+      if (entry == null) {
+        continue;
+      }
+      String pattern = entry.trim();
+      if (pattern.isEmpty() || patterns.contains(pattern)) {
+        continue;
+      }
+      patterns.add(pattern);
+    }
+    return List.copyOf(patterns);
+  }
+
+  /** 编译世界名通配模式：含 {@code *} 时预编译为正则（{@code *} → 任意字符序列）；不含则返回 {@code null}（走精确名比较）。 */
+  private static Pattern compileGlob(String pattern) {
+    return pattern.indexOf('*') >= 0
+        ? Pattern.compile("\\Q" + pattern.replace("*", "\\E.*\\Q") + "\\E")
+        : null;
   }
 
   /** 解析某个维度段（未出现的键回落该维度的内置默认）。 */
@@ -680,9 +744,7 @@ public final class AntiXrayConfig {
         continue;
       }
       // 通配模式预编译为正则（'*' → 任意字符序列）；不含 '*' 时走精确名比较，无需匹配器
-      Pattern glob = pattern.indexOf('*') >= 0
-          ? Pattern.compile("\\Q" + pattern.replace("*", "\\E.*\\Q") + "\\E")
-          : null;
+      Pattern glob = compileGlob(pattern);
 
       List<String> hideBlocks = null;
       if (world.contains("hide-blocks")) {
@@ -790,16 +852,6 @@ public final class AntiXrayConfig {
     return enabled;
   }
 
-  /**
-   * 世界是否在生效范围内。
-   *
-   * <p>旧的世界白名单（{@code worlds}）已随按维度分段重构移除：本方法现在只反映总开关，
-   * 逐维度是否启用由 {@link #dimensionEnabled(Dimension)} 决定。
-   */
-  public boolean appliesTo(String worldName) {
-    return enabled;
-  }
-
   /** 某维度是否启用（末地默认关闭）。 */
   public boolean dimensionEnabled(Dimension dimension) {
     return dimensionEnabled[dimension.ordinal()];
@@ -865,6 +917,46 @@ public final class AntiXrayConfig {
       }
     }
     return best;
+  }
+
+  /** 反矿透世界黑名单原始模式（声明序）；空列表 = 未配置。供启动日志与诊断回显。 */
+  public List<String> worldBlacklist() {
+    return worldBlacklist;
+  }
+
+  /**
+   * 某世界是否在反矿透黑名单内（<b>纯函数</b>：启动期已拆分并预编译，热路径零新增分配）。
+   *
+   * <p>匹配语义与 {@link #matchOverride(String)} 一致：精确名与通配（{@code *} 匹配任意字符序列）都可命中。
+   * 黑名单只关心「是否命中」这一布尔结果，因此「精确 &gt; 最长通配」在此等价于「任一命中即为黑名单」。
+   *
+   * @return true 表示该世界不使用任何反矿透功能（优先级最高，压过 {@code world-overrides}）
+   */
+  public boolean isBlacklisted(String worldName) {
+    if (worldName == null || worldBlacklist.isEmpty()) {
+      return false;
+    }
+    for (int i = 0; i < blacklistExact.size(); i++) {
+      if (blacklistExact.get(i).equals(worldName)) {
+        return true;
+      }
+    }
+    for (int i = 0; i < blacklistGlobs.size(); i++) {
+      if (blacklistGlobs.get(i).matcher(worldName).matches()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 反矿透是否应作用于该世界：总开关开启 <b>且</b> 该世界不在黑名单内。
+   *
+   * <p><b>这是所有反矿透入口（区块改写、邻近显形、事件即时显形、方块变更观察）统一的判定出口</b>——
+   * 各处不得自行重复实现匹配逻辑。注意：黑名单只豁免反矿透，带宽模块不受影响。
+   */
+  public boolean antiXrayAppliesTo(String worldName) {
+    return enabled && !isBlacklisted(worldName);
   }
 
   /** 是否对同一高度层统一使用同一种伪装方块。 */

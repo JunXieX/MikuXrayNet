@@ -11,6 +11,7 @@ import com.comphenix.protocol.wrappers.BlockPosition;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
+import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
@@ -57,6 +58,11 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private final ProximityStats stats;
   private final DiskCacheStore diskCache;
   /**
+   * 反矿透配置：用于世界黑名单判定。本监听器随热重载重建（见 {@code AntiXrayRuntime#restartProximity}），
+   * 因此持有的引用始终是「当前」配置，黑名单改动即时生效。{@code null} 表示不做黑名单判定。
+   */
+  private final AntiXrayConfig config;
+  /**
    * 事件驱动即时显形（P1-4，可选）：观测到方块变更时交给邻近显形做「当 tick 补发邻域」。
    * {@code null} 表示不启用（只做注销与代次递增，行为与旧版完全一致）。
    */
@@ -74,21 +80,23 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   public BlockChangeRevealListener(Plugin plugin, ProtocolManager protocolManager,
       ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
       DiskCacheStore diskCache) {
-    this(plugin, protocolManager, obfuscatedChunkIndex, revealedSet, stats, diskCache, null);
+    this(plugin, protocolManager, null, obfuscatedChunkIndex, revealedSet, stats, diskCache, null);
   }
 
   /**
-   * 完整构造（追加事件驱动即时显形）。
+   * 完整构造（反矿透配置 + 事件驱动即时显形）。
    *
+   * @param config          反矿透配置（用于世界黑名单判定）；{@code null} 表示不做黑名单判定
    * @param instantRevealer 邻近显形器；{@code null} 表示不启用事件显形
    */
   public BlockChangeRevealListener(Plugin plugin, ProtocolManager protocolManager,
-      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
-      DiskCacheStore diskCache, ProximityRevealer instantRevealer) {
+      AntiXrayConfig config, ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet,
+      ProximityStats stats, DiskCacheStore diskCache, ProximityRevealer instantRevealer) {
     super(plugin, ListenerPriority.HIGHEST, PacketType.Play.Server.BLOCK_CHANGE,
         PacketType.Play.Server.MULTI_BLOCK_CHANGE);
     this.plugin = plugin;
     this.protocolManager = protocolManager;
+    this.config = config;
     this.obfuscatedChunkIndex = obfuscatedChunkIndex;
     this.revealedSet = revealedSet;
     this.stats = stats;
@@ -174,11 +182,23 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * 内部完成，未启用时只有一个空引用判断的开销。
    */
   private void observeChange(Player player, String worldName, int x, int y, int z) {
+    // 黑名单世界不做任何反矿透工作：不注销显形、不驱动磁盘缓存代次、不触发事件即时显形。
+    if (isBlacklisted(config, worldName)) {
+      return;
+    }
     unregisterCoordinate(worldName, x, y, z);
     markChanged(worldName, x, z);
     if (instantRevealer != null) {
       instantRevealer.onBlockChangeObserved(player, worldName, x, y, z);
     }
+  }
+
+  /**
+   * 世界是否在反矿透黑名单内（可离线单测；黑名单世界完全不参与反矿透）。
+   * 复用 {@link AntiXrayConfig#isBlacklisted(String)}，不在此处重复实现匹配逻辑。
+   */
+  static boolean isBlacklisted(AntiXrayConfig config, String worldName) {
+    return config != null && config.isBlacklisted(worldName);
   }
 
   /**

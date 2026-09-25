@@ -12,6 +12,7 @@ import java.util.UUID;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
 import net.mikumc.mikuxraynet.cache.DiskPayload;
@@ -110,6 +111,12 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   }
 
   private final AntiXrayConfig config;
+  /**
+   * 实时配置源（读取「当前」的反矿透配置）。本监听器不随热重载重建，而 {@code AntiXrayConfig}
+   * 实例会被 reload 整体替换，因此世界黑名单等需要即时生效的判定必须走这里——
+   * 否则 reload 后新加入黑名单的世界仍会被改写（违反「黑名单世界绝不改写」）。
+   */
+  private final Supplier<AntiXrayConfig> liveConfig;
   private final ObfuscationProcessor processor;
   private final MikuWorkPool workPool;
   private final AsynchronousManager asynchronousManager;
@@ -143,6 +150,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final AtomicBoolean firstRewriteDiagnosed = new AtomicBoolean();
 
   /**
+   * @param liveConfig       实时配置源（读取「当前」配置，保证热重载后世界黑名单即时生效）；可为 null（回落 config）
    * @param neighborProvider 邻区块贴边快照提供者；仅在 {@code neighbors.enabled} 时被使用
    * @param handleChunkBatch 是否拦截 1.20.2+ 的区块批量包（不可用时由装配方降级为 false）
    * @param obfuscatedChunkIndex 伪装区块索引；{@code null} 表示不做邻近显形
@@ -150,13 +158,15 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * @param bypassRegistry   直通名单；{@code null} 表示退化为无直通（仍按世界范围判定）
    * @param diskCache        磁盘缓存；{@code null} 表示只用内存缓存
    */
-  public ProtocolLibAsyncListener(Plugin plugin, AntiXrayConfig config, ObfuscationProcessor processor,
+  public ProtocolLibAsyncListener(Plugin plugin, AntiXrayConfig config,
+      Supplier<AntiXrayConfig> liveConfig, ObfuscationProcessor processor,
       MikuWorkPool workPool, AsynchronousManager asynchronousManager,
       NeighborChunkProvider neighborProvider, boolean handleChunkBatch,
       ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, BypassRegistry bypassRegistry,
       DiskCacheStore diskCache) {
     super(plugin, ListenerPriority.NORMAL, packetTypes(handleChunkBatch));
     this.config = config;
+    this.liveConfig = liveConfig;
     this.processor = processor;
     this.workPool = workPool;
     this.asynchronousManager = asynchronousManager;
@@ -573,12 +583,24 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
   }
 
-  /** 该玩家是否受本模块影响（直通名单绕过 + 世界范围）。 */
+  /** 该玩家是否受本模块影响（直通名单绕过 + 反矿透世界判定）。 */
   private boolean appliesTo(Player player) {
     if (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId())) {
       return false;
     }
-    return config.appliesTo(player.getWorld().getName());
+    // 黑名单判定必须读「当前」配置（本监听器不随热重载重建）：否则 reload 后纳入黑名单的世界仍会被改写。
+    AntiXrayConfig live = liveConfig == null ? null : liveConfig.get();
+    return worldAllowed(live == null ? config : live, player.getWorld().getName());
+  }
+
+  /**
+   * 世界是否允许反矿透（统一入口判定，可离线单测）：总开关开启 <b>且</b> 世界不在黑名单。
+   *
+   * <p>黑名单世界一律拒绝——改写路径的入口判定即在此处最早返回，不登记延迟、不建任务、
+   * 不抓邻块快照、不读写磁盘缓存。带宽模块不走本判定，故不受影响。
+   */
+  static boolean worldAllowed(AntiXrayConfig config, String worldName) {
+    return config != null && config.antiXrayAppliesTo(worldName);
   }
 
   /** 使全部改写缓存、邻块快照与显形结构立即失效（配置热重载时调用）。 */

@@ -4,6 +4,7 @@ import com.comphenix.protocol.AsynchronousManager;
 import com.comphenix.protocol.ProtocolLibrary;
 import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.async.AsyncListenerHandler;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
@@ -50,13 +51,15 @@ public final class ProtocolLibHook {
    * @param revealedSet          已显形集合；{@code null} 表示不做邻近显形
    * @param bypassRegistry 直通名单；{@code null} 表示无直通
    * @param diskCache 磁盘缓存；{@code null} 表示只用内存缓存
+   * @param liveConfig 实时配置源（热重载后世界黑名单即时生效）；可为 null（回落启动期配置）
    * @return true 表示注册成功并已启动异步分发
    */
   public boolean register(AntiXrayConfig config, ObfuscationProcessor processor, MikuWorkPool workPool,
       NeighborChunkProvider neighborProvider, ObfuscatedChunkIndex obfuscatedChunkIndex,
-      RevealedSet revealedSet, BypassRegistry bypassRegistry, DiskCacheStore diskCache) {
+      RevealedSet revealedSet, BypassRegistry bypassRegistry, DiskCacheStore diskCache,
+      Supplier<AntiXrayConfig> liveConfig) {
     Throwable batchFailure = tryRegister(config, processor, workPool, neighborProvider,
-        obfuscatedChunkIndex, revealedSet, bypassRegistry, diskCache, true);
+        obfuscatedChunkIndex, revealedSet, bypassRegistry, diskCache, liveConfig, true);
     if (batchFailure == null) {
       return true;
     }
@@ -64,7 +67,7 @@ public final class ProtocolLibHook {
     logger.log(Level.WARNING,
         "区块批量包（CHUNK_BATCH_START/FINISHED）拦截注册失败，降级为仅拦截 MAP_CHUNK", batchFailure);
     Throwable fallbackFailure = tryRegister(config, processor, workPool, neighborProvider,
-        obfuscatedChunkIndex, revealedSet, bypassRegistry, diskCache, false);
+        obfuscatedChunkIndex, revealedSet, bypassRegistry, diskCache, liveConfig, false);
     if (fallbackFailure == null) {
       return true;
     }
@@ -77,11 +80,12 @@ public final class ProtocolLibHook {
   private Throwable tryRegister(AntiXrayConfig config, ObfuscationProcessor processor,
       MikuWorkPool workPool, NeighborChunkProvider neighborProvider,
       ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet,
-      BypassRegistry bypassRegistry, DiskCacheStore diskCache, boolean handleChunkBatch) {
+      BypassRegistry bypassRegistry, DiskCacheStore diskCache, Supplier<AntiXrayConfig> liveConfig,
+      boolean handleChunkBatch) {
     try {
       this.protocolManager = ProtocolLibrary.getProtocolManager();
       this.asynchronousManager = protocolManager.getAsynchronousManager();
-      this.listener = new ProtocolLibAsyncListener(plugin, config, processor, workPool,
+      this.listener = new ProtocolLibAsyncListener(plugin, config, liveConfig, processor, workPool,
           asynchronousManager, neighborProvider, handleChunkBatch, obfuscatedChunkIndex, revealedSet,
           bypassRegistry, diskCache);
       this.asyncListenerHandler = asynchronousManager.registerAsyncHandler(listener);

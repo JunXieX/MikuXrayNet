@@ -33,6 +33,7 @@ public final class ReloadCoordinator {
   /** 本次热重载后已即时生效的配置项。 */
   public static final List<String> APPLIED = List.of(
       "邻近显形（距离/周期/单次上限）",
+      "反矿透世界黑名单（world-blacklist，即时豁免/恢复对应世界）",
       "AFK 降级（判定时长/丢弃距离/包类型）",
       "高延迟降视距（阈值/幅度/下限/巡检周期）",
       "带宽全部子模块（零位移/变更合并/实体剔除/调色板重排）",

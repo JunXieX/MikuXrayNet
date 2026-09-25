@@ -44,6 +44,14 @@ public final class MikuConfig {
     } else {
       logger.info("反矿透配置已加载：功能处于关闭状态");
     }
+    // 世界黑名单（优先级最高）：启动/重载时打印一次数量与具体列表（空则明确写「未配置」），不逐区块刷屏
+    if (loadedAntiXray.worldBlacklist().isEmpty()) {
+      logger.info("反矿透世界黑名单：未配置（所有世界都启用反矿透）");
+    } else {
+      logger.info("反矿透世界黑名单：" + loadedAntiXray.worldBlacklist().size() + " 项 "
+          + loadedAntiXray.worldBlacklist()
+          + "（名单内世界不使用任何反矿透功能；带宽模块不受影响）");
+    }
     // 缺 dimensions 段（旧版 worlds / 顶层 obfuscation 结构）时用内置默认运行并一次性提示
     loadedAntiXray.warnIfDimensionsMissing(logger, dimensionsWarned);
     // tag(...) 展开失败的条目已按「忽略」处理（不猜成员），这里提示管理员改正

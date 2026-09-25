@@ -288,7 +288,10 @@ class ConfigDefaultsTest {
     AntiXrayConfig config = AntiXrayConfig.from(yaml(""));
 
     assertTrue(config.enabled(), "反矿透总开关默认开启");
-    assertTrue(config.appliesTo("any_world"), "总开关开启时对任意世界生效（世界白名单已随按维度分段重构移除）");
+    assertTrue(config.antiXrayAppliesTo("any_world"), "总开关开启且未命中黑名单时对任意世界生效（世界白名单已随按维度分段重构移除）");
+    assertTrue(config.worldBlacklist().isEmpty(), "反矿透世界黑名单默认空列表（现有用户行为不变）");
+    assertFalse(config.isBlacklisted("spawn"), "空黑名单下任何世界都不豁免");
+    assertTrue(config.antiXrayAppliesTo("spawn"), "空黑名单下所有世界照常反矿透");
     // 维度启用：主世界/地狱默认启用，末地默认关闭（末地无矿物）
     assertTrue(config.dimensionEnabled(AntiXrayConfig.Dimension.NORMAL), "主世界默认启用");
     assertTrue(config.dimensionEnabled(AntiXrayConfig.Dimension.NETHER), "地狱默认启用");

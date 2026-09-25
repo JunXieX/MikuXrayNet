@@ -258,6 +258,7 @@ public final class Diagnostics {
         + "｜平台 " + (s.env().folia() ? "Folia" : "Paper/Spigot"));
     lines.add("反矿透：" + (s.env().antiXrayActive() ? "已生效" : "未生效")
         + "｜直通玩家 " + s.env().bypassPlayers() + " 名");
+    lines.add("反矿透世界黑名单：" + worldBlacklistSummary(s.antiXray()));
     lines.add("改写缓存：命中 " + s.rewrite().cacheHits() + "，未命中 " + s.rewrite().cacheMisses()
         + "，命中率 " + hitRate(s.rewrite().cacheHits(), s.rewrite().cacheMisses())
         + "，条目 " + s.rewrite().cacheEntries());
@@ -305,6 +306,18 @@ public final class Diagnostics {
     lines.add("线程池：线程 " + s.pool().threads() + "，活动 " + s.pool().active()
         + "，队列 " + s.pool().queueSize() + "/" + s.pool().queueCapacity());
     return lines;
+  }
+
+  /** 世界黑名单回显（中文，纯函数；status 与 dump 共用）。空列表明确写「未配置」。 */
+  private static String worldBlacklistSummary(AntiXrayConfig c) {
+    if (c == null) {
+      return "配置未加载";
+    }
+    if (c.worldBlacklist().isEmpty()) {
+      return "未配置（所有世界都启用反矿透）";
+    }
+    return c.worldBlacklist().size() + " 项：" + String.join(", ", c.worldBlacklist())
+        + "（名单内世界不使用任何反矿透功能）";
   }
 
   /**
@@ -387,6 +400,7 @@ public final class Diagnostics {
       return;
     }
     sb.append("enabled=").append(c.enabled()).append('\n');
+    sb.append("world-blacklist=").append(worldBlacklistSummary(c)).append('\n');
     if (c.dimensionsMissing()) {
       sb.append("dimensions=缺少该段（已使用内置默认运行，请重新生成配置）\n");
     }

@@ -337,7 +337,8 @@ public final class ProximityRevealer implements Listener {
 
     World world = player.getWorld();
     String worldName = world.getName();
-    if (!config.appliesTo(worldName)) {
+    // 黑名单世界不做任何邻近显形（周期巡检）：antiXrayAppliesTo = 总开关 且 不在黑名单。
+    if (!config.antiXrayAppliesTo(worldName)) {
       return;
     }
 
@@ -644,6 +645,10 @@ public final class ProximityRevealer implements Listener {
         || !instant.enabled() || instant.maxPerTick() <= 0) {
       return;
     }
+    // 黑名单世界不做事件即时显形（在调度前就返回，避免产生任何任务）：纯判定，不触碰 Bukkit。
+    if (config.isBlacklisted(worldName)) {
+      return;
+    }
     if (chunkIndex == null || revealedSet == null) {
       return;
     }
@@ -680,7 +685,8 @@ public final class ProximityRevealer implements Listener {
         return;
       }
       World world = player.getWorld();
-      if (!config.appliesTo(world.getName())) {
+      // 黑名单世界不做任何邻近显形（事件即时）：与周期巡检共用同一判定出口。
+      if (!config.antiXrayAppliesTo(world.getName())) {
         return;
       }
       int radius = instant.radius();

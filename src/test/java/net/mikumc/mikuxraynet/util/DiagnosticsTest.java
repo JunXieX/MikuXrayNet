@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
+import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -48,6 +49,48 @@ class DiagnosticsTest {
       throw new IllegalStateException("测试用 YAML 不合法", exception);
     }
     return BandwidthConfig.from(configuration);
+  }
+
+  private static AntiXrayConfig antiXray(String content) {
+    YamlConfiguration configuration = new YamlConfiguration();
+    try {
+      configuration.loadFromString(content);
+    } catch (InvalidConfigurationException exception) {
+      throw new IllegalStateException("测试用 YAML 不合法", exception);
+    }
+    return AntiXrayConfig.from(configuration);
+  }
+
+  private static Diagnostics.Snapshot withAntiXray(AntiXrayConfig antiXray) {
+    return new Diagnostics.Snapshot(
+        new Diagnostics.Snapshot.Env(true, true, false, true, 0, "Paper", "25"),
+        Diagnostics.Snapshot.Rewrite.EMPTY,
+        Diagnostics.Snapshot.Proximity.EMPTY,
+        Diagnostics.Snapshot.Index.EMPTY,
+        Diagnostics.Snapshot.Throttle.EMPTY,
+        Diagnostics.Snapshot.Pool.EMPTY,
+        Diagnostics.Snapshot.DiskCache.EMPTY,
+        antiXray, null);
+  }
+
+  /**
+   * 世界黑名单必须出现在 status（人类可读行）与 dump（配置有效值）两处回显中；
+   * 空列表也要明确写「未配置」，否则管理员无法确认「是没配」还是「解析丢了」。
+   */
+  @Test
+  void statusAndDumpEchoWorldBlacklist() {
+    Diagnostics.Snapshot configured = withAntiXray(antiXray("world-blacklist: [spawn, dungeon_*]\n"));
+    String status = String.join("\n", Diagnostics.formatStatus(configured));
+    assertTrue(status.contains("反矿透世界黑名单：2 项：spawn, dungeon_*"),
+        "status 必须回显黑名单数量与列表：" + status);
+    String dump = Diagnostics.formatDump(configured, "20260925-000000");
+    assertTrue(dump.contains("world-blacklist=2 项：spawn, dungeon_*"),
+        "dump 的配置有效值必须回显黑名单：" + dump);
+
+    Diagnostics.Snapshot empty = withAntiXray(antiXray("enabled: true\n"));
+    String emptyStatus = String.join("\n", Diagnostics.formatStatus(empty));
+    assertTrue(emptyStatus.contains("反矿透世界黑名单：未配置"),
+        "空黑名单必须明确写「未配置」：" + emptyStatus);
   }
 
   @Test
