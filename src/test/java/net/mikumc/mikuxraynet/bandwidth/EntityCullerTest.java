@@ -234,6 +234,39 @@ class EntityCullerTest {
     }
   }
 
+  /**
+   * Folia 回归：已隐藏实体<b>离开本区域</b>后，周期复检不得读取它的任何状态。
+   *
+   * <p>真机症状（Lophine 26.3 / Folia）：{@code EntityCuller.recheck} 在玩家所在区域线程上读跨区域实体的
+   * entityId → {@code TickThread.ensureTickThread} <b>先打 ERROR 再抛</b> IllegalStateException，
+   * 任务每轮刷屏。这里把「跨区域实体」建模为「归属判定为 false + 一旦被读状态就抛」——
+   * 实现里只要还有一次越界读取，本用例即失败。
+   */
+  @Test
+  void foreignRegionEntityIsSkippedWithoutTouchingItsState() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub foreign = new EntityStub(7001, world);
+    EntityStub owned = new EntityStub(7002, world);
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 7, 3), stats,
+        entity -> entity != foreign.proxy());
+
+    // 先在「同区域」时把两者隐藏（此时读状态合法），随后 foreign 离开本区域
+    culler.evaluate(player.proxy(), foreign.proxy(), true);
+    culler.evaluate(player.proxy(), owned.proxy(), true);
+    assertEquals(2, culler.hiddenCount());
+    foreign.foreign = true;
+
+    culler.recheck(player.proxy()); // 关键：不得抛异常（更不得读 foreign 的状态）
+
+    assertEquals(1L, stats.recheckSubmitted.sum(),
+        "本区域实体仍须被复检：不能因为存在跨区域实体就整轮放弃");
+    assertEquals(2, culler.hiddenCount(),
+        "跨区域实体本轮既不清理也不报错，留待重新进入追踪范围时的 onTrack 复评或退出时的账本清理");
+  }
+
   /** 已隐藏实体每周期全量复检（不退化），可见追踪实体每周期只取预算分片。 */
   @Test
   void recheckSubmitsEveryHiddenEntityPlusABudgetedTrackedSlice() {
@@ -403,6 +436,8 @@ class EntityCullerTest {
     private final Location location;
     private final BoundingBox box;
     private volatile boolean valid = true;
+    /** 模拟「实体已离开本区域」：任何状态读取都像 Folia 那样抛异常（真机还会先打一条 ERROR）。 */
+    private volatile boolean foreign;
 
     EntityStub(int id, WorldStub world) {
       this(id, world, 100.0D, 65.0D, 100.0D);
@@ -430,6 +465,10 @@ class EntityCullerTest {
       if (isObjectMethod(method)) {
         return "hashCode".equals(method.getName()) ? System.identityHashCode(proxy)
             : ("equals".equals(method.getName()) ? proxy == args[0] : "EntityStub#" + id);
+      }
+      if (foreign) {
+        // 跨区域读取：真机上 TickThread.ensureTickThread 先 ERROR 再抛，这里只要被读到就抛
+        throw new IllegalStateException("模拟 Folia 跨区域访问：entity#" + id);
       }
       return switch (method.getName()) {
         case "getEntityId" -> id;

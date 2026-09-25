@@ -4,7 +4,6 @@ import io.papermc.paper.event.player.PlayerTrackEntityEvent;
 import io.papermc.paper.event.player.PlayerUntrackEntityEvent;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -65,6 +64,8 @@ public final class EntityCuller implements Listener {
   private final Plugin plugin;
   private final BandwidthConfig.EntityCulling config;
   private final ThrottleStats stats;
+  /** 实体归属判定（Folia 跨区域实体不得触碰；见 {@link EntityOwnership}）。 */
+  private final EntityOwnership ownership;
   private final double forceVisibleSquared;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
@@ -83,10 +84,41 @@ public final class EntityCuller implements Listener {
   private final ConcurrentHashMap<UUID, ScheduledTask> recheckTasks = new ConcurrentHashMap<>();
 
   public EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats) {
+    this(plugin, config, stats, EntityCuller::ownedByCurrentRegion);
+  }
+
+  /** 完整构造（追加实体归属判定；离线单测可注入假实现，见 {@link EntityOwnership}）。 */
+  EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
+      EntityOwnership ownership) {
     this.plugin = plugin;
     this.config = config;
     this.stats = stats;
+    this.ownership = ownership;
     this.forceVisibleSquared = config.forceVisibleDistance() * config.forceVisibleDistance();
+  }
+
+  /**
+   * 实体归属判定：该实体当前是否由本线程所属区域拥有（Paper 上恒为 true）。
+   *
+   * <p><b>为什么必须在「碰之前」先问</b>：Folia 上读取非本区域实体的状态会走
+   * {@code TickThread.ensureTickThread} 校验——它<b>先打一条 ERROR 日志再抛异常</b>，所以 try/catch
+   * 兜住并不能避免刷屏（真机 Lophine 26.3 上表现为每周期一次 ERROR + 任务异常）。
+   * 周期复检跑在玩家所在区域线程，而玩家走远/传送后，其已隐藏列表里的实体可能已在别的区域，
+   * 甚至已被服务端 DISCARDED。
+   */
+  @FunctionalInterface
+  public interface EntityOwnership {
+    boolean isOwnedByCurrentRegion(Entity entity);
+  }
+
+  /** 生产实现：{@link Bukkit#isOwnedByCurrentRegion(Entity)}（内部用 getHandleRaw + TickThread 判定，不写日志）。 */
+  private static boolean ownedByCurrentRegion(Entity entity) {
+    try {
+      return Bukkit.isOwnedByCurrentRegion(entity);
+    } catch (Throwable throwable) {
+      // 判定不可用（离线单测无服务端实例等）：按「属于本区域」处理，退回本改动之前的行为
+      return true;
+    }
   }
 
   /** 注册事件监听与周期复检任务。 */
@@ -193,8 +225,14 @@ public final class EntityCuller implements Listener {
     }
     Entity entity = event.getEntity();
     // 玩家可见性交给原版与其它插件，避免干扰 PvP；烟花被隐藏会破坏鞘翅飞行体验
-    if (entity instanceof Player || entity.getEntityId() == player.getEntityId()
-        || entity instanceof Firework) {
+    if (entity instanceof Player || entity instanceof Firework) {
+      return;
+    }
+    // 跨区域实体不登记也不评估：读它们的任何状态都会触发 Folia 线程校验（先打 ERROR 再抛异常）
+    if (!owns(entity)) {
+      return;
+    }
+    if (entity.getEntityId() == player.getEntityId()) {
       return;
     }
     // 登记进轮转队列：这是「入场那一刻评估一次」之外的兜底，保证之后出现的遮挡也能被发现
@@ -210,7 +248,8 @@ public final class EntityCuller implements Listener {
     }
     TrackedRotation rotation = rotations.get(event.getPlayer().getUniqueId());
     if (rotation != null) {
-      rotation.remove(event.getEntity().getEntityId());
+      // 按实例摘除：实体此时可能已经离开本区域，读它的 entityId 会触发 Folia 线程校验并刷 ERROR
+      rotation.remove(event.getEntity());
     }
   }
 
@@ -231,12 +270,18 @@ public final class EntityCuller implements Listener {
     }
     UUID playerId = player.getUniqueId();
 
-    // ① 已隐藏实体：每周期全量复检（既有行为）
+    // ① 已隐藏实体：每周期全量复检（既有行为）。
+    //    用「键（加入时捕获的 entityId）+ 归属判定」遍历：玩家走远/传送后这些实体可能已在别的区域，
+    //    读它们的任何状态都会触发 Folia 线程校验（先打 ERROR 再抛异常），因此先问能不能碰，不能则整轮跳过。
     Map<Integer, Entity> hiddenMap = hidden.get(playerId);
     if (hiddenMap != null && !hiddenMap.isEmpty()) {
-      for (Entity entity : new ArrayList<>(hiddenMap.values())) {
+      for (Map.Entry<Integer, Entity> entry : new ArrayList<>(hiddenMap.entrySet())) {
+        Entity entity = entry.getValue();
+        if (!owns(entity)) {
+          continue;
+        }
         if (!entity.isValid()) {
-          hiddenMap.remove(entity.getEntityId());
+          hiddenMap.remove(entry.getKey());
           continue;
         }
         stats.recheckSubmitted.increment();
@@ -251,6 +296,9 @@ public final class EntityCuller implements Listener {
     }
     Set<Integer> hiddenIds = hiddenMap == null ? Set.of() : hiddenMap.keySet();
     for (Entity entity : rotation.nextBatch(config.recheckBudget(), hiddenIds)) {
+      if (!owns(entity)) {
+        continue;
+      }
       if (!entity.isValid()) {
         rotation.remove(entity.getEntityId());
         continue;
@@ -493,6 +541,15 @@ public final class EntityCuller implements Listener {
     inFlight.removeIf(key -> key.playerId().equals(playerId));
   }
 
+  /** 本线程是否可以安全读取该实体的状态；判定本身异常时按「可以」处理（退回改动前行为）。 */
+  private boolean owns(Entity entity) {
+    try {
+      return ownership.isOwnedByCurrentRegion(entity);
+    } catch (Throwable throwable) {
+      return true;
+    }
+  }
+
   private void logThrottled(Throwable throwable) {
     if (errorCounter.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
       plugin.getLogger().log(Level.WARNING, "实体剔除判定失败，已按「保持可见」处理", throwable);
@@ -506,35 +563,57 @@ public final class EntityCuller implements Listener {
    * 因此 {@code ceil(size / budget)} 个周期内必然遍历到所有位置——这正是「先可见、之后才被挡住」
    * 的实体能被收敛到隐藏的原因；同时每周期真正提交的复检数不超过 {@code budget}。
    *
+   * <p><b>键是加入时捕获的 entityId</b>：实体可能已经离开本区域，届时读 {@code entity.getEntityId()}
+   * （走 {@code CraftEntity#getHandle}）会触发 Folia 线程校验并刷 ERROR 日志；加入那一刻它必然可达
+   * （追踪事件由本区域发出），因此 id 在那一刻取好，之后只读键、不碰实体。
+   *
    * <p>线程模型：事件与周期任务都落在玩家所属线程上；加锁仅为防御两者线程不一致（Folia 区域线程）。
    */
   static final class TrackedRotation {
 
-    private final List<Entity> order = new ArrayList<>();
-    /** 已追踪实体的 id 索引：去重判定从「线性扫描」降到 O(1)（批量入场时原为 O(n²)）。 */
-    private final Set<Integer> trackedIds = new HashSet<>();
+    private final LinkedHashMap<Integer, Entity> order = new LinkedHashMap<>();
     private int cursor;
 
     /** 加入一个被追踪实体（按 entityId 去重）。 */
     synchronized void add(Entity entity) {
-      int entityId = entity.getEntityId();
-      if (!trackedIds.add(entityId)) {
-        return;
-      }
-      order.add(entity);
+      order.putIfAbsent(entity.getEntityId(), entity);
     }
 
-    /** 摘除一个不再被追踪的实体，并修正游标使「下一页」不被跳过。 */
-    synchronized void remove(int entityId) {
-      trackedIds.remove(entityId);
-      for (int i = 0; i < order.size(); i++) {
-        if (order.get(i).getEntityId() == entityId) {
-          order.remove(i);
-          if (cursor > i) {
-            cursor--;
-          }
-          return;
+    /** 按实例摘除（不读实体状态，供可能已跨区域的 untrack 事件使用）。 */
+    synchronized void remove(Entity entity) {
+      Integer key = null;
+      int index = 0;
+      for (Map.Entry<Integer, Entity> entry : order.entrySet()) {
+        if (entry.getValue() == entity) {
+          key = entry.getKey();
+          break;
         }
+        index++;
+      }
+      if (key == null) {
+        return;
+      }
+      order.remove(key);
+      if (cursor > index) {
+        cursor--;
+      }
+    }
+
+    /** 按 id 摘除一个不再被追踪的实体，并修正游标使「下一页」不被跳过。 */
+    synchronized void remove(int entityId) {
+      if (!order.containsKey(entityId)) {
+        return;
+      }
+      int index = 0;
+      for (Integer key : order.keySet()) {
+        if (key == entityId) {
+          break;
+        }
+        index++;
+      }
+      order.remove(entityId);
+      if (cursor > index) {
+        cursor--;
       }
     }
 
@@ -561,10 +640,13 @@ public final class EntityCuller implements Listener {
       int step = Math.min(Math.max(1, budget), size);
       int start = Math.floorMod(cursor, size);
       List<Entity> batch = new ArrayList<>(step);
-      for (int i = 0; i < step; i++) {
-        Entity entity = order.get((start + i) % size);
-        if (!hiddenIds.contains(entity.getEntityId())) {
-          batch.add(entity);
+      int index = 0;
+      for (Map.Entry<Integer, Entity> entry : order.entrySet()) {
+        // 与旧实现同一分片语义：位置落在 [start, start+step) 内才取，已隐藏者按「存下来的 id」跳过
+        boolean inSlice = Math.floorMod(index - start, size) < step;
+        index++;
+        if (inSlice && !hiddenIds.contains(entry.getKey())) {
+          batch.add(entry.getValue());
         }
       }
       cursor = (start + step) % size;
