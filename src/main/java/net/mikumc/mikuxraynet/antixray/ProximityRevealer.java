@@ -70,9 +70,12 @@ import org.bukkit.util.Vector;
  * 功能不降级、绝不阻塞。
  *
  * <p><b>发包纪律</b>：显形包改用 <b>Paper 原生 API</b>（{@code Player#sendMultiBlockChange} /
- * {@code Player#sendBlockChange}）直接发出，不再自拼包结构——因此既不触碰 ProtocolLib 的
+ * {@code Player#sendBlockChange}）直接发出，不再自拼包结构——因此不触碰 ProtocolLib 的
  * {@code WrappedBlockData}（它内部硬查 {@code CraftMagicNumbers} 的方法契约，属「未来某版 MC
- * 一改就整体失效」的脆弱面），也天然不会再次进入本插件的出站监听器。
+ * 一改就整体失效」的脆弱面）。
+ * <b>注意</b>：原生通道同样会经过本插件的出站观察链路（{@link BlockChangeRevealListener}），
+ * 因此每个确实发出的坐标都会记入 {@link RevealEchoLedger}，让观察方认出「这是我们的回显」——
+ * 只摘显形索引，不推进磁盘缓存区块代次（详见 {@link #consumeSelfSentEcho}）。
  * {@code proximity.batch-reveal-sends}（默认开启）时把一个周期内通过筛选的坐标累积起来、
  * 周期末一次 {@code sendMultiBlockChange} 发出（Paper 按 16³ 区块段自动合并，每个涉及的段一个包），
  * 失败时退化为逐坐标 {@code sendBlockChange}；关闭时逐坐标发单方块变更包（旧行为，供 A/B 与回退）。
@@ -182,6 +185,11 @@ public final class ProximityRevealer implements Listener {
   private final TickQuota instantQuota = new TickQuota();
   /** 过度显形抽样器（1/N，只计数不改行为；N=0 关闭）。 */
   private final OverRevealSampler overRevealSampler;
+  /**
+   * 「自己刚发出的显形包」账本：显形包走 Paper 原生通道后同样会被 {@link BlockChangeRevealListener}
+   * 观察到，观察方据此区分「我们的回显」与「服务端真实方块变更」——回显不推进磁盘缓存区块代次。
+   */
+  private final RevealEchoLedger selfSentEchoes = new RevealEchoLedger();
 
   private ScheduledTask globalTask;
 
@@ -260,6 +268,7 @@ public final class ProximityRevealer implements Listener {
     HandlerList.unregisterAll(this);
     chunkIndex.clear();
     revealedSet.clear();
+    selfSentEchoes.clear();
   }
 
   /** 在玩家所属线程上启动周期巡检并保存句柄（调度失败则无句柄可存）。 */
@@ -625,7 +634,23 @@ public final class ProximityRevealer implements Listener {
 
   /** 写入「该玩家已显形」标记（与坐标注销、整块跳过判定共用同一不变式）。 */
   private void markRevealed(Player player, World world, int x, int y, int z) {
-    revealedSet.mark(player.getUniqueId(), ChunkKey.ofBlock(world.getName(), x, z), x, y, z);
+    UUID playerId = player.getUniqueId();
+    String worldName = world.getName();
+    revealedSet.mark(playerId, ChunkKey.ofBlock(worldName, x, z), x, y, z);
+    // 同一个「确实发出之后」的时刻记账：出站观察链路随后看到这个坐标的变更时，
+    // 能认出这是本插件自己的显形回显，从而只摘索引、不推进磁盘缓存代次。
+    selfSentEchoes.record(playerId, worldName, x, y, z);
+  }
+
+  /**
+   * 消费一次「自己刚发出的显形回显」记录（由 {@link BlockChangeRevealListener} 在封包解析线程调用）。
+   *
+   * <p>一次性语义：命中即移除，因此同坐标随后的服务端真实变更仍会被判为真实变更（照常推进代次）。
+   *
+   * @return true 表示这次观测到的方块变更就是本插件自己刚发的显形包
+   */
+  public boolean consumeSelfSentEcho(UUID playerId, String worldName, int x, int y, int z) {
+    return selfSentEchoes.consume(playerId, worldName, x, y, z);
   }
 
   /**

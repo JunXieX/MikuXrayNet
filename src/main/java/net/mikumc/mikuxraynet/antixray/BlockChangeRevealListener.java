@@ -44,6 +44,13 @@ import org.bukkit.plugin.Plugin;
  * 注销按「世界名 + 坐标」精确定位，因此不需要扫描全部玩家或全部区块。不检查取消状态：即使原包被
  * 别的插件取消，最坏结果也只是少发一个冗余显形包，不会丢失更新。
  *
+ * <p><b>自己发的显形包也会被看到（1.1.6 起）</b>：显形发包改用 Paper 原生
+ * {@code Player#sendMultiBlockChange} / {@code Player#sendBlockChange}，这些包同样进入本监听器
+ * （实测「变更注销」增量与「显形发送」增量逐次相等即为此证据）。因此观察方必须先问一次
+ * {@link ProximityRevealer#consumeSelfSentEcho}：命中说明这是本插件自己的回显——回显不改变服务端
+ * 内容，<b>只摘索引、不推进磁盘缓存代次</b>（否则每次显形都会作废该区块的缓存条目）；
+ * 服务端真实方块变更的语义完全不变（照常推进代次）。
+ *
  * <p><b>事件驱动即时显形（P1-4，可选）</b>：构造时传入 {@link ProximityRevealer} 后，每次观测到
  * 变更还会调用 {@link ProximityRevealer#onBlockChangeObserved}——变更邻域内仍有伪装坐标时，
  * 由邻近显形当 tick 补发「玩家身边、已伪装且视线可见」的坐标（周期巡检兜底不变）。
@@ -186,8 +193,16 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     if (isBlacklisted(config, worldName)) {
       return;
     }
+    // 1.1.6 起显形包走 Paper 原生通道（sendMultiBlockChange / sendBlockChange），因此本监听器
+    // 也会看到「我们自己发出的显形回显」。回显不改变服务端内容：只摘索引，绝不推进区块代次
+    // （否则每次显形都会作废该区块的磁盘缓存条目，玩家身边等于没有磁盘缓存）。
+    // 消费是一次性的：同坐标随后的服务端真实变更仍照常推进代次。
+    boolean selfSentEcho = instantRevealer != null
+        && instantRevealer.consumeSelfSentEcho(player.getUniqueId(), worldName, x, y, z);
     unregisterCoordinate(worldName, x, y, z);
-    markChanged(worldName, x, z);
+    if (!selfSentEcho) {
+      markChanged(worldName, x, z);
+    }
     if (instantRevealer != null) {
       instantRevealer.onBlockChangeObserved(player, worldName, x, y, z);
     }
