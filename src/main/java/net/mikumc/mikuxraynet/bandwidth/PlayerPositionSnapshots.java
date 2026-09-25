@@ -25,6 +25,12 @@ import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
  *
  * <p><b>fail-open</b>：快照缺失（刚登录 / 刚重置）或读取异常一律按「近身」处理（立即放行）——
  * 无法判断距离时宁可少合并，绝不制造延迟。本类不触碰任何 Bukkit API，可离线单测。
+ *
+ * <p><b>方块坐标不变的提前返回</b>：判定只用到方块坐标（见 {@link #immediatePass}），因此
+ * {@link #refresh} 先读回当前快照，若其方块坐标与本次完全相同就直接返回——不 new 记录、不写 CHM。
+ * 这样静止玩家（占绝大多数）每 tick 只剩一次 CHM 读，省下每秒每玩家一次记录分配与写操作。
+ * 判据是<b>同一枚</b> {@link #blockCoordinate} 纯函数同时供写入侧（是否重发）与判定侧（算距离）使用，
+ * 两侧不可能漂移。
  */
 final class PlayerPositionSnapshots {
 
@@ -34,9 +40,16 @@ final class PlayerPositionSnapshots {
 
   private final ConcurrentHashMap<UUID, Position> positions = new ConcurrentHashMap<>();
 
-  /** 刷新某玩家快照（必须在拥有该玩家的线程调用）。 */
+  /** 刷新某玩家快照（必须在拥有该玩家的线程调用）。方块坐标未变时不发布，见类注释。 */
   void refresh(UUID playerId, double x, double y, double z) {
     if (playerId == null) {
+      return;
+    }
+    Position current = positions.get(playerId);
+    if (current != null && blockCoordinate(current.x()) == blockCoordinate(x)
+        && blockCoordinate(current.y()) == blockCoordinate(y)
+        && blockCoordinate(current.z()) == blockCoordinate(z)) {
+      // 仍在同一方块：判定结果不可能改变，跳过分配与写入
       return;
     }
     positions.put(playerId, new Position(x, y, z));
@@ -86,11 +99,17 @@ final class PlayerPositionSnapshots {
       // fail-open：无快照 → 按近身处理（宁可少合并，绝不制造延迟）
       return true;
     }
-    return BlockChangeBatch.anyWithinRadius(updates, floor(snapshot.x()), floor(snapshot.y()),
-        floor(snapshot.z()), radius);
+    return BlockChangeBatch.anyWithinRadius(updates, blockCoordinate(snapshot.x()),
+        blockCoordinate(snapshot.y()), blockCoordinate(snapshot.z()), radius);
   }
 
-  private static int floor(double value) {
+  /**
+   * 精确坐标 → 所在方块坐标的<b>唯一</b>转换（写入侧是否重发与判定侧算距离都调用它）。
+   *
+   * <p>必须是 {@link Math#floor} 语义而<b>不能</b>是 {@code (int)} 截断：负数坐标下截断会向零取整，
+   * 例如 {@code -0.5} 截断得 {@code 0}（把玩家算到了隔壁方块），floor 才是正确的 {@code -1}。
+   */
+  static int blockCoordinate(double value) {
     return (int) Math.floor(value);
   }
 }
