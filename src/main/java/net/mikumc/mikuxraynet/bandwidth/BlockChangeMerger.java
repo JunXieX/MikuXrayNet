@@ -11,6 +11,7 @@ import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -28,14 +29,11 @@ import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.util.Constants;
-import org.bukkit.Location;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
-import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
-import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 
@@ -50,10 +48,14 @@ import org.bukkit.plugin.Plugin;
  * <p><b>近身变更立即放行</b>：距离玩家 {@code block-changes.immediate-radius}（默认 8 格）以内的
  * 方块变更<b>不进合并窗口</b>，原包立即放行——玩家自己挖/放方块时目标就在脚边，被窗口延迟会让
  * 客户端预测得不到确认，表现为「挖掘时顿一下」。半径外的变更（爆炸、大面积刷新等）照常合并。
+ * 判定只读一份由实体调度器<b>每 tick 刷新</b>的位置快照（见 {@link PlayerPositionSnapshots}）：
+ * 封包线程不触碰实体状态，且刷新跟随实体/区域归属，因此传送等任何位置变化都会在一个 tick 内生效
+ * （旧实现依赖 {@code PlayerMoveEvent}，而传送有独立 HandlerList，会按陈旧坐标判错）。
  *
  * <p><b>fail-open</b>：读不出字段、构造失败、校验不通过、玩家离线 —— 一律原样放行原包，绝不丢更新。
  * 原包放行通过 {@link AsyncMarker} 的 {@code signalPacketTransmission} 完成，并用一次性闸保证
- * 「恰好放行一次」。
+ * 「恰好放行一次」。位置快照不可用（尚未建立 / 刷新或读取异常）时同样 fail-open：近身判定按
+ * 「立即放行」处理，宁可少合并、绝不制造延迟。
  *
  * <p><b>首包自检</b>：第一次真正发送合并包时会回读刚写入的字段做结构校验；未通过校验前会
  * <em>同时</em>保留原包（重复下发相同方块状态是无害幂等操作），校验通过后才开始取消原包。
@@ -62,10 +64,6 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
   private static final String BYPASS_PERMISSION = "mikuxraynet.bypass";
   private static final int MAX_ERROR_LOGS = 3;
-
-  /** 玩家所在方块坐标（只含基本类型，供封包线程安全读取）。 */
-  private record BlockPos(int x, int y, int z) {
-  }
 
   /** 冲刷批次内的 section 分组键。 */
   private record SectionKey(int x, int y, int z) {
@@ -103,15 +101,20 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   private final ScheduledExecutorService flusher;
   private final ConcurrentHashMap<UUID, Pending> pending = new ConcurrentHashMap<>();
   /**
-   * 玩家所在方块坐标缓存（主线程 / 区域线程经 {@link PlayerMoveEvent} 刷新）。
+   * 玩家位置快照（由实体调度器在玩家所属线程每 tick 刷新，封包线程只读）。
    *
-   * <p><b>为什么不直接读 {@code player.getLocation()}</b>：本监听回调运行在 ProtocolLib 的封包线程，
-   * 遵循「封包线程不触碰实体坐标」的 Folia 纪律（与 {@code AfkTracker} 同款做法）。
-   * 因此在主线程刷新后缓存，封包线程只读缓存；{@link PlayerMoveEvent} 仅在跨越方块边界时更新，
-   * 空闲时（含原地挖掘）几乎零开销。缓存未命中（刚登录尚未移动）时按「未知」处理，退化为照常合并。
+   * <p>取代旧的 {@code PlayerMoveEvent} 坐标缓存：传送有独立 HandlerList，缓存会陈旧。
+   *
+   * @see PlayerPositionSnapshots
    */
-  private final ConcurrentHashMap<UUID, BlockPos> playerPositions = new ConcurrentHashMap<>();
+  private final PlayerPositionSnapshots positions = new PlayerPositionSnapshots();
+  /** 每玩家的位置刷新任务句柄（退出 / 实体退役 / 停用时逐一取消）。 */
+  private final ConcurrentHashMap<UUID, ScheduledTask> positionTasks = new ConcurrentHashMap<>();
   private final AtomicInteger errorCounter = new AtomicInteger();
+  /** 「位置快照不可用 → 近身判定一律立即放行」的一次性提示闸。 */
+  private final AtomicBoolean snapshotFailOpenNoticed = new AtomicBoolean();
+  /** 启动期「方块数据契约探测」只做一次（重复 start 不重复探测/刷屏）。 */
+  private final AtomicBoolean blockDataProbeDone = new AtomicBoolean();
 
   private volatile boolean verified;
   private AsyncListenerHandler handler;
@@ -132,13 +135,15 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     });
   }
 
-  /** 注册异步监听器（真异步扣包）与坐标缓存事件。 */
+  /** 注册异步监听器（真异步扣包）与每 tick 的位置快照刷新任务，并做一次启动期契约探测。 */
   public void start() {
+    // 启动期探测一次：让「服务端结构变更导致合并静默失效」可见（不改变任何行为）
+    probeBlockDataContract();
     handler = asynchronousManager.registerAsyncHandler(this);
     handler.start();
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     for (Player player : plugin.getServer().getOnlinePlayers()) {
-      remember(player);
+      schedulePositionRefresh(player);
     }
     plugin.getLogger().info("带宽模块已启用：方块变更合并（时间窗 " + config.mergeWindowMillis()
         + "ms，邻域半径 " + config.mergeRadius() + "，立即放行半径 " + config.immediateRadius()
@@ -157,59 +162,162 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       handler = null;
     }
     HandlerList.unregisterAll(this);
-    playerPositions.clear();
+    cancelAllPositionRefreshTasks();
+    positions.clear();
     flusher.shutdownNow();
   }
 
   @EventHandler(ignoreCancelled = true)
   public void onJoin(PlayerJoinEvent event) {
-    remember(event.getPlayer());
+    schedulePositionRefresh(event.getPlayer());
   }
 
   @EventHandler(ignoreCancelled = true)
   public void onQuit(PlayerQuitEvent event) {
-    playerPositions.remove(event.getPlayer().getUniqueId());
+    cancelPositionRefresh(event.getPlayer().getUniqueId());
   }
 
-  /** 仅在玩家跨越方块边界时刷新缓存，避免高频移动事件的额外开销。 */
-  @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-  public void onMove(PlayerMoveEvent event) {
-    Location to = event.getTo();
-    if (to == null) {
+  /**
+   * 为玩家启动「每 tick 刷新位置快照」的实体调度任务。
+   *
+   * <p><b>为什么用实体调度器</b>：{@code player.getScheduler().runAtFixedRate(...)} 在 Paper 与 Folia
+   * 上是同一套 API——Paper 上「实体所属线程」即服务端主线程，Folia 上即该玩家所在区域的区域线程，
+   * 因此刷新永远运行在拥有该玩家的线程上（Folia 上绝不跨区域读实体状态），无需按平台二选一。
+   */
+  private void schedulePositionRefresh(Player player) {
+    UUID playerId = player.getUniqueId();
+    long period = 1L;
+    ScheduledTask task = Schedulers.repeatOnEntity(plugin, player, period, period,
+        () -> refreshPosition(player, playerId), () -> discardPositionSnapshot(playerId));
+    if (task == null) {
+      // 实体已退役（调度失败）：无句柄可存，读取侧会因缺快照而 fail-open
       return;
     }
-    int blockX = to.getBlockX();
-    int blockY = to.getBlockY();
-    int blockZ = to.getBlockZ();
-    BlockPos current = playerPositions.get(event.getPlayer().getUniqueId());
-    if (current != null && current.x() == blockX && current.y() == blockY && current.z() == blockZ) {
-      return;
+    ScheduledTask previous = positionTasks.put(playerId, task);
+    if (previous != null) {
+      previous.cancel();
     }
-    playerPositions.put(event.getPlayer().getUniqueId(), new BlockPos(blockX, blockY, blockZ));
   }
 
-  /** 主线程读取玩家方块坐标并写入缓存；异常时留空（未知坐标退化为照常合并）。 */
-  private void remember(Player player) {
+  /**
+   * 玩家所属线程：用<b>零分配 getter</b>读取位置写入快照。
+   *
+   * <p>刻意不用 {@code getLocation()}——那会每 tick 每玩家 new 一个 {@code Location}。
+   * 读取或写入异常只丢弃该玩家的快照（读取侧随即 fail-open，下一 tick 自动重建），
+   * 任务句柄仍保留以便退出/停用时正常取消，且绝不把异常抛回调度器。
+   */
+  private void refreshPosition(Player player, UUID playerId) {
     try {
-      Location location = player.getLocation();
-      playerPositions.put(player.getUniqueId(),
-          new BlockPos(location.getBlockX(), location.getBlockY(), location.getBlockZ()));
+      positions.refresh(playerId, player.getX(), player.getY(), player.getZ());
     } catch (Throwable throwable) {
-      logThrottled(throwable);
+      positions.discard(playerId);
+      noticeSnapshotFailOpen(throwable);
     }
   }
 
-  /** 该玩家的近身变更判定；坐标未知（缓存未命中）时返回 false，退化为照常合并。 */
+  /** 玩家退出 / 实体退役：取消其刷新任务并丢弃快照。 */
+  private void cancelPositionRefresh(UUID playerId) {
+    ScheduledTask task = positionTasks.remove(playerId);
+    if (task != null) {
+      try {
+        task.cancel();
+      } catch (Throwable ignored) {
+        // 任务可能已随实体退役结束，取消失败可忽略
+      }
+    }
+    positions.discard(playerId);
+  }
+
+  /** 实体退役回调：摘掉任务句柄并丢弃快照（此后读取侧一律 fail-open）。 */
+  private void discardPositionSnapshot(UUID playerId) {
+    positionTasks.remove(playerId);
+    positions.discard(playerId);
+  }
+
+  /** 停用兜底：取消全部位置刷新任务。 */
+  private void cancelAllPositionRefreshTasks() {
+    for (ScheduledTask task : positionTasks.values()) {
+      try {
+        task.cancel();
+      } catch (Throwable ignored) {
+        // 任务可能已随实体退役结束，取消失败可忽略
+      }
+    }
+    positionTasks.clear();
+  }
+
+  /**
+   * 快照不可用时的一次性中文提示。语义是 fail-open：一律按近身处理（立即放行），
+   * 宁可少合并、绝不制造延迟。
+   */
+  private void noticeSnapshotFailOpen(Throwable cause) {
+    if (!snapshotFailOpenNoticed.compareAndSet(false, true)) {
+      return;
+    }
+    String text = "方块变更合并：玩家位置快照暂不可用，近身判定一律按「立即放行」处理"
+        + "（fail-open——宁可少合并、绝不制造延迟）。快照由玩家所属线程每 tick 重建，"
+        + "通常一两秒内自动恢复；此提示只打印一次。";
+    if (cause == null) {
+      plugin.getLogger().warning(text);
+    } else {
+      plugin.getLogger().log(Level.WARNING, text, cause);
+    }
+  }
+
+  /**
+   * 启动期探测一次「ProtocolLib 的 {@code WrappedBlockData$NewBlockData} 静态契约」是否成立。
+   *
+   * <p><b>为什么需要</b>：该类 {@code <clinit>} 会用 {@code FuzzyReflection} 在 {@code CraftMagicNumbers}
+   * 上硬查 7 个方法契约（{@code MATERIAL_FROM_BLOCK} / {@code BLOCK_FROM_MATERIAL} /
+   * {@code TO_LEGACY_DATA} / {@code FROM_LEGACY_DATA} / {@code GET_BLOCK} /
+   * {@code DEFAULT_BLOCK_DATA} / {@code GET_HANDLE}）；服务端结构一变就可能整体失败。失败后
+   * {@link #readUpdates} 会把出站包判为「解析不了」并原样放行（既有 fail-open），于是
+   * <b>合并能力静默消失</b>——日志里看不到任何异常，排查时极易误判为「配置没生效」。
+   *
+   * <p><b>只让静默降级可见</b>：探测结果不改变任何行为（不注册/不注销该模块、不抛异常、不影响启动），
+   * 失败只打一次中文 WARN。用 {@code initialize=true} 触发 clinit——这与生产路径（首个出站变更包）
+   * 触发的是同一个初始化，因此不引入新的失败面；探测本身抛出的异常一律吞掉并记为该探针失败。
+   */
+  private void probeBlockDataContract() {
+    if (!blockDataProbeDone.compareAndSet(false, true)) {
+      return;
+    }
+    try {
+      Class.forName("com.comphenix.protocol.wrappers.WrappedBlockData$NewBlockData", true,
+          WrappedBlockData.class.getClassLoader());
+    } catch (Throwable throwable) {
+      // 异常吞掉：探测失败绝不影响启动
+      plugin.getLogger().log(Level.WARNING,
+          "变更合并模块已停用（服务端结构变更）：ProtocolLib 的 WrappedBlockData$NewBlockData 静态契约"
+              + "探测失败（CraftMagicNumbers 的 7 个方法契约未全部探到），方块变更合并将静默失效、"
+              + "原包照常放行。请更新 ProtocolLib 或本插件到匹配当前服务端的版本后重启。",
+          throwable);
+    }
+  }
+
+  /**
+   * 该玩家的近身变更判定：<b>只读位置快照</b>（封包线程不触碰任何 Bukkit API）。
+   *
+   * <p>fail-open：快照尚未建立（刚登录 / 刚重置）或读取异常 → 按近身处理（立即放行）。
+   * 与旧实现的唯一语义差别就在这里：旧实现快照缺失时退化为「照常合并」（会延迟），
+   * 现在改为「立即放行」——无法判断距离时宁可少合并，绝不制造延迟。
+   */
   private boolean shouldPassThroughImmediately(UUID playerId, List<Update<WrappedBlockData>> updates) {
     int radius = config.immediateRadius();
     if (radius <= 0) {
+      // 配置关闭立即放行：与旧行为一致（全部走合并）
       return false;
     }
-    BlockPos position = playerPositions.get(playerId);
-    if (position == null) {
-      return false;
+    try {
+      PlayerPositionSnapshots.Position position = positions.get(playerId);
+      if (position == null) {
+        noticeSnapshotFailOpen(null);
+      }
+      return PlayerPositionSnapshots.immediatePass(position, updates, radius);
+    } catch (Throwable throwable) {
+      noticeSnapshotFailOpen(throwable);
+      return true;
     }
-    return BlockChangeBatch.anyWithinRadius(updates, position.x(), position.y(), position.z(), radius);
   }
 
   @Override

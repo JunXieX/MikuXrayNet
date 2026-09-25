@@ -42,8 +42,21 @@ public final class Schedulers {
    */
   public static ScheduledTask repeatOnEntity(Plugin plugin, Entity entity, long delayTicks,
       long periodTicks, Runnable task) {
+    return repeatOnEntity(plugin, entity, delayTicks, periodTicks, task, null);
+  }
+
+  /**
+   * 在实体所属线程上启动周期任务，并登记「实体已退役」回调。
+   *
+   * <p>退役回调由服务端在实体销毁时调用（也可能永不调用，例如插件先停用并主动取消任务），
+   * 供调用方丢弃「只服务于该实体」的辅助状态（如位置快照）。
+   *
+   * @param retired 实体退役时执行的回调；{@code null} 表示不处理退役
+   */
+  public static ScheduledTask repeatOnEntity(Plugin plugin, Entity entity, long delayTicks,
+      long periodTicks, Runnable task, Runnable retired) {
     try {
-      return entity.getScheduler().runAtFixedRate(plugin, scheduled -> task.run(), null, delayTicks,
+      return entity.getScheduler().runAtFixedRate(plugin, scheduled -> task.run(), retired, delayTicks,
           periodTicks);
     } catch (Throwable ignored) {
       // 实体已退役：无需周期任务
