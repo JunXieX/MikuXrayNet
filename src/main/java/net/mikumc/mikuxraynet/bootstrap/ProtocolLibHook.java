@@ -7,6 +7,7 @@ import com.comphenix.protocol.async.AsyncListenerHandler;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import net.mikumc.mikuxraynet.antixray.ChunkPacketAccessor;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
@@ -58,6 +59,10 @@ public final class ProtocolLibHook {
       NeighborChunkProvider neighborProvider, ObfuscatedChunkIndex obfuscatedChunkIndex,
       RevealedSet revealedSet, BypassRegistry bypassRegistry, DiskCacheStore diskCache,
       Supplier<AntiXrayConfig> liveConfig) {
+    // 启动期解析并缓存区块数据字段（字段直读，不依赖 ProtocolLib 自带的区块数据包装类）。
+    // 打一行判定结果便于用户核对：任一 ✗ 都意味着该功能 fail-open（放行原包），一眼可定位环境问题。
+    logger.info(ChunkPacketAccessor.resolveAndDescribe());
+
     Throwable batchFailure = tryRegister(config, processor, workPool, neighborProvider,
         obfuscatedChunkIndex, revealedSet, bypassRegistry, diskCache, liveConfig, true);
     if (batchFailure == null) {

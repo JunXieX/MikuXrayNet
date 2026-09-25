@@ -256,7 +256,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     try {
       accessor = new ChunkPacketAccessor(event.getPacket());
     } catch (Throwable throwable) {
-      logThrottled("区块封包结构解析失败，已按原包放行", throwable);
+      // 文案必须指向环境问题：绝大多数情况是服务端 NMS 结构变更（如 26.3 移除了构造器/改了字段）
+      logThrottled("区块封包结构解析失败（无法定位区块数据字段，服务端 NMS 结构可能已变更），已按原包放行",
+          throwable);
       return;
     }
 
@@ -566,9 +568,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return;
     }
     if (!accessor.update(data, positions, task.minHeight(), config.removeBlockEntities())) {
-      // 「算了但没写」：setBuffer 回读不一致（ProtocolLib 版本/封包结构不符），必须留痕
+      // 「算了但没写」：写回后回读不一致（ProtocolLib 版本/封包结构不符），必须留痕
       stats.writeBackFailures.increment();
-      logThrottled("区块改写结果未能写回封包（setBuffer 回读不一致），本轮按原包内容放行", null);
+      logThrottled("区块改写结果未能写回封包（写回后回读不一致），本轮按原包内容放行", null);
     }
 
     // 记录「这个区块被伪装过的坐标」（按区块共享，只存一份；纯内存写入，可在工作线程执行）

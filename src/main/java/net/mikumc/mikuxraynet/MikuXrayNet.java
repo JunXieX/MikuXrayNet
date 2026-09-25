@@ -59,8 +59,8 @@ public final class MikuXrayNet extends JavaPlugin {
 
     // 平台判定必须最先做：调度已统一走 Paper 调度器（不再分支），但平台判定仍决定
     // 「能否安全枚举全服实体」（零位移包白名单）与「邻近显形的巡检策略」两处能力差异。
-    // 依据是服务端品牌/版本标识（antixray.yml: advanced.platform 可手动指定），不再用「类存在性」，
-    // 因为 Paper 及其下游分支（如 Leaf）都会自带 io.papermc.paper.threadedregions.* 的调度器 API 类。
+    // 判定顺序：advanced.platform 手动覆盖 → 品牌/版本标识（含 folia）→ 判别类探测
+    // （io.papermc.paper.threadedregions.RegionizedServer：Folia 核心独有，Leaf/Paper 都没有）。
     PlatformSupport.configure(config.antiXray().platform());
     getLogger().info("运行平台：" + PlatformSupport.platformDescription());
     this.runtime = new AntiXrayRuntime(this);

@@ -29,7 +29,7 @@ public final class RewriteStats {
   /** 处理超时、由看门狗放行原包的次数。 */
   public final LongAdder chunksTimedOut = new LongAdder();
 
-  /** 改写字节已算出但未能写回封包的次数（setBuffer 未生效，self-check 失败）。 */
+  /** 改写字节已算出但未能写回封包的次数（字段直写未生效，写回后回读 self-check 失败）。 */
   public final LongAdder writeBackFailures = new LongAdder();
 
   /**

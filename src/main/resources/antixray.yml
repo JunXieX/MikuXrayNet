@@ -482,17 +482,19 @@ cache:
   expire-after-access-seconds: 60
 
 advanced:
-  # 平台判定兜底：auto | paper | folia（默认 auto）。
-  # 本插件同时支持 Paper 系（单主线程、常规 Bukkit 调度）与 Folia 系（区域化多线程、区域调度器），
-  # auto 时按服务端自己报出的品牌/版本标识判定（Bukkit.getName() / getVersion() / getBukkitVersion()
-  # 任一含 "folia" 才判为 Folia 系），并在启动日志里打印判定依据，例如：
-  #   运行平台：Leaf 26.2（Paper 系，单主线程）｜判定依据：服务端名称=Leaf（不含 folia 标识 → Paper 系）
-  # 为什么不能靠「类是否存在」判断：现代 Paper 及其下游分支（真机 Leaf 26.2）都会自带
-  # io.papermc.paper.threadedregions.* 的 Folia 调度器 API 类，用类存在性会把纯 Paper 误判成 Folia，
-  # 从而错误地禁用实体枚举、改走区域调度。
-  # 若你的服务端是改了品牌的 Folia 衍生端（标识里没有 folia），把它设为 folia 即可强制走 Folia 路径；
-  # 反之若某个分支误报 folia，设为 paper。本项全局生效（同时影响反矿透与带宽两个模块），
-  # 改后执行 /mikuxraynet reload 生效（会按新值重新判定并重建周期任务）。
+  # 平台判定兜底：auto | paper | folia（默认 auto，最高优先级）。
+  # 本插件同时支持 Paper 系（单主线程、常规 Bukkit 调度）与 Folia 系（区域化多线程、区域调度器）。
+  # auto 时判定顺序为：品牌/版本标识 → 判别类探测，并在启动日志里打印判定依据，例如：
+  #   运行平台：Leaf 26.2（Paper 系，单主线程）｜判定依据：品牌=Leaf（不含 folia 标识）；
+  #             判别类 io.papermc.paper.threadedregions.RegionizedServer 不存在 → Paper 系
+  #   运行平台：Lophine 26.3（Folia 系，区域化多线程）｜判定依据：品牌=Lophine（不含 folia 标识）；
+  #             判别类 io.papermc.paper.threadedregions.RegionizedServer 存在 → Folia 系（Folia 衍生端）
+  # 判别类取 Folia 的「服务端实现类」RegionizedServer：实测 Lophine 26.3 有，而 Leaf 26.2 与
+  # paper-api 26.2 都没有（它们只自带 Folia 调度器 API 与 RegionizedServerInitEvent）。
+  # 因此不能用 RegionizedServerInitEvent / 「包内任一类存在」来判断——那会把 Leaf 误判成 Folia。
+  # 若你的服务端是改了品牌的 Folia 衍生端（标识里没有 folia 且判别类探测也失效），把它设为 folia
+  # 即可强制走 Folia 路径；反之若某个分支误报 folia，设为 paper。本项全局生效（同时影响反矿透与
+  # 带宽两个模块），改后执行 /mikuxraynet reload 生效（会按新值重新判定并重建周期任务）。
   platform: auto
 
   # 工作线程数；0 表示按 CPU 核数自动推算（上限 4）。
