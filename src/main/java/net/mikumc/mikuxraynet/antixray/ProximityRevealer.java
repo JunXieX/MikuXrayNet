@@ -21,9 +21,11 @@ import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
+import org.bukkit.FluidCollisionMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
+import org.bukkit.block.Block;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -34,6 +36,7 @@ import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
 import org.bukkit.event.world.WorldUnloadEvent;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 
 /**
@@ -51,18 +54,20 @@ import org.bukkit.util.Vector;
  * <ul>
  *   <li><b>视锥剔除</b>（默认开启，80° 竖直全角）：只显形玩家视野锥内的候选坐标；
  *       水平方向按 16:9 宽高比更宽（约 112° 全角），与客户端观感一致；最小距离内豁免；</li>
- *   <li><b>可见性判定</b>（默认开启，多候选点采样）：先识别方块的暴露面，只在暴露面上取至多 5 个采样点
- *       （正对玩家的面中心 → 包围盒最近点 → 面四角）分别做体素步进，任一条通畅即显形；六面全被遮挡
- *       （完全掩埋）时一个点都不采 → 直接判不可见，绝不隔着墙还原。</li>
+ *   <li><b>可见性判定</b>（默认开启，多候选点 + Paper 原生射线）：先识别方块的暴露面，只在暴露面上取
+ *       候选点（正对玩家的面中心 → 包围盒最近点 → 面四角），每个候选点用
+ *       {@code World#rayTraceBlocks} 做原生射线检测，任一条通畅即显形；候选点数由
+ *       {@code proximity.raycast.samples} 限制（已钳制 1..8）；六面全被遮挡（完全掩埋）时一个点都不采
+ *       → 直接判不可见，绝不隔着墙还原。</li>
  *   <li><b>流体覆盖</b>（默认开启，{@code occlusion.fluid-cover}）：目标方块上方紧邻方块是流体
  *       （水/岩浆）时不显形——刷在岩浆里的下界残骸本就被伪装，显形侧若还原就等于把它亮给玩家。</li>
  * </ul>
  *
- * <p><b>线程纪律</b>：位置读取、方块读取与发包都在主线程 / Folia 区域线程（非 Folia 为统一主线程任务，
+ * <p><b>线程纪律</b>：位置读取、方块读取、原生射线与发包都在主线程 / Folia 区域线程（非 Folia 为统一主线程任务，
  * Folia 为各玩家的区域任务）；纯计算（视锥角度）交给 {@link MikuWorkPool} 的工作线程，
- * 算完再回到玩家所属线程。可见性判定必须在主线程 / 区域线程做——它要先读 6 个邻块判暴露面，
- * 因此不再像旧实现那样把射线路径预计算在工作线程（那时只有单点采样、无需读邻块）。
- * 工作队列已满时退化为「主线程直接做纯计算」，功能不降级、绝不阻塞。
+ * 算完再回到玩家所属线程。可见性判定（含 {@code rayTraceBlocks}）必须在主线程 / 区域线程做——
+ * 它是 Bukkit API，且要先读 6 个邻块判暴露面。工作队列已满时退化为「主线程直接做纯计算」，
+ * 功能不降级、绝不阻塞。
  *
  * <p><b>发包纪律</b>：ProtocolLib 是唯一封包通道，包用 {@code createPacket} 构造、用
  * {@code sendServerPacket(..., filters=false)} 发出，因此显形包不会再次进入本插件的出站监听器。
@@ -137,6 +142,8 @@ public final class ProximityRevealer implements Listener {
   private final AtomicBoolean firstRevealDiagnosed = new AtomicBoolean();
   /** 「显形索引安全阀触发」只提示一次（CAS 抢占），避免每轮巡检刷屏。 */
   private final AtomicBoolean capacityWarned = new AtomicBoolean();
+  /** 「可见性判定失败」只提示一次（CAS 抢占）：原生射线改造后新增的失败模式必须可见但不刷屏。 */
+  private final AtomicBoolean visibilityWarned = new AtomicBoolean();
   /** 事件显形的每玩家每 tick 限额（默认 16，防爆刷；见 {@link TickQuota}）。 */
   private final TickQuota instantQuota = new TickQuota();
   /** 过度显形抽样器（1/N，只计数不改行为；N=0 关闭）。 */
@@ -191,7 +198,8 @@ public final class ProximityRevealer implements Listener {
         + (proximity.frustumEnabled() ? proximity.frustumFov() + "°（最小距离 "
             + proximity.frustumMinDistance() + " 格内豁免）" : "已关闭")
         + "，可见性判定 " + (proximity.raycastEnabled()
-            ? "已开启（多候选点，暴露面上至多 5 点）" : "已关闭"));
+            ? "已开启（Paper 原生射线 rayTraceBlocks，暴露面上至多 " + proximity.raycastSamples()
+                + " 个候选点）" : "已关闭"));
   }
 
   /** 停用：注销任务与事件监听，并清空两个显形索引（不留副作用）。 */
@@ -525,14 +533,19 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 主线程 / 区域线程读方块做可见性判定：先判「上方是否流体」（流体覆盖开启时，是则不显形），
-   * 再读 6 个邻块判暴露面，然后对暴露面上的至多 5 个采样点做体素步进，任一条通畅即可见。
-   * 任何异常都按「可见」处理（fail-open，宁可多显形）。
+   * 主线程 / 区域线程做可见性判定：先判「上方是否流体」（流体覆盖开启时，是则不显形），
+   * 再读 6 个邻块判暴露面，然后对暴露面上的至多 {@code proximity.raycast.samples} 个候选点
+   * 用 Paper 原生射线（{@code World#rayTraceBlocks}）逐一检测，任一条通畅即可见。
+   *
+   * <p><b>绝不隔墙还原</b>：任何异常/歧义一律按「不显形」处理（保守）。
    */
   private boolean isVisible(World world, ProximitySelector.Eye eye, int x, int y, int z) {
     try {
-      int samples = proximity.raycastSamples();
-      return ProximitySelector.isVisible(eye, x, y, z, new ProximitySelector.RayQuery() {
+      // 候选点数（由 proximity.raycast.samples 提供，配置解析时已钳制 1..8）
+      int maxPoints = proximity.raycastSamples();
+      // 射线起点必须是带世界的 Location：rayTraceBlocks 依赖它定位起始体素
+      Location eyeLocation = new Location(world, eye.x(), eye.y(), eye.z());
+      ProximitySelector.RayQuery query = new ProximitySelector.RayQuery() {
         @Override
         public boolean isOccluding(int blockX, int blockY, int blockZ) {
           BlockData data = world.getBlockData(blockX, blockY, blockZ);
@@ -546,10 +559,51 @@ public final class ProximityRevealer implements Listener {
           return material == Material.WATER || material == Material.LAVA
               || material == Material.BUBBLE_COLUMN;
         }
-      }, samples, fluidCover);
+      };
+      return ProximitySelector.isVisible(eye, x, y, z, query, maxPoints, fluidCover,
+          (pointX, pointY, pointZ) -> rayClear(world, eyeLocation, x, y, z, pointX, pointY, pointZ));
     } catch (Throwable throwable) {
-      logThrottled(throwable);
+      // 无法判定 → 按「不可见」保守处理（红线：绝不隔着墙还原）
+      logVisibilityFailure(throwable);
+      return false;
+    }
+  }
+
+  /**
+   * 单点原生射线检测：从眼睛射向世界坐标 {@code (pointX, pointY, pointZ)}。
+   *
+   * <p>返回 true = 途中未被任何方块截住（可视为通畅）；命中「目标方块自身」也容忍为通畅
+   * （候选点正落在方块表面上时的边界情形，射线恰好在端点处碰到本方块）。
+   * 命中其它方块（含玻璃等非遮挡方块）一律判为「不通畅」——宁可漏显形，也绝不隔着墙还原。
+   */
+  private static boolean rayClear(World world, Location eyeLocation, int targetX, int targetY,
+      int targetZ, double pointX, double pointY, double pointZ) {
+    double dx = pointX - eyeLocation.getX();
+    double dy = pointY - eyeLocation.getY();
+    double dz = pointZ - eyeLocation.getZ();
+    double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (distance < 1.0E-6D) {
+      // 眼位与候选点重合：视为通畅（贴得太近，无从遮挡）
       return true;
+    }
+    Vector direction = new Vector(dx, dy, dz).normalize();
+    // FluidCollisionMode.NEVER：流体不参与射线（流体规则由 isVisible 显式判定）
+    RayTraceResult hit = world.rayTraceBlocks(eyeLocation, direction, distance,
+        FluidCollisionMode.NEVER, true);
+    if (hit == null || hit.getHitBlock() == null) {
+      return true;
+    }
+    Block block = hit.getHitBlock();
+    return block.getX() == targetX && block.getY() == targetY && block.getZ() == targetZ;
+  }
+
+  /** 可见性判定失败（异常）只提示一次：新增失败模式必须可见，但不刷屏。 */
+  private void logVisibilityFailure(Throwable throwable) {
+    if (visibilityWarned.compareAndSet(false, true)) {
+      plugin.getLogger().log(Level.WARNING,
+          "邻近显形可见性判定失败：本次一律按「不显形」处理（绝不隔着墙还原）。"
+              + "改用 Paper 原生 rayTraceBlocks 后，此类失败通常源于世界读取异常，请反馈此日志。",
+          throwable);
     }
   }
 

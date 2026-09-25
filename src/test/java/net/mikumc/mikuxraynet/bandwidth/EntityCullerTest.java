@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.papermc.paper.event.player.PlayerTrackEntityEvent;
@@ -16,11 +17,17 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
-import org.bukkit.block.data.BlockData;
+import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.util.BoundingBox;
+import org.bukkit.util.RayTraceResult;
+import org.bukkit.util.Vector;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -30,6 +37,11 @@ import org.junit.jupiter.api.Test;
  * ② 实体失效（死亡 / 卸载）时隐藏记录被清理（不泄漏映射）；③ 停用 / 退出有全量恢复入口。
  * 本测试把这三件事逐一钉死。
  *
+ * <p><b>与原实现的差异</b>：遮挡结论已改由 Paper 原生 {@code World#rayTraceBlocks} 给出，
+ * 因此账本类断言直接把结论（{@code evaluate(..., allBlocked, ...)}）喂给评估入口；
+ * 「判定失败必须保持可见」的红线另由 {@link #failedBlockReadKeepsEntityVisible} 覆盖
+ * （世界桩让 {@code rayTraceBlocks} 抛异常）。
+ *
  * <p>Bukkit 运行时在离线测试环境不可用（服务器的注册 / 调度都是静态状态），因此这里用
  * {@link Proxy} 动态代理 Bukkit 接口作为替身——不引入任何新依赖（pom 只有 junit-jupiter），
  * 也不需要 Mockito 之类的框架。
@@ -38,32 +50,25 @@ class EntityCullerTest {
 
   private static final Logger LOGGER = Logger.getLogger("EntityCullerTest");
 
-  /** 被完全遮挡（一条体素路径 + 世界桩返回「遮挡」）→ 隐藏。 */
-  private static List<int[]> blockedPath() {
-    return List.of(new int[] {0, 0, 0});
-  }
-
   @Test
   void hiddenEntityIsShownAgainWhenTheViewIsClear() {
     ThrottleStats stats = new ThrottleStats();
     EntityCuller culler = newCuller(stats);
     PlayerStub player = new PlayerStub();
-    WorldStub world = new WorldStub();
-    EntityStub entity = new EntityStub(101, world);
+    EntityStub entity = new EntityStub(101, new WorldStub());
 
-    culler.evaluate(player.proxy(), entity.proxy(), blockedPath());
+    culler.evaluate(player.proxy(), entity.proxy(), true);
     assertEquals(1L, stats.entitiesHidden.sum(), "被完全遮挡必须隐藏");
     assertEquals(1, culler.hiddenCount(), "隐藏账本必须有记录");
     assertEquals(0L, stats.entitiesShown.sum());
 
     // 重复判定仍然遮挡：不得重复计入隐藏数、不得重复登记（账本按 (玩家, 实体) 去重）
-    culler.evaluate(player.proxy(), entity.proxy(), blockedPath());
+    culler.evaluate(player.proxy(), entity.proxy(), true);
     assertEquals(1L, stats.entitiesHidden.sum(), "同一实体重复判定只算一次隐藏");
     assertEquals(1, culler.hiddenCount());
 
-    // 视线通畅（世界桩不再遮挡）→ 必须恢复显示，且账本同步摘除
-    world.occluding = false;
-    culler.evaluate(player.proxy(), entity.proxy(), blockedPath());
+    // 视线通畅（原生射线判为不被挡）→ 必须恢复显示，且账本同步摘除
+    culler.evaluate(player.proxy(), entity.proxy(), false);
     assertEquals(1L, stats.entitiesShown.sum(), "重新可见必须调用 showEntity");
     assertEquals(1, player.showCalls.get(), "恢复必须真的下发 showEntity（否则会残留看不见的怪）");
     assertEquals(0, culler.hiddenCount(), "恢复后账本必须同步摘除");
@@ -77,11 +82,11 @@ class EntityCullerTest {
     PlayerStub player = new PlayerStub();
     EntityStub entity = new EntityStub(202, new WorldStub());
 
-    culler.evaluate(player.proxy(), entity.proxy(), blockedPath());
+    culler.evaluate(player.proxy(), entity.proxy(), true);
     assertEquals(1, culler.hiddenCount());
 
     entity.valid = false;
-    culler.evaluate(player.proxy(), entity.proxy(), List.of());
+    culler.evaluate(player.proxy(), entity.proxy(), false);
 
     assertEquals(0, culler.hiddenCount(), "失效实体的隐藏记录必须清理，避免映射泄漏");
     assertEquals(0L, stats.entitiesShown.sum(), "已被服务端自然回收的实体不需要（也不该）showEntity");
@@ -96,11 +101,11 @@ class EntityCullerTest {
     PlayerStub player = new PlayerStub();
     EntityStub entity = new EntityStub(303, new WorldStub());
 
-    culler.evaluate(player.proxy(), entity.proxy(), blockedPath());
+    culler.evaluate(player.proxy(), entity.proxy(), true);
     assertEquals(1, culler.hiddenCount());
 
     player.online = false;
-    culler.evaluate(player.proxy(), entity.proxy(), blockedPath());
+    culler.evaluate(player.proxy(), entity.proxy(), true);
 
     assertEquals(0, culler.hiddenCount(), "玩家离线后不得继续保留隐藏记录");
     assertEquals(0L, stats.entitiesShown.sum(), "离线不产生恢复计数");
@@ -117,8 +122,8 @@ class EntityCullerTest {
     EntityStub first = new EntityStub(1, world);
     EntityStub second = new EntityStub(2, world);
 
-    culler.evaluate(player.proxy(), first.proxy(), blockedPath());
-    culler.evaluate(player.proxy(), second.proxy(), blockedPath());
+    culler.evaluate(player.proxy(), first.proxy(), true);
+    culler.evaluate(player.proxy(), second.proxy(), true);
     assertEquals(2, culler.hiddenCount());
 
     Map<Integer, Entity> drained = culler.drainPlayer(player.id());
@@ -205,14 +210,12 @@ class EntityCullerTest {
     }
 
     // 阶段一：实体刚入场、视线通畅 → 一轮完整轮转内不得隐藏任何实体
-    world.occluding = false;
-    runRotation(rotation, budget, player, culler);
+    runRotation(rotation, budget, player, culler, false);
     assertEquals(0L, stats.entitiesHidden.sum(), "视线通畅时不得隐藏（先可见阶段的正常状态）");
     assertEquals(0, culler.hiddenCount());
 
     // 阶段二：之后才建墙遮挡 → 同一轮转在一个有限周期内必然再次覆盖到它并隐藏
-    world.occluding = true;
-    runRotation(rotation, budget, player, culler);
+    runRotation(rotation, budget, player, culler, true);
     assertEquals(50L, stats.entitiesHidden.sum(),
         "「先可见后被遮挡」的实体必须在有限周期内被隐藏（旧实现此处恒为 0）");
     assertEquals(50, culler.hiddenCount());
@@ -220,12 +223,12 @@ class EntityCullerTest {
 
   /** 走一轮完整轮转：每个被选中的实体都用真实评估入口判定一次。 */
   private static void runRotation(EntityCuller.TrackedRotation rotation, int budget, PlayerStub player,
-      EntityCuller culler) {
+      EntityCuller culler, boolean allBlocked) {
     int cycles = 0;
     int maxCycles = (rotation.size() + budget - 1) / budget;
     while (cycles < maxCycles) {
       for (Entity entity : rotation.nextBatch(budget, Set.of())) {
-        culler.evaluate(player.proxy(), entity, blockedPath());
+        culler.evaluate(player.proxy(), entity, allBlocked);
       }
       cycles++;
     }
@@ -240,15 +243,16 @@ class EntityCullerTest {
     PlayerStub player = new PlayerStub();
     WorldStub world = new WorldStub();
 
-    // 3 个「入场即被遮挡」的实体：只进隐藏账本，不占轮转队列
+    // 3 个「入场即被遮挡」的实体：位置离玩家很远（不触发强制可见）→ 复检时走射线判定，保持隐藏
     for (int i = 0; i < 3; i++) {
-      culler.evaluate(player.proxy(), new EntityStub(4000 + i, world).proxy(), blockedPath());
+      culler.evaluate(player.proxy(), new EntityStub(4000 + i, world).proxy(), true);
     }
     assertEquals(3, culler.hiddenCount());
 
-    // 10 个可见追踪实体：经真实 onTrack 路径登记进轮转队列
+    // 10 个可见追踪实体：位置与玩家重合（在强制可见距离内）→ 经真实 onTrack 路径登记进轮转队列，
+    // 且不会被隐藏，从而不占用「已隐藏实体」那条通道
     for (int i = 0; i < 10; i++) {
-      EntityStub stub = new EntityStub(5000 + i, world);
+      EntityStub stub = new EntityStub(5000 + i, world, 0.5D, 65.0D, 0.5D);
       culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), stub.proxy()));
     }
 
@@ -267,26 +271,22 @@ class EntityCullerTest {
     ThrottleStats stats = new ThrottleStats();
     EntityCuller culler = newCuller(stats, 12);
     PlayerStub player = new PlayerStub();
-    WorldStub world = new WorldStub();
-    EntityStub entity = new EntityStub(6001, world);
+    EntityStub entity = new EntityStub(6001, new WorldStub());
 
-    world.occluding = false;
-    culler.evaluate(player.proxy(), entity.proxy(), blockedPath(), true);
+    culler.evaluate(player.proxy(), entity.proxy(), false, true);
     assertEquals(0L, stats.recheckHidden.sum(), "视线通畅时复检不得隐藏");
     assertEquals(0, culler.hiddenCount());
 
-    world.occluding = true;
-    culler.evaluate(player.proxy(), entity.proxy(), blockedPath(), true);
+    culler.evaluate(player.proxy(), entity.proxy(), true, true);
     assertEquals(1L, stats.recheckHidden.sum(), "复检发现新遮挡必须计入「复检致隐藏」");
     assertEquals(1, culler.hiddenCount());
 
-    world.occluding = false;
-    culler.evaluate(player.proxy(), entity.proxy(), blockedPath(), true);
+    culler.evaluate(player.proxy(), entity.proxy(), false, true);
     assertEquals(1L, stats.recheckShown.sum(), "复检重新可见必须计入「复检致恢复」");
     assertEquals(0, culler.hiddenCount());
   }
 
-  /** 红线：评估拿不到方块数据（异常）时不得隐藏，实体保持可见。 */
+  /** 红线：射线 / 世界读取失败（异常）时不得隐藏，实体保持可见。 */
   @Test
   void failedBlockReadKeepsEntityVisible() {
     ThrottleStats stats = new ThrottleStats();
@@ -296,9 +296,9 @@ class EntityCullerTest {
     world.failBlockRead = true;
     EntityStub entity = new EntityStub(7001, world);
 
-    culler.evaluate(player.proxy(), entity.proxy(), blockedPath(), true);
-
-    assertEquals(0, culler.hiddenCount(), "读方块失败必须按「保持可见」处理（fail-open，不得误藏）");
+    assertFalse(culler.isFullyOccluded(player.proxy(), entity.proxy()),
+        "读世界/射线失败必须按「保持可见」处理（fail-open，不得误藏）");
+    assertEquals(0, culler.hiddenCount(), "失败时不得隐藏");
     assertEquals(0L, stats.entitiesHidden.sum());
     assertEquals(0L, stats.recheckHidden.sum());
   }
@@ -312,9 +312,9 @@ class EntityCullerTest {
   }
 
   private static EntityCuller newCuller(ThrottleStats stats, int recheckBudget) {
-    // 启用实体剔除与射线判定；强制可见距离 2 格、单工作线程，均为不影响本测试的取值
+    // 启用实体剔除与射线判定；强制可见距离 2 格，均为不影响本测试的取值
     return new EntityCuller(new PluginStub().proxy(),
-        new BandwidthConfig.EntityCulling(true, true, 2.0D, 1, 10, 24, recheckBudget), stats);
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 1, 10, 8, recheckBudget), stats);
   }
 
   /** 接口方法的默认返回值（未显式打桩的方法一律走这里）。 */
@@ -361,6 +361,8 @@ class EntityCullerTest {
     private final AtomicInteger showCalls = new AtomicInteger();
     private final Player proxy = (Player) Proxy.newProxyInstance(
         Player.class.getClassLoader(), new Class<?>[] {Player.class}, this);
+    /** 位置与 {@link EntityStub} 的默认位置不同，但坐标本身不重要（只用于距离比较）。 */
+    private final Location location = new Location(null, 0.5D, 65.0D, 0.5D);
     private volatile boolean online = true;
 
     Player proxy() {
@@ -381,6 +383,7 @@ class EntityCullerTest {
         case "getUniqueId" -> id;
         case "isOnline" -> online;
         case "hasPermission" -> false;
+        case "getLocation", "getEyeLocation" -> location;
         case "hideEntity" -> null;
         case "showEntity" -> {
           showCalls.incrementAndGet();
@@ -391,17 +394,25 @@ class EntityCullerTest {
     }
   }
 
-  /** 实体替身：EntityCuller 会读 entityId / isValid / getWorld。 */
+  /** 实体替身：EntityCuller 会读 entityId / isValid / getWorld / getLocation / getBoundingBox。 */
   private static final class EntityStub implements InvocationHandler {
 
     private final int id;
     private final WorldStub world;
     private final Entity proxy;
+    private final Location location;
+    private final BoundingBox box;
     private volatile boolean valid = true;
 
     EntityStub(int id, WorldStub world) {
+      this(id, world, 100.0D, 65.0D, 100.0D);
+    }
+
+    EntityStub(int id, WorldStub world, double x, double y, double z) {
       this.id = id;
       this.world = world;
+      this.location = new Location(null, x, y, z);
+      this.box = new BoundingBox(x, y, z, x + 0.6D, y + 1.8D, z + 0.6D);
       this.proxy = (Entity) Proxy.newProxyInstance(
           Entity.class.getClassLoader(), new Class<?>[] {Entity.class}, this);
     }
@@ -424,20 +435,26 @@ class EntityCullerTest {
         case "getEntityId" -> id;
         case "isValid" -> valid;
         case "getWorld" -> world.proxy();
+        case "getLocation" -> location;
+        case "getBoundingBox" -> box;
         default -> defaultValue(method.getReturnType());
       };
     }
   }
 
-  /** 世界替身：getBlockData 返回同源替身，isOccluding 由 {@code occluding} 开关决定。 */
+  /**
+   * 世界替身：{@code rayTraceBlocks} 由 {@code occluding} 开关决定「命中遮挡方块 / 通畅」
+   * （命中时返回带 {@link Material#STONE} 的 {@link RayTraceResult}，未命中返回 null）。
+   */
   private static final class WorldStub implements InvocationHandler {
 
-    private final BlockData blockData = (BlockData) Proxy.newProxyInstance(
-        BlockData.class.getClassLoader(), new Class<?>[] {BlockData.class}, this);
+    private final Block block = (Block) Proxy.newProxyInstance(
+        Block.class.getClassLoader(), new Class<?>[] {Block.class}, this);
     private final World proxy = (World) Proxy.newProxyInstance(
         World.class.getClassLoader(), new Class<?>[] {World.class}, this);
+    /** true = 射线命中遮挡方块（实体被判为被挡）；false = 射线通畅（实体可见）。 */
     private volatile boolean occluding = true;
-    /** 为 true 时 getBlockData 抛异常，模拟「拿不到方块数据」（红线：此时不得隐藏）。 */
+    /** 为 true 时 rayTraceBlocks 抛异常，模拟「射线 / 世界读取失败」（红线：此时不得隐藏）。 */
     private volatile boolean failBlockRead;
 
     World proxy() {
@@ -451,13 +468,14 @@ class EntityCullerTest {
             : ("equals".equals(method.getName()) ? proxy == args[0] : "WorldStub");
       }
       return switch (method.getName()) {
-        case "getBlockData" -> {
+        case "rayTraceBlocks" -> {
           if (failBlockRead) {
-            throw new IllegalStateException("模拟读方块失败");
+            throw new IllegalStateException("模拟射线 / 世界读取失败");
           }
-          yield blockData;
+          yield occluding ? new RayTraceResult(new Vector(0, 0, 0), block, BlockFace.UP) : null;
         }
-        case "isOccluding" -> occluding;
+        // 命中方块的材质：stone 为遮挡方块、glass 为非遮挡方块（可透见其后实体）
+        case "getType" -> occluding ? Material.STONE : Material.GLASS;
         default -> defaultValue(method.getReturnType());
       };
     }

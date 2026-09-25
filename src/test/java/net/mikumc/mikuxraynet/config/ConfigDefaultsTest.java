@@ -316,7 +316,8 @@ class ConfigDefaultsTest {
     assertTrue(config.proximity().enabled(), "邻近显形默认开启");
     assertTrue(config.proximity().frustumEnabled(), "视锥剔除默认开启");
     assertEquals(80.0D, config.proximity().frustumFov(), 1.0E-9D, "视锥竖直全角默认 80°");
-    assertEquals(16, config.proximity().raycastSamples(), "射线采样默认 16（越大越准、越费主线程读方块）");
+    assertEquals(4, config.proximity().raycastSamples(),
+        "候选点数默认 4（原生射线改造后语义为「每方块最多尝试的候选点数」，钳制 1..8）");
 
     // disk-cache 全部 13 键
     assertTrue(config.diskCache().enabled(), "磁盘缓存默认开启");
@@ -373,8 +374,10 @@ class ConfigDefaultsTest {
     // entity-culling 其余键
     assertTrue(config.entityCulling().raycast(), "实体射线判定默认开启");
     assertEquals(32.0D, config.entityCulling().forceVisibleDistance(), 1.0E-9D, "强制可见距离默认 32 格");
-    assertEquals(0, config.entityCulling().threads(), "剔除线程数默认 0 = 按 CPU 自动推算（上限 2）");
-    assertEquals(24, config.entityCulling().raySamples(), "实体射线采样默认 24");
+    assertEquals(0, config.entityCulling().threads(),
+        "剔除线程数键保留（原生射线后已废弃、不再生效），默认仍解析为 0");
+    assertEquals(8, config.entityCulling().raySamples(),
+        "候选顶点数默认 8（原生射线改造后语义为「每实体最多尝试的候选顶点数」，钳制 1..8）");
 
     // afk 全部键
     assertEquals(300, config.afk().seconds(), "AFK 判定默认 300 秒无操作");

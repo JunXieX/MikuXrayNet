@@ -3,14 +3,15 @@ package net.mikumc.mikuxraynet.antixray;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import net.mikumc.mikuxraynet.bandwidth.OcclusionRaytracer;
 
 /**
  * 邻近显形的「选择逻辑」：视锥剔除 + 可见性判定的纯计算部分。
  *
- * <p><b>为什么拆出来</b>：「读方块」需要 Bukkit 世界对象，无法离线单测。因此这里只保留可离线验证的纯函数：
- * 视锥角度计算、方块暴露面识别、候选采样点生成、射线体素路径，以及「给定遮挡查询时路径是否被挡住」。
- * 生产代码把「读世界方块」注入为 {@link RayQuery}，单测注入内存表即可覆盖全部判定分支。
+ * <p><b>为什么拆出来</b>：「读方块」与「射线求交」都需要 Bukkit 世界对象，无法离线单测。因此这里只保留
+ * 可离线验证的纯函数：视锥角度计算、方块暴露面识别、候选采样点生成，以及「哪些候选点值得一试」。
+ * 生产代码把「读世界方块」注入为 {@link RayQuery}、把「原生射线求交」注入为 {@link RayProbe}
+ * （{@code ProximityRevealer} 用 Paper 的 {@code World#rayTraceBlocks} 实现），单测注入内存表/内存探针
+ * 即可覆盖全部判定分支——不再自造体素步进。
  *
  * <p><b>视锥</b>（{@link #withinFrustum}）：{@code fovDegrees} 是<b>竖直方向的张开全角</b>（与 Minecraft
  * 客户端 FOV 设置同义），按客户端的矩形投影分解成两轴判定——竖直半角 = {@code fov/2}，
@@ -26,12 +27,13 @@ import net.mikumc.mikuxraynet.bandwidth.OcclusionRaytracer;
  *   <li>只在<b>暴露面</b>上取至多 {@link #MAX_SAMPLE_POINTS} 个候选点：
  *       ① 正对玩家（按视线方向选面）的那个暴露面的中心 → ② 包围盒最近点（仅当它确实落在暴露面上）
  *       → ③ 该暴露面四角中离眼睛最近的至多 3 个；</li>
- *   <li>按序做体素步进，任一条通畅即判可见并立即返回；全部被挡才判不可见。</li>
+ *   <li>按序做原生射线检测（生产为 {@code World#rayTraceBlocks}，由 {@link RayProbe} 注入），
+ *       任一条通畅即判可见并立即返回；全部被挡才判不可见。</li>
  * </ol>
  * 六面全被遮挡（完全掩埋）时一个采样点都不产生 → 直接判不可见，从根上保证不会「隔着墙还原」。
  *
- * <p>射线起点（眼睛）与终点所在体素都会被排除，且目标方块自身绝不作为遮挡物，避免自遮挡。
- * 采样数有限，宁可漏判遮挡（多显形）也不误隐藏。
+ * <p>射线起点（眼睛）不在判定范围内、目标方块自身被容忍为「通畅」（端点贴面时的边界情形），
+ * 候选点有限，宁可漏判遮挡（多显形）也不误隐藏。
  */
 public final class ProximitySelector {
 
@@ -41,7 +43,10 @@ public final class ProximitySelector {
 
   /** 世界坐标遮挡/流体查询（显形流程用主线程读世界方块，单测可注入纯内存实现）。 */
   @FunctionalInterface
-  public interface RayQuery extends OcclusionRaytracer.OcclusionQuery {
+  public interface RayQuery {
+
+    /** 该坐标是否为遮挡方块（不透明、挡光）。 */
+    boolean isOccluding(int x, int y, int z);
 
     /**
      * 该坐标是否为流体（水/岩浆；含水的台阶/栅栏等不算）。
@@ -52,6 +57,25 @@ public final class ProximitySelector {
     default boolean isFluid(int x, int y, int z) {
       return false;
     }
+  }
+
+  /**
+   * 原生射线探针：从玩家眼睛射向给定世界坐标点，回答「途中是否通畅」。
+   *
+   * <p>生产实现由 {@code ProximityRevealer} 注入，内部调用 Paper 的
+   * {@code World#rayTraceBlocks(Location, Vector, double, FluidCollisionMode, boolean)}，
+   * 因此<b>必须在拥有该玩家的线程调用</b>（Paper 主线程 / Folia 所属区域线程）。
+   * 单测注入内存实现，从而在不依赖 Bukkit 的前提下覆盖「多候选点、任一通畅即可见」的判定分支。
+   */
+  @FunctionalInterface
+  public interface RayProbe {
+
+    /**
+     * 从眼睛射向该点，途中是否未被遮挡方块截住。
+     *
+     * @return true 表示通畅（射线抵达该点前没有可遮挡的方块）；异常由调用方按「不通畅」保守处理
+     */
+    boolean isClear(double x, double y, double z);
   }
 
   /** 各正交面的位掩码（{@link #exposedFaces} 的返回值）。 */
@@ -165,70 +189,6 @@ public final class ProximitySelector {
   }
 
   /**
-   * 从眼睛到目标方块「中心」的射线体素路径（不含起点与终点所在体素）。
-   *
-   * <p>中心射线更严格：它要求玩家能直视方块中心，因而更适合需要「完整可见」判定的场合。
-   * 显形判定请用 {@link #isVisible}——矿几乎总是嵌在岩石里，到中心的射线会先钻进
-   * 相邻岩石，把「明明看得到」的裸露矿误判为被遮挡。
-   *
-   * <p>测试专用豁免：生产显形判定走 {@link #isVisible} 的多候选点采样，本方法当前仅单测在用，
-   * 保留以免破坏测试。
-   *
-   * @param maxSamples 最多采样数（越小越省主线程读方块次数，但可能漏判薄墙）
-   */
-  public static int[] rayPath(Eye eye, int blockX, int blockY, int blockZ, int maxSamples) {
-    if (eye == null) {
-      return new int[0];
-    }
-    return OcclusionRaytracer.voxelPath(eye.x(), eye.y(), eye.z(),
-        blockX + 0.5D, blockY + 0.5D, blockZ + 0.5D, maxSamples);
-  }
-
-  /**
-   * 从眼睛到目标方块<b>最近点</b>（包围盒上离眼睛最近的那一点，即朝向玩家一侧的面/棱/角）的射线体素路径。
-   *
-   * <p><b>为什么不用方块中心</b>：矿几乎总是嵌在岩石里（裸露 = 某一面朝着空气），而到中心的射线必须
-   * 先穿过紧贴该面的岩石才能抵达中心，于是那些岩石被当成遮挡物——表现为「看得到的裸露矿永不显形」。
-   * 打到最近点则让射线沿着朝向玩家的可见面走，只有真正挡在前面的方块才会被判为遮挡。
-   *
-   * <p>注意：这只是「单点」采样，角落场景仍会被旁边方块挡住；生产路径已改用 {@link #isVisible} 的
-   * 多候选点判定，本方法保留给需要单点语义的场合与离线测试。
-   *
-   * <p>测试专用豁免：生产显形判定走 {@link #isVisible}，本方法当前仅单测在用，保留以免破坏测试。
-   *
-   * <p>起点（眼睛）与终点所在体素由 {@link OcclusionRaytracer#voxelPath} 排除，因此贴墙、站在
-   * 方块棱角上、甚至眼位就在目标方块内（此时长度 0 → 空路径 → 视为可见）都能正确退化。
-   *
-   * @param maxSamples 最多采样数（越小越省主线程读方块次数，但可能漏判薄墙）
-   */
-  public static int[] visibilityPath(Eye eye, int blockX, int blockY, int blockZ, int maxSamples) {
-    if (eye == null) {
-      return new int[0];
-    }
-    // 把眼睛坐标夹进方块包围盒 → 得到「离眼睛最近的点」；眼睛本就在方块内时即眼睛自身
-    double[] nearest = nearestPoint(eye, blockX, blockY, blockZ);
-    return OcclusionRaytracer.voxelPath(eye.x(), eye.y(), eye.z(),
-        nearest[0], nearest[1], nearest[2], maxSamples);
-  }
-
-  /**
-   * 给定遮挡查询，判定射线路径是否被挡住。
-   *
-   * <p>实现下沉到 {@link OcclusionRaytracer#isPathOccluded}（与实体剔除的遮挡循环共用同一份
-   * 纯函数，避免两处实现漂移）；本方法保留原签名供既有调用方与单测使用。
-   *
-   * <p>测试专用豁免：生产路径只有 {@link #isVisible} 内部复用它做逐路径判定，无其它生产调用方；
-   * 保留为公开方法以免破坏单测。
-   *
-   * @param path  {@link #visibilityPath}（或 {@link #rayPath}）返回的扁平坐标数组（x,y,z 依次排列）
-   * @param query 遮挡查询；为 {@code null} 时不做判定（返回 false，即视为可见）
-   * @return 是否被遮挡；路径为空时恒为 false（贴得太近，视为可见）
-   */
-  public static boolean isRayOccluded(int[] path, RayQuery query) {
-    return OcclusionRaytracer.isPathOccluded(path, query);
-  }
-
-  /**
    * 识别方块的<b>暴露面</b>：某个面朝向的方向上「不是遮挡方块」（空气/玻璃/植物等都算暴露）即为暴露面。
    *
    * @param query 遮挡查询；为 {@code null} 时保守认为六面全暴露（由后续射线判定兜底）
@@ -263,16 +223,20 @@ public final class ProximitySelector {
   /**
    * 方块是否对玩家可见：<b>多候选点、任一通畅即可见</b>。
    *
-   * <p>候选点只取在暴露面上（顺序见类注释），最多 {@link #MAX_SAMPLE_POINTS} 个；命中即返回。
+   * <p>候选点只取在暴露面上（顺序见类注释），最多 {@code maxPoints} 个（钳制 1..候选点数）；命中即返回。
    * 六面全被遮挡（完全掩埋）时直接判不可见——这是「不得隔着墙还原」的红线，
    * 因为掩埋方块从任何方向都不可能被看到。
    *
-   * @param query      遮挡查询；为 {@code null} 时视为可见（fail-open）
-   * @param maxSamples 每条射线的最大采样体素数
+   * <p>射线检测由 {@link RayProbe} 注入（生产为 {@code World#rayTraceBlocks}）。探针抛异常时按
+   * 「不通畅」保守处理：无法判定就不显形，绝不隔着墙还原。
+   *
+   * @param query     遮挡查询；为 {@code null} 时视为可见（fail-open）
+   * @param maxPoints 每方块最多尝试的候选点数（由配置 {@code proximity.raycast.samples} 提供，已钳制 1..8）
+   * @param probe     射线探针；为 {@code null} 时视为可见（fail-open）
    */
   public static boolean isVisible(Eye eye, int blockX, int blockY, int blockZ, RayQuery query,
-      int maxSamples) {
-    return isVisible(eye, blockX, blockY, blockZ, query, maxSamples, false);
+      int maxPoints, RayProbe probe) {
+    return isVisible(eye, blockX, blockY, blockZ, query, maxPoints, false, probe);
   }
 
   /**
@@ -287,8 +251,8 @@ public final class ProximitySelector {
    * @param fluidCover true = 启用「上方是流体则不显形」；false = 完全保持既有行为（两处规则都不生效）
    */
   public static boolean isVisible(Eye eye, int blockX, int blockY, int blockZ, RayQuery query,
-      int maxSamples, boolean fluidCover) {
-    if (eye == null || query == null) {
+      int maxPoints, boolean fluidCover, RayProbe probe) {
+    if (eye == null || query == null || probe == null) {
       return true;
     }
     if (fluidCover && query.isFluid(blockX, blockY + 1, blockZ)) {
@@ -301,15 +265,18 @@ public final class ProximitySelector {
       return false;
     }
 
-    // 目标方块自身绝不作为遮挡物（眼位与方块同格/贴面时射线可能擦过自身体素）
-    RayQuery effective = (x, y, z) -> !(x == blockX && y == blockY && z == blockZ)
-        && query.isOccluding(x, y, z);
-
     double[][] points = visibilityPoints(eye, blockX, blockY, blockZ, faces);
-    for (double[] point : points) {
-      int[] path = OcclusionRaytracer.voxelPath(eye.x(), eye.y(), eye.z(),
-          point[0], point[1], point[2], maxSamples);
-      if (!isRayOccluded(path, effective)) {
+    int limit = Math.min(Math.max(1, maxPoints), points.length);
+    for (int i = 0; i < limit; i++) {
+      double[] point = points[i];
+      boolean clear;
+      try {
+        clear = probe.isClear(point[0], point[1], point[2]);
+      } catch (Throwable throwable) {
+        // 探针异常：无法判定 → 按「不通畅」保守处理（绝不隔着墙还原）
+        clear = false;
+      }
+      if (clear) {
         return true;
       }
     }

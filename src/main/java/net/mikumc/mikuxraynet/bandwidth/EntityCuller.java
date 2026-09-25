@@ -10,16 +10,15 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
+import org.bukkit.FluidCollisionMode;
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.block.Block;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Firework;
 import org.bukkit.entity.Player;
@@ -30,16 +29,20 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.util.BoundingBox;
+import org.bukkit.util.RayTraceResult;
+import org.bukkit.util.Vector;
 
 /**
  * 实体射线剔除：被不透明方块完全遮挡的实体对玩家隐藏，节省下行的实体跟踪带宽。
  *
- * <p>线程模型（严格遵守「worker 只做纯计算」）：
+ * <p>线程模型（严格「Bukkit API 只在自己线程调用」）：
  * <ol>
  *   <li>主线程/区域线程：从 {@link PlayerTrackEntityEvent} 或周期任务里抓取「眼睛坐标 + 包围盒顶点」；</li>
- *   <li>工作线程：{@link OcclusionRaytracer} 纯数学求出每条射线的体素序列；</li>
- *   <li>主线程/区域线程：读方块判定遮挡，再执行 {@link Player#hideEntity} / {@link Player#showEntity}。</li>
+ *   <li>同一线程：用 Paper 原生射线（{@code World#rayTraceBlocks}）逐顶点判定是否被遮挡；</li>
+ *   <li>同一线程：执行 {@link Player#hideEntity} / {@link Player#showEntity}。</li>
  * </ol>
+ * 原生射线是 Bukkit API，必须在实体所属线程调用，因此不再把体素路径交给工作线程预计算
+ * （旧实现：worker 算路径 → 回主线程读方块），也没有了 {@code int[]} 路径分配与 worker 往返。
  *
  * <p>安全策略：强制可见距离内的实体一律可见；只有当包围盒的所有可见顶点射线都被遮挡时才隐藏
  * （宁可少隐藏，也不隐藏可见实体）；玩家自身、其它玩家与烟花不做剔除。
@@ -51,14 +54,16 @@ import org.bukkit.util.BoundingBox;
  *       游标推进，故 {@code ceil(追踪数 / budget)} 个周期内必然覆盖全部追踪实体——
  *       这样实体入场时可见、之后才被墙/地形挡住的场景也能被收敛到隐藏。</li>
  * </ol>
- * 两条通道都复用同一套评估链路（worker 算射线、玩家所在线程读方块并 hide/show），不另写一套。
+ * 两条通道都复用同一套评估链路（实体所属线程做原生射线并 hide/show），不另写一套。
  */
 public final class EntityCuller implements Listener {
+
+  /** 单个小体积实体（如物品、投掷物）只取中心顶点即可。 */
+  private static final double SMALL_BOX = 0.25D;
 
   private final Plugin plugin;
   private final BandwidthConfig.EntityCulling config;
   private final ThrottleStats stats;
-  private final ExecutorService workers;
   private final double forceVisibleSquared;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
@@ -77,14 +82,6 @@ public final class EntityCuller implements Listener {
     this.config = config;
     this.stats = stats;
     this.forceVisibleSquared = config.forceVisibleDistance() * config.forceVisibleDistance();
-    int threads = config.threads() > 0
-        ? config.threads()
-        : Math.max(1, Math.min(2, Runtime.getRuntime().availableProcessors()));
-    this.workers = Executors.newFixedThreadPool(threads, runnable -> {
-      Thread thread = new Thread(runnable, "MikuXrayNet-Culler");
-      thread.setDaemon(true);
-      return thread;
-    });
   }
 
   /** 注册事件监听与周期复检任务。 */
@@ -95,17 +92,17 @@ public final class EntityCuller implements Listener {
     for (Player player : Bukkit.getOnlinePlayers()) {
       scheduleRecheck(player, interval);
     }
-    plugin.getLogger().info("带宽模块已启用：实体射线剔除（强制可见距离 " + config.forceVisibleDistance() + " 格）");
+    plugin.getLogger().info("带宽模块已启用：实体射线剔除（强制可见距离 " + config.forceVisibleDistance()
+        + " 格，Paper 原生射线，每实体至多 " + config.raySamples() + " 个包围盒顶点）");
   }
 
-  /** 注销监听、恢复全部被隐藏实体并关闭线程池。 */
+  /** 注销监听、恢复全部被隐藏实体。 */
   public void stop() {
     cancelRecheckTasks();
     HandlerList.unregisterAll(this);
     restoreAll();
     inFlight.clear();
     rotations.clear();
-    workers.shutdownNow();
   }
 
   @EventHandler(ignoreCancelled = true)
@@ -258,7 +255,14 @@ public final class EntityCuller implements Listener {
     }
   }
 
-  /** 抓取纯数据后交给工作线程求体素序列；{@code fromRecheck} 仅用于统计归属（不影响判定逻辑）。 */
+  /**
+   * 在实体所属线程直接评估：抓取眼睛坐标与包围盒顶点 → 原生射线判定 → hide/show。
+   *
+   * <p>不再有 worker 往返与 {@code int[]} 路径分配：{@code World#rayTraceBlocks} 是 Bukkit API，
+   * 必须在实体所属线程调用（事件与周期复检本就落在该线程上）。
+   *
+   * <p>{@code fromRecheck} 仅用于统计归属（不影响判定逻辑）。
+   */
   private void submitRaycast(Player player, Entity entity, boolean fromRecheck) {
     // 烟花被隐藏会破坏鞘翅飞行体验，直接跳过
     if (entity instanceof Firework) {
@@ -268,90 +272,131 @@ public final class EntityCuller implements Listener {
     if (!inFlight.add(key)) {
       return;
     }
-
-    double[] eye;
-    double[][] vertices;
     try {
       // 强制可见距离内一律不剔除——复检通道同样适用，避免轮转复检把近处实体误藏
       if (player.getLocation().distanceSquared(entity.getLocation()) <= forceVisibleSquared) {
-        inFlight.remove(key);
         showIfHidden(player, entity);
         return;
       }
-      Location eyeLocation = player.getEyeLocation();
-      eye = new double[] {eyeLocation.getX(), eyeLocation.getY(), eyeLocation.getZ()};
-      BoundingBox box = entity.getBoundingBox();
-      vertices = OcclusionRaytracer.visibleVertices(eye,
-          box.getMinX(), box.getMinY(), box.getMinZ(), box.getMaxX(), box.getMaxY(), box.getMaxZ());
+      evaluate(player, entity, isFullyOccluded(player, entity), fromRecheck);
     } catch (Throwable throwable) {
-      inFlight.remove(key);
+      // 任意失败都按「保持可见」处理（fail-open：绝不误藏实体）
       logThrottled(throwable);
-      return;
-    }
-
-    try {
-      workers.execute(() -> {
-        List<int[]> paths;
-        try {
-          paths = OcclusionRaytracer.traceAll(eye, vertices, config.raySamples());
-        } catch (Throwable throwable) {
-          inFlight.remove(key);
-          return;
-        }
-        Schedulers.onEntity(plugin, player, () -> {
-          try {
-            evaluate(player, entity, paths, fromRecheck);
-          } finally {
-            inFlight.remove(key);
-          }
-        });
-      });
-    } catch (RejectedExecutionException exception) {
-      // 线程池已满：本实体不剔除（fail-open）
+    } finally {
       inFlight.remove(key);
     }
   }
 
-  /** 主线程/区域线程：读方块判定遮挡并执行隐藏/恢复（包可见：供离线单测直接驱动账本行为）。 */
-  void evaluate(Player player, Entity entity, List<int[]> paths) {
-    evaluate(player, entity, paths, false);
+  /**
+   * 实体所属线程：用 Paper 原生射线判定实体是否被完全遮挡。
+   *
+   * <p>把包围盒「朝向玩家一侧」的可见顶点逐一射向玩家眼睛，任一条通畅即判「未被完全遮挡」；
+   * 顶点数上限由 {@code entity-culling.ray-samples} 提供（已钳制 1..8）。
+   *
+   * <p><b>失败语义 fail-open</b>：任何异常都返回 {@code false}（不遮挡）——绝不误藏实体。
+   *
+   * @return true 表示所有候选顶点的射线都被遮挡（可隐藏）
+   */
+  boolean isFullyOccluded(Player player, Entity entity) {
+    try {
+      Location eye = player.getEyeLocation();
+      World world = entity.getWorld();
+      BoundingBox box = entity.getBoundingBox();
+      double[][] vertices = visibleVertices(eye.getX(), eye.getY(), eye.getZ(),
+          box.getMinX(), box.getMinY(), box.getMinZ(), box.getMaxX(), box.getMaxY(), box.getMaxZ());
+      int limit = Math.min(Math.max(1, config.raySamples()), vertices.length);
+      for (int i = 0; i < limit; i++) {
+        if (isClear(world, eye, vertices[i][0], vertices[i][1], vertices[i][2])) {
+          return false;
+        }
+      }
+      return true;
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+      return false;
+    }
+  }
+
+  /**
+   * 从眼睛射向该世界坐标点：命中「可遮挡方块」即算被挡；未命中、或命中的是非遮挡方块
+   * （玻璃/台阶/植物等，玩家仍能看见其后的实体）算通畅。
+   *
+   * <p>{@code FluidCollisionMode.NEVER}：流体不参与射线（水里的实体照常可见）。
+   * 命中方块的遮挡判定用 {@code Material#isOccluding()}，不新建 BlockData 对象。
+   */
+  private static boolean isClear(World world, Location eye, double x, double y, double z) {
+    double dx = x - eye.getX();
+    double dy = y - eye.getY();
+    double dz = z - eye.getZ();
+    double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (distance < 1.0E-6D) {
+      return true;
+    }
+    RayTraceResult hit = world.rayTraceBlocks(eye, new Vector(dx, dy, dz).normalize(), distance,
+        FluidCollisionMode.NEVER, true);
+    if (hit == null || hit.getHitBlock() == null) {
+      return true;
+    }
+    Block block = hit.getHitBlock();
+    return !block.getType().isOccluding();
+  }
+
+  /**
+   * 取实体包围盒上「朝向玩家一侧」的可见顶点，用于多射线判定（任一射线不被遮挡即视为可见）。
+   *
+   * <p>原生射线改造后本方法仍需要：一次判定最多尝试 {@code ray-samples} 个顶点。
+   *
+   * @return 顶点数组，每项为 (x, y, z)
+   */
+  static double[][] visibleVertices(double eyeX, double eyeY, double eyeZ,
+      double minX, double minY, double minZ, double maxX, double maxY, double maxZ) {
+    double sizeX = maxX - minX;
+    double sizeY = maxY - minY;
+    double sizeZ = maxZ - minZ;
+    if (sizeX <= SMALL_BOX && sizeY <= SMALL_BOX && sizeZ <= SMALL_BOX) {
+      return new double[][] {{(minX + maxX) / 2.0D, (minY + maxY) / 2.0D, (minZ + maxZ) / 2.0D}};
+    }
+
+    boolean nearestXIsMin = Math.abs(eyeX - minX) < Math.abs(eyeX - maxX);
+    boolean nearestYIsMin = Math.abs(eyeY - minY) < Math.abs(eyeY - maxY);
+    boolean nearestZIsMin = Math.abs(eyeZ - minZ) < Math.abs(eyeZ - maxZ);
+
+    double nearX = nearestXIsMin ? minX : maxX;
+    double nearY = nearestYIsMin ? minY : maxY;
+    double nearZ = nearestZIsMin ? minZ : maxZ;
+    double farX = nearestXIsMin ? maxX : minX;
+    double farY = nearestYIsMin ? maxY : minY;
+    double farZ = nearestZIsMin ? maxZ : minZ;
+
+    return new double[][] {
+        {nearX, nearY, nearZ},
+        {farX, nearY, nearZ},
+        {nearX, farY, nearZ},
+        {nearX, nearY, farZ},
+        {farX, farY, nearZ},
+        {farX, nearY, farZ},
+        {nearX, farY, farZ}
+    };
+  }
+
+  /** 主线程/区域线程：按遮挡结论执行隐藏/恢复（包可见：供离线单测直接驱动账本行为）。 */
+  void evaluate(Player player, Entity entity, boolean allBlocked) {
+    evaluate(player, entity, allBlocked, false);
   }
 
   /**
    * 评估入口（包可见：供离线单测直接驱动「复检通道」的计数归属）。
    *
+   * @param allBlocked  是否所有可见顶点都被遮挡（true = 可隐藏）
    * @param fromRecheck 是否来自周期复检：仅用于把计数归入「复检致隐藏 / 复检致恢复」，不影响判定逻辑
    */
-  void evaluate(Player player, Entity entity, List<int[]> paths, boolean fromRecheck) {
+  void evaluate(Player player, Entity entity, boolean allBlocked, boolean fromRecheck) {
     if (!entity.isValid() || !player.isOnline()) {
       Map<Integer, Entity> map = hidden.get(player.getUniqueId());
       if (map != null) {
         map.remove(entity.getEntityId());
       }
       return;
-    }
-    if (paths.isEmpty()) {
-      if (showIfHidden(player, entity) && fromRecheck) {
-        stats.recheckShown.increment();
-      }
-      return;
-    }
-
-    World world = entity.getWorld();
-    boolean allBlocked = true;
-    for (int[] path : paths) {
-      // 起点与目标同一体素：视为无遮挡
-      if (path.length == 0) {
-        allBlocked = false;
-        break;
-      }
-      // 遮挡判定下沉为公共纯函数（与显形可见性共用，见 OcclusionRaytracer#isPathOccluded）：
-      // 「任一体素是遮挡方块即被挡、空路径/异常 fail-open 判可见」的语义与旧内联循环逐字节等价
-      if (!OcclusionRaytracer.isPathOccluded(path,
-          (x, y, z) -> isOccluding(world, x, y, z))) {
-        allBlocked = false;
-        break;
-      }
     }
 
     if (allBlocked) {
@@ -432,14 +477,6 @@ public final class EntityCuller implements Listener {
   private void purgeInFlight(UUID playerId) {
     String prefix = playerId + ":";
     inFlight.removeIf(key -> key.startsWith(prefix));
-  }
-
-  private static boolean isOccluding(World world, int x, int y, int z) {
-    try {
-      return world.getBlockData(x, y, z).isOccluding();
-    } catch (Throwable throwable) {
-      return false;
-    }
   }
 
   private void logThrottled(Throwable throwable) {

@@ -269,7 +269,8 @@ public final class AntiXrayConfig {
    *                              详见 {@code ProximitySelector#withinFrustum}
    * @param frustumMinDistance    该距离内的候选豁免视锥判定
    * @param raycastEnabled        是否做射线可见性判定（被墙挡住的不显形；<b>默认开启</b>）
-   * @param raycastSamples        每条射线的最大采样体素数
+   * @param raycastSamples        <b>每方块最多尝试的候选点数</b>（射线改用 Paper 原生
+   *                              {@code World#rayTraceBlocks} 后不再表示采样数）；钳制 1..8，默认 4
    * @param instantReveal         事件驱动即时显形（周期巡检的补充，见 {@link InstantReveal}）
    * @param overRevealSampling    过度显形抽样统计的抽样率分母 N（1/N 抽样，只计数不改行为；
    *                              0 表示关闭）
@@ -598,7 +599,9 @@ public final class AntiXrayConfig {
             clampFov(root.getDouble("proximity.frustum.fov", 80.0D)),
             Math.max(0.0D, root.getDouble("proximity.frustum.min-distance", 4.0D)),
             root.getBoolean("proximity.raycast.enabled", true),
-            Math.max(2, root.getInt("proximity.raycast.samples", 16)),
+            // 语义已变：原生射线改造后本键表示「每方块最多尝试的候选点数」（不再表示采样数）。
+            // 钳制 1..8，默认 4；候选点的选择只在暴露面上（面中心 → 最近点 → 面四角），命中即止。
+            Math.max(1, Math.min(8, root.getInt("proximity.raycast.samples", 4))),
             new InstantReveal(
                 root.getBoolean("proximity.instant-reveal.enabled", true),
                 Math.max(1, Math.min(8, root.getInt("proximity.instant-reveal.radius", 2))),

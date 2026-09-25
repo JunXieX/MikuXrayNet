@@ -62,14 +62,19 @@ public final class BandwidthConfig {
    *
    * @param enabled  模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
    * @param raycast  行为开关：依据视线射线剔除被遮挡实体；仅在 {@code enabled=true} 时生效。
+   * @param threads  <b>已废弃</b>：射线改用 Paper 原生 {@code World#rayTraceBlocks} 后，判定直接在实体
+   *                 所属线程完成，不再需要工作线程池；本项仅为兼容旧配置保留，设置后不再生效。
    * @param recheckBudget 周期复检预算：除「已隐藏实体每周期全部复检」外，每周期额外按轮转分片
    *                      复检的「可见追踪实体」条数上限（默认 12，建议 8~16）。
    *                      <p>为什么需要它：实体进入追踪范围那一刻（{@code PlayerTrackEntityEvent}）只评估一次，
    *                      若实体是「先可见、之后才被墙/地形挡住」，只复检已隐藏集合永远发现不了它。
    *                      轮转分片让复检在 {@code ceil(追踪数 / recheckBudget)} 个周期内覆盖全部追踪实体
    *                      （如 50 个实体、预算 10 → 5 个周期内全部复检一次），因此新出现的遮挡也能被隐藏。
-   *                      <p>CPU 取舍：本项把「每周期读方块判定」的调用数摊平为固定上限——越大越早发现新遮挡，
-   *                      但每周期主线程读方块次数与工作线程射线计算量同比上升；越小越省 CPU，但收敛更慢。
+   *                      <p>CPU 取舍：本项把「每周期射线判定」的调用数摊平为固定上限——越大越早发现新遮挡，
+   *                      但每周期主线程射线次数同比上升；越小越省 CPU，但收敛更慢。
+   * @param raySamples <b>每个实体最多尝试的候选顶点数</b>（射线改用 Paper 原生
+   *                   {@code World#rayTraceBlocks} 后不再表示采样数）；钳制 1..8，默认 8
+   *                   （包围盒至多 7 个可见顶点，故 8 即「全部顶点都试」）。
    */
   public record EntityCulling(boolean enabled, boolean raycast, double forceVisibleDistance, int threads,
       int updateIntervalTicks, int raySamples, int recheckBudget) {
@@ -144,7 +149,9 @@ public final class BandwidthConfig {
             Math.max(0.0D, root.getDouble("entity-culling.force-visible-distance", 32.0D)),
             Math.max(0, root.getInt("entity-culling.threads", 0)),
             Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),
-            Math.max(2, root.getInt("entity-culling.ray-samples", 24)),
+            // 语义已变：原生射线改造后本键表示「每个实体最多尝试的候选顶点数」（不再表示采样数）。
+            // 钳制 1..8，默认 8（包围盒至多 7 个可见顶点 → 8 即全部顶点都试）。
+            Math.max(1, Math.min(8, root.getInt("entity-culling.ray-samples", 8))),
             // 周期复检预算默认 12：约「每 0.5 秒（10 tick）多复检 12 个可见追踪实体」，
             // 既能在数个周期内发现新遮挡，又不会让主线程每周期读方块次数失控（建议 8~16）。
             Math.max(1, root.getInt("entity-culling.recheck-budget", 12))),
