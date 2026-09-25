@@ -250,6 +250,19 @@ class ConfigDefaultsTest {
   }
 
   /**
+   * {@code entity-culling.ray-samples} 的上限就是「包围盒可见顶点数」7：包围盒「朝向玩家一侧」的
+   * 有效顶点最多 7 个，配置写 8 或更大不会多试出第 8 个点（旧实现钳到 8 但实际只用 7，属静默失效）。
+   */
+  @Test
+  void raySamplesIsClampedToVisibleVertexCount() {
+    assertEquals(7, BandwidthConfig.from(yaml("entity-culling:\n  ray-samples: 99\n"))
+        .entityCulling().raySamples(), "超过上限按上限钳制");
+    assertEquals(7, BandwidthConfig.MAX_RAY_SAMPLES, "上限常量本身即 7");
+    assertEquals(1, BandwidthConfig.from(yaml("entity-culling:\n  ray-samples: 0\n"))
+        .entityCulling().raySamples(), "下限仍为 1");
+  }
+
+  /**
    * 新增的各模块总开关（{@code *.enabled}）默认必须为 true —— 补开关不得改变既有行为。
    * 同时锁住 {@code palette.reorder} 仍为 false（zlib/zstd 两种压缩口径实测均无收益）。
    */
@@ -392,8 +405,8 @@ class ConfigDefaultsTest {
     // entity-culling 其余键（threads 键已彻底删除，其残留配置的兼容性见下方专项测试）
     assertTrue(config.entityCulling().raycast(), "实体射线判定默认开启");
     assertEquals(32.0D, config.entityCulling().forceVisibleDistance(), 1.0E-9D, "强制可见距离默认 32 格");
-    assertEquals(8, config.entityCulling().raySamples(),
-        "候选顶点数默认 8（原生射线改造后语义为「每实体最多尝试的候选顶点数」，钳制 1..8）");
+    assertEquals(BandwidthConfig.MAX_RAY_SAMPLES, config.entityCulling().raySamples(),
+        "候选顶点数默认取上限 7（包围盒可见顶点最多 7 个，钳制 1..7）");
 
     // afk 全部键
     assertEquals(300, config.afk().seconds(), "AFK 判定默认 300 秒无操作");

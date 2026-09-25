@@ -162,6 +162,26 @@ class BufferedLinearV3FormatTest {
   }
 
   @Test
+  void countBucketEntriesSeesTheSameSlotsAsDecode() {
+    BufferedLinearV3Format.Entry[] slots =
+        new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
+    slots[0] = new BufferedLinearV3Format.Entry(1L, 100L, 5, payload(300));
+    slots[7] = new BufferedLinearV3Format.Entry(2L, 200L, 6, payload(700));
+    slots[63] = new BufferedLinearV3Format.Entry(3L, 300L, 7, payload(64));
+    byte[] bucket = BufferedLinearV3Format.encodeBucket(slots, SEED);
+
+    assertEquals(3, BufferedLinearV3Format.countBucketEntries(bucket),
+        "只数条数的口径必须与解码出的非空槽位一致");
+
+    assertEquals(0, BufferedLinearV3Format.countBucketEntries(null), "空输入计 0 条");
+    assertEquals(0, BufferedLinearV3Format.countBucketEntries(new byte[] {1, 2, 3}),
+        "连一个长度前缀都读不全时计 0 条");
+    assertEquals(2, BufferedLinearV3Format.countBucketEntries(
+        Arrays.copyOf(bucket, bucket.length - 5)),
+        "尾部截断：数到截断点为止（截断的那一条不计），且绝不抛异常");
+  }
+
+  @Test
   void bucketRoundTripKeepsSlotLayout() throws IOException {
     BufferedLinearV3Format.Entry[] slots =
         new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];

@@ -381,16 +381,34 @@ public final class BufferedLinearV3Format {
   /**
    * 解析一条条目；负载校验和不符时抛异常（阻止把坏数据当作命中返回）。
    *
+   * <p>测试专用豁免：生产端一律走「按区间解析」的重载（bucket 内联解析、不为每个槽位复制数组），
+   * 本重载当前仅单测在用，保留以免破坏测试。
+   *
    * @throws IOException 截断、长度非法或校验失败
    */
   public static Entry decodeEntry(byte[] raw, int hashSeed) throws IOException {
-    if (raw == null || raw.length < ENTRY_HEADER_SIZE) {
-      throw new IOException("条目截断（" + (raw == null ? 0 : raw.length) + " 字节）");
+    if (raw == null) {
+      throw new IOException("条目截断（0 字节）");
     }
-    ByteBuffer buffer = ByteBuffer.wrap(raw);
+    return decodeEntry(raw, 0, raw.length, hashSeed);
+  }
+
+  /**
+   * 从缓冲区区间 {@code [offset, offset + length)} 解析一条条目（<b>不</b>复制数组）。
+   *
+   * <p>与 2 参重载语义完全一致，只是把「先 {@code Arrays.copyOfRange} 再解析」合并成原地解析：
+   * 一个 bucket 最多 64 个槽位，原先每次载入桶都要多出最多 64 次数组复制与对应的垃圾。
+   *
+   * @throws IOException 截断、长度非法或校验失败
+   */
+  static Entry decodeEntry(byte[] raw, int offset, int length, int hashSeed) throws IOException {
+    if (raw == null || offset < 0 || length < ENTRY_HEADER_SIZE || offset > raw.length - length) {
+      throw new IOException("条目截断（" + Math.max(0, length) + " 字节）");
+    }
+    ByteBuffer buffer = ByteBuffer.wrap(raw, offset, length);
     int payloadLength = buffer.getInt();
     if (payloadLength < 0 || payloadLength > MAX_PAYLOAD_SIZE
-        || payloadLength > raw.length - ENTRY_HEADER_SIZE) {
+        || payloadLength > length - ENTRY_HEADER_SIZE) {
       throw new IOException("条目负载长度非法：" + payloadLength);
     }
     long generation = buffer.getLong();
@@ -431,6 +449,38 @@ public final class BufferedLinearV3Format {
   }
 
   /**
+   * 只数条数、不解码：按「每槽位一个 int 长度前缀」扫一遍，返回长度大于 0 的槽位数。
+   *
+   * <p>遍历规则与 {@link #decodeBucket(byte[], int)} 一致（长度 ≤ 0 视为空槽、越界即停止），
+   * 但既不复制也不校验、更不分配负载数组——供启动期统计磁盘既有条目数使用（避免为一个计数
+   * 把整份区域文件的桶全部解码进内存）。
+   */
+  public static int countBucketEntries(byte[] raw) {
+    if (raw == null) {
+      return 0;
+    }
+    int count = 0;
+    int offset = 0;
+    for (int i = 0; i < BUCKET_SIZE; i++) {
+      if (offset + 4 > raw.length) {
+        break;
+      }
+      int length = readInt(raw, offset);
+      offset += 4;
+      if (length <= 0) {
+        continue;
+      }
+      if (length > raw.length - offset) {
+        // 截断：这里不抛异常（与 decodeBucket 的差异），直接停止计数——调用方只损失计数精度
+        break;
+      }
+      count++;
+      offset += length;
+    }
+    return count;
+  }
+
+  /**
    * 解析一个 bucket；单个槽位损坏时只把该槽位视为空槽（fail-open，不影响其它槽位）。
    *
    * @return 长度为 {@link #BUCKET_SIZE} 的槽位数组（无数据的槽位为 {@code null}）
@@ -455,7 +505,7 @@ public final class BufferedLinearV3Format {
         throw new IOException("bucket 槽位截断：槽位 " + i + " 需要 " + length + " 字节");
       }
       try {
-        slots[i] = decodeEntry(Arrays.copyOfRange(raw, offset, offset + length), hashSeed);
+        slots[i] = decodeEntry(raw, offset, length, hashSeed);
       } catch (IOException exception) {
         // 单槽损坏：视为空槽，其它槽位照常可用
         slots[i] = null;

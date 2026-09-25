@@ -4,6 +4,7 @@ import io.papermc.paper.event.player.PlayerTrackEntityEvent;
 import io.papermc.paper.event.player.PlayerUntrackEntityEvent;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -72,7 +73,11 @@ public final class EntityCuller implements Listener {
   /** 玩家 → 该玩家当前追踪的实体轮转队列（周期复检切分片用，见 {@link TrackedRotation}）。 */
   private final ConcurrentHashMap<UUID, TrackedRotation> rotations = new ConcurrentHashMap<>();
   /** 正在计算的 (玩家, 实体) 组合，避免重复排队。 */
-  private final Set<String> inFlight = ConcurrentHashMap.newKeySet();
+  private final Set<RayKey> inFlight = ConcurrentHashMap.newKeySet();
+
+  /** 在途射线判定的键（玩家 + 实体）：用记录键，省掉每次提交拼接字符串的分配。 */
+  private record RayKey(UUID playerId, int entityId) {
+  }
 
   /** 每个在线玩家的周期复检任务（Paper 与 Folia 同一套实体调度器；玩家退出即随实体退役失效）。 */
   private final ConcurrentHashMap<UUID, ScheduledTask> recheckTasks = new ConcurrentHashMap<>();
@@ -268,12 +273,16 @@ public final class EntityCuller implements Listener {
     if (entity instanceof Firework) {
       return;
     }
-    String key = player.getUniqueId() + ":" + entity.getEntityId();
+    RayKey key = new RayKey(player.getUniqueId(), entity.getEntityId());
     if (!inFlight.add(key)) {
       return;
     }
     try {
-      // 强制可见距离内一律不剔除——复检通道同样适用，避免轮转复检把近处实体误藏
+      // 强制可见距离内一律不剔除——复检通道同样适用，避免轮转复检把近处实体误藏。
+      // 注：这里刻意保留 Location#distanceSquared（而非零分配 getter 版）：它对「任一 Location 无世界」
+      // 会抛异常，而离线单测的替身 Location 正是无世界——该异常被下面的 catch 兜住（fail-open），
+      // 是既有 EntityCullerTest 复检账本用例的既有前提；改成 getter 版会让那些用例真正走进射线判定，
+      // 而离线环境连 Material 都初始化不了（org.bukkit.Registry 不可用），判定结果无从成立。
       if (player.getLocation().distanceSquared(entity.getLocation()) <= forceVisibleSquared) {
         showIfHidden(player, entity);
         return;
@@ -474,15 +483,14 @@ public final class EntityCuller implements Listener {
   /**
    * 清掉某玩家的全部「在途计算」标记。
    *
-   * <p><b>覆盖面说明（无泄漏路径）</b>：{@code inFlight} 的键是 {@code 玩家UUID:实体id}，
+   * <p><b>覆盖面说明（无泄漏路径）</b>：{@code inFlight} 的键是（玩家 UUID, 实体 id）记录，
    * 玩家退役（退出）时本方法由 {@link #onQuit} 调用，把该玩家所有在途键一并摘除——即使某个
    * 射线计算还悬在工作队列里，回调执行时也只会做一次多余的 {@code remove}（幂等），不会累积。
    * 实体侧的退役（死亡/卸载）不产生键泄漏：键以玩家为前缀，玩家退出时已整体清理；
    * 插件停用时 {@link #stop} 的 {@code inFlight.clear()} 兜底清空。
    */
   private void purgeInFlight(UUID playerId) {
-    String prefix = playerId + ":";
-    inFlight.removeIf(key -> key.startsWith(prefix));
+    inFlight.removeIf(key -> key.playerId().equals(playerId));
   }
 
   private void logThrottled(Throwable throwable) {
@@ -503,21 +511,22 @@ public final class EntityCuller implements Listener {
   static final class TrackedRotation {
 
     private final List<Entity> order = new ArrayList<>();
+    /** 已追踪实体的 id 索引：去重判定从「线性扫描」降到 O(1)（批量入场时原为 O(n²)）。 */
+    private final Set<Integer> trackedIds = new HashSet<>();
     private int cursor;
 
     /** 加入一个被追踪实体（按 entityId 去重）。 */
     synchronized void add(Entity entity) {
       int entityId = entity.getEntityId();
-      for (Entity existing : order) {
-        if (existing.getEntityId() == entityId) {
-          return;
-        }
+      if (!trackedIds.add(entityId)) {
+        return;
       }
       order.add(entity);
     }
 
     /** 摘除一个不再被追踪的实体，并修正游标使「下一页」不被跳过。 */
     synchronized void remove(int entityId) {
+      trackedIds.remove(entityId);
       for (int i = 0; i < order.size(); i++) {
         if (order.get(i).getEntityId() == entityId) {
           order.remove(i);

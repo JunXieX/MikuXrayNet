@@ -607,6 +607,9 @@ public final class DiskCacheStore implements AutoCloseable {
    *
    * <p>计数取「文件里的全部条目」而不过滤过期/旧代次——这些条目随后被惰性清理或压缩回收时
    * 会正常递减，多计的部分只是暂时的保守值；宁可计数偏大提前拒绝写入，也不偏小放任磁盘增长。
+   *
+   * <p>只读字节流数长度前缀（{@link RegionFile#countEntriesOnDisk()}）：既不解码负载也不进 LRU，
+   * 因此启动期统计不会把别的区域文件的脏桶挤出去写盘（旧实现逐个 {@code get} 会触发整文件解码）。
    */
   private void countDiskEntries(RegionKey key, Handle handle) {
     if (closed || open.get(key) != handle) {
@@ -615,13 +618,7 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
     try {
-      int count = 0;
-      int totalSlots = BufferedLinearV3Format.BUCKET_COUNT * BufferedLinearV3Format.BUCKET_SIZE;
-      for (int chunkIndex = 0; chunkIndex < totalSlots; chunkIndex++) {
-        if (handle.file.get(chunkIndex) != null) {
-          count++;
-        }
-      }
+      int count = handle.file.countEntriesOnDisk();
       if (count > 0) {
         approximateEntries.addAndGet(count);
       }

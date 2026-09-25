@@ -481,6 +481,41 @@ final class RegionFile implements AutoCloseable {
     return bucketSlots;
   }
 
+  /**
+   * 统计本区域文件里磁盘上已有的条目数：只读各非空 bucket 的字节流并数「槽位长度前缀」，
+   * <b>不</b>把桶载入内存缓存、不解码条目负载、不触发脏桶落盘。
+   *
+   * <p>与逐个 {@code get(chunkIndex)} 的区别（这正是本方法存在的理由）：后者会把整份区域文件的
+   * 桶全部解码进 LRU，可能把<b>别的</b>区域文件的脏桶挤出去写盘，还顺带产生大量负载数组垃圾；
+   * 启动期只为「把已有条目数补进近似计数」不值得付这些代价。
+   *
+   * <p>fail-open：单个 bucket 损坏只少计它自己（计数偏小只影响写入上限的保守度，不影响缓存读写）。
+   */
+  int countEntriesOnDisk() {
+    int count = 0;
+    for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
+      if (positions[bucket] <= 0L) {
+        continue;
+      }
+      try {
+        byte[] lengths = readAt(channel, positions[bucket], 8);
+        ByteBuffer buffer = ByteBuffer.wrap(lengths);
+        int rawLength = buffer.getInt();
+        int compressedLength = buffer.getInt();
+        if (rawLength <= 0 || compressedLength <= 0
+            || positions[bucket] + 8L + compressedLength > fileSize) {
+          continue;
+        }
+        byte[] compressed = readAt(channel, positions[bucket] + 8L, compressedLength);
+        count += BufferedLinearV3Format.countBucketEntries(
+            BufferedLinearV3Format.decompress(compressed, rawLength, compression));
+      } catch (IOException | RuntimeException exception) {
+        // 结构损坏：只少计这一个桶
+      }
+    }
+    return count;
+  }
+
   /** LRU 驱逐：脏 bucket 先落盘再释放，避免丢写入。 */
   private void evictIfNeeded() {
     if (compacting) {

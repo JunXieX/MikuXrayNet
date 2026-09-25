@@ -12,6 +12,12 @@ import org.bukkit.configuration.ConfigurationSection;
 public final class BandwidthConfig {
 
   /**
+   * 实体剔除「每实体候选顶点数」的上限：包围盒「朝向玩家一侧」的有效顶点最多就 7 个
+   * （见 {@code EntityCuller#visibleVertices}，小包围盒退化为中心 1 个），配置超过它没有第 8 个点可试。
+   */
+  public static final int MAX_RAY_SAMPLES = 7;
+
+  /**
    * 零位移实体包抑制。
    *
    * @param enabled           模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
@@ -66,8 +72,9 @@ public final class BandwidthConfig {
    *                      <p>CPU 取舍：本项把「每周期射线判定」的调用数摊平为固定上限——越大越早发现新遮挡，
    *                      但每周期主线程射线次数同比上升；越小越省 CPU，但收敛更慢。
    * @param raySamples <b>每个实体最多尝试的候选顶点数</b>（射线改用 Paper 原生
-   *                   {@code World#rayTraceBlocks} 后不再表示采样数）；钳制 1..8，默认 8
-   *                   （包围盒至多 7 个可见顶点，故 8 即「全部顶点都试」）。
+   *                   {@code World#rayTraceBlocks} 后不再表示采样数）；钳制 1..{@value #MAX_RAY_SAMPLES}，
+   *                   默认 {@value #MAX_RAY_SAMPLES}——包围盒「朝向玩家一侧」的可见顶点最多
+   *                   {@value #MAX_RAY_SAMPLES} 个，取到上限即「全部顶点都试」。
    */
   public record EntityCulling(boolean enabled, boolean raycast, double forceVisibleDistance,
       int updateIntervalTicks, int raySamples, int recheckBudget) {
@@ -142,8 +149,8 @@ public final class BandwidthConfig {
             Math.max(0.0D, root.getDouble("entity-culling.force-visible-distance", 32.0D)),
             Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),
             // 语义已变：原生射线改造后本键表示「每个实体最多尝试的候选顶点数」（不再表示采样数）。
-            // 钳制 1..8，默认 8（包围盒至多 7 个可见顶点 → 8 即全部顶点都试）。
-            Math.max(1, Math.min(8, root.getInt("entity-culling.ray-samples", 8))),
+            // 钳制 1..MAX_RAY_SAMPLES，默认即上限（包围盒至多 7 个可见顶点 → 取上限就是全部顶点都试）。
+            Math.max(1, Math.min(MAX_RAY_SAMPLES, root.getInt("entity-culling.ray-samples", MAX_RAY_SAMPLES))),
             // 周期复检预算默认 12：约「每 0.5 秒（10 tick）多复检 12 个可见追踪实体」，
             // 既能在数个周期内发现新遮挡，又不会让主线程每周期读方块次数失控（建议 8~16）。
             Math.max(1, root.getInt("entity-culling.recheck-budget", 12))),
