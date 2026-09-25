@@ -274,12 +274,15 @@ public final class AntiXrayConfig {
    * @param instantReveal         事件驱动即时显形（周期巡检的补充，见 {@link InstantReveal}）
    * @param overRevealSampling    过度显形抽样统计的抽样率分母 N（1/N 抽样，只计数不改行为；
    *                              0 表示关闭）
+   * @param batchRevealSends      是否把同一个周期内的显形合并成 Paper 原生多方块变更包
+   *                              （{@code Player#sendMultiBlockChange}）发出；关闭时逐坐标
+   *                              用 {@code Player#sendBlockChange} 发出（默认开启，供 A/B 与回退用）
    */
   public record Proximity(boolean enabled, double distance, int intervalTicks, int maxRevealsPerTick,
       int expireSeconds, int maxPositions, int maxPositionsPerPlayer,
       boolean frustumEnabled, double frustumFov, double frustumMinDistance,
       boolean raycastEnabled, int raycastSamples,
-      InstantReveal instantReveal, int overRevealSampling) {
+      InstantReveal instantReveal, int overRevealSampling, boolean batchRevealSends) {
 
     /** 邻近显形相关配置的兼容读取入口缺失时的兜底值（仅供旧构造方使用）。 */
     public Proximity {
@@ -606,7 +609,10 @@ public final class AntiXrayConfig {
                 root.getBoolean("proximity.instant-reveal.enabled", true),
                 Math.max(1, Math.min(8, root.getInt("proximity.instant-reveal.radius", 2))),
                 Math.max(0, root.getInt("proximity.instant-reveal.max-per-tick", 16))),
-            Math.max(0, root.getInt("proximity.over-reveal-sampling", 20))),
+            Math.max(0, root.getInt("proximity.over-reveal-sampling", 20)),
+            // 批量合并显形包（默认开启）：把一个周期内的显形用 Paper 原生多方块变更包一次发出。
+            // 关掉即逐坐标发单方块变更包（旧行为），供 A/B 对比与线上回退。
+            root.getBoolean("proximity.batch-reveal-sends", true)),
         new DiskCache(
             root.getBoolean("disk-cache.enabled", true),
             Math.max(1, root.getInt("disk-cache.max-entries", 20000)),

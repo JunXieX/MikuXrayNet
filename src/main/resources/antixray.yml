@@ -392,6 +392,17 @@ proximity:
   # 用于评估是否需要收紧显形策略。默认 20（1/20 抽样，开销可忽略）；0 = 关闭统计。
   over-reveal-sampling: 20
 
+  # 批量合并显形包（默认 true）：把一个巡检周期内通过筛选的显形坐标累积起来，
+  # 周期末用 Paper 原生多方块变更包（Player#sendMultiBlockChange）一次发出。
+  #   · Paper 会按 16×16×16 区块段自行合并，因此「本周期 N 个显形」通常只产生「涉及的段数」个包
+  #     （旧实现是每坐标一个单方块变更包，N 个坐标就是 N 个包）；
+  #   · 只有一个坐标时自动用单方块变更包（更小，行为与旧版一致）；
+  #   · 批量调用整体失败时自动退化为逐坐标 Player#sendBlockChange，失败只记日志并跳过，
+  #     不影响其它坐标与反矿透主流程（fail-open）；
+  #   · 显形包一律走 Paper 原生通道（不经封包自拼），因此不会再次进入本插件的出站监听器。
+  # 关掉本项即回到「逐坐标单包」的旧行为，供 A/B 对比与线上回退（默认开启）。
+  batch-reveal-sends: true
+
 disk-cache:
   # 磁盘缓存：把「已改写完成的区块负载」持久化到
   #   plugins/MikuXrayNet/cache/<世界名>/r.<regionX>.<regionZ>.b_linear

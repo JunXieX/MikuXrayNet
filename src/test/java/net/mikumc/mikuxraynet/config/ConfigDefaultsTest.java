@@ -318,6 +318,8 @@ class ConfigDefaultsTest {
     assertEquals(80.0D, config.proximity().frustumFov(), 1.0E-9D, "视锥竖直全角默认 80°");
     assertEquals(4, config.proximity().raycastSamples(),
         "候选点数默认 4（原生射线改造后语义为「每方块最多尝试的候选点数」，钳制 1..8）");
+    assertTrue(config.proximity().batchRevealSends(),
+        "显形包批量合并默认开启（Paper 原生多方块变更包，关掉即回退为逐坐标单包）");
 
     // disk-cache 全部 13 键
     assertTrue(config.diskCache().enabled(), "磁盘缓存默认开启");

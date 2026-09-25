@@ -1,12 +1,12 @@
 package net.mikumc.mikuxraynet.antixray;
 
-import com.comphenix.protocol.PacketType;
 import com.comphenix.protocol.ProtocolManager;
-import com.comphenix.protocol.events.PacketContainer;
-import com.comphenix.protocol.wrappers.BlockPosition;
-import com.comphenix.protocol.wrappers.WrappedBlockData;
+import io.papermc.paper.math.Position;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -69,8 +69,13 @@ import org.bukkit.util.Vector;
  * 它是 Bukkit API，且要先读 6 个邻块判暴露面。工作队列已满时退化为「主线程直接做纯计算」，
  * 功能不降级、绝不阻塞。
  *
- * <p><b>发包纪律</b>：ProtocolLib 是唯一封包通道，包用 {@code createPacket} 构造、用
- * {@code sendServerPacket(..., filters=false)} 发出，因此显形包不会再次进入本插件的出站监听器。
+ * <p><b>发包纪律</b>：显形包改用 <b>Paper 原生 API</b>（{@code Player#sendMultiBlockChange} /
+ * {@code Player#sendBlockChange}）直接发出，不再自拼包结构——因此既不触碰 ProtocolLib 的
+ * {@code WrappedBlockData}（它内部硬查 {@code CraftMagicNumbers} 的方法契约，属「未来某版 MC
+ * 一改就整体失效」的脆弱面），也天然不会再次进入本插件的出站监听器。
+ * {@code proximity.batch-reveal-sends}（默认开启）时把一个周期内通过筛选的坐标累积起来、
+ * 周期末一次 {@code sendMultiBlockChange} 发出（Paper 按 16³ 区块段自动合并，每个涉及的段一个包），
+ * 失败时退化为逐坐标 {@code sendBlockChange}；关闭时逐坐标发单方块变更包（旧行为，供 A/B 与回退）。
  * 同一坐标只显形一次（发送成功后立即写入该玩家的 {@link RevealedSet}）；区块被重新下发或被卸载时
  * 该区块的已显形标记一并失效（客户端又会看到伪装结果，必须重新显形）。单个坐标失败只记日志并跳过，
  * 绝不中断整体。
@@ -125,13 +130,42 @@ public final class ProximityRevealer implements Listener {
     private int sent;
   }
 
+  /**
+   * 一个周期（或一次事件触发）内待发的显形批次：只累积「已通过全部筛选、待发包」的坐标与真实方块状态，
+   * 周期末由 {@link #flushBatch} 一次发出并逐个写回「已显形」标记。
+   *
+   * <p><b>为什么先累积再发</b>：批量合并的前提是「先知道本周期有哪些坐标要发」；同时把标记推迟到
+   * 真正发出之后，保证「已显形标记 ⊆ 客户端真正收到过的坐标」这一不变式不被破坏。
+   * 坐标为绝对方块坐标；方块状态在玩家所属线程读取（见 {@link #sendOne}）。
+   */
+  private static final class RevealBatch {
+
+    private final World world;
+    private final List<int[]> positions = new ArrayList<>();
+    private final List<BlockData> states = new ArrayList<>();
+
+    private RevealBatch(World world) {
+      this.world = world;
+    }
+
+    private void add(int x, int y, int z, BlockData data) {
+      positions.add(new int[] {x, y, z});
+      states.add(data);
+    }
+
+    private int size() {
+      return positions.size();
+    }
+  }
+
   private final Plugin plugin;
-  private final ProtocolManager protocolManager;
   private final AntiXrayConfig config;
   private final AntiXrayConfig.Proximity proximity;
   private final AntiXrayConfig.InstantReveal instant;
   /** 流体覆盖开关（{@code occlusion.fluid-cover}）：上方是流体时不显形（保持伪装）。 */
   private final boolean fluidCover;
+  /** 是否把同一周期的显形合并成一个 Paper 原生多方块变更包发出（{@code proximity.batch-reveal-sends}）。 */
+  private final boolean batchRevealSends;
   private final ObfuscatedChunkIndex chunkIndex;
   private final RevealedSet revealedSet;
   private final ProximityStats stats;
@@ -160,15 +194,20 @@ public final class ProximityRevealer implements Listener {
    */
   private final ConcurrentHashMap<UUID, ScheduledTask> entityTasks = new ConcurrentHashMap<>();
 
+  /**
+   * @param protocolManager ProtocolLib 协议管理器。<b>保留形参以维持既有装配签名</b>——显形发包已改用
+   *                        Paper 原生 API（见类注释「发包纪律」），封包通道由本插件其它模块继续使用；
+   *                        本类不再读取它。
+   */
   public ProximityRevealer(Plugin plugin, ProtocolManager protocolManager, AntiXrayConfig config,
       ObfuscatedChunkIndex chunkIndex, RevealedSet revealedSet, ProximityStats stats,
       BypassRegistry bypassRegistry, MikuWorkPool workPool) {
     this.plugin = plugin;
-    this.protocolManager = protocolManager;
     this.config = config;
     this.proximity = config.proximity();
     this.instant = proximity.instantReveal();
     this.fluidCover = config.occlusion().fluidCover();
+    this.batchRevealSends = proximity.batchRevealSends();
     this.overRevealSampler = new OverRevealSampler(Math.max(0, proximity.overRevealSampling()));
     this.chunkIndex = chunkIndex;
     this.revealedSet = revealedSet;
@@ -199,7 +238,8 @@ public final class ProximityRevealer implements Listener {
             + proximity.frustumMinDistance() + " 格内豁免）" : "已关闭")
         + "，可见性判定 " + (proximity.raycastEnabled()
             ? "已开启（Paper 原生射线 rayTraceBlocks，暴露面上至多 " + proximity.raycastSamples()
-                + " 个候选点）" : "已关闭"));
+                + " 个候选点）" : "已关闭")
+        + "，显形发包 " + (batchRevealSends ? "已合并（Paper 原生多方块变更包）" : "逐坐标单包"));
   }
 
   /** 停用：注销任务与事件监听，并清空两个显形索引（不留副作用）。 */
@@ -446,14 +486,16 @@ public final class ProximityRevealer implements Listener {
         ? plan.candidateCount
         : (candidates == null ? 0 : candidates.size());
     int frustumCulled = plan != null ? plan.frustumCulled : 0;
+    RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
 
     if (candidates != null) {
       for (ObfuscatedChunkIndex.Position position : candidates) {
         if (budget.remaining <= 0) {
           break;
         }
-        sendOne(player, world, position.x(), position.y(), position.z(), eye, budget, tally);
+        sendOne(player, world, position.x(), position.y(), position.z(), eye, budget, tally, batch);
       }
+      flushBatch(player, batch, tally);
       logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
       return;
     }
@@ -467,14 +509,15 @@ public final class ProximityRevealer implements Listener {
         break;
       }
       sendOne(player, world, plan.coordinates[i * 3], plan.coordinates[i * 3 + 1],
-          plan.coordinates[i * 3 + 2], eye, budget, tally);
+          plan.coordinates[i * 3 + 2], eye, budget, tally, batch);
     }
+    flushBatch(player, batch, tally);
     logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
   }
 
-  /** 单个坐标：区块未加载则跳过、不可见则跳过，否则读真实方块并发包、成功后标记该玩家已显形。 */
+  /** 单个坐标：区块未加载则跳过、不可见则跳过，否则读真实方块；批量模式累积、否则立即发包并标记。 */
   private void sendOne(Player player, World world, int x, int y, int z, ProximitySelector.Eye eye,
-      Budget budget, PassTally tally) {
+      Budget budget, PassTally tally, RevealBatch batch) {
     if (!world.isChunkLoaded(x >> 4, z >> 4)) {
       // 区块未加载：本次跳过，坐标留在索引里等玩家真正靠近
       stats.revealsSkipped.increment();
@@ -497,14 +540,92 @@ public final class ProximityRevealer implements Listener {
       }
     }
 
-    if (send(player, world, x, y, z)) {
-      revealedSet.mark(player.getUniqueId(), ChunkKey.ofBlock(world.getName(), x, z), x, y, z);
+    // 真实方块状态必须在玩家所属线程读取（本方法即运行在该线程上）
+    BlockData data;
+    try {
+      data = world.getBlockAt(x, y, z).getBlockData();
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+      data = null;
+    }
+    if (data == null) {
+      stats.revealsSkipped.increment();
+      return;
+    }
+
+    if (batch != null) {
+      // 批量模式：先累积，周期末由 flushBatch 一次发出并在成功后才写入「已显形」标记
+      batch.add(x, y, z, data);
+      budget.remaining--;
+      return;
+    }
+
+    if (sendSingle(player, world, x, y, z, data)) {
+      markRevealed(player, world, x, y, z);
       stats.revealsSent.increment();
       tally.sent++;
       budget.remaining--;
     } else {
       stats.revealsSkipped.increment();
     }
+  }
+
+  /**
+   * 发出本周期累积的显形（批量模式）：优先一次 {@code Player#sendMultiBlockChange}——Paper 会按
+   * 16³ 区块段自行合并，因此「本周期 N 个坐标」通常只产生「涉及的段数」个多方块变更包。
+   *
+   * <p>只有一个坐标时直接用 {@code sendBlockChange}（单包更小，也与旧行为一致）。
+   * 批量调用整体失败时退化为逐坐标 {@code sendBlockChange}（同一条原生通道），单个坐标失败只计数并
+   * 跳过；标记与统计只在「确实发出」后写入，因此发包失败不影响其它坐标、也不污染已显形索引。
+   */
+  private void flushBatch(Player player, RevealBatch batch, PassTally tally) {
+    if (batch == null || batch.size() == 0) {
+      return;
+    }
+    World world = batch.world;
+    boolean batched = false;
+    if (batch.size() > 1) {
+      try {
+        Map<Position, BlockData> changes = new LinkedHashMap<>(batch.size() * 2);
+        for (int i = 0; i < batch.size(); i++) {
+          int[] position = batch.positions.get(i);
+          changes.put(Position.block(position[0], position[1], position[2]), batch.states.get(i));
+        }
+        player.sendMultiBlockChange(changes);
+        batched = true;
+      } catch (Throwable throwable) {
+        // 退化路径：仍走 Paper 原生单方块变更包，不退回封包自拼
+        logThrottled(throwable);
+      }
+    }
+
+    for (int i = 0; i < batch.size(); i++) {
+      int[] position = batch.positions.get(i);
+      if (!batched
+          && !sendSingle(player, world, position[0], position[1], position[2], batch.states.get(i))) {
+        stats.revealsSkipped.increment();
+        continue;
+      }
+      markRevealed(player, world, position[0], position[1], position[2]);
+      stats.revealsSent.increment();
+      tally.sent++;
+    }
+  }
+
+  /** Paper 原生单方块变更包（{@code Player#sendBlockChange}）；任何异常只返回 false，绝不外抛。 */
+  private boolean sendSingle(Player player, World world, int x, int y, int z, BlockData data) {
+    try {
+      player.sendBlockChange(new Location(world, x, y, z), data);
+      return true;
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+      return false;
+    }
+  }
+
+  /** 写入「该玩家已显形」标记（与坐标注销、整块跳过判定共用同一不变式）。 */
+  private void markRevealed(Player player, World world, int x, int y, int z) {
+    revealedSet.mark(player.getUniqueId(), ChunkKey.ofBlock(world.getName(), x, z), x, y, z);
   }
 
   /**
@@ -604,34 +725,6 @@ public final class ProximityRevealer implements Listener {
           "邻近显形可见性判定失败：本次一律按「不显形」处理（绝不隔着墙还原）。"
               + "改用 Paper 原生 rayTraceBlocks 后，此类失败通常源于世界读取异常，请反馈此日志。",
           throwable);
-    }
-  }
-
-  /** 构造并发送一条方块变更包；任何异常都只返回 false，不影响原包流程与其它坐标。 */
-  private boolean send(Player player, World world, int x, int y, int z) {
-    try {
-      BlockData data = world.getBlockData(x, y, z);
-      if (data == null) {
-        return false;
-      }
-
-      BlockPosition blockPosition = new BlockPosition(x, y, z);
-      PacketContainer packet = protocolManager.createPacket(PacketType.Play.Server.BLOCK_CHANGE);
-      packet.getBlockPositionModifier().writeSafely(0, blockPosition);
-      packet.getBlockData().writeSafely(0, WrappedBlockData.createData(data));
-
-      // 回读自检：结构不符宁可跳过，也不能把错坐标或错方块发给客户端
-      if (!blockPosition.equals(packet.getBlockPositionModifier().readSafely(0))
-          || packet.getBlockData().readSafely(0) == null) {
-        return false;
-      }
-
-      // filters=false：显形包由本模块自行发出，不能再触发本插件的出站监听器
-      protocolManager.sendServerPacket(player, packet, false);
-      return true;
-    } catch (Throwable throwable) {
-      logThrottled(throwable);
-      return false;
     }
   }
 
@@ -762,6 +855,7 @@ public final class ProximityRevealer implements Listener {
 
       ProximitySelector.Eye eye = proximity.raycastEnabled() ? eyeOf(player) : null;
       PassTally tally = new PassTally();
+      RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
       String liveWorld = world.getName();
       for (int[] offset : instantOffsets(radius)) {
         if (budget.remaining <= 0) {
@@ -773,8 +867,9 @@ public final class ProximityRevealer implements Listener {
         if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
           continue;
         }
-        sendOne(player, world, x, y, z, eye, budget, tally);
+        sendOne(player, world, x, y, z, eye, budget, tally, batch);
       }
+      flushBatch(player, batch, tally);
       instantQuota.setRemaining(playerId, tick, Math.max(0, budget.remaining));
     } catch (Throwable throwable) {
       logThrottled(throwable);

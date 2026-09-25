@@ -443,7 +443,8 @@ public final class Diagnostics {
     sb.append("proximity.instant-reveal.enabled=").append(c.proximity().instantReveal().enabled())
         .append("，radius=").append(c.proximity().instantReveal().radius())
         .append("，max-per-tick=").append(c.proximity().instantReveal().maxPerTick()).append('\n');
-    sb.append("proximity.over-reveal-sampling=").append(c.proximity().overRevealSampling()).append('\n');
+    sb.append("proximity.over-reveal-sampling=").append(c.proximity().overRevealSampling())
+        .append("，batch-reveal-sends=").append(c.proximity().batchRevealSends()).append('\n');
     sb.append("proximity.enabled=").append(c.proximity().enabled())
         .append("，distance=").append(c.proximity().distance())
         .append("，interval-ticks=").append(c.proximity().intervalTicks())
