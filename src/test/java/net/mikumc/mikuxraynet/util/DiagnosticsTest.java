@@ -29,7 +29,7 @@ class DiagnosticsTest {
 
   private static Diagnostics.Snapshot fixed(BandwidthConfig bandwidth) {
     return new Diagnostics.Snapshot(
-        new Diagnostics.Snapshot.Env(true, true, false, true, 1, "Paper 1.20.4", "25"),
+        new Diagnostics.Snapshot.Env(true, true, false, true, 1, "Paper 1.20.4", "25", "1.2.5"),
         new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 100L, 331L, 5L, 2L, 1L, 2L,
             0L, 0L, 0L, "无采样"),
         new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 40L, 6L),
@@ -37,7 +37,7 @@ class DiagnosticsTest {
         new Diagnostics.Snapshot.Throttle(20L, 30L, 4L, 40L, 12L,
             6L, 5L, 4, 40L, 7L, 3L, 2, 3L, 8L, 9L, 4L),
         new Diagnostics.Snapshot.Pool(4, 2, 10, 2048),
-        new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2),
+        new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2, 4L, 5L, 6L, 1L, 0L),
         null, bandwidth);
   }
 
@@ -63,7 +63,7 @@ class DiagnosticsTest {
 
   private static Diagnostics.Snapshot withAntiXray(AntiXrayConfig antiXray) {
     return new Diagnostics.Snapshot(
-        new Diagnostics.Snapshot.Env(true, true, false, true, 0, "Paper", "25"),
+        new Diagnostics.Snapshot.Env(true, true, false, true, 0, "Paper", "25", ""),
         Diagnostics.Snapshot.Rewrite.EMPTY,
         Diagnostics.Snapshot.Proximity.EMPTY,
         Diagnostics.Snapshot.Index.EMPTY,
@@ -91,6 +91,31 @@ class DiagnosticsTest {
     String emptyStatus = String.join("\n", Diagnostics.formatStatus(empty));
     assertTrue(emptyStatus.contains("反矿透世界黑名单：未配置"),
         "空黑名单必须明确写「未配置」：" + emptyStatus);
+  }
+
+  /**
+   * 配置项被安全下限抬升时，dump 必须同时给出「被抬升的键」与「抬升后的生效值」。
+   *
+   * <p>否则管理员会以为生效值就是自己写的那份（视锥配窄 → 玩家看得见的方块保持伪装；
+   * 磁盘缓存过期时间配短 → 条目活不过一次重启、命中率恒为 0）。
+   */
+  @Test
+  void dumpEchoesConfigFloorAdjustments() {
+    Diagnostics.Snapshot raised = withAntiXray(antiXray("""
+        proximity:
+          frustum:
+            fov: 60.0
+        disk-cache:
+          expire-seconds: 600
+        """));
+
+    String dump = Diagnostics.formatDump(raised, "20260925-000000");
+    assertTrue(dump.contains("配置安全下限已抬升：proximity.frustum.fov=60.0"),
+        "dump 必须回显被抬升的视锥键：" + dump);
+    assertTrue(dump.contains("disk-cache.expire-seconds=600"),
+        "dump 必须回显被抬升的磁盘缓存过期时间：" + dump);
+    assertTrue(dump.contains("expire-seconds=86400"),
+        "dump 的有效值必须是抬升后的下限（1 天）：" + dump);
   }
 
   @Test
@@ -123,6 +148,11 @@ class DiagnosticsTest {
         "状态面板必须单列周期复检口径，否则「先可见后被遮挡」是否被收敛到隐藏无法观测：" + text);
     assertTrue(text.contains("磁盘缓存"), text);
     assertTrue(text.contains("命中率 75.0%"), text);
+    // 「命中率为什么是 0」的自证口径：过期清理 / 代次递增 / 写入被拒 / 异常必须可见
+    assertTrue(text.contains("过期清理 4，代次递增 5，写入被拒 7，异常 0"),
+        "磁盘缓存必须分列过期清理、代次递增、写入被拒与异常，否则「命中率恒为 0」无法自证：" + text);
+    assertTrue(text.contains("==== MikuXrayNet 运行状态（v1.2.5） ===="),
+        "状态面板首行必须回显插件版本（区分不同构建的日志靠它）：" + text);
     assertTrue(text.contains("带宽"), text);
     assertTrue(text.contains("AFK 玩家 2"), text);
     assertTrue(text.contains("线程池"), text);
@@ -175,7 +205,7 @@ class DiagnosticsTest {
   @Test
   void hitRateHandlesNoSamples() {
     Diagnostics.Snapshot empty = new Diagnostics.Snapshot(
-        new Diagnostics.Snapshot.Env(false, false, true, false, 0, "Folia 1.21", "21"),
+        new Diagnostics.Snapshot.Env(false, false, true, false, 0, "Folia 1.21", "21", ""),
         Diagnostics.Snapshot.Rewrite.EMPTY,
         Diagnostics.Snapshot.Proximity.EMPTY,
         Diagnostics.Snapshot.Index.EMPTY,

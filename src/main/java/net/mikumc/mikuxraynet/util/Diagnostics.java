@@ -67,7 +67,8 @@ public final class Diagnostics {
 
     /** 依赖与运行环境（依赖就绪性、平台、直通玩家数、版本标识）。 */
     public record Env(boolean packetEventsReady, boolean protocolLibReady, boolean folia,
-        boolean antiXrayActive, int bypassPlayers, String serverVersion, String javaVersion) {
+        boolean antiXrayActive, int bypassPlayers, String serverVersion, String javaVersion,
+        String pluginVersion) {
     }
 
     /**
@@ -124,11 +125,20 @@ public final class Diagnostics {
       public static final Pool EMPTY = new Pool(0, 0, 0, 0);
     }
 
-    /** 磁盘缓存域：命中、持有量与打开的区域文件数。 */
-    public record DiskCache(long hits, long misses, int entries, int openFiles) {
+    /**
+     * 磁盘缓存域：命中、持有量、打开的区域文件数与「为什么没命中」的拆解计数。
+     *
+     * <p>{@code expiredRemoved} / {@code generationBumps} / {@code rejectedBy*} 是排查「命中率恒为 0」
+     * 的关键：过期清理说明条目活不过配置的 expire-seconds（配短了等于关掉缓存），
+     * 写入被拒说明容量/文件大小上限在拦，代次递增说明该区块被观测到方块变更。
+     */
+    public record DiskCache(long hits, long misses, int entries, int openFiles,
+        long expiredRemoved, long generationBumps, long rejectedByCapacity, long rejectedBySize,
+        long errors) {
 
       /** 磁盘缓存未启用时的零值兜底。 */
-      public static final DiskCache EMPTY = new DiskCache(0L, 0L, 0, 0);
+      public static final DiskCache EMPTY =
+          new DiskCache(0L, 0L, 0, 0, 0L, 0L, 0L, 0L, 0L);
     }
   }
 
@@ -232,14 +242,18 @@ public final class Diagnostics {
             pool.queueCapacity());
     Snapshot.DiskCache diskCacheSnapshot = diskCache == null ? Snapshot.DiskCache.EMPTY
         : new Snapshot.DiskCache(diskCache.stats().hits.sum(), diskCache.stats().misses.sum(),
-            diskCache.entries(), diskCache.openRegionFiles());
+            diskCache.entries(), diskCache.openRegionFiles(),
+            diskCache.stats().expiredRemoved.sum(), diskCache.stats().generationBumps.sum(),
+            diskCache.stats().rejectedByCapacity.sum(), diskCache.stats().rejectedBySize.sum(),
+            diskCache.stats().errors.sum());
 
     return new Snapshot(
         new Snapshot.Env(DependencyGuard.isPacketEventsPresent(),
             DependencyGuard.isProtocolLibPresent(), PlatformSupport.isFolia(),
             runtime != null && runtime.antiXrayActive(), bypass == null ? 0 : bypass.size(),
             Bukkit.getName() + " " + Bukkit.getMinecraftVersion(),
-            System.getProperty("java.version", "未知")),
+            System.getProperty("java.version", "未知"),
+            pluginVersion(plugin)),
         rewrite,
         proximity,
         index,
@@ -253,7 +267,8 @@ public final class Diagnostics {
   /** 状态面板格式化（纯函数）。 */
   public static List<String> formatStatus(Snapshot s) {
     List<String> lines = new ArrayList<>();
-    lines.add("==== MikuXrayNet 运行状态 ====");
+    lines.add("==== MikuXrayNet 运行状态"
+        + (s.env().pluginVersion().isEmpty() ? "" : "（v" + s.env().pluginVersion() + "）") + " ====");
     lines.add("依赖：PacketEvents " + (s.env().packetEventsReady() ? "就绪" : "缺失")
         + "｜ProtocolLib " + (s.env().protocolLibReady() ? "就绪" : "缺失")
         + "｜平台 " + (s.env().folia() ? "Folia" : "Paper/Spigot"));
@@ -287,10 +302,17 @@ public final class Diagnostics {
         + s.index().revealedRegisteredTotal()
         + "｜安全阀触发 " + s.index().indexEvictedByCapacity() + "/" + s.index().revealedDroppedByCapacity()
         + "（正常运营下应为 0，触发即说明有 bug）");
+    // 「过期清理 / 代次递增 / 写入被拒 / 异常」是「命中率为什么是 0」的自证口径：
+    // 过期清理 > 0 说明文件的 expire-seconds 比两次启动的间隔还短（条目全死），
+    // 写入被拒 > 0 说明容量/单文件上限在拦（新区块没进缓存），异常 > 0 见日志。
     lines.add("磁盘缓存：" + (s.diskCache().openFiles() > 0 || s.diskCache().entries() > 0 ? "已启用" : "无数据")
         + "｜命中 " + s.diskCache().hits() + "，未命中 " + s.diskCache().misses()
         + "，命中率 " + hitRate(s.diskCache().hits(), s.diskCache().misses())
-        + "，条目约 " + s.diskCache().entries() + "，打开区域文件 " + s.diskCache().openFiles());
+        + "，条目约 " + s.diskCache().entries() + "，打开区域文件 " + s.diskCache().openFiles()
+        + "｜过期清理 " + s.diskCache().expiredRemoved()
+        + "，代次递增 " + s.diskCache().generationBumps()
+        + "，写入被拒 " + (s.diskCache().rejectedByCapacity() + s.diskCache().rejectedBySize())
+        + "，异常 " + s.diskCache().errors());
     lines.add("带宽：零位移取消 " + s.throttle().entityPacketsCancelled() + "，合并批次 "
         + s.throttle().blockMergeBatches()
         + "（合并 " + s.throttle().blockChangesMerged() + " 条），实体隐藏 " + s.throttle().entitiesHidden()
@@ -307,6 +329,28 @@ public final class Diagnostics {
     lines.add("线程池：线程 " + s.pool().threads() + "，活动 " + s.pool().active()
         + "，队列 " + s.pool().queueSize() + "/" + s.pool().queueCapacity());
     return lines;
+  }
+
+  /**
+   * 插件版本号（纯读取，绝不抛异常）：状态面板第一行回显，供「同一份日志到底是哪个构建」对照。
+   *
+   * <p>优先走 Paper 的 {@code getPluginMeta()}；纯 Bukkit/Spigot 核心没有该方法，回落到已废弃但仍
+   * 处处可用的 {@code getDescription()}。两处都失败时返回空串（面板不显示版本，绝不因此报错）。
+   */
+  private static String pluginVersion(MikuXrayNet plugin) {
+    if (plugin == null) {
+      return "";
+    }
+    try {
+      return plugin.getPluginMeta().getVersion();
+    } catch (Throwable ignored) {
+      // 非 Paper 核心：走传统描述
+    }
+    try {
+      return plugin.getDescription().getVersion();
+    } catch (Throwable ignored) {
+      return "";
+    }
   }
 
   /** 世界黑名单回显（中文，纯函数；status 与 dump 共用）。空列表明确写「未配置」。 */
@@ -458,9 +502,9 @@ public final class Diagnostics {
         .append("，min-distance=").append(c.proximity().frustumMinDistance())
         .append("，raycast.enabled=").append(c.proximity().raycastEnabled())
         .append("，raycast.samples=").append(c.proximity().raycastSamples()).append('\n');
-    // 视锥两键被安全下限抬升时明示（否则管理员会以为 dump 里的值是自己配的，或怀疑读错配置）
-    if (c.frustumFloorDetail() != null) {
-      sb.append("proximity.frustum 低于安全下限已抬升：").append(c.frustumFloorDetail()).append('\n');
+    // 配置项被安全下限抬升时明示（否则管理员会以为 dump 里的值是自己配的，或怀疑读错配置）
+    if (!c.floorAdjustments().isEmpty()) {
+      sb.append("配置安全下限已抬升：").append(String.join("、", c.floorAdjustments())).append('\n');
     }
     sb.append("disk-cache.enabled=").append(c.diskCache().enabled())
         .append("，max-entries=").append(c.diskCache().maxEntries())

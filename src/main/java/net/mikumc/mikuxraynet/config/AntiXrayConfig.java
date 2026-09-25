@@ -279,6 +279,20 @@ public final class AntiXrayConfig {
   public static final double FRUSTUM_MIN_DISTANCE_FLOOR = 16.0D;
 
   /**
+   * 磁盘缓存条目过期秒数的<b>安全下限</b>（1 天）。
+   *
+   * <p><b>为什么设下限</b>：磁盘缓存的用途就是「重启后直接复用已改写好的区块负载」，而条目过期时间
+   * 是<b>从写入时刻</b>算的——配得比两次启动的间隔还短，条目在重启后必然已经过期，命中率恒为 0
+   * （真机反馈：把 expire-seconds 配成默认的 1800 秒，两次会话间隔 70 分钟 → 命中 0／未命中 2096，
+   * 磁盘上躺着的 1951 条全是过期条目）。
+   *
+   * <p>内容是否还新鲜<b>不</b>由过期时间判定：条目负载里带着原始区块字节指纹，与本次要改写的字节
+   * 不符即视为未命中（见 {@code DiskPayload}）。因此限制磁盘占用应当调
+   * {@code disk-cache.max-entries} / {@code max-file-size-mb}，而不是把过期时间配短。
+   */
+  public static final int DISK_CACHE_EXPIRE_FLOOR_SECONDS = 86400;
+
+  /**
    * 邻近显形：玩家靠近曾被伪装的坐标时，主动把该坐标的真实方块发回客户端。
    *
    * @param distance              触发显形的距离（格，三维欧氏距离，等于阈值也算命中）
@@ -328,7 +342,8 @@ public final class AntiXrayConfig {
    * @param enabled                    总开关（默认开启，限额保守）
    * @param maxEntries                 近似条目总数上限（超出后拒绝新写入）
    * @param maxFileSizeMb              单个区域文件（32×32 区块）的大小上限（MB）
-   * @param expireSeconds              条目过期秒数（读取与后台维护都会惰性清理）
+   * @param expireSeconds              条目过期秒数（读取与后台维护都会惰性清理）；
+   *                                   <b>不低于 {@link #DISK_CACHE_EXPIRE_FLOOR_SECONDS}</b>（低于下限会被抬升并 WARN）
    * @param bucketCacheSize            每个打开的区域文件在内存里缓存的 bucket 数（内存上限的关键）
    * @param idleCloseSeconds           句柄闲置多久后自动落盘并关闭（释放文件描述符与内存）
    * @param maintenanceIntervalSeconds 后台维护周期（落盘 + 压缩回收 + 关闭闲置句柄）
@@ -413,10 +428,11 @@ public final class AntiXrayConfig {
   /** 配置是否缺少 {@code dimensions} 段（缺段时用内置默认运行并一次性 WARN）。 */
   private final boolean dimensionsMissing;
   /**
-   * 视锥两键被安全下限（{@link #FRUSTUM_FOV_FLOOR} / {@link #FRUSTUM_MIN_DISTANCE_FLOOR}）抬升的明细；
-   * {@code null} 表示未抬升。加载时由 {@link #warnIfFrustumBelowFloor} 一次性 WARN。
+   * 被安全下限（{@link #FRUSTUM_FOV_FLOOR} / {@link #FRUSTUM_MIN_DISTANCE_FLOOR} /
+   * {@link #DISK_CACHE_EXPIRE_FLOOR_SECONDS}）抬升过的配置键明细；空列表表示未抬升。
+   * 加载时由 {@link #warnIfConfigFloorApplied} 一次性 WARN。
    */
-  private final String frustumFloorDetail;
+  private final List<String> floorAdjustments;
   private final boolean layerObfuscation;
   private final boolean removeBlockEntities;
   private final Neighbors neighbors;
@@ -449,7 +465,7 @@ public final class AntiXrayConfig {
       DiskCache diskCache, PlatformSupport.Mode platform, int cacheMaximumSize,
       int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis, int queueCapacity,
       Set<String> unresolvedTags, List<WorldOverride> worldOverrides, List<String> worldBlacklist,
-      String frustumFloorDetail) {
+      List<String> floorAdjustments) {
     this.enabled = enabled;
     this.dimensionEffectives = dimensionEffectives.clone();
     this.dimensionEnabled = dimensionEnabled.clone();
@@ -470,8 +486,8 @@ public final class AntiXrayConfig {
     this.worldOverrides = List.copyOf(worldOverrides);
     // 黑名单在构造期拆分并预编译通配匹配器：热路径只有短线性扫描，绝不逐包编译正则（列表通常 1~10 项）。
     this.worldBlacklist = List.copyOf(worldBlacklist);
-    // 视锥两键被安全下限抬升的明细（null = 未抬升）；加载时由 warnIfFrustumBelowFloor 一次性提示
-    this.frustumFloorDetail = frustumFloorDetail;
+    // 被安全下限抬升过的键（空 = 未抬升）；加载时由 warnIfConfigFloorApplied 一次性提示
+    this.floorAdjustments = floorAdjustments == null ? List.of() : List.copyOf(floorAdjustments);
     List<String> blacklistExactNames = new ArrayList<>(this.worldBlacklist.size());
     List<Pattern> blacklistGlobPatterns = new ArrayList<>(this.worldBlacklist.size());
     for (String pattern : this.worldBlacklist) {
@@ -595,8 +611,8 @@ public final class AntiXrayConfig {
     List<WorldOverride> overrides =
         parseWorldOverrides(root.getConfigurationSection("world-overrides"), unknownTags);
 
-    // ---- proximity.frustum 的安全下限：被抬升的键记进 detail，加载时一次性 WARN（解析侧不持日志）----
-    StringBuilder frustumFloorDetail = new StringBuilder();
+    // ---- 安全下限：被抬升的键记进 floorAdjustments，加载时一次性 WARN（解析侧不持日志）----
+    List<String> floorAdjustments = new ArrayList<>(3);
 
     return new AntiXrayConfig(
         root.getBoolean("enabled", true),
@@ -633,11 +649,11 @@ public final class AntiXrayConfig {
             root.getBoolean("proximity.frustum.enabled", true),
             // 视锥两键都有安全下限（见 FRUSTUM_FOV_FLOOR / FRUSTUM_MIN_DISTANCE_FLOOR）：
             // 配得比客户端可视范围更窄会让「玩家看得见的方块」保持伪装，因此低于下限时按下限生效，
-            // 并把被抬升的键记进 frustumFloorDetail，由加载时一次性 WARN 显式告知（绝不静默改配置）。
-            frustumFov(root.getDouble("proximity.frustum.fov", FRUSTUM_FOV_FLOOR), frustumFloorDetail),
+            // 并把被抬升的键记进 floorAdjustments，由加载时一次性 WARN 显式告知（绝不静默改配置）。
+            frustumFov(root.getDouble("proximity.frustum.fov", FRUSTUM_FOV_FLOOR), floorAdjustments),
             frustumMinDistance(
                 root.getDouble("proximity.frustum.min-distance", FRUSTUM_MIN_DISTANCE_FLOOR),
-                frustumFloorDetail),
+                floorAdjustments),
             root.getBoolean("proximity.raycast.enabled", true),
             // 语义已变：原生射线改造后本键表示「每方块最多尝试的候选点数」（不再表示采样数）。
             // 钳制 1..8，默认 4；候选点的选择只在暴露面上（面中心 → 最近点 → 面四角），命中即止。
@@ -654,7 +670,10 @@ public final class AntiXrayConfig {
             root.getBoolean("disk-cache.enabled", true),
             Math.max(1, root.getInt("disk-cache.max-entries", 20000)),
             Math.max(1, root.getInt("disk-cache.max-file-size-mb", 16)),
-            Math.max(1, root.getInt("disk-cache.expire-seconds", 1800)),
+            // 过期秒数有安全下限（见 DISK_CACHE_EXPIRE_FLOOR_SECONDS）：从写入时刻算的过期时间配得比
+            // 两次启动的间隔还短，条目在重启后必然已过期，磁盘缓存等于白写（真机命中率恒为 0 的根因）。
+            diskCacheExpireSeconds(root.getInt("disk-cache.expire-seconds", 7 * 24 * 60 * 60),
+                floorAdjustments),
             Math.max(1, root.getInt("disk-cache.bucket-cache-size", 8)),
             Math.max(1, root.getInt("disk-cache.idle-close-seconds", 300)),
             Math.max(1, root.getInt("disk-cache.maintenance-interval-seconds", 30)),
@@ -675,7 +694,7 @@ public final class AntiXrayConfig {
         unknownTags,
         overrides,
         worldBlacklist,
-        frustumFloorDetail.isEmpty() ? null : frustumFloorDetail.toString());
+        floorAdjustments);
   }
 
   /**
@@ -890,25 +909,24 @@ public final class AntiXrayConfig {
 
   /**
    * 视锥竖直全角的生效值：非法值（{@code <=0} / {@code >360}）回落默认，低于
-   * {@link #FRUSTUM_FOV_FLOOR} 时抬升到下限并把明细写入 {@code floorDetail}。
+   * {@link #FRUSTUM_FOV_FLOOR} 时抬升到下限并记入 {@code floorAdjustments}。
    *
    * <p>升到下限而不是照配置生效的原因见 {@link #FRUSTUM_FOV_FLOOR}：配窄了会让玩家看得见的方块
    * 一直保持伪装（显形判定里只有这一道闸门会「看得见却不发」）。要省带宽请关掉整个视锥剔除。
    */
-  private static double frustumFov(double configured, StringBuilder floorDetail) {
+  private static double frustumFov(double configured, List<String> floorAdjustments) {
     if (Double.isNaN(configured) || configured <= 0.0D || configured > 360.0D) {
       return FRUSTUM_FOV_FLOOR;
     }
     if (configured >= FRUSTUM_FOV_FLOOR) {
       return configured;
     }
-    floorDetail.append("proximity.frustum.fov=").append(configured).append("（下限 ")
-        .append(FRUSTUM_FOV_FLOOR).append("°）");
+    floorAdjustments.add("proximity.frustum.fov=" + configured + "（下限 " + FRUSTUM_FOV_FLOOR + "°）");
     return FRUSTUM_FOV_FLOOR;
   }
 
   /** 最小豁免距离的生效值：低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR} 时抬升到下限并记录明细。 */
-  private static double frustumMinDistance(double configured, StringBuilder floorDetail) {
+  private static double frustumMinDistance(double configured, List<String> floorAdjustments) {
     if (Double.isNaN(configured)) {
       return FRUSTUM_MIN_DISTANCE_FLOOR;
     }
@@ -916,12 +934,25 @@ public final class AntiXrayConfig {
     if (value >= FRUSTUM_MIN_DISTANCE_FLOOR) {
       return value;
     }
-    if (!floorDetail.isEmpty()) {
-      floorDetail.append('、');
-    }
-    floorDetail.append("proximity.frustum.min-distance=").append(value).append("（下限 ")
-        .append(FRUSTUM_MIN_DISTANCE_FLOOR).append(" 格）");
+    floorAdjustments.add("proximity.frustum.min-distance=" + value
+        + "（下限 " + FRUSTUM_MIN_DISTANCE_FLOOR + " 格）");
     return FRUSTUM_MIN_DISTANCE_FLOOR;
+  }
+
+  /**
+   * 磁盘缓存过期秒数的生效值：低于 {@link #DISK_CACHE_EXPIRE_FLOOR_SECONDS} 时抬升到下限并记录明细。
+   *
+   * <p>条目内容是否新鲜由负载里的原始字节指纹判定（见 {@code DiskPayload}），过期时间只是「多久没被
+   * 复用就回收磁盘」的粒度，因此下限刻意取得较大（1 天）：小于这个量级的取值会让缓存活不过一次重启，
+   * 功能等于关闭（真机命中率恒为 0 的根因）。
+   */
+  private static int diskCacheExpireSeconds(int configured, List<String> floorAdjustments) {
+    if (configured >= DISK_CACHE_EXPIRE_FLOOR_SECONDS) {
+      return configured;
+    }
+    floorAdjustments.add("disk-cache.expire-seconds=" + configured
+        + "（下限 " + DISK_CACHE_EXPIRE_FLOOR_SECONDS + " 秒 = 1 天）");
+    return DISK_CACHE_EXPIRE_FLOOR_SECONDS;
   }
 
   /** 解析缺失策略；取值非法时回落到最安全的 {@link MissingPolicy#HIDE}。 */
@@ -978,28 +1009,30 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 视锥两键被安全下限抬升时的<b>一次性</b>中文 WARN（进程级闸门 {@code once} 保证只提示一次）。
+   * 配置项被安全下限抬升时的<b>一次性</b>中文 WARN（进程级闸门 {@code once} 保证只提示一次）。
    *
    * <p><b>为什么必须提示</b>：生效值与管理员的 yml 不一致，若不说明，管理员会以为「配的还是我写的值」，
-   * 或反过来怀疑插件读错配置。这里明确给出被抬升的键与原因，并指出正确的省带宽出口
-   * （关掉整个视锥剔除，而不是把角度/距离配窄）。
+   * 或反过来怀疑插件读错配置。这里给出被抬升的键、原因与正确出口（两个下限指向的功能失效模式见
+   * {@link #FRUSTUM_FOV_FLOOR} 与 {@link #DISK_CACHE_EXPIRE_FLOOR_SECONDS}）。
    *
    * @param once 进程级一次性闸门（同一实例重复 reload 不会重复刷屏）
    */
-  public void warnIfFrustumBelowFloor(Logger logger, AtomicBoolean once) {
-    if (frustumFloorDetail == null || logger == null || !once.compareAndSet(false, true)) {
+  public void warnIfConfigFloorApplied(Logger logger, AtomicBoolean once) {
+    if (floorAdjustments.isEmpty() || logger == null || !once.compareAndSet(false, true)) {
       return;
     }
-    logger.warning("antixray.yml 的 " + frustumFloorDetail + " 低于安全下限，已按下限生效"
-        + "（当前：fov=" + proximity.frustumFov() + "°、min-distance=" + proximity.frustumMinDistance()
-        + " 格）。客户端 FOV 是纯本地设置、服务端拿不到，视锥配得比它更窄会让玩家「看得见的方块」"
-        + "一直保持伪装（表现为要点一下或挖一下才变回来）；确实想省带宽请把 proximity.frustum.enabled"
-        + " 设为 false（完全不做视锥剔除），而不是缩小角度。");
+    logger.warning("antixray.yml 的 " + String.join("、", floorAdjustments) + " 低于安全下限，已按下限生效"
+        + "（当前：proximity.frustum.fov=" + proximity.frustumFov() + "°、min-distance="
+        + proximity.frustumMinDistance() + " 格、disk-cache.expire-seconds="
+        + diskCache.expireSeconds() + " 秒）。低于下限的取值会让对应功能静默失效："
+        + "视锥配窄 → 玩家看得见的方块保持伪装（要点一下才变回来）；"
+        + "磁盘缓存过期时间配短 → 条目活不过一次重启，命中率恒为 0。"
+        + "限制磁盘占用请调 disk-cache.max-entries / max-file-size-mb，而不是缩短过期时间。");
   }
 
-  /** 视锥两键被安全下限抬升的明细（{@code null} = 未抬升）；供诊断回显。 */
-  public String frustumFloorDetail() {
-    return frustumFloorDetail;
+  /** 被安全下限抬升过的配置键明细（空列表 = 未抬升）；供诊断回显。 */
+  public List<String> floorAdjustments() {
+    return floorAdjustments;
   }
 
   /** 逐世界覆盖段（声明序）；空列表 = 无覆盖。 */

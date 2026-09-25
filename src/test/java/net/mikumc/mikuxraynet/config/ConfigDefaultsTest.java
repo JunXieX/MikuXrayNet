@@ -3,8 +3,6 @@ package net.mikumc.mikuxraynet.config;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
@@ -56,41 +54,52 @@ class ConfigDefaultsTest {
   }
 
   /**
-   * 视锥两键的<b>安全下限</b>：旧配置（fov=80 / min-distance=4）也必须被抬升到下限并留下 WARN 明细。
+   * 配置安全下限：旧配置（fov=80 / min-distance=4 / disk-cache.expire-seconds=1800）也必须被抬升到下限
+   * 并留下 WARN 明细。
    *
-   * <p>真机回归：视锥配得比客户端可视范围窄时，被剔除的坐标既不发包也不记已显形，玩家会看到
-   * 「站在门正前方，一半方块一直是伪装，点一下才变回来」。因此下限不是「建议值」而是硬约束，
-   * 且必须能被加载路径显式提示（绝不静默改用户配置）。
+   * <p>真机回归两条：① 视锥配得比客户端可视范围窄 → 玩家看到的方块一直保持伪装（点一下才变回来）；
+   * ② 磁盘缓存过期时间从写入时刻算起、配得比两次启动的间隔还短 → 条目在重启后必然过期，命中率恒为 0
+   * （实机 70 分钟后重启：命中 0／未命中 2096，磁盘上 1951 条全是过期条目）。
+   * 因此下限不是「建议值」而是硬约束，且必须能被加载路径显式提示（绝不静默改用户配置）。
    */
   @Test
-  void frustumOptionsBelowSafetyFloorAreRaisedAndReported() {
+  void optionsBelowSafetyFloorAreRaisedAndReported() {
     AntiXrayConfig raised = AntiXrayConfig.from(yaml("""
         proximity:
           frustum:
             fov: 80.0
             min-distance: 4.0
+        disk-cache:
+          expire-seconds: 1800
         """));
 
     assertEquals(AntiXrayConfig.FRUSTUM_FOV_FLOOR, raised.proximity().frustumFov(), 1.0E-9D,
         "旧默认 80° 必须被抬升到下限 110°");
     assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_FLOOR, raised.proximity().frustumMinDistance(),
         1.0E-9D, "旧默认 4 格必须被抬升到下限 16 格");
-    assertNotNull(raised.frustumFloorDetail(), "抬升必须留下明细，供加载时一次性 WARN");
-    assertTrue(raised.frustumFloorDetail().contains("proximity.frustum.fov=80.0"),
-        "明细必须点名被抬升的键：" + raised.frustumFloorDetail());
-    assertTrue(raised.frustumFloorDetail().contains("proximity.frustum.min-distance=4.0"),
-        "明细必须列出全部被抬升的键：" + raised.frustumFloorDetail());
+    assertEquals(AntiXrayConfig.DISK_CACHE_EXPIRE_FLOOR_SECONDS, raised.diskCache().expireSeconds(),
+        "旧默认 1800 秒必须被抬升到下限 1 天（否则条目活不过一次重启，命中率恒为 0）");
+    assertFalse(raised.floorAdjustments().isEmpty(), "抬升必须留下明细，供加载时一次性 WARN");
+    assertTrue(joinedFloors(raised).contains("proximity.frustum.fov=80.0"),
+        "明细必须点名被抬升的键：" + raised.floorAdjustments());
+    assertTrue(joinedFloors(raised).contains("proximity.frustum.min-distance=4.0"),
+        "明细必须列出全部被抬升的键：" + raised.floorAdjustments());
+    assertTrue(joinedFloors(raised).contains("disk-cache.expire-seconds=1800"),
+        "磁盘缓存过期时间被抬升也必须留痕：" + raised.floorAdjustments());
 
-    // 高于下限的值原样生效（下限只挡更窄的配置），且不产生明细
+    // 高于下限的值原样生效（下限只挡更短的配置），且不产生明细
     AntiXrayConfig kept = AntiXrayConfig.from(yaml("""
         proximity:
           frustum:
             fov: 120.0
             min-distance: 24.0
+        disk-cache:
+          expire-seconds: 1209600
         """));
     assertEquals(120.0D, kept.proximity().frustumFov(), 1.0E-9D, "高于下限的 fov 原样生效");
     assertEquals(24.0D, kept.proximity().frustumMinDistance(), 1.0E-9D, "高于下限的 min-distance 原样生效");
-    assertNull(kept.frustumFloorDetail(), "未抬升时不得产生明细（否则会误导性 WARN）");
+    assertEquals(1209600, kept.diskCache().expireSeconds(), "高于下限的过期时间原样生效");
+    assertTrue(kept.floorAdjustments().isEmpty(), "未抬升时不得产生明细（否则会误导性 WARN）");
 
     // 非法值：fov 的 0/-1/大于 360 一律回落默认（= 下限）；min-distance 负数按 0 处理后同样抬升到下限
     AntiXrayConfig invalid = AntiXrayConfig.from(yaml("""
@@ -103,6 +112,11 @@ class ConfigDefaultsTest {
         "fov 非法值回落默认（即下限）");
     assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_FLOOR,
         invalid.proximity().frustumMinDistance(), 1.0E-9D, "min-distance 负数按下限处理");
+  }
+
+  /** 把「被抬升的键明细」拼成一行，便于用 contains 断言具体键名。 */
+  private static String joinedFloors(AntiXrayConfig config) {
+    return String.join("、", config.floorAdjustments());
   }
 
   /**
@@ -405,7 +419,7 @@ class ConfigDefaultsTest {
     assertTrue(config.proximity().frustumEnabled(), "视锥剔除默认开启");
     assertEquals(AntiXrayConfig.FRUSTUM_FOV_FLOOR, config.proximity().frustumFov(), 1.0E-9D,
         "视锥竖直全角默认为安全下限 110°（客户端 FOV 上限；配窄会让玩家看得见的方块保持伪装）");
-    assertNull(config.frustumFloorDetail(), "默认值不触发安全下限抬升（不产生误导性 WARN）");
+    assertTrue(config.floorAdjustments().isEmpty(), "默认值不触发安全下限抬升（不产生误导性 WARN）");
     assertEquals(4, config.proximity().raycastSamples(),
         "候选点数默认 4（原生射线改造后语义为「每方块最多尝试的候选点数」，钳制 1..8）");
     assertTrue(config.proximity().batchRevealSends(),
@@ -415,7 +429,10 @@ class ConfigDefaultsTest {
     assertTrue(config.diskCache().enabled(), "磁盘缓存默认开启");
     assertEquals(20000, config.diskCache().maxEntries(), "条目总数上限默认 20000");
     assertEquals(16, config.diskCache().maxFileSizeMb(), "单区域文件上限默认 16 MB");
-    assertEquals(1800, config.diskCache().expireSeconds(), "条目过期默认 1800 秒（30 分钟）");
+    assertEquals(7 * 24 * 60 * 60, config.diskCache().expireSeconds(),
+        "条目过期默认 7 天（原 1800 秒：从写入时刻算起，配得比两次启动间隔还短 → 重启后条目全过期、"
+            + "命中率恒为 0；实机 70 分钟后重启命中 0／未命中 2096）。内容新鲜度由原始字节指纹判定，"
+            + "限制磁盘占用应调 max-entries / max-file-size-mb");
     assertEquals(8, config.diskCache().bucketCacheSize(),
         "bucket 缓存默认 8（原 2；真机命中率提升约 16~20 个百分点，依据见 antixray.yml 注释）");
     assertEquals(300, config.diskCache().idleCloseSeconds(), "句柄闲置关闭默认 300 秒");
