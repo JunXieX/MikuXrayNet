@@ -15,6 +15,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -97,6 +98,9 @@ public final class ZstdSupport {
   private static volatile Source source = Source.NONE;
   /** 最后一次失败原因（诊断用，只出现在日志里）。 */
   private static volatile String lastError = "";
+  /** 最近一次成功下载使用的分类器（空 = 全平台包）与体积，仅用于启动日志。 */
+  private static volatile String downloadedClassifier = "";
+  private static volatile long downloadedBytes;
 
   private ZstdSupport() {
   }
@@ -139,13 +143,51 @@ public final class ZstdSupport {
   }
 
   /**
+   * 平台 → zstd-jni 分类器映射表（键为「归一化平台|归一化架构」，例如 {@code win|amd64}）。
+   *
+   * <p><b>取值来源</b>：Maven Central 上 zstd-jni 1.5.7-6 / 1.5.7-15 实际发布的二进制分类器，
+   * 实测清单为：
+   * <pre>
+   * aix_ppc64, darwin_aarch64, darwin_x86_64, freebsd_amd64, freebsd_i386,
+   * linux_aarch64, linux_amd64, linux_arm, linux_i386, linux_loongarch64, linux_mips64,
+   * linux_ppc64, linux_ppc64le, linux_riscv64, linux_s390x, win_aarch64, win_amd64, win_x86
+   * </pre>
+   * （另有 {@code javadoc} / {@code sources} 两个非二进制分类器，以及不适用于本下载的 {@code cloud}。）
+   * <b>任何一个「猜出来」的名字都会 404 并白白回退到 6.2 MB 的全平台包</b>——例如 32 位 Linux
+   * 曾错拼成 {@code linux_x86}，真实分类器是 {@code linux_i386}。因此本表每个取值都必须在上面
+   * 这份实测清单内，并由 {@code ZstdSupportTest} 逐项断言（表驱动，防止再出现猜出来的分类器）。
+   *
+   * <p>特别注意 32 位架构在三家系统上的真实分类器<b>各不相同</b>：
+   * Linux → {@code linux_i386}、Windows → {@code win_x86}、FreeBSD → {@code freebsd_i386}。
+   */
+  private static final Map<String, String> PLATFORM_CLASSIFIERS = Map.ofEntries(
+      Map.entry("win|amd64", "win_amd64"),
+      Map.entry("win|aarch64", "win_aarch64"),
+      Map.entry("win|x86", "win_x86"),
+      Map.entry("macos|amd64", "darwin_x86_64"),
+      Map.entry("macos|aarch64", "darwin_aarch64"),
+      Map.entry("linux|amd64", "linux_amd64"),
+      Map.entry("linux|aarch64", "linux_aarch64"),
+      Map.entry("linux|arm", "linux_arm"),
+      Map.entry("linux|x86", "linux_i386"),
+      Map.entry("linux|ppc64", "linux_ppc64"),
+      Map.entry("linux|ppc64le", "linux_ppc64le"),
+      Map.entry("linux|s390x", "linux_s390x"),
+      Map.entry("linux|riscv64", "linux_riscv64"),
+      Map.entry("linux|mips64", "linux_mips64"),
+      Map.entry("linux|loongarch64", "linux_loongarch64"),
+      Map.entry("freebsd|amd64", "freebsd_amd64"),
+      Map.entry("freebsd|x86", "freebsd_i386"),
+      Map.entry("aix|ppc64", "aix_ppc64"));
+
+  /**
    * 当前平台的 zstd-jni 分类器（{@code linux_amd64} / {@code win_amd64} / {@code darwin_aarch64} …）。
    *
    * <p>zstd-jni 在 Maven Central 上同时发布**平台专用包**与**全平台包**；二者的类与 API 完全一致，
    * 但平台包只有约 0.4 MB，而全平台包要 6.2 MB（实测 1.5.7-15：linux_amd64 410604 字节 vs
    * 全平台 6451268 字节）。因此自动下载优先取平台包，取不到再退全平台包。
    *
-   * @return 分类器名；平台无法识别时返回 {@code null}（调用方退回全平台包）
+   * @return 分类器名；平台或架构无法识别时返回 {@code null}（调用方退回全平台包）
    */
   public static String platformClassifier() {
     return classifierFor(System.getProperty("os.name"), System.getProperty("os.arch"));
@@ -153,48 +195,101 @@ public final class ZstdSupport {
 
   /** 纯函数：由 {@code os.name} / {@code os.arch} 推导 zstd-jni 的分类器名（不可识别返回 null）。 */
   public static String classifierFor(String osName, String osArch) {
+    String platform = platformToken(osName);
+    if (platform.isEmpty()) {
+      return null;
+    }
+    return PLATFORM_CLASSIFIERS.get(platform + "|" + archToken(osArch));
+  }
+
+  /** 平台映射表（只读；仅供测试逐项核对「每个取值都来自实测清单」）。 */
+  static Map<String, String> platformTable() {
+    return PLATFORM_CLASSIFIERS;
+  }
+
+  /**
+   * {@code os.name} 归一化（只识别有分类器的平台；其余返回空串，调用方据此退回全平台包）。
+   * 归一化后的取值：{@code win} / {@code macos} / {@code linux} / {@code freebsd} / {@code aix}。
+   */
+  static String platformToken(String osName) {
     String os = osName == null ? "" : osName.toLowerCase(Locale.ROOT);
-    String arch = osArch == null ? "" : osArch.toLowerCase(Locale.ROOT);
-    String archToken = switch (arch) {
+    if (os.contains("win")) {
+      return "win";
+    }
+    if (os.contains("mac") || os.contains("darwin")) {
+      return "macos";
+    }
+    if (os.contains("linux")) {
+      return "linux";
+    }
+    if (os.contains("freebsd")) {
+      return "freebsd";
+    }
+    if (os.contains("aix")) {
+      return "aix";
+    }
+    return "";
+  }
+
+  /**
+   * {@code os.arch} 归一化：32 位 JVM 可能报 {@code x86} / {@code i386} / {@code i486} / {@code i586}
+   * / {@code i686}，64 位可能报 {@code amd64} / {@code x86_64}，ARM 可能报 {@code aarch64} /
+   * {@code arm64} / {@code arm}（Linux 上还常见 {@code armv7l} / {@code armhf}）。
+   * 其余取值（ppc64 / ppc64le / s390x / riscv64 / mips64 / loongarch64 …）原样返回。
+   */
+  static String archToken(String osArch) {
+    String arch = osArch == null ? "" : osArch.trim().toLowerCase(Locale.ROOT);
+    return switch (arch) {
       case "amd64", "x86_64" -> "amd64";
       case "aarch64", "arm64" -> "aarch64";
       case "x86", "i386", "i486", "i586", "i686" -> "x86";
       case "arm", "armv7l", "armhf" -> "arm";
       default -> arch;
     };
-    if (os.contains("win")) {
-      return switch (archToken) {
-        case "amd64" -> "win_amd64";
-        case "aarch64" -> "win_aarch64";
-        case "x86" -> "win_x86";
-        default -> null;
-      };
+  }
+
+  /** 平台展示名（仅用于启动日志，例：{@code windows} / {@code linux} / {@code macos}）。 */
+  static String platformLabel(String osName) {
+    String token = platformToken(osName);
+    if (token.equals("win")) {
+      return "windows";
     }
-    if (os.contains("mac") || os.contains("darwin")) {
-      return switch (archToken) {
-        case "amd64" -> "darwin_x86_64";
-        case "aarch64" -> "darwin_aarch64";
-        default -> null;
-      };
+    if (!token.isEmpty()) {
+      return token;
     }
-    if (os.contains("linux")) {
-      return switch (archToken) {
-        case "amd64", "aarch64", "arm", "x86", "ppc64", "ppc64le", "s390x", "riscv64",
-            "mips64", "loongarch64" -> "linux_" + archToken;
-        default -> null;
-      };
+    String os = osName == null ? "" : osName.trim().toLowerCase(Locale.ROOT);
+    return os.isEmpty() ? "未知" : os;
+  }
+
+  /**
+   * 启动日志前缀：一次性、中文地打印「检测到的平台」与「推导出的分类器」两件事，
+   * 让用户在服务器上一眼确认走对了（例如 Windows 服务器必须是 {@code win_amd64}）。
+   *
+   * <p>形如 {@code ZSTD 前置：平台 windows/amd64 → 分类器 win_amd64}；分类器不可识别时为
+   * {@code ZSTD 前置：平台 sunos/sparc → 分类器未识别，将尝试全平台包}。
+   */
+  static String detectionLine() {
+    String osName = System.getProperty("os.name");
+    String osArch = System.getProperty("os.arch");
+    String classifier = classifierFor(osName, osArch);
+    String arch = archToken(osArch);
+    String platform = platformLabel(osName) + "/" + (arch.isEmpty() ? "未知" : arch);
+    return "ZSTD 前置：平台 " + platform + " → "
+        + (classifier == null ? "分类器未识别，将尝试全平台包" : "分类器 " + classifier);
+  }
+
+  /** 「分类器 + 体积」的来源细节（例：{@code win_amd64，401 KB}；全平台包时写「全平台包」）。 */
+  private static String artifactDetail(String classifier, long bytes) {
+    String name = classifier == null || classifier.isBlank() ? "全平台包" : classifier;
+    return bytes > 0L ? name + "，" + bytes / 1024L + " KB" : name;
+  }
+
+  private static long sizeOf(Path path) {
+    try {
+      return Files.size(path);
+    } catch (Throwable throwable) {
+      return 0L;
     }
-    if (os.contains("freebsd")) {
-      return switch (archToken) {
-        case "amd64" -> "freebsd_amd64";
-        case "x86" -> "freebsd_i386";
-        default -> null;
-      };
-    }
-    if (os.contains("aix")) {
-      return "ppc64".equals(archToken) ? "aix_ppc64" : null;
-    }
-    return null;
   }
 
   /**
@@ -266,17 +361,23 @@ public final class ZstdSupport {
       int timeoutSeconds, Logger logger) {
     codec(); // ① 运行期已有（服务端自带）
     if (codec != null) {
-      logger.info("已检测到 ZSTD（来源：" + source.label() + "）");
+      logger.info(detectionLine() + "；来源=" + source.label());
       return;
     }
 
     // ② 本地已下载（上次启动下载留下的 jar；平台专用包与全平台包都认）
     if (libraryDir != null) {
-      for (Path candidate : libraryCandidates(libraryDir)) {
+      String classifier = platformClassifier();
+      List<Path> candidates = libraryCandidates(libraryDir);
+      for (int i = 0; i < candidates.size(); i++) {
+        Path candidate = candidates.get(i);
         Codec local = loadFromJar(candidate);
         if (local != null) {
           install(local, Source.LOCAL);
-          logger.info("已检测到 ZSTD（来源：" + source.label() + "）");
+          // 候选顺序固定为「平台包 → 全平台包」，故首个候选只在分类器可识别时才是平台包
+          String used = i == 0 && classifier != null ? classifier : null;
+          logger.info(detectionLine() + "；来源=" + source.label() + "（"
+              + artifactDetail(used, sizeOf(candidate)) + "）");
           return;
         }
       }
@@ -286,15 +387,17 @@ public final class ZstdSupport {
     if (autoDownload) {
       Codec downloaded = downloadCodec(libraryDir, downloadUrl, timeoutSeconds);
       if (downloaded != null) {
-        logger.info("已检测到 ZSTD（来源：" + source.label() + "）");
+        logger.info(detectionLine() + "；来源=" + source.label() + "（"
+            + artifactDetail(downloadedClassifier, downloadedBytes) + "）");
         return;
       }
-      logger.warning("未检测到 ZSTD 且自动下载失败，已回退内置压缩（磁盘缓存仍可用，压缩率略低）"
+      logger.warning(detectionLine() + "；自动下载失败，已回退内置压缩（磁盘缓存仍可用，压缩率略低）"
           + (lastError.isEmpty() ? "" : "（原因：" + lastError + "）"));
       return;
     }
 
-    logger.warning("未检测到 ZSTD（自动下载已关闭），已回退内置压缩（磁盘缓存仍可用，压缩率略低）");
+    logger.warning(detectionLine()
+        + "；未启用自动下载，已回退内置压缩（磁盘缓存仍可用，压缩率略低）");
   }
 
   // ------------------------------------------------------------------ 探测与加载
@@ -396,13 +499,9 @@ public final class ZstdSupport {
     }
     long deadlineNanos =
         System.nanoTime() + TimeUnit.SECONDS.toNanos(Math.max(1, timeoutSeconds));
-    String classifier = platformClassifier();
-    List<String> attempts = new ArrayList<>(2);
-    if (classifier != null) {
-      attempts.add(classifier);
-    }
-    attempts.add(""); // 全平台包兜底
-    for (String attempt : attempts) {
+    downloadedClassifier = "";
+    downloadedBytes = 0L;
+    for (String attempt : downloadClassifiers(platformClassifier())) {
       long remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
       if (remainingMillis <= 0L) {
         lastError = "下载总等待已用尽（" + Math.max(1, timeoutSeconds) + "s）";
@@ -415,6 +514,22 @@ public final class ZstdSupport {
       }
     }
     return null;
+  }
+
+  /**
+   * 下载候选顺序：平台专用包在前、全平台包在后（空串表示全平台包）；
+   * 分类器不可识别时只有全平台包一个候选。
+   *
+   * <p>该顺序必须与 {@link #libraryCandidates} 的顺序一致，否则「本次下载平台包、下次启动却只找全平台包」
+   * 会导致每次启动都重下。
+   */
+  static List<String> downloadClassifiers(String classifier) {
+    List<String> attempts = new ArrayList<>(2);
+    if (classifier != null && !classifier.isBlank()) {
+      attempts.add(classifier);
+    }
+    attempts.add(""); // 全平台包兜底
+    return attempts;
   }
 
   /** 单次下载尝试（一个分类器）：下载 → 非空校验 → 原子替换 → 可加载校验。 */
@@ -437,6 +552,9 @@ public final class ZstdSupport {
         Files.deleteIfExists(target);
         return null;
       }
+      // 记下分类器与体积，供启动日志打印「来源=新下载（win_amd64，401 KB）」
+      downloadedClassifier = classifier == null ? "" : classifier;
+      downloadedBytes = sizeOf(target);
       return found;
     } catch (Throwable throwable) {
       lastError = throwable.toString();

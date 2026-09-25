@@ -121,20 +121,25 @@ public final class MikuWorkPool implements AutoCloseable {
    * 否则 shutdownNow 丢弃的排队任务会让对应封包永远无人放行（客户端卡加载界面）。
    *
    * <p>放行顺序上先 {@code shutdownNow} 再兜底：队列一旦排空就不会再有排队任务被启动，
-   * 而正在写入中的任务（{@link RewriteTask#isWriting()}）由其工作线程自行放行，
-   * 兜底跳过它们，避免「包已发出却仍在改写」的写回竞争。
-   * {@code signalOnce} 幂等（CAS 保证恰好一次）：已被看门狗放行或已完成的任务不受影响。
+   * 而正在写入中的任务由其工作线程自行放行，兜底不得碰它们，避免「包已发出却仍在改写」的写回竞争。
+   *
+   * <p>这里用 {@link RewriteTask#releaseOnTimeout()} 的<b>原子 CAS</b>（写入权 OPEN → DONE）而不是
+   * 「先看 {@code isWriting()} 再放行」：后者是 check-then-act，在「工作线程刚把任务从队列取出、
+   * 还没调 {@code tryBeginWrite()}」的窗口里会误判为「未开始写」并抢先放行，随后工作线程的
+   * {@code tryBeginWrite()} 仍会成功 → 出现「包已发出却仍在改写」的数据竞争。CAS 让「取得写入权」
+   * 与「兜底放行」互斥：本方法抢到就放行（工作线程随后必然放弃改写），抢不到说明工作线程已在写
+   * （或已由看门狗放行/已完成），一律交由工作线程自行放行。
+   *
+   * <p>{@code signalOnce} 幂等（CAS 保证恰好一次）：已被看门狗放行或已完成的任务不受影响。
    */
   @Override
   public void close() {
     this.executor.shutdownNow();
     for (RewriteTask task : pending) {
-      if (!task.isWriting()) {
-        try {
-          task.signalOnce();
-        } catch (Throwable ignored) {
-          // 单个任务的放行动作异常（例如玩家已掉线导致回调失败）不得中断其余任务的兜底放行
-        }
+      try {
+        task.releaseOnTimeout();
+      } catch (Throwable ignored) {
+        // 单个任务的放行动作异常（例如玩家已掉线导致回调失败）不得中断其余任务的兜底放行
       }
     }
     pending.clear();

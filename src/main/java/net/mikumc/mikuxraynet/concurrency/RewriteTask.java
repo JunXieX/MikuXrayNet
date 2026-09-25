@@ -115,9 +115,14 @@ public final class RewriteTask {
   }
 
   /**
-   * 看门狗超时兜底：仅在写入尚未开始时放行；写入中/已完成的任务由工作线程负责放行。
+   * 「写入开始前」的原子兜底放行：仅在写入尚未开始时抢到并放行；写入中/已完成的任务由工作线程负责放行。
    *
-   * @return {@code true} 表示本次确实由看门狗放行了原包（供超时统计使用）
+   * <p>两个调用方共用同一道闸（都是「写入还没开始就必须放行，已经开始就不要抢」）：
+   * {@code MikuWorkPool} 的看门狗（超时）与 {@code close()} 的排空兜底。用 CAS 而不是
+   * 「先读状态再放行」，是为了让兜底放行与 {@link #tryBeginWrite()} 互斥——抢到者放行原包，
+   * 没抢到者交给正在写入的工作线程，绝不会出现「包已发出却仍在改写」。
+   *
+   * @return {@code true} 表示本次确实由兜底放行了原包（供超时统计使用）
    */
   public boolean releaseOnTimeout() {
     if (gate.compareAndSet(GATE_OPEN, GATE_DONE)) {
@@ -125,15 +130,5 @@ public final class RewriteTask {
       return true;
     }
     return false;
-  }
-
-  /**
-   * 是否正处于「写入中」。
-   *
-   * <p>仅供 {@link MikuWorkPool#close()} 的排空兜底使用：正在写入的任务由工作线程自行放行，
-   * 兜底绝不能对它放行——否则封包在改写完成前就被发出，工作线程随后写回会与序列化竞争。
-   */
-  boolean isWriting() {
-    return gate.get() == GATE_WRITING;
   }
 }

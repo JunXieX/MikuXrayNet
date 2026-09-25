@@ -13,6 +13,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -144,17 +146,100 @@ class ZstdSupportTest {
   /** 平台分类器映射：名称必须与 Maven Central 上实际发布的分类器一致（否则下载必 404）。 */
   @Test
   void classifierMatchesPublishedPlatformNames() {
-    assertEquals("linux_amd64", ZstdSupport.classifierFor("Linux", "amd64"));
-    assertEquals("linux_amd64", ZstdSupport.classifierFor("Linux", "x86_64"));
-    assertEquals("linux_aarch64", ZstdSupport.classifierFor("Linux", "aarch64"));
-    assertEquals("linux_aarch64", ZstdSupport.classifierFor("Linux", "arm64"));
-    assertEquals("linux_riscv64", ZstdSupport.classifierFor("Linux", "riscv64"));
-    assertEquals("win_amd64", ZstdSupport.classifierFor("Windows 11", "amd64"));
-    assertEquals("darwin_x86_64", ZstdSupport.classifierFor("Mac OS X", "x86_64"));
-    assertEquals("darwin_aarch64", ZstdSupport.classifierFor("Mac OS X", "aarch64"));
-    assertEquals("freebsd_amd64", ZstdSupport.classifierFor("FreeBSD", "amd64"));
-    assertNull(ZstdSupport.classifierFor("SunOS", "sparc"), "无法识别的平台必须返回 null（退回全平台包）");
-    assertNull(ZstdSupport.classifierFor(null, null), "系统属性缺失也不能抛异常");
+    String[][] cases = {
+        // Windows：64 位别名 / Windows ARM / 32 位别名（真实分类器是 win_x86）
+        {"Windows Server 2022", "amd64", "win_amd64"},
+        {"Windows 11", "x86_64", "win_amd64"},
+        {"Windows 10", "aarch64", "win_aarch64"},
+        {"Windows 10", "arm64", "win_aarch64"},
+        {"Windows 10", "x86", "win_x86"},
+        {"Windows 10", "i386", "win_x86"},
+        {"Windows 10", "i686", "win_x86"},
+        // macOS（含 Apple Silicon）
+        {"Mac OS X", "x86_64", "darwin_x86_64"},
+        {"Mac OS X", "amd64", "darwin_x86_64"},
+        {"Mac OS X", "aarch64", "darwin_aarch64"},
+        {"Mac OS X", "arm64", "darwin_aarch64"},
+        // Linux：真实分类器里没有 linux_x86，32 位一律是 linux_i386
+        {"Linux", "amd64", "linux_amd64"},
+        {"Linux", "x86_64", "linux_amd64"},
+        {"Linux", "aarch64", "linux_aarch64"},
+        {"Linux", "arm64", "linux_aarch64"},
+        {"Linux", "arm", "linux_arm"},
+        {"Linux", "armv7l", "linux_arm"},
+        {"Linux", "x86", "linux_i386"},
+        {"Linux", "i386", "linux_i386"},
+        {"Linux", "i486", "linux_i386"},
+        {"Linux", "i586", "linux_i386"},
+        {"Linux", "i686", "linux_i386"},
+        {"Linux", "ppc64", "linux_ppc64"},
+        {"Linux", "ppc64le", "linux_ppc64le"},
+        {"Linux", "s390x", "linux_s390x"},
+        {"Linux", "riscv64", "linux_riscv64"},
+        {"Linux", "mips64", "linux_mips64"},
+        {"Linux", "loongarch64", "linux_loongarch64"},
+        // FreeBSD（含 i386）
+        {"FreeBSD", "amd64", "freebsd_amd64"},
+        {"FreeBSD", "x86_64", "freebsd_amd64"},
+        {"FreeBSD", "x86", "freebsd_i386"},
+        {"FreeBSD", "i386", "freebsd_i386"},
+        // AIX
+        {"AIX", "ppc64", "aix_ppc64"},
+        // 不可识别的平台 / 架构 / 缺失属性 → null（调用方退回全平台包）
+        {"SunOS", "sparc", null},
+        {"SunOS", "amd64", null},
+        {"AIX", "x86_64", null},
+        {"Linux", "sparc64", null},
+        {"Linux", "unknown", null},
+        {null, null, null}
+    };
+    for (String[] entry : cases) {
+      assertEquals(entry[2], ZstdSupport.classifierFor(entry[0], entry[1]),
+          "平台 " + entry[0] + "/" + entry[1] + " 的分类器必须与实测清单一致（猜错会 404）");
+    }
+  }
+
+  /**
+   * Maven Central 上 zstd-jni 1.5.7-6 / 1.5.7-15 <b>实测</b>的二进制分类器全清单。
+   * 映射表里任何一个不在这份清单内的取值都会 404（然后白白回退 6.2 MB 全平台包）。
+   */
+  private static final Set<String> PUBLISHED_CLASSIFIERS = Set.of(
+      "aix_ppc64", "darwin_aarch64", "darwin_x86_64", "freebsd_amd64", "freebsd_i386",
+      "linux_aarch64", "linux_amd64", "linux_arm", "linux_i386", "linux_loongarch64",
+      "linux_mips64", "linux_ppc64", "linux_ppc64le", "linux_riscv64", "linux_s390x",
+      "win_aarch64", "win_amd64", "win_x86");
+
+  /** 映射表的每个取值都必须来自实测清单（防止再出现「凭记忆拼出来的分类器」）。 */
+  @Test
+  void everyMappedClassifierIsPublishedOnMavenCentral() {
+    assertEquals(18, ZstdSupport.platformTable().size(), "映射表应覆盖 18 个可用平台/架构组合");
+    for (Map.Entry<String, String> entry : ZstdSupport.platformTable().entrySet()) {
+      assertTrue(PUBLISHED_CLASSIFIERS.contains(entry.getValue()),
+          entry.getKey() + " 推导出的 " + entry.getValue() + " 不在 Maven Central 实测清单里（会 404）");
+    }
+    assertTrue(PUBLISHED_CLASSIFIERS.contains("linux_i386"),
+        "32 位 Linux 的真实分类器是 linux_i386");
+    assertFalse(PUBLISHED_CLASSIFIERS.contains("linux_x86"), "linux_x86 并不存在（曾经的拼写错误）");
+  }
+
+  /** 下载候选顺序：平台专用包在前、全平台包在后；文件名 / URL 必须带正确的分类器。 */
+  @Test
+  void downloadTriesPlatformJarBeforeAllPlatformJar() {
+    assertEquals(List.of("win_amd64", ""), ZstdSupport.downloadClassifiers("win_amd64"),
+        "Windows 服务器必须先试 win_amd64 平台包，失败再退全平台包");
+    assertEquals(List.of("linux_i386", ""), ZstdSupport.downloadClassifiers("linux_i386"));
+    assertEquals(List.of(""), ZstdSupport.downloadClassifiers(null),
+        "分类器不可识别时只有全平台包一个候选");
+    assertEquals(List.of(""), ZstdSupport.downloadClassifiers("   "), "空白分类器按不可识别处理");
+
+    assertEquals("zstd-jni-1.5.7-15-win_amd64.jar",
+        ZstdSupport.jarFileName(ZstdSupport.ARTIFACT, ZstdSupport.VERSION, "win_amd64"));
+    assertEquals("zstd-jni-1.5.7-15-aix_ppc64.jar",
+        ZstdSupport.jarFileName(ZstdSupport.ARTIFACT, ZstdSupport.VERSION, "aix_ppc64"));
+    assertEquals("https://repo1.maven.org/maven2/com/github/luben/zstd-jni/1.5.7-15/"
+            + "zstd-jni-1.5.7-15-win_amd64.jar",
+        ZstdSupport.downloadUrl(null, ZstdSupport.GROUP, ZstdSupport.ARTIFACT,
+            ZstdSupport.VERSION, "win_amd64"));
   }
 
   /** 平台专用包：URL 与文件名都要带上分类器；lib 目录候选顺序必须是「平台包 → 全平台包」。 */
@@ -213,7 +298,10 @@ class ZstdSupportTest {
 
     assertTrue(ZstdSupport.available(), "本进程类路径有 zstd-jni，必须探测成功");
     assertEquals(ZstdSupport.Source.SERVER, ZstdSupport.source(), "来源必须是「服务端自带」");
-    assertTrue(logger.contains("已检测到 ZSTD（来源：服务端自带）"), "必须打印中文检测日志：" + logger.lines);
+    // 启动日志必须一次性说清三件事：检测到的平台、推导出的分类器、最终来源
+    assertTrue(logger.contains("ZSTD 前置：平台 "), "必须打印检测到的平台：" + logger.lines);
+    assertTrue(logger.contains("分类器 "), "必须打印推导出的分类器：" + logger.lines);
+    assertTrue(logger.contains("；来源=服务端自带"), "必须打印最终来源：" + logger.lines);
     assertFalse(Files.exists(libDir.resolve(
         ZstdSupport.jarFileName(ZstdSupport.ARTIFACT, ZstdSupport.VERSION))),
         "①命中后不得发起下载（lib 目录必须为空）");
