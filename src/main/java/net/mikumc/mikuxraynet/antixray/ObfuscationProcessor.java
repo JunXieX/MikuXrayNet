@@ -51,7 +51,8 @@ import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
  *
  * <p><b>关键优化</b>：
  * <ul>
- *   <li>全空气 section 直接跳过；</li>
+ *   <li>section 级预筛：全空气（封包头 blockCount==0）与<b>调色板里没有目标方块</b>的 section 整段跳过，
+ *       不做 4096 次逐格查表（见 {@link ChunkSection#paletteCouldContain}）；</li>
  *   <li>非目标方块只做一次位图查询即跳过，不做任何邻居判定；</li>
  *   <li>整块区块无任何改动时直接返回原字节数组，完全不触发重编码；</li>
  *   <li>只有真正被改动的 section 才重编码（未改动的 section 由 codec 原样搬运原始字节）；</li>
@@ -557,12 +558,17 @@ public final class ObfuscationProcessor {
     try {
       boolean rangeLimited = profile.minY != Integer.MIN_VALUE || profile.maxY != Integer.MAX_VALUE;
       boolean bandDriven = profile.bandMinY.length > 0;
+      // section 级预筛（封包侧判空）：全空气（封包头 blockCount==0）与本段调色板里没有目标方块的
+      // section 整段跳过，省下它们各 4096 次逐格查表（见 ChunkSection#paletteCouldContain）。
+      // 判定一次性算在循环外：热循环里只读一个布尔数组，不引入任何接口调用——否则逐格扫描那段
+      // 会有可观测的变慢（实测「24 个 section 全含目标」的形态从 0.34ms 涨到 0.76ms）。
+      boolean[] sectionCandidates = selectCandidateSections(chunk, profile);
 
       for (int sectionIndex = 0; sectionIndex < chunk.getSectionCount(); sectionIndex++) {
-        ChunkSection section = chunk.getSection(sectionIndex);
-        if (section == null || section.isEmpty()) {
+        if (!sectionCandidates[sectionIndex]) {
           continue;
         }
+        ChunkSection section = chunk.getSection(sectionIndex);
 
         int baseY = sectionIndex << 4;
         int layerY = Integer.MIN_VALUE;
@@ -675,6 +681,29 @@ public final class ObfuscationProcessor {
     } finally {
       chunk.close();
     }
+  }
+
+  /**
+   * section 级预筛（封包侧判空）：标出「这个 section 可能需要处理」的位置。
+   *
+   * <p>三个条件都成立才算候选：section 存在（未在缓冲区内省略）、非全空气（封包头
+   * {@code blockCount == 0}）、且本段调色板里存在目标方块状态（{@link ChunkSection#paletteCouldContain}）。
+   * 前两条是原有的短路，第三条把「整段没有目标方块」的 section 一并跳过——那些段逐格扫 4096 次也不会命中。
+   *
+   * <p>预筛刻意放在逐格循环<b>之外</b>一次性完成、循环内只读布尔数组：在热循环头部引入接口调用
+   * （{@code profile.targets::get}）会拖累逐格扫描的优化程度，实测让「每段都含目标」的形态从
+   * 0.34 ms/区块 涨到 0.76 ms/区块（输出字节与替换数完全一致，属纯粹的编译质量退化）。
+   */
+  private static boolean[] selectCandidateSections(Chunk chunk, WorldProfile profile) {
+    int sectionCount = chunk.getSectionCount();
+    boolean[] candidates = new boolean[sectionCount];
+    for (int sectionIndex = 0; sectionIndex < sectionCount; sectionIndex++) {
+      ChunkSection section = chunk.getSection(sectionIndex);
+      candidates[sectionIndex] = section != null
+          && !section.isEmpty()
+          && section.paletteCouldContain(profile.targets::get);
+    }
+    return candidates;
   }
 
   /**

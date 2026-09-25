@@ -49,6 +49,12 @@ class ProductionPathBenchmarkTest {
   private static final int COLUMN_VOLUME = BenchFixtures.COLUMN_VOLUME;
 
   private static final int WARMUP_ROUNDS = 10;
+  /**
+   * 测量前的「跨形态轮转预热」轮数：单形态连续热身时，先测的形态会替后测的形态付 JIT 成本，
+   * 于是任何让先测形态变快的改动都会让后测形态看起来变慢（实测同一份代码仅调换顺序，「洞穴」
+   * 就在 0.34ms 与 0.85ms 之间跳）。轮转预热让各形态拿到的总执行量一致，前后对比才有意义。
+   */
+  private static final int GLOBAL_WARMUP_ROUNDS = 20;
   private static final int MEASURE_ROUNDS = 60;
   private static final int MIN_MEASURE_ROUNDS = 5;
   private static final long TIME_BUDGET_NANOS = 8_000_000_000L;
@@ -98,6 +104,17 @@ class ProductionPathBenchmarkTest {
     int rounds = chooseRounds(estimate, shapes.size());
 
     // 3) 逐形态测量
+    //    先在**所有形态之间轮转预热**，再逐形态测量：单形态连续热身时，先测的形态会替后测的形态
+    //    付 JIT 成本，于是「让先测形态变快」的任何改动都会让后测形态看起来变慢——实测同一份代码
+    //    仅调换形态顺序，「洞穴」的中位耗时就在 0.34ms 与 0.85ms 之间跳（两种编译状态双稳）。
+    //    轮转预热把这块外部性抹平：无论形态顺序如何、某个形态自身是快是慢，各形态拿到的总执行量
+    //    一致，前后对比才有意义。
+    for (int i = 0; i < GLOBAL_WARMUP_ROUNDS; i++) {
+      for (BenchFixtures.Fixture shape : shapes) {
+        processor.rewrite(shape.bytes(), SECTION_COUNT, SEED, null);
+      }
+    }
+
     List<PipelineRow> rows = new ArrayList<>();
     for (BenchFixtures.Fixture shape : shapes) {
       byte[] pristine = shape.bytes().clone();
@@ -402,8 +419,12 @@ class ProductionPathBenchmarkTest {
     report.append("- 配置口径（与 antixray.yml 默认一致）：隐藏集合 = 6 种矿；伪装权重 stone:10 / deepslate:8；"
         + "层状伪装关闭；邻块缺失策略 hide\n");
     report.append("- 调色板重排取 `PaletteOptions.DISABLED`，与 `bandwidth.yml: palette.reorder` 的新默认值 false 一致\n");
-    report.append("- 每形态预热 ").append(WARMUP_ROUNDS).append(" 轮、测量 ").append(rounds)
+    report.append("- 先在所有形态之间**轮转预热 ").append(GLOBAL_WARMUP_ROUNDS)
+        .append(" 轮**，再逐形态预热 ").append(WARMUP_ROUNDS).append(" 轮、测量 ").append(rounds)
         .append(" 轮；耗时取中位数；分配量为每轮 `getThreadAllocatedBytes` 差值\n");
+    report.append("- 为什么要跨形态轮转预热：单形态连续热身时，先测形态会替后测形态付 JIT 成本，"
+        + "实测**同一份代码**仅调换形态顺序，「洞穴」的中位耗时就在 0.34ms 与 0.85ms 之间跳；"
+        + "轮转预热抹平这块外部性，使逐形态耗时可用于前后对比\n");
     report.append("- 本基准自身耗时 ").append(elapsedNanos / 1_000_000L).append(" ms\n\n");
 
     report.append("> **桩注册表说明**：`StubRegistry` 只构造基准所需的十余个状态"

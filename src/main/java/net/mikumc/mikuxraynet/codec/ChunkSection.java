@@ -2,6 +2,7 @@
 package net.mikumc.mikuxraynet.codec;
 
 import java.util.Arrays;
+import java.util.function.IntPredicate;
 import io.netty.buffer.ByteBuf;
 
 /**
@@ -131,6 +132,29 @@ public class ChunkSection {
 
   public boolean isEmpty() {
     return this.blockCount == 0;
+  }
+
+  /**
+   * 调色板级预筛：本 section 的<b>调色板条目</b>里是否存在满足 {@code test} 的方块状态。
+   *
+   * <p>只看调色板（O(条目数)），不逐格读 4096 次。返回 {@code false} 可安全整段跳过：方块的本地 id
+   * 只能取自调色板，条目里一个都没有 ⇒ 整段必然不含；返回 {@code true} 只是「可能有」——间接调色板
+   * 可能留有数据未引用的条目。这类查询一律不会把「其实含有」误判成 {@code false}。
+   *
+   * <p><b>直接调色板（{@code bitsPerBlock > 8}）恒返回 {@code true}</b>：它没有条目表（本地 id 即全局
+   * 状态 id），无法在不扫描数据的前提下证明「不含」，因此保守不跳过，语义与不开预筛完全一致。
+   */
+  public boolean paletteCouldContain(IntPredicate test) {
+    int entries = this.palette.size();
+    if (entries == 0) {
+      return true;
+    }
+    for (int id = 0; id < entries; id++) {
+      if (test.test(this.palette.valueFor(id))) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public void write(ByteBuf buffer) {

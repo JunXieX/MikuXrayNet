@@ -15,6 +15,7 @@ import net.mikumc.mikuxraynet.codec.Chunk;
 import net.mikumc.mikuxraynet.codec.ChunkCodec;
 import net.mikumc.mikuxraynet.codec.ChunkVersionFlags;
 import net.mikumc.mikuxraynet.codec.RegistryAccessor;
+import net.mikumc.mikuxraynet.codec.TestChunkBuilder;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import org.junit.jupiter.api.Test;
 
@@ -279,6 +280,42 @@ class ObfuscationProcessorTest {
         "逐维度一致：各维度档案都是 all");
     assertFalse(inactiveProcessor().needsNeighbors(null, AntiXrayConfig.Dimension.NORMAL),
         "未生效档案（没有隐藏方块）直接跳过改写，同样不需要邻块快照");
+  }
+
+  /**
+   * 调色板级预筛不能漏判：用<b>间接调色板</b>构造「section 0 = 纯石头（无目标）+ section 1 = 含钻石矿」。
+   *
+   * <p>本类其余测试都用直接调色板（预筛在那种情况下恒不跳过），因此这一条专门钉住预筛启用后的判定：
+   * 无目标的 section 整段跳过、含目标的 section 照常替换，且只替换该矿。
+   */
+  @Test
+  void indirectPalettePreFilterDoesNotMissTargets() {
+    int[] stoneIndices = new int[4096]; // 全 0 = 石头
+    int[] oreIndices = new int[4096];
+    oreIndices[index(8, 8, 8)] = 1; // 一个钻石矿
+    byte[] source = new TestChunkBuilder(MODERN)
+        .indirectSection(4, 4096, 0, new int[] {STONE}, stoneIndices, 0, new int[] {1})
+        .indirectSection(4, 4096, 0, new int[] {STONE, DIAMOND_ORE}, oreIndices, 0, new int[] {1})
+        .build();
+
+    ObfuscationProcessor.Result result = processor().rewrite(source, 2, 42L);
+
+    assertTrue(result.changed(), "含矿的 section 必须被改写");
+    assertArrayEquals(new int[] {index(8, 8, 8) + (16 << 8)}, result.obfuscatedPositions(),
+        "只该替换第二个 section 里那个矿（第一个 section 调色板无目标，整段预筛跳过）");
+  }
+
+  /** 整块区块都没有目标方块（间接调色板、预筛整段跳过）→ 直接复用原字节并报告无改动。 */
+  @Test
+  void targetFreeSectionsAreSkippedWithoutChangingTheChunk() {
+    byte[] source = new TestChunkBuilder(MODERN)
+        .indirectSection(4, 4096, 0, new int[] {STONE}, new int[4096], 0, new int[] {1})
+        .build();
+
+    ObfuscationProcessor.Result result = processor().rewrite(source, 1, 42L);
+
+    assertFalse(result.changed(), "调色板里没有目标方块的 section 整段跳过，区块不应有改动");
+    assertSame(source, result.data(), "无改动时直接复用原字节数组");
   }
 
   private static int[] filled(int state) {
