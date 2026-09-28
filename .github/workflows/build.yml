@@ -1,0 +1,74 @@
+name: Build
+
+on:
+  push:
+    branches: [ "**" ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Compile with JDK 25
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Build and test
+        run: mvn -B -ntp verify
+
+      - name: Publish benchmark report
+        if: always()
+        run: |
+          if [ -f target/benchmark-report.md ]; then
+            cat target/benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "未生成 target/benchmark-report.md（离线基准未运行到报告步骤）" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-report
+          path: target/benchmark-report.md
+          if-no-files-found: ignore
+
+      - name: Upload jar artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mikuxraynet-jar
+          path: target/MikuXrayNet-*.jar
+          if-no-files-found: error
+
+      - name: Resolve release info
+        if: startsWith(github.ref, 'refs/tags/')
+        id: rel
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          echo "title=MikuXrayNet ${VER}" >> "$GITHUB_OUTPUT"
+          # 版本规则（大版本.正式版.测试版）：第三位 > 0 视为测试版（预发布），= 0 为正式版
+          PATCH="${VER##*.}"
+          case "$PATCH" in
+            0) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ steps.rel.outputs.title }}
+          files: target/MikuXrayNet-*.jar
+          prerelease: ${{ steps.rel.outputs.prerelease }}
+          generate_release_notes: true

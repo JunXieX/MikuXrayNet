@@ -1,0 +1,68 @@
+
+package net.mikumc.mikuxraynet.codec;
+
+import io.netty.buffer.ByteBuf;
+
+/**
+ * bitsPerBlock=0 的单值调色板：整个 section 只有一种方块状态，无位打包数据。
+ *
+ * <p>关键约束：只能容纳一个值，出现第二种方块状态时通过 {@link ChunkSection#grow(int, int)} 升级为间接调色板；
+ * 未初始化（值为 -1）时读取或写出都会抛 {@link IllegalStateException}。
+ */
+public class SingleValuePalette implements Palette {
+
+  private final ChunkSection chunkSection;
+
+  private int value = -1;
+
+  public SingleValuePalette(ChunkSection chunkSection, int value) {
+    this.chunkSection = chunkSection;
+    this.value = value;
+  }
+
+  @Override
+  public int idFor(int value) {
+    if (this.value != -1 && value != this.value) {
+      return this.chunkSection.grow(1, value);
+    } else {
+      this.value = value;
+      return 0;
+    }
+  }
+
+  @Override
+  public int valueFor(int id) {
+    if (this.value == -1) {
+      throw new IllegalStateException("value isn't initialized");
+    }
+    if (id != 0) {
+      // 单值调色板只有 id=0 一个条目：id≠0 说明上游索引越界，而非「未初始化」
+      throw new IndexOutOfBoundsException("single-value palette only has id 0, got " + id);
+    }
+    return this.value;
+  }
+
+  @Override
+  public void read(ByteBuf buffer) {
+    this.value = ByteBufUtil.readVarInt(buffer);
+  }
+
+  @Override
+  public void write(ByteBuf buffer) {
+    if (this.value == -1) {
+      throw new IllegalStateException("value isn't initialized");
+    } else {
+      ByteBufUtil.writeVarInt(buffer, this.value);
+    }
+  }
+
+  @Override
+  public int size() {
+    return this.value == -1 ? 0 : 1;
+  }
+
+  @Override
+  public boolean contains(int value) {
+    return this.value == value;
+  }
+}
