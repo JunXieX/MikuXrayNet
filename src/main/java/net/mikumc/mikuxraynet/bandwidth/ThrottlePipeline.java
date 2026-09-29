@@ -24,7 +24,8 @@ import org.bukkit.plugin.Plugin;
  * </ul>
  * 任一模块的 {@code enabled=false} 都意味着它<b>完全不注册</b>（不建监听器、不起任务、不产生任何开销），
  * 而不是「注册了但不生效」。不具备 ProtocolLib 时：变更合并在 {@link #start()} 里被显式停用，
- * 零位移取消与 AFK 丢包则由 {@link #register} 捕获构造期异常兜底停用，其余模块仍可用。
+ * 零位移取消与 AFK 丢包则由 {@link #register} 捕获构造/启动期异常兜底停用（启动失败会先对该实例
+ * 调用 {@code stop()} 撤销已注册的监听与已调度的任务），其余模块仍可用。
  */
 public final class ThrottlePipeline {
 
@@ -44,7 +45,7 @@ public final class ThrottlePipeline {
   /**
    * 依配置推导各子模块的注册决策：总开关或模块 {@code enabled} 关闭（以及其行为开关关闭）时，
    * 对应模块<b>不会注册</b>，因此不产生任何开销。依赖可用性（ProtocolLib）不在此判定：由
- * {@link #start()} 对变更合并显式停用，零位移取消 / AFK 则靠 {@link #register} 捕获构造异常兜底停用。
+   * {@link #start()} 对变更合并显式停用，零位移取消 / AFK 则靠 {@link #register} 捕获构造/启动期异常兜底停用。
    */
   public static ModulePlan plan(BandwidthConfig config) {
     boolean master = config.enabled();
@@ -103,12 +104,9 @@ public final class ThrottlePipeline {
     ModulePlan plan = plan(config);
 
     if (plan.entityPackets()) {
-      entityPacketFilter = register(() -> {
-        EntityPacketFilter module = new EntityPacketFilter(plugin, manager,
-            config.entityPackets(), stats);
-        module.start();
-        return module;
-      });
+      entityPacketFilter = register(
+          () -> new EntityPacketFilter(plugin, manager, config.entityPackets(), stats),
+          EntityPacketFilter::start, EntityPacketFilter::stop);
     } else {
       logDisabled("零位移实体包取消", config.entityPackets().enabled()
           ? "entity-packets.skip-zero-movement" : "entity-packets.enabled");
@@ -117,42 +115,34 @@ public final class ThrottlePipeline {
       if (manager == null || asynchronous == null) {
         plugin.getLogger().warning("方块变更合并需要 ProtocolLib，已停用");
       } else {
-        blockChangeMerger = register(() -> {
-          BlockChangeMerger module = new BlockChangeMerger(plugin, manager, asynchronous,
-              config.blockChanges(), stats);
-          module.start();
-          return module;
-        });
+        blockChangeMerger = register(
+            () -> new BlockChangeMerger(plugin, manager, asynchronous, config.blockChanges(),
+                stats),
+            BlockChangeMerger::start, BlockChangeMerger::stop);
       }
     } else {
       logDisabled("方块变更合并", config.blockChanges().enabled()
           ? "block-changes.merge" : "block-changes.enabled");
     }
     if (plan.entityCulling()) {
-      entityCuller = register(() -> {
-        EntityCuller module = new EntityCuller(plugin, config.entityCulling(), stats);
-        module.start();
-        return module;
-      });
+      entityCuller = register(
+          () -> new EntityCuller(plugin, config.entityCulling(), stats),
+          EntityCuller::start, EntityCuller::stop);
     } else {
       logDisabled("实体射线剔除", config.entityCulling().enabled()
           ? "entity-culling.raycast" : "entity-culling.enabled");
     }
     if (plan.afk()) {
-      afkTracker = register(() -> {
-        AfkTracker module = new AfkTracker(plugin, manager, config.afk(), stats);
-        module.start();
-        return module;
-      });
+      afkTracker = register(
+          () -> new AfkTracker(plugin, manager, config.afk(), stats),
+          AfkTracker::start, AfkTracker::stop);
     } else {
       logDisabled("AFK 降级", "afk.enabled");
     }
     if (plan.latency()) {
-      latencyMonitor = register(() -> {
-        LatencyMonitor module = new LatencyMonitor(plugin, config.latency(), stats);
-        module.start();
-        return module;
-      });
+      latencyMonitor = register(
+          () -> new LatencyMonitor(plugin, config.latency(), stats),
+          LatencyMonitor::start, LatencyMonitor::stop);
     } else {
       logDisabled("高延迟降视距", "latency.enabled");
     }
@@ -195,10 +185,30 @@ public final class ThrottlePipeline {
     return culler == null ? 0 : culler.hiddenCount();
   }
 
-  private <T> T register(ModuleFactory<T> factory) {
+  /**
+   * 注册单个子模块：{@code factory} 构造 → {@code starter} 启动。
+   *
+   * <p><b>启动失败必须先清理</b>：各模块的 {@code start()} 都是「先注册监听/调度、后可能抛」
+   * （见 {@link EntityCuller} / {@link EntityPacketFilter} / {@link BlockChangeMerger}）。若直接返回
+   * {@code null}，字段会保持为 null，之后 {@link #stop()} 便无从注销已注册的监听与已调度的玩家任务——
+   * 反复 reload 会持续累积泄漏。因此这里在返回 null 前先对<b>同一实例</b>调用其 {@code stop()}
+   * （三处 stop 均已幂等/判空），撤销启动期已产生的副作用；清理或启动失败都<b>不阻塞</b>其它模块注册。
+   */
+  <T> T register(ModuleFactory<T> factory, ModuleStarter<T> starter, ModuleStopper<T> stopper) {
+    T module = null;
     try {
-      return factory.create();
+      module = factory.create();
+      starter.start(module);
+      return module;
     } catch (Throwable throwable) {
+      if (module != null) {
+        try {
+          stopper.stop(module);
+        } catch (Throwable cleanupFailure) {
+          plugin.getLogger().log(Level.WARNING, "带宽子模块启动失败后的清理出现异常（已忽略）",
+              cleanupFailure);
+        }
+      }
       plugin.getLogger().log(Level.WARNING, "带宽子模块注册失败，已单独停用该模块", throwable);
       return null;
     }
@@ -220,11 +230,15 @@ public final class ThrottlePipeline {
     }
   }
 
-  private interface ModuleFactory<T> {
+  interface ModuleFactory<T> {
     T create();
   }
 
-  private interface ModuleStopper<T> {
+  interface ModuleStarter<T> {
+    void start(T module);
+  }
+
+  interface ModuleStopper<T> {
     void stop(T module);
   }
 }

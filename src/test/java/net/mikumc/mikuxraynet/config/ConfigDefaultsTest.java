@@ -139,7 +139,9 @@ class ConfigDefaultsTest {
             mode: all
         """));
 
-    assertEquals(144724291, config.configHash(),
+    // 2026-09 更新：权重表改为按有序 entry 列表参与指纹（顺序敏感），期望值随之变化，
+    // 现存磁盘缓存会一次性失效重建（属正常）。
+    assertEquals(-519526892, config.configHash(),
         "配置指纹必须是跨进程稳定的固定值（不得混入枚举 identity hash / 随机值）");
     // 同一份内容重复解析必须得到同一个值（同一进程内的自洽性）
     assertEquals(config.configHash(), AntiXrayConfig.from(yaml("""
@@ -148,6 +150,30 @@ class ConfigDefaultsTest {
             hide-blocks: [diamond_ore, emerald_ore]
             mode: all
         """)).configHash(), "同一份配置重复解析必须得到同一个指纹");
+  }
+
+  /**
+   * 权重书写顺序必须进入指纹（回归）：{@code ObfuscationProcessor} 按 Map 的<b>迭代序</b>累加权重
+   * 决定伪装方块分布，因此仅调换 yml 里 {@code replacement-weights} 的书写顺序就会改变结果。
+   * 指纹若对其无序敏感（旧实现直接用 {@code Map.hashCode}），旧磁盘缓存会被错误复用
+   * （后果仅观感、不泄漏真矿，但属指纹失准）。
+   */
+  @Test
+  void configHashIsSensitiveToWeightOrder() {
+    AntiXrayConfig forward = AntiXrayConfig.from(yaml("""
+        dimensions:
+          normal:
+            hide-blocks: [diamond_ore]
+            replacement-weights: {stone: 10, deepslate: 4}
+        """));
+    AntiXrayConfig reversed = AntiXrayConfig.from(yaml("""
+        dimensions:
+          normal:
+            hide-blocks: [diamond_ore]
+            replacement-weights: {deepslate: 4, stone: 10}
+        """));
+    assertNotEquals(forward.configHash(), reversed.configHash(),
+        "同内容但权重书写顺序不同 → 指纹必须不同（顺序影响伪装分布）");
   }
 
   /**

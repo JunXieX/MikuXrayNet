@@ -2,6 +2,7 @@ package net.mikumc.mikuxraynet.config;
 
 import java.io.File;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.plugin.Plugin;
@@ -24,6 +25,10 @@ public final class MikuConfig {
   private final AtomicBoolean dimensionsWarned = new AtomicBoolean();
   /** 「配置项被安全下限抬升」WARN 的进程级一次性闸门。 */
   private final AtomicBoolean floorWarned = new AtomicBoolean();
+  /** 「反矿透配置解析失败已保留上一份/改用默认」WARN 的进程级一次性闸门。 */
+  private final AtomicBoolean antiXrayFallbackWarned = new AtomicBoolean();
+  /** 「带宽配置解析失败已保留上一份/改用默认」WARN 的进程级一次性闸门。 */
+  private final AtomicBoolean bandwidthFallbackWarned = new AtomicBoolean();
 
   private AntiXrayConfig antiXray;
   private BandwidthConfig bandwidth;
@@ -33,10 +38,17 @@ public final class MikuConfig {
     this.logger = plugin.getLogger();
   }
 
-  /** 加载（或重新加载）两份配置。加载失败时保留上一份有效值，不抛异常。 */
+  /**
+   * 加载（或重新加载）两份配置。加载失败时保留上一份有效值，不抛异常。
+   *
+   * <p><b>为什么解析必须包 try/catch(Throwable)</b>：本方法由 {@code MikuXrayNet.onLoad()} 调用，
+   * 一旦解析抛异常冒泡上去，服务端会把插件整体禁用（连带宽/反矿透都一起停）。因此两份配置各自
+   * 兜底：解析成功则替换，失败则保留上一份有效值（首次加载即失败则回落到内置默认），
+   * 保证 {@link #antiXray()} / {@link #bandwidth()} 永远非 {@code null}。
+   */
   public void load() {
-    AntiXrayConfig loadedAntiXray = AntiXrayConfig.from(read(ANTI_XRAY_FILE));
-    BandwidthConfig loadedBandwidth = BandwidthConfig.from(read(BANDWIDTH_FILE));
+    AntiXrayConfig loadedAntiXray = loadAntiXray();
+    BandwidthConfig loadedBandwidth = loadBandwidth();
 
     this.antiXray = loadedAntiXray;
     this.bandwidth = loadedBandwidth;
@@ -91,6 +103,50 @@ public final class MikuConfig {
 
   public BandwidthConfig bandwidth() {
     return bandwidth;
+  }
+
+  /**
+   * 读取并解析反矿透配置，任何 {@code Throwable}（含解析期间抛出的 {@code Error}）都不冒泡。
+   *
+   * <p>失败语义：已有上一份有效配置则原样保留；首次加载即失败则回落到「全部键缺失」的内置默认
+   * （{@link AntiXrayConfig#from} 传一个空 {@link YamlConfiguration}），绝不返回 {@code null}。
+   */
+  private AntiXrayConfig loadAntiXray() {
+    try {
+      return AntiXrayConfig.from(read(ANTI_XRAY_FILE));
+    } catch (Throwable throwable) {
+      AntiXrayConfig previous = this.antiXray;
+      if (previous != null) {
+        warnFallbackOnce(antiXrayFallbackWarned, ANTI_XRAY_FILE, "已保留上一份配置", throwable);
+        return previous;
+      }
+      warnFallbackOnce(antiXrayFallbackWarned, ANTI_XRAY_FILE, "已改用内置默认配置", throwable);
+      return AntiXrayConfig.from(new YamlConfiguration());
+    }
+  }
+
+  /** 读取并解析带宽配置；失败语义同 {@link #loadAntiXray()}。 */
+  private BandwidthConfig loadBandwidth() {
+    try {
+      return BandwidthConfig.from(read(BANDWIDTH_FILE));
+    } catch (Throwable throwable) {
+      BandwidthConfig previous = this.bandwidth;
+      if (previous != null) {
+        warnFallbackOnce(bandwidthFallbackWarned, BANDWIDTH_FILE, "已保留上一份配置", throwable);
+        return previous;
+      }
+      warnFallbackOnce(bandwidthFallbackWarned, BANDWIDTH_FILE, "已改用内置默认配置", throwable);
+      return BandwidthConfig.from(new YamlConfiguration());
+    }
+  }
+
+  /** 配置解析失败的一次性中文提示（每个文件只打印一次，说明保留策略与后果）。 */
+  private void warnFallbackOnce(AtomicBoolean gate, String fileName, String detail, Throwable cause) {
+    if (!gate.compareAndSet(false, true)) {
+      return;
+    }
+    logger.log(Level.WARNING, "配置文件 " + fileName + " 解析失败，" + detail
+        + "（本次按该策略继续运行，不会因此禁用插件）。请检查该文件内容后重载。", cause);
   }
 
   private YamlConfiguration read(String fileName) {

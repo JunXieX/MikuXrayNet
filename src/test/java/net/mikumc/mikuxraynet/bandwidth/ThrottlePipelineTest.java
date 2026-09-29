@@ -1,11 +1,16 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Proxy;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.plugin.Plugin;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -85,5 +90,37 @@ class ThrottlePipelineTest {
         config("entity-packets:\n  skip-zero-movement: false\n")).entityPackets());
     assertFalse(ThrottlePipeline.plan(config("block-changes:\n  merge: false\n")).blockChanges());
     assertFalse(ThrottlePipeline.plan(config("entity-culling:\n  raycast: false\n")).entityCulling());
+  }
+
+  /** 仅用于 register 单测：getLogger() 之外的调用不被触发，故其余方法一律返回 null 即可。 */
+  private static Plugin pluginStub() {
+    Logger logger = Logger.getLogger("ThrottlePipelineTest");
+    return (Plugin) Proxy.newProxyInstance(Plugin.class.getClassLoader(),
+        new Class<?>[] {Plugin.class},
+        (proxy, method, args) -> method.getName().equals("getLogger") ? logger : null);
+  }
+
+  /**
+   * 回归：模块 {@code start()} 抛异常时必须在返回 null 前调用该实例的 {@code stop()}。
+   *
+   * <p>各模块都「先注册监听/调度、后可能抛」，若字段保持为 null，之后的 {@code stop()} 便无从清理，
+   * 反复 reload 会累积泄漏已注册的 Listener 与已调度的玩家任务。
+   */
+  @Test
+  void failedModuleStartIsStoppedInsteadOfLeaking() {
+    ThrottlePipeline pipeline = new ThrottlePipeline(pluginStub(), config("enabled: true\n"));
+    AtomicBoolean stopped = new AtomicBoolean();
+    Object module = new Object();
+
+    Object result = pipeline.register(
+        () -> module,
+        m -> {
+          throw new IllegalStateException("模拟 start 失败");
+        },
+        m -> stopped.set(true));
+
+    assertNull(result, "start 抛异常的模块必须返回 null（单独停用该模块）");
+    assertTrue(stopped.get(),
+        "start 抛异常后必须对同一实例调用 stop()，撤销已注册的监听/已调度的任务，避免 reload 累积泄漏");
   }
 }

@@ -8,6 +8,9 @@ package net.mikumc.mikuxraynet.codec;
  */
 public record ZeroVarBitBuffer(int size) implements VarBitBuffer {
 
+  /** 共享的零长度数组：本缓冲恒为 0 长度，避免每次 {@link #toArray()} 都新建一个（内容恒等、无状态）。 */
+  private static final long[] EMPTY = new long[0];
+
   @Override
   public int get(int index) {
     return 0;
@@ -22,6 +25,6 @@ public record ZeroVarBitBuffer(int size) implements VarBitBuffer {
 
   @Override
   public long[] toArray() {
-    return new long[0];
+    return EMPTY;
   }
 }

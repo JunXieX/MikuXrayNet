@@ -7,7 +7,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.util.Iterator;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -331,7 +331,7 @@ final class RegionFile implements AutoCloseable {
       return dropped;
     } finally {
       compacting = false;
-      evictIfNeeded();
+      evictIfNeeded(-1);
     }
   }
 
@@ -477,7 +477,8 @@ final class RegionFile implements AutoCloseable {
 
     slots[bucket] = bucketSlots;
     loaded.put(bucket, Boolean.FALSE);
-    evictIfNeeded();
+    // 正在加载的 bucket 不得被本轮驱逐（否则返回给调用方的数组会变成孤儿、后续写入丢失）
+    evictIfNeeded(bucket);
     return bucketSlots;
   }
 
@@ -516,35 +517,62 @@ final class RegionFile implements AutoCloseable {
     return count;
   }
 
-  /** LRU 驱逐：脏 bucket 先落盘再释放，避免丢写入。 */
-  private void evictIfNeeded() {
+  /**
+   * LRU 驱逐：脏 bucket 先落盘再释放，避免丢写入。
+   *
+   * @param pinned 本轮正在加载、<b>不得驱逐</b>的桶下标（{@code -1} = 无）。
+   *               驱逐绝不能碰正在加载的桶，否则调用方持有的 {@code bucketSlots} 会变成孤儿数组、
+   *               随后的写入丢失（且会留下「脏标记在、slots 为 null」的不一致态）。
+   */
+  private void evictIfNeeded(int pinned) {
     if (compacting) {
       return;
     }
     while (loaded.size() > bucketCacheSize) {
-      Iterator<Map.Entry<Integer, Boolean>> iterator = loaded.entrySet().iterator();
-      if (!iterator.hasNext()) {
+      int victim = selectEvictableVictim(pinned);
+      if (victim < 0) {
+        // 当前没有「可安全驱逐」的桶（剩下的全是脏且落盘失败）：放弃本轮。
+        // 这些桶必须留在 loaded 记账内——若把它们移出却不释放 slots，就会脱离 LRU 记账，
+        // 使实际内存桶数突破 bucketCacheSize（旧缺陷正是如此）；等下次 flush/close 再重试落盘。
         return;
       }
-      int victim = iterator.next().getKey();
-      iterator.remove();
-      if (dirty[victim] && slots[victim] != null) {
-        try {
-          if (flushBucket(victim)) {
-            writePosTable();
-            // 驱逐落盘后旧副本成为垃圾：与 flushDirty/compact 口径一致地重算垃圾字节数，
-            // 否则压缩回收的「垃圾占比」判定会低估，垃圾迟迟得不到回收
-            garbageBytes = Math.max(0L,
-                fileSize - BufferedLinearV3Format.DATA_AREA_OFFSET - liveBytes);
-          }
-        } catch (IOException exception) {
-          // 落盘失败：保留脏标记与内存态，等下次 flush/close 再试
-          dirty[victim] = true;
-          continue;
-        }
-      }
+      // 先确认能安全移除再移除，保证不变式：桶要么在 loaded 记账内，要么 slots 已释放。
+      loaded.remove(victim);
       slots[victim] = null;
     }
+  }
+
+  /**
+   * 选一个「可安全驱逐」的牺牲桶（按 LRU 序从最久未用者开始；跳过 {@code pinned}）：
+   * 非脏桶无需落盘可直接释放；脏桶先尝试落盘，<b>失败则跳过它另选</b>——绝不把它移出
+   * {@code loaded}，否则它会脱离 LRU 记账但 {@code slots} 仍在内存里，实际桶数会突破上限；
+   * 同时保留其脏标记，以便下次 flush/close 重试。
+   *
+   * @return 可安全移除的桶下标；{@code -1} 表示当前没有可安全驱逐的桶
+   */
+  private int selectEvictableVictim(int pinned) {
+    // 遍历期间不修改 loaded（flushBucket/writePosTable 都不触碰它），这里用快照更清晰
+    for (Integer candidate : new ArrayList<>(loaded.keySet())) {
+      if (candidate == pinned) {
+        continue;
+      }
+      if (!dirty[candidate] || slots[candidate] == null) {
+        return candidate;
+      }
+      try {
+        flushBucket(candidate);
+        writePosTable();
+        // 驱逐落盘后旧副本成为垃圾：与 flushDirty/compact 口径一致地重算垃圾字节数，
+        // 否则压缩回收的「垃圾占比」判定会低估，垃圾迟迟得不到回收
+        garbageBytes = Math.max(0L,
+            fileSize - BufferedLinearV3Format.DATA_AREA_OFFSET - liveBytes);
+        return candidate;
+      } catch (IOException exception) {
+        // 落盘（或偏移表写入）失败：保留脏标记与内存态，等下次 flush/close 再试；跳过它另选
+        dirty[candidate] = true;
+      }
+    }
+    return -1;
   }
 
   private void writePosTable() throws IOException {

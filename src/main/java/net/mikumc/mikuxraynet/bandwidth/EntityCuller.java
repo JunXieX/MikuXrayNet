@@ -155,6 +155,11 @@ public final class EntityCuller implements Listener {
     Player player = event.getPlayer();
     cancelRecheckTask(player.getUniqueId());
     for (Entity entity : drainPlayer(player.getUniqueId()).values()) {
+      // Folia：玩家退出时其隐藏列表里的实体可能已随玩家走远/传送落在别的区域，读它们的状态会触发
+      // TickThread 校验（先打 ERROR 再抛），因此先问归属，跨区域者直接跳过（该实体随后由所在区域自然退役）。
+      if (!owns(entity)) {
+        continue;
+      }
       show(player, entity);
     }
     rotations.remove(player.getUniqueId());
@@ -275,17 +280,28 @@ public final class EntityCuller implements Listener {
     //    读它们的任何状态都会触发 Folia 线程校验（先打 ERROR 再抛异常），因此先问能不能碰，不能则整轮跳过。
     Map<Integer, Entity> hiddenMap = hidden.get(playerId);
     if (hiddenMap != null && !hiddenMap.isEmpty()) {
-      for (Map.Entry<Integer, Entity> entry : new ArrayList<>(hiddenMap.entrySet())) {
+      // 就地遍历（不再每周期拷贝一份 entrySet），失效键先收集、遍历结束后统一删除。
+      // hiddenMap 是并发 Map，遍历中 submitRaycast 可能增删；弱一致迭代不会抛异常。
+      List<Integer> stale = null;
+      for (Map.Entry<Integer, Entity> entry : hiddenMap.entrySet()) {
         Entity entity = entry.getValue();
         if (!owns(entity)) {
           continue;
         }
         if (!entity.isValid()) {
-          hiddenMap.remove(entry.getKey());
+          if (stale == null) {
+            stale = new ArrayList<>(4);
+          }
+          stale.add(entry.getKey());
           continue;
         }
         stats.recheckSubmitted.increment();
         submitRaycast(player, entity, true);
+      }
+      if (stale != null) {
+        for (Integer key : stale) {
+          hiddenMap.remove(key);
+        }
       }
     }
 
@@ -521,7 +537,13 @@ public final class EntityCuller implements Listener {
       }
       for (Entity entity : drained.values()) {
         // 一律回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
-        Schedulers.onEntity(plugin, player, () -> show(player, entity));
+        Schedulers.onEntity(plugin, player, () -> {
+          // 同上：跨区域实体（玩家走远/传送后已在别的区域）不得读取状态，先问归属再恢复
+          if (!owns(entity)) {
+            return;
+          }
+          show(player, entity);
+        });
       }
     }
     // 离线玩家（停用时已不在线）的登记一并丢弃：它们已随退出被恢复，这里只兜底清账本
@@ -571,49 +593,54 @@ public final class EntityCuller implements Listener {
    */
   static final class TrackedRotation {
 
-    private final LinkedHashMap<Integer, Entity> order = new LinkedHashMap<>();
+    /** 队列条目：加入时捕获的 entityId + 实体引用；之后只读 id，绝不读可能已跨区域的实体状态。 */
+    private record Tracked(int id, Entity entity) {
+    }
+
+    /**
+     * 环形数组：按加入顺序保存，游标在 {@code [0, size)} 上推进。
+     *
+     * <p>为什么用数组 + 游标而不是 {@code LinkedHashMap}：旧实现每周期全量扫描整个队列、再按预算过滤，
+     * 每周期开销 O(队列长度)；改为直接按下标取 {@code step} 个位置后降到 O(step)，语义（位置推进、
+     * 已隐藏按 id 跳过、有限周期内覆盖全部）完全不变。
+     */
+    private final List<Tracked> order = new ArrayList<>();
     private int cursor;
 
-    /** 加入一个被追踪实体（按 entityId 去重）。 */
+    /** 加入一个被追踪实体（按加入时捕获的 entityId 去重）。 */
     synchronized void add(Entity entity) {
-      order.putIfAbsent(entity.getEntityId(), entity);
+      int id = entity.getEntityId();
+      for (Tracked tracked : order) {
+        if (tracked.id() == id) {
+          return;
+        }
+      }
+      order.add(new Tracked(id, entity));
     }
 
     /** 按实例摘除（不读实体状态，供可能已跨区域的 untrack 事件使用）。 */
     synchronized void remove(Entity entity) {
-      Integer key = null;
-      int index = 0;
-      for (Map.Entry<Integer, Entity> entry : order.entrySet()) {
-        if (entry.getValue() == entity) {
-          key = entry.getKey();
-          break;
+      for (int index = 0; index < order.size(); index++) {
+        if (order.get(index).entity() == entity) {
+          order.remove(index);
+          if (cursor > index) {
+            cursor--;
+          }
+          return;
         }
-        index++;
-      }
-      if (key == null) {
-        return;
-      }
-      order.remove(key);
-      if (cursor > index) {
-        cursor--;
       }
     }
 
     /** 按 id 摘除一个不再被追踪的实体，并修正游标使「下一页」不被跳过。 */
     synchronized void remove(int entityId) {
-      if (!order.containsKey(entityId)) {
-        return;
-      }
-      int index = 0;
-      for (Integer key : order.keySet()) {
-        if (key == entityId) {
-          break;
+      for (int index = 0; index < order.size(); index++) {
+        if (order.get(index).id() == entityId) {
+          order.remove(index);
+          if (cursor > index) {
+            cursor--;
+          }
+          return;
         }
-        index++;
-      }
-      order.remove(entityId);
-      if (cursor > index) {
-        cursor--;
       }
     }
 
@@ -630,6 +657,9 @@ public final class EntityCuller implements Listener {
     /**
      * 取出本轮要复检的一小批追踪实体（跳过已隐藏者——它们由「每周期全量复检」通道负责），
      * 并把游标推进一批，保证有限周期内覆盖全部追踪实体。
+     *
+     * <p>环形数组直接取 {@code step} 个位置：{@code start = cursor % size}，依次取
+     * {@code [start, start+step)}（回绕），位置数而非提交数推进，覆盖保证与旧实现一致。
      */
     synchronized List<Entity> nextBatch(int budget, Set<Integer> hiddenIds) {
       int size = order.size();
@@ -640,13 +670,10 @@ public final class EntityCuller implements Listener {
       int step = Math.min(Math.max(1, budget), size);
       int start = Math.floorMod(cursor, size);
       List<Entity> batch = new ArrayList<>(step);
-      int index = 0;
-      for (Map.Entry<Integer, Entity> entry : order.entrySet()) {
-        // 与旧实现同一分片语义：位置落在 [start, start+step) 内才取，已隐藏者按「存下来的 id」跳过
-        boolean inSlice = Math.floorMod(index - start, size) < step;
-        index++;
-        if (inSlice && !hiddenIds.contains(entry.getKey())) {
-          batch.add(entry.getValue());
+      for (int offset = 0; offset < step; offset++) {
+        Tracked tracked = order.get(Math.floorMod(start + offset, size));
+        if (!hiddenIds.contains(tracked.id())) {
+          batch.add(tracked.entity());
         }
       }
       cursor = (start + step) % size;

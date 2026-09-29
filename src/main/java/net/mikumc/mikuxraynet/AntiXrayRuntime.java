@@ -315,14 +315,35 @@ public final class AntiXrayRuntime {
     antiXrayActive = false;
   }
 
-  /** 按新配置重建邻近显形（复用同一套显形结构，避免与改写链路脱钩）。 */
+  /**
+   * 按新配置重建邻近显形（复用同一套显形结构，避免与改写链路脱钩）。
+   *
+   * <p><b>为什么必须读新配置的 {@code proximity.enabled}</b>：索引与已显形集合在启动期一旦建立就一直
+   * 非 null，若只凭「字段非 null」判定就重启显形，则热重载把 {@code proximity.enabled} 改成 false 时
+   * 显形仍会照常启动——「关闭即零开销」的承诺在 reload 路径失效（旧缺陷：条件恒真、索引从不置空）。
+   * 现在关闭时释放索引并停用显形；启用时复用既有索引重启显形。
+   */
   void restartProximity() {
     stopProximity();
-    if (antiXrayActive && proximityStats != null
-        && (obfuscatedChunkIndex != null || diskCacheStore != null)) {
-      startProximity(plugin.mikuConfig().antiXray(), obfuscatedChunkIndex, revealedSet,
-          proximityStats);
+    if (!antiXrayActive || proximityStats == null) {
+      return;
     }
+    AntiXrayConfig antiXray = plugin.mikuConfig().antiXray();
+    if (!antiXray.proximity().enabled()) {
+      // 关闭：stopProximity 已停周期任务、注销变更注销监听并清空索引内容；这里再置空字段，
+      // 之后不再登记/发送任何显形——与启动路径「关闭即不建索引、零开销」保持一致。
+      obfuscatedChunkIndex = null;
+      revealedSet = null;
+      logger.info("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
+      return;
+    }
+    if (obfuscatedChunkIndex == null || revealedSet == null) {
+      // 启动时该功能为关闭（索引从未接入改写链路）：热重载无法凭空补齐，明确提示需重启而非静默失效。
+      logger.info("邻近显形在配置中已启用，但启动时该功能为关闭状态、显形索引未接入改写链路；"
+          + "重启服务器后生效");
+      return;
+    }
+    startProximity(antiXray, obfuscatedChunkIndex, revealedSet, proximityStats);
   }
 
   /** 使全部改写缓存、邻块快照、显形结构失效并落盘磁盘缓存（配置热重载时调用）。 */

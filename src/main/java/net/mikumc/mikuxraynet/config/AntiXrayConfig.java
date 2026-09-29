@@ -426,11 +426,39 @@ public final class AntiXrayConfig {
      * configHash，磁盘缓存条目会被逐条判为「配置已变」而丢弃，重启后命中率恒为 0
      * （真机实测：同一配置两次启动 configHash 分别为 335527235 与 -1449763053）。
      * 这里改用 {@code mode.name()}（{@link String#hashCode} 有规范定义，跨进程/跨版本稳定），
-     * 其余分量（{@code List} / {@code Map} / {@code int} / {@code boolean}）的哈希也都有规范定义。
+     * 其余分量（{@code List} / {@code int} / {@code boolean}）的哈希也都有规范定义。
+     *
+     * <p><b>权重表必须按有序 entry 列表参与</b>（不再直接用 {@code Map}）：{@code Map} 的哈希与迭代序
+     * 无关，而伪装分布依赖迭代序（见 {@link #weightEntries}），仅调换书写顺序就会改变结果——用
+     * {@code Map} 会让这种情况下的旧磁盘缓存被错误复用。此次改动会使现存磁盘缓存<b>一次性失效</b>
+     * （属正常：指纹变了，旧条目判为「配置已变」而被回收）。
      */
     public List<Object> fingerprint() {
-      return List.of(hideBlocks, replacementWeights, replacementBands, minY, maxY, mode.name(),
-          useBlockBelow);
+      return List.of(hideBlocks, weightEntries(replacementWeights),
+          bandFingerprint(replacementBands), minY, maxY, mode.name(), useBlockBelow);
+    }
+
+    /**
+     * 权重表的有序稳定表示：{@code Map} 的 {@code hashCode} 与迭代顺序无关，而
+     * {@code ObfuscationProcessor.weightedTable} 是按<b>迭代序</b>累加权重决定伪装方块分布的——
+     * 仅调换 yml 里权重的书写顺序就会改变伪装结果。因此这里把权重表按 entry <b>有序列表</b>参与指纹
+     * （{@code List} 的哈希对顺序敏感，键/值的哈希也都有规范定义），否则旧磁盘缓存会被错误复用。
+     */
+    private static List<List<Object>> weightEntries(Map<String, Integer> weights) {
+      List<List<Object>> entries = new ArrayList<>(weights.size());
+      for (Map.Entry<String, Integer> entry : weights.entrySet()) {
+        entries.add(List.of(entry.getKey(), entry.getValue()));
+      }
+      return List.copyOf(entries);
+    }
+
+    /** 分区伪装表同样含权重映射：逐段拆成有序 entry 列表参与指纹（理由同 {@link #weightEntries}）。 */
+    private static List<Object> bandFingerprint(List<ReplacementBand> bands) {
+      List<Object> result = new ArrayList<>(bands.size());
+      for (ReplacementBand band : bands) {
+        result.add(List.of(band.minY(), band.maxY(), weightEntries(band.weights())));
+      }
+      return List.copyOf(result);
     }
   }
 

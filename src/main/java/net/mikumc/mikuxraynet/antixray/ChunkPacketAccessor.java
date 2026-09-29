@@ -10,6 +10,7 @@ import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -172,19 +173,16 @@ public final class ChunkPacketAccessor {
    * @param relativeY  方块实体的区块内相对 Y（绝对 Y − 世界最低建筑高度；负值必然不在清单里）
    * @param sectionX   方块实体的 section 内 X（0..15）
    * @param sectionZ   方块实体的 section 内 Z（0..15）
-   * @param localPositions 被伪装坐标清单，编码为 {@code y << 8 | z << 4 | x}
+   * @param localPositions 被伪装坐标清单，编码为 {@code y << 8 | z << 4 | x}，
+   *                   <b>必须是升序数组</b>（生产由 {@code ObfuscationProcessor} 按 section、再按
+   *                    元素序号递增生成，天然升序），此处用二分查找替代线性扫描
    */
   static boolean isObfuscated(int relativeY, int sectionX, int sectionZ, int[] localPositions) {
     if (relativeY < 0) {
       return false;
     }
     int packed = relativeY << 8 | sectionZ << 4 | sectionX;
-    for (int position : localPositions) {
-      if (position == packed) {
-        return true;
-      }
-    }
-    return false;
+    return Arrays.binarySearch(localPositions, packed) >= 0;
   }
 
   /**

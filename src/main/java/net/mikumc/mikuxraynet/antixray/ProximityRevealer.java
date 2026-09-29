@@ -99,6 +99,18 @@ public final class ProximityRevealer implements Listener {
    */
   private static final int CANDIDATE_OVERSAMPLE = 4;
   private static final int MAX_CANDIDATES = 512;
+  /**
+   * 单玩家单周期「候选评估」硬上限（与发包额度解耦）。
+   *
+   * <p><b>为什么需要它</b>：旧的循环只在发包额度 {@code budget.remaining <= 0} 时断环，而可见性判定
+   * 失败、区块未加载都是直接 {@code return}、<b>不扣发包额度</b>——于是发包额度只限「发了多少包」，
+   * 不限「评估了多少候选」。每评估一个候选要在主线程 / 区域线程上读 6 个邻块并行 ≤4 条原生射线，是
+   * 本功能最重的部分；一批「永远看不见的坐标」（整块埋住、上方流体等）会把评估量顶到候选上限
+   * {@link #MAX_CANDIDATES} 而一个包都不发。这里单独设一个评估额度：无论是否发得出包，评估次数触顶即
+   * 停。候选本就按距离由近到远取（见 ProximityScanner），因此超出的候选只是延后到后续周期（分片轮转）
+   * 评估，<b>可见的矿仍会显形，最坏多等一个周期</b>——绝不丢显形。
+   */
+  private static final int MAX_EVALUATIONS_PER_PASS = 256;
 
   /**
    * 附近区块的分片数：每次巡检只看其中一片（{@link ProximityScanner#shardOf} 决定某个区块属于哪片）。
@@ -516,13 +528,17 @@ public final class ProximityRevealer implements Listener {
         : (candidates == null ? 0 : candidates.size());
     int frustumCulled = plan != null ? plan.frustumCulled : 0;
     RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
+    // 评估额度（本玩家本周期）：每次 sendOne 都算一次评估（含区块未加载 / 不可见的失败评估），
+    // 因此评估量有独立于发包额度的明确上界；触顶即停，余下候选留在索引里等下一个周期。
+    int evaluationsLeft = MAX_EVALUATIONS_PER_PASS;
 
     if (candidates != null) {
       for (ObfuscatedChunkIndex.Position position : candidates) {
-        if (budget.remaining <= 0) {
+        if (budget.remaining <= 0 || evaluationsLeft <= 0) {
           break;
         }
         sendOne(player, world, position.x(), position.y(), position.z(), eye, budget, tally, batch);
+        evaluationsLeft--;
       }
       flushBatch(player, batch, tally);
       logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
@@ -534,11 +550,12 @@ public final class ProximityRevealer implements Listener {
 
     int count = plan.count();
     for (int i = 0; i < count; i++) {
-      if (budget.remaining <= 0) {
+      if (budget.remaining <= 0 || evaluationsLeft <= 0) {
         break;
       }
       sendOne(player, world, plan.coordinates[i * 3], plan.coordinates[i * 3 + 1],
           plan.coordinates[i * 3 + 2], eye, budget, tally, batch);
+      evaluationsLeft--;
     }
     flushBatch(player, batch, tally);
     logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);

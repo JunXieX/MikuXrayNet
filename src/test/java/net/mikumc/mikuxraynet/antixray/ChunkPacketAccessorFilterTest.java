@@ -58,4 +58,25 @@ class ChunkPacketAccessorFilterTest {
     assertTrue(ChunkPacketAccessor.isObfuscated(relativeY, 9, 7, positions));
     assertEquals(44, relativeY);
   }
+
+  /**
+   * 升序清单必须能被二分查找命中（首/中/末）与正确排除：{@link ChunkPacketAccessor#isObfuscated}
+   * 已由线性扫描改为 {@code Arrays.binarySearch}，依赖「清单升序」这一生产不变量
+   * （{@code ObfuscationProcessor} 按 section、再按元素序号递增生成）。
+   */
+  @Test
+  void sortedListingIsMatchedByBinarySearch() {
+    int[] sorted = {
+        1 << 8 | 0 << 4 | 0,    // y=1, z=0, x=0（最小）
+        3 << 8 | 5 << 4 | 7,    // y=3, z=5, x=7（中间）
+        9 << 8 | 15 << 4 | 15,  // y=9, z=15, x=15（最大）
+    };
+
+    assertTrue(ChunkPacketAccessor.isObfuscated(1, 0, 0, sorted), "首个元素必须命中");
+    assertTrue(ChunkPacketAccessor.isObfuscated(3, 7, 5, sorted), "中间元素必须命中");
+    assertTrue(ChunkPacketAccessor.isObfuscated(9, 15, 15, sorted), "末个元素必须命中");
+    assertFalse(ChunkPacketAccessor.isObfuscated(2, 0, 0, sorted), "y 不在清单不得命中");
+    assertFalse(ChunkPacketAccessor.isObfuscated(9, 15, 14, sorted), "x 不同不得命中");
+    assertFalse(ChunkPacketAccessor.isObfuscated(-1, 0, 0, sorted), "相对 Y 为负必须短路返回 false");
+  }
 }

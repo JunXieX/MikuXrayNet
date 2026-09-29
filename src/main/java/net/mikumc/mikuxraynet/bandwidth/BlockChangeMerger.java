@@ -19,7 +19,6 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -317,6 +316,15 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
   }
 
+  /**
+   * 延迟登记与放行：<b>先入 held 缓冲、再登记延迟</b>。
+   *
+   * <p>顺序不能颠倒：{@code flush()} 的兜底只遍历 {@code target.held} 来放行原包，若先
+   * {@code incrementProcessingDelay()} 却没能把条目放进 {@code held}（登记后构造/入队抛异常），
+   * 该包就永远等不到放行（永久卡包）。把 {@code held.add} 提到登记之前后，两者都在
+   * {@code synchronized(target)} 内、且 {@code flush()} 持同一把锁，因此顺序调整不产生竞态；
+   * 登记/调度整段再包 {@code try/catch}，异常时撤销条目并放行原包，保证「恰好放行一次」。
+   */
   @Override
   public void onPacketSending(PacketEvent event) {
     if (!config.merge() || event.isCancelled()) {
@@ -361,20 +369,28 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         for (Update<WrappedBlockData> update : updates) {
           overflow |= target.batch.add(update.x(), update.y(), update.z(), update.value());
         }
-        // 先登记延迟，再入缓冲；此后必须由 flush() 放行，保证恰好一次
-        marker.incrementProcessingDelay();
+        // 先入缓冲、再登记延迟：held.add 若在此之后抛异常，登记过的延迟就再也没人放行（永久卡包）。
+        // flush() 的兜底只遍历 target.held，所以条目必须先在里面，登记才能生效。
         Held entry = new Held(event);
         target.held.add(entry);
+        // delayRegistered 记录「延迟是否真的登记成功」：未登记则从未延迟，不能 release（那会多减一次）。
+        boolean delayRegistered = false;
         try {
+          marker.incrementProcessingDelay();
+          delayRegistered = true;
           if (target.timer == null) {
             long window = Math.max(1L, config.mergeWindowMillis());
             final Pending scheduled = target;
             target.timer = flusher.schedule(() -> flush(scheduled), window, TimeUnit.MILLISECONDS);
           }
-        } catch (RejectedExecutionException exception) {
-          // 冲刷线程已失效（插件停用中）：立即原样放行，绝不卡包
+        } catch (Throwable throwable) {
+          // 登记或调度失败（含冲刷线程已失效的 RejectedExecutionException）：撤销缓冲条目，
+          // 已登记过延迟则立即原样放行，绝不卡包；未登记则原包本就照常流出，无需 release。
           target.held.remove(entry);
-          release(entry);
+          if (delayRegistered) {
+            release(entry);
+          }
+          logThrottled(throwable);
         }
         break;
       }

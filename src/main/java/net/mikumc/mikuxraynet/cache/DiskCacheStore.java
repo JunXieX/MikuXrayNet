@@ -16,6 +16,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -66,6 +67,15 @@ public final class DiskCacheStore implements AutoCloseable {
   private static final long FLUSH_TIMEOUT_MILLIS = 5000L;
   /** 触发压缩回收的垃圾占比（垃圾字节 > 活数据的一半）。 */
   private static final double COMPACT_GARBAGE_RATIO = 0.5D;
+  /**
+   * 两次「单文件压缩」之间的让出时间（毫秒）。
+   *
+   * <p>压缩是「整文件重写 + force + move」的长任务，与读取共用同一个磁盘线程。若把一轮的全部候选连续
+   * 做完，这期间提交的读取会在队列里枯等到 50ms 预算耗尽、记未命中，上层于是回退重写——缓存近乎失效。
+   * 因此一次只压缩一个文件，压完隔一小段时间再排下一个：空档里新提交的读取能立刻执行（见
+   * {@link #compactGarbage()}）。
+   */
+  private static final long COMPACT_YIELD_MILLIS = 20L;
 
   /** 区域缓存文件后缀（BufferedLinearV3 的线性 bucket 布局）。 */
   private static final String REGION_FILE_SUFFIX = ".b_linear";
@@ -118,6 +128,13 @@ public final class DiskCacheStore implements AutoCloseable {
   private final long maxFileSizeBytes;
   private final long readTimeoutMillis;
   private final ScheduledExecutorService executor;
+  /**
+   * 压缩会话是否进行中。
+   *
+   * <p>压缩被拆成「一轮一个文件、自链式排程」的多步任务后，可能跨过维护周期（默认 30 秒）；用该标志
+   * 避免下一轮维护再起一条会话与旧会话叠加。
+   */
+  private final AtomicBoolean compactionRunning = new AtomicBoolean();
 
   private volatile boolean closed;
 
@@ -399,40 +416,89 @@ public final class DiskCacheStore implements AutoCloseable {
     }
   }
 
-  /** 压缩回收：把垃圾占比过高的区域文件整文件重写，顺带丢弃过期/旧代次条目。 */
+  /**
+   * 压缩回收：把垃圾占比过高的区域文件整文件重写，顺带丢弃过期/旧代次条目。
+   *
+   * <p><b>为什么把「一轮多个文件」拆成多个自链式任务</b>：压缩是「整文件重写 + {@code force(true)} +
+   * move」的长任务，与读取共用同一个磁盘线程（{@code MikuXrayNet-DiskCache}）。旧实现把候选文件在一个
+   * 任务里连续压完，这期间提交的读取全部排在长任务之后、50ms 预算内跑不到 → 记未命中 → 上层回退重写，
+   * 缓存近乎失效。这里改为：一次只压一个文件（单轮工作量上限仍由 {@code compact-per-pass} 决定），
+   * 压完隔 {@link #COMPACT_YIELD_MILLIS} 毫秒再排下一个——空档里新提交的读取能被立刻处理，长阻塞被
+   * 切到「单文件」粒度。全部磁盘 IO 仍只在该单线程上执行，因此不引入任何并发（RegionFile 的单线程
+   * 纪律、关闭时的排空顺序、fail-open 与计数语义全部不变）。
+   */
   private void compactGarbage() {
-    int budget = Math.max(1, config.compactPerPass());
-    List<Map.Entry<RegionKey, Handle>> candidates = new ArrayList<>();
-    for (Map.Entry<RegionKey, Handle> entry : open.entrySet()) {
-      Handle handle = entry.getValue();
-      long garbage = handle.file.garbageBytes();
-      long live = Math.max(0L, handle.file.sizeBytes() - BufferedLinearV3Format.DATA_AREA_OFFSET);
-      if (garbage > 0L && (double) garbage > (double) live * COMPACT_GARBAGE_RATIO) {
-        candidates.add(entry);
-      }
+    if (!compactionRunning.compareAndSet(false, true)) {
+      // 上一条压缩会话尚未结束（跨维护周期）：跳过本轮，避免叠加
+      return;
     }
-
-    int done = 0;
-    for (Map.Entry<RegionKey, Handle> candidate : candidates) {
-      if (done >= budget) {
+    try {
+      int budget = Math.max(1, config.compactPerPass());
+      List<RegionKey> candidates = new ArrayList<>();
+      for (Map.Entry<RegionKey, Handle> entry : open.entrySet()) {
+        Handle handle = entry.getValue();
+        long garbage = handle.file.garbageBytes();
+        long live = Math.max(0L, handle.file.sizeBytes() - BufferedLinearV3Format.DATA_AREA_OFFSET);
+        if (garbage > 0L && (double) garbage > (double) live * COMPACT_GARBAGE_RATIO) {
+          candidates.add(entry.getKey());
+          if (candidates.size() >= budget) {
+            break;
+          }
+        }
+      }
+      if (candidates.isEmpty()) {
+        compactionRunning.set(false);
         return;
       }
-      RegionKey key = candidate.getKey();
-      Handle handle = candidate.getValue();
-      try {
-        int dropped = handle.file.compact((chunkIndex, entry) -> keepEntry(entry));
-        if (dropped > 0) {
-          approximateEntries.updateAndGet(value -> Math.max(0, value - dropped));
+      scheduleCompactStep(candidates, 0);
+    } catch (Throwable throwable) {
+      compactionRunning.set(false);
+      fail("磁盘缓存压缩回收调度失败（已跳过本轮）", throwable);
+    }
+  }
+
+  /** 排程压缩会话的第 {@code index} 个文件；每步之间让出磁盘线程，见 {@link #compactGarbage()} 说明。 */
+  private void scheduleCompactStep(List<RegionKey> candidates, int index) {
+    if (closed || index >= candidates.size()) {
+      compactionRunning.set(false);
+      return;
+    }
+    RegionKey key = candidates.get(index);
+    try {
+      executor.schedule(() -> {
+        try {
+          if (!closed) {
+            compactOne(key);
+          }
+        } finally {
+          scheduleCompactStep(candidates, index + 1);
         }
-        // 压缩会把内存里的全部 bucket（含脏的）整文件重写：待落盘记账随之清零
-        handle.pendingBytes = 0L;
-        done++;
-      } catch (Throwable throwable) {
-        // 压缩失败：句柄可能已不可用（例如文件被外部删除），直接关闭并让它下次重新打开
-        fail("磁盘缓存压缩回收失败，已关闭该区域文件句柄：" + handle.file.path(), throwable);
-        open.remove(key, handle);
-        closeHandleQuietly(handle);
+      }, COMPACT_YIELD_MILLIS, TimeUnit.MILLISECONDS);
+    } catch (Throwable throwable) {
+      compactionRunning.set(false);
+      fail("磁盘缓存压缩回收排程失败（已中止本轮）", throwable);
+    }
+  }
+
+  /** 压缩单个区域文件（在磁盘线程上执行，与读写天然串行）。 */
+  private void compactOne(RegionKey key) {
+    Handle handle = open.get(key);
+    if (handle == null) {
+      // 句柄可能已被闲置关闭 / 世界卸载关闭：跳过（数据已在之前的落盘中持久化）
+      return;
+    }
+    try {
+      int dropped = handle.file.compact((chunkIndex, entry) -> keepEntry(entry));
+      if (dropped > 0) {
+        approximateEntries.updateAndGet(value -> Math.max(0, value - dropped));
       }
+      // 压缩会把内存里的全部 bucket（含脏的）整文件重写：待落盘记账随之清零
+      handle.pendingBytes = 0L;
+    } catch (Throwable throwable) {
+      // 压缩失败：句柄可能已不可用（例如文件被外部删除），直接关闭并让它下次重新打开
+      fail("磁盘缓存压缩回收失败，已关闭该区域文件句柄：" + handle.file.path(), throwable);
+      open.remove(key, handle);
+      closeHandleQuietly(handle);
     }
   }
 

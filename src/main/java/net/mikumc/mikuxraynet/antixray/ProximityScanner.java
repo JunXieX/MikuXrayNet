@@ -104,6 +104,12 @@ final class ProximityScanner {
         if (entry == null) {
           continue;
         }
+        // 刷新该玩家在此区块的活跃时间放在「分片过滤」之前：其它分片的区块本周期虽不评估，但仍在该玩家
+        // 扫描半径内，必须照样刷新，否则它们的已显形标记会随分片周期与 expire-seconds 赛跑而周期性失效。
+        // 同样放在「整块跳过」判定之前：整块已显形的区块不再逐坐标评估，若此时不刷新，它的标记会在
+        // expire-seconds 后被过期清掉，导致「整块跳过」周期性失效、同一批坐标被反复重新评估与重复发包
+        // （真机上表现为「20 万次判定只换来百余次发送」）。
+        revealed.touch(playerId, key);
         // 分片轮转：本周期只处理属于本片的区块，其余留给后面的周期（见类注释「区块分片轮转」）。
         // 放在「整块跳过」判定之前：不属于本片的区块连清单都不读，本片单周期的评估量因此不随
         // 「身边伪装坐标总量」增长——它只与本片的坐标数相关。
@@ -113,10 +119,6 @@ final class ProximityScanner {
           }
           continue;
         }
-        // 刷新该玩家在此区块的活跃时间必须放在「整块跳过」判定之前：整块已显形的区块不再逐坐标评估，
-        // 若此时不刷新，它的标记会在 expire-seconds 后被过期清掉，导致「整块跳过」周期性失效、
-        // 同一批坐标被反复重新评估与重复发包（真机上表现为「20 万次判定只换来百余次发送」）。
-        revealed.touch(playerId, key);
         if (revealed.sizeFor(playerId, key) >= entry.size()) {
           // 整块已全部显形：稳态下每周期只处理「新进入视野的区块」
           if (tally != null) {
@@ -137,14 +139,16 @@ final class ProximityScanner {
           int blockX = (chunkX << 4) | (local & 15);
           int blockZ = (chunkZ << 4) | (local >> 4 & 15);
           int blockY = minHeight + (local >> 8);
-          if (distanceSquared(blockX, blockY, blockZ, x, y, z) > maxDistanceSquared) {
+          // 同一候选只算一次距离平方：范围筛选与入堆复用同一个值（见 offer 的入参）
+          long distanceSq = distanceSquared(blockX, blockY, blockZ, x, y, z);
+          if (distanceSq > maxDistanceSquared) {
             continue;
           }
           if (revealed.contains(playerId, key, blockX, blockY, blockZ)) {
             continue;
           }
           offer(worst, new ObfuscatedChunkIndex.Position(blockX, blockY, blockZ),
-              distanceSquared(blockX, blockY, blockZ, x, y, z), sequence++, limit);
+              distanceSq, sequence++, limit);
         }
       }
     }
@@ -179,12 +183,16 @@ final class ProximityScanner {
     return Math.floorMod(hash, shards);
   }
 
-  /** 往容量上限为 {@code limit} 的最大堆里放一个候选：堆满时淘汰堆顶（最差者）。 */
+  /**
+   * 往容量上限为 {@code limit} 的最大堆里放一个候选：堆满时淘汰堆顶（最差者）。
+   *
+   * <p>先与堆顶比较、只有确实值得入堆才构造 {@link Scored}：堆满后的绝大多数候选注定被淘汰，
+   * 这样可以省掉它们的对象分配。
+   */
   private static void offer(PriorityQueue<Scored> worst, ObfuscatedChunkIndex.Position position,
       long distanceSquared, int sequence, int limit) {
-    Scored candidate = new Scored(position, distanceSquared, sequence);
     if (worst.size() < limit) {
-      worst.add(candidate);
+      worst.add(new Scored(position, distanceSquared, sequence));
       return;
     }
     Scored currentWorst = worst.peek();
@@ -193,7 +201,7 @@ final class ProximityScanner {
         || (distanceSquared == currentWorst.distanceSquared()
             && sequence < currentWorst.sequence())) {
       worst.poll();
-      worst.add(candidate);
+      worst.add(new Scored(position, distanceSquared, sequence));
     }
   }
 

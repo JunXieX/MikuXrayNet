@@ -32,8 +32,15 @@ public final class BypassRegistry implements Listener {
   /** 绕过反矿透所必需的权限节点（唯一出处见 {@link Constants#BYPASS_PERMISSION}）。 */
   public static final String PERMISSION = Constants.BYPASS_PERMISSION;
 
-  /** 在线玩家权限巡检周期（tick）：约 2 秒一次，用于捕捉运行期的权限变更。 */
-  private static final long REFRESH_INTERVAL_TICKS = 40L;
+  /**
+   * 在线玩家权限巡检周期（tick）：约 5 秒一次，用于捕捉运行期的权限变更。
+   *
+   * <p>放宽自 40（约 2 秒）：巡检要对全服玩家逐个 {@code hasPermission} 并重建在线集合做
+   * {@code retainAll}，是本类唯一的周期性开销；而「运行期授予/收回 bypass」是低频操作，5 秒的
+   * 生效延迟对操作者已无感，却把这次开销降到原来的约 40%。登录/退出事件仍即时维护名单，
+   * 因此「及时性」只是运行期改权限的收敛窗口，不影响进出服。
+   */
+  private static final long REFRESH_INTERVAL_TICKS = 100L;
 
   private final Plugin plugin;
   private final Set<UUID> bypassed = ConcurrentHashMap.newKeySet();

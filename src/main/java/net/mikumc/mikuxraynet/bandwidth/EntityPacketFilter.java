@@ -9,6 +9,7 @@ import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.reflect.StructureModifier;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Locale;
@@ -22,6 +23,7 @@ import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.EntityType;
 import org.bukkit.plugin.Plugin;
 
 /**
@@ -48,6 +50,15 @@ public final class EntityPacketFilter extends PacketAdapter {
   private final BandwidthConfig.EntityPackets config;
   private final ThrottleStats stats;
   private final Set<String> whitelist;
+  /** 启动期解析出的「白名单命中的实体类型」：刷新索引时先用 {@code entity.getType()} 直接比对，零字符串分配。 */
+  private final Set<EntityType> whitelistedTypes;
+  /**
+   * 白名单里「解析不出对应实体类型」的归一化条目（通常为空）。
+   *
+   * <p>只有它非空时才需要退回「逐实体取 key 字符串再归一化比较」的旧路径——以此保证：
+   * 即使白名单里混入了拼错的/未知的类型名，语义也与旧实现完全一致。
+   */
+  private final Set<String> unresolvedWhitelist;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
   /** 实体 id → 归一化类型键（主线程刷新，网络线程只读）。 */
@@ -63,6 +74,20 @@ public final class EntityPacketFilter extends PacketAdapter {
     this.config = config;
     this.stats = stats;
     this.whitelist = normalizeAll(config.whitelist());
+    // 启动期把白名单解析成实体类型集合：刷新索引时先用 entity.getType() 直接比对，
+    // 只有解析不出的条目才回退到字符串比较（见 unresolvedWhitelist）。
+    Set<EntityType> types = EnumSet.noneOf(EntityType.class);
+    Set<String> unresolved = new HashSet<>(this.whitelist);
+    for (EntityType type : EntityType.values()) {
+      // EntityType 的 path（不带命名空间、全小写）正是白名单归一化后的形态，取它不产生字符串分配
+      String path = type.getKey().getKey();
+      if (this.whitelist.contains(path)) {
+        types.add(type);
+        unresolved.remove(path);
+      }
+    }
+    this.whitelistedTypes = types;
+    this.unresolvedWhitelist = unresolved;
   }
 
   /** 注册监听器；白名单非空时启动实体类型索引刷新任务。 */
@@ -164,13 +189,18 @@ public final class EntityPacketFilter extends PacketAdapter {
       Map<Integer, String> index = new HashMap<>();
       for (World world : Bukkit.getWorlds()) {
         for (Entity entity : world.getEntities()) {
-          String typeKey = normalize(entity.getType().getKey().toString());
-          // 索引瘦身：只收录「白名单命中」的类型（isWhitelisted 语义不变——不在索引里的实体
-          // 与「类型不在白名单」同样判 false，故查询结果与收录全部实体时完全一致）。
-          // 白名单通常只有个位数条目，全服实体动辄上千：把索引从 O(全服实体数) 压到 O(白名单实体数，
-          // 近零)，每 100 tick 的重建成本随之降到可忽略。
-          if (whitelist.contains(typeKey)) {
-            index.put(entity.getEntityId(), typeKey);
+          EntityType type = entity.getType();
+          // 先用实体类型直接比对（零字符串分配）：白名单通常只有个位数条目，全服实体动辄上千，
+          // 旧实现对每个实体都做一次 getKey().toString() + normalize() 字符串分配，是这段遍历的主要成本。
+          if (whitelistedTypes.contains(type)) {
+            // 命中项才登记；这里取 EntityType 的 path（引用既有常量，不新建字符串）
+            index.put(entity.getEntityId(), type.getKey().getKey());
+          } else if (!unresolvedWhitelist.isEmpty()) {
+            // 回退：白名单里存在解析不出类型的条目时，退回旧的「归一化字符串比较」以保证语义一致
+            String typeKey = normalize(type.getKey().toString());
+            if (whitelist.contains(typeKey)) {
+              index.put(entity.getEntityId(), typeKey);
+            }
           }
         }
       }

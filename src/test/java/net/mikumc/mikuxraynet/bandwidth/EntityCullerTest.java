@@ -1,5 +1,6 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -24,6 +25,7 @@ import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.util.BoundingBox;
 import org.bukkit.util.RayTraceResult;
@@ -267,6 +269,36 @@ class EntityCullerTest {
         "跨区域实体本轮既不清理也不报错，留待重新进入追踪范围时的 onTrack 复评或退出时的账本清理");
   }
 
+  /**
+   * Folia 回归：玩家退出时，其隐藏列表里的<b>跨区域</b>实体不得被读取任何状态。
+   *
+   * <p>{@link EntityCuller#onQuit} 与 {@link EntityCuller#restoreAll} 旧实现直接对全部隐藏实体调
+   * {@code show}（内部读 {@code isValid}）；跨区域实体会触发 TickThread 校验（真机先打 ERROR 再抛），
+   * 虽有 try/catch 兜住不崩，但会周期性刷 ERROR 日志。这里用「一旦被读取就抛 + 读取计数」的替身，
+   * 断言退出恢复路径对跨区域实体一次都没碰。
+   */
+  @Test
+  void quitDoesNotTouchForeignRegionEntities() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub foreign = new EntityStub(8001, world);
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 7, 3), stats,
+        entity -> entity != foreign.proxy());
+
+    culler.evaluate(player.proxy(), foreign.proxy(), true);
+    assertEquals(1, culler.hiddenCount());
+    int readsBeforeQuit = foreign.stateReads();
+    foreign.foreign = true;
+
+    assertDoesNotThrow(() -> culler.onQuit(new PlayerQuitEvent(player.proxy(), (String) null)),
+        "退出恢复不得因跨区域实体抛异常");
+    assertEquals(readsBeforeQuit, foreign.stateReads(),
+        "跨区域实体的任何状态读取都会在 Folia 上刷 ERROR，退出恢复必须完全跳过它");
+    assertEquals(0, culler.hiddenCount(), "账本随退出清空（跨区域实体的恢复交由其所在区域）");
+  }
+
   /** 已隐藏实体每周期全量复检（不退化），可见追踪实体每周期只取预算分片。 */
   @Test
   void recheckSubmitsEveryHiddenEntityPlusABudgetedTrackedSlice() {
@@ -438,6 +470,8 @@ class EntityCullerTest {
     private volatile boolean valid = true;
     /** 模拟「实体已离开本区域」：任何状态读取都像 Folia 那样抛异常（真机还会先打一条 ERROR）。 */
     private volatile boolean foreign;
+    /** 被读取状态的次数（跨区域回归用：一次都不能被碰到）。 */
+    private final AtomicInteger stateReads = new AtomicInteger();
 
     EntityStub(int id, WorldStub world) {
       this(id, world, 100.0D, 65.0D, 100.0D);
@@ -460,12 +494,17 @@ class EntityCullerTest {
       return id;
     }
 
+    int stateReads() {
+      return stateReads.get();
+    }
+
     @Override
     public Object invoke(Object ignored, Method method, Object[] args) {
       if (isObjectMethod(method)) {
         return "hashCode".equals(method.getName()) ? System.identityHashCode(proxy)
             : ("equals".equals(method.getName()) ? proxy == args[0] : "EntityStub#" + id);
       }
+      stateReads.incrementAndGet();
       if (foreign) {
         // 跨区域读取：真机上 TickThread.ensureTickThread 先 ERROR 再抛，这里只要被读到就抛
         throw new IllegalStateException("模拟 Folia 跨区域访问：entity#" + id);

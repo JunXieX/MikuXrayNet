@@ -1,7 +1,10 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 单玩家的方块变更待发缓冲与邻域合并分组（纯逻辑，不依赖 Bukkit / ProtocolLib，便于单元测试）。
@@ -55,50 +58,108 @@ public final class BlockChangeBatch<V> {
   /**
    * 按「曼哈顿距离不超过 radius」的邻域把待发变更聚成若干簇，并清空缓冲。
    *
+   * <p><b>为什么改成网格分桶 + 并查集</b>：旧实现是「每簇 × while(grew) × 遍历簇内成员」三重循环，
+   * 同簇 256 条的最坏情形要做约 1.6e7 次曼哈顿比较，且整段在 {@code synchronized(target)} 内执行。
+   * 新实现求的是同一个图（顶点=变更，边=曼哈顿距离 ≤ radius）的连通分量：先用边长 {@code radius+1}
+   * 的网格分桶（距离 ≤ radius 的两点只可能落在相邻的 3×3×3 格内），再对 27 邻格内成对判定并入并查集，
+   * 复杂度降到 O(变更数 × 邻域内平均桶占用)。
+   *
+   * <p><b>顺序语义保持不变</b>：簇列表按「簇内最小插入下标」升序，簇内成员按插入下标升序。
+   *
    * @return 簇列表；每簇内的条目集合即为一次可合并发送的更新集合
    */
   public List<List<Update<V>>> drainClusters(int radius) {
     int distance = Math.max(0, radius);
+    int size = pending.size();
     List<List<Update<V>>> clusters = new ArrayList<>();
-    boolean[] assigned = new boolean[pending.size()];
+    if (size == 0) {
+      pending.clear();
+      return clusters;
+    }
 
-    for (int i = 0; i < pending.size(); i++) {
-      if (assigned[i]) {
-        continue;
-      }
-      List<Update<V>> cluster = new ArrayList<>();
-      cluster.add(pending.get(i));
-      assigned[i] = true;
+    // 网格边长取 radius+1：曼哈顿距离 ≤ radius 的两个点，其 x/y/z 格下标至多相差 1，故只需查 27 邻格
+    int cell = distance + 1;
+    Map<Long, List<Integer>> buckets = new HashMap<>();
+    for (int i = 0; i < size; i++) {
+      Update<V> update = pending.get(i);
+      long key = cellKey(Math.floorDiv(update.x(), cell), Math.floorDiv(update.y(), cell),
+          Math.floorDiv(update.z(), cell));
+      buckets.computeIfAbsent(key, ignored -> new ArrayList<>()).add(i);
+    }
 
-      boolean grew = true;
-      while (grew) {
-        grew = false;
-        for (int j = 0; j < pending.size(); j++) {
-          if (assigned[j] || !withinRadius(cluster, pending.get(j), distance)) {
-            continue;
+    int[] parent = new int[size];
+    for (int i = 0; i < size; i++) {
+      parent[i] = i;
+    }
+    for (int i = 0; i < size; i++) {
+      Update<V> update = pending.get(i);
+      int cellX = Math.floorDiv(update.x(), cell);
+      int cellY = Math.floorDiv(update.y(), cell);
+      int cellZ = Math.floorDiv(update.z(), cell);
+      for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+          for (int dz = -1; dz <= 1; dz++) {
+            List<Integer> bucket = buckets.get(cellKey(cellX + dx, cellY + dy, cellZ + dz));
+            if (bucket == null) {
+              continue;
+            }
+            for (int j : bucket) {
+              if (j == i) {
+                continue;
+              }
+              Update<V> other = pending.get(j);
+              // 桶仅用于剪枝：是否相连仍以精确的曼哈顿距离判定（哈希冲突只会多比几次，不影响正确性）
+              int manhattan = Math.abs(update.x() - other.x())
+                  + Math.abs(update.y() - other.y())
+                  + Math.abs(update.z() - other.z());
+              if (manhattan <= distance) {
+                union(parent, i, j);
+              }
+            }
           }
-          cluster.add(pending.get(j));
-          assigned[j] = true;
-          grew = true;
         }
       }
-      clusters.add(cluster);
     }
+
+    // 按插入顺序归组：外层 LinkedHashMap 保证「簇按最小下标升序」，内层按 i 升序添加保证成员插入序
+    Map<Integer, List<Update<V>>> byRoot = new LinkedHashMap<>();
+    for (int i = 0; i < size; i++) {
+      byRoot.computeIfAbsent(find(parent, i), ignored -> new ArrayList<>()).add(pending.get(i));
+    }
+    clusters.addAll(byRoot.values());
 
     pending.clear();
     return clusters;
   }
 
-  private static boolean withinRadius(List<? extends Update<?>> cluster, Update<?> candidate, int radius) {
-    for (Update<?> member : cluster) {
-      int manhattan = Math.abs(member.x() - candidate.x())
-          + Math.abs(member.y() - candidate.y())
-          + Math.abs(member.z() - candidate.z());
-      if (manhattan <= radius) {
-        return true;
-      }
+  /** 网格单元键：对三个格下标做混合散列（冲突安全——见 {@link #drainClusters} 的距离判定）。 */
+  private static long cellKey(int cellX, int cellY, int cellZ) {
+    long hash = cellX * 0x9E3779B97F4A7C15L;
+    hash ^= (cellY + 0x165667B19E3779F9L) * 0xC2B2AE3D27D4EB4FL;
+    hash ^= (cellZ + 0x27D4EB2F165667C5L) * 0x9E3779B97F4A7C15L;
+    return hash;
+  }
+
+  private static int find(int[] parent, int value) {
+    int root = value;
+    while (parent[root] != root) {
+      root = parent[root];
     }
-    return false;
+    // 路径压缩：把沿途节点直接挂到根上
+    while (parent[value] != root) {
+      int next = parent[value];
+      parent[value] = root;
+      value = next;
+    }
+    return root;
+  }
+
+  private static void union(int[] parent, int a, int b) {
+    int rootA = find(parent, a);
+    int rootB = find(parent, b);
+    if (rootA != rootB) {
+      parent[rootB] = rootA;
+    }
   }
 
   /**
