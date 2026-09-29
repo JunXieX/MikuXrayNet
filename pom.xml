@@ -158,6 +158,15 @@
                 <!-- release 目标版本由 properties 的 maven.compiler.release 统一提供，不再重复声明 -->
                 <configuration>
                     <!--
+                      强制 fork 到独立 javac 进程：JDK 25.0.4 上 maven-compiler-plugin 的
+                      **进程内编译**路径会命中 javac 内部缺陷——编译测试源时抛
+                      「Cannot load from object array because "this.hashes" is null」。
+                      已用诊断工作流对照验证：完全相同的参数/源文件/classpath 下，外挂 javac 正常，
+                      -Dmaven.compiler.fork=true 通过，而 proc=none/full、implicit 等各变体均失败。
+                      因此这里固定 fork，绕开进程内编译路径；诊断过程见提交说明。
+                    -->
+                    <fork>true</fork>
+                    <!--
                       体积优化（依据见文件末尾 <properties> 下方的说明）：只保留行号与源文件名，
                       去掉局部变量表（LocalVariableTable）。
                       写法依据（本机 javap 核实 maven-compiler-plugin 3.13.0 的 AbstractCompilerMojo）：
