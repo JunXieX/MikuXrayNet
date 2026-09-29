@@ -13,7 +13,6 @@ target/
 .settings/
 .classpath
 .project
-.trae/
 
 # 日志与临时文件
 *.log
