@@ -3,6 +3,7 @@ package net.mikumc.mikuxraynet.antixray;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.netty.buffer.ByteBuf;
@@ -280,6 +281,32 @@ class ObfuscationProcessorWorldBandTest {
     assertEquals(2, result.obfuscatedPositions().length, "未被 band 覆盖的高度仍必须伪装（回落表兜底）");
     assertEquals(DEEPSLATE, decodedState(result.data(), 5, 0, target), "band 覆盖的高度用 band 候选");
     assertEquals(STONE, decodedState(result.data(), 5, 4, target), "未覆盖高度回落 replacement-weights");
+  }
+
+  /**
+   * 只配 bands、回落表为空，且方块落在 band 覆盖之外——修复前 {@code pick()} 会以 {@code cum[-1]}
+   * 抛 AIOOBE，被外层 catch 成整区块 fail-open（原字节放行 → 该区块完全裸露）。
+   * 修复后：跳过该方块（不伪装），同区块内 band 覆盖的方块照常伪装，整区块绝不 fail-open。
+   */
+  @Test
+  void outOfBandBlockWithNoFallbackIsSkippedNotFailOpen() {
+    // 只有 band [-64,-1]；回落表为空。section 0（绝对 y -56）在覆盖内、section 4（绝对 y 8）在覆盖外。
+    ObfuscationProcessor.WorldProfile profile = profile(new int[0],
+        new int[] {-64, -1, DEEPSLATE}, Integer.MIN_VALUE, Integer.MAX_VALUE);
+    int covered = index(8, 8, 8);
+    int uncovered = index(8, 8, 8);
+    byte[] source = chunk(stoneWithTarget(covered), filled(STONE), filled(STONE), filled(STONE),
+        stoneWithTarget(uncovered));
+
+    ObfuscationProcessor.Result result = processor(profile, false)
+        .rewrite(source, 5, 42L, null, "world", -64);
+
+    assertNull(result.failure(), "空权重表不得抛异常（否则整区块 fail-open 原样放行）");
+    assertTrue(result.changed(), "band 覆盖内的方块仍必须被伪装（不能整块放弃）");
+    assertEquals(1, result.obfuscatedPositions().length, "只有 band 覆盖内的方块被伪装");
+    assertEquals(DEEPSLATE, decodedState(result.data(), 5, 0, covered), "band 覆盖处照常伪装");
+    assertEquals(DIAMOND_ORE, decodedState(result.data(), 5, 4, uncovered),
+        "未覆盖处跳过伪装（保持原样），但不得因异常整块放行");
   }
 
   @Test

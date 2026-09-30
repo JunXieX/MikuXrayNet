@@ -235,6 +235,46 @@ class DiskCacheStoreTest {
     }
   }
 
+  /**
+   * 世界名仅大小写不同时 sanitize 后同名：必须共用同一物理文件与<b>同一句柄</b>。
+   *
+   * <p>回归：旧实现 {@code RegionKey} 存原始世界名、物理文件却按 sanitize 名落盘，于是
+   * {@code World} / {@code world} 两个键各自开出句柄、指向同一文件互踩（Windows 上 ATOMIC_MOVE 还会失败）。
+   */
+  @Test
+  void worldNamesDifferingOnlyByCaseShareOnePhysicalFile(@TempDir Path dir) {
+    byte[] first = payload(128);
+    byte[] second = payload(256);
+    try (DiskCacheStore store = store(dir, config(1024, 600, 600))) {
+      store.put("World", 0, 0, 1, first);
+      store.put("world", 1, 0, 1, second);
+      store.flush();
+
+      assertEquals(1, store.openRegionFiles(), "sanitize 后同名的世界必须共用一个句柄（不互踩）");
+      assertTrue(Files.isRegularFile(dir.resolve("world").resolve("r.0.0.b_linear")),
+          "物理文件按 sanitize 名（小写）落盘");
+      assertArrayEquals(first, store.get("World", 0, 0, 1), "大小写不同的世界名指向同一物理文件");
+      assertArrayEquals(second, store.get("world", 1, 0, 1));
+    }
+  }
+
+  /**
+   * 句柄关闭必须收回其计入的条目额度（否则条目计数只增不减，{@code max-entries} 随句柄开关不断抬高）。
+   */
+  @Test
+  void entryCountIsReleasedWhenHandleCloses(@TempDir Path dir) {
+    try (DiskCacheStore store = store(dir, config(1024, 600, 600))) {
+      store.put(WORLD, 0, 0, 1, payload(128));
+      store.put(WORLD, 1, 0, 1, payload(256));
+      store.flush();
+      assertEquals(2, store.entries());
+
+      store.invalidateWorld(WORLD);
+      assertEquals(0, store.openRegionFiles());
+      assertEquals(0, store.entries(), "世界卸载关闭句柄时必须收回该文件的条目额度");
+    }
+  }
+
   @Test
   void closedStoreStopsServing(@TempDir Path dir) {
     DiskCacheStore store = store(dir, config(1024, 600, 600));

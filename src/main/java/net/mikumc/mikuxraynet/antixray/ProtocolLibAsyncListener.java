@@ -83,6 +83,24 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return gates.get(playerId);
     }
 
+    /**
+     * 原子地「取某玩家当前闸门 + 登记一个待完成区块」。
+     *
+     * <p><b>为什么必须原子</b>：若先 {@link #get} 再在临界区外调用 {@link ChunkBatchGate#chunkStarted()}，
+     * 这两步之间到达的 {@code CHUNK_BATCH_FINISHED} 会 {@link #remove} 闸门并在 pending 仍为 0 时立即放行
+     * ——本区块的改写结果随后才回到客户端，批次节奏被提前打乱。合并为一次同步操作后，凡成功取得闸门的
+     * 区块必然已被计数，FINISHED 只能等它 {@link ChunkBatchGate#chunkDone()} 后才放行。
+     *
+     * @return 该玩家当前闸门；无闸门（或恰好已被 FINISHED 取走）时返回 {@code null}（调用方按无批次处理）
+     */
+    synchronized ChunkBatchGate acquire(UUID playerId) {
+      ChunkBatchGate gate = gates.get(playerId);
+      if (gate != null) {
+        gate.chunkStarted();
+      }
+      return gate;
+    }
+
     /** 打开某玩家的批次闸门；已达上限时先淘汰最旧的未完成条目（只清一个）。 */
     synchronized void open(UUID playerId) {
       while (gates.size() >= maxPending) {
@@ -263,7 +281,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return;
     }
 
-    ChunkBatchGate gate = batches.get(player.getUniqueId());
+    // 「取闸门 + 登记 chunkStarted」必须是同一次原子操作（见 BatchTable#acquire）：
+    // 否则 FINISHED 可能在本线程取到闸门之后、登记之前完成放行，批次节奏被提前。
+    ChunkBatchGate gate = batches.acquire(player.getUniqueId());
 
     // 与 world.getMinHeight() 同一处安全取数点：这两个值都必须在此（网络线程读 Bukkit）取出，
     // 之后只传纯值给任务；worker 线程严禁触碰 Bukkit API。
@@ -297,15 +317,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     } catch (Throwable throwable) {
       // 已登记延迟但看门狗没注册成功（通常为插件停用中）：走一次放行动作把刚登记的延迟
       // 「用掉」（signalPacketTransmission 即放行本封包），等价于旧实现的「未登记延迟直接放行」。
-      // 此时批次计数尚未登记（chunkStarted 在下一步才调用），release 动作里的 gate.chunkDone()
-      // 会被 ChunkBatchGate 的 max(0, ...) 防护钳回 0，无副作用。
+      // 批次计数已在 batches.acquire 处登记，release 动作里的 gate.chunkDone() 会把它正好归还（净零）。
       logThrottled("超时看门狗登记失败，已按原包放行", throwable);
       task.signalOnce();
       return;
-    }
-
-    if (gate != null) {
-      gate.chunkStarted();
     }
 
     // 邻块快照未命中：先转主线程 / Folia 区域线程抓取，抓完再交给工作线程
@@ -454,9 +469,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         task.worldName(), task.dimension(), task.minHeight());
 
     if (result.failed()) {
-      // 解码/重编码异常：必须可观测——否则「本该伪装却失败」会被并进「跳过」里，看起来一切正常
+      // 解码/重编码异常：必须可观测——否则「本该伪装却失败」会被并进「跳过」里，看起来一切正常。
+      // 失败结果不写入任何一级缓存（见 resultCacheable）：瞬时故障若被固化，同指纹区块在缓存有效期内
+      // 不再重试改写，等于长期裸露。chunksFailed 计数即「失败且未入缓存」的次数，供诊断回显。
       stats.chunksFailed.increment();
-      logThrottled("区块改写异常（已按原包放行）：" + result.failure(), null);
+      logThrottled("区块改写异常（已按原包放行，未写入任何缓存）：" + result.failure(), null);
     }
     if (result.changed()) {
       stats.chunksRewritten.increment();
@@ -482,15 +499,32 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     logFirstRewriteDiagnostic(task, source, result);
 
-    CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions());
-    cache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(), value);
-    if (diskCache != null) {
-      // 磁盘写入是「提交即返回」的异步操作（自有磁盘线程），不阻塞本工作线程；
-      // 负载里带上被伪装坐标，磁盘缓存命中时才能重新写入显形索引（见 DiskPayload）。
-      diskCache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(),
-          DiskPayload.encode(sourceHash, result.obfuscatedPositions(), result.data()));
+    if (resultCacheable(result)) {
+      CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions());
+      cache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(), value);
+      if (diskCache != null) {
+        // 磁盘写入是「提交即返回」的异步操作（自有磁盘线程），不阻塞本工作线程；
+        // 负载里带上被伪装坐标，磁盘缓存命中时才能重新写入显形索引（见 DiskPayload）。
+        diskCache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(),
+            DiskPayload.encode(sourceHash, result.obfuscatedPositions(), result.data()));
+      }
     }
-    writeBack(accessor, task, value.data(), value.positions());
+    // 失败结果：data == source 且伪装位置为空 → writeBack 直接返回，原包照常下发（fail-open 语义不变）。
+    writeBack(accessor, task, result.data(), result.obfuscatedPositions());
+  }
+
+  /**
+   * 改写结果是否允许写入缓存（内存 + 磁盘）。
+   *
+   * <p><b>为什么失败结果绝不入缓存</b>：解码/重编码异常通常是瞬时故障（并发抖动、临时状态）；
+   * 若把「原样字节 + 空位置」固化进任一级缓存，同指纹区块就会在内存有效期（默认约 600s）
+   * 乃至磁盘过期前都不再重试改写——瞬时故障被永久化，等于该区块一直裸露。
+   * 放行语义不受影响：失败时 {@code data == source} 且位置为空，{@code writeBack} 直接跳过。
+   *
+   * <p>包级可见，便于离线单测（无需实例化整个监听器）。
+   */
+  static boolean resultCacheable(ObfuscationProcessor.Result result) {
+    return result != null && !result.failed();
   }
 
   /**

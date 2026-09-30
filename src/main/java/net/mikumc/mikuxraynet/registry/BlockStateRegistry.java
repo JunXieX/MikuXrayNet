@@ -12,6 +12,8 @@ import java.util.Collection;
 import java.util.EnumSet;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.codec.RegistryAccessor;
 
 /**
@@ -35,8 +37,11 @@ import net.mikumc.mikuxraynet.codec.RegistryAccessor;
  */
 public final class BlockStateRegistry implements RegistryAccessor {
 
-  /** 探测状态总数的安全上限，防止映射异常时无限循环。 */
-  private static final int MAX_STATE_SCAN = 1 << 20;
+  /** 探测状态 id 的安全扫描上限（防御映射异常时无限循环）；远大于任何真实映射规模（实测约 3.2 万）。 */
+  private static final int MAX_STATE_SCAN = 1 << 18;
+
+  /** 「探测结果不确定需保守放大位宽」的一次性 WARN 闸门。 */
+  private static final AtomicBoolean UNCERTAIN_PROBE_WARNED = new AtomicBoolean();
 
   /** 材质类别明确不属于「整块不透明」的集合。 */
   private static final Set<MaterialType> NON_OCCLUDING_MATERIALS = EnumSet.of(
@@ -69,8 +74,11 @@ public final class BlockStateRegistry implements RegistryAccessor {
   /**
    * 枚举服务端当前版本的全部方块状态并建立位图。
    *
-   * <p>状态 id 在原版映射中是 0..N-1 的稠密区间，越界 id 会回落为空气（globalId=0），
-   * 因此逐个探测到「回落到空气」即得到总数 N。
+   * <p><b>为什么不能「遇到第一个空洞就停」</b>：旧实现逐个探测到「回落到空气」即认定总数 N，
+   * 这隐含假设「状态 id 是 0..N-1 的连续稠密区间」。一旦 PE 映射<b>存在空洞</b>，第一次中断处
+   * 就会把 id 统计偏小，进而使 {@code M = ceilLog2(N)} 位宽偏小——高位状态被漏判、反矿透<b>静默失效</b>。
+   * 这里改为<b>扫描整个 id 区间取实际最大有效 id</b>（空洞处跳过、继续向后），按 {@code 最大 id + 1}
+   * 的口径确定覆盖范围与位宽。
    *
    * @param extraOccluding    额外视为「遮挡」的方块名（覆盖表；可为空集）
    * @param extraNonOccluding 额外视为「不遮挡」的方块名（覆盖表；可为空集）
@@ -82,7 +90,14 @@ public final class BlockStateRegistry implements RegistryAccessor {
     Set<String> nonOccludingOverrides = OcclusionRules.normalizeAll(extraNonOccluding);
 
     ClientVersion version = PacketEvents.getAPI().getServerManager().getVersion().toClientVersion();
-    int count = probeStateCount(version);
+    Probe probe = probeStates(version);
+    int count = probe.stateCount();
+    int width = ceilLog2(count);
+    if (probe.uncertain()) {
+      // 扫到上限仍存在有效状态：无法确定映射是否更大 → 位宽宁大不小（宁可多占几 bit，绝不漏判高位状态）
+      width = Math.max(width, ceilLog2(MAX_STATE_SCAN));
+      warnUncertainProbe(count, width);
+    }
 
     BitSet airStates = new BitSet(count);
     BitSet fluidStates = new BitSet(count);
@@ -90,8 +105,11 @@ public final class BlockStateRegistry implements RegistryAccessor {
     BitSet occludingStates = new BitSet(count);
 
     for (int id = 0; id < count; id++) {
-      // clone=false：直接使用映射表内的共享实例，避免构建期产生大量临时对象
-      WrappedBlockState state = WrappedBlockState.getByGlobalId(version, id, false);
+      // 空洞 id（映射异常）本身不是有效状态：直接跳过，不参与任何位图
+      WrappedBlockState state = getByGlobalIdOrNull(version, id);
+      if (state == null) {
+        continue;
+      }
       StateType type = state.getType();
       String name = type.getName();
 
@@ -114,7 +132,7 @@ public final class BlockStateRegistry implements RegistryAccessor {
       }
     }
 
-    return new BlockStateRegistry(count, ceilLog2(count), airStates, fluidStates, fluidCoverStates,
+    return new BlockStateRegistry(count, width, airStates, fluidStates, fluidCoverStates,
         occludingStates);
   }
 
@@ -212,20 +230,57 @@ public final class BlockStateRegistry implements RegistryAccessor {
     }
   }
 
-  private static int probeStateCount(ClientVersion version) {
-    int id = 0;
-    while (id < MAX_STATE_SCAN) {
-      if (WrappedBlockState.getByGlobalId(version, id, false).getGlobalId() != id) {
-        break;
+  /** 探测结果：覆盖范围（实际最大有效 id + 1）与「是否无法确定上限」。 */
+  private record Probe(int stateCount, boolean uncertain) {
+  }
+
+  /**
+   * 扫描整个 id 区间，取<b>实际最大有效 id</b>（空洞处跳过并继续向后），据此给出覆盖范围。
+   *
+   * <p><b>刻意不早停</b>：早停会在「第一个空洞」处误判结束，使统计偏小、位宽偏小——正是本次要修的缺陷。
+   *
+   * @return 覆盖范围（最大有效 id + 1）与「扫满上限仍未确定上限」标记
+   */
+  private static Probe probeStates(ClientVersion version) {
+    int maxValidId = -1;
+    for (int id = 0; id < MAX_STATE_SCAN; id++) {
+      if (isValidState(version, id)) {
+        maxValidId = id;
       }
-      id++;
     }
 
-    if (id == 0 || id >= MAX_STATE_SCAN) {
-      throw new IllegalStateException(
-          "方块状态映射异常：探测到的状态数量为 " + id + "，请检查 PacketEvents 版本是否匹配服务端");
+    if (maxValidId < 0) {
+      throw new IllegalStateException("方块状态映射异常：在 0.." + (MAX_STATE_SCAN - 1)
+          + " 内探测不到任何有效状态，请检查 PacketEvents 版本是否匹配服务端");
     }
-    return id;
+    int stateCount = maxValidId + 1;
+    // 扫满上限仍存在有效状态：无法确定映射是否更大 → 交由调用方保守放大位宽（宁大不小）
+    return new Probe(stateCount, stateCount >= MAX_STATE_SCAN);
+  }
+
+  /** id 处是否为有效状态（未越界、且未落在空洞）：取回状态的 globalId 必须等于 id。 */
+  private static boolean isValidState(ClientVersion version, int id) {
+    return getByGlobalIdOrNull(version, id) != null;
+  }
+
+  /** 取 id 对应的状态；越界或落在空洞（返回状态的 globalId 不等于 id）时返回 {@code null}，绝不误取。 */
+  private static WrappedBlockState getByGlobalIdOrNull(ClientVersion version, int id) {
+    try {
+      WrappedBlockState state = WrappedBlockState.getByGlobalId(version, id, false);
+      return state != null && state.getGlobalId() == id ? state : null;
+    } catch (Throwable throwable) {
+      return null;
+    }
+  }
+
+  /** 探测结果不确定时的一次性中文 WARN：位宽已按上限保守放大（仅影响体积、不影响正确性）。 */
+  private static void warnUncertainProbe(int stateCount, int width) {
+    if (!UNCERTAIN_PROBE_WARNED.compareAndSet(false, true)) {
+      return;
+    }
+    Logger.getLogger("MikuXrayNet").warning("方块状态映射探测结果不确定：扫描到上限仍存在有效状态"
+        + "（最大 id + 1 = " + stateCount + "），已保守把直接格式位宽放大到 " + width
+        + "（宁大不小，避免高位状态被漏判导致反矿透静默失效）。请检查 PacketEvents 版本是否匹配服务端。");
   }
 
   private static int ceilLog2(int value) {

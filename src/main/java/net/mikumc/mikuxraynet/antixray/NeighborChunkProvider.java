@@ -2,6 +2,7 @@ package net.mikumc.mikuxraynet.antixray;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.function.LongSupplier;
 import org.bukkit.HeightMap;
 import org.bukkit.World;
 
@@ -22,9 +23,15 @@ import org.bukkit.World;
  * （见 {@link #capturePlane} 的说明与 {@code antixray.yml} 中 {@code neighbors} 段的代价标注）。
  * 上界查询本身极便宜（直接读区块的高度图数组），失败时该列退回全高度扫描，只损失优化、不改变结果。
  *
- * <p><b>容量</b>：LRU 有界缓存，键为 {@code (世界名, chunkX, chunkZ)}；每格只占 1 bit，
+ * <p><b>容量与过期</b>：LRU 有界缓存，键为 {@code (世界名, chunkX, chunkZ)}；每格只占 1 bit，
  * 故每条约 {@code 4 × 16 × 世界高度 / 8} 字节 = {@code 4 × 高度 / 2} 字节
  * （主世界 384 高度约 3 KB），默认上限见 {@code antixray.yml} 的 {@code neighbors.cache-maximum-size}。
+ *
+ * <p><b>为什么还要 TTL</b>：快照里的平面可能含 {@code null}（邻块未加载 / Folia 跨区域 / 世界卸载），
+ * 也可能在抓取后因邻块被挖开/放置而失真。<b>方块变更不会使本缓存失效</b>（不像改写缓存有内容指纹），
+ * 若永久缓存，边界遮挡判定会长期失真（仅 {@code mode=enclosed} 用到）。因此每条快照带一个<b>写入时刻</b>
+ * 起算的短 TTL（{@link #DEFAULT_CACHE_TTL_MILLIS}）：到期后按未命中处理并重抓，fail-open 语义不变
+ * （取不到仍按既有缺失策略处理）。
  */
 public final class NeighborChunkProvider {
 
@@ -54,27 +61,66 @@ public final class NeighborChunkProvider {
 
   private static final int SIDE_LENGTH = 16;
 
+  /**
+   * 快照缓存的默认 TTL（毫秒，从写入时刻起算）。
+   *
+   * <p>取 30 秒：够短，能在邻块被挖开/放置、或邻块从「未加载」变为「已加载」后较快重建；
+   * 又够长，不会每次巡检都触发重抓（单次抓取约 0.776 ms，且只在 {@code mode=enclosed} 世界发生）。
+   */
+  static final long DEFAULT_CACHE_TTL_MILLIS = 30_000L;
+
   private final int cacheMaximumSize;
-  private final Map<ChunkKey, NeighborEdges> cache;
+  private final long cacheTtlNanos;
+  private final LongSupplier nanoClock;
+  private final Map<ChunkKey, CacheEntry> cache;
 
   /** 缓存键：只含不可变类型，不钉住世界对象。 */
   private record ChunkKey(String worldName, int chunkX, int chunkZ) {
   }
 
+  /** 缓存条目：快照 + 到期时刻（纳秒）。{@code expiresAtNanos == Long.MAX_VALUE} 表示永不过期。 */
+  private record CacheEntry(NeighborEdges edges, long expiresAtNanos) {
+  }
+
   public NeighborChunkProvider(int cacheMaximumSize) {
+    this(cacheMaximumSize, DEFAULT_CACHE_TTL_MILLIS, System::nanoTime);
+  }
+
+  /** 带 TTL 的构造（毫秒，{@code <= 0} 表示不过期）；供装配方按需传入更短/更长的过期时间。 */
+  public NeighborChunkProvider(int cacheMaximumSize, long cacheTtlMillis) {
+    this(cacheMaximumSize, cacheTtlMillis, System::nanoTime);
+  }
+
+  /** 测试专用：额外注入时间源，便于离线验证过期语义（无需真实等待）。 */
+  NeighborChunkProvider(int cacheMaximumSize, long cacheTtlMillis, LongSupplier nanoClock) {
     this.cacheMaximumSize = Math.max(1, cacheMaximumSize);
+    this.cacheTtlNanos = cacheTtlMillis <= 0 ? 0L : cacheTtlMillis * 1_000_000L;
+    this.nanoClock = nanoClock;
     this.cache = new LinkedHashMap<>(16, 0.75f, true) {
       @Override
-      protected boolean removeEldestEntry(Map.Entry<ChunkKey, NeighborEdges> eldest) {
+      protected boolean removeEldestEntry(Map.Entry<ChunkKey, CacheEntry> eldest) {
         return size() > NeighborChunkProvider.this.cacheMaximumSize;
       }
     };
   }
 
-  /** 读取已缓存的快照；未命中返回 {@code null}（不做任何 Bukkit 访问，可在任意线程调用）。 */
+  /**
+   * 读取已缓存的快照；未命中或已过期返回 {@code null}（不做任何 Bukkit 访问，可在任意线程调用）。
+   *
+   * <p>过期条目在读取时立即移除，因此调用方拿到 {@code null} 后走既有缺失策略（fail-open）。
+   */
   public NeighborEdges cached(String worldName, int chunkX, int chunkZ) {
+    ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
     synchronized (cache) {
-      return cache.get(new ChunkKey(worldName, chunkX, chunkZ));
+      CacheEntry entry = cache.get(key);
+      if (entry == null) {
+        return null;
+      }
+      if (entry.expiresAtNanos() != Long.MAX_VALUE && nanoClock.getAsLong() >= entry.expiresAtNanos()) {
+        cache.remove(key);
+        return null;
+      }
+      return entry.edges();
     }
   }
 
@@ -119,8 +165,12 @@ public final class NeighborChunkProvider {
         captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_MINUS, chunkLoaded, query, columnTop),
         captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_PLUS, chunkLoaded, query, columnTop));
 
+    // 写入时刻起算 TTL：缓存不能永久持有陈旧（含 null 平面）的快照，到期后重抓。
+    long expiresAt = cacheTtlNanos <= 0L
+        ? Long.MAX_VALUE
+        : nanoClock.getAsLong() + cacheTtlNanos;
     synchronized (cache) {
-      cache.put(new ChunkKey(worldName, chunkX, chunkZ), edges);
+      cache.put(new ChunkKey(worldName, chunkX, chunkZ), new CacheEntry(edges, expiresAt));
     }
     return edges;
   }

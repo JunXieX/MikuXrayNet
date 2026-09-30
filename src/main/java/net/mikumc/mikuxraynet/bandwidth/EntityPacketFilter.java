@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
@@ -125,8 +126,8 @@ public final class EntityPacketFilter extends PacketAdapter {
     if (!config.skipZeroMovement() || event.isCancelled() || event.getPlayer() == null) {
       return;
     }
-    // 权限检查在封包线程执行：依赖权限插件自身线程安全（LuckPerms 支持异步查询，安全）
-    if (event.getPlayer().hasPermission(Constants.BYPASS_PERMISSION)) {
+    // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API
+    if (BypassRegistry.isBypassedNow(event.getPlayer().getUniqueId())) {
       return;
     }
 

@@ -58,4 +58,15 @@ class BypassRegistryTest {
     registry.refresh(null, true);
     assertEquals(0, registry.size());
   }
+
+  /**
+   * 共享入口 {@link BypassRegistry#isBypassedNow(UUID)} 在名单未装配（未调用 {@code start()}）时必须
+   * fail-open 为 false，且绝不抛异常——带宽模块在封包线程无条件依赖它。
+   */
+  @Test
+  void sharedLookupIsFailOpenWhenNoActiveRegistry() {
+    assertFalse(BypassRegistry.isBypassedNow(null), "null 玩家恒为「不直通」");
+    assertFalse(BypassRegistry.isBypassedNow(UUID.randomUUID()),
+        "未装配名单时返回 false（与「无直通」一致，fail-open）");
+  }
 }

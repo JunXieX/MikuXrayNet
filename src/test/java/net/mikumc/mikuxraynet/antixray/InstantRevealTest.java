@@ -7,6 +7,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -162,6 +166,47 @@ class InstantRevealTest {
 
     quota.clear(player);
     assertEquals(16, quota.remaining(player, 101L, 16), "退出清理后按满额对待（新玩家语义）");
+  }
+
+  // ---------------------------------------------------------- 发包额度线程安全（任务 5）
+
+  /**
+   * 共享 {@link ProximityRevealer.Budget} 会被多个异步任务并发持有：扣减必须是原子的，
+   * 否则普通 int 字段会丢失更新、把「全服合计额度」突破成超发。这里 N 次并发扣减应精确归零。
+   */
+  @Test
+  void budgetDecrementsAreAtomicAcrossThreads() throws Exception {
+    int capacity = 1000;
+    int threads = 8;
+    ProximityRevealer.Budget budget = new ProximityRevealer.Budget(capacity);
+    assertEquals(capacity, budget.remaining(), "初始额度");
+
+    ExecutorService pool = Executors.newFixedThreadPool(threads);
+    try {
+      int perThread = capacity / threads;
+      CountDownLatch start = new CountDownLatch(1);
+      CountDownLatch done = new CountDownLatch(threads);
+      for (int t = 0; t < threads; t++) {
+        pool.execute(() -> {
+          try {
+            start.await();
+          } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+          }
+          for (int i = 0; i < perThread; i++) {
+            budget.decrement();
+          }
+          done.countDown();
+        });
+      }
+      start.countDown();
+      assertTrue(done.await(5, TimeUnit.SECONDS), "并发扣减不得超时");
+    } finally {
+      pool.shutdownNow();
+      pool.awaitTermination(5, TimeUnit.SECONDS);
+    }
+
+    assertEquals(0, budget.remaining(), "并发扣减不得丢失更新（这正是普通 int 字段的缺陷）");
   }
 
   /** max-per-tick = 0（配置关闭事件显形）时 remaining 恒为 0，调用方直接放弃。 */

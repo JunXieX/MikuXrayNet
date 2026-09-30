@@ -13,9 +13,11 @@ import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -27,6 +29,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -65,10 +68,21 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   private record SectionKey(int x, int y, int z) {
   }
 
-  /** 每个玩家的待发缓冲。 */
+  /** 方块坐标（用于「本窗口内已立即放行的坐标」做 last-write-wins 判定）。 */
+  record Coord(int x, int y, int z) {
+  }
+
+  /**
+   * 每个玩家的待发缓冲。
+   *
+   * <p><b>已立即放行的坐标</b>（{@link #passed}）：本窗口内经「立即放行」路径先行下发的坐标——
+   * 窗口到期构造合并包前据此把缓冲里的<b>旧状态</b>剔除，避免旧态晚到覆盖先到的新态（方块短暂回退）。
+   * 只在持有该 {@code Pending} 的锁内读写。
+   */
   private static final class Pending {
     private final UUID uuid;
     private final List<Held> held = new ArrayList<>();
+    private final Set<Coord> passed = new HashSet<>();
     private final BlockChangeBatch<WrappedBlockData> batch;
     private ScheduledFuture<?> timer;
     private final AtomicBoolean flushed = new AtomicBoolean();
@@ -331,8 +345,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       return;
     }
     Player player = event.getPlayer();
-    // 权限检查在封包线程执行：依赖权限插件自身线程安全（LuckPerms 支持异步查询，安全）
-    if (player == null || player.hasPermission(Constants.BYPASS_PERMISSION)) {
+    // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API（名单由主/区域线程即时+每 tick 维护）
+    if (player == null || BypassRegistry.isBypassedNow(player.getUniqueId())) {
       return;
     }
 
@@ -350,6 +364,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     // 近身变更立即放行：不登记延迟、不入缓冲，原包按原样流出。
     // 这样玩家自己挖/放方块时的方块更新不会被合并窗口拖延，客户端预测得以立即确认（消除顿感）。
     if (shouldPassThroughImmediately(player.getUniqueId(), updates)) {
+      // 记录本窗口内已立即下发的坐标：合并窗口内可能有同一方块的旧状态仍在缓冲，
+      // 若不剔除会在窗口到期后晚到并把新态覆盖回去（方块短暂回退）。
+      rememberImmediatelyPassed(player.getUniqueId(), updates);
       stats.blockChangesPassed.increment();
       return;
     }
@@ -402,10 +419,33 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
   }
 
+  /**
+   * 记录本窗口内已通过「立即放行」路径下发的坐标（供 {@link #flush} 做 last-write-wins）。
+   *
+   * <p>只在已有待发缓冲时记录：没有缓冲就不可能有会被旧态覆盖的条目。与 {@code flush}
+   * 共用同一把锁，保证「记录」与「冲刷时读取」不交错。
+   */
+  private void rememberImmediatelyPassed(UUID playerId, List<Update<WrappedBlockData>> updates) {
+    Pending target = pending.get(playerId);
+    if (target == null) {
+      return;
+    }
+    synchronized (target) {
+      if (target.flushed.get()) {
+        // 窗口已冲刷：缓冲内容已定型（本次记录再无处生效），跳过
+        return;
+      }
+      for (Update<WrappedBlockData> update : updates) {
+        target.passed.add(new Coord(update.x(), update.y(), update.z()));
+      }
+    }
+  }
+
   /** 冲刷某玩家的缓冲：构造合并包并放行/取消原包。 */
   private void flush(Pending target) {
     List<Held> held;
     List<List<Update<WrappedBlockData>>> clusters;
+    Set<Coord> passed;
     ScheduledFuture<?> timer;
     synchronized (target) {
       // 「是否已冲刷」与缓冲读写共用同一把锁，保证不会边冲刷边追加
@@ -418,6 +458,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       held = new ArrayList<>(target.held);
       target.held.clear();
       clusters = target.batch.drainClusters(config.mergeRadius());
+      // 本窗口内经立即放行先行下发的坐标：缓冲里的同一坐标属旧状态，必须剔除
+      passed = target.passed.isEmpty() ? Set.of() : new HashSet<>(target.passed);
     }
     if (timer != null) {
       timer.cancel(false);
@@ -427,6 +469,34 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
 
     try {
+      if (!passed.isEmpty()) {
+        // 本窗口内有坐标经「立即放行」先行下发：做 last-write-wins——
+        // 合并包只保留未被先行下发的坐标，且原包一律取消（其数据要么已由更新的包交付、
+        // 要么由下方的合并结果交付），绝不把旧状态晚发回去覆盖新态。
+        // 注意：此处不套用「首包保留原包自检」的宽松策略——对新态与旧态同坐标的情形，
+        // 重复下发旧态即等于回退；改为完全信任 {@link #trySendMerged} 的回读自检（失败即 fail-open 放行）。
+        List<List<Update<WrappedBlockData>>> survivors = dropPassed(clusters, passed);
+        boolean anySurvivor = false;
+        for (List<Update<WrappedBlockData>> cluster : survivors) {
+          if (!cluster.isEmpty()) {
+            anySurvivor = true;
+            break;
+          }
+        }
+        if (!anySurvivor || trySendMerged(held.get(0).event.getPlayer(), survivors)) {
+          stats.blockMergeBatches.increment();
+          stats.blockChangesMerged.add(held.size());
+          for (Held entry : held) {
+            entry.event.setCancelled(true);
+            release(entry);
+          }
+          return;
+        }
+        // 构造/发送失败：退回既有 fail-open（原包照常放行，绝不丢更新）
+        stats.blockChangesPassed.add(held.size());
+        return;
+      }
+
       boolean mergeable = false;
       if (held.size() >= 2) {
         for (List<Update<WrappedBlockData>> cluster : clusters) {
@@ -460,6 +530,26 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         release(entry);
       }
     }
+  }
+
+  /**
+   * 从簇中剔除「本窗口已经立即放行过」的坐标（last-write-wins：只保留未被先行下发者）。
+   *
+   * <p>包可见：供离线单测直接驱动该纯逻辑（真实链路依赖 ProtocolLib 封包，离线不可用）。
+   */
+  static List<List<Update<WrappedBlockData>>> dropPassed(
+      List<List<Update<WrappedBlockData>>> clusters, Set<Coord> passed) {
+    List<List<Update<WrappedBlockData>>> survivors = new ArrayList<>(clusters.size());
+    for (List<Update<WrappedBlockData>> cluster : clusters) {
+      List<Update<WrappedBlockData>> kept = new ArrayList<>(cluster.size());
+      for (Update<WrappedBlockData> update : cluster) {
+        if (!passed.contains(new Coord(update.x(), update.y(), update.z()))) {
+          kept.add(update);
+        }
+      }
+      survivors.add(kept);
+    }
+    return survivors;
   }
 
   /** 放行一个被延迟的原包，恰好一次。 */

@@ -102,7 +102,7 @@ public final class ProximityRevealer implements Listener {
   /**
    * 单玩家单周期「候选评估」硬上限（与发包额度解耦）。
    *
-   * <p><b>为什么需要它</b>：旧的循环只在发包额度 {@code budget.remaining <= 0} 时断环，而可见性判定
+   * <p><b>为什么需要它</b>：旧的循环只在发包额度 {@code budget.remaining() <= 0} 时断环，而可见性判定
    * 失败、区块未加载都是直接 {@code return}、<b>不扣发包额度</b>——于是发包额度只限「发了多少包」，
    * 不限「评估了多少候选」。每评估一个候选要在主线程 / 区域线程上读 6 个邻块并行 ≤4 条原生射线，是
    * 本功能最重的部分；一批「永远看不见的坐标」（整块埋住、上方流体等）会把评估量顶到候选上限
@@ -128,13 +128,30 @@ public final class ProximityRevealer implements Listener {
    */
   private static final int SCAN_SHARDS = 4;
 
-  /** 单次巡检的发包额度（非 Folia 为全服合计，Folia 为每个玩家各自的巡检）。 */
-  private static final class Budget {
+  /**
+   * 单次巡检的发包额度（非 Folia 为全服合计，Folia 为每个玩家各自的巡检）。
+   *
+   * <p><b>为什么必须用 {@link AtomicInteger}</b>：非 Folia 的一次巡检里，同一份 {@code Budget} 会被
+   * 多个玩家的异步视锥任务并发持有（{@code workPool.execute} 把后续发包推迟到工作线程 / 玩家线程），
+   * 普通 int 字段的读写无同步、会丢失更新，导致 {@code max-reveals-per-tick} 的「全服合计」语义被突破
+   * （超发若干显形包）。改为原子计数后，扣减不再丢失，「近的先发」的排序与额度上限保持一致。
+   */
+  static final class Budget {
 
-    private int remaining;
+    private final AtomicInteger remaining;
 
-    private Budget(int remaining) {
-      this.remaining = remaining;
+    Budget(int remaining) {
+      this.remaining = new AtomicInteger(remaining);
+    }
+
+    /** 剩余额度（跨线程读取）。 */
+    int remaining() {
+      return remaining.get();
+    }
+
+    /** 扣减一个额度（跨线程安全的原子扣减，不会丢失更新）。 */
+    void decrement() {
+      remaining.decrementAndGet();
     }
   }
 
@@ -370,7 +387,7 @@ public final class ProximityRevealer implements Listener {
     int shard = scanShard();
     Budget budget = new Budget(limit());
     for (Player player : Bukkit.getOnlinePlayers()) {
-      if (budget.remaining <= 0) {
+      if (budget.remaining() <= 0) {
         return;
       }
       try {
@@ -434,7 +451,7 @@ public final class ProximityRevealer implements Listener {
     ProximityScanner.Tally scanTally = new ProximityScanner.Tally();
     List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex,
         revealedSet, player.getUniqueId(), worldName, location.getBlockX(), location.getBlockY(),
-        location.getBlockZ(), proximity.distance(), fetchLimit(budget.remaining), shard,
+        location.getBlockZ(), proximity.distance(), fetchLimit(budget.remaining()), shard,
         SCAN_SHARDS, scanTally);
     if (candidates.isEmpty()) {
       return;
@@ -534,7 +551,7 @@ public final class ProximityRevealer implements Listener {
 
     if (candidates != null) {
       for (ObfuscatedChunkIndex.Position position : candidates) {
-        if (budget.remaining <= 0 || evaluationsLeft <= 0) {
+        if (budget.remaining() <= 0 || evaluationsLeft <= 0) {
           break;
         }
         sendOne(player, world, position.x(), position.y(), position.z(), eye, budget, tally, batch);
@@ -550,7 +567,7 @@ public final class ProximityRevealer implements Listener {
 
     int count = plan.count();
     for (int i = 0; i < count; i++) {
-      if (budget.remaining <= 0 || evaluationsLeft <= 0) {
+      if (budget.remaining() <= 0 || evaluationsLeft <= 0) {
         break;
       }
       sendOne(player, world, plan.coordinates[i * 3], plan.coordinates[i * 3 + 1],
@@ -602,7 +619,7 @@ public final class ProximityRevealer implements Listener {
     if (batch != null) {
       // 批量模式：先累积，周期末由 flushBatch 一次发出并在成功后才写入「已显形」标记
       batch.add(x, y, z, data);
-      budget.remaining--;
+      budget.decrement();
       return;
     }
 
@@ -610,7 +627,7 @@ public final class ProximityRevealer implements Listener {
       markRevealed(player, world, x, y, z);
       stats.revealsSent.increment();
       tally.sent++;
-      budget.remaining--;
+      budget.decrement();
     } else {
       stats.revealsSkipped.increment();
     }
@@ -898,7 +915,7 @@ public final class ProximityRevealer implements Listener {
       UUID playerId = player.getUniqueId();
       long tick = Bukkit.getCurrentTick();
       Budget budget = new Budget(instantQuota.remaining(playerId, tick, instant.maxPerTick()));
-      if (budget.remaining <= 0) {
+      if (budget.remaining() <= 0) {
         return;
       }
 
@@ -907,7 +924,7 @@ public final class ProximityRevealer implements Listener {
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
       String liveWorld = world.getName();
       for (int[] offset : instantOffsets(radius)) {
-        if (budget.remaining <= 0) {
+        if (budget.remaining() <= 0) {
           break;
         }
         int x = cx + offset[0];
@@ -919,7 +936,7 @@ public final class ProximityRevealer implements Listener {
         sendOne(player, world, x, y, z, eye, budget, tally, batch);
       }
       flushBatch(player, batch, tally);
-      instantQuota.setRemaining(playerId, tick, Math.max(0, budget.remaining));
+      instantQuota.setRemaining(playerId, tick, Math.max(0, budget.remaining()));
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }

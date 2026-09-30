@@ -8,6 +8,7 @@ import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.reflect.StructureModifier;
 import com.comphenix.protocol.wrappers.BlockPosition;
+import io.papermc.paper.event.player.AsyncChatEvent;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -15,6 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Location;
 import org.bukkit.entity.Player;
@@ -22,6 +24,8 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerAnimationEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -31,12 +35,21 @@ import org.bukkit.plugin.Plugin;
 /**
  * AFK 降级：跟踪玩家活动，长时间无操作即视为 AFK，对 AFK 玩家按距离丢弃「低价值」出站包。
  *
- * <p>活动跟踪使用 {@link PlayerMoveEvent}，并以「方块坐标是否变化」过滤高频事件，
- * 保证空闲时几乎零开销；一旦发生有效移动立即退出 AFK。
+ * <p><b>活动来源（低成本，均只做状态标记）</b>：
+ * <ul>
+ *   <li>跨方块移动（{@link PlayerMoveEvent}，以「方块坐标是否变化」过滤高频事件，空闲时几乎零开销）；
+ *   </li>
+ *   <li>跨方块传送（{@link PlayerTeleportEvent}）；</li>
+ *   <li>角落交互（{@link PlayerInteractEvent}：开箱/开门/使用物品）——原地操作也算活动；</li>
+ *   <li>挥手（{@link PlayerAnimationEvent}：攻击/挖掘/空挥）——原地打怪/挖矿也算活动；</li>
+ *   <li>聊天（{@link AsyncChatEvent}，异步事件，仅做状态标记）。</li>
+ * </ul>
+ * 后三类直接解决「原地聊天/开箱/打怪被误判为 AFK，导致粒子/动画被丢」的问题；它们都只更新
+ * {@link AfkState} 的存活时间与 AFK 标志（volatile 字段，任意线程安全），不触碰任何实体状态，
+ * 因此符合 Folia「worker 与网络线程不触碰实体」的要求。
  *
- * <p>距离判定所需的玩家位置来自状态缓存（在主线程刷新），因此封包线程无需访问实体位置，
- * 符合 Folia「worker 与网络线程不触碰实体」的要求。默认丢弃的包类型保守且数量少：
- * 世界粒子与方块破坏动画。
+ * <p>距离判定所需的玩家位置来自状态缓存（在主线程刷新），因此封包线程无需访问实体位置。
+ * 默认丢弃的包类型保守且数量少：世界粒子与方块破坏动画。
  */
 public final class AfkTracker implements Listener {
 
@@ -137,6 +150,40 @@ public final class AfkTracker implements Listener {
         to.getX(), to.getY(), to.getZ());
   }
 
+  /** 交互（开箱 / 开门 / 使用物品）也算活动：原地操作不应被判为 AFK，否则粒子/动画会被丢。 */
+  @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+  public void onInteract(PlayerInteractEvent event) {
+    markActive(event.getPlayer());
+  }
+
+  /** 挥手（攻击 / 挖掘 / 空挥）也算活动：原地打怪/挖矿不应被判为 AFK。 */
+  @EventHandler(priority = EventPriority.MONITOR)
+  public void onAnimation(PlayerAnimationEvent event) {
+    markActive(event.getPlayer());
+  }
+
+  /**
+   * 聊天也算活动：原地打字不应被判为 AFK。该事件是<b>异步</b>触发的，这里只做状态标记
+   * （volatile 字段写入），不触碰任何实体/世界 API，符合线程纪律。
+   */
+  @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+  public void onChat(AsyncChatEvent event) {
+    markActive(event.getPlayer());
+  }
+
+  /**
+   * 低成本活动标记：只刷新存活时间并退出 AFK，<b>不改动缓存坐标</b>（玩家并未移动）。
+   *
+   * <p>这些事件落在玩家所属线程（主线程 / 区域线程），{@link AfkState} 字段为 volatile，写入安全；
+   * 只是状态标记，不触碰任何实体状态或 Bukkit 世界 API。
+   */
+  private void markActive(Player player) {
+    AfkState state = states.get(player.getUniqueId());
+    if (state != null) {
+      state.touch(System.currentTimeMillis(), false, 0, 0, 0, 0.0D, 0.0D, 0.0D);
+    }
+  }
+
   private void remember(Player player) {
     Location location = player.getLocation();
     states.put(player.getUniqueId(), new AfkState(System.currentTimeMillis(),
@@ -162,8 +209,8 @@ public final class AfkTracker implements Listener {
       return;
     }
     Player player = event.getPlayer();
-    // 权限检查在封包线程执行：依赖权限插件自身线程安全（LuckPerms 支持异步查询，安全）
-    if (player.hasPermission(Constants.BYPASS_PERMISSION)) {
+    // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API
+    if (BypassRegistry.isBypassedNow(player.getUniqueId())) {
       return;
     }
     AfkState state = states.get(player.getUniqueId());
@@ -218,14 +265,17 @@ public final class AfkTracker implements Listener {
           + squared(position.getZ() + 0.5D - playerZ);
     }
 
-    // 世界粒子：位置为 double（旧版本可能为 float），读不到即放行
+    // 世界粒子：位置为 x/y/z 三个 double（偏移/速度/数量都是 float）。刻意要求「恰好 3 个 double」，
+    // 而不是「>= 3 就取前三个」——后者在字段布局变化（多出/错位 double 字段）时会误取坐标并误判距离。
+    // 数量不符即视为无法确定字段序，直接放行（返回 NaN），绝不误取。
     StructureModifier<Double> doubles = packet.getSpecificModifier(double.class);
-    if (doubles.size() >= 3) {
+    if (doubles.size() == 3) {
       return squared(doubles.read(0) - playerX) + squared(doubles.read(1) - playerY)
           + squared(doubles.read(2) - playerZ);
     }
+    // 旧版本可能以 float 承载位置：同样要求恰好 3 个
     StructureModifier<Float> floats = packet.getSpecificModifier(float.class);
-    if (floats.size() >= 3) {
+    if (floats.size() == 3) {
       return squared(floats.read(0) - playerX) + squared(floats.read(1) - playerY)
           + squared(floats.read(2) - playerZ);
     }

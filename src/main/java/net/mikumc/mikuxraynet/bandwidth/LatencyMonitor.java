@@ -22,6 +22,11 @@ import org.bukkit.plugin.Plugin;
  *
  * <p>视距的读写与还原全部在玩家所属线程执行（统一走每个玩家一条实体调度任务：Paper 上落在主线程，
  * Folia 上落在区域线程）；原始视距只存内存，玩家退出即清理，插件停用时统一还原。
+ *
+ * <p><b>读写必须成对</b>：本类只动「send 视距」（{@code getSendViewDistance()} /
+ * {@code setSendViewDistance()}）—— Paper 上 {@code view-distance} 与 {@code send-view-distance}
+ * 是两个独立配置。旧实现「读 send、写 view」会在一次降级+还原后把玩家的 {@code view-distance}
+ * 永久改成原 send 值（服主把 send 配得低于 view 时尤其明显），故读写与还原统一到 send 这一对。
  */
 public final class LatencyMonitor implements Listener {
 
@@ -130,6 +135,8 @@ public final class LatencyMonitor implements Listener {
 
   private void reduce(Player player) {
     try {
+      // 读的必须是 send 视距：与下面写入、以及 restore 的还原严格配对，
+      // 否则一次降级+还原会把 view-distance 永久改成原 send 值（见类注释）
       int current = player.getSendViewDistance();
       if (current <= config.minViewDistance()) {
         return;
@@ -138,8 +145,14 @@ public final class LatencyMonitor implements Listener {
       if (target >= current) {
         return;
       }
+      // setSendViewDistance 要求目标 ≤ 玩家当前 view-distance（且落在 [2,32]）：超出就钳到合法范围，
+      // 而不是交给它抛异常（catch 仅作最后兜底）。
+      target = Math.max(2, Math.min(target, player.getViewDistance()));
+      if (target >= current) {
+        return;
+      }
       originalViewDistance.put(player.getUniqueId(), current);
-      player.setViewDistance(target);
+      player.setSendViewDistance(target);
       stats.viewDistanceReduced.increment();
     } catch (Throwable throwable) {
       // 视距调整失败不影响其它功能
@@ -153,7 +166,8 @@ public final class LatencyMonitor implements Listener {
       return;
     }
     try {
-      player.setViewDistance(original);
+      // 与 reduce 配对：还原也写 send 视距（originalViewDistance 记录的正是原 send 值）
+      player.setSendViewDistance(original);
       stats.viewDistanceRestored.increment();
     } catch (Throwable throwable) {
       plugin.getLogger().fine("还原视距失败：" + throwable.getMessage());
@@ -169,14 +183,15 @@ public final class LatencyMonitor implements Listener {
       }
       int original = entry.getValue();
       // 一律回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
-      Schedulers.onEntity(plugin, player, () -> setViewDistance(player, original));
+      Schedulers.onEntity(plugin, player, () -> setSendViewDistance(player, original));
     }
     originalViewDistance.clear();
   }
 
-  private void setViewDistance(Player player, int distance) {
+  /** 与 {@link #reduce} 配对地还原 send 视距（停用兜底路径）。 */
+  private void setSendViewDistance(Player player, int distance) {
     try {
-      player.setViewDistance(distance);
+      player.setSendViewDistance(distance);
       stats.viewDistanceRestored.increment();
     } catch (Throwable throwable) {
       plugin.getLogger().fine("还原视距失败：" + throwable.getMessage());

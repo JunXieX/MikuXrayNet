@@ -27,7 +27,7 @@ main: net.mikumc.mikuxraynet.MikuXrayNet
 api-version: '26.2'
 authors:
   - JunXieX
-description: MikuMC 服务器原创插件
+description: MikuMC 服务器原创插件｜作者 JunXieX｜交流群 1105054380
 # 默认即 POSTWORLD，此处显式写出以表明本插件不在 STARTUP 阶段加载（与 plugin.yml 行为一致）。
 load: POSTWORLD
 

@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider.ChunkLoadedCheck;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider.ColumnTopQuery;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider.OcclusionQuery;
@@ -99,6 +100,49 @@ class NeighborChunkProviderTest {
 
     provider.invalidateWorld("world");
     assertNull(provider.cached("world", 4, 7), "世界卸载后必须整体失效");
+  }
+
+  /** 快照带写时 TTL：窗口内命中，超过 TTL 后按未命中（不再永久缓存陈旧边界判定）。 */
+  @Test
+  void cachedSnapshotExpiresAfterTtl() {
+    AtomicLong clock = new AtomicLong(0L);
+    NeighborChunkProvider provider = new NeighborChunkProvider(8, 1000L, clock::get);
+    ChunkLoadedCheck loaded = (chunkX, chunkZ) -> true;
+
+    NeighborEdges first = provider.capture("world", 0, HEIGHT, 4, 7, loaded, QUERY, UNBOUNDED);
+    assertSame(first, provider.cached("world", 4, 7), "TTL 窗口内应命中");
+
+    clock.set(1_000_000_000L); // 距写入恰好 1000 ms = TTL，视为过期
+    assertNull(provider.cached("world", 4, 7), "超过 TTL 后按未命中（不再永久缓存）");
+
+    NeighborEdges refreshed = provider.capture("world", 0, HEIGHT, 4, 7, loaded, QUERY, UNBOUNDED);
+    assertSame(refreshed, provider.cached("world", 4, 7), "过期后重抓应回到命中");
+  }
+
+  /**
+   * 含 null 平面（邻块未加载）的快照在 TTL 过期后必须重建：邻块随后加载时缺失平面要补回，
+   * 而不是被永久缓存（这正是报告里「边界遮挡判定长期失真」的根因）。
+   */
+  @Test
+  void staleMissingPlaneSnapshotIsRefreshedAfterTtl() {
+    AtomicLong clock = new AtomicLong(0L);
+    NeighborChunkProvider provider = new NeighborChunkProvider(8, 500L, clock::get);
+
+    // 第一次：X_PLUS 邻块 (5,7) 未加载 → 该平面为 null
+    NeighborEdges first = provider.capture("world", 0, HEIGHT, 4, 7,
+        (chunkX, chunkZ) -> !(chunkX == 5 && chunkZ == 7), QUERY, UNBOUNDED);
+    assertFalse(first.has(Side.X_PLUS), "未加载的邻块对应平面缺失");
+
+    // 邻块现已加载，但快照仍在 TTL 内 → 复用旧快照（缺失平面暂存，属预期）
+    NeighborEdges withinWindow = provider.capture("world", 0, HEIGHT, 4, 7,
+        (chunkX, chunkZ) -> true, QUERY, UNBOUNDED);
+    assertSame(first, withinWindow, "TTL 窗口内直接复用缓存");
+
+    // TTL 过期后重抓 → 缺失平面被补齐
+    clock.set(500_000_000L);
+    NeighborEdges refreshed = provider.capture("world", 0, HEIGHT, 4, 7,
+        (chunkX, chunkZ) -> true, QUERY, UNBOUNDED);
+    assertTrue(refreshed.has(Side.X_PLUS), "TTL 过期后缺失平面必须重抓补齐（不再被永久缓存）");
   }
 
   @Test

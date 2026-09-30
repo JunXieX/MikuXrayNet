@@ -186,10 +186,6 @@ public final class ObfuscationProcessor {
           + " 种 → " + resolvedTargets);
 
       int[][] fallback = weightedTable(effective.replacementWeights(), logger, label);
-      if (fallback[0].length == 0 && !effective.replacementBands().isEmpty()) {
-        logger.warning(label + "的 replacement-weights 未解析到任何有效伪装方块（仅有分区段可用，"
-            + "未被分区覆盖的高度将不伪装，请检查伪装方块名称）");
-      }
 
       // band 表构建：无有效候选的段直接丢弃，使该高度回落下一覆盖段或回落表（运行期无需空表分支）
       List<AntiXrayConfig.ReplacementBand> validBands = new ArrayList<>();
@@ -214,6 +210,22 @@ public final class ObfuscationProcessor {
         bandMaxY[i] = band.maxY();
         bandIds[i] = validTables.get(i)[0];
         bandCum[i] = validTables.get(i)[1];
+      }
+
+      // 构建期校验（一次性 WARN）：只配了分区段、回落表为空，且分区段未完整覆盖高度。
+      // 这些「未被任何分区段覆盖」的高度上的目标方块运行期会跳过伪装（见 rewrite），
+      // 因此必须显式告知用户「哪些高度将不伪装」——否则就是「该藏的没藏住」且无人察觉。
+      if (fallback[0].length == 0 && bandCount > 0) {
+        String uncovered = uncoveredHeightRanges(bandMinY, bandMaxY, effective.minY(), effective.maxY());
+        boolean rangeKnown = effective.minY() != Integer.MIN_VALUE
+            && effective.maxY() != Integer.MAX_VALUE;
+        // 仅在「覆盖可证不完整」或「无法验证覆盖是否完整」时告警：可证完整（区间已知且无缺口）不告警
+        if (!rangeKnown || !uncovered.isEmpty()) {
+          logger.warning(label + "的 replacement-weights 未解析到任何有效伪装方块，且分区段未完整覆盖高度"
+              + (uncovered.isEmpty() ? "" : "（未覆盖 " + uncovered + "）")
+              + "：这些高度上的目标方块将不伪装（运行期跳过该方块，而不是整块放行）。"
+              + "请检查伪装方块名称，或补全分区段/回落表");
+        }
       }
 
       if (effective.minY() > effective.maxY()) {
@@ -253,6 +265,48 @@ public final class ObfuscationProcessor {
         cum = Arrays.copyOf(cum, index);
       }
       return new int[][] {ids, cum};
+    }
+
+    /**
+     * 计算「未被任何分区段覆盖、且回落表为空时不会伪装」的高度区间（构建期一次性诊断用）。
+     *
+     * <p>返回中文可读串（如 {@code y=-63..-1、y=321}）；高度范围未限定（哨兵值）时无法给出具体
+     * 区间，返回空串（此时调用方仍会给出通用告警）。
+     */
+    private static String uncoveredHeightRanges(int[] bandMinY, int[] bandMaxY, int minY, int maxY) {
+      if (minY == Integer.MIN_VALUE || maxY == Integer.MAX_VALUE || minY > maxY) {
+        return "";
+      }
+      StringBuilder sb = new StringBuilder();
+      int cursor = minY;
+      while (cursor <= maxY) {
+        int coverEnd = Integer.MIN_VALUE;
+        int nextStart = Integer.MAX_VALUE;
+        for (int b = 0; b < bandMinY.length; b++) {
+          if (cursor >= bandMinY[b] && cursor <= bandMaxY[b]) {
+            coverEnd = Math.max(coverEnd, bandMaxY[b]);
+          } else if (bandMinY[b] > cursor) {
+            nextStart = Math.min(nextStart, bandMinY[b]);
+          }
+        }
+        if (coverEnd != Integer.MIN_VALUE) {
+          if (coverEnd >= maxY) {
+            break;
+          }
+          cursor = coverEnd + 1;
+          continue;
+        }
+        int end = Math.min(maxY, nextStart == Integer.MAX_VALUE ? maxY : nextStart - 1);
+        if (sb.length() > 0) {
+          sb.append('、');
+        }
+        sb.append(end == cursor ? "y=" + cursor : "y=" + cursor + ".." + end);
+        if (end >= maxY) {
+          break;
+        }
+        cursor = end + 1;
+      }
+      return sb.toString();
     }
   }
 
@@ -642,6 +696,13 @@ public final class ObfuscationProcessor {
             }
           }
           if (replacement < 0) {
+            if (cum.length == 0 || ids.length == 0) {
+              // 该高度未被任何分区段覆盖、回落表也为空（缺省配置失误）：跳过这一块的伪装，
+              // 而不是让 pick() 以 cum[-1] 抛 AIOOBE——后者会被本方法外层 catch 成整区块 fail-open
+              // （原字节原样放行），等于把这个区块里「本应伪装」的矿全部裸露给透视端。
+              // 红线：宁可少伪装这一块，绝不因异常整块裸露。
+              continue;
+            }
             if (layerObfuscation) {
               int y = baseY | (index >> 8 & 15);
               if (layerY != y) {

@@ -8,6 +8,11 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -107,5 +112,112 @@ class ProtocolLibAsyncListenerBatchTest {
     assertSame(second, table.get(player));
     assertTrue(first != second, "重新打开批次必须换新闸门（旧闸门随 FINISHED 释放）");
     assertEquals(1, table.size());
+  }
+
+  // ---------------------------------------------------------- 取闸门 + 登记 原子性（任务 3）
+
+  /**
+   * 顺序用例：{@code acquire}（取闸门 + 登记）先于 FINISHED 时，FINISHED 必须等该区块改写完成才放行。
+   * 修复前 {@code get} 与 {@code chunkStarted} 分离，这里会出现「取到闸门但尚未登记 → pending=0 →
+   * FINISHED 提前放行」的窗口。
+   */
+  @Test
+  void acquireRegistersChunkBeforeFinishCanRelease() {
+    ProtocolLibAsyncListener.BatchTable table = new ProtocolLibAsyncListener.BatchTable(4);
+    UUID player = UUID.nameUUIDFromBytes("p".getBytes());
+    table.open(player);
+
+    // 模拟 handleChunk：取闸门 + 登记在一次原子操作里完成
+    ChunkBatchGate gate = table.acquire(player);
+    assertNotNull(gate);
+
+    // CHUNK_BATCH_FINISHED 到达：remove + finish
+    AtomicInteger releases = new AtomicInteger();
+    ChunkBatchGate removed = table.remove(player);
+    assertSame(gate, removed, "FINISHED 应取到同一闸门");
+    removed.finish(releases::incrementAndGet);
+
+    assertEquals(0, releases.get(), "已登记的区块未完成前不得放行 FINISHED（修复前这里会被提前放行）");
+    gate.chunkDone();
+    assertEquals(1, releases.get(), "改写完成后恰好放行一次");
+  }
+
+  /** FINISHED 已先取走闸门时，{@code acquire} 返回 null：该区块不再登记，按无批次处理。 */
+  @Test
+  void acquireReturnsNullWhenFinishAlreadyTookTheGate() {
+    ProtocolLibAsyncListener.BatchTable table = new ProtocolLibAsyncListener.BatchTable(4);
+    UUID player = UUID.nameUUIDFromBytes("q".getBytes());
+    table.open(player);
+    table.remove(player);
+
+    assertNull(table.acquire(player), "闸门已被 FINISHED 取走：不得再登记");
+  }
+
+  /** 并发用例：{@code acquire} 与 FINISHED（remove + finish）并发时仍必须「恰好放行一次」。 */
+  @Test
+  void acquireRacesFinishButReleasesExactlyOnce() throws Exception {
+    ExecutorService pool = Executors.newFixedThreadPool(2);
+    try {
+      for (int round = 0; round < 300; round++) {
+        ProtocolLibAsyncListener.BatchTable table = new ProtocolLibAsyncListener.BatchTable(4);
+        UUID player = UUID.nameUUIDFromBytes(("r" + round).getBytes());
+        table.open(player);
+        AtomicInteger releases = new AtomicInteger();
+        CountDownLatch go = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(2);
+
+        pool.execute(() -> {
+          awaitQuietly(go);
+          ChunkBatchGate gate = table.acquire(player);
+          if (gate != null) {
+            gate.chunkDone();
+          }
+          done.countDown();
+        });
+        pool.execute(() -> {
+          awaitQuietly(go);
+          ChunkBatchGate gate = table.remove(player);
+          if (gate != null) {
+            gate.finish(releases::incrementAndGet);
+          }
+          done.countDown();
+        });
+
+        go.countDown();
+        assertTrue(done.await(5, TimeUnit.SECONDS), "并发用例不得超时");
+        assertEquals(1, releases.get(), "并发取闸门/FINISHED 也必须恰好放行一次（不早放、不重复）");
+      }
+    } finally {
+      pool.shutdownNow();
+      pool.awaitTermination(5, TimeUnit.SECONDS);
+    }
+  }
+
+  private static void awaitQuietly(CountDownLatch latch) {
+    try {
+      latch.await();
+    } catch (InterruptedException exception) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  // ---------------------------------------------------------- 失败结果不入缓存（任务 2）
+
+  /** 失败结果（解码/重编码异常）绝不允许写入内存/磁盘缓存；正常与未改动结果照常可缓存。 */
+  @Test
+  void failedResultIsNeverCacheable() {
+    ObfuscationProcessor.Result failed =
+        new ObfuscationProcessor.Result(new byte[] {1}, new int[0], "boom", null);
+    assertTrue(failed.failed());
+    assertFalse(ProtocolLibAsyncListener.resultCacheable(failed),
+        "失败结果不得写入任何一级缓存（否则瞬时故障被固化，同指纹区块不再重试改写）");
+
+    ObfuscationProcessor.Result unchanged =
+        new ObfuscationProcessor.Result(new byte[] {1}, new int[0], null, null);
+    assertTrue(ProtocolLibAsyncListener.resultCacheable(unchanged), "未改动结果照常可缓存");
+
+    ObfuscationProcessor.Result changed =
+        new ObfuscationProcessor.Result(new byte[] {2}, new int[] {1}, null, null);
+    assertTrue(ProtocolLibAsyncListener.resultCacheable(changed), "改写结果照常可缓存");
   }
 }

@@ -351,6 +351,33 @@ class EntityCullerTest {
     assertEquals(0, culler.hiddenCount());
   }
 
+  /**
+   * 运行期获得 {@code mikuxraynet.bypass} 的玩家：周期复检必须立即恢复其<b>全部</b>已隐藏实体，
+   * 且不再提交任何射线复检——否则中途授权的玩家看不到被隐藏的实体（缺陷：bypass 只在 onTrack 查一次）。
+   */
+  @Test
+  void recheckRestoresAllHiddenEntitiesForBypassedPlayer() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler = newCuller(stats, 12);
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub first = new EntityStub(6101, world);
+    EntityStub second = new EntityStub(6102, world);
+
+    culler.evaluate(player.proxy(), first.proxy(), true);
+    culler.evaluate(player.proxy(), second.proxy(), true);
+    assertEquals(2, culler.hiddenCount());
+    long submittedBefore = stats.recheckSubmitted.sum();
+
+    // 运行期授予直通权限 → 复检路径必须查权限并恢复可见
+    player.bypass = true;
+    culler.recheck(player.proxy());
+
+    assertEquals(0, culler.hiddenCount(), "获得直通权限后账本必须清空（实体恢复可见）");
+    assertEquals(2, player.showCalls.get(), "必须对每个被隐藏实体下发 showEntity");
+    assertEquals(submittedBefore, stats.recheckSubmitted.sum(), "直通玩家不再提交任何射线复检");
+  }
+
   /** 红线：射线 / 世界读取失败（异常）时不得隐藏，实体保持可见。 */
   @Test
   void failedBlockReadKeepsEntityVisible() {
@@ -429,6 +456,8 @@ class EntityCullerTest {
     /** 位置与 {@link EntityStub} 的默认位置不同，但坐标本身不重要（只用于距离比较）。 */
     private final Location location = new Location(null, 0.5D, 65.0D, 0.5D);
     private volatile boolean online = true;
+    /** 是否持有 {@code mikuxraynet.bypass} 权限（复检直通恢复回归用）。 */
+    private volatile boolean bypass;
 
     Player proxy() {
       return proxy;
@@ -447,7 +476,7 @@ class EntityCullerTest {
       return switch (method.getName()) {
         case "getUniqueId" -> id;
         case "isOnline" -> online;
-        case "hasPermission" -> false;
+        case "hasPermission" -> bypass;
         case "getLocation", "getEyeLocation" -> location;
         case "hideEntity" -> null;
         case "showEntity" -> {

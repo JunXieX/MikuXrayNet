@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
@@ -73,15 +74,11 @@ public final class EntityCuller implements Listener {
   private final ConcurrentHashMap<UUID, Map<Integer, Entity>> hidden = new ConcurrentHashMap<>();
   /** 玩家 → 该玩家当前追踪的实体轮转队列（周期复检切分片用，见 {@link TrackedRotation}）。 */
   private final ConcurrentHashMap<UUID, TrackedRotation> rotations = new ConcurrentHashMap<>();
-  /** 正在计算的 (玩家, 实体) 组合，避免重复排队。 */
-  private final Set<RayKey> inFlight = ConcurrentHashMap.newKeySet();
-
-  /** 在途射线判定的键（玩家 + 实体）：用记录键，省掉每次提交拼接字符串的分配。 */
-  private record RayKey(UUID playerId, int entityId) {
-  }
 
   /** 每个在线玩家的周期复检任务（Paper 与 Folia 同一套实体调度器；玩家退出即随实体退役失效）。 */
   private final ConcurrentHashMap<UUID, ScheduledTask> recheckTasks = new ConcurrentHashMap<>();
+  /** 「停用时恢复失败」的中文 WARN 一次性闸门。 */
+  private final AtomicBoolean restoreFailureNoticed = new AtomicBoolean();
 
   public EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats) {
     this(plugin, config, stats, EntityCuller::ownedByCurrentRegion);
@@ -138,7 +135,6 @@ public final class EntityCuller implements Listener {
     cancelRecheckTasks();
     HandlerList.unregisterAll(this);
     restoreAll();
-    inFlight.clear();
     rotations.clear();
   }
 
@@ -154,16 +150,23 @@ public final class EntityCuller implements Listener {
   public void onQuit(PlayerQuitEvent event) {
     Player player = event.getPlayer();
     cancelRecheckTask(player.getUniqueId());
+    restorePlayer(player);
+    rotations.remove(player.getUniqueId());
+  }
+
+  /**
+   * 恢复某玩家当前被隐藏的全部实体并清空其账本（玩家退出 / 复检发现直通时使用）。
+   *
+   * <p>Folia：这些实体可能已随玩家走远/传送落在别的区域，读它们的状态会触发 TickThread 校验
+   * （先打 ERROR 再抛），因此先问归属，跨区域者直接跳过（随后由其所在区域自然退役）。
+   */
+  private void restorePlayer(Player player) {
     for (Entity entity : drainPlayer(player.getUniqueId()).values()) {
-      // Folia：玩家退出时其隐藏列表里的实体可能已随玩家走远/传送落在别的区域，读它们的状态会触发
-      // TickThread 校验（先打 ERROR 再抛），因此先问归属，跨区域者直接跳过（该实体随后由所在区域自然退役）。
       if (!owns(entity)) {
         continue;
       }
       show(player, entity);
     }
-    rotations.remove(player.getUniqueId());
-    purgeInFlight(player.getUniqueId());
   }
 
   /**
@@ -275,6 +278,14 @@ public final class EntityCuller implements Listener {
     }
     UUID playerId = player.getUniqueId();
 
+    // 运行期获得直通权限：立即恢复该玩家所有已隐藏实体，否则它们会一直保持隐藏直到重登
+    // （此前 bypass 只在 onTrack 查一次，复检不查 → 中途授权的玩家看不到被隐藏的实体）。
+    // 复检运行在玩家所属线程，此处读权限是安全的 Bukkit 调用。
+    if (player.hasPermission(Constants.BYPASS_PERMISSION)) {
+      restorePlayer(player);
+      return;
+    }
+
     // ① 已隐藏实体：每周期全量复检（既有行为）。
     //    用「键（加入时捕获的 entityId）+ 归属判定」遍历：玩家走远/传送后这些实体可能已在别的区域，
     //    读它们的任何状态都会触发 Folia 线程校验（先打 ERROR 再抛异常），因此先问能不能碰，不能则整轮跳过。
@@ -337,10 +348,6 @@ public final class EntityCuller implements Listener {
     if (entity instanceof Firework) {
       return;
     }
-    RayKey key = new RayKey(player.getUniqueId(), entity.getEntityId());
-    if (!inFlight.add(key)) {
-      return;
-    }
     try {
       // 强制可见距离内一律不剔除——复检通道同样适用，避免轮转复检把近处实体误藏。
       // 注：这里刻意保留 Location#distanceSquared（而非零分配 getter 版）：它对「任一 Location 无世界」
@@ -355,8 +362,6 @@ public final class EntityCuller implements Listener {
     } catch (Throwable throwable) {
       // 任意失败都按「保持可见」处理（fail-open：绝不误藏实体）
       logThrottled(throwable);
-    } finally {
-      inFlight.remove(key);
     }
   }
 
@@ -537,13 +542,7 @@ public final class EntityCuller implements Listener {
       }
       for (Entity entity : drained.values()) {
         // 一律回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
-        Schedulers.onEntity(plugin, player, () -> {
-          // 同上：跨区域实体（玩家走远/传送后已在别的区域）不得读取状态，先问归属再恢复
-          if (!owns(entity)) {
-            return;
-          }
-          show(player, entity);
-        });
+        Schedulers.onEntity(plugin, player, () -> restoreWithRetry(player, entity, true));
       }
     }
     // 离线玩家（停用时已不在线）的登记一并丢弃：它们已随退出被恢复，这里只兜底清账本
@@ -551,16 +550,33 @@ public final class EntityCuller implements Listener {
   }
 
   /**
-   * 清掉某玩家的全部「在途计算」标记。
+   * 停用瞬间恢复单个被隐藏实体：失败时做一次重试，再次失败则记一次中文 WARN——
+   * 绝不静默吞掉（旧实现下被隐藏实体可能保持隐藏到玩家重登，管理员无从察觉）。
    *
-   * <p><b>覆盖面说明（无泄漏路径）</b>：{@code inFlight} 的键是（玩家 UUID, 实体 id）记录，
-   * 玩家退役（退出）时本方法由 {@link #onQuit} 调用，把该玩家所有在途键一并摘除——即使某个
-   * 射线计算还悬在工作队列里，回调执行时也只会做一次多余的 {@code remove}（幂等），不会累积。
-   * 实体侧的退役（死亡/卸载）不产生键泄漏：键以玩家为前缀，玩家退出时已整体清理；
-   * 插件停用时 {@link #stop} 的 {@code inFlight.clear()} 兜底清空。
+   * <p>注意 {@link #show} 内部已捕获异常并返回 {@code false}，所以这里以「返回值」判断成败；
+   * 实体跨区域（{@code owns} 为 false）或已失效时无需恢复，视为成功。
+   *
+   * @param allowRetry 是否还允许再调度一次重试（只重试一次，避免失败时无限重排）
    */
-  private void purgeInFlight(UUID playerId) {
-    inFlight.removeIf(key -> key.playerId().equals(playerId));
+  private void restoreWithRetry(Player player, Entity entity, boolean allowRetry) {
+    boolean restored;
+    try {
+      restored = !owns(entity) || show(player, entity) || !entity.isValid();
+    } catch (Throwable throwable) {
+      restored = false;
+    }
+    if (restored) {
+      return;
+    }
+    if (allowRetry) {
+      // 按玩家区域调度一次重试（停用瞬间的实体/世界可能尚未稳定）
+      Schedulers.onEntity(plugin, player, () -> restoreWithRetry(player, entity, false));
+      return;
+    }
+    if (restoreFailureNoticed.compareAndSet(false, true)) {
+      plugin.getLogger().warning("插件停用时恢复被隐藏实体失败（已重试一次）："
+          + "个别实体可能需玩家重新登录后才可见；不影响其它功能。");
+    }
   }
 
   /** 本线程是否可以安全读取该实体的状态；判定本身异常时按「可以」处理（退回改动前行为）。 */

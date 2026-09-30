@@ -47,6 +47,31 @@ class ChunkPacketAccessorFilterTest {
         "相对 Y 为负（世界最低高度以下）不得命中");
   }
 
+  /**
+   * packedXZ 的 byte 高位形态必须被掩回无符号（回归 P1：byte 字段 0xF0 作为有符号数读出为 -16，
+   * 直接 {@code >> 4} 会符号扩展成负 sectionX，该 section 的方块实体永远剔不掉）。
+   */
+  @Test
+  void packedXzKeepsHighBitOfByteUnsigned() {
+    // byte 字段 0xF0 有符号读出为 -16：直接右移即得到错误的负 sectionX（旧实现）
+    int signed = (byte) 0xF0;
+    assertEquals(-16, signed, "前置：byte 0xF0 按有符号读出为 -16");
+    assertEquals(-1, signed >> 4, "旧实现：符号扩展把 sectionX 变成 -1（永远匹配不上清单）");
+
+    // 掩码后只取低 8 位：sectionX=15、sectionZ=0，且对 int/short 形态同样成立
+    int normalized = ChunkPacketAccessor.normalizePackedXz(signed);
+    assertEquals(0xF0, normalized);
+    assertEquals(15, normalized >> 4, "sectionX 必须是 15，不得符号扩展");
+    assertEquals(0, normalized & 0x0F, "sectionZ 必须是 0");
+    assertEquals(0xF0, ChunkPacketAccessor.normalizePackedXz(0x1F0), "int 形态同样只取低 8 位");
+    assertEquals(0xF0, ChunkPacketAccessor.normalizePackedXz((short) 0xF0), "short 形态同样只取低 8 位");
+
+    // 与纯判定函数联动：该 section 必须能命中清单（旧实现因 sectionX=-1 而漏剔）
+    int[] positions = {1 << 8 | 0 << 4 | 15};
+    assertTrue(ChunkPacketAccessor.isObfuscated(1, normalized >> 4, normalized & 0x0F, positions),
+        "x=15/z=0 的方块实体必须被识别为需要剔除");
+  }
+
   /** 与生产路径一致的换算：绝对 Y − minHeight = 相对 Y。 */
   @Test
   void minHeightConversionMatchesProduction() {

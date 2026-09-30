@@ -33,16 +33,21 @@ import java.util.zip.Inflater;
  * 否则磁盘缓存命中的区块不会进入显形索引。读取 {@code 0x03} 旧文件时明确拒绝并（只提示一次）
  * 由调用方删除重建，避免复用与当前信封约定不一致的历史条目。
  *
- * <p><b>压缩方案（偏移 9 的那个字节）</b>：该字节决定整个文件里所有 bucket 的压缩算法。
- * 当前写入统一使用 <b>zstd</b>（{@code 0x02}），用的是服务端自带的 zstd-jni（{@code scope=provided}，
- * 不 shade、不进插件 jar；服务端若没有则由 {@link ZstdSupport} 在启动期自动下载到
- * {@code plugins/MikuXrayNet/lib}，详见该类的来源解析顺序）；历史文件里的 Deflate（{@code 0x01}）
- * 仍被完整支持，因此老的 {@code .b_linear} 缓存不会被当成损坏文件删除。读路径按该字节选择解压器：
- * {@code 0x01} 走 JDK {@link Inflater}，{@code 0x02} 走 zstd。
+ * <p><b>压缩方案（偏移 9 的那个字节）</b>：该字节在文件<b>创建时</b>确定，并决定整个文件里所有 bucket
+ * 的压缩算法；此后<b>追加入写必须沿用该字节</b>（调用 {@link #compress(byte[], byte)} 传入它，
+ * 而不是重新取全局 {@link #currentCompression()}）—— 否则会出现「头部声明 0x01(Deflate)、
+ * 桶却按 zstd 写」的错配，读回时按 0x01 走 Inflater 解压失败、整个 bucket 被当作空，
+ * 刚写入的条目静默丢失。新文件创建时取 {@link #currentCompression()}：zstd 可用取 <b>zstd</b>
+ * （{@code 0x02}，服务端自带的 zstd-jni，{@code scope=provided}，不 shade、不进插件 jar；
+ * 服务端若没有则由 {@link ZstdSupport} 在启动期自动下载到 {@code plugins/MikuXrayNet/lib}），
+ * 否则取 Deflate（{@code 0x01}）。历史文件里的 Deflate 仍被完整支持，因此老的
+ * {@code .b_linear} 缓存不会被当成损坏文件删除。读路径按该字节选择解压器：{@code 0x01} 走 JDK
+ * {@link Inflater}，{@code 0x02} 走 zstd。
  *
  * <p><b>fail-open</b>：运行期若 zstd 不可用（服务端没有该库、自动下载失败、或原生库缺失导致类初始化抛
- * {@link Throwable} 等），压缩自动回退 JDK {@link Deflater}（{@link #currentCompression()} 因此返回
- * {@code 0x01}，保证「头部方案字节」与实际写入的压缩算法始终一致），并只提示一次中文日志。
+ * {@link Throwable} 等），新文件的 {@link #currentCompression()} 返回 {@code 0x01}（回退 JDK
+ * {@link Deflater}）。对<b>既有</b>文件：若其声明的方案在本进程不可用（头=zstd 但 zstd 库缺失），
+ * 由 {@code RegionFile#open} 整文件迁移为可行方案（见其注释），保证「读回一定能解开」。
  * 任何压缩/解压异常都只记日志并降级，绝不影响封包链路。
  */
 public final class BufferedLinearV3Format {
@@ -55,6 +60,9 @@ public final class BufferedLinearV3Format {
 
   /** 仅提示一次的「旧版（0x03）区域文件已被拒绝、将重建」日志开关。 */
   private static final AtomicBoolean LEGACY_VERSION_WARNED = new AtomicBoolean();
+
+  /** 仅提示一次的「文件声明方案在本进程不可用、已整文件迁移」日志开关。 */
+  private static final AtomicBoolean SCHEME_DOWNGRADE_WARNED = new AtomicBoolean();
 
   /** 初版格式版本：其负载信封未约定必须携带被伪装坐标，读取时明确拒绝。 */
   private static final byte LEGACY_VERSION = 0x03;
@@ -152,12 +160,39 @@ public final class BufferedLinearV3Format {
   }
 
   /**
+   * 文件声明的压缩方案在本进程不可用、整文件迁移为可行方案时的唯一一次中文提示（并发安全）。
+   *
+   * <p>例：头=0x02(zstd) 但本进程没有 zstd-jni。此时该文件既有的 zstd bucket 本就解不开
+   * （读路径必抛异常、整桶当空），因此无从保留；迁移只是把「声明」修正为可行方案并重建索引。
+   */
+  static void warnSchemeDowngradeOnce(byte declared, byte used) {
+    if (SCHEME_DOWNGRADE_WARNED.compareAndSet(false, true)) {
+      LOGGER.warning("区域缓存文件声明的压缩方案 0x" + Integer.toHexString(declared & 0xFF)
+          + " 在本进程不可用，已整文件迁移为可行方案 0x" + Integer.toHexString(used & 0xFF)
+          + "：按原方案写入的旧 bucket 本就无法解压，迁移后头部与后续写入保持一致、读回一定能解开"
+          + "（缓存只是可选加速，不影响封包链路）");
+    }
+  }
+
+  /**
    * 当前写入使用的压缩方案字节：zstd 可用时为 {@link #COMPRESSION_ZSTD}，否则 {@link #COMPRESSION_DEFLATE}。
    *
-   * <p>{@link #encodeHeader(int)} 与实际压缩都取此值，因此「头部声明的方案」与「bucket 实际算法」永远一致。
+   * <p><b>只代表「新文件的方案」</b>：新文件创建时由 {@link #encodeHeader(int)} 写入此值。既有文件一旦创建，
+   * 其头部方案字节便固定；此后写入一律走 {@link #encodeHeader(int, byte)} / {@link #compress(byte[], byte)}
+   * 并传入该文件声明的方案，不得再取此值 —— 否则会造成「头部方案」与「bucket 实际算法」错配（见类注释）。
    */
   public static byte currentCompression() {
     return ZstdSupport.available() ? COMPRESSION_ZSTD : COMPRESSION_DEFLATE;
+  }
+
+  /**
+   * 给定压缩方案在本进程是否可用：Deflate 由 JDK 提供、恒可用；zstd 取决于 zstd-jni 是否就绪。
+   *
+   * <p>{@code RegionFile#open} 用它判定「文件声明方案能否在本进程读/写」，
+   * 不可用则整文件迁移为可行方案（见 {@link #currentCompression()}）。
+   */
+  public static boolean compressionAvailable(byte compression) {
+    return compression != COMPRESSION_ZSTD || ZstdSupport.available();
   }
 
   // ------------------------------------------------------------------ 坐标换算
@@ -179,12 +214,22 @@ public final class BufferedLinearV3Format {
 
   // ------------------------------------------------------------------ 文件头
 
-  /** 编码 14 字节文件头（压缩方案字节取 {@link #currentCompression()}）。 */
+  /** 编码 14 字节文件头（压缩方案字节取 {@link #currentCompression()}，即「新文件」方案）。 */
   public static byte[] encodeHeader(int hashSeed) {
+    return encodeHeader(hashSeed, currentCompression());
+  }
+
+  /**
+   * 编码 14 字节文件头（压缩方案字节<b>显式指定</b>）。
+   *
+   * <p>改写既有文件头（压缩回收 / 迁移）时必须传该文件声明的方案，保证「头部」与「bucket 数据」一致；
+   * 只有创建新文件时才用 {@link #encodeHeader(int)}（自动取 {@link #currentCompression()}）。
+   */
+  public static byte[] encodeHeader(int hashSeed, byte compression) {
     ByteBuffer buffer = ByteBuffer.allocate(HEADER_SIZE);
     buffer.putLong(MAGIC);
     buffer.put(VERSION);
-    buffer.put(currentCompression());
+    buffer.put(compression);
     buffer.putInt(hashSeed);
     return buffer.array();
   }
@@ -255,6 +300,10 @@ public final class BufferedLinearV3Format {
   /**
    * 压缩一段数据：优先 zstd（{@link #ZSTD_LEVEL} = 3，速度优先），
    * zstd 不可用或其抛异常时回退 {@link Deflater#BEST_SPEED}（fail-open）。
+   *
+   * <p><b>测试与「无固定头部」场景专用</b>：生产写入路径（{@code RegionFile}）一律走
+   * {@link #compress(byte[], byte)} 并传入文件声明的方案，绝不能用本方法 —— 否则会写出与头部不符的
+   * 数据，读回时整桶丢失。
    */
   public static byte[] compress(byte[] raw) {
     if (ZstdSupport.available()) {
@@ -262,6 +311,28 @@ public final class BufferedLinearV3Format {
         return ZstdSupport.compress(raw, ZSTD_LEVEL);
       } catch (Throwable throwable) {
         warnZstdFallbackOnce(throwable);
+      }
+    }
+    return deflate(raw);
+  }
+
+  /**
+   * 按<b>指定方案</b>压缩；写入侧必须传「文件头声明的方案」，绝不能用全局 {@link #currentCompression()}。
+   *
+   * @param compression {@link #COMPRESSION_ZSTD} 或 {@link #COMPRESSION_DEFLATE}
+   * @throws IOException 声明 zstd 但本进程无 zstd（zstd-jni 不可用），或 zstd 运行期异常。
+   *         <b>刻意抛出而非回退 Deflate</b>：回退会写出与头部方案不符的数据，读回时整桶丢失；
+   *         抛出让调用方 fail-open（保留脏标记、下轮重试），绝不产生静默损坏。
+   */
+  public static byte[] compress(byte[] raw, byte compression) throws IOException {
+    if (compression == COMPRESSION_ZSTD) {
+      if (!ZstdSupport.available()) {
+        throw new IOException("文件声明使用 zstd，但当前环境无 zstd（zstd-jni 不可用）");
+      }
+      try {
+        return ZstdSupport.compress(raw, ZSTD_LEVEL);
+      } catch (Throwable throwable) {
+        throw new IOException("zstd 压缩失败", throwable);
       }
     }
     return deflate(raw);
@@ -288,7 +359,12 @@ public final class BufferedLinearV3Format {
     }
   }
 
-  /** 已知原始长度时解压；按 {@link #currentCompression()} 选择解压器（写读配对的便捷入口）。 */
+  /**
+   * 已知原始长度时解压；按 {@link #currentCompression()} 选择解压器。
+   *
+   * <p><b>测试专用豁免</b>：生产读取路径一律走 {@link #decompress(byte[], int, byte)} 并传「文件头声明的
+   * 方案」（{@code RegionFile}），绝不假定文件方案等于全局当前方案。
+   */
   public static byte[] decompress(byte[] compressed, int rawLength) throws IOException {
     return decompress(compressed, rawLength, currentCompression());
   }

@@ -100,6 +100,14 @@ public final class DiskCacheStore implements AutoCloseable {
      */
     private long pendingBytes;
 
+    /**
+     * 本句柄当前「计入」{@link #approximateEntries} 的条目数（只有磁盘线程访问）。
+     *
+     * <p>句柄关闭（闲置 / 世界卸载 / 停用 / 通道失效）时据此把该文件的额度收回，
+     * 避免条目计数只增不减、上限随句柄开关不断抬高。重新打开时会重新扫描磁盘并补计。
+     */
+    private long accountedEntries;
+
     private Handle(RegionFile file) {
       this.file = file;
       this.lastAccessNanos = System.nanoTime();
@@ -118,11 +126,11 @@ public final class DiskCacheStore implements AutoCloseable {
   private final AtomicInteger pendingOps = new AtomicInteger();
   private final AtomicInteger approximateEntries = new AtomicInteger();
   /**
-   * 已做过「磁盘既有条目补计」的区域文件（每进程每文件至多一次）。
+   * 本进程内「已做过磁盘既有条目补计、且句柄仍打开」的区域文件集合。
    *
    * <p>重启后 {@link #approximateEntries} 从 0 开始；首次打开某个已存在的区域文件时把磁盘上的
    * 真实条目数补计进来，否则 {@code max-entries} 上限在重启后完全失效（旧条目不占额度）。
-   * 句柄闲置关闭后重开不会重扫（文件内容未变，计数仍准确）。
+   * 句柄关闭时该键会被移除、其额度一并收回（见 {@link #removeAndClose}），因此重开时会重新扫描补计。
    */
   private final Set<RegionKey> entryCounted = ConcurrentHashMap.newKeySet();
   private final long maxFileSizeBytes;
@@ -350,6 +358,7 @@ public final class DiskCacheStore implements AutoCloseable {
   /** 惰性清理一个条目并同步近似计数（计数只作容量判断，夹在 0 以上）。 */
   private void removeEntry(Handle handle, int chunkIndex) throws IOException {
     if (handle.file.clear(chunkIndex)) {
+      handle.accountedEntries = Math.max(0L, handle.accountedEntries - 1L);
       approximateEntries.updateAndGet(value -> Math.max(0, value - 1));
     }
   }
@@ -370,6 +379,7 @@ public final class DiskCacheStore implements AutoCloseable {
         new BufferedLinearV3Format.Entry(0L, writtenAt, configHash, payload);
     boolean replaced = handle.file.put(BufferedLinearV3Format.chunkIndex(chunkX, chunkZ), entry);
     if (!replaced) {
+      handle.accountedEntries++;
       approximateEntries.incrementAndGet();
     }
     // 该负载会在 flushDirty 时随所属 bucket 整块 append；bucket 重写产生的旧副本计入垃圾，由压缩回收
@@ -404,8 +414,7 @@ public final class DiskCacheStore implements AutoCloseable {
           // 通道已永久失效（FileChannel 一旦被线程中断或外部关闭就无法再用）。此时句柄留在表里、
           // 脏标记还在，旧实现会「每轮维护都抛一次同样的异常」——真机上表现为每 30 秒一条
           // ClosedChannelException。这里直接丢弃句柄并只提示一次，下次访问自动重建（fail-open）。
-          open.remove(entry.getKey(), handle);
-          closeHandleQuietly(handle);
+          removeAndClose(entry.getKey(), handle);
           stats.errors.increment();
           logger.warning("磁盘缓存区域文件通道已失效，已丢弃句柄（下次访问自动重建）："
               + handle.file.path() + "（原因：" + throwable + "）");
@@ -437,8 +446,12 @@ public final class DiskCacheStore implements AutoCloseable {
       List<RegionKey> candidates = new ArrayList<>();
       for (Map.Entry<RegionKey, Handle> entry : open.entrySet()) {
         Handle handle = entry.getValue();
+        // 数据区总字节 = 活数据 + 垃圾；据此反推真正的活数据字节。
+        // 旧实现把「数据区总字节」当成活数据当分母，等价于判据「垃圾 > 活数据」（阈值 0.5 时），
+        // 与常量/注释声明的「垃圾 > 活数据的一半」差了一倍，压缩迟迟不触发。
+        long dataArea = Math.max(0L, handle.file.sizeBytes() - BufferedLinearV3Format.DATA_AREA_OFFSET);
         long garbage = handle.file.garbageBytes();
-        long live = Math.max(0L, handle.file.sizeBytes() - BufferedLinearV3Format.DATA_AREA_OFFSET);
+        long live = Math.max(0L, dataArea - garbage);
         if (garbage > 0L && (double) garbage > (double) live * COMPACT_GARBAGE_RATIO) {
           candidates.add(entry.getKey());
           if (candidates.size() >= budget) {
@@ -490,6 +503,7 @@ public final class DiskCacheStore implements AutoCloseable {
     try {
       int dropped = handle.file.compact((chunkIndex, entry) -> keepEntry(entry));
       if (dropped > 0) {
+        handle.accountedEntries = Math.max(0L, handle.accountedEntries - dropped);
         approximateEntries.updateAndGet(value -> Math.max(0, value - dropped));
       }
       // 压缩会把内存里的全部 bucket（含脏的）整文件重写：待落盘记账随之清零
@@ -497,8 +511,7 @@ public final class DiskCacheStore implements AutoCloseable {
     } catch (Throwable throwable) {
       // 压缩失败：句柄可能已不可用（例如文件被外部删除），直接关闭并让它下次重新打开
       fail("磁盘缓存压缩回收失败，已关闭该区域文件句柄：" + handle.file.path(), throwable);
-      open.remove(key, handle);
-      closeHandleQuietly(handle);
+      removeAndClose(key, handle);
     }
   }
 
@@ -520,32 +533,45 @@ public final class DiskCacheStore implements AutoCloseable {
       if (now - handle.lastAccessNanos < idleNanos) {
         continue;
       }
-      if (!open.remove(entry.getKey(), handle)) {
-        continue;
-      }
-      closeHandleQuietly(handle);
+      removeAndClose(entry.getKey(), handle);
     }
   }
 
   private void closeWorldHandles(String worldName) {
+    // 键里存的是 sanitize 后的世界名：这里同样归一化后再比较，保证 World/world 命中同一文件的句柄
+    String world = sanitize(worldName);
     for (Map.Entry<RegionKey, Handle> entry : open.entrySet()) {
-      if (!entry.getKey().worldName().equals(worldName)) {
+      if (!entry.getKey().worldName().equals(world)) {
         continue;
       }
-      if (!open.remove(entry.getKey(), entry.getValue())) {
-        continue;
-      }
-      closeHandleQuietly(entry.getValue());
+      removeAndClose(entry.getKey(), entry.getValue());
     }
   }
 
   private void closeAllHandles() {
     for (Map.Entry<RegionKey, Handle> entry : open.entrySet()) {
-      if (open.remove(entry.getKey(), entry.getValue())) {
-        closeHandleQuietly(entry.getValue());
-      }
+      removeAndClose(entry.getKey(), entry.getValue());
     }
     approximateEntries.set(0);
+  }
+
+  /**
+   * 从打开表摘除句柄并关闭它，同时<b>收回该句柄计入的条目额度</b>并把该键从「已补计」集合移除——
+   * 让下次打开时重新扫描磁盘、重新补计（否则计数只增不减，{@code max-entries} 会随句柄开关不断抬高）。
+   *
+   * <p>只有磁盘线程调用；{@link ConcurrentHashMap#remove(Object, Object)} 返回 false（句柄已被别处移除）时不做任何事。
+   */
+  private void removeAndClose(RegionKey key, Handle handle) {
+    if (!open.remove(key, handle)) {
+      return;
+    }
+    long accounted = handle.accountedEntries;
+    if (accounted > 0L) {
+      handle.accountedEntries = 0L;
+      approximateEntries.updateAndGet(value -> (int) Math.max(0L, value - accounted));
+    }
+    entryCounted.remove(key);
+    closeHandleQuietly(handle);
   }
 
   /** 落盘 + 关闭，并删掉「空且不脏」的文件，避免磁盘上残留无意义的小文件。 */
@@ -569,14 +595,17 @@ public final class DiskCacheStore implements AutoCloseable {
   /** 打开（或复用）区域文件句柄；文件头损坏时删除重建（缓存可丢，但不能卡住链路）。 */
   private Handle handle(String worldName, int regionX, int regionZ, boolean create)
       throws IOException {
-    RegionKey key = new RegionKey(worldName, regionX, regionZ);
+    // 键里存<b>sanitize 后</b>的世界名：物理文件就是按 sanitize 名落盘的，若键里存原始名，
+    // 「World」「world」两个键会各自解析到同一路径、开出两个句柄互踩（Windows 上 ATOMIC_MOVE 还会失败）。
+    String world = sanitize(worldName);
+    RegionKey key = new RegionKey(world, regionX, regionZ);
     Handle existing = open.get(key);
     if (existing != null) {
       existing.touch();
       return existing;
     }
 
-    Path path = pathFor(worldName, regionX, regionZ);
+    Path path = pathFor(world, regionX, regionZ);
     if (!create && !Files.isRegularFile(path)) {
       return null;
     }
@@ -643,6 +672,7 @@ public final class DiskCacheStore implements AutoCloseable {
     try {
       int count = handle.file.countEntriesOnDisk();
       if (count > 0) {
+        handle.accountedEntries += count;
         approximateEntries.addAndGet(count);
       }
     } catch (Throwable throwable) {

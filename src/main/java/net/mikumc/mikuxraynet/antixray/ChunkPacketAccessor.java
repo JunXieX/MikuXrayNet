@@ -147,10 +147,23 @@ public final class ChunkPacketAccessor {
 
   /** 读取单个方块实体条目的区块内相对坐标并复用 {@link #isObfuscated} 判定。 */
   private boolean isObfuscated(Object entry, int[] localPositions, int minHeight) {
-    int packedXz = number(fieldPlan.blockEntityPackedXz().get(entry));
+    int packedXz = normalizePackedXz(number(fieldPlan.blockEntityPackedXz().get(entry)));
     int relativeY = number(fieldPlan.blockEntityY().get(entry)) - minHeight;
     // 与 ProtocolLib 同口径：sectionX = packedXZ >> 4，sectionZ = packedXZ & 15
     return isObfuscated(relativeY, packedXz >> 4, packedXz & 15, localPositions);
+  }
+
+  /**
+   * 归一化方块实体条目的 packedXZ 原始值：<b>只取低 8 位</b>。
+   *
+   * <p>packed XZ 设计上就是 8 位（x ∈ [0,15] 占高 4 位、z ∈ [0,15] 占低 4 位），因此对
+   * {@code byte} / {@code short} / {@code int} 三种字段类型都成立、无害。关键是 {@code byte}：
+   * 局部 X ≥ 8 时该字节 ≥ 0x80，作为<b>有符号</b>数读出后是负数（如 0xF0 → -16），
+   * 直接 {@code >> 4} 会符号扩展成负 sectionX，使该 section 的方块实体永远匹配不上被伪装坐标清单
+   * ——伪装成石头的箱子/刷怪笼实体仍随包下发。这里掩回 0..255 即消除符号扩展。
+   */
+  static int normalizePackedXz(int raw) {
+    return raw & 0xFF;
   }
 
   private static int number(Object value) {

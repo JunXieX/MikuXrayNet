@@ -18,7 +18,7 @@ main: net.mikumc.mikuxraynet.MikuXrayNet
 api-version: '26.2'
 authors:
   - JunXieX
-description: MikuMC 服务器原创插件
+description: MikuMC 服务器原创插件｜作者 JunXieX｜交流群 1105054380
 
 # Folia（区域化多线程）兼容：世界访问一律走区域调度器
 folia-supported: true

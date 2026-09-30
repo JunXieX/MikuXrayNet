@@ -1,9 +1,13 @@
 package net.mikumc.mikuxraynet.config;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.plugin.Plugin;
 
@@ -30,8 +34,8 @@ public final class MikuConfig {
   /** 「带宽配置解析失败已保留上一份/改用默认」WARN 的进程级一次性闸门。 */
   private final AtomicBoolean bandwidthFallbackWarned = new AtomicBoolean();
 
-  private AntiXrayConfig antiXray;
-  private BandwidthConfig bandwidth;
+  private volatile AntiXrayConfig antiXray;
+  private volatile BandwidthConfig bandwidth;
 
   public MikuConfig(Plugin plugin) {
     this.plugin = plugin;
@@ -149,14 +153,30 @@ public final class MikuConfig {
         + "（本次按该策略继续运行，不会因此禁用插件）。请检查该文件内容后重载。", cause);
   }
 
-  private YamlConfiguration read(String fileName) {
+  /**
+   * 读取并解析某份配置。
+   *
+   * <p><b>为什么用 {@code loadFromString} 而不是 {@code loadConfiguration(File)}</b>：
+   * {@code loadConfiguration} 对<b>坏 YAML</b> 不抛异常——它把解析错误转成一条日志后返回<b>空配置</b>，
+   * 于是「解析失败保留上一份」的外层 catch 永不触发，改坏文件会<b>静默回落全默认</b>。
+   * 改为读文本 + {@code loadFromString} 后，坏 YAML 会抛 {@link InvalidConfigurationException}，
+   * 真正走到「保留上一份 + 一次性 WARN」的兜底分支。
+   *
+   * @throws IOException 读取文件失败
+   * @throws InvalidConfigurationException YAML 结构非法（由调用方兜底为「保留上一份」）
+   */
+  private YamlConfiguration read(String fileName)
+      throws IOException, InvalidConfigurationException {
     File file = new File(plugin.getDataFolder(), fileName);
     if (!file.isFile()) {
       // 只在文件不存在时复制资源，注释随资源文件一并落盘
       plugin.saveResource(fileName, false);
     }
 
-    YamlConfiguration configuration = YamlConfiguration.loadConfiguration(file);
+    String content = Files.readString(file.toPath(), StandardCharsets.UTF_8);
+    YamlConfiguration configuration = new YamlConfiguration();
+    // 坏 YAML 会在此抛出 InvalidConfigurationException（而非静默返回空配置）
+    configuration.loadFromString(content);
     if (configuration.getKeys(false).isEmpty()) {
       logger.warning("配置文件 " + fileName + " 为空或无法解析，将使用内置默认值");
     }

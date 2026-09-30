@@ -38,7 +38,13 @@ final class RegionFile implements AutoCloseable {
   private final Path path;
   private final int hashSeed;
   private final int bucketCacheSize;
-  /** 本文件使用的压缩方案字节（文件头偏移 9）；写入后与头部保持一致，读取时据此选择解压器。 */
+  /**
+   * 本文件使用的压缩方案字节（文件头偏移 9）。<b>读取与写入都只用它</b>：读取据此选解压器，
+   * 写入（{@link #flushBucket} / {@link #compact}）也传它去压缩 —— 绝不用全局
+   * {@code currentCompression()}，否则既有 Deflate 文件在 zstd 可用后追加写会写出 zstd 数据、
+   * 头部却仍是 0x01，读回整桶当空、刚写入的条目静默丢失。
+   * 仅在「创建新文件」与「声明方案不可用时的整文件迁移」时改写。
+   */
   private byte compression;
   private final long[] positions = new long[BufferedLinearV3Format.BUCKET_COUNT];
   private final long[] bucketSizes = new long[BufferedLinearV3Format.BUCKET_COUNT];
@@ -102,6 +108,13 @@ final class RegionFile implements AutoCloseable {
         file.writeHeaderAndEmptyTable();
       } else {
         file.loadIndex(size);
+        // 文件声明的方案在本进程不可用（头=zstd 但 zstd 库缺失）→ 整文件迁移为可行方案。
+        // 选「open 时迁移」而不是「写入时逐桶降级」（二选一）：头部方案字节是整文件唯一的，
+        // 逐桶降级无法改变头部，只会再次造成「头与数据错配」；迁移后 compression 恒为可行方案，
+        // 后续所有写入都按它压缩，读回一定能解开。
+        if (!BufferedLinearV3Format.compressionAvailable(compression)) {
+          file.migrateToFeasibleCompression();
+        }
       }
     } catch (IOException exception) {
       file.closeQuietly();
@@ -110,15 +123,44 @@ final class RegionFile implements AutoCloseable {
     return file;
   }
 
-  /** 写入文件头与全零偏移表，并把数据区起始位置作为当前文件长度。 */
+  /**
+   * 写入文件头与全零偏移表，并把数据区起始位置作为当前文件长度。
+   *
+   * <p>头部方案字节<b>取本实例的 {@link #compression}</b>（新文件在构造时已定为
+   * {@code currentCompression()}；迁移时已先改为可行方案），保证「声明的方案」与随后 bucket
+   * 的实际压缩一致。
+   */
   private void writeHeaderAndEmptyTable() throws IOException {
-    writeFully(channel, ByteBuffer.wrap(BufferedLinearV3Format.encodeHeader(hashSeed)), 0L);
+    writeFully(channel, ByteBuffer.wrap(BufferedLinearV3Format.encodeHeader(hashSeed, compression)), 0L);
     writeFully(channel, ByteBuffer.wrap(BufferedLinearV3Format.encodePosTable(positions)),
         BufferedLinearV3Format.POS_TABLE_OFFSET);
     channel.force(false);
-    // 头部刚按当前方案重写，字段同步跟进，保证「声明的方案」与随后 bucket 的实际压缩一致
-    this.compression = BufferedLinearV3Format.currentCompression();
     this.fileSize = BufferedLinearV3Format.DATA_AREA_OFFSET;
+  }
+
+  /**
+   * 把「声明方案在本进程不可用」的区域文件整文件迁移为可行方案。
+   *
+   * <p><b>为什么是「重建」而非「逐桶换算法」</b>：按原方案（zstd）写入的 bucket 在本进程根本解不开
+   * （{@code decompress} 必抛异常、读路径本就把整桶当空），因此不存在可保留的旧数据。直接把头部方案
+   * 改写为可行方案并清空偏移表，即可让「头部声明」与「后续写入」重新一致，失败模式从
+   * 「静默丢新写入」变成「明确丢弃本就读不到的旧数据」，并严守「读回一定能解开」这一更强不变式。
+   */
+  private void migrateToFeasibleCompression() throws IOException {
+    byte feasible = BufferedLinearV3Format.currentCompression(); // zstd 不可用时为 Deflate
+    BufferedLinearV3Format.warnSchemeDowngradeOnce(compression, feasible);
+    this.compression = feasible;
+    // 先丢弃不可读的旧索引，再重写头部与全零偏移表（顺序不能反，否则会把旧偏移写回偏移表）
+    for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
+      positions[bucket] = 0L;
+      bucketSizes[bucket] = 0L;
+      dirty[bucket] = false;
+      slots[bucket] = null;
+    }
+    loaded.clear();
+    writeHeaderAndEmptyTable();
+    liveBytes = 0L;
+    garbageBytes = 0L;
   }
 
   /** 读入偏移表并统计有效/垃圾字节数（损坏的引用按「空桶 + 垃圾」处理）。 */
@@ -219,7 +261,8 @@ final class RegionFile implements AutoCloseable {
     }
 
     byte[] raw = BufferedLinearV3Format.encodeBucket(slots[bucket], hashSeed);
-    byte[] compressed = BufferedLinearV3Format.compress(raw);
+    // 必须按本文件头部声明的方案压缩（不能用全局 currentCompression）：否则头与数据错配、读回整桶丢失
+    byte[] compressed = BufferedLinearV3Format.compress(raw, compression);
     ByteBuffer buffer = ByteBuffer.allocate(8 + compressed.length);
     buffer.putInt(raw.length);
     buffer.putInt(compressed.length);
@@ -287,7 +330,8 @@ final class RegionFile implements AutoCloseable {
             continue;
           }
           byte[] raw = BufferedLinearV3Format.encodeBucket(all[bucket], hashSeed);
-          byte[] compressed = BufferedLinearV3Format.compress(raw);
+          // 与 flushBucket 同口径：按本文件声明的方案压缩，压缩回收不改变文件的压缩方案
+          byte[] compressed = BufferedLinearV3Format.compress(raw, compression);
           ByteBuffer buffer = ByteBuffer.allocate(8 + compressed.length);
           buffer.putInt(raw.length);
           buffer.putInt(compressed.length);
@@ -298,7 +342,8 @@ final class RegionFile implements AutoCloseable {
           newSizes[bucket] = 8L + compressed.length;
           offset += newSizes[bucket];
         }
-        writeFully(out, ByteBuffer.wrap(BufferedLinearV3Format.encodeHeader(hashSeed)), 0L);
+        // 头部沿用本文件声明的方案（不是 currentCompression）：压缩回收只重排数据，不改变压缩方案
+        writeFully(out, ByteBuffer.wrap(BufferedLinearV3Format.encodeHeader(hashSeed, compression)), 0L);
         writeFully(out, ByteBuffer.wrap(BufferedLinearV3Format.encodePosTable(newPositions)),
             BufferedLinearV3Format.POS_TABLE_OFFSET);
         out.force(true);
@@ -323,8 +368,7 @@ final class RegionFile implements AutoCloseable {
         loaded.remove(bucket);
       }
       slotsLoad(all);
-      // 整文件已按当前方案重写（头部 + 全部 bucket 都是 currentCompression），字段同步跟进
-      this.compression = BufferedLinearV3Format.currentCompression();
+      // 整文件已按本文件声明的方案重写（头部 + 全部 bucket 都是 compression），方案字段保持不变
       fileSize = offset;
       liveBytes = offset - BufferedLinearV3Format.DATA_AREA_OFFSET;
       garbageBytes = 0L;
