@@ -138,6 +138,39 @@ class ConfigDefaultsTest {
   }
 
   /**
+   * 任务3：{@code proximity.frustum.min-distance} 的 NaN、以及 {@code proximity.distance} 的负值
+   * 都不得静默回落/归零——必须与 frustumFov 口径一致，进入一次性 WARN 明细。
+   */
+  @Test
+  void nanMinDistanceAndNegativeProximityDistanceAreReported() {
+    AntiXrayConfig nan = AntiXrayConfig.from(yaml("proximity:\n  frustum:\n    min-distance: .nan\n"));
+    assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_FLOOR, nan.proximity().frustumMinDistance(),
+        1.0E-9D, "NaN 的 min-distance 必须回落默认（= 下限）");
+    assertTrue(joinedFloors(nan).contains("proximity.frustum.min-distance=NaN"),
+        "NaN 的 min-distance 必须纳入一次性 WARN 明细（不再静默）：" + nan.floorAdjustments());
+
+    AntiXrayConfig negative = AntiXrayConfig.from(yaml("proximity:\n  distance: -5.0\n"));
+    assertEquals(0.0D, negative.proximity().distance(), 1.0E-9D, "负值的显形距离必须按 0 处理");
+    assertTrue(joinedFloors(negative).contains("proximity.distance=-5.0"),
+        "负值的 proximity.distance 必须留痕（不再静默归 0）：" + negative.floorAdjustments());
+  }
+
+  /**
+   * 任务3：bandwidth 侧浮点钳制的<b>有限负值</b>不得再静默归 0（旧实现 {@code Math.max(0, v)} 无记录）。
+   */
+  @Test
+  void negativeFiniteFloatClampInBandwidthIsReported() {
+    BandwidthConfig config = BandwidthConfig.from(yaml("""
+        entity-culling:
+          force-visible-distance: -3.0
+        """));
+    assertEquals(0.0D, config.entityCulling().forceVisibleDistance(), 1.0E-9D, "负值必须钳到 0");
+    assertTrue(String.join("、", config.clampAdjustments())
+            .contains("entity-culling.force-visible-distance=-3.0"),
+        "有限负值必须进入钳制明细（不再静默归 0）：" + config.clampAdjustments());
+  }
+
+  /**
    * 配置指纹必须是<b>跨进程稳定</b>的固定值（真机回归：磁盘缓存重启后命中率恒为 0 的根因）。
    *
    * <p>指纹曾被「枚举的 identity hash」污染（{@code EffectiveObfuscation.mode} / {@code missingPolicy}），

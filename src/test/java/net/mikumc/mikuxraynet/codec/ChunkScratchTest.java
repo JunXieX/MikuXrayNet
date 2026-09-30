@@ -3,15 +3,21 @@ package net.mikumc.mikuxraynet.codec;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -273,5 +279,71 @@ class ChunkScratchTest {
     } finally {
       scratch.recycle();
     }
+  }
+
+  /**
+   * 输出缓冲区「只增不减」不得导致超大数组随线程常驻：超过保留上限的数组在借出后不驻留，下次按需重分配。
+   *
+   * <p>回归：旧实现 {@code outputArray} 只记住历史最大容量，一旦被异常/损坏输入撑到接近 64 MiB，该数组
+   * 就会随线程常驻（每线程最多 2 个 scratch）。
+   */
+  @Test
+  void oversizedOutputArrayIsNotRetained() {
+    ChunkScratch scratch = ChunkScratch.acquire();
+    try {
+      byte[] small = scratch.growOutput(1024);
+      assertSame(small, scratch.outputArray(1024), "小数组应被保留以便同线程复用");
+
+      byte[] huge = scratch.growOutput(ChunkScratch.MAX_RETAINED_OUTPUT_CAPACITY + 1);
+      assertTrue(huge.length > ChunkScratch.MAX_RETAINED_OUTPUT_CAPACITY, "本次仍须返回足够大的数组");
+
+      byte[] next = scratch.outputArray(1024);
+      assertNotSame(huge, next, "超过保留上限的数组不得被 scratch 保留（否则近 64 MiB 会随线程常驻）");
+      assertTrue(next.length >= 1024, "重分配的数组仍须满足请求容量");
+    } finally {
+      scratch.recycle();
+    }
+  }
+
+  /**
+   * 构造中途失败（损坏区块）必须归还 scratch，否则连续损坏区块会把按线程复用的空闲池打空。
+   *
+   * <p>做法：在<b>全新线程</b>上用「空缓冲区」构造区块——解析第一个 section 时必然越界抛异常；随后断言
+   * 该线程的空闲池恰好收回了这一个 scratch。
+   */
+  @Test
+  void failedConstructionRecyclesScratch() throws Exception {
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    int[] idleBefore = new int[1];
+    int[] idleAfter = new int[1];
+    Thread worker = new Thread(() -> {
+      try {
+        ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+        idleBefore[0] = idlePoolSize();
+        try {
+          codec.decode(new byte[0], SECTION_COUNT); // 空缓冲区 → 读 section 必然抛异常
+          failure.set(new AssertionError("损坏区块必须构造失败"));
+        } catch (RuntimeException expected) {
+          // 预期：构造过程抛异常
+        }
+        idleAfter[0] = idlePoolSize();
+      } catch (Throwable throwable) {
+        failure.set(throwable);
+      }
+    });
+    worker.start();
+    worker.join();
+
+    assertNull(failure.get(), "失败构造测试本身不得出错：" + failure.get());
+    assertEquals(idleBefore[0] + 1, idleAfter[0],
+        "构造失败后 scratch 必须归还空闲池（旧实现只 acquire 不 recycle，连续损坏会把池打空）");
+  }
+
+  /** 反射读取当前线程的 scratch 空闲池大小（IDLE 为私有静态 ThreadLocal）。 */
+  private static int idlePoolSize() throws Exception {
+    Field field = ChunkScratch.class.getDeclaredField("IDLE");
+    field.setAccessible(true);
+    ThreadLocal<?> threadLocal = (ThreadLocal<?>) field.get(null);
+    return ((ArrayDeque<?>) threadLocal.get()).size();
   }
 }

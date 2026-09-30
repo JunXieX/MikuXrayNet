@@ -117,6 +117,31 @@ class SectionBatchProcessingTest {
     assertEquals(0, revealed.sizeFor(PLAYER, key), "索引未命中也要摘标记，杜绝孤儿标记");
   }
 
+  /**
+   * 复用去重 scratch 的跨调用正确性：同一线程连续两次处理同一批坐标，第二次不得把上一轮的 seen
+   * 状态带进来（否则所有坐标被误判为「已见」而整批漏掉）。这锁死「代次戳」替换「每 section new
+   * boolean[4096]」后语义不变。
+   */
+  @Test
+  void repeatedCallsDoNotLeakSeenScratchState() {
+    ObfuscatedChunkIndex index = index();
+    RevealedSet revealed = revealed();
+    // 含一个重复坐标（1,64,1）：应被去重为 2 个
+    int[] changes = {1, 64, 1, 1, 64, 1, 2, 64, 1};
+
+    List<int[]> first = new ArrayList<>();
+    BlockChangeRevealListener.processChanges(WORLD, changes, 3, index, revealed, null,
+        (coords, count) -> first.add(java.util.Arrays.copyOf(coords, count * 3)));
+    List<int[]> second = new ArrayList<>();
+    BlockChangeRevealListener.processChanges(WORLD, changes, 3, index, revealed, null,
+        (coords, count) -> second.add(java.util.Arrays.copyOf(coords, count * 3)));
+
+    assertEquals(1, first.size());
+    assertEquals(2, first.get(0).length / 3, "同一调用内重复坐标被去重");
+    assertEquals(1, second.size());
+    assertEquals(2, second.get(0).length / 3, "跨调用不得泄漏上一轮的 seen 状态（否则会漏掉整批坐标）");
+  }
+
   /** 批量摘除：与逐坐标摘除等价，且重复坐标只计一次命中。 */
   @Test
   void removePositionsMatchesRepeatedRemovePosition() {

@@ -41,6 +41,15 @@ public final class RewriteStats {
   public final LongAdder writeBackFailures = new LongAdder();
 
   /**
+   * 因写回未确认生效（{@link #writeBackFailures}）而<b>跳过伪装索引登记</b>的区块次数。
+   *
+   * <p><b>为什么单列一个观测点</b>：写回失败时客户端拿到的仍是原始（未伪装）字节，本区块没有隐藏任何矿物，
+   * 因此不应把坐标登记进伪装索引（否则邻近显形会为「本就没被伪装的坐标」发冗余包）。这个计数即
+   * 「本该登记、因写回失败被跳过」的次数；它应与 {@link #writeBackFailures} 同步增长，单独可观测。
+   */
+  public final LongAdder indexSkippedOnWriteBackFailure = new LongAdder();
+
+  /**
    * 磁盘缓存「读到了负载但被拒」的次数：负载里的原始区块字节指纹与本次要改写的字节不符（或信封损坏）。
    *
    * <p><b>为什么必须有这个计数器</b>：这是磁盘缓存唯一「命中计数 +1 但实际用不上」的出口——
@@ -132,6 +141,7 @@ public final class RewriteStats {
     map.put("跳过", chunksSkipped.sum());
     map.put("失败", chunksFailed.sum());
     map.put("写回失败", writeBackFailures.sum());
+    map.put("写回失败跳过登记", indexSkippedOnWriteBackFailure.sum());
     map.put("超时放行", chunksTimedOut.sum());
     return map;
   }

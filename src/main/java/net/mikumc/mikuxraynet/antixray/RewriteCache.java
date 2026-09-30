@@ -20,6 +20,13 @@ import java.util.function.LongSupplier;
  * {@code LinkedHashMap}，每次 get 都独占锁并改动链表、每次新建 {@code Key}）。淘汰语义仍为「优先淘汰
  * 最久未使用」：被访问过的条目获得一次「第二次机会」，未被再次访问即被淘汰。
  *
+ * <p><b>过期回收为什么不能只靠 get / 顶满淘汰</b>：多数区块只下发一次、此后永不 {@code get}，这类
+ * 「冷条目」既不触发 {@code get} 的过期检查、也在容量未顶满时不经过淘汰扫描，于是「按过期时间回收」
+ * 对它们失效、条目会无限期驻留到顶满上限，{@code size()} 也会与真实占用背离。因此在每次新建条目的
+ * {@link #put} 里做一次<b>摊还清理</b>（{@link #amortizedCleanup()}）：按 lastAccessNanos 巡检固定
+ * 条数的环节点，回收过期冷条目并丢弃已从主存储消失的死节点。成本按 put 摊还为 O(1)，且沿用既有
+ * {@link #clockLock}，不引入新锁、不改动 {@code maximumSize} 的容量语义（它仍是条目总数上限）。
+ *
  * @param <V> 缓存值类型；由调用方保证值本身也不持有世界/封包引用
  */
 public final class RewriteCache<V> {
@@ -27,6 +34,16 @@ public final class RewriteCache<V> {
   /** 缓存键：只含基本类型与不可变字符串。 */
   public record Key(String worldName, int x, int z, int configHash) {
   }
+
+  /**
+   * 每次 {@link #put}（新建条目）摊还清理的环节点数上限。
+   *
+   * <p>为什么要「摊还」而非一次性全扫：全扫是 O(n)、会把并发回填重新串行化并让单次 put 抖动；固定小
+   * 常数则让每次 put 只付 O(1)。环上 n 个节点约需 n/该常数 次 put 被完整巡检一遍，冷条目与死节点据此
+   * 被渐进回收。取 8 是在「回收及时性」与「单次 put 开销」之间取的折中：对默认 40960 上限，约 5000 次
+   * 新建即可扫完一圈，远快于条目过期本身的时间尺度。
+   */
+  private static final int CLEANUP_NODES_PER_PUT = 8;
 
   private static final class CacheEntry<V> {
 
@@ -133,6 +150,37 @@ public final class RewriteCache<V> {
     synchronized (clockLock) {
       clockQueue.addLast(entry);
       evictOverflow();
+      // 顶满淘汰只在超容量时触发，冷条目的过期回收必须另有着落：每次新建条目顺带巡检少量节点
+      amortizedCleanup();
+    }
+  }
+
+  /**
+   * 摊还清理：从 CLOCK 环队首起最多巡检 {@value #CLEANUP_NODES_PER_PUT} 个节点，处理三件事——
+   * <ul>
+   *   <li><b>丢弃死节点</b>：该键已从主存储消失（被 {@link #get} 的过期检查或失效方法移除）却仍留在环里
+   *       的陈旧引用，直接丢弃，避免环随冷条目读取无限增长；</li>
+   *   <li><b>主动剔除过期冷条目</b>：{@code put} 一次后永不再被 {@code get} 的条目，按 {@code lastAccessNanos}
+   *       判定已过期即从主存储移除，兑现 {@code expireAfterAccess} 的回收承诺；</li>
+   *   <li><b>保留仍有效的节点</b>：原样轮转回队尾，<b>不改动其 second-chance 位</b>，淘汰语义与顺序保持不变。</li>
+   * </ul>
+   * 只在 {@link #clockLock} 内调用；每次最多常量条，均摊成本 O(1)。
+   */
+  private void amortizedCleanup() {
+    long now = clock.getAsLong();
+    for (int inspected = 0; inspected < CLEANUP_NODES_PER_PUT; inspected++) {
+      CacheEntry<V> candidate = clockQueue.pollFirst();
+      if (candidate == null) {
+        return;
+      }
+      if (entries.get(candidate.key) != candidate) {
+        continue; // 死节点：键已被移除，环里只剩陈旧引用，直接丢弃
+      }
+      if (now - candidate.lastAccessNanos > expireAfterAccessNanos) {
+        entries.remove(candidate.key, candidate); // 过期冷条目：主动回收，不再无限期驻留
+        continue;
+      }
+      clockQueue.addLast(candidate); // 仍有效：原样轮转回队尾（保留 referenced 位）
     }
   }
 
@@ -184,8 +232,8 @@ public final class RewriteCache<V> {
   /**
    * 当前<b>有效</b>缓存条目数（诊断用）。
    *
-   * <p>过期条目在未被再访问时不会主动出清，本方法据此按访问时间过滤，避免「虚高」的条目数误导诊断；
-   * 这与淘汰时的过期剔除口径一致（过期条目既不计入 size，也不占淘汰名额）。
+   * <p>过期条目在未被摊还清理巡检到之前仍可能短暂驻留，本方法据此按访问时间过滤，避免「虚高」的条目数
+   * 误导诊断；这与淘汰时的过期剔除口径一致（过期条目既不计入 size，也不占淘汰名额）。
    */
   public int size() {
     long now = clock.getAsLong();
@@ -196,6 +244,16 @@ public final class RewriteCache<V> {
       }
     }
     return live;
+  }
+
+  /**
+   * 当前<b>原始</b>条目数（含尚未被摊还清理巡检到的过期条目）——诊断用。
+   *
+   * <p>与 {@link #size()}（仅活跃条目）<b>口径分离</b>：两者之差即「已过期、但尚未被巡检回收」的驻留量，
+   * 可用于判断过期回收是否跟得上写入速率。持久占用只会以本值为上界（受 {@code maximumSize} 约束）。
+   */
+  public int rawSize() {
+    return entries.size();
   }
 
   public long hitCount() {

@@ -67,6 +67,13 @@ import org.bukkit.plugin.Plugin;
  * 字段做结构校验（单条与多条的路径都做）。校验通过会置 {@code verified}；在第一次成功发送之前
  * （{@code verified} 仍为 false）合并包照发，但<em>同时</em>保留原包（重复下发相同方块状态是无害的
  * 幂等操作），此后才开始取消原包。
+ *
+ * <p><b>last-write-wins 的微秒级残余窗口（已接受，勿当 bug 修）</b>：{@code passed} 集合是在
+ * 持锁的临界区里「读取 + 剔除旧态」的，但把合并包发到客户端、以及取消原包，都发生在<b>释放锁之后</b>。
+ * 因此「本窗口内某坐标经立即放行先行下发」与「合并包真正抵达客户端」之间存在一个微秒级窗口：
+ * 若该坐标恰在此窗口内又发生一次新的变更，客户端理论上可能在极短时间内看到「新→旧→新」的抖动。
+ * 后果仅为<b>一帧级</b>的方块观感抖动，不丢更新、不影响判定，且窗口宽度远小于客户端一帧；
+ * 引入跨线程顺序屏障来消除它得不偿失，故此处<b>明确接受该窗口并文档化</b>，不改变行为。
  */
 public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
@@ -469,8 +476,25 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
   }
 
-  /** 冲刷某玩家的缓冲：构造合并包并放行/取消原包。 */
+  /**
+   * 冲刷某玩家的缓冲：构造合并包并放行/取消原包，并记录<b>单线程冲刷耗时</b>诊断计数。
+   *
+   * <p>冲刷跑在唯一的 {@code MikuXrayNet-BlockMerge} 线程上，是极端配置下的延迟瓶颈。这里只加
+   * 「次数 + 累计耗时」两个无锁计数（纯观测，不改变任何行为、不引入任何并发），
+   * 供 {@code /mxnet status} 观测「平均一次冲刷的成本」是否随配置/负载恶化。
+   */
   private void flush(Pending target) {
+    long startNanos = System.nanoTime();
+    try {
+      flushInternal(target);
+    } finally {
+      stats.blockMergeFlushes.increment();
+      stats.blockMergeFlushNanos.add(System.nanoTime() - startNanos);
+    }
+  }
+
+  /** 冲刷主体（计时由 {@link #flush} 包在外层）。 */
+  private void flushInternal(Pending target) {
     List<Held> held;
     List<List<Update<WrappedBlockData>>> clusters;
     Set<Coord> passed;

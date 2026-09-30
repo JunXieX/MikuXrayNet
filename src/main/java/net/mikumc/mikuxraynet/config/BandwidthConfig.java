@@ -297,12 +297,15 @@ public final class BandwidthConfig {
   }
 
   /**
-   * 浮点上限钳制：非有限值（NaN / ±Inf）显式回落默认值，其余先按 0 兜底再取上限。
+   * 浮点上限钳制：非有限值（NaN / ±Inf）显式回落默认值，负数显式钳到 0 并留痕，其余先按 0 兜底再取上限。
    *
    * <p><b>为什么要拦非有限值</b>：NaN 不满足 {@code > max}，会原样穿过钳制进入配置指纹，
    * 使同一份「其实无效」的配置算出与众不同的指纹 —— 结果是<b>任何</b>进程算出的指纹都与它不等，
    * 磁盘缓存整体失效（缓存重启后命中率恒为 0）；而 {@code -Inf} 也会被 {@code Math.max} 悄悄抬成 0，
    * 让「配错了」看起来像「配成了 0」。两类都改为回落默认并记入明细，由加载路径一次性 WARN。
+   *
+   * <p><b>有限负值同样留痕</b>：旧实现对 {@code -5.0} 这类有限负值只做 {@code Math.max(0, v)} →
+   * 静默归 0、明细里看不到任何记录，管理员会以为负数已生效。现在统一记入明细（低于下限取下限）。
    */
   private static double clampUpper(double value, double defaultValue, double max, String key,
       List<String> adjustments) {
@@ -310,12 +313,15 @@ public final class BandwidthConfig {
       adjustments.add(key + "=" + value + "（非有限值，回落默认 " + defaultValue + "）");
       return defaultValue;
     }
-    double floored = Math.max(0.0D, value);
-    if (floored > max) {
+    if (value < 0.0D) {
+      adjustments.add(key + "=" + value + "（低于下限 0，按 0 生效）");
+      return 0.0D;
+    }
+    if (value > max) {
       adjustments.add(key + "=" + value + "（上限 " + max + "）");
       return max;
     }
-    return floored;
+    return value;
   }
 
   /**

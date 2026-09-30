@@ -37,17 +37,25 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
 
   @Override
   public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-    if (args.length == 0) {
-      usage(sender, label);
+    // 整段包在 try 内：usage 提示此前在任何保护之外，一旦回显失败（例如在不支持 Adventure 的核心上）
+    // 会从命令分发器二次抛出。现在任何异常都只记日志并尽力回显一句中文提示，绝不外抛。
+    try {
+      if (args.length == 0) {
+        usage(sender, label);
+        return true;
+      }
+      switch (args[0].toLowerCase(Locale.ROOT)) {
+        case "status" -> status(sender);
+        case "dump" -> dump(sender);
+        case "reload" -> reload(sender);
+        default -> usage(sender, label);
+      }
+      return true;
+    } catch (Throwable throwable) {
+      plugin.getLogger().log(Level.WARNING, "执行管理命令时出现异常", throwable);
+      safeMessage(sender, "执行管理命令时出现异常，详见服务端日志");
       return true;
     }
-    switch (args[0].toLowerCase(Locale.ROOT)) {
-      case "status" -> status(sender);
-      case "dump" -> dump(sender);
-      case "reload" -> reload(sender);
-      default -> usage(sender, label);
-    }
-    return true;
   }
 
   private void status(CommandSender sender) {
@@ -107,6 +115,18 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
    */
   private static void message(CommandSender sender, String text) {
     sender.sendMessage(Component.text(text));
+  }
+
+  /**
+   * 回显失败也不外抛的兜底入口（供 {@code onCommand} 的顶层 catch 使用）：
+   * 回显本身再失败时只吞掉——顶层早已把异常记进日志，绝不从命令分发器二次抛出。
+   */
+  private static void safeMessage(CommandSender sender, String text) {
+    try {
+      message(sender, text);
+    } catch (Throwable ignored) {
+      // 回显失败：日志已记录，命令处理到此为止（返回 true 表示已处理）
+    }
   }
 
   @Override

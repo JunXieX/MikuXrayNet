@@ -40,7 +40,7 @@ class DiagnosticsTest {
         new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 40L, 6L),
         new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L),
         new Diagnostics.Snapshot.Throttle(20L, 30L, 4L, 40L, 12L,
-            6L, 5L, 4, 40L, 7L, 3L, 2, 3L, 8L, 9L, 4L),
+            6L, 5L, 4, 40L, 7L, 3L, 2, 3L, 8L, 9L, 4L, 5L, 25_000_000L),
         new Diagnostics.Snapshot.Pool(4, 2, 10, 2048),
         new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2, 4L, 5L, 6L, 1L, 0L),
         null, bandwidth);
@@ -175,6 +175,8 @@ class DiagnosticsTest {
         "实体隐藏/恢复必须附带实时「当前隐藏中」，否则 721 vs 299 这类不对称无法自证：" + text);
     assertTrue(text.contains("实体复检 40（复检致隐藏 7，复检致恢复 3）"),
         "状态面板必须单列周期复检口径，否则「先可见后被遮挡」是否被收敛到隐藏无法观测：" + text);
+    assertTrue(text.contains("单线程冲刷 5 次（累计 25.0 ms，平均 5.00 ms/次）"),
+        "状态面板必须暴露单线程合并冲刷的次数与耗时（极端配置下的延迟瓶颈观测口径）：" + text);
     assertTrue(text.contains("磁盘缓存"), text);
     assertTrue(text.contains("命中率 75.0%"), text);
     // 「命中率为什么异常」的自证口径：过期清理 / 负载被拒 / 写入被拒 / 异常必须可见

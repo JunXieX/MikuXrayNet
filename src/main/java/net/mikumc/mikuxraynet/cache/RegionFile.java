@@ -37,6 +37,32 @@ final class RegionFile implements AutoCloseable {
   /** 「未取得文件锁」的 WARN 只打一次（多文件被占用时不刷屏）。 */
   private static final AtomicBoolean LOCK_WARNING = new AtomicBoolean();
 
+  /**
+   * 桶头声明的 {@code rawLength} 相对<b>整文件大小</b>的许可倍数上限。
+   *
+   * <p><b>为什么需要</b>：{@code rawLength} 直接来自（可能损坏/被篡改的）文件，解压会按它先分配原始
+   * 缓冲区。单靠 {@code BufferedLinearV3Format} 的 {@link BufferedLinearV3Format#MAX_RAW_SIZE}（128 MiB）
+   * 与「压缩比」闸门仍留有一个洞：压缩长度约 16 KB 的桶恰好能声明到约 128 MiB raw（8192 × 16 KB）通过
+   * 压缩比检查，16 个桶叠加即约 2 GiB 的分配尖峰。用一个与文件实际大小挂钩的钳制即可堵住它——
+   * 桶占文件字节数很小，却声明出远超文件的原始长度，只可能是伪造头。
+   *
+   * <p><b>为什么取 1024</b>：真实负载里「单桶原始长度 / 整文件字节」远小于 100（区块负载压缩比通常个位数
+   * 到几十；即便单个高重复桶，其原始长度也不会超过整文件的千倍），1024 留足 >10 倍余量、绝不误伤合法桶；
+   * 同时它远小于 8192，可把上述「16 KB 声明 128 MiB」的伪造头直接拒之门外（该类伪造需要 8192 倍）。
+   */
+  private static final long MAX_RAW_LENGTH_RATIO = 1024L;
+
+  /**
+   * 单次 {@link #compact} 允许累计解压的原始字节上限（256 MiB）。
+   *
+   * <p>压缩要先把全部 bucket 载入内存（见 {@link #compact} 的内存尖峰说明）。即便每个桶都通过了
+   * {@link #MAX_RAW_LENGTH_RATIO} 钳制，16 个桶叠加仍可能很大；这里对「累计解压字节」再加一道总量闸：
+   * 超限即中止本次压缩、直接抛异常（此时尚未创建临时文件，原文件毫发无损，交由调用方走既有安全路径）。
+   * 取值依据：合法文件的活动数据受 {@code max-file-size-mb}（默认远小于此）与逐条目负载上限共同约束，
+   * 整文件解压后极少超过 256 MiB，故它只拦异常/伪造输入。
+   */
+  private static final long MAX_COMPACT_TOTAL_RAW = 256L * 1024 * 1024;
+
   /** 条目的保留判定（用于压缩回收时丢弃过期/旧代次条目）。 */
   @FunctionalInterface
   interface EntryFilter {
@@ -339,18 +365,31 @@ final class RegionFile implements AutoCloseable {
     return replaced;
   }
 
-  /** 清空一个区块的条目（惰性清理过期/旧代次条目时使用）。 */
+  /**
+   * 清空一个区块的条目（惰性清理过期/旧代次条目时使用）。
+   *
+   * <p><b>轻量路径（绝不触发整桶解码）</b>：只在桶「已经加载」时就地清空槽位；桶未被加载（已被 LRU 释放）
+   * 时直接返回 {@code false}，<b>不为清一个槽位把整桶 64 个条目解码进内存</b>。这样读路径上的过期/配置不符
+   * 清理不会额外付出「整桶 decode」的开销（读路径只担保 50ms 预算），磁盘上的陈旧条目改由维护期压缩回收
+   * （{@code DiskCacheStore#keepEntry} 按过期时间丢弃）兜底；语义仍是 fail-open，未清即为「未删」，
+   * 调用方的计数不会因此多减。
+   */
   boolean clear(int chunkIndex) {
     if (lockUnavailable) {
       return false; // 该文件归其它进程所有：跳过（不落盘、不报错）
     }
-    BufferedLinearV3Format.Entry[] bucketSlots = ensureLoaded(bucketIndex(chunkIndex));
+    int bucket = bucketIndex(chunkIndex);
+    BufferedLinearV3Format.Entry[] bucketSlots = slots[bucket];
+    if (bucketSlots == null) {
+      return false; // 桶未加载：不为它解码，交给维护期回收
+    }
+    loaded.get(bucket); // 与 ensureLoaded 一致地标记为最近使用，保持 LRU 语义
     int slot = slotInBucket(chunkIndex);
     if (bucketSlots[slot] == null) {
       return false;
     }
     bucketSlots[slot] = null;
-    dirty[bucketIndex(chunkIndex)] = true;
+    dirty[bucket] = true;
     return true;
   }
 
@@ -360,20 +399,39 @@ final class RegionFile implements AutoCloseable {
       return false; // 该文件归其它进程所有：跳过落盘（不报错）
     }
     boolean wrote = false;
+    // 记录本轮真正追加落盘的桶，等偏移表也写成功后再统一清 dirty（见方法说明）。
+    boolean[] flushed = new boolean[BufferedLinearV3Format.BUCKET_COUNT];
     for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
       if (dirty[bucket] && slots[bucket] != null) {
-        wrote |= flushBucket(bucket);
+        if (flushBucket(bucket)) {
+          wrote = true;
+          flushed[bucket] = true;
+        }
       }
     }
     if (wrote) {
+      // 顺序关键：先把偏移表写成功，再清 dirty。若先清 dirty、后写偏移表，一旦 writePosTable/force
+      // 失败，新副本就成了「偏移表里没有、脏标记也没了」的孤儿——重启会回退到旧版本条目（仅靠源指纹
+      // 兜底）。现在失败时 dirty 保持为真，下轮 flushDirty 会重试（重试会再追加一份新副本，旧副本计入垃圾）。
       writePosTable();
       channel.force(false);
+      for (int bucket = 0; bucket < flushed.length; bucket++) {
+        if (flushed[bucket]) {
+          dirty[bucket] = false;
+        }
+      }
       garbageBytes = Math.max(0L, fileSize - BufferedLinearV3Format.DATA_AREA_OFFSET - liveBytes);
     }
     return wrote;
   }
 
-  /** 追加写入单个 bucket（append-only：旧副本变成垃圾，由 {@link #compact} 回收）。 */
+  /**
+   * 追加写入单个 bucket（append-only：旧副本变成垃圾，由 {@link #compact} 回收）。
+   *
+   * <p><b>刻意不清 {@code dirty[bucket]}</b>：本方法只负责写数据，脏标记的清除由调用方在「偏移表也写成功」
+   * 之后统一完成（{@link #flushDirty} / {@link #selectEvictableVictim}），从而保证「新副本已可被索引到」
+   * 之前不会被误判为已落盘（见 {@link #flushDirty} 的顺序说明）。
+   */
   private boolean flushBucket(int bucket) throws IOException {
     if (fileSize < BufferedLinearV3Format.DATA_AREA_OFFSET) {
       // 兜底不变式：数据区之前永远先有头部与偏移表，绝不把 bucket 写进元数据区
@@ -397,8 +455,7 @@ final class RegionFile implements AutoCloseable {
     liveBytes += bucketSizes[bucket];
     positions[bucket] = offset;
     fileSize = offset + bucketSizes[bucket];
-    dirty[bucket] = false;
-    return true;
+    return true; // dirty 的清除交给调用方在偏移表写成功之后，见方法说明
   }
 
   /**
@@ -424,8 +481,15 @@ final class RegionFile implements AutoCloseable {
     try {
       BufferedLinearV3Format.Entry[][] all =
           new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_COUNT][];
+      // 累计解压字节的记账数组：即使每个桶都过了 rawLength 钳制，16 个桶叠加仍可能过大，
+      // 因此再加一道总量闸。超限即在此抛异常——此刻临时文件尚未创建，原文件毫发无损。
+      long[] compactRawBudget = {0L};
       for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
-        all[bucket] = ensureLoaded(bucket);
+        all[bucket] = ensureLoaded(bucket, compactRawBudget);
+        if (compactRawBudget[0] > MAX_COMPACT_TOTAL_RAW) {
+          throw new IOException("压缩回收累计解压字节 " + compactRawBudget[0]
+              + " 超过上限 " + MAX_COMPACT_TOTAL_RAW + "，已中止本次压缩（保持原文件不变）");
+        }
       }
 
       int dropped = 0;
@@ -662,6 +726,16 @@ final class RegionFile implements AutoCloseable {
   }
 
   private BufferedLinearV3Format.Entry[] ensureLoaded(int bucket) {
+    return ensureLoaded(bucket, null);
+  }
+
+  /**
+   * 载入一个 bucket（必要时从磁盘解压）。
+   *
+   * @param compactRawBudget 非 {@code null} 时用于 {@link #compact} 的累计解压字节记账：每成功解压一个桶
+   *                         就把其声明原始长度累加进去，供调用方实施 {@link #MAX_COMPACT_TOTAL_RAW} 总量闸
+   */
+  private BufferedLinearV3Format.Entry[] ensureLoaded(int bucket, long[] compactRawBudget) {
     BufferedLinearV3Format.Entry[] bucketSlots = slots[bucket];
     if (bucketSlots != null) {
       loaded.get(bucket);
@@ -676,7 +750,12 @@ final class RegionFile implements AutoCloseable {
         int rawLength = buffer.getInt();
         int compressedLength = buffer.getInt();
         if (rawLength > 0 && compressedLength > 0
-            && positions[bucket] + 8L + compressedLength <= fileSize) {
+            && positions[bucket] + 8L + compressedLength <= fileSize
+            && rawLengthWithinFileBudget(rawLength)) {
+          if (compactRawBudget != null) {
+            // 只在「确实要按 rawLength 分配解压缓冲」时才计入，避免把已内存驻留的桶重复计数
+            compactRawBudget[0] += rawLength;
+          }
           byte[] compressed = readAt(channel, positions[bucket] + 8L, compressedLength);
           bucketSlots = BufferedLinearV3Format.decodeBucket(
               BufferedLinearV3Format.decompress(compressed, rawLength, compression), hashSeed);
@@ -692,6 +771,14 @@ final class RegionFile implements AutoCloseable {
     // 正在加载的 bucket 不得被本轮驱逐（否则返回给调用方的数组会变成孤儿、后续写入丢失）
     evictIfNeeded(bucket);
     return bucketSlots;
+  }
+
+  /**
+   * 桶头 {@code rawLength} 是否落在「按整文件大小放大的合理上界」内（见 {@link #MAX_RAW_LENGTH_RATIO}）。
+   * 不满足即视为损坏/伪造头，由调用方 fail-open（该桶当空），<b>在分配任何解压缓冲之前</b>拦下。
+   */
+  private boolean rawLengthWithinFileBudget(int rawLength) {
+    return rawLength > 0 && (long) rawLength <= fileSize * MAX_RAW_LENGTH_RATIO;
   }
 
   /**
@@ -719,8 +806,9 @@ final class RegionFile implements AutoCloseable {
         int rawLength = buffer.getInt();
         int compressedLength = buffer.getInt();
         if (rawLength <= 0 || compressedLength <= 0
-            || positions[bucket] + 8L + compressedLength > fileSize) {
-          continue;
+            || positions[bucket] + 8L + compressedLength > fileSize
+            || !rawLengthWithinFileBudget(rawLength)) {
+          continue; // 含「声明原始长度远超文件」的伪造头：与 ensureLoaded 同口径，避免按它分配
         }
         byte[] compressed = readAt(channel, positions[bucket] + 8L, compressedLength);
         count += BufferedLinearV3Format.countBucketEntries(
@@ -778,6 +866,8 @@ final class RegionFile implements AutoCloseable {
       try {
         flushBucket(candidate);
         writePosTable();
+        // 与 flushDirty 同口径：偏移表写成功后才清 dirty（失败则保持为真、下轮重试，避免新副本成为孤儿）
+        dirty[candidate] = false;
         // 驱逐落盘后旧副本成为垃圾：与 flushDirty/compact 口径一致地重算垃圾字节数，
         // 否则压缩回收的「垃圾占比」判定会低估，垃圾迟迟得不到回收
         garbageBytes = Math.max(0L,

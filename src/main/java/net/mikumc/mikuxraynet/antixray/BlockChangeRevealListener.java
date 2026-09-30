@@ -208,21 +208,23 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private static final class SectionBuffer {
 
     private final long key;
-    /** 16³ = 4096 个槽位，同一 section 内坐标编码唯一，用于去重。 */
-    private final boolean[] seen = new boolean[4096];
+    /** 本 section 专属的去重代次（见 {@link SeenScratch}）；同一线程内每个 section 都不同。 */
+    private final int generation;
+    private final SeenScratch scratch;
     private int[] data = new int[48];
     private int count;
 
-    private SectionBuffer(long key) {
+    private SectionBuffer(long key, int generation, SeenScratch scratch) {
       this.key = key;
+      this.generation = generation;
+      this.scratch = scratch;
     }
 
     private void add(int x, int y, int z) {
       int slot = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
-      if (seen[slot]) {
+      if (!scratch.mark(slot, generation)) {
         return;
       }
-      seen[slot] = true;
       if (count * 3 + 3 > data.length) {
         data = java.util.Arrays.copyOf(data, data.length * 2);
       }
@@ -230,6 +232,42 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       data[count * 3 + 1] = y;
       data[count * 3 + 2] = z;
       count++;
+    }
+  }
+
+  /**
+   * 去重 scratch（线程本地，复用避免为每个 section 新分配一个 {@code boolean[4096]}）：
+   * 用「代次戳数组」而非每次清零的布尔数组——同一 16³ 槽位只记一个 {@code stamp[slot] == generation}
+   * 即视为已见，换一个 section 只递增代次，无需清空 4096 个槽。仅 netty 事件循环线程会用到，
+   * 线程数量少且长生存，因此 ThreadLocal 复用是安全的（每个线程各自持有）。
+   */
+  private static final class SeenScratch {
+
+    private static final ThreadLocal<SeenScratch> LOCAL = ThreadLocal.withInitial(SeenScratch::new);
+
+    private final int[] stamp = new int[4096];
+    private int generation;
+
+    private static SeenScratch current() {
+      return LOCAL.get();
+    }
+
+    /** 取得本 section 专属的新代次；代次回绕到 0 时整表清零重来（实际不可能到达）。 */
+    private int nextGeneration() {
+      if (++generation == 0) {
+        java.util.Arrays.fill(stamp, 0);
+        generation = 1;
+      }
+      return generation;
+    }
+
+    /** 标注并返回该槽位是否为「本代次首次出现」（false = 重复，调用方应跳过）。 */
+    private boolean mark(int slot, int generation) {
+      if (stamp[slot] == generation) {
+        return false;
+      }
+      stamp[slot] = generation;
+      return true;
     }
   }
 
@@ -251,6 +289,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
 
     java.util.List<SectionBuffer> sections = new java.util.ArrayList<>();
+    SeenScratch scratch = SeenScratch.current();
     for (int i = 0; i < count; i++) {
       int x = coordinates[i * 3];
       int y = coordinates[i * 3 + 1];
@@ -264,7 +303,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
         }
       }
       if (buffer == null) {
-        buffer = new SectionBuffer(key);
+        buffer = new SectionBuffer(key, scratch.nextGeneration(), scratch);
         sections.add(buffer);
       }
       buffer.add(x, y, z);
@@ -285,11 +324,11 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
     // 已显形标记必须与伪装清单同步摘除：维持「已显形坐标 ⊆ 区块伪装清单」不变式。
     // 索引未命中也要摘（宁可多摘一次也不能留孤儿标记，见 unregisterCoordinate）。
+    // 一个 SectionBuffer 的坐标同属一个区块，故一次批量摘除即可（与索引侧 removePositions 对称）：
+    // 逐坐标调用会为每个坐标重复一次 ChunkKey.ofBlock + 遍历全部玩家 + 逐 marker 加锁，
+    // 一个 section 最多 4096 个坐标时会把这段工作量在 netty 线程上确定性放大。
     if (revealedSet != null) {
-      for (int i = 0; i < section.count; i++) {
-        revealedSet.removePosition(worldName, section.data[i * 3], section.data[i * 3 + 1],
-            section.data[i * 3 + 2]);
-      }
+      revealedSet.removePositions(worldName, section.data, section.count);
     }
     if (removed > 0 && stats != null) {
       stats.unregistered.add(removed);

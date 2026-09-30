@@ -58,24 +58,35 @@ public final class BypassRegistry implements Listener {
   /**
    * 注册登录/退出监听，并对「启用时已在线」的玩家做一次快照判定。可重复调用，异常安全。
    *
-   * <p><b>幂等且清理前一实例</b>：先停用「当前活动实例」再停用自身（若不同），最后再注册。
-   * 旧实现只调 {@code this.stop()}，若换实例启用（stat 命令重建 / 重复 enable），前一实例的
-   * 事件监听仍挂着并继续维护它自己的名单，与 {@link #active} 指向的新实例不一致（stale 名单 +
-   * 监听泄漏：旧实例的 onJoin 更新旧集合，封包线程读的却是新集合）。因此这里显式先清理前一实例。
+   * <p><b>先注册成功再发布 {@code active}（本次修复）</b>：旧实现先把 {@code active = this} 再
+   * {@code registerEvents}，一旦注册<b>半程失败</b>，{@code active} 已指向本实例、但监听未注册，
+   * 名单永不更新 → 该显示真矿的 bypass 玩家反而被 fail-closed（看不到真矿）。现在改为：
+   * 只有 {@code registerEvents} 成功才接管 {@code active}；失败则<b>保留前一实例</b>（不 stop、不覆盖），
+   * 从而既不泄漏 stale 名单，也绝不因一次注册失败把一个可用的名单整体打成 fail-closed。
    *
-   * <p>不注册任何周期任务：权限变更需重进服务器才生效（见类注释）。
+   * <p><b>幂等且清理前一实例</b>：注册成功后，先停用「当前活动实例」（若不同）再接管，最后做一次性快照。
+   * 若当前活动实例正是本实例（重复 {@code start()}），直接返回，避免重复注册监听。
    */
   public void start() {
-    // 清理「当前活动实例」（可能是另一个实例）：其监听必须先注销、名单先清空，避免与本次注册的
-    // 监听并存导致名单双份维护、互相不一致（本实例尚未注册，此步对其无副作用）。
+    // 已是当前活动实例：重复启动无副作用，直接返回（否则会重复注册监听，事件被处理两次）
+    if (active == this) {
+      return;
+    }
+    try {
+      plugin.getServer().getPluginManager().registerEvents(this, plugin);
+    } catch (Throwable throwable) {
+      // 注册失败：不发布 active、不清前一实例，保留既有可用名单（绝不 fail-closed）
+      plugin.getLogger().warning("直通名单初始化失败（不影响按登录/退出维护）：" + throwable.getMessage());
+      return;
+    }
+    // 注册成功：清理「当前活动实例」（可能是另一个实例）——其监听必须先注销、名单先清空，
+    // 避免两个实例并存导致名单双份维护、互相不一致（stale 名单 + 监听泄漏）。
     BypassRegistry previous = active;
     if (previous != null && previous != this) {
       previous.stop();
     }
-    stop();
     active = this;
     try {
-      plugin.getServer().getPluginManager().registerEvents(this, plugin);
       // 一次性快照（非周期）：服务器刚装插件 / reload 时，把「当时已在线」玩家的当前权限登记进名单。
       // 复用被移除的巡检所用调度方式（GlobalRegionScheduler）：Paper 上落在主线程，Folia 上落在全局
       // 区域线程；只跑一次，此后不再有任何刷新——运行期改权限需重进服务器。

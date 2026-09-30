@@ -114,6 +114,47 @@ class ProtocolLibAsyncListenerBatchTest {
     assertEquals(1, table.size());
   }
 
+  /**
+   * 超限逐出行为不变（每次只淘汰最旧一个），并新增「累计逐出计数 + 节流中文 WARN」观测点：
+   * 每 64 次逐出输出一条日志，避免真机超限时刷屏。
+   */
+  @Test
+  void overLimitEvictionIsCountedAndLoggedThrottled() {
+    java.util.logging.Logger logger =
+        java.util.logging.Logger.getLogger("MikuXrayNet-BatchTest-" + System.nanoTime());
+    logger.setUseParentHandlers(false);
+    java.util.List<String> warnings = new java.util.ArrayList<>();
+    java.util.logging.Handler handler = new java.util.logging.Handler() {
+      @Override
+      public void publish(java.util.logging.LogRecord record) {
+        if (record.getLevel().intValue() >= java.util.logging.Level.WARNING.intValue()) {
+          warnings.add(record.getMessage());
+        }
+      }
+
+      @Override
+      public void flush() {
+      }
+
+      @Override
+      public void close() {
+      }
+    };
+    logger.addHandler(handler);
+    try {
+      ProtocolLibAsyncListener.BatchTable table = new ProtocolLibAsyncListener.BatchTable(2, logger);
+      for (int i = 0; i < 66; i++) {
+        table.open(UUID.nameUUIDFromBytes(("p" + i).getBytes()));
+      }
+      assertEquals(2, table.size(), "容量上限不变");
+      assertEquals(64L, table.evictions(), "逐出行为不变：每次超限只淘汰最旧一个");
+      assertEquals(1, warnings.size(), "每 64 次逐出输出一条 WARN（节流，不刷屏）");
+      assertTrue(warnings.get(0).contains("批次闸门"), "日志应为可读中文");
+    } finally {
+      logger.removeHandler(handler);
+    }
+  }
+
   // ---------------------------------------------------------- 取闸门 + 登记 原子性（任务 3）
 
   /**

@@ -13,7 +13,9 @@ import java.util.Arrays;
 import java.util.Map;
 import java.util.UUID;
 import java.util.logging.Logger;
+import org.bukkit.Server;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.PluginManager;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -160,18 +162,45 @@ class BypassRegistryTest {
   }
 
   /**
-   * 离线桩插件：{@code getServer()} 抛异常（离线无 Bukkit），{@code getLogger()} 返回真实 Logger，
-   * 使 {@link BypassRegistry#start()} 走到「初始化失败但不影响名单维护」的兜底分支。
+   * 离线桩插件：{@code getServer().getPluginManager().registerEvents(...)} 为成功的空实现，
+   * {@code getLogger()} 返回真实 Logger；{@code Bukkit.getGlobalRegionScheduler()} 在离线环境不可用
+   * （静态 Bukkit 未初始化），使 {@link BypassRegistry#start()} 走到「快照登记失败但不影响名单维护」的
+   * 兜底分支——注册监听本身成功，故 {@code active} 会被正常发布。
+   *
+   * @param registrationFails true 时让 {@code registerEvents} 抛异常，用于验证「注册半程失败不发布 active」
    */
-  private static Plugin stubPlugin() {
+  private static Plugin stubPlugin(boolean registrationFails) {
     Logger logger = Logger.getLogger("BypassRegistryTest");
+    PluginManager pluginManager = (PluginManager) Proxy.newProxyInstance(
+        PluginManager.class.getClassLoader(), new Class<?>[] {PluginManager.class},
+        (proxy, method, args) -> switch (method.getName()) {
+          case "registerEvents" -> {
+            if (registrationFails) {
+              throw new IllegalStateException("离线测试：模拟 registerEvents 半程失败");
+            }
+            yield null;
+          }
+          case "hashCode" -> System.identityHashCode(proxy);
+          case "equals" -> proxy == args[0];
+          case "toString" -> "stub-plugin-manager";
+          default -> null;
+        });
+    Server server = (Server) Proxy.newProxyInstance(
+        Server.class.getClassLoader(), new Class<?>[] {Server.class},
+        (proxy, method, args) -> switch (method.getName()) {
+          case "getPluginManager" -> pluginManager;
+          case "hashCode" -> System.identityHashCode(proxy);
+          case "equals" -> proxy == args[0];
+          case "toString" -> "stub-server";
+          default -> null;
+        });
     return (Plugin) Proxy.newProxyInstance(Plugin.class.getClassLoader(),
         new Class<?>[] {Plugin.class}, new InvocationHandler() {
           @Override
           public Object invoke(Object proxy, Method method, Object[] args) {
             return switch (method.getName()) {
               case "getLogger" -> logger;
-              case "getServer" -> throw new IllegalStateException("离线测试：无 Bukkit 服务端");
+              case "getServer" -> server;
               case "toString" -> "stub-plugin";
               case "hashCode" -> System.identityHashCode(proxy);
               case "equals" -> proxy == args[0];
@@ -179,5 +208,34 @@ class BypassRegistryTest {
             };
           }
         });
+  }
+
+  /** 注册成功的桩插件（常见路径）。 */
+  private static Plugin stubPlugin() {
+    return stubPlugin(false);
+  }
+
+  /**
+   * 任务4 回归：{@code registerEvents} 半程失败时<b>不得发布 {@code active}</b>，且<b>不得停掉前一实例</b>
+   * （否则会把一个可用的名单整体打成 fail-closed，该显示真矿的 bypass 玩家反而看不到真矿）。
+   */
+  @Test
+  void failedRegistrationKeepsPreviousActiveInsteadOfFailClosed() {
+    BypassRegistry good = new BypassRegistry(stubPlugin(false));
+    BypassRegistry broken = new BypassRegistry(stubPlugin(true));
+    UUID player = UUID.randomUUID();
+    try {
+      good.start();
+      good.refresh(player, true);
+      assertTrue(BypassRegistry.isBypassedNow(player), "可用实例启用后其名单生效");
+
+      // 以「注册会失败」的实例再次 start：必须保留 good 为 active，且 players 仍直通（不 fail-closed）
+      broken.start();
+      assertTrue(BypassRegistry.isBypassedNow(player),
+          "注册半程失败绝不能让 active 指向未注册监听的实例（否则名单永不更新 → bypass 玩家 fail-closed）");
+    } finally {
+      broken.stop();
+      good.stop();
+    }
   }
 }

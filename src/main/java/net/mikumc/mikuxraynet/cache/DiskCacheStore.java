@@ -775,7 +775,15 @@ public final class DiskCacheStore implements AutoCloseable {
         .resolve("r." + regionX + "." + regionZ + REGION_FILE_SUFFIX);
   }
 
-  /** 世界名 → 目录名：只保留安全字符，避免路径穿越或非法文件名。 */
+  /**
+   * 世界名 → 目录名：只保留安全字符，避免路径穿越或非法文件名。
+   *
+   * <p><b>目录名碰撞（既定取舍，靠源指纹兜底）</b>：非安全字符统一替换为 {@code '_'} 并转小写，因此
+   * 形如 {@code a/b}、{@code a_b}、{@code A_B} 的不同世界名会落到同一目录、共用同一物理文件，彼此
+   * 可能命中对方写下的条目。这是刻意接受的：条目新鲜度由负载里的<b>原始区块字节指纹</b>判定
+   * （见 {@code DiskPayload.decode}），只有「原始字节完全相同」才会命中——而原始字节相同意味着改写结果
+   * 也相同，跨世界复用它们不会产生错误内容；指纹不符则按未命中处理，最多损失一点命中率，绝不错服。
+   */
   private static String sanitize(String worldName) {
     StringBuilder builder = new StringBuilder(worldName.length());
     for (int index = 0; index < worldName.length(); index++) {

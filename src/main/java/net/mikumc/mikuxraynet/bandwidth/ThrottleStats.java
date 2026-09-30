@@ -21,6 +21,17 @@ public final class ThrottleStats {
   public final LongAdder blockChangesMerged = new LongAdder();
   public final LongAdder blockChangesPassed = new LongAdder();
 
+  /**
+   * 方块变更合并的<b>冲刷诊断</b>：冲刷次数与累计冲刷耗时（纳秒）。
+   *
+   * <p><b>为什么单列</b>：合并冲刷跑在单线程 {@code MikuXrayNet-BlockMerge} 上，极端配置（大时间窗 +
+   * 大邻域 + 大方块量）下「同一玩家窗口到期」的构造/发送会成为延迟瓶颈。本组计数把这条单线程路径的
+   * 实际耗时暴露出来（累计耗时 / 冲刷次数 = 平均一次冲刷的成本），无需引入任何复杂并发。
+   * 这是<b>纯观测</b>值，不影响任何行为。
+   */
+  public final LongAdder blockMergeFlushes = new LongAdder();
+  public final LongAdder blockMergeFlushNanos = new LongAdder();
+
   /** 实体剔除：隐藏次数 / 恢复次数。 */
   public final LongAdder entitiesHidden = new LongAdder();
   public final LongAdder entitiesShown = new LongAdder();

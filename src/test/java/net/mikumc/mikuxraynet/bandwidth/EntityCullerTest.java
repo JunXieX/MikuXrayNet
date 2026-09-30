@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.papermc.paper.event.player.PlayerTrackEntityEvent;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -443,6 +444,34 @@ class EntityCullerTest {
     double[][] tiny = EntityCuller.visibleVertices(0.5D, 64.5D, 0.5D,
         10.0D, 64.0D, 10.0D, 10.05D, 64.05D, 10.05D);
     assertTrue(tiny.length <= BandwidthConfig.MAX_RAY_SAMPLES, "小包围盒的顶点数不得超过上限");
+  }
+
+  /**
+   * 停用并发闭合（任务1）：{@code stop()} 首行置 {@code stopping} 后，任何迟到的复检/评估
+   * <b>都不得再隐藏实体</b>——否则会把 {@code restoreAll()} 刚恢复的实体重新藏回（玩家持续不可见）。
+   *
+   * <p>离线不可构造完整停用链路（{@code restoreAll} 依赖 {@code Bukkit.getOnlinePlayers()}），
+   * 因此这里以反射置位 {@code stopping}，只钉死「迟到隐藏被拒」这一关键不变量。
+   */
+  @Test
+  void stopPreventsLateHides() throws Exception {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler = newCuller(stats);
+    PlayerStub player = new PlayerStub();
+    EntityStub entity = new EntityStub(9001, new WorldStub());
+
+    setStopping(culler);
+    culler.evaluate(player.proxy(), entity.proxy(), true);
+
+    assertEquals(0L, stats.entitiesHidden.sum(),
+        "停用开始后不得再隐藏实体（否则会把刚被恢复的实体重新藏回）");
+    assertEquals(0, culler.hiddenCount(), "停用开始后账本不得新增记录");
+  }
+
+  private static void setStopping(EntityCuller culler) throws Exception {
+    Field field = EntityCuller.class.getDeclaredField("stopping");
+    field.setAccessible(true);
+    field.setBoolean(culler, true);
   }
 
   private static Set<Integer> idsOf(List<Entity> entities) {

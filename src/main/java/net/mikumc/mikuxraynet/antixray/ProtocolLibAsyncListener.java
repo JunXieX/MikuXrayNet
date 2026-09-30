@@ -66,16 +66,28 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    */
   static final class BatchTable {
 
+    /** 每逐出多少个批次闸门输出一条 WARN（节流，避免超限时刷屏）。 */
+    private static final long EVICTION_LOG_INTERVAL = 64;
+
     private final int maxPending;
+    private final java.util.logging.Logger logger;
     private final LinkedHashMap<UUID, ChunkBatchGate> gates = new LinkedHashMap<>();
+    /** 累计逐出的闸门数（诊断用；逐出行为本身不变）。 */
+    private long evictions;
 
     BatchTable() {
-      this(MAX_PENDING_BATCHES);
+      this(MAX_PENDING_BATCHES, null);
     }
 
-    /** 测试用构造：可指定容量上限。 */
+    /** 测试用构造：可指定容量上限（不输出日志）。 */
     BatchTable(int maxPending) {
+      this(maxPending, null);
+    }
+
+    /** 生产用构造：超限逐出最旧条目时按 {@link #EVICTION_LOG_INTERVAL} 节流输出中文 WARN。 */
+    BatchTable(int maxPending, java.util.logging.Logger logger) {
       this.maxPending = Math.max(1, maxPending);
+      this.logger = logger;
     }
 
     /** 取某玩家当前未配对的闸门；无则返回 {@code null}。 */
@@ -102,16 +114,33 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
 
     /** 打开某玩家的批次闸门；已达上限时先淘汰最旧的未完成条目（只清一个）。 */
-    synchronized void open(UUID playerId) {
-      while (gates.size() >= maxPending) {
-        Iterator<UUID> iterator = gates.keySet().iterator();
-        if (!iterator.hasNext()) {
-          break;
+    void open(UUID playerId) {
+      long totalEvicted;
+      synchronized (this) {
+        boolean evicted = false;
+        while (gates.size() >= maxPending) {
+          Iterator<UUID> iterator = gates.keySet().iterator();
+          if (!iterator.hasNext()) {
+            break;
+          }
+          iterator.next();
+          iterator.remove();
+          evictions++;
+          evicted = true;
         }
-        iterator.next();
-        iterator.remove();
+        gates.put(playerId, new ChunkBatchGate());
+        totalEvicted = evictions;
+        if (!evicted) {
+          return;
+        }
       }
-      gates.put(playerId, new ChunkBatchGate());
+      // 日志在锁外输出（锁内只做内存操作，见类注释）；按固定间隔节流，绝不因超限刷屏。
+      if (logger != null && totalEvicted % EVICTION_LOG_INTERVAL == 0) {
+        logger.warning("区块批次闸门表已满（上限 " + maxPending + " 个未配对批次），"
+            + "已按插入序淘汰最旧的闸门（累计逐出 " + totalEvicted + " 个）："
+            + "被淘汰玩家的 CHUNK_BATCH_FINISHED 将无配对 START、直接放行。"
+            + "正常运营下不应出现——请排查是否有玩家的批次包只发 START 不发 FINISHED。");
+      }
     }
 
     /** 移除并返回某玩家的闸门（批次结束 / 玩家退出时调用）。 */
@@ -121,6 +150,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     synchronized int size() {
       return gates.size();
+    }
+
+    /** 累计因超限被淘汰的闸门数（诊断用）。 */
+    synchronized long evictions() {
+      return evictions;
     }
 
     /** 清空全部闸门（停用时调用；此时不会再有批次包到达）。 */
@@ -164,7 +198,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final BypassRegistry bypassRegistry;
   private final DiskCacheStore diskCache;
   private final RewriteStats stats = new RewriteStats();
-  private final BatchTable batches = new BatchTable();
+  private final BatchTable batches;
   /**
    * 玩家退出清理批次闸门的 Bukkit 监听。
    *
@@ -214,6 +248,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     this.revealedSet = revealedSet;
     this.bypassRegistry = bypassRegistry;
     this.diskCache = diskCache;
+    // 批次闸门表在超限逐出时按间隔输出中文 WARN（旧实现静默逐出，真机无法察觉异常玩家）。
+    this.batches = new BatchTable(MAX_PENDING_BATCHES, plugin.getLogger());
     registerQuitHook();
   }
 
@@ -258,11 +294,20 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
   @Override
   public void onPacketSending(PacketEvent event) {
+    PacketType type = event.getPacketType();
+    // 停用 / 被取消瞬间：先把 CHUNK_BATCH_FINISHED 的残留闸门清掉，再判 isActive。旧实现直接
+    // early-return，残留闸门只能靠退出清理 / 下次 START 覆盖 / 超限淘汰兜底——与 handleBatchFinish
+    // 「先清闸门再判 appliesTo」同构。活跃路径不改：handleBatchFinish 自己会先 remove 再延迟放行，
+    // 若这里抢先 remove，该批次的 FINISHED 就失去了应有的延迟，故清理只放在早退分支里。
     if (event.isCancelled() || !processor.isActive()) {
+      if (handleChunkBatch && type == PacketType.Play.Server.CHUNK_BATCH_FINISHED) {
+        Player player = event.getPlayer();
+        if (player != null) {
+          batches.remove(player.getUniqueId());
+        }
+      }
       return;
     }
-
-    PacketType type = event.getPacketType();
     if (handleChunkBatch && type == PacketType.Play.Server.CHUNK_BATCH_START) {
       handleBatchStart(event);
     } else if (handleChunkBatch && type == PacketType.Play.Server.CHUNK_BATCH_FINISHED) {
@@ -274,7 +319,14 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
   private void handleChunk(PacketEvent event) {
     Player player = event.getPlayer();
-    if (player == null || !appliesTo(player)) {
+    if (player == null) {
+      return;
+    }
+    // 世界只取一次并复用同一引用：旧实现 appliesTo(player) 内部取一次 getWorld()、
+    // 下面又取一次——玩家恰在两次取之间切换世界时，可能用「新世界的生效判定」去放行
+    // 「旧世界的区块原包」（窗口极小，但确实存在 TOCTOU）。这里固定一次读取。
+    World world = player.getWorld();
+    if (world == null || !appliesTo(player, world)) {
       return;
     }
 
@@ -287,7 +339,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return;
     }
 
-    World world = player.getWorld();
     ChunkPacketAccessor accessor;
     try {
       accessor = new ChunkPacketAccessor(event.getPacket());
@@ -647,10 +698,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return;
     }
     // remove-block-entities 实时读「当前」配置：它直接决定写进封包的字节，reload 切换必须立即生效。
-    if (!accessor.update(data, positions, task.minHeight(), current.removeBlockEntities())) {
+    boolean verified = accessor.update(data, positions, task.minHeight(), current.removeBlockEntities());
+    if (!verified) {
       // 「算了但没写」：写回后回读不一致（ProtocolLib 版本/封包结构不符），必须留痕
       stats.writeBackFailures.increment();
       logThrottled("区块改写结果未能写回封包（写回后回读不一致），本轮按原包内容放行", null);
+      // 写回未确认生效时，客户端拿到的仍是原始（未伪装）字节，本区块其实没有隐藏任何矿物。
+      // 若此时仍把坐标登记进伪装索引，邻近显形只会为「本就没被伪装的坐标」发冗余显形包，
+      // 既浪费带宽又把索引/统计撑大——与本类「verified=false 不剔除方块实体」的既有短路同向，
+      // 这里直接跳过索引登记（也不动已显形集合）。计数观测点让「本该登记却因写回失败被跳过」可见。
+      stats.indexSkippedOnWriteBackFailure.increment();
+      return;
     }
 
     // 记录「这个区块被伪装过的坐标」（按区块共享，只存一份；纯内存写入，可在工作线程执行）。
@@ -695,11 +753,20 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
   /** 该玩家是否受本模块影响（直通名单绕过 + 反矿透世界判定）。 */
   private boolean appliesTo(Player player) {
+    World world = player.getWorld();
+    return world != null && appliesTo(player, world);
+  }
+
+  /**
+   * 该玩家是否受本模块影响（判定用调用方已捕获的世界实例，避免重复 {@code getWorld()} 造成 TOCTOU）。
+   *
+   * <p>黑名单判定必须读「当前」配置（本监听器不随热重载重建）：否则 reload 后纳入黑名单的世界仍会被改写。
+   */
+  private boolean appliesTo(Player player, World world) {
     if (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId())) {
       return false;
     }
-    // 黑名单判定必须读「当前」配置（本监听器不随热重载重建）：否则 reload 后纳入黑名单的世界仍会被改写。
-    return worldAllowed(live(), player.getWorld().getName());
+    return worldAllowed(live(), world.getName());
   }
 
   /**

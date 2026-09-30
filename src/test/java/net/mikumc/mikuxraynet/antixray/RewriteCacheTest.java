@@ -147,6 +147,74 @@ class RewriteCacheTest {
     assertEquals("d", cache.get("world", 3, 0, 1), "新条目不得因过期条目占位而被淘汰");
   }
 
+  /**
+   * 冷条目（put 后永不再 get）在过期后必须被摊还清理回收。
+   *
+   * <p>回归：旧实现只有「get 命中已过期」与「put 且超容量」两个回收触发点，多数区块只下发一次、
+   * 此后永不 get，于是过期冷条目会一直驻留到顶满上限——「按过期时间回收」对它们失效。
+   */
+  @Test
+  void coldExpiredEntriesAreReclaimedByAmortizedSweep() {
+    RewriteCache<String> cache = cache(64, 10 * SECOND_NANOS);
+    for (int i = 0; i < 6; i++) {
+      cache.put("world", i, 0, 1, "cold" + i);
+    }
+    assertEquals(6, cache.rawSize(), "前置：6 条冷条目入驻");
+
+    clock[0] = 11 * SECOND_NANOS; // 全部过期，但此后不再 get，只能靠摊还清理回收
+    for (int i = 0; i < 3; i++) {
+      cache.put("world", 100 + i, 0, 1, "fresh" + i); // 新建条目触发摊还清理
+    }
+
+    assertEquals(3, cache.rawSize(), "过期冷条目必须被摊还清理回收，不得无限期驻留");
+    assertEquals(3, cache.size(), "只应剩 3 条新写入的有效条目");
+    for (int i = 0; i < 6; i++) {
+      assertNull(cache.get("world", i, 0, 1), "过期冷条目必须已被回收：冷条目 " + i);
+    }
+  }
+
+  /** 摊还清理不得误伤有效条目：窗口内、或近期被访问过的条目必须原样保留。 */
+  @Test
+  void activeEntriesSurviveAmortizedSweep() {
+    RewriteCache<String> cache = cache(64, 10 * SECOND_NANOS);
+    for (int i = 0; i < 5; i++) {
+      cache.put("world", i, 0, 1, "v" + i);
+    }
+
+    clock[0] = 6 * SECOND_NANOS;
+    assertEquals("v0", cache.get("world", 0, 0, 1), "刷新 k0 的访问时间，使其在新时刻仍有效");
+
+    clock[0] = 12 * SECOND_NANOS; // k1..k4 距上次访问 12 秒已过期；k0 仅 6 秒仍有效
+    for (int i = 0; i < 5; i++) {
+      cache.put("world", 100 + i, 0, 1, "n" + i);
+    }
+
+    assertEquals(6, cache.rawSize(), "应为 k0 + 5 条新条目（k1..k4 已过期回收）");
+    assertEquals(6, cache.size());
+    assertEquals("v0", cache.get("world", 0, 0, 1), "窗口内仍有效的条目不得被清理");
+    for (int i = 1; i < 5; i++) {
+      assertNull(cache.get("world", i, 0, 1), "过期条目应已被回收：k" + i);
+    }
+  }
+
+  /** size() 只报活跃数、rawSize() 报原始条目数：口径分离，供诊断区分「已过期未回收」的驻留量。 */
+  @Test
+  void sizeSeparatesActiveFromRaw() {
+    RewriteCache<String> cache = cache(8, 10 * SECOND_NANOS);
+    cache.put("world", 0, 0, 1, "a");
+    cache.put("world", 1, 0, 1, "b");
+    assertEquals(2, cache.size());
+    assertEquals(2, cache.rawSize());
+
+    clock[0] = 11 * SECOND_NANOS; // 两条都过期，但尚未被巡检回收
+    assertEquals(0, cache.size(), "活跃数立即排除过期条目");
+    assertEquals(2, cache.rawSize(), "原始数仍含未回收的过期条目——两者之差即驻留量");
+
+    cache.put("world", 2, 0, 1, "c"); // 触发摊还清理
+    assertEquals(1, cache.size());
+    assertEquals(1, cache.rawSize(), "摊还清理后原始数收敛到活跃数");
+  }
+
   /** 并发回填不同键：缩小同步范围（只在新建条目时维护 CLOCK 队列）后不得丢条目。 */
   @Test
   void concurrentPutsKeepEveryEntry() throws Exception {

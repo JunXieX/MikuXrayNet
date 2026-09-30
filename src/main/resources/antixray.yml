@@ -46,6 +46,12 @@ world-blacklist: []
 #   插件内置常用 tag 映射（各类 _ores、base_stone_overworld / base_stone_nether /
 #   base_stone_end 等）；不认识的 tag 会在启动日志提示并忽略该条目（不会误藏其它方块）。
 #   普通名称与 tag(...) 可以混用。
+#
+#   ★ hide-blocks 空清单的语义（与 world-overrides 相反，务必看清）：
+#       在本 dimensions 段里，把 hide-blocks 显式写成空列表 [] 或不写，效果相同——
+#       都「回落该维度的内置默认清单」（即仍然隐藏默认那批方块），而不是「一个都不藏」。
+#       （这是刻意的：避免服主手滑配空导致该维度悄悄完全不伪装。）
+#       若确实想让某维度「一个方块都不隐藏」，请用 world-overrides 对具体世界覆盖为 []（见文末说明）。
 # ---------------------------------------------------------------------------
 dimensions:
 
@@ -136,6 +142,11 @@ dimensions:
 #   · 可覆盖的键与 dimensions 段相同（enabled / mode / min-y / max-y / hide-blocks /
 #     replacement-weights / replacement-bands / use-block-below）；
 #   · 只写需要覆盖的键即可（例如某个世界只换伪装方块清单，其余全部沿用其维度）；
+#
+#   ★ hide-blocks 空清单在这里的语义与 dimensions 段相反（务必看清）：
+#       在 world-overrides 里把 hide-blocks 显式写成 [] 表示「覆盖为空清单 = 该世界一个方块都不隐藏」
+#       （例如主城世界配 hide-blocks: [] 即完全不伪装）；不写 hide-blocks 才表示「沿用其维度」。
+#       注意：若该世界还在 world-blacklist 里，则以黑名单为准（同样是完全不反矿透）。
 #   · 修改本段后，相关世界的磁盘缓存会自动失效重建（属正常现象）；
 #   · 修改后执行 /mikuxraynet reload 生效。
 # 示例（默认全部注释，不覆盖任何世界）：
@@ -358,6 +369,10 @@ cache:
   # 条目在最后一次被使用后多久过期（秒）。默认 600（10 分钟）：
   # 玩家在同一片区域来回走动/挖矿时会持续命中同一批区块，过期时间越长命中率越高，
   # 代价是这些条目在内存里驻留更久。
+  # 注：条目过期后由「按 put 摊还的巡检」主动回收（不再只依赖读取命中或容量顶满），
+  #     因此长期不再命中的冷条目也会在过期后被释放，实际内存占用会回落到活跃条目规模。
+  #     /mikuxraynet status 的条目数只计「未过期」的活跃数；两者之差为尚未被巡检回收的驻留量，
+  #     短暂存在属正常现象。
   expire-after-access-seconds: 600
 
 advanced:

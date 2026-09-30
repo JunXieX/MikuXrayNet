@@ -128,11 +128,12 @@ public final class Diagnostics {
         long entitiesHidden, long entitiesShown, int entitiesHiddenNow,
         long recheckSubmitted, long recheckHidden, long recheckShown,
         int afkPlayers, long afkEntered, long afkPacketsDropped,
-        long viewDistanceReduced, long viewDistanceRestored) {
+        long viewDistanceReduced, long viewDistanceRestored,
+        long blockMergeFlushes, long blockMergeFlushNanos) {
 
       /** 带宽优化未启用时的零值兜底。 */
       public static final Throttle EMPTY = new Throttle(
-          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L);
+          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     /** 工作线程池域：线程数、活动数与队列占用。 */
@@ -301,7 +302,8 @@ public final class Diagnostics {
             throttleStats.recheckHidden.sum(), throttleStats.recheckShown.sum(),
             pipeline.afkPlayerCount(), throttleStats.afkEntered.sum(),
             throttleStats.afkPacketsDropped.sum(), throttleStats.viewDistanceReduced.sum(),
-            throttleStats.viewDistanceRestored.sum());
+            throttleStats.viewDistanceRestored.sum(), throttleStats.blockMergeFlushes.sum(),
+            throttleStats.blockMergeFlushNanos.sum());
     Snapshot.Pool poolSnapshot = pool == null ? Snapshot.Pool.EMPTY
         : new Snapshot.Pool(pool.poolSize(), pool.activeCount(), pool.queueSize(),
             pool.queueCapacity());
@@ -388,6 +390,11 @@ public final class Diagnostics {
         // 与「合并后发出的包数」（= 合并批次）不是一回事，写「条」极易被读成合并结果的条数。
         + "（合并 " + s.throttle().blockChangesMerged() + " 个原包，放行 "
         + s.throttle().blockChangesPassed() + "）"
+        // 单线程冲刷的「次数 + 累计耗时」：极端配置下的延迟瓶颈靠它观测（累计/次数 = 平均一次的成本）
+        + "；单线程冲刷 " + s.throttle().blockMergeFlushes() + " 次（累计 "
+        + formatMillis(s.throttle().blockMergeFlushNanos()) + " ms，平均 "
+        + averageFlushMillis(s.throttle().blockMergeFlushes(), s.throttle().blockMergeFlushNanos())
+        + " ms/次）"
         + "，实体隐藏 " + s.throttle().entitiesHidden() + "/恢复 " + s.throttle().entitiesShown()
         + "（当前隐藏中 " + s.throttle().entitiesHiddenNow()
         + "；两者之差 = 死亡/卸载被服务端自然回收 + 仍在隐藏）");
@@ -681,5 +688,18 @@ public final class Diagnostics {
       return "0.0%";
     }
     return String.format(Locale.ROOT, "%.1f%%", hits * 100.0D / total);
+  }
+
+  /** 纳秒 → 毫秒文本（一位小数）；纯观测计数用。 */
+  private static String formatMillis(long nanos) {
+    return String.format(Locale.ROOT, "%.1f", Math.max(0L, nanos) / 1_000_000.0D);
+  }
+
+  /** 平均一次冲刷的毫秒文本（次数为 0 时为 0.0）；纯观测计数用。 */
+  private static String averageFlushMillis(long flushes, long nanos) {
+    if (flushes <= 0L) {
+      return "0.0";
+    }
+    return String.format(Locale.ROOT, "%.2f", Math.max(0L, nanos) / 1_000_000.0D / flushes);
   }
 }

@@ -10,6 +10,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import java.util.Arrays;
 import java.util.BitSet;
+import java.util.Random;
 import net.mikumc.mikuxraynet.codec.ByteBufUtil;
 import net.mikumc.mikuxraynet.codec.Chunk;
 import net.mikumc.mikuxraynet.codec.ChunkCodec;
@@ -419,6 +420,30 @@ class ObfuscationProcessorTest {
     ChunkCodec codec = new ChunkCodec(registry(), MODERN);
     try (Chunk chunk = codec.decode(data, sectionCount)) {
       return chunk.getSection(0).getBlockState(index);
+    }
+  }
+
+  /**
+   * 极端权重下累计权重绝不溢出为负：旧的 {@code cumulative += weight} 在多条权重 ≥ 2^28 时会回绕成负数，
+   * 使 {@code pick()} 的 {@code nextInt(负数)} 抛异常、整区块 fail-open（相当于全区裸露）。饱和累加必须
+   * 封顶在 {@link Integer#MAX_VALUE}，且随后 {@code pick()} 仍能选出合法候选、绝不抛异常。
+   */
+  @Test
+  void weightSaturationNeverOverflowsToNegative() {
+    int sum = 0;
+    for (int i = 0; i < 16; i++) {
+      sum = ObfuscationProcessor.WorldProfile.saturatingAdd(sum, 1 << 28);
+      assertTrue(sum > 0, "累计权重永远不得为负（第 " + i + " 次）");
+    }
+    assertEquals(Integer.MAX_VALUE, sum, "越过 int 上限后封顶");
+
+    // 饱和后的累计权重喂给 pick()：不得抛异常，且总返回合法候选
+    int[] ids = {1, 2, 3};
+    int[] cum = {Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE};
+    Random random = new Random(42L);
+    for (int i = 0; i < 200; i++) {
+      int picked = ObfuscationProcessor.pick(ids, cum, random);
+      assertTrue(picked >= 1 && picked <= 3, "饱和累计下 pick 必须返回合法候选");
     }
   }
 }

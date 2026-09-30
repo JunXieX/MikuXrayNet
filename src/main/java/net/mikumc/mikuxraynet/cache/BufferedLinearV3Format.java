@@ -367,25 +367,35 @@ public final class BufferedLinearV3Format {
     return deflate(raw);
   }
 
+  /**
+   * 按线程复用的 Deflater：避免「每个桶新建一个 Deflater」。
+   *
+   * <p>Deflater 构造会分配原生内存与内部状态，而 {@link #deflate} 在历史 Deflate 文件写入 / zstd 不可用时
+   * 会被每个桶反复调用（一个区域文件最多 16 个桶，且会被反复重压缩）。复用同一实例并每次 {@code reset()}
+   * 即可消除这部分分配，输出字节与每次新建完全相同（Deflate 是确定性算法）。
+   *
+   * <p><b>为什么不 {@code end()}</b>：{@code end()} 之后该 Deflater 不可再用；按线程复用的实例刻意不释放，
+   * 让其原生内存随线程存活（使用它的只有磁盘线程等少数长驻线程，数量有界），换取热路径零分配。
+   */
+  private static final ThreadLocal<Deflater> REUSABLE_DEFLATER =
+      ThreadLocal.withInitial(() -> new Deflater(Deflater.BEST_SPEED));
+
   /** JDK Deflater（BEST_SPEED）压缩：历史格式的写入路径，也是 zstd 不可用时的回退路径。 */
   private static byte[] deflate(byte[] raw) {
-    Deflater deflater = new Deflater(Deflater.BEST_SPEED);
-    try {
-      deflater.setInput(raw);
-      deflater.finish();
-      ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(64, raw.length / 2 + 64));
-      byte[] chunk = new byte[8192];
-      while (!deflater.finished()) {
-        int produced = deflater.deflate(chunk);
-        if (produced <= 0) {
-          break;
-        }
-        out.write(chunk, 0, produced);
+    Deflater deflater = REUSABLE_DEFLATER.get();
+    deflater.reset();
+    deflater.setInput(raw);
+    deflater.finish();
+    ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(64, raw.length / 2 + 64));
+    byte[] chunk = new byte[8192];
+    while (!deflater.finished()) {
+      int produced = deflater.deflate(chunk);
+      if (produced <= 0) {
+        break;
       }
-      return out.toByteArray();
-    } finally {
-      deflater.end();
+      out.write(chunk, 0, produced);
     }
+    return out.toByteArray();
   }
 
   /**
@@ -564,18 +574,28 @@ public final class BufferedLinearV3Format {
       }
     }
 
-    ByteArrayOutputStream out = new ByteArrayOutputStream(capacity);
+    // 容量已逐槽精确算好，直接把每条条目写进结果数组——不再走 ByteArrayOutputStream + toByteArray() 的
+    // 「先写进中间缓冲、再整块复制一份」双重拷贝，也不再为每个条目单独分配一个编码临时数组
+    // （桶是热路径：一个区域文件最多 16 个桶会被反复重编码）。写出字节与 encodeEntry 完全一致。
+    byte[] out = new byte[capacity];
+    int offset = 0;
     for (int i = 0; i < BUCKET_SIZE; i++) {
       Entry entry = slots != null && i < slots.length ? slots[i] : null;
       if (entry == null || entry.payload() == null || entry.payload().length == 0) {
-        writeInt(out, 0);
+        offset = writeInt(out, offset, 0);
         continue;
       }
-      byte[] encoded = encodeEntry(entry, hashSeed);
-      writeInt(out, encoded.length);
-      out.write(encoded, 0, encoded.length);
+      byte[] payload = entry.payload();
+      offset = writeInt(out, offset, ENTRY_HEADER_SIZE + payload.length);
+      offset = writeInt(out, offset, payload.length);
+      offset = writeLong(out, offset, entry.generation());
+      offset = writeLong(out, offset, entry.writtenAtMillis());
+      offset = writeInt(out, offset, entry.configHash());
+      offset = writeInt(out, offset, XXHash32.hash(payload, hashSeed));
+      System.arraycopy(payload, 0, out, offset, payload.length);
+      offset += payload.length;
     }
-    return out.toByteArray();
+    return out;
   }
 
   /**
@@ -645,11 +665,26 @@ public final class BufferedLinearV3Format {
     return slots;
   }
 
-  private static void writeInt(ByteArrayOutputStream out, int value) {
-    out.write(value >>> 24 & 0xFF);
-    out.write(value >>> 16 & 0xFF);
-    out.write(value >>> 8 & 0xFF);
-    out.write(value & 0xFF);
+  /** 把一个大端 i32 写入 {@code out[offset..]}，返回写入后的新偏移（与 {@link #readInt} 同字节序）。 */
+  private static int writeInt(byte[] out, int offset, int value) {
+    out[offset] = (byte) (value >>> 24);
+    out[offset + 1] = (byte) (value >>> 16);
+    out[offset + 2] = (byte) (value >>> 8);
+    out[offset + 3] = (byte) value;
+    return offset + 4;
+  }
+
+  /** 把一个大端 i64 写入 {@code out[offset..]}，返回写入后的新偏移。 */
+  private static int writeLong(byte[] out, int offset, long value) {
+    out[offset] = (byte) (value >>> 56);
+    out[offset + 1] = (byte) (value >>> 48);
+    out[offset + 2] = (byte) (value >>> 40);
+    out[offset + 3] = (byte) (value >>> 32);
+    out[offset + 4] = (byte) (value >>> 24);
+    out[offset + 5] = (byte) (value >>> 16);
+    out[offset + 6] = (byte) (value >>> 8);
+    out[offset + 7] = (byte) value;
+    return offset + 8;
   }
 
   private static int readInt(byte[] raw, int offset) {

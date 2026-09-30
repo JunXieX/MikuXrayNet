@@ -35,6 +35,19 @@ final class ChunkScratch {
   static final int MAX_OUTPUT_CAPACITY = 64 * 1024 * 1024;
 
   /**
+   * 输出缓冲区<b>保留</b>上限（字节）：超过它的数组在本次借出后不再被 scratch 保留，下次按需重新分配。
+   *
+   * <p>为什么要设保留上限：{@link #outputArray} 只会「只增不减」地记住历史最大容量，一旦某个异常/损坏输入
+   * 把它撑到接近 {@link #MAX_OUTPUT_CAPACITY}（64 MiB），该数组就会随线程常驻（每线程最多
+   * {@value #MAX_IDLE_PER_THREAD} 个 scratch，单线程可常驻上百 MB）。
+   *
+   * <p>为什么取 4 MiB：合法区块的未压缩负载典型为几十 KB 到数百 KB（384 高世界的最坏个例也仅约 200 KB），
+   * 4 MiB 对正常负载有 &gt;10 倍余量；超过它基本只可能是异常输入。因此只在「明显过大」时才丢弃，稳态下
+   * 小数组照常复用、性能不受影响。
+   */
+  static final int MAX_RETAINED_OUTPUT_CAPACITY = 4 * 1024 * 1024;
+
+  /**
    * 输出缓冲区容量已达绝对上限、无法再扩容。它与「数据损坏」区分开：表示「需要更大的输出缓冲而不可得」，
    * 由上层按 fail-open 放行原包；是 {@link RuntimeException} 而非 {@code Error}，能被封包链路兜住。
    */
@@ -154,8 +167,11 @@ final class ChunkScratch {
       throw new OutputOverflowException(
           "输出容量已达绝对上限 " + MAX_OUTPUT_CAPACITY + " 字节，无法继续扩容");
     }
-    this.outputArray = new byte[Math.max(1, capacity)];
-    return this.outputArray;
+    byte[] grown = new byte[Math.max(1, capacity)];
+    // 只在容量未超过保留上限时才记住它；过大则本次照常使用、但不驻留（下次按需重分配），
+    // 避免一个异常输入把近 64 MiB 的数组永久钉在“该线程的复用池”里。
+    this.outputArray = grown.length > MAX_RETAINED_OUTPUT_CAPACITY ? null : grown;
+    return grown;
   }
 
   /**
@@ -174,8 +190,11 @@ final class ChunkScratch {
    * 这里把真实容量同步回来，使同线程随后的区块一次到位，不再重复扩容。
    */
   void keepOutputCapacity(int capacity) {
-    if (this.outputArray == null || this.outputArray.length < capacity) {
-      this.outputArray = new byte[Math.max(1, capacity)];
+    if (this.outputArray != null && this.outputArray.length >= capacity) {
+      return;
     }
+    int size = Math.max(1, capacity);
+    // 与 growOutput 同口径：超过保留上限的数组不驻留（下次按需重分配），避免大数组永久留在复用池里
+    this.outputArray = size > MAX_RETAINED_OUTPUT_CAPACITY ? null : new byte[size];
   }
 }

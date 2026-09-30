@@ -3,6 +3,7 @@ package net.mikumc.mikuxraynet.bandwidth;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -214,6 +215,30 @@ class LatencyMonitorTest {
 
     invoke(monitor, "reduce", player);
     assertTrue(state.sendSets.isEmpty(), "钳制会击穿视距下限时必须放弃降级，绝不降到下限以下");
+    assertTrue(state.viewSets.isEmpty());
+  }
+
+  /**
+   * 停用并发闭合（任务1）：{@code stop()} 首行置 {@code stopping} 后，迟到的 tick/reduce
+   * <b>不得再下调视距</b>——否则会把 {@code restoreAll()} 刚还原的视距又降回去（玩家卡在降级视距）。
+   *
+   * <p>离线不可构造完整停用链路（{@code restoreAll} 依赖 {@code Bukkit.getPlayer}），
+   * 因此以反射置位 {@code stopping}，只钉死「迟到降级被拒」这一关键不变量。
+   */
+  @Test
+  void stoppingPreventsLateReduce() throws Exception {
+    LatencyMonitor monitor = new LatencyMonitor(stubPlugin(), config(2, 4), new ThrottleStats());
+    PlayerState state = new PlayerState();
+    state.send = 12;
+    state.view = 12;
+    Player player = stubPlayer(state);
+
+    Field field = LatencyMonitor.class.getDeclaredField("stopping");
+    field.setAccessible(true);
+    field.setBoolean(monitor, true);
+
+    invoke(monitor, "reduce", player);
+    assertTrue(state.sendSets.isEmpty(), "停用开始后不得再下调视距（否则会把刚还原的视距又降回去）");
     assertTrue(state.viewSets.isEmpty());
   }
 }

@@ -90,6 +90,33 @@ class RevealedSetTest {
     assertEquals(1, revealed.sizeFor(PLAYER, key));
   }
 
+  /** 批量注销（同一区块）：等价于逐坐标，且计数与存活集合自洽；未命中坐标不误伤。 */
+  @Test
+  void removePositionsDropsBatchAndKeepsCountConsistent() {
+    RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
+    ChunkKey key = chunk(0, 0);
+    revealed.mark(PLAYER, key, 1, 64, 1);
+    revealed.mark(PLAYER, key, 2, 64, 1);
+    revealed.mark(PLAYER, key, 3, 64, 1);
+    revealed.mark(OTHER_PLAYER, key, 1, 64, 1);
+    revealed.mark(OTHER_PLAYER, key, 2, 64, 1);
+    revealed.mark(OTHER_PLAYER, key, 3, 64, 1);
+
+    // 含一个不在集合里的坐标（9,64,9）：不得影响计数
+    int[] batch = {1, 64, 1, 2, 64, 1, 9, 64, 9};
+    revealed.removePositions(WORLD, batch, 3);
+
+    assertFalse(revealed.contains(PLAYER, key, 1, 64, 1));
+    assertFalse(revealed.contains(PLAYER, key, 2, 64, 1));
+    assertFalse(revealed.contains(OTHER_PLAYER, key, 1, 64, 1), "所有玩家的同一坐标都要摘除（维持子集不变式）");
+    assertFalse(revealed.contains(OTHER_PLAYER, key, 2, 64, 1));
+    assertTrue(revealed.contains(PLAYER, key, 3, 64, 1), "未变更坐标必须保留");
+    assertTrue(revealed.contains(OTHER_PLAYER, key, 3, 64, 1));
+    assertEquals(1, revealed.sizeFor(PLAYER, key));
+    assertEquals(1, revealed.sizeFor(OTHER_PLAYER, key));
+    assertEquals(2, revealed.positionCount(), "批量摘除后计数与存活集合自洽");
+  }
+
   @Test
   void clearChunkClearsEveryPlayerOfThatChunk() {
     RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
@@ -354,5 +381,84 @@ class RevealedSetTest {
     }
     assertEquals(live, revealed.positionCount(),
         "playerTotals 必须与存活集合大小自洽（无孤儿标记 / 无扣减漂移）");
+  }
+
+  /**
+   * 并发 clearChunk 与 removePosition 交错：两者必须用<b>同一判据</b>（持「映射监视器」并校验映射仍在
+   * {@code chunks} 里），否则同一坐标会被 removePosition 摘一次（扣 1）、又被 clearChunk 按旧 size 计一次，
+   * 使 playerTotals 被多扣（低估，方向为「越清越少」）。
+   *
+   * <p>判据与 {@link #concurrentMarkAndExpireKeepTotalsConsistent} 同：清点全部区块键上的实时 size 之和
+   * 必须等于 {@link RevealedSet#positionCount()}。
+   */
+  @Test
+  void concurrentClearChunkAndRemoveKeepTotalsConsistent() throws Exception {
+    RevealedSet revealed = revealed(1 << 20, 600 * SECOND_NANOS);
+    ChunkKey[] chunkKeys = {
+        new ChunkKey(WORLD, -1, -1), new ChunkKey(WORLD, -1, 0),
+        new ChunkKey(WORLD, 0, -1), new ChunkKey(WORLD, 0, 0),
+    };
+    int threads = 3;
+    int perThread = 4000;
+    ExecutorService pool = Executors.newFixedThreadPool(threads * 2 + 1);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    CountDownLatch done = new CountDownLatch(threads * 2 + 1);
+    try {
+      for (int t = 0; t < threads; t++) {
+        int base = t * perThread;
+        // 标记线程：x/z 落在 [-16,15]，其导出的区块键恰为上面 4 个（保证后续 removePosition 能命中）
+        pool.execute(() -> {
+          try {
+            for (int i = 0; i < perThread; i++) {
+              int v = base + i;
+              int x = (v & 31) - 16;
+              int z = (v >> 5 & 31) - 16;
+              int y = (v >> 10) & 255;
+              revealed.mark(PLAYER, ChunkKey.ofBlock(WORLD, x, z), x, y, z);
+            }
+          } catch (Throwable throwable) {
+            failure.compareAndSet(null, throwable);
+          } finally {
+            done.countDown();
+          }
+        });
+        // 注销线程：与标记线程用同一坐标编码，制造与 clearChunk 的三方交错
+        pool.execute(() -> {
+          try {
+            for (int i = 0; i < perThread; i++) {
+              int v = base + i;
+              revealed.removePosition(WORLD, (v & 31) - 16, (v >> 10) & 255, (v >> 5 & 31) - 16);
+            }
+          } catch (Throwable throwable) {
+            failure.compareAndSet(null, throwable);
+          } finally {
+            done.countDown();
+          }
+        });
+      }
+      // clearChunk 线程：轮流清掉 4 个区块，与 mark / removePosition 交错
+      pool.execute(() -> {
+        try {
+          for (int i = 0; i < chunkKeys.length * 64; i++) {
+            revealed.clearChunk(chunkKeys[i % chunkKeys.length]);
+          }
+        } catch (Throwable throwable) {
+          failure.compareAndSet(null, throwable);
+        } finally {
+          done.countDown();
+        }
+      });
+      assertTrue(done.await(60, TimeUnit.SECONDS), "并发 clearChunk/removePosition/mark 必须在超时内完成");
+    } finally {
+      pool.shutdownNow();
+    }
+
+    assertNull(failure.get(), "并发清理不得抛异常：" + failure.get());
+    int live = 0;
+    for (ChunkKey key : chunkKeys) {
+      live += revealed.sizeFor(PLAYER, key);
+    }
+    assertEquals(live, revealed.positionCount(),
+        "clearChunk 与 removePosition 判据一致：计数必须与存活集合自洽（不得二次命中多扣）");
   }
 }

@@ -53,10 +53,16 @@ import org.bukkit.plugin.Plugin;
  * 交互/移动/聊天就不会被判定为 AFK，因此真在操作的人不会看到动画中断）。
  *
  * <p><b>活动判定只采信未被取消的事件</b>：交互（{@link PlayerInteractEvent}）、移动、传送、聊天这几类
- * 监听器都标了 {@code ignoreCancelled = true}，即<b>被其它插件取消的事件不计为活动</b>
- * （{@link PlayerAnimationEvent} 本身不可取消，故其监听器无需该标记、始终计入）。方向刻意保守：
+ * 监听器都标了 {@code ignoreCancelled = true}，即<b>被其它插件取消的事件不计为活动</b>。方向刻意保守：
  * 宁可让挂机玩家多留一会儿，也不把「被取消的交互」误判为正在活动中——后者会让 AFK 降级对该玩家失效
  * （粒子/动画被继续下发）。请勿移除这些 {@code ignoreCancelled}。
+ *
+ * <p><b>挥手监听器刻意不带 {@code ignoreCancelled}（勿当 bug「补」上去）</b>：
+ * 旧注释称 {@code PlayerAnimationEvent}「本身不可取消」，此说法<b>已被证伪</b>——paper-api 26.2 实测
+ * {@code PlayerAnimationEvent implements Cancellable}（{@code javap} 确认）。尽管如此，其监听器仍
+ * <b>不</b>加 {@code ignoreCancelled = true}：这意味着<b>被其它插件取消的挥手也照样计为活动</b>，
+ * 这正是本类刻意的<b>方向保守</b>选择——挥手（攻击/挖掘/空挥）本就意味着玩家在操作，多算一次活动只会让
+ * 挂机玩家更晚进入 AFK，绝不会把「真在操作的人」误判为挂机。因此<b>不要</b>为它补 {@code ignoreCancelled}。
  */
 public final class AfkTracker implements Listener {
 

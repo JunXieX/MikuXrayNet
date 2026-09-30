@@ -4,6 +4,7 @@ import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
@@ -40,6 +41,13 @@ public final class LatencyMonitor implements Listener {
 
   /** 每个在线玩家的周期检查任务（Paper 与 Folia 同一套实体调度器；玩家退出即随实体退役失效）。 */
   private final ConcurrentHashMap<UUID, ScheduledTask> checkTasks = new ConcurrentHashMap<>();
+  /** 「停用时跨区域（Folia）无法同步还原视距」的中文 WARN 一次性闸门。 */
+  private final AtomicBoolean crossRegionRestoreNoticed = new AtomicBoolean();
+  /**
+   * 停用中标记：{@code stop()} 首行置位，用于闭合停用期并发——正在跑的 tick 若在此之后才走到
+   * {@code reduce()}，会被拒绝，绝不把刚被还原的视距再次降低。
+   */
+  private volatile boolean stopping;
 
   public LatencyMonitor(Plugin plugin, BandwidthConfig.Latency config, ThrottleStats stats) {
     this.plugin = plugin;
@@ -63,6 +71,9 @@ public final class LatencyMonitor implements Listener {
 
   /** 停用：取消任务并还原所有被下调的视距。 */
   public void stop() {
+    // 先取消在途任务、再同步还原：setEnabled(false) 先置 isEnabled=false 再调 onDisable，
+    // 停用链路的 EntityScheduler 一律被拒（旧实现经 Schedulers 静默吞掉 → 视距卡在降级值直到重登）。
+    stopping = true;
     cancelCheckTasks();
     HandlerList.unregisterAll(this);
     restoreAll();
@@ -114,7 +125,7 @@ public final class LatencyMonitor implements Listener {
 
   /** 单个玩家的采样与降级/还原（必须在玩家所属线程执行）。 */
   private void tick(Player player) {
-    if (!player.isOnline()) {
+    if (stopping || !player.isOnline()) {
       return;
     }
     PingState state = watches.computeIfAbsent(player.getUniqueId(), uuid -> new PingState());
@@ -134,6 +145,10 @@ public final class LatencyMonitor implements Listener {
   }
 
   private void reduce(Player player) {
+    if (stopping) {
+      // 停用已开始：绝不再下调视距（否则会把刚被 restoreAll 还原的视距又降回去）
+      return;
+    }
     try {
       // 读的必须是 send 视距：与下面写入、以及 restore 的还原严格配对，
       // 否则一次降级+还原会把 view-distance 永久改成原 send 值（见类注释）
@@ -183,16 +198,46 @@ public final class LatencyMonitor implements Listener {
 
   /** 停用兜底：还原全部被下调的视距。 */
   private void restoreAll() {
+    boolean stillEnabled = plugin.isEnabled();
     for (Map.Entry<UUID, Integer> entry : originalViewDistance.entrySet()) {
       Player player = Bukkit.getPlayer(entry.getKey());
       if (player == null) {
         continue;
       }
       int original = entry.getValue();
-      // 一律回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
-      Schedulers.onEntity(plugin, player, () -> setSendViewDistance(player, original));
+      if (stillEnabled) {
+        // 热重载路径：回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
+        Schedulers.onEntity(plugin, player, () -> setSendViewDistance(player, original));
+      } else {
+        // 停用路径：调度器已不可用，同步还原
+        restoreNow(player, original);
+      }
     }
     originalViewDistance.clear();
+  }
+
+  /**
+   * 停用路径的<b>同步</b>还原（不再经调度器）：Paper 主线程恒可同步；Folia 仅当玩家属于当前区域时才可同步，
+   * 跨区域者无法在当前线程安全写视距，打一次性中文 WARN 提示「需重登才能还原」。
+   */
+  private void restoreNow(Player player, int original) {
+    if (!ownsCurrentRegion(player)) {
+      if (crossRegionRestoreNoticed.compareAndSet(false, true)) {
+        plugin.getLogger().warning("插件停用时检测到跨区域（Folia）玩家视距无法同步还原："
+            + "个别玩家的视距可能需重新登录后才还原。此为 Folia 区域化线程的限制，非本插件故障。");
+      }
+      return;
+    }
+    setSendViewDistance(player, original);
+  }
+
+  /** 当前线程是否拥有该玩家（Paper 上恒真；Folia 上即「该玩家所在区域线程」）。判定异常时按「拥有」处理。 */
+  private static boolean ownsCurrentRegion(Player player) {
+    try {
+      return Bukkit.isOwnedByCurrentRegion(player);
+    } catch (Throwable throwable) {
+      return true;
+    }
   }
 
   /** 与 {@link #reduce} 配对地还原 send 视距（停用兜底路径）。 */

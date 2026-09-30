@@ -751,7 +751,8 @@ public final class AntiXrayConfig {
             // 默认 64：真机反馈「48 格仍然偏近，走到跟前才变回来」。显形只在射线通畅时才还原，
             // 因此放大距离不会隔着墙泄露——它只是把「本来就看得到的矿」更早、更远地还给玩家。
             // 但扫描量随半径平方增长，故设有安全上限（见 PROXIMITY_DISTANCE_MAX）。
-            proximityDistance(root.getDouble("proximity.distance", 64.0D), ceilingAdjustments),
+            proximityDistance(root.getDouble("proximity.distance", 64.0D), floorAdjustments,
+                ceilingAdjustments),
             // 默认 4（原为 5）：显形周期越短，「石头还没变回来」的窗口越小。
             Math.max(1, root.getInt("proximity.interval-ticks", 4)),
             // 默认 256（原为 128）：配合扩大到 64 格的距离，候选数量随之上升，单次额度也要相应放大。
@@ -1049,9 +1050,13 @@ public final class AntiXrayConfig {
     return FRUSTUM_FOV_FLOOR;
   }
 
-  /** 最小豁免距离的生效值：低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR} 时抬升到下限并记录明细。 */
+  /** 最小豁免距离的生效值：非法值（NaN）回落默认，低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR} 时抬升到下限——
+   * 两种情况都记入 {@code floorAdjustments}（与 {@link #frustumFov} 口径一致，绝不静默改用户配置）。 */
   private static double frustumMinDistance(double configured, List<String> floorAdjustments) {
     if (Double.isNaN(configured)) {
+      // 与 frustumFov 对齐：NaN 不再静默回落，纳入统一的一次性 WARN 明细
+      floorAdjustments.add("proximity.frustum.min-distance=" + configured + "（非法值，回落默认 "
+          + FRUSTUM_MIN_DISTANCE_FLOOR + " 格）");
       return FRUSTUM_MIN_DISTANCE_FLOOR;
     }
     double value = Math.max(0.0D, configured);
@@ -1094,23 +1099,31 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 邻近显形触发距离的生效值：非有限值（NaN / ±Inf）回落默认 64，负数按 0 处理，
-   * 超过 {@link #PROXIMITY_DISTANCE_MAX} 时按上限生效并记入 {@code ceilingAdjustments}。
+   * 邻近显形触发距离的生效值：非有限值（NaN / ±Inf）回落默认 64，负数钳到 0（= 关闭邻近显形触发），
+   * 超过 {@link #PROXIMITY_DISTANCE_MAX} 时按上限生效。
+   *
+   * <p>三种情况都记入明细、由加载路径一次性 WARN（绝不静默改用户配置）：负数是「低于下限（0）」，
+   * 记入 {@code floorAdjustments}；非有限值与超上限记入 {@code ceilingAdjustments}。
    *
    * <p>之所以要显式拦非有限值：{@code Math.max(0.0, NaN)} 仍是 NaN，NaN 会污染距离比较
    * （所有比较恒 false）并进入配置指纹，导致磁盘缓存整体失效；因此一律回落默认。
    */
-  private static double proximityDistance(double configured, List<String> ceilingAdjustments) {
+  private static double proximityDistance(double configured, List<String> floorAdjustments,
+      List<String> ceilingAdjustments) {
     if (!Double.isFinite(configured)) {
       ceilingAdjustments.add("proximity.distance=" + configured + "（非有限值，回落默认 64 格）");
       return 64.0D;
     }
-    double value = Math.max(0.0D, configured);
-    if (value > PROXIMITY_DISTANCE_MAX) {
-      ceilingAdjustments.add("proximity.distance=" + value + "（上限 " + PROXIMITY_DISTANCE_MAX + " 格）");
+    if (configured < 0.0D) {
+      // 负数钳到 0：旧实现直接 Math.max(0, value) 静默归 0、不留痕，管理员会以为负数已生效
+      floorAdjustments.add("proximity.distance=" + configured + "（负值，按 0 处理 = 不触发邻近显形）");
+      return 0.0D;
+    }
+    if (configured > PROXIMITY_DISTANCE_MAX) {
+      ceilingAdjustments.add("proximity.distance=" + configured + "（上限 " + PROXIMITY_DISTANCE_MAX + " 格）");
       return PROXIMITY_DISTANCE_MAX;
     }
-    return value;
+    return configured;
   }
 
   /** 解析缺失策略；取值非法时回落到最安全的 {@link MissingPolicy#HIDE}。 */

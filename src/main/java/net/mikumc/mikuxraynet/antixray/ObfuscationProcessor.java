@@ -105,6 +105,10 @@ public final class ObfuscationProcessor {
    */
   static final class WorldProfile {
 
+    /** 「伪装权重累计溢出封顶」只提示一次（CAS 抢占），避免每个档案/分区段各刷一条。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean WEIGHT_OVERFLOW_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean();
+
     final BitSet targets;
     /** 回落候选表（{@code replacement-weights}）：无 band 覆盖该高度时使用。 */
     final int[] replacementIds;
@@ -240,7 +244,13 @@ public final class ObfuscationProcessor {
     }
 
     /**
-     * 把「方块名 → 权重」解析为「状态 id → 累计权重」表（保持声明顺序，累计权重严格递增）。
+     * 把「方块名 → 权重」解析为「状态 id → 累计权重」表（保持声明顺序，累计权重非递减）。
+     *
+     * <p><b>饱和累加</b>：累计权重是 int，极端配置（多条权重 ≥ 2^28，合计越过 2^31）会溢出为负。
+     * 一旦为负，运行期 {@code pick()} 的 {@code random.nextInt(负数)} 会抛异常，被 {@code rewrite}
+     * 外层 catch 成整区块 fail-open（原字节放行）——等于该区块的矿全部裸露。因此这里改为<b>饱和累加</b>：
+     * 累计到 {@link Integer.MAX_VALUE} 即封顶并只提示一次。封顶后同一批权重的相对比例会失真
+     * （挤在封顶值附近的候选各占很小概率），但绝不抛异常、伪装覆盖不丢。
      *
      * @return {@code {ids, cum}}；两个数组等长（可能为空）
      */
@@ -249,22 +259,41 @@ public final class ObfuscationProcessor {
       int[] cum = new int[ids.length];
       int index = 0;
       int cumulative = 0;
+      boolean saturated = false;
       for (Map.Entry<String, Integer> entry : weights.entrySet()) {
         int stateId = BlockStateRegistry.resolveStateId(entry.getKey());
         if (stateId < 0) {
           logger.warning(label + "配置中的伪装方块名称无法识别，已跳过：" + entry.getKey());
           continue;
         }
-        cumulative += entry.getValue();
+        int weight = entry.getValue();
+        if ((long) cumulative + weight > Integer.MAX_VALUE) {
+          saturated = true;
+        }
+        cumulative = saturatingAdd(cumulative, weight);
         ids[index] = stateId;
         cum[index] = cumulative;
         index++;
+      }
+      if (saturated && WEIGHT_OVERFLOW_WARNED.compareAndSet(false, true)) {
+        logger.warning(label + "的伪装权重累计超过 int 上限，已封顶在 " + Integer.MAX_VALUE
+            + "：伪装仍生效、不会整块放行，但多条大权重的相对比例会失真。请把 replacement-weights / "
+            + "replacement-bands 的权重改小（例如各不超过 1000000）");
       }
       if (index != ids.length) {
         ids = Arrays.copyOf(ids, index);
         cum = Arrays.copyOf(cum, index);
       }
       return new int[][] {ids, cum};
+    }
+
+    /**
+     * 累计权重的饱和加法：超过 {@link Integer.MAX_VALUE} 即封顶（绝不回绕为负）。
+     * 包级可见，便于离线单测直接验证「永不溢出为负」这一红线。
+     */
+    static int saturatingAdd(int current, int weight) {
+      long sum = (long) current + weight;
+      return sum >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) sum;
     }
 
     /**
@@ -967,8 +996,9 @@ public final class ObfuscationProcessor {
     return -1;
   }
 
-  /** 按累计权重随机挑选一个伪装方块状态 id（表来自 profile 预构建或本 section 的预算筛选结果）。 */
-  private static int pick(int[] ids, int[] cum, Random random) {
+  /** 按累计权重随机挑选一个伪装方块状态 id（表来自 profile 预构建或本 section 的预算筛选结果）。
+   * 包级可见，便于离线单测验证「饱和累计权重下绝不因 nextInt(负数) 抛异常」。 */
+  static int pick(int[] ids, int[] cum, Random random) {
     int roll = random.nextInt(cum[cum.length - 1]);
     for (int i = 0; i < cum.length; i++) {
       if (roll < cum[i]) {

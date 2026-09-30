@@ -13,6 +13,7 @@ import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -24,6 +25,7 @@ import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
+import org.bukkit.Chunk;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
@@ -50,9 +52,9 @@ import org.bukkit.plugin.Plugin;
  * <ul>
  *   <li><b>Paper 系</b>（含 Leaf 等下游分支）：<b>增量维护</b>——由
  *       {@link EntityAddToWorldEvent} / {@link EntityRemoveFromWorldEvent} 在实体加入/离开世界时
- *       即时登记/摘除（不再等下一个全量刷新周期），另保留一个<b>低频兜底全量重建</b>
- *       （{@link #INDEX_REBUILD_TICKS}）补齐万一漏接的事件。启动时先做一次全量建索引，
- *       让插件启用前就已存在的实体立即生效。</li>
+ *       即时登记/摘除（不再等下一个全量刷新周期），另保留一个<b>低频、按区块分片的兜底重建</b>
+ *       （{@link #INDEX_REBUILD_TICKS} 周期触发，每次最多 {@link #REBUILD_CHUNK_BUDGET} 个区块）
+ *       补齐万一漏接的事件。启动时先做一次不限额的全量建索引，让插件启用前就已存在的实体立即生效。</li>
  *   <li><b>Folia 系</b>：不做索引（无法跨区域安全枚举全服实体，且该平台是否为所有实体触发上述事件
  *       未经核实），白名单退化为「对所有实体生效」，只影响保守性、不影响正确性——与改动前一致。</li>
  * </ul>
@@ -60,13 +62,25 @@ import org.bukkit.plugin.Plugin;
 public final class EntityPacketFilter extends PacketAdapter implements Listener {
 
   /**
-   * 兜底全量重建周期（tick）。
+   * 兜底重建周期（tick）。
    *
    * <p>增量事件已覆盖日常增删，兜底只用于补「万一漏接的事件」，因此刻意取低频（600 tick = 30 秒）。
    * 旧实现对全服实体每 100 tick（5 秒）枚举一次世界，是主线程上的固定开销；改为低频后这笔开销
    * 降到约 1/6，同时白名单准确性反而更高（新实体秒级生效，而非等下一个刷新周期）。
+   *
+   * <p><b>兜底重建本身也做了分片</b>：见 {@link #REBUILD_CHUNK_BUDGET}。
    */
   private static final long INDEX_REBUILD_TICKS = 600L;
+
+  /**
+   * 单次兜底重建最多处理的<b>区块数</b>（跨 tick 分片预算）。
+   *
+   * <p><b>为什么分片</b>：旧实现每个兜底周期都用 {@code world.getEntities()} 一次性拷贝全服实体列表
+   * （万人实体即毫秒级主线程尖峰）。现在改为按「已加载区块」分批：每次兜底只处理至多本预算个区块，
+   * 游标跨 tick 推进，因此一轮完整覆盖摊到多个周期、单 tick 主线程开销有界，彻底消除该尖峰。
+   * 增量事件（实体加入/离开世界）仍是主力；兜底只补漏接，覆盖慢几轮无碍。
+   */
+  private static final int REBUILD_CHUNK_BUDGET = 256;
 
   private final Plugin plugin;
   private final ProtocolManager protocolManager;
@@ -92,6 +106,14 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
    */
   private final Map<Integer, String> entityTypeIndex = new ConcurrentHashMap<>();
   private ScheduledTask indexTask;
+
+  /**
+   * 兜底重建的跨 tick 分片游标：当前世界下标 + 每个世界内已处理到的区块下标。
+   *
+   * <p>只在 {@code GlobalRegionScheduler}（Paper 主线程）上读写，天然单线程，无需任何并发控制。
+   */
+  private int rebuildWorldCursor;
+  private final Map<String, Integer> rebuildChunkCursors = new HashMap<>();
 
   public EntityPacketFilter(Plugin plugin, ProtocolManager protocolManager,
       BandwidthConfig.EntityPackets config, ThrottleStats stats) {
@@ -128,11 +150,13 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
       } else {
         // 增量事件（实体加入/离开世界）由本类作为 Listener 接收；事件在实体所属线程触发，只更新并发索引
         plugin.getServer().getPluginManager().registerEvents(this, plugin);
-        // 启动时先全量建一次索引：让「插件启用前就已存在」的实体立即命中白名单
-        refreshEntityTypeIndex();
-        // GlobalRegionScheduler：Paper 上落在主线程；周期以 tick 计。低频兜底只补漏接的事件。
+        // 启动时先做一次「不限额」的全量建索引：让「插件启用前就已存在」的实体立即命中白名单
+        // （一次性启动开销可接受；运行期兜底才走区块分片，避免周期尖峰）
+        refreshEntityTypeIndex(Integer.MAX_VALUE);
+        // GlobalRegionScheduler：Paper 上落在主线程；周期以 tick 计。低频兜底只补漏接的事件，且已分片。
         indexTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin,
-            scheduled -> refreshEntityTypeIndex(), INDEX_REBUILD_TICKS, INDEX_REBUILD_TICKS);
+            scheduled -> refreshEntityTypeIndex(REBUILD_CHUNK_BUDGET), INDEX_REBUILD_TICKS,
+            INDEX_REBUILD_TICKS);
       }
     }
     plugin.getLogger().info("带宽模块已启用：零位移实体包取消（白名单 " + whitelist.size() + " 项）");
@@ -155,6 +179,8 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
       plugin.getLogger().log(Level.WARNING, "注销零位移监听器时出现异常（通常可忽略）", throwable);
     }
     entityTypeIndex.clear();
+    rebuildChunkCursors.clear();
+    rebuildWorldCursor = 0;
   }
 
   /**
@@ -240,25 +266,61 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
   }
 
   /**
-   * 低频兜底：主线程全量枚举世界、重建实体类型索引（只读世界与实体，不修改任何状态）。
+   * 兜底重建（分片版）：按「世界 → 已加载区块」分批、每批限量处理，游标跨 tick 推进。
    *
-   * <p>采用「对账」而不是「清空重填」：清空会让封包线程短暂看到空索引（把白名单实体误判为非白名单），
-   * 且增量事件恰在此时登记的新实体会被清掉。对账只摘除「已不在世界的 id」、覆盖登记「当前仍在世界的 id」，
-   * 因此即使上一周期漏接了事件，也能在一个兜底周期内收敛，且不会丢掉同时到达的增量登记。
+   * <p><b>与旧实现的语义差别</b>：旧实现每个周期用 {@code world.getEntities()} 一次性拷贝并重建全服索引
+   * （万人实体毫秒级尖峰）。现在改为按区块分片，单次调用最多处理 {@code chunkBudget} 个区块，
+   * 主线程开销有界。索引更新是逐实体、幂等的（白名单类型 → put；否则 → remove，顺带清掉「id 被复用为
+   * 非白名单实体」的陈旧映射），因此跨 tick 分片不引入任何并发/竞态：实体消失由增量 remove 事件兜住，
+   * 兜底只补「漏接的加入/类型」。
+   *
+   * <p>{@code chunkBudget = Integer.MAX_VALUE} 时一轮走遍全部世界（启动期用一次，尽快让既有实体生效）。
+   * 本方法只在 Paper 主线程被调用（GlobalRegionScheduler），游标字段无需同步。
    */
-  private void refreshEntityTypeIndex() {
+  private void refreshEntityTypeIndex(int chunkBudget) {
     try {
-      Map<Integer, String> found = new HashMap<>();
-      for (World world : Bukkit.getWorlds()) {
-        for (Entity entity : world.getEntities()) {
-          String typeKey = typeKeyFor(entity.getType());
-          if (typeKey != null) {
-            found.put(entity.getEntityId(), typeKey);
+      List<World> worlds = Bukkit.getWorlds();
+      if (worlds.isEmpty()) {
+        return;
+      }
+      if (rebuildWorldCursor >= worlds.size()) {
+        rebuildWorldCursor = 0;
+      }
+      int remaining = chunkBudget;
+      while (remaining > 0 && rebuildWorldCursor < worlds.size()) {
+        World world = worlds.get(rebuildWorldCursor);
+        Chunk[] chunks = world.getLoadedChunks();
+        if (chunks.length == 0) {
+          rebuildWorldCursor++;
+          continue;
+        }
+        int cursor = Math.floorMod(rebuildChunkCursors.getOrDefault(world.getName(), 0), chunks.length);
+        int take = Math.min(remaining, chunks.length);
+        for (int i = 0; i < take; i++) {
+          Chunk chunk = chunks[(cursor + i) % chunks.length];
+          for (Entity entity : chunk.getEntities()) {
+            int id = entity.getEntityId();
+            String typeKey = typeKeyFor(entity.getType());
+            if (typeKey != null) {
+              entityTypeIndex.put(id, typeKey);
+            } else {
+              // 非白名单实体：清掉可能残留的陈旧映射（id 被复用时的正确性兜底）
+              entityTypeIndex.remove(id);
+            }
           }
         }
+        // 走完整个世界 → 该世界游标归零、轮到下一个世界；否则保留游标，下次继续这个世界的剩余区块
+        rebuildChunkCursors.put(world.getName(), take >= chunks.length ? 0 : (cursor + take) % chunks.length);
+        remaining -= take;
+        if (take >= chunks.length) {
+          rebuildWorldCursor++;
+        }
       }
-      entityTypeIndex.keySet().removeIf(entityId -> !found.containsKey(entityId));
-      entityTypeIndex.putAll(found);
+      if (rebuildWorldCursor >= worlds.size()) {
+        // 一轮覆盖完成：游标全部归零，下个周期从头再来
+        rebuildWorldCursor = 0;
+        rebuildChunkCursors.clear();
+      }
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }

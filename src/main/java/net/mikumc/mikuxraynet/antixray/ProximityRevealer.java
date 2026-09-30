@@ -888,15 +888,39 @@ public final class ProximityRevealer implements Listener {
    * 周期清理过期条目（区块卸载未触发时的兜底）：伪装清单与已显形标记都要清，避免长期堆积。
    *
    * <p>两个结构的活跃时间都会在扫描到该区块时刷新，因此玩家身边的条目不会被误清。
+   *
+   * <p><b>为什么挪进工作池</b>：expire 是 O(全服存活条目) 的全量扫描，旧的实现把它放在主线程 /
+   * Folia 区域线程上执行——大服每 {@value #EXPIRE_EVERY_PASSES} 个周期就会出现一次与「全服状态量」
+   * 成正比的毛刺（区域线程被占住 = 该区域玩家卡顿）。两个结构的 expire 都是纯并发容器操作
+   * （不触碰任何 Bukkit API、可在任意线程运行），因此改投 {@link MikuWorkPool}；提交是非阻塞的，
+   * 绝不让调用线程等待。工作队列满或未配置工作池时退化为当前线程直接清理，<b>过期清除语义不变</b>。
+   *
+   * <p>并发安全：多轮 expire 可能重叠（工作线程慢时），但两者都只用 {@code map.remove(k, v)} 原子判活，
+   * 同一 entry 只会被真正移除一次，计数扣减不会重复。
    */
   private void maybeExpire() {
-    if (passes.incrementAndGet() % EXPIRE_EVERY_PASSES == 0L) {
+    if (passes.incrementAndGet() % EXPIRE_EVERY_PASSES != 0L) {
+      return;
+    }
+    if (workPool != null && workPool.hasCapacity()) {
       try {
-        chunkIndex.expire();
-        revealedSet.expire();
+        workPool.execute(this::expireNow);
+        return;
       } catch (Throwable throwable) {
+        // 入队失败（队列刚被填满 / 线程池关闭）：退回当前线程直接清理，绝不丢过期清除
         logThrottled(throwable);
       }
+    }
+    expireNow();
+  }
+
+  /** 实际执行两个结构的过期清理（工作线程或退化时的调用线程；纯并发结构操作，任意线程安全）。 */
+  private void expireNow() {
+    try {
+      chunkIndex.expire();
+      revealedSet.expire();
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
     }
   }
 
@@ -1105,7 +1129,12 @@ public final class ProximityRevealer implements Listener {
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
       String liveWorld = world.getName();
       int[][] offsets = instantOffsets(radius);
-      // 去重：同一候选坐标可能同时落在多个变更坐标的邻域里，只评估一次（保证「恰好一次放行」）
+      // 去重：同一候选坐标可能同时落在多个变更坐标的邻域里，只评估一次（保证「恰好一次放行」）。
+      // 去重集合用 HashSet<Long>，代价是每个候选一次 long 装箱 + 哈希节点分配（一个 section 变更的
+      // 邻域候选量级为数千），换来的是与「逐变更坐标各判一遍」的**逐条等价**：同一坐标只评估/发包一次。
+      // 之所以不换位图：候选坐标是绝对坐标、可能跨 section，位图需要以变更点为中心开辟随半径增长的
+      // 三维空间（半径 8 时 17³≈5k 格 × 大量变更点），哈希反而更省；若将来改位图，必须证明去掉装箱后
+      // 「每个绝对坐标仍只评估一次」——否则会重复发包（over-reveal）或漏去重（同一坐标多次 sendOne）。
       java.util.HashSet<Long> evaluated = new java.util.HashSet<>();
       boolean exhausted = false;
       for (int i = 0; i < count && !exhausted; i++) {

@@ -47,22 +47,46 @@ public class Chunk implements AutoCloseable {
   Chunk(ChunkCodec codec, byte[] data, boolean[] sectionsPresent) {
     this.codec = codec;
     this.scratch = ChunkScratch.acquire();
+    ByteBuf input = Unpooled.wrappedBuffer(data);
+    try {
+      // 必须在构造任何 ChunkSectionHolder 之前完成赋值：holder 内部会读取本字段推进 readerIndex
+      this.inputBuffer = input;
+      this.sections = new ChunkSectionHolder[sectionsPresent.length];
 
-    this.sections = new ChunkSectionHolder[sectionsPresent.length];
+      // 输出缓冲区复用 scratch 的字节数组：容量不足时在 finalizeOutput 里扩容重写
+      this.outputBuffer = Unpooled.wrappedBuffer(this.scratch.outputArray(Math.max(1, data.length)));
+      this.outputBuffer.clear();
 
-    this.inputBuffer = Unpooled.wrappedBuffer(data);
-    // 输出缓冲区复用 scratch 的字节数组：容量不足时在 finalizeOutput 里扩容重写
-    this.outputBuffer = Unpooled.wrappedBuffer(this.scratch.outputArray(Math.max(1, data.length)));
-    this.outputBuffer.clear();
-
-    for (int sectionIndex = 0; sectionIndex < this.sections.length; sectionIndex++) {
-      if (sectionsPresent[sectionIndex]) {
-        this.sections[sectionIndex] = new ChunkSectionHolder();
+      for (int sectionIndex = 0; sectionIndex < this.sections.length; sectionIndex++) {
+        if (sectionsPresent[sectionIndex]) {
+          this.sections[sectionIndex] = new ChunkSectionHolder();
+        }
       }
-    }
 
-    this.trailingOffset = this.inputBuffer.readerIndex();
-    this.trailingLength = this.inputBuffer.readableBytes();
+      this.trailingOffset = this.inputBuffer.readerIndex();
+      this.trailingLength = this.inputBuffer.readableBytes();
+    } catch (RuntimeException | Error throwable) {
+      // 构造中途失败（典型：损坏区块在 read/skip 时抛 IndexOutOfBoundsException）：对象不会交付给调用方，
+      // close() 永远不会被调到，因此必须在此自行收尾——否则连续损坏区块会把按线程复用的空闲池打空
+      // （每次都 acquire 却从不 recycle），并泄漏 wrappedBuffer 包装的输入/输出堆缓冲。
+      // 回收 scratch 是安全的：它不保留区块数据，下个借出方会重新初始化各数组。
+      releaseQuietly(input);
+      releaseQuietly(this.outputBuffer);
+      this.scratch.recycle();
+      throw throwable;
+    }
+  }
+
+  /** 尽力释放一个缓冲区；null 或重复释放都忽略（构造失败路径专用）。 */
+  private static void releaseQuietly(ByteBuf buffer) {
+    if (buffer == null) {
+      return;
+    }
+    try {
+      buffer.release();
+    } catch (Throwable ignored) {
+      // 构造失败收尾：释放异常无可补救，交给 GC / 引用计数兜底
+    }
   }
 
   public int getSectionCount() {
@@ -114,7 +138,10 @@ public class Chunk implements AutoCloseable {
           return array;
         }
         // 未写满（复用数组偏大）：必须复制出长度精确的独立数组，不能把偏大的复用数组交出去
-        // （若底层缓冲区在写出过程中自行扩容，把真实容量同步回 scratch，后续区块一次到位）
+        // （若底层缓冲区在写出过程中自行扩容，把真实容量同步回 scratch，后续区块一次到位）。
+        // 这是既定取舍：稳态下复用数组往往比本次输出略大，于是每个区块要付一次整块复制；换来的是
+        // 「交出去的字节长度精确、且完全独立于 scratch」这一强不变式（调用方会长期持有该数组）。
+        // 若未来确有需要，可让 scratch 记「上次实际写出长度」并据此定容以减少该复制，此处不做。
         this.scratch.keepOutputCapacity(out.capacity());
         return Arrays.copyOfRange(array, out.arrayOffset(), out.arrayOffset() + readable);
       } catch (IndexOutOfBoundsException overflow) {

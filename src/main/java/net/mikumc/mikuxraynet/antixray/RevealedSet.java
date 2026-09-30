@@ -276,26 +276,60 @@ public final class RevealedSet {
    * 注销一个坐标的已显形标记（服务端自行下发了该坐标的方块变更时调用）。
    *
    * <p>与 {@link ObfuscatedChunkIndex#removePosition} 配套：两者必须同步摘除，才能维持
-   * 「已显形坐标 ⊆ 区块伪装清单」这一不变式。
+   * 「已显形坐标 ⊆ 区块伪装清单」这一不变式。委托给批量接口，保证与 {@link #removePositions}
+   * 用同一把锁、同一套判活逻辑。
    */
   void removePosition(String worldName, int x, int y, int z) {
-    if (worldName == null) {
+    removePositions(worldName, new int[] {x, y, z}, 1);
+  }
+
+  /**
+   * 批量注销<b>同一区块</b>内的多个坐标的已显形标记（出站多方块变更包路径，一个 section 只调用一次）。
+   *
+   * <p><b>为什么需要它</b>：逐坐标调用会为每个坐标重复一次 {@code ChunkKey.ofBlock} + 映射查找
+   * + 遍历全部玩家 + 逐 marker 加锁；一个 section 最多 4096 个坐标时会被确定性放大。这里一次定位、
+   * 一次遍历、逐个 marker 内成批摘除，与 {@link ObfuscatedChunkIndex#removePositions} 的批量口径对称。
+   *
+   * <p><b>判活同构</b>：进入遍历前先持「逐区块映射监视器」并校验 {@code chunks.get(key) == players}
+   * （与 {@link #mark} / {@link #expire} / {@link #clearChunk} 完全同一判据）。这样「判活 + 摘标记 +
+   * 扣减」与 {@link #clearChunk} 的「整图摘除 + 按 {@code marker.size()} 扣减」严格互斥——
+   * 否则并发（区块卸载 vs 同区块变更包）时，同一坐标会在 {@code removePosition} 里被摘一次（扣 1），
+   * 又被 {@code clearChunk} 按旧 {@code size} 计一次，导致 {@code playerTotals} 被多扣（低估）。
+   *
+   * @param coordinates 同一区块的绝对坐标三元组（{@code x,y,z} 连续存放）；调用方保证它们同属一个区块
+   * @param count       有效坐标个数（前 {@code count} 个三元组）
+   */
+  void removePositions(String worldName, int[] coordinates, int count) {
+    if (worldName == null || coordinates == null || count <= 0 || coordinates.length < count * 3) {
       return;
     }
-    ConcurrentHashMap<UUID, Marker> players = chunks.get(ChunkKey.ofBlock(worldName, x, z));
+    // 同一批坐标必然落在同一区块：由首坐标导出区块键
+    ChunkKey key = ChunkKey.ofBlock(worldName, coordinates[0], coordinates[2]);
+    ConcurrentHashMap<UUID, Marker> players = chunks.get(key);
     if (players == null) {
       return;
     }
-    long packedValue = pack(x, y, z);
-    for (Map.Entry<UUID, Marker> entry : players.entrySet()) {
-      Marker marker = entry.getValue();
-      synchronized (marker) {
-        if (!marker.remove(packedValue)) {
-          continue;
-        }
-        AtomicInteger total = playerTotals.get(entry.getKey());
-        if (total != null) {
-          subtract(total, 1);
+    synchronized (players) {
+      if (chunks.get(key) != players) {
+        // 映射已被并行的 clearChunk / expire 摘除：它们已按其 size 扣减，这里不再重复扣。
+        return;
+      }
+      for (Map.Entry<UUID, Marker> entry : players.entrySet()) {
+        Marker marker = entry.getValue();
+        synchronized (marker) {
+          int removed = 0;
+          for (int i = 0; i < count; i++) {
+            if (marker.remove(pack(coordinates[i * 3], coordinates[i * 3 + 1],
+                coordinates[i * 3 + 2]))) {
+              removed++;
+            }
+          }
+          if (removed > 0) {
+            AtomicInteger total = playerTotals.get(entry.getKey());
+            if (total != null) {
+              subtract(total, removed);
+            }
+          }
         }
       }
     }

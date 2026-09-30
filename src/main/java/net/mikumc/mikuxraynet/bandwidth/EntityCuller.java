@@ -57,6 +57,9 @@ import org.bukkit.util.Vector;
  *       这样实体入场时可见、之后才被墙/地形挡住的场景也能被收敛到隐藏。</li>
  * </ol>
  * 两条通道都复用同一套评估链路（实体所属线程做原生射线并 hide/show），不另写一套。
+ * <b>距离闸门</b>：两条通道都只对「在强制可见距离内」的实体做恢复（{@code showIfHidden}），
+ * 超出该距离时直接跳过（不再打射线）——避免玩家走远后、实体仍留在常加载区块时每周期累积大量远距离射线。
+ * 入场那一刻的首评（{@code onTrack}）不受此闸门限制，因此「远距离实体照常被剔除」这一行为不变。
  */
 public final class EntityCuller implements Listener {
 
@@ -82,6 +85,13 @@ public final class EntityCuller implements Listener {
   private final ConcurrentHashMap<UUID, ScheduledTask> recheckTasks = new ConcurrentHashMap<>();
   /** 「停用时恢复失败」的中文 WARN 一次性闸门。 */
   private final AtomicBoolean restoreFailureNoticed = new AtomicBoolean();
+  /** 「停用时存在跨区域被隐藏实体（Folia）无法同步恢复」的中文 WARN 一次性闸门。 */
+  private final AtomicBoolean crossRegionRestoreNoticed = new AtomicBoolean();
+  /**
+   * 停用中标记：{@code stop()} 首行置位，用于闭合停用期并发——正在跑的复检若在此之后才走到
+   * {@code hide()}，会被拒绝，绝不把实体重新藏回（否则刚刚 {@code restoreAll()} 恢复过的实体会再次不可见）。
+   */
+  private volatile boolean stopping;
 
   public EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats) {
     this(plugin, config, stats, EntityCuller::ownedByCurrentRegion);
@@ -174,6 +184,10 @@ public final class EntityCuller implements Listener {
 
   /** 注销监听、恢复全部被隐藏实体。 */
   public void stop() {
+    // 先取消在途任务、再同步恢复：Bukkit 的 setEnabled(false) 先置 isEnabled=false 再调 onDisable，
+    // 因此停用链路里的 EntityScheduler 一律抛 IllegalPluginAccessException（旧实现被 Schedulers 静默吞掉，
+    // 导致恢复完全无声）。这里改为「先 cancel 在途任务闭合并发 → 检测到已停用则同步恢复」。
+    stopping = true;
     cancelRecheckTasks();
     HandlerList.unregisterAll(this);
     restoreAll();
@@ -320,7 +334,7 @@ public final class EntityCuller implements Listener {
    * <p>包可见：供离线单测直接驱动「轮转分片 + 预算」账本行为（真实链路依赖 Bukkit 调度，离线不可用）。
    */
   void recheck(Player player) {
-    if (!config.raycast() || !player.isOnline()) {
+    if (stopping || !config.raycast() || !player.isOnline()) {
       return;
     }
     UUID playerId = player.getUniqueId();
@@ -404,6 +418,15 @@ public final class EntityCuller implements Listener {
       // 而离线环境连 Material 都初始化不了（org.bukkit.Registry 不可用），判定结果无从成立。
       if (player.getLocation().distanceSquared(entity.getLocation()) <= forceVisibleSquared) {
         showIfHidden(player, entity);
+        return;
+      }
+      // 复检通道：超出强制可见距离的实体不再打射线。
+      // 「玩家走远后实体仍留在常加载区块（出生点刷怪塔等）」时，这些账本条目会让复检通道每周期
+      // 对每个远距离实体打至多 ray-samples 条无距离上限的射线，会话越长累积越多。这里直接跳过：
+      // 账本条目保留（不能摘——Paper 的 hideEntity 状态跨 untrack 仍生效，账本是我们「重进追踪范围时
+      // 该不该 showEntity」的唯一依据），待实体重新进入强制可见距离时，上面的 showIfHidden 分支会恢复它。
+      // 入场那一刻的首评（fromRecheck=false）仍会打射线，故「远距离实体照常剔除」这一行为不变。
+      if (fromRecheck) {
         return;
       }
       evaluate(player, entity, isFullyOccluded(player, entity), fromRecheck);
@@ -552,6 +575,10 @@ public final class EntityCuller implements Listener {
 
   /** @return 是否真的新登记并执行了 hideEntity（已隐藏 / 失败时为 false）。 */
   private boolean hide(Player player, Entity entity) {
+    if (stopping) {
+      // 停用已开始：绝不再新登记隐藏（否则会把刚被 restoreAll 恢复的实体重新藏回）
+      return false;
+    }
     Map<Integer, Entity> map = hidden.computeIfAbsent(player.getUniqueId(),
         uuid -> new ConcurrentHashMap<>());
     if (map.containsKey(entity.getEntityId())) {
@@ -591,20 +618,67 @@ public final class EntityCuller implements Listener {
     return false;
   }
 
-  /** 停用时的兜底：把所有被隐藏的实体恢复显示，不留副作用。 */
+  /**
+   * 停用时的兜底：把所有被隐藏的实体恢复显示，不留副作用。
+   *
+   * <p><b>停用路径必须同步恢复</b>：Bukkit 的 {@code setEnabled(false)} 先置 {@code isEnabled=false}
+   * 再调 {@code onDisable()}，此时 {@code EntityScheduler} 一律抛 {@link org.bukkit.plugin.IllegalPluginAccessException}
+   * （旧实现被 {@link Schedulers} 静默吞掉 → 关服 / reload / 停用后实体对玩家持续不可见，且「恢复失败必 WARN」永不触发）。
+   * 因此这里按「插件是否仍启用」分流：仍启用（热重载）时回到玩家所属线程调度；
+   * 已停用时改为<b>同步</b>恢复——Paper 主线程恒可同步；Folia 仅当实体属于当前区域（{@code owns}）时才同步，
+   * 跨区域者无法在当前线程安全操作，打一次性中文 WARN 提示「需重登才能恢复」。
+   */
   private void restoreAll() {
+    boolean stillEnabled = plugin.isEnabled();
     for (Player player : Bukkit.getOnlinePlayers()) {
       Map<Integer, Entity> drained = drainPlayer(player.getUniqueId());
       if (drained.isEmpty()) {
         continue;
       }
       for (Entity entity : drained.values()) {
-        // 一律回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
-        Schedulers.onEntity(plugin, player, () -> restoreWithRetry(player, entity, true));
+        if (stillEnabled) {
+          // 热重载路径：回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
+          Schedulers.onEntity(plugin, player, () -> restoreWithRetry(player, entity, true));
+        } else {
+          // 停用路径：调度器已不可用（plugin.isEnabled()=false），同步恢复
+          restoreNow(player, entity);
+        }
       }
     }
     // 离线玩家（停用时已不在线）的登记一并丢弃：它们已随退出被恢复，这里只兜底清账本
     hidden.clear();
+  }
+
+  /**
+   * 停用路径的<b>同步</b>恢复单个被隐藏实体（不再经调度器）。
+   *
+   * <p>Paper：主线程拥有全部实体，{@code owns} 恒真，直接 {@code showEntity}。
+   * Folia：当前（停用）线程未必拥有该实体所在区域——{@code owns} 为 false 时<b>绝不</b>触碰该实体状态
+   * （否则会触发 TickThread 校验先打 ERROR 再抛），只记一次性中文 WARN，说明该实体需玩家重登才能恢复。
+   */
+  private void restoreNow(Player player, Entity entity) {
+    if (!owns(entity)) {
+      warnCrossRegionRestore();
+      return;
+    }
+    boolean restored;
+    try {
+      restored = show(player, entity) || !entity.isValid();
+    } catch (Throwable throwable) {
+      restored = false;
+    }
+    if (!restored && restoreFailureNoticed.compareAndSet(false, true)) {
+      plugin.getLogger().warning("插件停用时同步恢复被隐藏实体失败："
+          + "个别实体可能需玩家重新登录后才可见；不影响其它功能。");
+    }
+  }
+
+  /** Folia 停用时跨区域实体无法同步恢复的一次性中文 WARN（进程级闸门，绝不刷屏）。 */
+  private void warnCrossRegionRestore() {
+    if (crossRegionRestoreNoticed.compareAndSet(false, true)) {
+      plugin.getLogger().warning("插件停用时检测到跨区域（Folia）被隐藏实体：当前线程无法安全恢复，"
+          + "个别实体可能需玩家重新登录后才可见。此为 Folia 区域化线程的限制，非本插件故障。");
+    }
   }
 
   /**
