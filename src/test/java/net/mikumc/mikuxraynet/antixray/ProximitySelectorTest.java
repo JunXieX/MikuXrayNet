@@ -515,6 +515,31 @@ class ProximitySelectorTest {
     assertEquals(0.0D, all[0][2], 1.0E-9D, "正对 +Z 方向看时，应优先取 -Z 面（朝向玩家的那个面）中心");
   }
 
+  /**
+   * 有效采样上限：候选点数固定封顶 {@link ProximitySelector#MAX_SAMPLE_POINTS}=5——即使配置给到 8
+   * （旧注释曾写「钳制 1..8」），实际尝试的候选点数仍是候选点数（≤5），不会更多（见 P3 打磨项）。
+   */
+  @Test
+  void effectiveSampleCapIsFiveRegardlessOfConfiguredSamples() {
+    ProximitySelector.Eye eye = standingEye();
+    ProximitySelector.RayQuery allOpen = (x, y, z) -> false; // 六面全暴露
+
+    assertEquals(5, ProximitySelector.MAX_SAMPLE_POINTS, "有效上限常量本身即 5");
+    int expected = ProximitySelector.visibilityPoints(eye, 0, 64, 30, ProximitySelector.ALL_FACES).length;
+    assertTrue(expected > 0 && expected <= ProximitySelector.MAX_SAMPLE_POINTS,
+        "候选点数必须为正且不超过有效上限：" + expected);
+
+    int[] probes = {0};
+    ProximitySelector.RayProbe counter = (x, y, z) -> {
+      probes[0]++;
+      return false; // 全部不通畅 → 会一路试到上限
+    };
+    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 30, allOpen, 8, counter),
+        "所有候选射线被挡 → 判为不可见");
+    assertEquals(expected, probes[0],
+        "配置 samples=8 时，实际尝试的候选点数仍受有效上限 5 约束（不会超过候选点数）");
+  }
+
   // ---------------------------------------------------------------- 流体覆盖（显形侧）
 
   /**

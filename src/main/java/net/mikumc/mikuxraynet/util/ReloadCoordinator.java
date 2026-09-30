@@ -47,7 +47,7 @@ public final class ReloadCoordinator {
       "反矿透世界黑名单（world-blacklist，即时豁免/恢复对应世界）",
       "AFK 降级（判定时长/丢弃距离/包类型）",
       "高延迟降视距（阈值/幅度/下限/巡检周期）",
-      "带宽全部子模块（零位移/变更合并/实体剔除/调色板重排）",
+      "带宽全部子模块（零位移/变更合并/实体剔除）",
       "平台判定（advanced.platform，会重新判定并按新分支重建周期任务）",
       "两份配置文件的读取值");
 
@@ -58,7 +58,9 @@ public final class ReloadCoordinator {
       "邻块快照开关/缺失策略/容量",
       "反矿透工作线程数与队列容量",
       "区块改写超时与改写缓存容量/过期",
-      "调色板 strict-verify");
+      // 调色板三键在启动期被固化为编码链路的 PaletteOptions（见 AntiXrayRuntime.startAntiXray），
+      // reload 只重启显形/带宽任务、不重建编码器，故这三键改了必须重启（含 reorder / width-budget / strict-verify）。
+      "调色板重排 / 位宽预算封顶 / 严格自检（palette.reorder / width-budget / strict-verify）");
 
   /**
    * 执行一次热重载。

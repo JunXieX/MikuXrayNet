@@ -370,7 +370,7 @@ public final class EntityCuller implements Listener {
    *
    * <p>把包围盒「朝向玩家一侧」的可见顶点逐一射向玩家眼睛，任一条通畅即判「未被完全遮挡」；
  * 可见顶点由 {@code visibleVertices} 给出（包围盒至多 7 个），再由 {@code entity-culling.ray-samples}
- * （已钳制 1..8）截断实际尝试的顶点数。
+   * （已钳制 1..7，上限即 {@link BandwidthConfig#MAX_RAY_SAMPLES}）截断实际尝试的顶点数。
    *
    * <p><b>失败语义 fail-open</b>：任何异常都返回 {@code false}（不遮挡）——绝不误藏实体。
    *

@@ -478,7 +478,7 @@ class ConfigDefaultsTest {
         "视锥竖直全角默认为安全下限 110°（客户端 FOV 上限；配窄会让玩家看得见的方块保持伪装）");
     assertTrue(config.floorAdjustments().isEmpty(), "默认值不触发安全下限抬升（不产生误导性 WARN）");
     assertEquals(4, config.proximity().raycastSamples(),
-        "候选点数默认 4（原生射线改造后语义为「每方块最多尝试的候选点数」，钳制 1..8）");
+        "候选点数默认 4（原生射线改造后语义为「每方块最多尝试的候选点数」，钳制 1..5）");
     assertTrue(config.proximity().batchRevealSends(),
         "显形包批量合并默认开启（Paper 原生多方块变更包，关掉即回退为逐坐标单包）");
 
@@ -513,6 +513,88 @@ class ConfigDefaultsTest {
     assertEquals(0, config.threads(), "工作线程数默认 0 = 按 CPU 自动推算（上限 4）");
     assertEquals(2500, config.timeoutMillis(), "单区块包处理超时默认 2500 毫秒");
     assertEquals(2048, config.queueCapacity(), "工作队列容量默认 2048");
+    assertTrue(config.ceilingAdjustments().isEmpty(), "默认值不触发安全上限回落（不产生误导性 WARN）");
+  }
+
+  /**
+   * 反矿透侧的安全上限：邻近显形距离 / 邻块缓存 / 改写缓存三键配成失控值时按上限生效并留痕；
+   * {@code proximity.raycast.samples} 的有效上限是「暴露面上的候选点数」5（配 6~8 静默无效）。
+   *
+   * <p>邻近显形距离的扫描量随半径平方增长（O(r²)），配成几百上千会把主线程拖住——这正是补上限的动机。
+   */
+  @Test
+  void antixrayCeilingsClampAndReport() {
+    AntiXrayConfig config = AntiXrayConfig.from(yaml("""
+        proximity:
+          distance: 4096.0
+          raycast:
+            samples: 8
+        neighbors:
+          cache-maximum-size: 1000000
+        cache:
+          maximum-size: 409600
+        """));
+
+    assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_MAX, config.proximity().distance(), 1.0E-9D,
+        "邻近显形距离超过上限必须钳制到 256 格（扫描量 O(r²)，防止把主线程拖住）");
+    assertEquals(AntiXrayConfig.PROXIMITY_RAY_SAMPLES_MAX, config.proximity().raycastSamples(),
+        "候选点数超过有效上限必须钳制到 5（暴露面上至多 5 个候选点）");
+    assertEquals(AntiXrayConfig.NEIGHBORS_CACHE_MAXIMUM_MAX, config.neighbors().cacheMaximumSize(),
+        "邻块缓存条目超过上限必须钳制到 16384");
+    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_SIZE_MAX, config.cacheMaximumSize(),
+        "改写缓存条目超过上限必须钳制到 65536");
+
+    String details = String.join("、", config.ceilingAdjustments());
+    assertTrue(details.contains("proximity.distance=4096.0"), details);
+    assertTrue(details.contains("neighbors.cache-maximum-size=1000000"), details);
+    assertTrue(details.contains("cache.maximum-size=409600"), details);
+
+    // 上限以内的显式值原样生效、不产生明细
+    AntiXrayConfig inRange = AntiXrayConfig.from(yaml("""
+        proximity:
+          distance: 128.0
+          raycast:
+            samples: 5
+        neighbors:
+          cache-maximum-size: 4096
+        cache:
+          maximum-size: 50000
+        """));
+    assertEquals(128.0D, inRange.proximity().distance(), 1.0E-9D);
+    assertEquals(5, inRange.proximity().raycastSamples(), "samples=5 是有效上限，应原样生效");
+    assertEquals(4096, inRange.neighbors().cacheMaximumSize());
+    assertEquals(50000, inRange.cacheMaximumSize());
+    assertTrue(inRange.ceilingAdjustments().isEmpty(),
+        "上限内的值不得产生回落明细：" + inRange.ceilingAdjustments());
+
+    // 下限：邻块缓存/改写缓存为 0 或负数时至少取 1（否则缓存恒空、退化为重复抓取）
+    AntiXrayConfig floored = AntiXrayConfig.from(yaml("""
+        neighbors:
+          cache-maximum-size: 0
+        cache:
+          maximum-size: -5
+        """));
+    assertEquals(1, floored.neighbors().cacheMaximumSize(), "邻块缓存下限为 1");
+    assertEquals(1, floored.cacheMaximumSize(), "改写缓存下限为 1");
+  }
+
+  /**
+   * {@code proximity.distance} 的非有限值（NaN / ±Inf）必须回落默认 64，不得原样穿过钳制。
+   *
+   * <p>NaN 会污染距离比较（所有比较恒 false）并进入配置指纹，导致磁盘缓存整体失效。
+   */
+  @Test
+  void proximityDistanceNonFiniteFallsBackToDefault() {
+    AntiXrayConfig nan = AntiXrayConfig.from(yaml("proximity:\n  distance: .nan\n"));
+    assertEquals(64.0D, nan.proximity().distance(), 1.0E-9D, "NaN 必须回落默认 64");
+    assertTrue(String.join("、", nan.ceilingAdjustments()).contains("proximity.distance=NaN"),
+        "非有限值回落必须留痕：" + nan.ceilingAdjustments());
+
+    AntiXrayConfig inf = AntiXrayConfig.from(yaml("proximity:\n  distance: .inf\n"));
+    assertEquals(64.0D, inf.proximity().distance(), 1.0E-9D,
+        "+Inf 属于非有限值，同样回落默认 64（而不是被当成超大值）");
+    assertTrue(String.join("、", inf.ceilingAdjustments()).contains("proximity.distance=Infinity"),
+        "非有限值回落必须留痕：" + inf.ceilingAdjustments());
   }
 
   // ------------------------------------------------------------ 缺省键全覆盖（bandwidth）
@@ -640,6 +722,43 @@ class ConfigDefaultsTest {
     assertTrue(BandwidthConfig.from(yaml("")).clampAdjustments().isEmpty(),
         "默认值必须全部落在合法区间内（新增上限不得改变默认行为）");
     assertTrue(BandwidthConfig.from(yaml("enabled: true\n")).clampAdjustments().isEmpty());
+  }
+
+  /**
+   * 非有限值（NaN / ±Inf）必须显式回落默认并留痕，且<b>不得污染配置指纹</b>。
+   *
+   * <p>回归动机：NaN 不满足 {@code > max}，旧实现会让它原样穿过钳制进入 {@code configHash}——
+   * 于是同一份「其实无效」的配置算出的指纹与任何正常进程都不同，磁盘缓存被整体判为「配置已变」
+   * 而失效（重启后命中率恒为 0）。现在 NaN/±Inf 一律回落默认，生效值与指纹都与「根本没写这项」一致。
+   */
+  @Test
+  void bandwidthNonFiniteValuesFallBackToDefaultsAndKeepFingerprintStable() {
+    BandwidthConfig base = BandwidthConfig.from(yaml("enabled: true\n"));
+    BandwidthConfig nan = BandwidthConfig.from(yaml("""
+        entity-culling:
+          force-visible-distance: .nan
+        afk:
+          distance: .nan
+        """));
+
+    assertEquals(32.0D, nan.entityCulling().forceVisibleDistance(), 1.0E-9D, "NaN 必须回落默认 32");
+    assertEquals(16.0D, nan.afk().distance(), 1.0E-9D, "NaN 必须回落默认 16");
+    String nanDetails = String.join("、", nan.clampAdjustments());
+    assertTrue(nanDetails.contains("entity-culling.force-visible-distance"), nanDetails);
+    assertTrue(nanDetails.contains("afk.distance"), nanDetails);
+    assertTrue(nanDetails.contains("非有限值"), nanDetails);
+    assertEquals(base.configHash(), nan.configHash(),
+        "非有限值回落默认后指纹必须与默认配置一致（否则磁盘缓存会被无谓地整体失效）");
+
+    BandwidthConfig inf = BandwidthConfig.from(yaml("""
+        entity-culling:
+          force-visible-distance: .inf
+        afk:
+          distance: -.inf
+        """));
+    assertEquals(32.0D, inf.entityCulling().forceVisibleDistance(), 1.0E-9D, "+Inf 必须回落默认 32");
+    assertEquals(16.0D, inf.afk().distance(), 1.0E-9D, "-Inf 必须回落默认 16（而不是被 Math.max 悄悄抬成 0）");
+    assertEquals(base.configHash(), inf.configHash(), "±Inf 回落默认后指纹同样必须稳定");
   }
 
   /**

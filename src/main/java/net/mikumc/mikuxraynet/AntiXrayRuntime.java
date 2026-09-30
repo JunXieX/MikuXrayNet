@@ -46,10 +46,15 @@ public final class AntiXrayRuntime {
   private MikuWorkPool workPool;
   private ProximityRevealer proximityRevealer;
   private BlockChangeRevealListener blockChangeRevealListener;
-  /** 按区块共享的伪装坐标索引（内存 = O(有伪装的已加载区块数)）。 */
-  private ObfuscatedChunkIndex obfuscatedChunkIndex;
-  /** 按玩家的已显形集合（内存 = O(玩家身边确实显形过的坐标数)）。 */
-  private RevealedSet revealedSet;
+  /**
+   * 按区块共享的伪装坐标索引（内存 = O(有伪装的已加载区块数)）。
+   *
+   * <p><b>volatile</b>：热重载会把它置空（关闭 proximity），而改写链路的工作线程通过可变引用读取它——
+   * 需要跨线程立即可见，避免「已关闭但工作线程仍在一小段时间内登记」的可见性竞态。
+   */
+  private volatile ObfuscatedChunkIndex obfuscatedChunkIndex;
+  /** 按玩家的已显形集合（内存 = O(玩家身边确实显形过的坐标数)）；volatile 原因同上。 */
+  private volatile RevealedSet revealedSet;
   private ProximityStats proximityStats;
   private DiskCacheStore diskCacheStore;
   private BypassRegistry bypassRegistry;
@@ -142,18 +147,25 @@ public final class AntiXrayRuntime {
 
     MikuWorkPool pool = new MikuWorkPool(antiXray.threads(), antiXray.queueCapacity());
     ProtocolLibHook hook = new ProtocolLibHook(plugin);
+    // 先把索引/已显形集合落到运行时字段，再以「可变引用」传给改写链路：热重载关闭 proximity 时
+    // restartProximity 会把这两个字段置空，改写链路随即读到 null（跳过 recordChunk），
+    // 从而真正做到「关闭即零开销」，且与面板读到的字段一致。提前赋值还可避免启动瞬间的读取竞态。
+    this.obfuscatedChunkIndex = chunkIndex;
+    this.revealedSet = revealed;
     // 传实时配置源：世界黑名单热重载后必须即时生效（否则纳入黑名单的世界仍会被改写）。
-    if (!hook.register(antiXray, processor, pool, neighborProvider, chunkIndex, revealed,
+    if (!hook.register(antiXray, processor, pool, neighborProvider,
+        () -> this.obfuscatedChunkIndex, () -> this.revealedSet,
         bypassRegistry, diskCache, () -> plugin.mikuConfig().antiXray())) {
       pool.close();
       closeDiskCache(diskCache);
+      // 注册失败：清掉刚赋值的索引字段，保持「未接入改写链路」的原语义（诊断据此回落 EMPTY）
+      this.obfuscatedChunkIndex = null;
+      this.revealedSet = null;
       return;
     }
 
     this.workPool = pool;
     this.protocolLibHook = hook;
-    this.obfuscatedChunkIndex = chunkIndex;
-    this.revealedSet = revealed;
     this.diskCacheStore = diskCache;
     this.proximityStats = new ProximityStats();
     this.antiXrayActive = true;

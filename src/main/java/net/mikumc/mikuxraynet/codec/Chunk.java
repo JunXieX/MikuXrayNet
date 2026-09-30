@@ -93,9 +93,23 @@ public class Chunk implements AutoCloseable {
       out.clear();
       try {
         writeAll(out);
-        // 若底层缓冲区在写出过程中自行扩容，把真实容量同步回 scratch，后续区块一次到位
+        byte[] array = out.array();
+        int readable = out.readableBytes();
+        if (out.arrayOffset() == 0 && readable == array.length) {
+          // 缓冲区恰好写满（无偏移）：把底层数组零拷贝移交给调用方，省掉 worker 热路径上约 50KB 的整块复制。
+          // 别名安全前提：返回的数组会被内存缓存 / 磁盘 / NMS 字段长期持有，必须由调用方独占，因此这里
+          // 让 scratch 与 outputBuffer 双双放弃对它的引用——scratch 下次另分配（detachOutput），本对象
+          // 再 finalizeOutput 也会写进新缓冲，绝不会就地改写已移交的数组；数组长度恰为 readable，长度精确。
+          this.scratch.detachOutput();
+          this.outputBuffer = Unpooled.wrappedBuffer(
+              this.scratch.outputArray(Math.max(1, array.length)));
+          this.outputBuffer.clear();
+          return array;
+        }
+        // 未写满（复用数组偏大）：必须复制出长度精确的独立数组，不能把偏大的复用数组交出去
+        // （若底层缓冲区在写出过程中自行扩容，把真实容量同步回 scratch，后续区块一次到位）
         this.scratch.keepOutputCapacity(out.capacity());
-        return Arrays.copyOfRange(out.array(), out.arrayOffset(), out.arrayOffset() + out.readableBytes());
+        return Arrays.copyOfRange(array, out.arrayOffset(), out.arrayOffset() + readable);
       } catch (IndexOutOfBoundsException overflow) {
         // 复用的输出数组容量不足（升位后调色板变大等情况）：翻倍扩容后整体重写。
         // 只会在输出超过该线程历史最大长度时发生，稳态下不再触发。

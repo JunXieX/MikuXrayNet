@@ -293,9 +293,44 @@ public final class AntiXrayConfig {
   public static final int DISK_CACHE_EXPIRE_FLOOR_SECONDS = 86400;
 
   /**
+   * 邻近显形触发距离的<b>安全上限</b>（格）。
+   *
+   * <p><b>为什么设上限</b>：每个巡检周期要对玩家周围该半径内的区块做候选扫描，扫描量随半径<b>平方增长</b>
+   * （O(r²)）。手滑把 64 多打一位成 640（甚至几千）会让每周期扫描的区块数暴涨几十倍，直接把主线程拖住。
+   * 256 格已远大于一个视距，再大也只是提前把远处矿物亮给玩家，故上限取 256。
+   */
+  public static final double PROXIMITY_DISTANCE_MAX = 256.0D;
+
+  /**
+   * {@code proximity.raycast.samples}（每方块最多尝试的候选点数）的有效上限。
+   *
+   * <p>候选点只取在方块<b>暴露面</b>上、按命中概率排序：面中心 + 最近点 + 至多 3 个面角，<b>至多 5 个</b>
+   * （见 {@code ProximitySelector#MAX_SAMPLE_POINTS}）。配 6~8 不会多试出第 6 个点，属静默失效，
+   * 因此钳制到 5；默认 4 落在区间内，不改变既有行为。
+   */
+  public static final int PROXIMITY_RAY_SAMPLES_MAX = 5;
+
+  /**
+   * {@code neighbors.cache-maximum-size}（邻块贴边快照缓存条目上限）的安全上限。
+   *
+   * <p>快照按位打包（每格 1 bit），约 3 KB/条；16384 条约 48 MB。再大只放大内存占用而无精度收益。
+   */
+  public static final int NEIGHBORS_CACHE_MAXIMUM_MAX = 16384;
+
+  /**
+   * {@code cache.maximum-size}（改写结果内存缓存条目上限）的安全上限。
+   *
+   * <p>每条约占 20~25 KB，65536 条饱和时约 1.3~1.6 GB。默认 40960 已接近常见堆预算，
+   * 上限用于防止手滑多打一位数把内存打满（缓存条目只在遇到新区块时增长）。
+   */
+  public static final int CACHE_MAXIMUM_SIZE_MAX = 65536;
+
+  /**
    * 邻近显形：玩家靠近曾被伪装的坐标时，主动把该坐标的真实方块发回客户端。
    *
-   * @param distance              触发显形的距离（格，三维欧氏距离，等于阈值也算命中）
+   * @param distance              触发显形的距离（格，三维欧氏距离，等于阈值也算命中）；
+   *                              <b>不高于 {@link #PROXIMITY_DISTANCE_MAX}</b>（超过上限会被钳制并 WARN，
+   *                              因为扫描量随半径平方增长）
    * @param intervalTicks         巡检周期（tick）
    * @param maxRevealsPerTick     单次巡检的发包上限（普通服务端为全服合计，Folia 为每玩家）
    * @param expireSeconds         显形索引条目的过期秒数（区块卸载未触发时的兜底）
@@ -310,7 +345,8 @@ public final class AntiXrayConfig {
    *                              <b>不低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR}</b>（低于下限会被抬升并 WARN）
    * @param raycastEnabled        是否做射线可见性判定（被墙挡住的不显形；<b>默认开启</b>）
    * @param raycastSamples        <b>每方块最多尝试的候选点数</b>（射线改用 Paper 原生
-   *                              {@code World#rayTraceBlocks} 后不再表示采样数）；钳制 1..8，默认 4
+   *                              {@code World#rayTraceBlocks} 后不再表示采样数）；
+   *                              钳制 1..{@link #PROXIMITY_RAY_SAMPLES_MAX}（默认 4）
    * @param instantReveal         事件驱动即时显形（周期巡检的补充，见 {@link InstantReveal}）
    * @param overRevealSampling    过度显形抽样统计的抽样率分母 N（1/N 抽样，只计数不改行为；
    *                              0 表示关闭）
@@ -474,9 +510,15 @@ public final class AntiXrayConfig {
   /**
    * 被安全下限（{@link #FRUSTUM_FOV_FLOOR} / {@link #FRUSTUM_MIN_DISTANCE_FLOOR} /
    * {@link #DISK_CACHE_EXPIRE_FLOOR_SECONDS}）抬升过的配置键明细；空列表表示未抬升。
-   * 加载时由 {@link #warnIfConfigFloorApplied} 一次性 WARN。
+   * 加载时由 {@link #warnIfConfigAdjusted} 一次性 WARN。
    */
   private final List<String> floorAdjustments;
+  /**
+   * 被安全上限（{@link #PROXIMITY_DISTANCE_MAX} / {@link #NEIGHBORS_CACHE_MAXIMUM_MAX} /
+   * {@link #CACHE_MAXIMUM_SIZE_MAX}）回落过的配置键明细；空列表表示未回落。
+   * 加载时由 {@link #warnIfConfigAdjusted} 一次性 WARN。
+   */
+  private final List<String> ceilingAdjustments;
   private final boolean layerObfuscation;
   private final boolean removeBlockEntities;
   private final Neighbors neighbors;
@@ -509,7 +551,7 @@ public final class AntiXrayConfig {
       DiskCache diskCache, PlatformSupport.Mode platform, int cacheMaximumSize,
       int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis, int queueCapacity,
       Set<String> unresolvedTags, List<WorldOverride> worldOverrides, List<String> worldBlacklist,
-      List<String> floorAdjustments) {
+      List<String> floorAdjustments, List<String> ceilingAdjustments) {
     this.enabled = enabled;
     this.dimensionEffectives = dimensionEffectives.clone();
     this.dimensionEnabled = dimensionEnabled.clone();
@@ -530,8 +572,11 @@ public final class AntiXrayConfig {
     this.worldOverrides = List.copyOf(worldOverrides);
     // 黑名单在构造期拆分并预编译通配匹配器：热路径只有短线性扫描，绝不逐包编译正则（列表通常 1~10 项）。
     this.worldBlacklist = List.copyOf(worldBlacklist);
-    // 被安全下限抬升过的键（空 = 未抬升）；加载时由 warnIfConfigFloorApplied 一次性提示
+    // 被安全下限抬升过的键（空 = 未抬升）；加载时由 warnIfConfigAdjusted 一次性提示
     this.floorAdjustments = floorAdjustments == null ? List.of() : List.copyOf(floorAdjustments);
+    // 被安全上限回落过的键（空 = 未回落）；同样由 warnIfConfigAdjusted 一次性提示
+    this.ceilingAdjustments =
+        ceilingAdjustments == null ? List.of() : List.copyOf(ceilingAdjustments);
     List<String> blacklistExactNames = new ArrayList<>(this.worldBlacklist.size());
     List<Pattern> blacklistGlobPatterns = new ArrayList<>(this.worldBlacklist.size());
     for (String pattern : this.worldBlacklist) {
@@ -673,6 +718,8 @@ public final class AntiXrayConfig {
 
     // ---- 安全下限：被抬升的键记进 floorAdjustments，加载时一次性 WARN（解析侧不持日志）----
     List<String> floorAdjustments = new ArrayList<>(3);
+    // ---- 安全上限：被回落的键记进 ceilingAdjustments，同样由加载时一次性 WARN 显式告知 ----
+    List<String> ceilingAdjustments = new ArrayList<>(4);
 
     return new AntiXrayConfig(
         root.getBoolean("enabled", true),
@@ -687,7 +734,9 @@ public final class AntiXrayConfig {
             // 默认 2048（原为 512）：快照已按位打包（每格 1 bit，主世界 384 高度约 3 KB/条），
             // 2048 条约 6 MB；512 条时缓存接近饱和、抓取次数随玩家移动抖动
             //（单次抓取实测约 0.776 ms，现按列高度上界裁剪后更少）。
-            root.getInt("neighbors.cache-maximum-size", 2048)),
+            // 下限 1（否则缓存恒空、退化为每次重复抓取），上限见 NEIGHBORS_CACHE_MAXIMUM_MAX。
+            clampCeiling(root.getInt("neighbors.cache-maximum-size", 2048), 1,
+                NEIGHBORS_CACHE_MAXIMUM_MAX, "neighbors.cache-maximum-size", ceilingAdjustments)),
         new Occlusion(
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-occluding")),
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding")),
@@ -697,7 +746,8 @@ public final class AntiXrayConfig {
             root.getBoolean("proximity.enabled", true),
             // 默认 64：真机反馈「48 格仍然偏近，走到跟前才变回来」。显形只在射线通畅时才还原，
             // 因此放大距离不会隔着墙泄露——它只是把「本来就看得到的矿」更早、更远地还给玩家。
-            Math.max(0.0D, root.getDouble("proximity.distance", 64.0D)),
+            // 但扫描量随半径平方增长，故设有安全上限（见 PROXIMITY_DISTANCE_MAX）。
+            proximityDistance(root.getDouble("proximity.distance", 64.0D), ceilingAdjustments),
             // 默认 4（原为 5）：显形周期越短，「石头还没变回来」的窗口越小。
             Math.max(1, root.getInt("proximity.interval-ticks", 4)),
             // 默认 256（原为 128）：配合扩大到 64 格的距离，候选数量随之上升，单次额度也要相应放大。
@@ -716,8 +766,9 @@ public final class AntiXrayConfig {
                 floorAdjustments),
             root.getBoolean("proximity.raycast.enabled", true),
             // 语义已变：原生射线改造后本键表示「每方块最多尝试的候选点数」（不再表示采样数）。
-            // 钳制 1..8，默认 4；候选点的选择只在暴露面上（面中心 → 最近点 → 面四角），命中即止。
-            Math.max(1, Math.min(8, root.getInt("proximity.raycast.samples", 4))),
+            // 钳制 1..PROXIMITY_RAY_SAMPLES_MAX（有效上限 = 暴露面上的候选点数），默认 4。
+            Math.max(1, Math.min(PROXIMITY_RAY_SAMPLES_MAX,
+                root.getInt("proximity.raycast.samples", 4))),
             new InstantReveal(
                 root.getBoolean("proximity.instant-reveal.enabled", true),
                 Math.max(1, Math.min(8, root.getInt("proximity.instant-reveal.radius", 2))),
@@ -747,7 +798,9 @@ public final class AntiXrayConfig {
             zstdSha256(root)),
         PlatformSupport.Mode.parse(root.getString("advanced.platform", "auto")),
         // 未配置时的内置兜底必须与打包 antixray.yml 的默认值保持一致（有单测对照）
-        root.getInt("cache.maximum-size", 40960),
+        // 上限见 CACHE_MAXIMUM_SIZE_MAX：每条约 20~25 KB，饱和时内存占用与条目数成正比。
+        clampCeiling(root.getInt("cache.maximum-size", 40960), 1,
+            CACHE_MAXIMUM_SIZE_MAX, "cache.maximum-size", ceilingAdjustments),
         root.getInt("cache.expire-after-access-seconds", 600),
         root.getInt("advanced.threads", 0),
         root.getInt("advanced.timeout-millis", 2500),
@@ -755,7 +808,8 @@ public final class AntiXrayConfig {
         unknownTags,
         overrides,
         worldBlacklist,
-        floorAdjustments);
+        floorAdjustments,
+        ceilingAdjustments);
   }
 
   /**
@@ -1016,6 +1070,40 @@ public final class AntiXrayConfig {
     return DISK_CACHE_EXPIRE_FLOOR_SECONDS;
   }
 
+  /**
+   * 整数上限钳制：非有限值不适用，仅对整数取值做「下限 max(minimum) + 上限 min(maximum)」；
+   * 上限被触发时记入 {@code ceilingAdjustments}（供加载时一次性 WARN）。
+   */
+  private static int clampCeiling(int value, int minimum, int maximum, String key,
+      List<String> ceilingAdjustments) {
+    int floored = Math.max(minimum, value);
+    if (floored > maximum) {
+      ceilingAdjustments.add(key + "=" + value + "（上限 " + maximum + "）");
+      return maximum;
+    }
+    return floored;
+  }
+
+  /**
+   * 邻近显形触发距离的生效值：非有限值（NaN / ±Inf）回落默认 64，负数按 0 处理，
+   * 超过 {@link #PROXIMITY_DISTANCE_MAX} 时按上限生效并记入 {@code ceilingAdjustments}。
+   *
+   * <p>之所以要显式拦非有限值：{@code Math.max(0.0, NaN)} 仍是 NaN，NaN 会污染距离比较
+   * （所有比较恒 false）并进入配置指纹，导致磁盘缓存整体失效；因此一律回落默认。
+   */
+  private static double proximityDistance(double configured, List<String> ceilingAdjustments) {
+    if (!Double.isFinite(configured)) {
+      ceilingAdjustments.add("proximity.distance=" + configured + "（非有限值，回落默认 64 格）");
+      return 64.0D;
+    }
+    double value = Math.max(0.0D, configured);
+    if (value > PROXIMITY_DISTANCE_MAX) {
+      ceilingAdjustments.add("proximity.distance=" + value + "（上限 " + PROXIMITY_DISTANCE_MAX + " 格）");
+      return PROXIMITY_DISTANCE_MAX;
+    }
+    return value;
+  }
+
   /** 解析缺失策略；取值非法时回落到最安全的 {@link MissingPolicy#HIDE}。 */
   private static MissingPolicy missingPolicy(String value) {
     if (value == null) {
@@ -1070,30 +1158,47 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 配置项被安全下限抬升时的<b>一次性</b>中文 WARN（进程级闸门 {@code once} 保证只提示一次）。
+   * 配置项被安全下限抬升或被安全上限回落时的<b>一次性</b>中文 WARN（进程级闸门 {@code once} 只提示一次）。
    *
    * <p><b>为什么必须提示</b>：生效值与管理员的 yml 不一致，若不说明，管理员会以为「配的还是我写的值」，
-   * 或反过来怀疑插件读错配置。这里给出被抬升的键、原因与正确出口（两个下限指向的功能失效模式见
-   * {@link #FRUSTUM_FOV_FLOOR} 与 {@link #DISK_CACHE_EXPIRE_FLOOR_SECONDS}）。
+   * 或反过来怀疑插件读错配置。这里分两条分别给出被抬升 / 被回落的键与原因（下限指向「玩家看得见假方块」，
+   * 上限指向「扫描量 O(r²) 拖垮主线程 / 缓存把内存打满」）。
    *
    * @param once 进程级一次性闸门（同一实例重复 reload 不会重复刷屏）
    */
-  public void warnIfConfigFloorApplied(Logger logger, AtomicBoolean once) {
-    if (floorAdjustments.isEmpty() || logger == null || !once.compareAndSet(false, true)) {
+  public void warnIfConfigAdjusted(Logger logger, AtomicBoolean once) {
+    if (logger == null || (floorAdjustments.isEmpty() && ceilingAdjustments.isEmpty())) {
       return;
     }
-    logger.warning("antixray.yml 的 " + String.join("、", floorAdjustments) + " 低于安全下限，已按下限生效"
-        + "（当前：proximity.frustum.fov=" + proximity.frustumFov() + "°、min-distance="
-        + proximity.frustumMinDistance() + " 格、disk-cache.expire-seconds="
-        + diskCache.expireSeconds() + " 秒）。低于下限的取值会让对应功能静默失效："
-        + "视锥配窄 → 玩家看得见的方块保持伪装（要点一下才变回来）；"
-        + "磁盘缓存过期时间配短 → 条目活不过一次重启，命中率恒为 0。"
-        + "限制磁盘占用请调 disk-cache.max-entries / max-file-size-mb，而不是缩短过期时间。");
+    if (!once.compareAndSet(false, true)) {
+      return;
+    }
+    if (!floorAdjustments.isEmpty()) {
+      logger.warning("antixray.yml 的 " + String.join("、", floorAdjustments) + " 低于安全下限，已按下限生效"
+          + "（当前：proximity.frustum.fov=" + proximity.frustumFov() + "°、min-distance="
+          + proximity.frustumMinDistance() + " 格、disk-cache.expire-seconds="
+          + diskCache.expireSeconds() + " 秒）。低于下限的取值会让对应功能静默失效："
+          + "视锥配窄 → 玩家看得见的方块保持伪装（要点一下才变回来）；"
+          + "磁盘缓存过期时间配短 → 条目活不过一次重启，命中率恒为 0。"
+          + "限制磁盘占用请调 disk-cache.max-entries / max-file-size-mb，而不是缩短过期时间。");
+    }
+    if (!ceilingAdjustments.isEmpty()) {
+      logger.warning("antixray.yml 的 " + String.join("、", ceilingAdjustments) + " 超过安全上限，已按上限生效"
+          + "（当前：proximity.distance=" + proximity.distance() + " 格、neighbors.cache-maximum-size="
+          + neighbors.cacheMaximumSize() + "、cache.maximum-size=" + cacheMaximumSize + "）。"
+          + "上限用于防止手滑多打一位数的失控配置：邻近显形距离的扫描量随半径平方增长（O(r²)）会拖住主线程，"
+          + "缓存条目上限则直接换算成内存占用。");
+    }
   }
 
   /** 被安全下限抬升过的配置键明细（空列表 = 未抬升）；供诊断回显。 */
   public List<String> floorAdjustments() {
     return floorAdjustments;
+  }
+
+  /** 被安全上限回落过的配置键明细（空列表 = 未回落）；供诊断回显。 */
+  public List<String> ceilingAdjustments() {
+    return ceilingAdjustments;
   }
 
   /** 逐世界覆盖段（声明序）；空列表 = 无覆盖。 */

@@ -209,6 +209,27 @@ class InstantRevealTest {
     assertEquals(0, budget.remaining(), "并发扣减不得丢失更新（这正是普通 int 字段的缺陷）");
   }
 
+  /**
+   * 显形额度「预扣 + 归还」对称：批量显形在 {@code sendOne} 里先预扣额度封住单周期上限，
+   * 若该批最终未能发出（退化路径发包失败），由 {@code flushBatch} 逐坐标 {@link ProximityRevealer.Budget#refund()}
+   * 归还，避免发包失败无谓吃掉本周期预算（见 P3 打磨项）。
+   *
+   * <p>注：{@code flushBatch} 的集成路径需要 Bukkit {@code Player}/{@code World}，离线无法构造，
+   * 故此处只钉死它依赖的额度归还语义；实际发包失败分支由真机日志验证。
+   */
+  @Test
+  void budgetRefundRestoresReservedButUnsentQuota() {
+    ProximityRevealer.Budget budget = new ProximityRevealer.Budget(2);
+    assertEquals(2, budget.remaining(), "初始额度");
+    budget.decrement();
+    budget.decrement();
+    assertEquals(0, budget.remaining(), "两次预扣后额度耗尽（本周期上限生效）");
+    budget.refund();
+    assertEquals(1, budget.remaining(), "未发出的坐标必须归还一个额度");
+    budget.refund();
+    assertEquals(2, budget.remaining(), "全部归还后恢复初始额度");
+  }
+
   /** max-per-tick = 0（配置关闭事件显形）时 remaining 恒为 0，调用方直接放弃。 */
   @Test
   void zeroMaxPerTickDisablesQuota() {

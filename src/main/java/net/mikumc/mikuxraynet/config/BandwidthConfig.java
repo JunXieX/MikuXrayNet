@@ -208,8 +208,8 @@ public final class BandwidthConfig {
         new EntityCulling(
             root.getBoolean("entity-culling.enabled", true),
             root.getBoolean("entity-culling.raycast", true),
-            clampUpper(Math.max(0.0D, root.getDouble("entity-culling.force-visible-distance", 32.0D)),
-                MAX_FORCE_VISIBLE_DISTANCE, "entity-culling.force-visible-distance", clampAdjustments),
+            clampUpper(root.getDouble("entity-culling.force-visible-distance", 32.0D),
+                32.0D, MAX_FORCE_VISIBLE_DISTANCE, "entity-culling.force-visible-distance", clampAdjustments),
             clampUpper(Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),
                 MAX_UPDATE_INTERVAL_TICKS, "entity-culling.update-interval-ticks", clampAdjustments),
             // 语义已变：原生射线改造后本键表示「每个实体最多尝试的候选顶点数」（不再表示采样数）。
@@ -223,8 +223,8 @@ public final class BandwidthConfig {
             root.getBoolean("afk.enabled", true),
             clampUpper(Math.max(1, root.getInt("afk.seconds", 300)),
                 MAX_AFK_SECONDS, "afk.seconds", clampAdjustments),
-            clampUpper(Math.max(0.0D, root.getDouble("afk.distance", 16.0D)),
-                MAX_AFK_DISTANCE, "afk.distance", clampAdjustments),
+            clampUpper(root.getDouble("afk.distance", 16.0D),
+                16.0D, MAX_AFK_DISTANCE, "afk.distance", clampAdjustments),
             root.getBoolean("afk.drop-particles", true),
             root.getBoolean("afk.drop-block-break-animation", true)),
         new Latency(
@@ -254,27 +254,41 @@ public final class BandwidthConfig {
     return max;
   }
 
-  /** 浮点上限钳制：NaN 不满足 {@code > max}，会原样返回（与改动前一致，由使用侧兜底）。 */
-  private static double clampUpper(double value, double max, String key, List<String> adjustments) {
-    if (!(value > max)) {
-      return value;
+  /**
+   * 浮点上限钳制：非有限值（NaN / ±Inf）显式回落默认值，其余先按 0 兜底再取上限。
+   *
+   * <p><b>为什么要拦非有限值</b>：NaN 不满足 {@code > max}，会原样穿过钳制进入配置指纹，
+   * 使同一份「其实无效」的配置算出与众不同的指纹 —— 结果是<b>任何</b>进程算出的指纹都与它不等，
+   * 磁盘缓存整体失效（缓存重启后命中率恒为 0）；而 {@code -Inf} 也会被 {@code Math.max} 悄悄抬成 0，
+   * 让「配错了」看起来像「配成了 0」。两类都改为回落默认并记入明细，由加载路径一次性 WARN。
+   */
+  private static double clampUpper(double value, double defaultValue, double max, String key,
+      List<String> adjustments) {
+    if (!Double.isFinite(value)) {
+      adjustments.add(key + "=" + value + "（非有限值，回落默认 " + defaultValue + "）");
+      return defaultValue;
     }
-    adjustments.add(key + "=" + value + "（上限 " + max + "）");
-    return max;
+    double floored = Math.max(0.0D, value);
+    if (floored > max) {
+      adjustments.add(key + "=" + value + "（上限 " + max + "）");
+      return max;
+    }
+    return floored;
   }
 
   /**
-   * 被安全上限钳制时的一次性中文 WARN。
+   * 被安全上限钳制或非有限值回落默认时的一次性中文 WARN。
    *
    * <p>钳制不改变默认行为（默认值都在区间内），只在管理员写了失控值时触发；用进程级一次性闸门避免
-   * 反复 reload 重复刷屏。
+   * 反复 reload 重复刷屏。两条明细都写清了「原值 → 生效值」与原因。
    */
   public void warnIfClampApplied(Logger logger, AtomicBoolean once) {
     if (clampAdjustments.isEmpty() || logger == null || !once.compareAndSet(false, true)) {
       return;
     }
     logger.warning("bandwidth.yml 的 " + String.join("、", clampAdjustments)
-        + " 超过安全上限，已按上限生效（防止失控配置把内存/带宽打满；默认值均在上限内）。");
+        + " 超出安全范围，已按安全值生效（超上限取上限、非有限值回落默认；默认值均在范围内）。"
+        + "这是为了防止失控配置把内存/带宽打满，也避免无效值污染配置指纹导致磁盘缓存整体失效。");
   }
 
   /** 被安全上限钳制过的配置键明细（空列表 = 未钳制）；供诊断回显。 */

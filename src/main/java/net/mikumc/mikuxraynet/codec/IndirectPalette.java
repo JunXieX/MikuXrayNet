@@ -1,7 +1,6 @@
 
 package net.mikumc.mikuxraynet.codec;
 
-import java.util.Arrays;
 import io.netty.buffer.ByteBuf;
 
 /**
@@ -12,6 +11,11 @@ import io.netty.buffer.ByteBuf;
  * 直接调色板（位宽取注册表上限），不再有「+1 位」的间接档位。
  * {@code byValue} 以方块状态 id 直接下标，故长度必须覆盖注册表全部方块状态
  * （由 {@link ChunkScratch} 按线程复用，避免每个 section 都新建这张 32 KB 级反查表）。
+ *
+ * <p><b>复用缓冲不做整表清零</b>：{@code byValue} 是 scratch 复用的大数组，构造时整表 memset 0xFF
+ * （注册表全部方块状态，≈2.6 万字节）就是每个 section 一次的无谓开销。改为「用反向表 {@code byId} 校验命中」：
+ * 仅当 {@code id < size} 且 {@code byId[id] == value} 时 {@code byValue[value]} 才视为有效，否则按残留处理
+ * （与旧实现的 0xFF 哨兵等价）；因此不清零也不会把上一轮登记的条目误判成本调色板已登记。纯查表校验、不新增常驻内存。
  */
 public class IndirectPalette implements Palette {
 
@@ -27,8 +31,8 @@ public class IndirectPalette implements Palette {
     this.bitsPerValue = bitsPerValue;
     this.chunkSection = chunkSection;
 
+    // byValue 由 scratch 复用、内容未初始化：不再整表 memset，命中与否交由 byId 反查校验（见类注释）
     this.byValue = chunkSection.scratch().bytes(chunkSection.registryAccessor().getUniqueBlockStateCount());
-    Arrays.fill(this.byValue, (byte) 0xFF);
     this.byId = new int[1 << bitsPerValue];
   }
 
@@ -48,7 +52,9 @@ public class IndirectPalette implements Palette {
   @Override
   public int idFor(int value) {
     int id = this.byValue[value] & 0xFF;
-    if (id == 0xFF) {
+    // byValue 复用、可能残留上一轮的登记：只有 id 落在已登记区间且反向表自洽才算命中（见类注释）
+    boolean registered = id != 0xFF && id < this.size && this.byId[id] == value;
+    if (!registered) {
       id = this.size++;
 
       if (id != 0xFF && id < this.byId.length) {
@@ -89,7 +95,9 @@ public class IndirectPalette implements Palette {
       // 若不在此拦截，后写入的 id 会覆盖 byValue 反查记录，使同一方块状态对应两个索引——后续
       // valueFor(idFor(v)) 可能返回另一个 id，导致本地索引与调色板不一致（静默改写语义）。按 fail-open
       // 约定在此早失败：异常由上层解码兜底，本 section 被拒绝、封包链路不受影响。
-      if ((this.byValue[value] & 0xFF) != 0xFF) {
+      // 判重同样靠 byId 反查校验（byValue 未清零，可能残留）：仅已在本次循环登记过的 id（< id）且反向自洽才算重复。
+      int existing = this.byValue[value] & 0xFF;
+      if (existing != 0xFF && existing < id && this.byId[existing] == value) {
         throw new IndexOutOfBoundsException(
             "duplicate palette value: " + value + " at id " + id);
       }
@@ -156,6 +164,11 @@ public class IndirectPalette implements Palette {
 
   @Override
   public boolean contains(int value) {
-    return value >= 0 && value < this.byValue.length && (this.byValue[value] & 0xFF) != 0xFF;
+    if (value < 0 || value >= this.byValue.length) {
+      return false;
+    }
+    // 与 idFor 同一套反查校验：byValue 可能残留上一轮的登记，必须由 byId 确认自洽
+    int id = this.byValue[value] & 0xFF;
+    return id != 0xFF && id < this.size && this.byId[id] == value;
   }
 }

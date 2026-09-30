@@ -48,16 +48,16 @@ public final class ProtocolLibHook {
    * 若当前 ProtocolLib / 服务端不支持这两个包类型而注册失败，则降级为仅拦截 {@code MAP_CHUNK}
    * （区块改写照常工作，只是失去批次闸门）。
    *
-   * @param obfuscatedChunkIndex 伪装区块索引；{@code null} 表示不做邻近显形
-   * @param revealedSet          已显形集合；{@code null} 表示不做邻近显形
+   * @param obfuscatedChunkIndex 伪装区块索引的<b>可变引用</b>；{@code get()} 返回 {@code null} 表示不做邻近显形
+   * @param revealedSet          已显形集合的<b>可变引用</b>；{@code get()} 返回 {@code null} 表示不做邻近显形
    * @param bypassRegistry 直通名单；{@code null} 表示无直通
    * @param diskCache 磁盘缓存；{@code null} 表示只用内存缓存
    * @param liveConfig 实时配置源（热重载后世界黑名单即时生效）；可为 null（回落启动期配置）
    * @return true 表示注册成功并已启动异步分发
    */
   public boolean register(AntiXrayConfig config, ObfuscationProcessor processor, MikuWorkPool workPool,
-      NeighborChunkProvider neighborProvider, ObfuscatedChunkIndex obfuscatedChunkIndex,
-      RevealedSet revealedSet, BypassRegistry bypassRegistry, DiskCacheStore diskCache,
+      NeighborChunkProvider neighborProvider, Supplier<ObfuscatedChunkIndex> obfuscatedChunkIndex,
+      Supplier<RevealedSet> revealedSet, BypassRegistry bypassRegistry, DiskCacheStore diskCache,
       Supplier<AntiXrayConfig> liveConfig) {
     // 启动期解析并缓存区块数据字段（字段直读，不依赖 ProtocolLib 自带的区块数据包装类）。
     // 打一行判定结果便于用户核对：任一 ✗ 都意味着该功能 fail-open（放行原包），一眼可定位环境问题。
@@ -84,7 +84,7 @@ public final class ProtocolLibHook {
   /** 单次注册尝试；成功返回 {@code null}，失败返回异常并回滚已注册的监听器。 */
   private Throwable tryRegister(AntiXrayConfig config, ObfuscationProcessor processor,
       MikuWorkPool workPool, NeighborChunkProvider neighborProvider,
-      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet,
+      Supplier<ObfuscatedChunkIndex> obfuscatedChunkIndex, Supplier<RevealedSet> revealedSet,
       BypassRegistry bypassRegistry, DiskCacheStore diskCache, Supplier<AntiXrayConfig> liveConfig,
       boolean handleChunkBatch) {
     try {

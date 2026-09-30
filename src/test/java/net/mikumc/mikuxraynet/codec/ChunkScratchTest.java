@@ -2,6 +2,7 @@ package net.mikumc.mikuxraynet.codec;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
@@ -131,6 +132,81 @@ class ChunkScratchTest {
       }
     } finally {
       pool.shutdownNow();
+    }
+  }
+
+  /**
+   * 输出缓冲「恰好写满」时 {@link Chunk#finalizeOutput()} 会零拷贝移交底层数组（不再整块复制 50KB 级负载）。
+   *
+   * <p>本轮打磨的关键不变量：移交给调用方的数组必须<b>独立于 scratch</b>——否则同线程处理下一个区块时
+   * 复用的输出数组会就地覆盖它（该字节会被磁盘 / 内存缓存 / NMS 字段长期持有）。这里在一个<b>全新线程</b>
+   * （scratch 池为空，首个区块的输出数组容量恰为输入长度 → 空白往返必然恰好写满）上先取走一个区块的
+   * 重编码结果，再在同一线程处理一个「长度相同、内容不同」的区块；若前者与复用的输出数组别名，其内容会被
+   * 后者覆盖，断言随即失败。
+   */
+  @Test
+  void exactFitHandoffIsIndependentOfScratch() throws Exception {
+    byte[] raw = new TestChunkBuilder(MODERN)
+        .singleValueSection(1, 4096, 0, 0, new int[] {7})
+        .build();
+    byte[] other = new TestChunkBuilder(MODERN)
+        .singleValueSection(2, 4096, 0, 0, new int[] {7})
+        .build();
+    assertEquals(raw.length, other.length, "构造前提：两区块长度相同、内容不同");
+
+    byte[][] results = new byte[2][];
+    Thread worker = new Thread(() -> {
+      ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+      try (Chunk chunk = codec.decode(raw, 1)) {
+        results[0] = chunk.finalizeOutput();
+      }
+      try (Chunk chunk = codec.decode(other, 1)) {
+        results[1] = chunk.finalizeOutput();
+      }
+    });
+    worker.start();
+    worker.join();
+
+    assertEquals(raw.length, results[0].length, "移交的数组长度必须精确等于输出长度");
+    assertArrayEquals(raw, results[0], "零拷贝移交的数组必须独立于 scratch：后续区块复用不得覆盖它");
+    assertArrayEquals(other, results[1]);
+  }
+
+  /**
+   * 间接调色板复用 scratch 的 {@code byValue} 数组时不得残留上一轮的登记：构造不再整表 memset 0xFF，
+   * 命中与否改由反向表 {@code byId} 校验（见 {@link IndirectPalette} 类注释）。
+   *
+   * <p>这里先让一个调色板登记 100/200，归还 scratch 后再借到<b>同一个</b>缓冲并新建调色板；
+   * 断言新调色板视 100/200 为未登记、并从 0 开始按新顺序重新分配——若残留（或含误导的哨兵），
+   * {@code contains(100)} 会误判为真、{@code idFor(100)} 会返回上一轮的旧索引。
+   */
+  @Test
+  void indirectPaletteIgnoresResidualLookupAfterBufferReuse() {
+    ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+
+    ChunkScratch scratch = ChunkScratch.acquire();
+    try {
+      IndirectPalette first = new IndirectPalette(4, new ChunkSection(codec, scratch));
+      assertEquals(0, first.idFor(100));
+      assertEquals(1, first.idFor(200));
+      assertTrue(first.contains(100), "前置：首次登记后必须命中");
+    } finally {
+      scratch.recycle();
+    }
+
+    // 游标复位后再借到同一个 scratch（进而借到同一个 byValue 数组），模拟跨区块复用
+    ChunkScratch reused = ChunkScratch.acquire();
+    try {
+      IndirectPalette second = new IndirectPalette(4, new ChunkSection(codec, reused));
+      assertFalse(second.contains(100), "上一轮的登记不得残留（否则新调色板会误判「已登记」）");
+      assertFalse(second.contains(200));
+      assertEquals(0, second.idFor(300), "新调色板从 0 开始分配，不受残留影响");
+      assertEquals(1, second.idFor(100), "先前出现过的值按新顺序重新登记");
+      assertEquals(1, second.idFor(100), "同一值重复查询必须稳定命中");
+      assertEquals(2, second.idFor(200));
+      assertTrue(second.contains(300));
+    } finally {
+      reused.recycle();
     }
   }
 }

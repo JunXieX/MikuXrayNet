@@ -27,7 +27,7 @@ public final class MikuConfig {
   private final Logger logger;
   /** 「缺 dimensions 段」WARN 的进程级一次性闸门（重复 reload 不重复刷屏）。 */
   private final AtomicBoolean dimensionsWarned = new AtomicBoolean();
-  /** 「配置项被安全下限抬升」WARN 的进程级一次性闸门。 */
+  /** 「配置项被安全下限抬升 / 安全上限回落」WARN 的进程级一次性闸门。 */
   private final AtomicBoolean floorWarned = new AtomicBoolean();
   /** 「反矿透配置解析失败已保留上一份/改用默认」WARN 的进程级一次性闸门。 */
   private final AtomicBoolean antiXrayFallbackWarned = new AtomicBoolean();
@@ -74,8 +74,9 @@ public final class MikuConfig {
     }
     // 缺 dimensions 段（旧版 worlds / 顶层 obfuscation 结构）时用内置默认运行并一次性提示
     loadedAntiXray.warnIfDimensionsMissing(logger, dimensionsWarned);
-    // 配置项低于安全下限（视锥两键、磁盘缓存过期时间）时按下限生效并一次性提示
-    loadedAntiXray.warnIfConfigFloorApplied(logger, floorWarned);
+    // 配置项低于安全下限（视锥两键、磁盘缓存过期时间）或高于安全上限（邻近距离、邻块/改写缓存容量）时
+    // 按下限/上限生效并一次性提示
+    loadedAntiXray.warnIfConfigAdjusted(logger, floorWarned);
     // tag(...) 展开失败的条目已按「忽略」处理（不猜成员），这里提示管理员改正
     if (!loadedAntiXray.unresolvedTags().isEmpty()) {
       logger.warning("配置里的 tag(...) 无法识别（不在内置 tag 映射表中），对应条目已忽略："

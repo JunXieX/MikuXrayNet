@@ -185,6 +185,9 @@ public final class Diagnostics {
         + "｜区块改写 " + s.rewrite().chunksRewritten() + "（异常 " + s.rewrite().chunksFailed()
         + "，超时放行 " + s.rewrite().chunksTimedOut() + "）"
         + "｜显形发送 " + s.proximity().revealsSent() + "，坐标跳过 " + s.proximity().revealsSkipped()
+        // 与状态面板/转储用同一口径：合并计的是「原包数」而非「合并结果的条数」
+        + "｜变更合并 " + s.throttle().blockMergeBatches()
+        + "（合并 " + s.throttle().blockChangesMerged() + " 个原包）"
         + "｜实体隐藏 " + s.throttle().entitiesHidden() + "/恢复 " + s.throttle().entitiesShown()
         + "（当前隐藏中 " + s.throttle().entitiesHiddenNow() + "）"
         + "｜磁盘缓存命中 " + s.diskCache().hits() + "，条目约 " + s.diskCache().entries()
@@ -378,10 +381,15 @@ public final class Diagnostics {
         + "，负载被拒 " + s.diskCache().payloadRejected()
         + "，写入被拒 " + (s.diskCache().rejectedByCapacity() + s.diskCache().rejectedBySize())
         + "，异常 " + s.diskCache().errors());
-    lines.add("带宽：零位移取消 " + s.throttle().entityPacketsCancelled() + "，合并批次 "
+    lines.add("带宽：零位移取消 " + s.throttle().entityPacketsCancelled()
+        + "（放行 " + s.throttle().entityPacketsPassed() + "），合并批次 "
         + s.throttle().blockMergeBatches()
-        + "（合并 " + s.throttle().blockChangesMerged() + " 条），实体隐藏 " + s.throttle().entitiesHidden()
-        + "/恢复 " + s.throttle().entitiesShown() + "（当前隐藏中 " + s.throttle().entitiesHiddenNow()
+        // 「个原包」而非「条」：blockChangesMerged 计的是被合并掉的<b>原始封包数</b>（add(held.size())），
+        // 与「合并后发出的包数」（= 合并批次）不是一回事，写「条」极易被读成合并结果的条数。
+        + "（合并 " + s.throttle().blockChangesMerged() + " 个原包，放行 "
+        + s.throttle().blockChangesPassed() + "）"
+        + "，实体隐藏 " + s.throttle().entitiesHidden() + "/恢复 " + s.throttle().entitiesShown()
+        + "（当前隐藏中 " + s.throttle().entitiesHiddenNow()
         + "；两者之差 = 死亡/卸载被服务端自然回收 + 仍在隐藏）");
     // 「复检」单列：累计隐藏混合了「入场即被遮挡」与「周期复检发现新遮挡」两条来源，
     // 只看总数无法判断「先可见、之后才被挡住」的实体是否真被收敛到隐藏（本次缺陷的观测口径）。
@@ -460,7 +468,7 @@ public final class Diagnostics {
         + "｜变更合并 " + c.blockChanges().enabled()
         + "｜调色板重排 " + paletteSwitch(c.palette())
         + "｜实体剔除 " + c.entityCulling().enabled()
-        + "｜AFK 降级 " + c.afk().enabled()
+        + "｜AFK 降级 " + afkSwitch(c.afk())
         + "｜高延迟降视距 " + c.latency().enabled();
   }
 
@@ -480,6 +488,30 @@ public final class Diagnostics {
       return "关闭（模块启用但 reorder=false，不做任何重排）";
     }
     return "启用（reorder=true）";
+  }
+
+  /**
+   * AFK 降级的开关回显。
+   *
+   * <p><b>为什么不直接打印 {@code afk.enabled()}</b>：AFK 模块有「总开关」与「丢弃类型」两层，
+   * 两个 drop-* 开关全为 false 时模块仍在跑（跟踪并统计 AFK 状态），但<b>不丢任何包</b>。
+   * 只打印总开关会出现「AFK 降级 true」这种容易被读成「丢包已生效」的输出，故按实际丢弃类型回显。
+   */
+  private static String afkSwitch(BandwidthConfig.Afk afk) {
+    if (!afk.enabled()) {
+      return "关闭（模块未启用）";
+    }
+    List<String> dropped = new ArrayList<>(2);
+    if (afk.dropParticles()) {
+      dropped.add("世界粒子");
+    }
+    if (afk.dropBlockBreakAnimation()) {
+      dropped.add("方块破坏动画");
+    }
+    if (dropped.isEmpty()) {
+      return "启用（仅统计 AFK 状态、不丢弃任何包：drop-particles 与 drop-block-break-animation 均为 false）";
+    }
+    return "启用（丢弃 " + String.join("、", dropped) + "）";
   }
 
   /** 转储文本格式化（纯函数）：状态面板 + 环境信息 + 配置项有效值。 */
@@ -571,6 +603,10 @@ public final class Diagnostics {
     if (!c.floorAdjustments().isEmpty()) {
       sb.append("配置安全下限已抬升：").append(String.join("、", c.floorAdjustments())).append('\n');
     }
+    // 配置项被安全上限回落时同样明示（邻近显形距离 / 邻块与改写缓存容量）
+    if (!c.ceilingAdjustments().isEmpty()) {
+      sb.append("配置安全上限已回落：").append(String.join("、", c.ceilingAdjustments())).append('\n');
+    }
     sb.append("disk-cache.enabled=").append(c.diskCache().enabled())
         .append("，max-entries=").append(c.diskCache().maxEntries())
         .append("，max-file-size-mb=").append(c.diskCache().maxFileSizeMb())
@@ -580,9 +616,17 @@ public final class Diagnostics {
         .append("，maintenance-interval-seconds=").append(c.diskCache().maintenanceIntervalSeconds())
         .append("，compact-per-pass=").append(c.diskCache().compactPerPass())
         .append("，queue-capacity=").append(c.diskCache().queueCapacity()).append('\n');
+    // zstd 前置（含新键 zstd-sha256）：回显是否已配置校验，而非打印完整哈希——
+    // 哈希本身不是密钥，但整串打进 dump 只是噪声，管理员只需知道「有没有开校验」。
+    sb.append("disk-cache.zstd.auto-download=").append(c.diskCache().zstdAutoDownload())
+        .append("，download-url=").append(c.diskCache().zstdDownloadUrl())
+        .append("，timeout-seconds=").append(c.diskCache().zstdTimeoutSeconds())
+        .append("，zstd-sha256=").append(c.diskCache().zstdSha256().isEmpty() ? "未配置（不校验）" : "已配置")
+        .append('\n');
     sb.append("cache.maximum-size=").append(c.cacheMaximumSize())
         .append("，expire-after-access-seconds=").append(c.cacheExpireAfterAccessSeconds()).append('\n');
-    sb.append("advanced.threads=").append(c.threads())
+    sb.append("advanced.platform=").append(c.platform())
+        .append("，threads=").append(c.threads())
         .append("，timeout-millis=").append(c.timeoutMillis())
         .append("，queue-capacity=").append(c.queueCapacity()).append('\n');
     sb.append("config-hash=").append(c.configHash()).append('\n');

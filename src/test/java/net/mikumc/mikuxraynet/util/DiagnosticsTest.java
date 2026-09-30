@@ -124,6 +124,30 @@ class DiagnosticsTest {
   }
 
   @Test
+  void dumpEchoesPlatformZstdAndCeilingAdjustments() {
+    // 平台判定与 zstd 前置（含 zstd-sha256）此前未回显，dump 与实现漂移；这里锁住它们必须出现。
+    String plain = Diagnostics.formatDump(
+        withAntiXray(antiXray("enabled: true\n")), "20260925-000000");
+    assertTrue(plain.contains("advanced.platform="), "dump 必须回显 advanced.platform：" + plain);
+    assertTrue(plain.contains("disk-cache.zstd.auto-download="), "dump 必须回显 zstd 前置键：" + plain);
+    assertTrue(plain.contains("zstd-sha256=未配置（不校验）"),
+        "zstd-sha256 只回显「已配置/未配置」，不打印完整哈希：" + plain);
+
+    // 安全上限回落同样要显式回显（邻近显形距离 / 缓存容量）
+    String capped = Diagnostics.formatDump(withAntiXray(antiXray("""
+        proximity:
+          distance: 4096.0
+        cache:
+          maximum-size: 409600
+        """)), "20260925-000000");
+    assertTrue(capped.contains("配置安全上限已回落：proximity.distance=4096.0"),
+        "dump 必须回显被回落的安全上限键：" + capped);
+    assertTrue(capped.contains("cache.maximum-size=409600"), capped);
+    assertTrue(capped.contains("distance=256.0"),
+        "dump 的有效值必须是被回落后的上限（256 格）：" + capped);
+  }
+
+  @Test
   void statusContainsAllKeyFields() {
     List<String> lines = Diagnostics.formatStatus(fixed());
     String text = String.join("\n", lines);

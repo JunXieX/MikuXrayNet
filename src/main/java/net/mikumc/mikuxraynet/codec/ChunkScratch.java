@@ -124,6 +124,15 @@ final class ChunkScratch {
   }
 
   /**
+   * 放弃对当前输出数组的引用（{@link Chunk#finalizeOutput()} 零拷贝移交时调用）：把 {@link #outputArray}
+   * 清空，使下一次 {@link #outputArray(int)} / {@link #growOutput(int)} 另分配新数组，
+   * <b>绝不把已交给调用方独占的数组再借给后续区块复用</b>（否则下一个区块会覆盖正在被缓存/落盘的字节）。
+   */
+  void detachOutput() {
+    this.outputArray = null;
+  }
+
+  /**
    * 记录一次写出实际用到的输出容量（只增不减）。
    *
    * <p>正常路径下写出直接用本 scratch 的数组；若底层缓冲区自行扩容（复用的数组偏小），

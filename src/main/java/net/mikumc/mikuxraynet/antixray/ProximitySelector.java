@@ -229,7 +229,8 @@ public final class ProximitySelector {
   /**
    * 方块是否对玩家可见：<b>多候选点、任一通畅即可见</b>。
    *
-   * <p>候选点只取在暴露面上（顺序见类注释），最多 {@code maxPoints} 个（钳制 1..候选点数）；命中即返回。
+   * <p>候选点只取在暴露面上（顺序见类注释），最多 {@code maxPoints} 个（钳制 1..{@link #MAX_SAMPLE_POINTS}，
+   * 即有效上限 5；配置给得再大也会被候选点数截断）。命中即返回。
    * 六面全被遮挡（完全掩埋）时直接判不可见——这是「不得隔着墙还原」的红线，
    * 因为掩埋方块从任何方向都不可能被看到。
    *
@@ -237,7 +238,8 @@ public final class ProximitySelector {
    * 「不通畅」保守处理：无法判定就不显形，绝不隔着墙还原。
    *
    * @param query     遮挡查询；为 {@code null} 时视为可见（fail-open）
-   * @param maxPoints 每方块最多尝试的候选点数（由配置 {@code proximity.raycast.samples} 提供，已钳制 1..8）
+   * @param maxPoints 每方块最多尝试的候选点数（由配置 {@code proximity.raycast.samples} 提供）；
+   *                  <b>有效上限为 {@link #MAX_SAMPLE_POINTS}=5</b>，超出部分会被候选点数截断
    * @param probe     射线探针；为 {@code null} 时视为可见（fail-open）
    *
    * <p>测试专用豁免：生产路径一律调 8 参重载（多传 {@code fluidCover}），本重载当前仅单测在用，

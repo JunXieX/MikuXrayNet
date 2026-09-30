@@ -9,7 +9,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -755,8 +754,9 @@ final class RegionFile implements AutoCloseable {
    * @return 可安全移除的桶下标；{@code -1} 表示当前没有可安全驱逐的桶
    */
   private int selectEvictableVictim(int pinned) {
-    // 遍历期间不修改 loaded（flushBucket/writePosTable 都不触碰它），这里用快照更清晰
-    for (Integer candidate : new ArrayList<>(loaded.keySet())) {
+    // 直接遍历 loaded：循环体只调 flushBucket/writePosTable（都不触碰 loaded），不会结构化修改，
+    // 因此无需先复制 keySet 快照（那会在每次驱逐时多分配一个列表）
+    for (Integer candidate : loaded.keySet()) {
       if (candidate == pinned) {
         continue;
       }

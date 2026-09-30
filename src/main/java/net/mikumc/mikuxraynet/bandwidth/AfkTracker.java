@@ -92,7 +92,28 @@ public final class AfkTracker implements Listener {
       this.packetFilter = new AfkPacketFilter(this, plugin, types.toArray(new PacketType[0]));
       protocolManager.addPacketListener(packetFilter);
     }
-    plugin.getLogger().info("带宽模块已启用：AFK 降级（" + config.seconds() + " 秒，距离 " + config.distance() + " 格）");
+    // 回显「实际会丢弃哪些包」而非只报「AFK 降级已启用」：drop-particles / drop-block-break-animation
+    // 全为 false 时本模块只统计 AFK 状态、不丢任何包，若仍写「已启用」会让管理员以为降级在生效。
+    plugin.getLogger().info("带宽模块已启用：AFK 降级（" + config.seconds() + " 秒，距离 "
+        + config.distance() + " 格；" + droppedTypesText(types) + "）");
+  }
+
+  /** AFK 实际丢弃的包类型中文描述；无可丢类型时明确写「仅计时不丢包」。 */
+  static String droppedTypesText(List<PacketType> types) {
+    if (types.isEmpty()) {
+      return "仅统计 AFK 状态、不丢弃任何包（drop-particles 与 drop-block-break-animation 均为 false）";
+    }
+    List<String> names = new ArrayList<>(types.size());
+    for (PacketType type : types) {
+      if (type == PacketType.Play.Server.WORLD_PARTICLES) {
+        names.add("世界粒子");
+      } else if (type == PacketType.Play.Server.BLOCK_BREAK_ANIMATION) {
+        names.add("方块破坏动画");
+      } else {
+        names.add(type.name());
+      }
+    }
+    return "丢弃类型：" + String.join("、", names);
   }
 
   /** 注销监听，清空状态。 */

@@ -61,10 +61,11 @@ import org.bukkit.util.Vector;
  *       因为「看得见却是假的方块」是本功能最严重的失效模式（真机反馈：点击/挖掘才变回来）。
  *       水平方向按 16:9 宽高比换算（110° → 水平半角约 68°），与客户端观感一致；</li>
  *   <li><b>可见性判定</b>（默认开启，多候选点 + Paper 原生射线）：先识别方块的暴露面，只在暴露面上取
- *       候选点（正对玩家的面中心 → 包围盒最近点 → 面四角），每个候选点用
- *       {@code World#rayTraceBlocks} 做原生射线检测，任一条通畅即显形；候选点数由
- *       {@code proximity.raycast.samples} 限制（已钳制 1..8）；六面全被遮挡（完全掩埋）时一个点都不采
- *       → 直接判不可见，绝不隔着墙还原。</li>
+   *       候选点（正对玩家的面中心 → 包围盒最近点 → 面四角），每个候选点用
+   *       {@code World#rayTraceBlocks} 做原生射线检测，任一条通畅即显形；候选点数由
+   *       {@code proximity.raycast.samples} 限制（<b>有效上限 5</b>，即
+   *       {@code ProximitySelector.MAX_SAMPLE_POINTS}，配置给得再大也会被截断）；六面全被遮挡（完全掩埋）时一个点都不采
+   *       → 直接判不可见，绝不隔着墙还原。</li>
  *   <li><b>流体覆盖</b>（默认开启，{@code occlusion.fluid-cover}）：目标方块上方紧邻方块是流体
  *       （水/岩浆）时不显形——刷在岩浆里的下界残骸本就被伪装，显形侧若还原就等于把它亮给玩家。</li>
  * </ul>
@@ -152,6 +153,11 @@ public final class ProximityRevealer implements Listener {
     /** 扣减一个额度（跨线程安全的原子扣减，不会丢失更新）。 */
     void decrement() {
       remaining.decrementAndGet();
+    }
+
+    /** 归还一个额度（批量显形里「预扣但最终未发出」的坐标；跨线程安全，与 {@link #decrement()} 对称）。 */
+    void refund() {
+      remaining.incrementAndGet();
     }
   }
 
@@ -557,7 +563,7 @@ public final class ProximityRevealer implements Listener {
         sendOne(player, world, position.x(), position.y(), position.z(), eye, budget, tally, batch);
         evaluationsLeft--;
       }
-      flushBatch(player, batch, tally);
+      flushBatch(player, batch, tally, budget);
       logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
       return;
     }
@@ -574,7 +580,7 @@ public final class ProximityRevealer implements Listener {
           plan.coordinates[i * 3 + 2], eye, budget, tally, batch);
       evaluationsLeft--;
     }
-    flushBatch(player, batch, tally);
+    flushBatch(player, batch, tally, budget);
     logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
   }
 
@@ -617,7 +623,8 @@ public final class ProximityRevealer implements Listener {
     }
 
     if (batch != null) {
-      // 批量模式：先累积，周期末由 flushBatch 一次发出并在成功后才写入「已显形」标记
+      // 批量模式：先累积，周期末由 flushBatch 一次发出并在成功后才写入「已显形」标记。
+      // 这里先预扣额度以封住单周期上限；若最终未能发出，由 flushBatch 归还（见其「额度归还」说明）。
       batch.add(x, y, z, data);
       budget.decrement();
       return;
@@ -640,8 +647,12 @@ public final class ProximityRevealer implements Listener {
    * <p>只有一个坐标时直接用 {@code sendBlockChange}（单包更小，也与旧行为一致）。
    * 批量调用整体失败时退化为逐坐标 {@code sendBlockChange}（同一条原生通道），单个坐标失败只计数并
    * 跳过；标记与统计只在「确实发出」后写入，因此发包失败不影响其它坐标、也不污染已显形索引。
+   *
+   * <p><b>额度归还</b>：批次坐标是在 {@link #sendOne} 里「先预扣额度再累积」的（用于封住单周期上限），
+   * 所以这里对<b>未能发出</b>的坐标（退化路径里 {@code sendBlockChange} 失败）逐个 {@link Budget#refund()}
+   * 归还额度；成功发出的不归还，维持「每周期上限」语义。
    */
-  private void flushBatch(Player player, RevealBatch batch, PassTally tally) {
+  private void flushBatch(Player player, RevealBatch batch, PassTally tally, Budget budget) {
     if (batch == null || batch.size() == 0) {
       return;
     }
@@ -667,6 +678,8 @@ public final class ProximityRevealer implements Listener {
       if (!batched
           && !sendSingle(player, world, position[0], position[1], position[2], batch.states.get(i))) {
         stats.revealsSkipped.increment();
+        // 未发出：归还先前在 sendOne 里预扣的额度（本周期上限只应计入真正发出的显形）
+        budget.refund();
         continue;
       }
       markRevealed(player, world, position[0], position[1], position[2]);
@@ -728,7 +741,7 @@ public final class ProximityRevealer implements Listener {
    */
   private boolean isVisible(World world, ProximitySelector.Eye eye, int x, int y, int z) {
     try {
-      // 候选点数（由 proximity.raycast.samples 提供，配置解析时已钳制 1..8）
+      // 候选点数（由 proximity.raycast.samples 提供；有效上限 5，即 ProximitySelector.MAX_SAMPLE_POINTS）
       int maxPoints = proximity.raycastSamples();
       // 射线起点必须是带世界的 Location：rayTraceBlocks 依赖它定位起始体素
       Location eyeLocation = new Location(world, eye.x(), eye.y(), eye.z());
@@ -935,7 +948,7 @@ public final class ProximityRevealer implements Listener {
         }
         sendOne(player, world, x, y, z, eye, budget, tally, batch);
       }
-      flushBatch(player, batch, tally);
+      flushBatch(player, batch, tally, budget);
       instantQuota.setRemaining(playerId, tick, Math.max(0, budget.remaining()));
     } catch (Throwable throwable) {
       logThrottled(throwable);

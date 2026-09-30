@@ -6,6 +6,8 @@
 #        所有子模块均为「失败即放行」：任何异常都不会丢包、不会卡住玩家。
 #
 #  本文件不会被插件回写；修改后执行 /mikuxraynet reload 生效。
+#  例外：palette 段的 reorder / width-budget / strict-verify 在启动期固化为编码链路设置，
+#        reload 不会重建编码器，改动这三项需重启服务端才生效（see palette 段注释）。
 # ===========================================================================
 
 # 带宽优化总开关。关闭时以下所有子模块都不生效。
@@ -56,6 +58,8 @@ block-changes:
 
 palette:
   # 模块总开关。false = 本模块完全关闭（零开销）。
+  # ⚠ 本节（enabled / reorder / width-budget / strict-verify）在启动期固化为编码链路设置，
+  #   修改后需重启服务端才生效；/mikuxraynet reload 不会重建编码器。
   enabled: true
 
   # 重排调色板：把高频方块排到低索引，期望提升压缩率。

@@ -395,6 +395,26 @@ class EntityCullerTest {
     assertEquals(0L, stats.recheckHidden.sum());
   }
 
+  /**
+   * 有效采样上限与常量一致：包围盒「朝向玩家一侧」的可见顶点数为 7，正对应
+   * {@code entity-culling.ray-samples} 的上限 {@link BandwidthConfig#MAX_RAY_SAMPLES}=7
+   * （旧注释曾写「钳制 1..8」，籍此钉死两者的对应关系，见 P3 打磨项）。
+   */
+  @Test
+  void visibleVerticesCountMatchesRaySampleCap() {
+    assertEquals(7, BandwidthConfig.MAX_RAY_SAMPLES, "上限常量本身即 7");
+
+    double[][] vertices = EntityCuller.visibleVertices(0.5D, 64.5D, 0.5D,
+        10.0D, 64.0D, 10.0D, 11.0D, 66.0D, 11.0D);
+    assertEquals(BandwidthConfig.MAX_RAY_SAMPLES, vertices.length,
+        "普通包围盒的可见顶点数应恰为上限 7（与 ray-samples 的有效钳制一致）");
+
+    // 极小包围盒退化为 1 个中心点，同样不得超过上限
+    double[][] tiny = EntityCuller.visibleVertices(0.5D, 64.5D, 0.5D,
+        10.0D, 64.0D, 10.0D, 10.05D, 64.05D, 10.05D);
+    assertTrue(tiny.length <= BandwidthConfig.MAX_RAY_SAMPLES, "小包围盒的顶点数不得超过上限");
+  }
+
   private static Set<Integer> idsOf(List<Entity> entities) {
     Set<Integer> ids = new HashSet<>();
     for (Entity entity : entities) {

@@ -53,6 +53,9 @@ public final class ThrottlePipeline {
         master && config.entityPackets().enabled() && config.entityPackets().skipZeroMovement(),
         master && config.blockChanges().enabled() && config.blockChanges().merge(),
         master && config.entityCulling().enabled() && config.entityCulling().raycast(),
+        // AFK 模块只看总开关：即使两个 drop-* 行为开关全为 false，它仍会注册以跟踪并统计 AFK 状态
+        // （「仅计时不丢包」），因此不能在 plan 里直接判为「未启用」。实际会丢弃哪些包由
+        // AfkTracker 的启动日志与 /mxnet status 的「AFK 降级」回显明确写出，避免被误读成「丢包已生效」。
         master && config.afk().enabled(),
         master && config.latency().enabled());
   }

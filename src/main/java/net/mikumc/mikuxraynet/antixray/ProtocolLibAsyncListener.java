@@ -143,8 +143,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final NeighborChunkProvider neighborProvider;
   private final boolean neighborsEnabled;
   private final boolean handleChunkBatch;
-  private final ObfuscatedChunkIndex obfuscatedChunkIndex;
-  private final RevealedSet revealedSet;
+  /**
+   * 伪装区块索引的<b>可变引用</b>（每次读取现取，而非构造期钉死实例）。
+   *
+   * <p><b>为什么用引用而非实例</b>：本监听器不随热重载重建，而邻近显形可在 reload 时被关闭——
+   * 关闭时调用方（{@code AntiXrayRuntime}）把该引用置为 {@code null}。若这里存的是构造期实例，
+   * 关闭后改写链路仍会继续往旧索引里 recordChunk：索引仍在增长（违背「关闭即零开销」），
+   * 而面板读的是已置空的运行时字段（显示 0），两边不一致。取可变引用后，关闭即为真正的零开销且与面板一致。
+   */
+  private final Supplier<ObfuscatedChunkIndex> obfuscatedChunkIndex;
+  /** 已显形集合的可变引用；语义同 {@link #obfuscatedChunkIndex}。 */
+  private final Supplier<RevealedSet> revealedSet;
   private final BypassRegistry bypassRegistry;
   private final DiskCacheStore diskCache;
   private final RewriteStats stats = new RewriteStats();
@@ -172,8 +181,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * @param liveConfig       实时配置源（读取「当前」配置，保证热重载后世界黑名单即时生效）；可为 null（回落 config）
    * @param neighborProvider 邻区块贴边快照提供者；仅在 {@code neighbors.enabled} 时被使用
    * @param handleChunkBatch 是否拦截 1.20.2+ 的区块批量包（不可用时由装配方降级为 false）
-   * @param obfuscatedChunkIndex 伪装区块索引；{@code null} 表示不做邻近显形
-   * @param revealedSet      已显形集合；{@code null} 表示不做邻近显形
+   * @param obfuscatedChunkIndex 伪装区块索引的<b>可变引用</b>；{@code get()} 返回 {@code null} 表示不做邻近显形
+   * @param revealedSet      已显形集合的<b>可变引用</b>；{@code get()} 返回 {@code null} 表示不做邻近显形
    * @param bypassRegistry   直通名单；{@code null} 表示退化为无直通（仍按世界范围判定）
    * @param diskCache        磁盘缓存；{@code null} 表示只用内存缓存
    */
@@ -181,8 +190,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       Supplier<AntiXrayConfig> liveConfig, ObfuscationProcessor processor,
       MikuWorkPool workPool, AsynchronousManager asynchronousManager,
       NeighborChunkProvider neighborProvider, boolean handleChunkBatch,
-      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, BypassRegistry bypassRegistry,
-      DiskCacheStore diskCache) {
+      Supplier<ObfuscatedChunkIndex> obfuscatedChunkIndex, Supplier<RevealedSet> revealedSet,
+      BypassRegistry bypassRegistry, DiskCacheStore diskCache) {
     super(plugin, ListenerPriority.NORMAL, packetTypes(handleChunkBatch));
     this.config = config;
     this.liveConfig = liveConfig;
@@ -616,16 +625,31 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       logThrottled("区块改写结果未能写回封包（写回后回读不一致），本轮按原包内容放行", null);
     }
 
-    // 记录「这个区块被伪装过的坐标」（按区块共享，只存一份；纯内存写入，可在工作线程执行）
-    if (obfuscatedChunkIndex != null) {
-      obfuscatedChunkIndex.recordChunk(task.worldName(), task.chunkX(), task.chunkZ(),
+    // 记录「这个区块被伪装过的坐标」（按区块共享，只存一份；纯内存写入，可在工作线程执行）。
+    // 索引走可变引用：热重载关闭 proximity 后引用被置空，这里直接跳过，不再登记（真正零开销且与面板一致）。
+    ObfuscatedChunkIndex index = index();
+    if (index != null) {
+      index.recordChunk(task.worldName(), task.chunkX(), task.chunkZ(),
           task.minHeight(), positions);
-      if (revealedSet != null) {
+      RevealedSet revealed = revealed();
+      if (revealed != null) {
         // 区块被重新下发 → 客户端又拿回了伪装结果，该区块的已显形标记必须作废（与旧行为一致：
         // 重新记录后这些坐标会再次被显形）
-        revealedSet.clearChunk(new ChunkKey(task.worldName(), task.chunkX(), task.chunkZ()));
+        revealed.clearChunk(new ChunkKey(task.worldName(), task.chunkX(), task.chunkZ()));
       }
     }
+  }
+
+  /** 取「当前」的伪装区块索引（可变引用）；未启用或已被热重载关闭时返回 {@code null}。 */
+  private ObfuscatedChunkIndex index() {
+    Supplier<ObfuscatedChunkIndex> supplier = obfuscatedChunkIndex;
+    return supplier == null ? null : supplier.get();
+  }
+
+  /** 取「当前」的已显形集合（可变引用）；未启用或已被热重载关闭时返回 {@code null}。 */
+  private RevealedSet revealed() {
+    Supplier<RevealedSet> supplier = revealedSet;
+    return supplier == null ? null : supplier.get();
   }
 
   /**
@@ -665,11 +689,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     if (neighborProvider != null) {
       neighborProvider.invalidateAll();
     }
-    if (obfuscatedChunkIndex != null) {
-      obfuscatedChunkIndex.clear();
+    ObfuscatedChunkIndex index = index();
+    if (index != null) {
+      index.clear();
     }
-    if (revealedSet != null) {
-      revealedSet.clear();
+    RevealedSet revealed = revealed();
+    if (revealed != null) {
+      revealed.clear();
     }
   }
 
@@ -694,11 +720,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     if (neighborProvider != null) {
       neighborProvider.invalidateWorld(worldName);
     }
-    if (obfuscatedChunkIndex != null) {
-      obfuscatedChunkIndex.invalidateWorld(worldName);
+    ObfuscatedChunkIndex index = index();
+    if (index != null) {
+      index.invalidateWorld(worldName);
     }
-    if (revealedSet != null) {
-      revealedSet.clearWorld(worldName);
+    RevealedSet revealed = revealed();
+    if (revealed != null) {
+      revealed.clearWorld(worldName);
     }
   }
 

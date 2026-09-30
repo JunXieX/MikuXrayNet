@@ -14,7 +14,9 @@ public final class ThrottleStats {
   public final LongAdder entityPacketsCancelled = new LongAdder();
   public final LongAdder entityPacketsPassed = new LongAdder();
 
-  /** 方块变更：合并批次 / 被合并进合并包的原包数 / 原样放行数。 */
+  /** 方块变更：合并批次 / 被合并掉的「原始封包个数」/ 原样放行数。
+   * 注意 {@link #blockChangesMerged} 计的是<b>原包数</b>（每条 add 传入的是被合并的原包个数），
+   * 不是「合并后发出的包数」（那才是 {@link #blockMergeBatches}），面板文案须写「个原包」。 */
   public final LongAdder blockMergeBatches = new LongAdder();
   public final LongAdder blockChangesMerged = new LongAdder();
   public final LongAdder blockChangesPassed = new LongAdder();

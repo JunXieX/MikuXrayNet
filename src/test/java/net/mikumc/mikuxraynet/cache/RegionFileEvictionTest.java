@@ -91,6 +91,33 @@ class RegionFileEvictionTest {
   }
 
   /**
+   * 驱逐顺序必须仍是「最久未使用优先」：去掉 {@code new ArrayList<>(loaded.keySet())} 快照、改为直接遍历
+   * 访问序 {@code LinkedHashMap} 后，LRU 语义不得改变。
+   *
+   * <p>装载桶 0、1 后读一次桶 0（把它提升为最近使用），再装载桶 2 触发驱逐：应淘汰桶 1（此时最久未用），
+   * 保留刚被访问过的桶 0。若遍历顺序被破坏（例如按插入序而非访问序），受害者会变成桶 0，本用例即失败。
+   */
+  @Test
+  void evictionPicksLeastRecentlyUsedBucketInAccessOrder(@TempDir Path dir) throws Exception {
+    RegionFile region = RegionFile.open(dir.resolve("r.0.0.b_linear"), 2);
+    try {
+      region.put(chunkIndexForBucket(0), entry(0));
+      region.put(chunkIndexForBucket(1), entry(1));
+      assertNotNull(region.get(chunkIndexForBucket(0)), "读命中桶 0，使其成为最近使用");
+
+      region.put(chunkIndexForBucket(2), entry(2));
+
+      Map<Integer, Boolean> loaded = loadedOf(region);
+      assertTrue(loaded.containsKey(0), "被最近访问过的桶 0 不应被驱逐（LRU 访问序必须保持）");
+      assertFalse(loaded.containsKey(1), "应淘汰最久未使用的桶 1");
+      assertTrue(loaded.containsKey(2), "新加载的桶 2 必须在记账内");
+      assertEquals(2, loaded.size(), "驱逐后 loaded.size() 必须收敛到 bucketCacheSize");
+    } finally {
+      region.close();
+    }
+  }
+
+  /**
    * 压缩回收「移动临时文件失败」时必须清理 .tmp，且不得破坏原文件。
    *
    * <p>做法：先把目标路径替换成<b>非空目录</b>（{@code Files.move} 到非空目录必然失败），
