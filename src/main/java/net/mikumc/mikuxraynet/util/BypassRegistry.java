@@ -1,7 +1,7 @@
 package net.mikumc.mikuxraynet.util;
 
-import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
-import java.util.HashSet;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -21,18 +21,19 @@ import org.bukkit.plugin.Plugin;
  * 共享的，若把绕过状态混进缓存键，会让每个玩家的缓存互相隔离，命中率崩塌且内存翻倍。因此这里只在
  * 玩家维度做一次短路判定——缓存本身完全不受影响，一致性不被破坏。
  *
- * <p><b>线程纪律</b>：名单是无锁并发集合。写入来自主线程 / Folia 区域线程（登录、退出、定时巡检）
- * 与任意读线程（封包改写路径），只做 {@code contains} 查询，不触碰任何 Bukkit API。
+ * <p><b>线程纪律</b>：名单是无锁并发集合。写入来自主线程 / Folia 区域线程（登录、退出、插件启用时
+ * 的一次性快照），读取来自任意线程（封包改写路径），读侧只做 {@code contains} 查询，不触碰任何 Bukkit API。
  *
- * <p><b>如何「及时反映」权限变更</b>：登录/退出事件即时增删；此外<b>每 tick</b>巡检在线玩家的权限，
- * 因此权限插件在运行期授予/收回 bypass 至多延迟一个 tick（约 50ms，对操作者无感）生效。
+ * <p><b>权限只在「进入服务器时」判定一次（核心语义，请勿当 bug「修」回去）</b>：本类<b>不做任何周期性
+ * 权限检查</b>。玩家是否直通仅在 {@link PlayerJoinEvent}（登录那一刻）与插件启用时对「当时已在线玩家」
+ * 的一次性快照里判定；<b>运行期间由权限插件授予 / 收回 {@code mikuxraynet.bypass} 都不会即时生效，
+ * 必须重新进入服务器（退出→重登即可）才按新权限重算</b>。
  *
- * <p><b>为什么从「5 秒一巡检」收紧到「每 tick」</b>：本类此前为省开销把巡检放宽到 100 tick，
- * 运行期改权限最长 5 秒不生效。带宽三条热路径（变更合并 / AFK / 零位移）原先在<b>封包线程逐包</b>
- * 调用 {@code player.hasPermission}（见各模块注释），既不满足「netty 线程不碰 Bukkit API」的纪律，
- * 也把正确性押在第三方权限插件的线程安全上。改为统一读本名单后，若仍保留 5 秒窗口，
- * 就会把「逐包即时」退化成「最长 5 秒」，故这里把巡检收紧到每 tick：时效对操作者无感，
- * 且「每玩家每秒 20 次」仍远低于原「每封包一次」的开销（封包速率通常远高于 20 次/秒/玩家）。
+ * <p><b>为什么这样设计</b>：封包线程（netty）绝不能查权限、不能碰 Bukkit API，直通判定只能读本名单这份
+ * 线程安全快照。此前为了「及时反映权限变更」每 tick 兜底巡检在线玩家（并周期性清理离线残留），
+ * 代价是引入了一个持续的调度任务与「运行期改权限会延迟生效」的错觉语义；经确认改为「登录时快照」，
+ * 语义简单无歧义，也彻底摆脱周期开销。若日后有人希望「运行期改权限即时生效」，不要恢复周期巡检——
+ * 那会让封包热路径的判定依赖随时间变化的状态，请先与需求方确认语义再动。
  *
  * <p><b>共享入口</b>：{@link #isBypassedNow(UUID)} 暴露「当前活动名单」的静态查询，供带宽模块
  * 在封包线程复用（这些模块由 {@code bandwidth.ThrottlePipeline} 装配，其构造签名不在本类职责范围，
@@ -44,61 +45,42 @@ public final class BypassRegistry implements Listener {
   /** 绕过反矿透所必需的权限节点（唯一出处见 {@link Constants#BYPASS_PERMISSION}）。 */
   public static final String PERMISSION = Constants.BYPASS_PERMISSION;
 
-  /**
-   * 在线玩家权限巡检周期（tick）：<b>每 tick</b>一次，把运行期权限变更的生效延迟压到一个 tick 内。
-   *
-   * <p>巡检本身是零分配遍历（不重建在线集合），每 100 tick 才做一次离线残留清理（体积 O(玩家数)）。
-   */
-  private static final long REFRESH_INTERVAL_TICKS = 1L;
-
-  /** 离线残留清理的周期（tick）：正常退出由退出事件即时处理，这里只兜底异常遗漏。 */
-  private static final long SWEEP_INTERVAL_TICKS = 100L;
-
-  /** 当前活动的直通名单（登录/退出/巡检由其维护）；插件未启用或已停用时为 null。 */
+  /** 当前活动的直通名单（登录/退出/启用快照由其维护）；插件未启用或已停用时为 null。 */
   private static volatile BypassRegistry active;
 
   private final Plugin plugin;
   private final Set<UUID> bypassed = ConcurrentHashMap.newKeySet();
 
-  private ScheduledTask refreshTask;
-  /** 巡检计数器（仅调度线程访问），用于低频触发离线残留清理。 */
-  private long refreshTicks;
-
   public BypassRegistry(Plugin plugin) {
     this.plugin = plugin;
   }
 
-  /** 注册登录/退出监听并启动在线玩家权限巡检。可重复调用，异常安全。 */
+  /**
+   * 注册登录/退出监听，并对「启用时已在线」的玩家做一次快照判定。可重复调用，异常安全。
+   *
+   * <p>不注册任何周期任务：权限变更需重进服务器才生效（见类注释）。
+   */
   public void start() {
     stop();
     active = this;
     try {
       plugin.getServer().getPluginManager().registerEvents(this, plugin);
-      refreshOnline();
-      // GlobalRegionScheduler：Paper 上落在主线程；延迟与周期都以 tick 计（与旧 runTaskTimer 一致）
-      this.refreshTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin,
-          scheduled -> refresh(), REFRESH_INTERVAL_TICKS, REFRESH_INTERVAL_TICKS);
+      // 一次性快照（非周期）：服务器刚装插件 / reload 时，把「当时已在线」玩家的当前权限登记进名单。
+      // 复用被移除的巡检所用调度方式（GlobalRegionScheduler）：Paper 上落在主线程，Folia 上落在全局
+      // 区域线程；只跑一次，此后不再有任何刷新——运行期改权限需重进服务器。
+      Bukkit.getGlobalRegionScheduler().run(plugin, scheduled -> snapshotOnlinePlayers());
     } catch (Throwable throwable) {
-      // 巡检只是「更快反映权限变更」，失败不影响登录/退出事件维护的名单
-      plugin.getLogger().warning("直通名单权限巡检启动失败（不影响按登录/退出维护）：" + throwable.getMessage());
+      // 快照只是「补齐启用时已在线玩家」，失败不影响登录/退出事件维护的名单
+      plugin.getLogger().warning("直通名单初始化失败（不影响按登录/退出维护）：" + throwable.getMessage());
     }
   }
 
-  /** 注销监听、取消巡检并清空名单。可重复调用。 */
+  /** 注销监听并清空名单。可重复调用。 */
   public void stop() {
     if (active == this) {
       active = null;
     }
     HandlerList.unregisterAll(this);
-    ScheduledTask task = refreshTask;
-    refreshTask = null;
-    if (task != null) {
-      try {
-        task.cancel();
-      } catch (Throwable ignored) {
-        // 任务可能已结束，忽略
-      }
-    }
     bypassed.clear();
   }
 
@@ -114,6 +96,7 @@ public final class BypassRegistry implements Listener {
 
   @EventHandler(ignoreCancelled = true)
   public void onJoin(PlayerJoinEvent event) {
+    // 登录那一刻判定一次；此后不再复查（运行期改权限需重进服务器）。
     Player player = event.getPlayer();
     refresh(player.getUniqueId(), player.hasPermission(PERMISSION));
   }
@@ -124,10 +107,10 @@ public final class BypassRegistry implements Listener {
   }
 
   /**
-   * 按某玩家当前的权限刷新直通名单（登录、权限巡检与单测桩共用此入口）。
+   * 按某玩家「登录时」的权限登记直通名单（登录事件与启用快照共用此入口）。
    *
    * @param playerId  玩家标识
-   * @param isBypassed 是否持有 bypass 权限
+   * @param isBypassed 登录那一刻是否持有 bypass 权限
    */
   public void refresh(UUID playerId, boolean isBypassed) {
     if (playerId == null) {
@@ -157,35 +140,34 @@ public final class BypassRegistry implements Listener {
     return bypassed.size();
   }
 
-  /** 巡检一步：每 tick 复查在线玩家权限，并按低频周期清理离线残留。 */
-  private void refresh() {
-    refreshOnline();
-    if (++refreshTicks % SWEEP_INTERVAL_TICKS == 0L) {
-      sweepOffline();
+  /**
+   * 一次性快照：把「在线玩家 → 是否持有 bypass」的判定结果灌入名单。
+   *
+   * <p>包可见以便离线单测注入判定结果（真实路径由 {@link #snapshotOnlinePlayers()} 采集）。
+   * 只在插件启用时调用一次，非周期。
+   */
+  void snapshot(Map<UUID, Boolean> decisions) {
+    if (decisions == null) {
+      return;
+    }
+    for (Map.Entry<UUID, Boolean> decision : decisions.entrySet()) {
+      refresh(decision.getKey(), Boolean.TRUE.equals(decision.getValue()));
     }
   }
 
-  /** 复查全部在线玩家的 bypass 权限（零分配遍历；登录/退出即时维护之外的兜底）。 */
-  private void refreshOnline() {
+  /** 采集「启用时已在线」的玩家并做一次性快照（真实路径，只跑一次）。 */
+  private void snapshotOnlinePlayers() {
     try {
+      // Folia 安全性：getOnlinePlayers() 只取在线玩家集合快照，不触碰实体状态/坐标；
+      // Player#hasPermission 只读权限表，与区域归属无关。因此在 GlobalRegionScheduler 的全局线程上
+      // 枚举并按玩家判定是全服安全的（与已移除的周期巡检所用枚举方式同源）。
+      Map<UUID, Boolean> decisions = new HashMap<>();
       for (Player player : Bukkit.getOnlinePlayers()) {
-        refresh(player.getUniqueId(), player.hasPermission(PERMISSION));
+        decisions.put(player.getUniqueId(), player.hasPermission(PERMISSION));
       }
+      snapshot(decisions);
     } catch (Throwable ignored) {
-      // 枚举失败：保留现有名单，下次巡检再修正
-    }
-  }
-
-  /** 清掉已下线玩家的残留条目（正常退出由退出事件处理，这里只兜底异常遗漏）。 */
-  private void sweepOffline() {
-    try {
-      Set<UUID> online = new HashSet<>();
-      for (Player player : Bukkit.getOnlinePlayers()) {
-        online.add(player.getUniqueId());
-      }
-      bypassed.retainAll(online);
-    } catch (Throwable ignored) {
-      // 枚举失败：保留现有名单，下次清扫再修正
+      // 枚举失败：保留现有名单，不影响登录/退出事件维护（fail-open）
     }
   }
 }

@@ -352,7 +352,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       return;
     }
     Player player = event.getPlayer();
-    // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API（名单由主/区域线程即时+每 tick 维护）
+    // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API（名单仅由登录/退出与启用快照维护，无周期刷新）
     if (player == null || BypassRegistry.isBypassedNow(player.getUniqueId())) {
       return;
     }

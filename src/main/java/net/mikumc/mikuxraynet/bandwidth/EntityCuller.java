@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.FluidCollisionMode;
@@ -67,6 +68,8 @@ public final class EntityCuller implements Listener {
   private final ThrottleStats stats;
   /** 实体归属判定（Folia 跨区域实体不得触碰；见 {@link EntityOwnership}）。 */
   private final EntityOwnership ownership;
+  /** 直通判定（只读 BypassRegistry 的登录期快照；见 {@link BypassLookup}）。 */
+  private final BypassLookup bypass;
   private final double forceVisibleSquared;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
@@ -87,10 +90,26 @@ public final class EntityCuller implements Listener {
   /** 完整构造（追加实体归属判定；离线单测可注入假实现，见 {@link EntityOwnership}）。 */
   EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
       EntityOwnership ownership) {
+    this(plugin, config, stats, ownership, BypassRegistry::isBypassedNow);
+  }
+
+  /**
+   * 完整构造（追加实体归属判定与直通判定；离线单测可对两者注入假实现）。
+   *
+   * <p><b>为什么直通判定默认走 {@link BypassRegistry#isBypassedNow} 这份静态共享名单，而不是把
+   * {@link BypassRegistry} 穿透装配链</b>：带宽侧其余模块（{@code EntityPacketFilter} /
+   * {@code BlockChangeMerger} / {@code AfkTracker}）已统一读这份共享快照，本类保持一致；直通名单由
+   * {@code MikuXrayNet} 持有、只在登录/启用时做一次快照，带宽模块只做一次纯内存读，为此再扩大
+   * {@code ThrottlePipeline} → {@code MikuXrayNet} 的构造签名不划算。本构造的注入点仅为离线单测提供
+   * （同 {@link EntityOwnership} 的做法）。
+   */
+  EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
+      EntityOwnership ownership, BypassLookup bypass) {
     this.plugin = plugin;
     this.config = config;
     this.stats = stats;
     this.ownership = ownership;
+    this.bypass = bypass == null ? BypassRegistry::isBypassedNow : bypass;
     this.forceVisibleSquared = config.forceVisibleDistance() * config.forceVisibleDistance();
   }
 
@@ -116,6 +135,25 @@ public final class EntityCuller implements Listener {
       // 判定不可用（离线单测无服务端实例等）：按「属于本区域」处理，退回本改动之前的行为
       return true;
     }
+  }
+
+  /**
+   * 直通判定查询：读「登录期快照」的线程安全只读入口，生产实现为 {@link BypassRegistry#isBypassedNow}。
+   *
+   * <p><b>语义（与全局一致，请勿当 bug「修」回去）</b>：直通权限只在玩家<b>进入服务器</b>时判定一次，
+   * 运行期由权限插件授予 / 收回 {@code mikuxraynet.bypass} 都<b>不会即时生效</b>，必须重新进入服务器
+   * （退出→重登）才按新权限重算（详见 {@link BypassRegistry}）。因此「复检恢复可见」只对
+   * <b>登录时已带权限</b>的玩家生效，这是既定语义而非缺陷。
+   *
+   * <p><b>线程纪律</b>：读侧只做一次并发集合查询，是纯内存读、不触碰任何 Bukkit API，因此可安全用于
+   * Folia 区域线程上的周期复检；本类<b>不做任何周期性权限查询</b>。
+   *
+   * <p><b>失败语义 fail-open</b>：名单未装配 / 已停用时 {@link BypassRegistry#isBypassedNow} 返回
+   * false（按「无直通」处理，与既有兜底语义一致）。
+   */
+  @FunctionalInterface
+  interface BypassLookup {
+    boolean isBypassed(UUID playerId);
   }
 
   /** 注册事件监听与周期复检任务。 */
@@ -228,7 +266,9 @@ public final class EntityCuller implements Listener {
       return;
     }
     Player player = event.getPlayer();
-    if (player.hasPermission(Constants.BYPASS_PERMISSION)) {
+    // 直通判定只读登录期快照（纯内存、线程安全），语义与复检路径一致：
+    // 运行期授予 / 撤销权限都需重进服务器才生效（见 BypassLookup）。
+    if (bypass.isBypassed(player.getUniqueId())) {
       return;
     }
     Entity entity = event.getEntity();
@@ -278,10 +318,11 @@ public final class EntityCuller implements Listener {
     }
     UUID playerId = player.getUniqueId();
 
-    // 运行期获得直通权限：立即恢复该玩家所有已隐藏实体，否则它们会一直保持隐藏直到重登
-    // （此前 bypass 只在 onTrack 查一次，复检不查 → 中途授权的玩家看不到被隐藏的实体）。
-    // 复检运行在玩家所属线程，此处读权限是安全的 Bukkit 调用。
-    if (player.hasPermission(Constants.BYPASS_PERMISSION)) {
+    // 直通玩家恢复其全部已隐藏实体，且不再提交任何射线复检。判定只读登录期快照（纯内存、线程安全），
+    // 不再调用任何 Bukkit 权限 API —— 因此本类周期路径上不存在任何权限查询。
+    // 语义一致性：运行期改权限需重进服务器才生效，故「复检恢复可见」只对登录时已带权限的玩家生效
+    // （见 BypassLookup，这是既定语义，不是缺陷）。
+    if (bypass.isBypassed(playerId)) {
       restorePlayer(player);
       return;
     }

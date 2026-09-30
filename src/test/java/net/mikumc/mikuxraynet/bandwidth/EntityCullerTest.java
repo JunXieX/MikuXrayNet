@@ -253,7 +253,7 @@ class EntityCullerTest {
     EntityStub owned = new EntityStub(7002, world);
     EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
         new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 7, 3), stats,
-        entity -> entity != foreign.proxy());
+        entity -> entity != foreign.proxy(), playerId -> false);
 
     // 先在「同区域」时把两者隐藏（此时读状态合法），随后 foreign 离开本区域
     culler.evaluate(player.proxy(), foreign.proxy(), true);
@@ -285,7 +285,7 @@ class EntityCullerTest {
     EntityStub foreign = new EntityStub(8001, world);
     EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
         new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 7, 3), stats,
-        entity -> entity != foreign.proxy());
+        entity -> entity != foreign.proxy(), playerId -> false);
 
     culler.evaluate(player.proxy(), foreign.proxy(), true);
     assertEquals(1, culler.hiddenCount());
@@ -352,30 +352,60 @@ class EntityCullerTest {
   }
 
   /**
-   * 运行期获得 {@code mikuxraynet.bypass} 的玩家：周期复检必须立即恢复其<b>全部</b>已隐藏实体，
-   * 且不再提交任何射线复检——否则中途授权的玩家看不到被隐藏的实体（缺陷：bypass 只在 onTrack 查一次）。
+   * 登录期快照语义：<b>进入服务器那一刻</b>已带 {@code mikuxraynet.bypass}（即已登记进
+   * {@link net.mikumc.mikuxraynet.util.BypassRegistry} 登录快照）的玩家，周期复检必须恢复其
+   * <b>全部</b>已隐藏实体，且不再提交任何射线复检。
    */
   @Test
-  void recheckRestoresAllHiddenEntitiesForBypassedPlayer() {
+  void recheckRestoresAllHiddenEntitiesForPlayerBypassedAtLogin() {
     ThrottleStats stats = new ThrottleStats();
-    EntityCuller culler = newCuller(stats, 12);
     PlayerStub player = new PlayerStub();
     WorldStub world = new WorldStub();
     EntityStub first = new EntityStub(6101, world);
     EntityStub second = new EntityStub(6102, world);
+    // 注入「该玩家在登录期快照中」；归属默认按本区域（与生产 Paper 行为一致）
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12), stats,
+        entity -> true, playerId -> playerId.equals(player.id()));
 
     culler.evaluate(player.proxy(), first.proxy(), true);
     culler.evaluate(player.proxy(), second.proxy(), true);
     assertEquals(2, culler.hiddenCount());
     long submittedBefore = stats.recheckSubmitted.sum();
 
-    // 运行期授予直通权限 → 复检路径必须查权限并恢复可见
-    player.bypass = true;
     culler.recheck(player.proxy());
 
-    assertEquals(0, culler.hiddenCount(), "获得直通权限后账本必须清空（实体恢复可见）");
+    assertEquals(0, culler.hiddenCount(), "登录时已带直通权限：账本必须清空（实体恢复可见）");
     assertEquals(2, player.showCalls.get(), "必须对每个被隐藏实体下发 showEntity");
     assertEquals(submittedBefore, stats.recheckSubmitted.sum(), "直通玩家不再提交任何射线复检");
+  }
+
+  /**
+   * 语义一致性回归：<b>运行期</b>才被授予 {@code mikuxraynet.bypass} 的玩家<b>不会即时生效</b>——
+   * 直通判定只读登录期快照，必须重新进入服务器（退出→重登）才按新权限重算，因此本轮复检照常评估、
+   * 不恢复已隐藏实体（这是用户要的语义，不是缺陷）。同时本用例也钉死「周期路径不得查权限」。
+   */
+  @Test
+  void runtimeGrantedBypassDoesNotTakeEffectUntilRelogin() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub entity = new EntityStub(6201, world);
+    // 快照里没有该玩家（登录时未带权限）
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12), stats,
+        owned -> true, playerId -> false);
+
+    culler.evaluate(player.proxy(), entity.proxy(), true);
+    assertEquals(1, culler.hiddenCount());
+    long submittedBefore = stats.recheckSubmitted.sum();
+
+    culler.recheck(player.proxy());
+
+    assertEquals(1, culler.hiddenCount(), "运行期授权的玩家不在登录快照里：本轮不得恢复，需重进服务器");
+    assertEquals(0, player.showCalls.get(), "未直通玩家不得下发 showEntity");
+    assertEquals(submittedBefore + 1L, stats.recheckSubmitted.sum(),
+        "未直通玩家照常复检其已隐藏实体（周期路径不得查权限）");
   }
 
   /** 红线：射线 / 世界读取失败（异常）时不得隐藏，实体保持可见。 */
@@ -476,8 +506,6 @@ class EntityCullerTest {
     /** 位置与 {@link EntityStub} 的默认位置不同，但坐标本身不重要（只用于距离比较）。 */
     private final Location location = new Location(null, 0.5D, 65.0D, 0.5D);
     private volatile boolean online = true;
-    /** 是否持有 {@code mikuxraynet.bypass} 权限（复检直通恢复回归用）。 */
-    private volatile boolean bypass;
 
     Player proxy() {
       return proxy;
@@ -496,7 +524,10 @@ class EntityCullerTest {
       return switch (method.getName()) {
         case "getUniqueId" -> id;
         case "isOnline" -> online;
-        case "hasPermission" -> bypass;
+        // EntityCuller 的直通判定只读 BypassRegistry 登录期快照，任何路径都不得查询 Bukkit 权限
+        // （事件路径与周期复检均然）；一旦有人把 hasPermission 加回来，这里立刻失败。
+        case "hasPermission" -> throw new UnsupportedOperationException(
+            "EntityCuller 不得查询 Bukkit 权限，直通判定只读 BypassRegistry 登录期快照");
         case "getLocation", "getEyeLocation" -> location;
         case "hideEntity" -> null;
         case "showEntity" -> {

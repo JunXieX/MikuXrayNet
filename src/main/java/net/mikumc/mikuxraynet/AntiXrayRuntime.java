@@ -65,7 +65,8 @@ public final class AntiXrayRuntime {
     this.logger = plugin.getLogger();
   }
 
-  /** 直通名单装配：登录/退出即时维护，并周期巡检在线玩家权限，及时反映权限变更。 */
+  /** 直通名单装配：登录/退出即时维护，并在启用时对「当时已在线」玩家做一次快照；不做周期巡检。 */
+  // 权限只在进入服务器时判定一次：运行期改权限需重进服务器生效（见 BypassRegistry 类注释）。
   void startBypassRegistry() {
     BypassRegistry registry = new BypassRegistry(plugin);
     try {
@@ -304,7 +305,7 @@ public final class AntiXrayRuntime {
 
   /**
    * 停机：按固定顺序释放反矿透侧全部资源（顺序由主类 onDisable 的既有纪律决定，不得调整）：
-   * 注销封包拦截 → 停邻近显形 → 关磁盘缓存 → 关工作池 → 停直通名单巡检。
+   * 注销封包拦截 → 停邻近显形 → 关磁盘缓存 → 关工作池 → 停直通名单。
    */
   void stopForDisable() {
     if (protocolLibHook != null) {
