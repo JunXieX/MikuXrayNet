@@ -341,16 +341,17 @@ class ConfigDefaultsTest {
   }
 
   /**
-   * 实体剔除周期复检预算默认 12（建议区间 8~16）：必须有非零默认值，否则「先可见、之后才被挡住」的
-   * 实体在本轮轮转分片下会收敛过慢（预算过小）或每周期读方块次数失控（预算过大）。
+   * 实体剔除周期复检预算默认 24（保守档，优先不影响玩家体验；旧建议区间 8~16、旧默认 12）：
+   * 必须有非零默认值，否则「先可见、之后才被挡住」的实体在本轮轮转分片下会收敛过慢（预算过小）
+   * 或每周期读方块次数失控（预算过大）。复检周期同时收紧到 5 tick（原 10），切换更及时。
    */
   @Test
-  void entityCullingRecheckBudgetDefaultsToTwelve() {
+  void entityCullingRecheckBudgetDefaultsToTwentyFour() {
     BandwidthConfig config = BandwidthConfig.from(yaml("enabled: true\n"));
 
-    assertEquals(12, config.entityCulling().recheckBudget(),
-        "周期复检预算默认 12（落在建议的 8~16 区间内）");
-    assertEquals(10, config.entityCulling().updateIntervalTicks(), "复检周期保持 10 tick");
+    assertEquals(24, config.entityCulling().recheckBudget(),
+        "周期复检预算默认 24（保守档，收敛更快；旧建议区间 8~16）");
+    assertEquals(5, config.entityCulling().updateIntervalTicks(), "复检周期默认收紧到 5 tick（保守档）");
   }
 
   /** 非法值（0 / 负数）必须保守钳制到至少 1，避免复检完全不推进。 */
@@ -376,7 +377,7 @@ class ConfigDefaultsTest {
 
     assertTrue(config.entityCulling().raycast(), "同段其它键照常生效（不受已删除键影响）");
     assertEquals(6, config.entityCulling().raySamples(), "同段其它键仍按显式取值解析");
-    assertEquals(10, config.entityCulling().updateIntervalTicks(), "未写的键仍回落默认值");
+    assertEquals(5, config.entityCulling().updateIntervalTicks(), "未写的键仍回落默认值");
   }
 
   /**
@@ -623,21 +624,23 @@ class ConfigDefaultsTest {
 
     // entity-culling 其余键（threads 键已彻底删除，其残留配置的兼容性见下方专项测试）
     assertTrue(config.entityCulling().raycast(), "实体射线判定默认开启");
-    assertEquals(32.0D, config.entityCulling().forceVisibleDistance(), 1.0E-9D, "强制可见距离默认 32 格");
+    assertEquals(64.0D, config.entityCulling().forceVisibleDistance(), 1.0E-9D,
+        "强制可见距离默认 64 格（保守档，优先不影响玩家体验；旧默认 32）");
     assertEquals(BandwidthConfig.MAX_RAY_SAMPLES, config.entityCulling().raySamples(),
         "候选顶点数默认取上限 7（包围盒可见顶点最多 7 个，钳制 1..7）");
 
     // afk 全部键
     assertEquals(300, config.afk().seconds(), "AFK 判定默认 300 秒无操作");
     assertEquals(16.0D, config.afk().distance(), 1.0E-9D, "AFK 低价值包丢弃距离默认 16 格");
-    assertTrue(config.afk().dropParticles(), "AFK 丢弃粒子包默认开启");
-    assertTrue(config.afk().dropBlockBreakAnimation(), "AFK 丢弃破坏动画包默认开启");
+    assertTrue(config.afk().dropParticles(), "AFK 丢弃粒子包默认保留 true（数量最多、价值最低）");
+    assertFalse(config.afk().dropBlockBreakAnimation(),
+        "AFK 默认不再丢弃破坏动画包（保守档；破坏动画与正在发生的事相关，丢掉会让 AFK 玩家回头看到动作中断）");
 
-    // latency 全部键
-    assertEquals(400, config.latency().thresholdMillis(), "延迟观察阈值默认 400 毫秒");
-    assertEquals(30, config.latency().sustainSeconds(), "持续超阈 30 秒才真正降视距");
-    assertEquals(2, config.latency().reduceViewDistance(), "触发后降视距默认 2");
-    assertEquals(4, config.latency().minViewDistance(), "视距下限默认 4");
+    // latency 全部键（保守档：更晚介入、降幅更小、保底更高）
+    assertEquals(1000, config.latency().thresholdMillis(), "延迟观察阈值默认 1000 毫秒（旧默认 400）");
+    assertEquals(60, config.latency().sustainSeconds(), "持续超阈 60 秒才真正降视距（旧默认 30）");
+    assertEquals(1, config.latency().reduceViewDistance(), "触发后降视距默认 1（旧默认 2）");
+    assertEquals(6, config.latency().minViewDistance(), "视距下限默认 6（旧默认 4）");
     assertEquals(5, config.latency().checkIntervalSeconds(), "延迟采样周期默认 5 秒");
 
     // diagnostics
@@ -725,6 +728,49 @@ class ConfigDefaultsTest {
   }
 
   /**
+   * 本版「保守档」默认值全部落在合法钳制区间内：把它们逐键显式写进 YAML（等价于服主按注释原样替换）
+   * 既不得触发上限钳制、也不得触发下限兜底，因此不会打出任何「被钳制」WARN。
+   *
+   * <p>同时锁定这组默认值本身（防被无意改回更激进的旧值）。
+   */
+  @Test
+  void conservativeDefaultsAreWithinClampRangeAndProduceNoWarn() {
+    BandwidthConfig explicit = BandwidthConfig.from(yaml("""
+        entity-culling:
+          force-visible-distance: 64.0
+          update-interval-ticks: 5
+          recheck-budget: 24
+        afk:
+          drop-particles: true
+          drop-block-break-animation: false
+        latency:
+          threshold-millis: 1000
+          sustain-seconds: 60
+          reduce-view-distance: 1
+          min-view-distance: 6
+        """));
+
+    assertTrue(explicit.clampAdjustments().isEmpty(),
+        "保守档默认值不得触发任何钳制明细（否则会出现误导性 WARN）：" + explicit.clampAdjustments());
+    assertEquals(64.0D, explicit.entityCulling().forceVisibleDistance(), 1.0E-9D);
+    assertEquals(5, explicit.entityCulling().updateIntervalTicks());
+    assertEquals(24, explicit.entityCulling().recheckBudget());
+    assertTrue(explicit.afk().dropParticles());
+    assertFalse(explicit.afk().dropBlockBreakAnimation());
+    assertEquals(1000, explicit.latency().thresholdMillis());
+    assertEquals(60, explicit.latency().sustainSeconds());
+    assertEquals(1, explicit.latency().reduceViewDistance());
+    assertEquals(6, explicit.latency().minViewDistance());
+
+    // 缺省（空配置）与显式写入必须解析出完全相同的生效值
+    BandwidthConfig byDefault = BandwidthConfig.from(yaml(""));
+    assertEquals(byDefault.entityCulling(), explicit.entityCulling(), "缺省与显式保守档的实体剔除取值必须一致");
+    assertEquals(byDefault.afk(), explicit.afk(), "缺省与显式保守档的 AFK 取值必须一致");
+    assertEquals(byDefault.latency(), explicit.latency(), "缺省与显式保守档的延迟降视距取值必须一致");
+    assertTrue(byDefault.clampAdjustments().isEmpty(), "缺省默认值同样不得触发钳制");
+  }
+
+  /**
    * 非有限值（NaN / ±Inf）必须显式回落默认并留痕，且<b>不得污染配置指纹</b>。
    *
    * <p>回归动机：NaN 不满足 {@code > max}，旧实现会让它原样穿过钳制进入 {@code configHash}——
@@ -741,7 +787,7 @@ class ConfigDefaultsTest {
           distance: .nan
         """));
 
-    assertEquals(32.0D, nan.entityCulling().forceVisibleDistance(), 1.0E-9D, "NaN 必须回落默认 32");
+    assertEquals(64.0D, nan.entityCulling().forceVisibleDistance(), 1.0E-9D, "NaN 必须回落默认 64");
     assertEquals(16.0D, nan.afk().distance(), 1.0E-9D, "NaN 必须回落默认 16");
     String nanDetails = String.join("、", nan.clampAdjustments());
     assertTrue(nanDetails.contains("entity-culling.force-visible-distance"), nanDetails);
@@ -756,7 +802,7 @@ class ConfigDefaultsTest {
         afk:
           distance: -.inf
         """));
-    assertEquals(32.0D, inf.entityCulling().forceVisibleDistance(), 1.0E-9D, "+Inf 必须回落默认 32");
+    assertEquals(64.0D, inf.entityCulling().forceVisibleDistance(), 1.0E-9D, "+Inf 必须回落默认 64");
     assertEquals(16.0D, inf.afk().distance(), 1.0E-9D, "-Inf 必须回落默认 16（而不是被 Math.max 悄悄抬成 0）");
     assertEquals(base.configHash(), inf.configHash(), "±Inf 回落默认后指纹同样必须稳定");
   }

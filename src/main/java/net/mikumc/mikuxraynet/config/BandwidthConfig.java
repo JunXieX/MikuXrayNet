@@ -108,7 +108,8 @@ public final class BandwidthConfig {
    * @param enabled  模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
    * @param raycast  行为开关：依据视线射线剔除被遮挡实体；仅在 {@code enabled=true} 时生效。
    * @param recheckBudget 周期复检预算：除「已隐藏实体每周期全部复检」外，每周期额外按轮转分片
-   *                      复检的「可见追踪实体」条数上限（默认 12，建议 8~16）。
+   *                      复检的「可见追踪实体」条数上限（默认 24——保守档，取值偏高以尽快收敛；
+   *                      旧建议区间 8~16、旧默认 12）。
    *                      <p>为什么需要它：实体进入追踪范围那一刻（{@code PlayerTrackEntityEvent}）只评估一次，
    *                      若实体是「先可见、之后才被墙/地形挡住」，只复检已隐藏集合永远发现不了它。
    *                      轮转分片让复检在 {@code ceil(追踪数 / recheckBudget)} 个周期内覆盖全部追踪实体
@@ -208,16 +209,18 @@ public final class BandwidthConfig {
         new EntityCulling(
             root.getBoolean("entity-culling.enabled", true),
             root.getBoolean("entity-culling.raycast", true),
-            clampUpper(root.getDouble("entity-culling.force-visible-distance", 32.0D),
-                32.0D, MAX_FORCE_VISIBLE_DISTANCE, "entity-culling.force-visible-distance", clampAdjustments),
-            clampUpper(Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),
+            // 默认 64（保守档，原 32）：覆盖绝大多数近身/视野中心实体，基本不会误藏玩家觉得该看见的实体。
+            clampUpper(root.getDouble("entity-culling.force-visible-distance", 64.0D),
+                64.0D, MAX_FORCE_VISIBLE_DISTANCE, "entity-culling.force-visible-distance", clampAdjustments),
+            // 默认 5（保守档，原 10）：复检更勤，遮挡/可见切换更及时，玩家几乎察觉不到剔除存在。
+            clampUpper(Math.max(1, root.getInt("entity-culling.update-interval-ticks", 5)),
                 MAX_UPDATE_INTERVAL_TICKS, "entity-culling.update-interval-ticks", clampAdjustments),
             // 语义已变：原生射线改造后本键表示「每个实体最多尝试的候选顶点数」（不再表示采样数）。
             // 钳制 1..MAX_RAY_SAMPLES，默认即上限（包围盒至多 7 个可见顶点 → 取上限就是全部顶点都试）。
             Math.max(1, Math.min(MAX_RAY_SAMPLES, root.getInt("entity-culling.ray-samples", MAX_RAY_SAMPLES))),
-            // 周期复检预算默认 12：约「每 0.5 秒（10 tick）多复检 12 个可见追踪实体」，
-            // 既能在数个周期内发现新遮挡，又不会让主线程每周期读方块次数失控（建议 8~16）。
-            clampUpper(Math.max(1, root.getInt("entity-culling.recheck-budget", 12)),
+            // 周期复检预算默认 24（保守档，原 12）：约「每 0.25 秒（5 tick）多复检 24 个可见追踪实体」，
+            // 收敛更快、更不容易出现「明明被挡住却还在显示」；旧建议区间 8~16。
+            clampUpper(Math.max(1, root.getInt("entity-culling.recheck-budget", 24)),
                 MAX_RECHECK_BUDGET, "entity-culling.recheck-budget", clampAdjustments)),
         new Afk(
             root.getBoolean("afk.enabled", true),
@@ -226,16 +229,22 @@ public final class BandwidthConfig {
             clampUpper(root.getDouble("afk.distance", 16.0D),
                 16.0D, MAX_AFK_DISTANCE, "afk.distance", clampAdjustments),
             root.getBoolean("afk.drop-particles", true),
-            root.getBoolean("afk.drop-block-break-animation", true)),
+            // 默认 false（保守档，原 true）：破坏动画与「正在发生的事」直接相关，丢掉会让 AFK 玩家
+            // 回头时看到动作中断，故默认不丢；更省带宽可改回 true。
+            root.getBoolean("afk.drop-block-break-animation", false)),
         new Latency(
             root.getBoolean("latency.enabled", true),
-            clampUpper(Math.max(1, root.getInt("latency.threshold-millis", 400)),
+            // 默认 1000（保守档，原 400）：只有明显卡顿才进入观察，正常网络绝不触发降视距。
+            clampUpper(Math.max(1, root.getInt("latency.threshold-millis", 1000)),
                 MAX_LATENCY_THRESHOLD_MILLIS, "latency.threshold-millis", clampAdjustments),
-            clampUpper(Math.max(1, root.getInt("latency.reduce-view-distance", 2)),
+            // 默认 1（保守档，原 2）：降幅最小，玩家几乎察觉不到画面变化。
+            clampUpper(Math.max(1, root.getInt("latency.reduce-view-distance", 1)),
                 MAX_REDUCE_VIEW_DISTANCE, "latency.reduce-view-distance", clampAdjustments),
-            clampUpper(Math.max(0, root.getInt("latency.sustain-seconds", 30)),
+            // 默认 60（保守档，原 30）：要求持续一分钟才动作，几乎排除偶发抖动。
+            clampUpper(Math.max(0, root.getInt("latency.sustain-seconds", 60)),
                 MAX_SUSTAIN_SECONDS, "latency.sustain-seconds", clampAdjustments),
-            clampUpper(Math.max(1, root.getInt("latency.min-view-distance", 4)),
+            // 默认 6（保守档，原 4）：保底视距更高，即使触发降视距也不影响正常观察。
+            clampUpper(Math.max(1, root.getInt("latency.min-view-distance", 6)),
                 MAX_MIN_VIEW_DISTANCE, "latency.min-view-distance", clampAdjustments),
             clampUpper(Math.max(1, root.getInt("latency.check-interval-seconds", 5)),
                 MAX_CHECK_INTERVAL_SECONDS, "latency.check-interval-seconds", clampAdjustments)),
