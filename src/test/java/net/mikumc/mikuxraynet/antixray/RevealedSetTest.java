@@ -290,4 +290,69 @@ class RevealedSetTest {
       assertTrue(revealed.contains(PLAYER, key, v & 15, v >> 4, 0), "v=" + v);
     }
   }
+
+  /**
+   * 并发 mark 与 expire 交错：expire 把「摘除 + 统计扣减」并入同一把 marker 锁、mark 又对「孤儿」
+   * 标记做重试后，计数器必须始终与存活集合自洽。
+   *
+   * <p>判据：清点所有用过的区块键上的实时 size 之和，必须等于 {@link RevealedSet#positionCount()}
+   * （后者就是 playerTotals 之和）。旧实现在锁外 remove，会在「读 size」与「remove」之间被并发 mark
+   * 写入，按旧 size 扣减导致计数漂高；若 mark 落进被摘掉的孤儿对象，也会造成两者偏离。
+   */
+  @Test
+  void concurrentMarkAndExpireKeepTotalsConsistent() throws Exception {
+    long window = 10 * SECOND_NANOS;
+    RevealedSet revealed = revealed(1 << 20, window);
+    int keys = 4;
+    int threads = 3;
+    int perThread = 3000;
+    ExecutorService pool = Executors.newFixedThreadPool(threads + 1);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    CountDownLatch marksDone = new CountDownLatch(threads);
+    CountDownLatch allDone = new CountDownLatch(threads + 1);
+    try {
+      for (int t = 0; t < threads; t++) {
+        int base = t * perThread;
+        pool.execute(() -> {
+          try {
+            for (int i = 0; i < perThread; i++) {
+              int v = base + i;
+              revealed.mark(PLAYER, chunk(v % keys, 0), v & 15, v >> 4 & 15, v & 7);
+            }
+          } catch (Throwable throwable) {
+            failure.compareAndSet(null, throwable);
+          } finally {
+            marksDone.countDown();
+            allDone.countDown();
+          }
+        });
+      }
+      // 过期线程：持续推进时钟并触发 expire，制造与 mark 的交错（每推进一个窗口即让上一批标记过期）
+      pool.execute(() -> {
+        try {
+          long t = 0;
+          while (marksDone.getCount() > 0) {
+            clock[0] = t;
+            revealed.expire(t);
+            t += window;
+          }
+        } catch (Throwable throwable) {
+          failure.compareAndSet(null, throwable);
+        } finally {
+          allDone.countDown();
+        }
+      });
+      assertTrue(allDone.await(30, TimeUnit.SECONDS), "并发 mark/expire 必须在超时内完成");
+    } finally {
+      pool.shutdownNow();
+    }
+
+    assertNull(failure.get(), "并发 mark/expire 不得抛异常：" + failure.get());
+    int live = 0;
+    for (int k = 0; k < keys; k++) {
+      live += revealed.sizeFor(PLAYER, chunk(k, 0));
+    }
+    assertEquals(live, revealed.positionCount(),
+        "playerTotals 必须与存活集合大小自洽（无孤儿标记 / 无扣减漂移）");
+  }
 }

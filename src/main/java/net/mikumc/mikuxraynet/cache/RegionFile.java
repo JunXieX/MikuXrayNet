@@ -303,7 +303,14 @@ final class RegionFile implements AutoCloseable {
 
   // ------------------------------------------------------------------ 读
 
-  /** 读取一个区块的条目；不存在、损坏、或该文件已被其它进程占用时为 {@code null}。 */
+  /**
+   * 读取一个区块的条目；不存在、损坏、或该文件已被其它进程占用时为 {@code null}。
+   *
+   * <p><b>返回的条目及其 {@code payload} 与内部 LRU 缓存以及后续写入共享同一实例</b>：本方法不做任何
+   * 复制，调用方必须<b>只读</b>对待它，或在使用前自行复制。若要跨后续的 {@code put}/{@code clear}/
+   * {@code compact} 长期持有该 payload，应先复制。实际安全由上层保证：{@code DiskPayload.decode} 解码时
+   * 已把 payload 复制成独立的字节数组，因此正常读写路径不会就地改写本方法返回的字节。
+   */
   BufferedLinearV3Format.Entry get(int chunkIndex) {
     if (lockUnavailable) {
       // 该文件归其它进程所有：一律视为未命中，交给上层回退重算（fail-open）

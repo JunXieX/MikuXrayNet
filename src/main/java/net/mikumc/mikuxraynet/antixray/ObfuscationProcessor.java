@@ -691,8 +691,17 @@ public final class ObfuscationProcessor {
             // 状态、或候选表已把空位用满）——此时引入它会新增调色板条目、有升位风险，只有在
             // 「候选表占用后仍有空位」或「已在调色板内」时才取用，否则退回候选表随机伪装，
             // 绝不绕过位宽封顶（预算关闭时 freeAfterTables 为最大值，行为与旧版一致）。
-            if (below >= 0 && (freeAfterTables[0] > 0 || section.paletteContains(below))) {
-              replacement = below;
+            // 余量必须随每个「调色板外的 below」逐格递减：同一 section 里下方方块各不相同，
+            // 若只做时点检查，多个不同 below 就能无限引入新调色板条目、越预算 grow 升位。
+            if (below >= 0) {
+              if (section.paletteContains(below)) {
+                // 已在调色板内：写入不新增条目，不消耗余量
+                replacement = below;
+              } else if (freeAfterTables[0] > 0) {
+                // 引入一个调色板外的新方块：消耗一个剩余空位；归零后回落候选表（伪装覆盖不减）
+                freeAfterTables[0]--;
+                replacement = below;
+              }
             }
           }
           if (replacement < 0) {
@@ -979,9 +988,39 @@ public final class ObfuscationProcessor {
    * <p><b>开销</b>：会完整解码一次区块并遍历全部 4096×N 个方块状态，只允许在一次性诊断路径上调用，
    * 绝不得进入封包热路径。
    *
+   * <p>本重载固定用 {@link #defaultProfile}（无逐世界覆盖）统计，供无世界上下文的调用方与单测使用；
+   * 运行期诊断应走 {@link #diagnose(byte[], int, String, AntiXrayConfig.Dimension)}，按世界取实际档案。
+   *
    * @return 诊断结果；区块解码失败（布局与预期不符）时返回 {@code null}
    */
   public Diagnostic diagnose(byte[] source, int sectionCount) {
+    return diagnose(source, sectionCount, defaultProfile);
+  }
+
+  /**
+   * 诊断（按「世界名 + 维度」取实际档案）。
+   *
+   * <p><b>为什么要带 worldName/dimension</b>：目标方块命中数必须按该世界实际生效的档案统计，
+   * 否则配置了 {@code world-overrides} 的世界（例如覆盖段新增/改动了目标方块）会按默认档案误判，
+   * 给出误导性的「命中目标方块 0 个」。解析优先级与改写路径完全一致（{@code world-overrides} &gt;
+   * {@code dimensions.<维度>}）。
+   *
+   * @param worldName 区块所在世界名；{@code null} 表示用默认档案（无逐世界覆盖）
+   * @param dimension 该世界所属维度；{@code null} 视为主世界
+   */
+  public Diagnostic diagnose(byte[] source, int sectionCount, String worldName,
+      AntiXrayConfig.Dimension dimension) {
+    WorldProfile profile = profileFor(worldName, dimension == null
+        ? AntiXrayConfig.Dimension.NORMAL : dimension);
+    return diagnose(source, sectionCount, profile);
+  }
+
+  /**
+   * 诊断实现（用给定档案统计）。
+   *
+   * @return 诊断结果；区块解码失败（布局与预期不符）时返回 {@code null}
+   */
+  private Diagnostic diagnose(byte[] source, int sectionCount, WorldProfile profile) {
     if (source == null || source.length == 0 || sectionCount <= 0) {
       return new Diagnostic(0, 0, 0);
     }
@@ -1003,7 +1042,7 @@ public final class ObfuscationProcessor {
         }
         for (int state : section.readAllBlockStates()) {
           seen.set(state);
-          if (defaultProfile.targets.get(state)) {
+          if (profile.targets.get(state)) {
             targetMatches++;
           }
         }

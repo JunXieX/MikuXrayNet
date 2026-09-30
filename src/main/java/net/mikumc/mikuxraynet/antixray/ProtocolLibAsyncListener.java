@@ -381,11 +381,19 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    */
   private void handleBatchFinish(PacketEvent event) {
     Player player = event.getPlayer();
-    if (player == null || !appliesTo(player)) {
+    if (player == null) {
       return;
     }
 
+    // 先无条件关闭本玩家的批次闸门，再判「本模块是否影响该玩家」。
+    // 玩家可能在 START（当时在可改写世界）与 FINISHED 之间切进黑名单世界 / 被加入直通名单：
+    // 若把 remove 放在 appliesTo 之后，这条残留闸门就只能靠退出清理 / 下次 START 覆盖 / 超限淘汰兜底，
+    // 与「闸门 = 配对 START/FINISHED 才延迟」的本意不符。对不受影响的路径而言，这一步只做一次有界的
+    // 移除——下面立即返回，不回写任何数据、不登记任何延迟，因此「恰好一次放行」不受影响。
     ChunkBatchGate gate = batches.remove(player.getUniqueId());
+    if (!appliesTo(player)) {
+      return;
+    }
     if (gate == null) {
       return;
     }
@@ -574,7 +582,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return;
     }
     try {
-      ObfuscationProcessor.Diagnostic diagnostic = processor.diagnose(source, task.sectionCount());
+      ObfuscationProcessor.Diagnostic diagnostic =
+          processor.diagnose(source, task.sectionCount(), task.worldName(), task.dimension());
       String sections = diagnostic == null
           ? String.valueOf(task.sectionCount()) : String.valueOf(diagnostic.sectionCount());
       String kinds = diagnostic == null ? "解码失败" : String.valueOf(diagnostic.stateKinds());

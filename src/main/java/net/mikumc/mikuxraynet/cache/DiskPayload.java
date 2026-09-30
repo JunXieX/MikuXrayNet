@@ -30,9 +30,14 @@ public final class DiskPayload {
   /**
    * 编码一条负载。
    *
+   * <p><b>编解码刻意不对称，空负载由上层拒绝</b>：本方法允许 {@code data} 为 {@code null} 或空（照常写出
+   * 完整头部），而 {@link #decode} 对空 data 返回 {@code null}。契约是「空负载在上层就被拒绝」——
+   * {@code DiskCacheStore#put} 会丢弃 {@code null}/空 payload，因此正常路径根本不会写出空负载；编码侧
+   * 保持宽容只是为了不因入参抛异常，读写两侧的不对称兜底统一交由上层完成。
+   *
    * @param sourceHash 原始（未改写）区块字节的指纹
    * @param positions  被伪装坐标；{@code null} 视为空
-   * @param data       改写后的区块字节；{@code null} 视为空
+   * @param data       改写后的区块字节；{@code null} 视为空（但正常路径不应传空，见上）
    */
   public static byte[] encode(long sourceHash, int[] positions, byte[] data) {
     int[] coordinates = positions == null ? new int[0] : positions;

@@ -54,10 +54,19 @@ public final class RewriteCache<V> {
   /**
    * second-chance 环形队列（CLOCK 手）。
    *
-   * <p>只在 {@link #put} / 失效方法的同步块内增删；读路径（{@link #get}）完全不碰它，
-   * 因此读取不需要任何锁。队首是「最久未被再访问」的候选。
+   * <p>只在「真正新建条目」的 {@link #put} 分支 / 失效方法的同步块内增删；同键覆盖与读路径
+   * （{@link #get}）完全不碰它，因此读写不需要任何锁。队首是「最久未被再访问」的候选。
    */
   private final ArrayDeque<CacheEntry<V>> clockQueue = new ArrayDeque<>();
+  /**
+   * CLOCK 环形队列 / 淘汰结构的专用锁。
+   *
+   * <p><b>为什么从「方法级 synchronized」缩小到这把锁</b>：旧实现整个 {@link #put} 都串行化，
+   * 多个工作线程并发回填不同区块时被无谓地逐个排队。实际需要互斥的只有「环形队列增删 + 淘汰扫描」
+   * 这一小段；同键覆盖只写 volatile 字段、插入 {@code entries} 由 ConcurrentHashMap 保证线程安全，
+   * 因此把它们移出锁后，不同键的并发回填不再互相阻塞，CLOCK 语义保持不变。
+   */
+  private final Object clockLock = new Object();
 
   private final LongAdder hits = new LongAdder();
   private final LongAdder misses = new LongAdder();
@@ -98,13 +107,13 @@ public final class RewriteCache<V> {
     return entry.value;
   }
 
-  /** 写入（覆盖同键旧值）。 */
-  public synchronized void put(String worldName, int x, int z, int configHash, V value) {
+  /** 写入（覆盖同键旧值）。同键覆盖与 {@code entries} 插入不加锁，仅新建条目时才同步维护 CLOCK 队列。 */
+  public void put(String worldName, int x, int z, int configHash, V value) {
     Key key = new Key(worldName, x, z, configHash);
     long now = clock.getAsLong();
     CacheEntry<V> existing = entries.get(key);
     if (existing != null) {
-      // 同键覆盖：原地更新，避免在环形队列里留下重复/陈旧节点
+      // 同键覆盖：原地更新，避免在环形队列里留下重复/陈旧节点。只写 volatile 字段，无需加锁。
       existing.value = value;
       existing.lastAccessNanos = now;
       existing.referenced = true;
@@ -112,13 +121,27 @@ public final class RewriteCache<V> {
     }
 
     CacheEntry<V> entry = new CacheEntry<>(key, value, now);
-    entries.put(key, entry);
-    clockQueue.addLast(entry);
-    evictOverflow();
+    CacheEntry<V> previous = entries.putIfAbsent(key, entry);
+    if (previous != null) {
+      // 并发插入同键：以先入者为存活条目，仅更新其值，绝不重复入队（否则队列会长出陈旧节点）。
+      previous.value = value;
+      previous.lastAccessNanos = now;
+      previous.referenced = true;
+      return;
+    }
+    // 只有「真正新建条目」才进入同步块维护环形队列并做淘汰扫描——把串行范围缩到最小。
+    synchronized (clockLock) {
+      clockQueue.addLast(entry);
+      evictOverflow();
+    }
   }
 
-  /** second-chance 淘汰：队列里已被移除的陈旧节点直接丢弃，被访问过的条目让一次机会。 */
+  /**
+   * second-chance 淘汰：<b>先剔除已过期条目</b>（它们绝不占用淘汰名额、也不该挤掉仍有效的条目），
+   * 队列里已被移除的陈旧节点直接丢弃，被访问过的条目让一次机会。
+   */
   private void evictOverflow() {
+    long now = clock.getAsLong();
     while (entries.size() > maximumSize) {
       CacheEntry<V> candidate = clockQueue.pollFirst();
       if (candidate == null) {
@@ -127,6 +150,11 @@ public final class RewriteCache<V> {
       }
       if (entries.get(candidate.key) != candidate) {
         continue; // 陈旧节点（该键已被失效或过期移除）
+      }
+      if (now - candidate.lastAccessNanos > expireAfterAccessNanos) {
+        // 已过期：直接移除并释放名额——过期条目不应被 CLOCK 当作有效候选
+        entries.remove(candidate.key, candidate);
+        continue;
       }
       if (candidate.referenced) {
         candidate.referenced = false;
@@ -138,19 +166,36 @@ public final class RewriteCache<V> {
   }
 
   /** 使某个世界的全部条目失效（世界卸载时调用）。 */
-  public synchronized void invalidateWorld(String worldName) {
-    entries.keySet().removeIf(key -> key.worldName().equals(worldName));
-    clockQueue.removeIf(entry -> entry.key.worldName().equals(worldName));
+  public void invalidateWorld(String worldName) {
+    synchronized (clockLock) {
+      entries.keySet().removeIf(key -> key.worldName().equals(worldName));
+      clockQueue.removeIf(entry -> entry.key.worldName().equals(worldName));
+    }
   }
 
   /** 使全部条目失效（配置重载等场景）。 */
-  public synchronized void invalidateAll() {
-    entries.clear();
-    clockQueue.clear();
+  public void invalidateAll() {
+    synchronized (clockLock) {
+      entries.clear();
+      clockQueue.clear();
+    }
   }
 
+  /**
+   * 当前<b>有效</b>缓存条目数（诊断用）。
+   *
+   * <p>过期条目在未被再访问时不会主动出清，本方法据此按访问时间过滤，避免「虚高」的条目数误导诊断；
+   * 这与淘汰时的过期剔除口径一致（过期条目既不计入 size，也不占淘汰名额）。
+   */
   public int size() {
-    return entries.size();
+    long now = clock.getAsLong();
+    int live = 0;
+    for (CacheEntry<V> entry : entries.values()) {
+      if (now - entry.lastAccessNanos <= expireAfterAccessNanos) {
+        live++;
+      }
+    }
+    return live;
   }
 
   public long hitCount() {

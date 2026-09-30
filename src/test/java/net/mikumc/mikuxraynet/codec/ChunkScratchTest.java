@@ -3,6 +3,7 @@ package net.mikumc.mikuxraynet.codec;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
@@ -207,6 +208,70 @@ class ChunkScratchTest {
       assertTrue(second.contains(300));
     } finally {
       reused.recycle();
+    }
+  }
+
+  /**
+   * 输出缓冲区容量不足（升位后调色板变大）时，{@link Chunk#finalizeOutput()} 必须翻倍扩容并整体重写成功。
+   *
+   * <p>用一个单值 section 造出「原始字节极小、改写后暴涨」的形态：单值 section 约 10 字节，写入第二种方块
+   * 状态即升位为 4 位间接调色板（位打包数据 2048 字节），必然超过初始输出容量（= 输入长度）而触发扩容。
+   */
+  @Test
+  void reencodeBeyondInitialCapacityGrowsAndSucceeds() {
+    ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+    byte[] raw = new TestChunkBuilder(MODERN)
+        .singleValueSection(0, 0, 0, 0, new int[] {1})
+        .build();
+
+    byte[] output;
+    try (Chunk chunk = codec.decode(raw, 1)) {
+      chunk.getSection(0).setBlockState(0, 0, 0, 999);
+      output = chunk.finalizeOutput();
+    }
+
+    assertTrue(output.length > raw.length, "升位后的输出必然大于原始单值 section（证明发生了扩容重写）");
+    // 扩容后的结果必须仍可解码且语义正确
+    try (Chunk chunk = codec.decode(output, 1)) {
+      assertEquals(999, chunk.getSection(0).getBlockState(0));
+    }
+  }
+
+  /**
+   * 源区间越界（数据损坏）必须在 {@link Chunk#finalizeOutput()} 入口立即 fail-open，而不是进入扩容重试。
+   *
+   * <p>这里把未改动 section 的原始区间改成缓冲区之外，模拟损坏；断言直接抛出（不重试、不扩容）。
+   */
+  @Test
+  void corruptSourceRangeFailsFastInsteadOfRetrying() {
+    ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+    byte[] raw = new TestChunkBuilder(MODERN)
+        .singleValueSection(7, 4096, 0, 0, new int[] {1})
+        .build();
+
+    try (Chunk chunk = codec.decode(raw, 1)) {
+      chunk.corruptSectionRangeForTest(0, raw.length + 4, 16);
+      assertThrows(IllegalStateException.class, chunk::finalizeOutput,
+          "源区间越界（数据损坏）必须在入口立即 fail-open，而不是进入扩容重试");
+    }
+  }
+
+  /**
+   * 扩容到达绝对上限时必须抛专用溢出异常（可被 {@code catch (RuntimeException)} 兜住的 fail-open 信号），
+   * 绝不真的分配超大数组——否则会先撞上 {@link OutOfMemoryError}（{@code Error} 不被封包链路兜住）。
+   */
+  @Test
+  void growOutputBeyondAbsoluteCapSignalsOverflowInsteadOfAllocating() {
+    ChunkScratch scratch = ChunkScratch.acquire();
+    try {
+      assertThrows(ChunkScratch.OutputOverflowException.class,
+          () -> scratch.growOutput(ChunkScratch.MAX_OUTPUT_CAPACITY + 1),
+          "超过绝对上限的扩容请求必须报专用溢出异常，而不是尝试分配");
+      // 上限内的正常扩容仍然可用（复用的 scratch 可能已持更大数组，只须保证不小于请求容量）
+      byte[] grown = scratch.growOutput(1024);
+      assertTrue(grown.length >= 1024, "上限内的扩容请求必须被满足");
+    } finally {
+      scratch.recycle();
     }
   }
 }

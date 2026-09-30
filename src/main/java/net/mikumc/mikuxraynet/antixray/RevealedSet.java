@@ -24,7 +24,9 @@ import java.util.function.LongSupplier;
  *
  * <p><b>线程纪律</b>：标记来自主线程 / Folia 区域线程（发包成功后）；清理来自主线程 / 区域线程
  * （区块卸载、玩家退出、世界卸载）与出站封包线程（方块变更注销）；读取来自区域线程 / 主线程。
- * 内部只用并发容器与「逐条目锁」，纯数据结构，不触碰任何 Bukkit API，可离线单测。
+ * 内部只用并发容器与两级锁——「逐条目锁」（保护单条「玩家 × 区块」标记的读写）与「逐区块映射监视器」
+ * （保护映射在 {@code chunks} 中的判活 / 摘除，使并发 mark 绝不写进已脱管的孤儿映射）；纯数据结构，
+ * 不触碰任何 Bukkit API，可离线单测。
  */
 public final class RevealedSet {
 
@@ -228,23 +230,37 @@ public final class RevealedSet {
       return;
     }
     long packedValue = pack(x, y, z);
-    ConcurrentHashMap<UUID, Marker> players =
-        chunks.computeIfAbsent(key, ignored -> new ConcurrentHashMap<>());
-    Marker marker = players.computeIfAbsent(playerId, ignored -> new Marker());
-
-    synchronized (marker) {
-      marker.updatedAtNanos = clock.getAsLong();
-      if (marker.contains(packedValue)) {
-        return;
+    while (true) {
+      ConcurrentHashMap<UUID, Marker> players =
+          chunks.computeIfAbsent(key, ignored -> new ConcurrentHashMap<>());
+      // 持「映射监视器」写入。expire / clearPlayer 在把变空的映射从 chunks 摘除前也必须取得同一监视器，
+      // 因此「判活 + 写入」与「摘除」互斥：新标记绝不会写进一张已脱管的 map（那样的标记不被任何路径
+      // 枚举，成为孤儿，使 playerTotals 虚高）。这是保证「计数 = 存活集合大小」的关键一半。
+      synchronized (players) {
+        if (chunks.get(key) != players) {
+          continue; // 映射已被并行摘除：重取（computeIfAbsent 会新建一张已挂载的映射）
+        }
+        Marker marker = players.computeIfAbsent(playerId, ignored -> new Marker());
+        synchronized (marker) {
+          // 并发的 expire / clearPlayer 仍可能把这条「玩家 × 区块」标记摘掉，需在 marker 锁内再确认一次。
+          if (players.get(playerId) != marker) {
+            continue;
+          }
+          marker.updatedAtNanos = clock.getAsLong();
+          if (marker.contains(packedValue)) {
+            return;
+          }
+          AtomicInteger total = playerTotals.computeIfAbsent(playerId, ignored -> new AtomicInteger());
+          if (total.get() >= maxPositionsPerPlayer) {
+            droppedByCapacity.increment();
+            return;
+          }
+          marker.add(packedValue);
+          total.incrementAndGet();
+          registeredTotal.increment();
+          return;
+        }
       }
-      AtomicInteger total = playerTotals.computeIfAbsent(playerId, ignored -> new AtomicInteger());
-      if (total.get() >= maxPositionsPerPlayer) {
-        droppedByCapacity.increment();
-        return;
-      }
-      marker.add(packedValue);
-      total.incrementAndGet();
-      registeredTotal.increment();
     }
   }
 
@@ -287,18 +303,25 @@ public final class RevealedSet {
 
   /** 使一个区块的全部玩家的已显形标记失效（区块卸载 / 区块被重新下发时调用）。 */
   void clearChunk(ChunkKey key) {
-    ConcurrentHashMap<UUID, Marker> players = chunks.remove(key);
+    ConcurrentHashMap<UUID, Marker> players = chunks.get(key);
     if (players == null) {
       return;
     }
-    for (Map.Entry<UUID, Marker> entry : players.entrySet()) {
-      AtomicInteger total = playerTotals.get(entry.getKey());
-      if (total == null) {
-        continue;
+    // 与 expire / clearPlayer 同构：摘除整张映射前持「映射监视器」（mark 写入时也持它），使
+    // 「判空 + 摘除 + 扣减」与「判活 + 写入」互斥，避免并发 mark 把新标记写进这张被摘掉的孤儿映射。
+    synchronized (players) {
+      if (!chunks.remove(key, players)) {
+        return; // 已被并行摘除：无需重复扣减
       }
-      Marker marker = entry.getValue();
-      synchronized (marker) {
-        subtract(total, marker.size());
+      for (Map.Entry<UUID, Marker> entry : players.entrySet()) {
+        AtomicInteger total = playerTotals.get(entry.getKey());
+        if (total == null) {
+          continue;
+        }
+        Marker marker = entry.getValue();
+        synchronized (marker) {
+          subtract(total, marker.size());
+        }
       }
     }
   }
@@ -309,11 +332,28 @@ public final class RevealedSet {
       return;
     }
     for (Map.Entry<ChunkKey, ConcurrentHashMap<UUID, Marker>> chunk : chunks.entrySet()) {
-      chunk.getValue().remove(playerId);
-      if (chunk.getValue().isEmpty()) {
-        chunks.remove(chunk.getKey(), chunk.getValue());
+      ChunkKey key = chunk.getKey();
+      ConcurrentHashMap<UUID, Marker> players = chunk.getValue();
+      // 持「映射监视器」（与 mark 同一把）：使「摘除标记 + 扣减计数」与「判活 + 写入」互斥，
+      // 并发 mark 不会把新标记写进正被摘掉的孤儿对象（配合 mark 侧 marker 判活，保证计数与集合自洽）。
+      synchronized (players) {
+        Marker marker = players.get(playerId);
+        if (marker != null) {
+          synchronized (marker) {
+            if (players.remove(playerId, marker)) {
+              AtomicInteger total = playerTotals.get(playerId);
+              if (total != null) {
+                subtract(total, marker.size());
+              }
+            }
+          }
+        }
+        if (chunks.get(key) == players && players.isEmpty()) {
+          chunks.remove(key, players);
+        }
       }
     }
+    // 玩家退出：计数对象一并丢弃（锁内已按实时 size 扣减；并发 mark 若重建计数，由孤儿检测兜底）
     playerTotals.remove(playerId);
   }
 
@@ -347,25 +387,33 @@ public final class RevealedSet {
    */
   void expire(long nowNanos) {
     for (Map.Entry<ChunkKey, ConcurrentHashMap<UUID, Marker>> chunk : chunks.entrySet()) {
+      ChunkKey key = chunk.getKey();
       ConcurrentHashMap<UUID, Marker> players = chunk.getValue();
       for (Map.Entry<UUID, Marker> entry : players.entrySet()) {
         Marker marker = entry.getValue();
-        int removed;
+        // 「摘除 + 统计扣减」必须在同一把 marker 锁内完成：mark 也在这把锁里做「登记 + 计数加一」，
+        // 两者严格串行。若像旧实现那样在锁外 players.remove，并发的 mark 可在「读 size」与「remove」
+        // 之间写入新标记，使整条被整批移除（丢一次标记，良性）却按旧 size 扣减，playerTotals 只增不减
+        // 地漂高，最终让安全阀 droppedByCapacity 误报。锁内 marker.size() 即移除那一刻的实时值，
+        // 计数与集合始终自洽。锁粒度仍是逐「玩家 × 区块」。
         synchronized (marker) {
           if (nowNanos - marker.updatedAtNanos <= expireNanos) {
             continue;
           }
-          removed = marker.size();
-        }
-        if (players.remove(entry.getKey(), marker)) {
-          AtomicInteger total = playerTotals.get(entry.getKey());
-          if (total != null) {
-            subtract(total, removed);
+          if (players.remove(entry.getKey(), marker)) {
+            AtomicInteger total = playerTotals.get(entry.getKey());
+            if (total != null) {
+              subtract(total, marker.size());
+            }
           }
         }
       }
-      if (players.isEmpty()) {
-        chunks.remove(chunk.getKey(), players);
+      // 摘除空映射前必须取得「映射监视器」（mark 写入时也持它）：否则可能在「判定已空」与「实际移除」
+      // 之间被并发 mark 写入新标记，使整张脱管 map 上的标记成为孤儿、playerTotals 虚高。
+      synchronized (players) {
+        if (chunks.get(key) == players && players.isEmpty()) {
+          chunks.remove(key, players);
+        }
       }
     }
   }

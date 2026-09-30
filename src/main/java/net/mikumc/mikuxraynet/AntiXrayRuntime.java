@@ -339,6 +339,9 @@ public final class AntiXrayRuntime {
   void restartProximity() {
     stopProximity();
     if (!antiXrayActive || proximityStats == null) {
+      // 反矿透整体未启用（或尚未装配完成）时邻近显形无从接入改写链路，重启项静默无效。
+      // 必须显式告知管理员「为什么没生效」，否则「重启邻近显形」这类操作会被误读为已生效。
+      logger.info("反矿透未启用，proximity 重启项已跳过");
       return;
     }
     AntiXrayConfig antiXray = plugin.mikuConfig().antiXray();

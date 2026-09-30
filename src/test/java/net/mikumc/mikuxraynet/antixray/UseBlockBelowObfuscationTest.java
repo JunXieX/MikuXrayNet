@@ -357,4 +357,38 @@ class UseBlockBelowObfuscationTest {
         "调色板有余量时下方方块照常取用（伪装=下方新状态 7）");
     assertEquals(4, result.sectionBits()[1], "写入后 palette 仅 3 条，位宽仍为 4 位");
   }
+
+  /**
+   * 红线（P0-1 × P2-6a）：同一 section 内「下方方块各不相同」时，每个<b>调色板外</b>的 below 都必须
+   * 消耗一个剩余空位，余量归零后回落候选表。若像旧实现那样只做时点检查（freeAfterTables 不递减），
+   * 多个不同 below 就能无限引入新调色板条目、越预算 grow 升位——这里锁死「第 15 个必须回落」。
+   */
+  @Test
+  void multipleDistinctBelowBlocksCannotExceedWidthBudget() {
+    // 上 section：4 位间接，调色板仅 {STONE, DIAMOND_ORE} → 剩余空位 = 16 - 2 = 14；
+    // 候选表 {STONE} 已在调色板内 → 不消耗空位，因此 freeAfterTables 初值 = 14。
+    int[] palette = {STONE, DIAMOND_ORE};
+    int[] indices = new int[4096];
+    java.util.Arrays.fill(indices, 0); // 默认石头
+    int[] lower = filled(STONE);
+    int ores = 15; // 比剩余空位（14）多一个
+    for (int x = 0; x < ores; x++) {
+      indices[x] = 1;                 // 上 section 的 localY=0 行：目标矿
+      lower[(15 << 8) | x] = 100 + x; // 下方方块各不相同，且都不在上 section 调色板内
+    }
+    byte[] source = indirectOverDirect(palette, indices, lower);
+
+    ObfuscationProcessor processor = new ObfuscationProcessor(new ChunkCodec(registry(), MODERN),
+        blockId -> blockId != AIR, oreTargets(), new int[] {STONE}, new int[] {1}, false,
+        true, new ObfuscationProcessor.PaletteOptions(false, false, true), true, true,
+        BELOW_USABLE);
+    ObfuscationProcessor.Result result = processor.rewrite(source, 2, 42L, null, null, 0);
+
+    assertTrue(result.changed(), "所有目标矿都必须被伪装（伪装覆盖不减）");
+    assertEquals(100, decodedState(result.data(), 2, 1, 0), "余量内照常取下方方块");
+    assertEquals(STONE, decodedState(result.data(), 2, 1, 14),
+        "余量耗尽后第 15 个矿必须回落候选表（石头），不得再引入新状态");
+    assertEquals(4, result.sectionBits()[1],
+        "多个不同下方方块不得越预算：位宽必须保持 4 位（14 个消耗余量，第 15 个回落）");
+  }
 }

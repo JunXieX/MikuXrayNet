@@ -90,7 +90,12 @@ public class Chunk implements AutoCloseable {
   }
 
   public byte[] finalizeOutput() {
-    for (int attempt = 0; ; attempt++) {
+    // 入口先校验所有「按绝对下标从输入缓冲区搬运」的源区间都落在缓冲区内。校验通过后，writeAll 期间
+    // 唯一可能的越界就只剩「输出缓冲区容量不足」，重试条件因此可精确判定；真正的数据损坏在这里就被
+    // 拦下（不进入任何扩容重试，直接交由上层 fail-open）。
+    validateSourceRanges();
+
+    for (;;) {
       ByteBuf out = this.outputBuffer;
       out.clear();
       try {
@@ -113,14 +118,48 @@ public class Chunk implements AutoCloseable {
         this.scratch.keepOutputCapacity(out.capacity());
         return Arrays.copyOfRange(array, out.arrayOffset(), out.arrayOffset() + readable);
       } catch (IndexOutOfBoundsException overflow) {
-        // 复用的输出数组容量不足（升位后调色板变大等情况）：翻倍扩容后整体重写。
-        // 只会在输出超过该线程历史最大长度时发生，稳态下不再触发。
-        if (attempt >= 24) {
-          throw overflow;
+        // 源区间已在入口校验 ⇒ 此处越界一定来自输出缓冲区写满（唯一允许重试的情形，与真损坏无关）。
+        // 扩容重写只会在「输出超过该线程历史最大长度」时发生，稳态下不再触发。
+        if (out.capacity() >= ChunkScratch.MAX_OUTPUT_CAPACITY) {
+          // 已达绝对上限：绝不继续翻倍（否则会指数膨胀到 OOM，而 OOM 是 Error、不被上层
+          // catch(RuntimeException) 兜住）。抛专用溢出异常，由封包链路按 fail-open 放行原包。
+          throw new ChunkScratch.OutputOverflowException(
+              "区块重编码输出超过绝对上限 " + ChunkScratch.MAX_OUTPUT_CAPACITY + " 字节，放弃改写");
         }
         this.outputBuffer = Unpooled.wrappedBuffer(this.scratch.growOutput(out.capacity() + 1));
       }
     }
+  }
+
+  /**
+   * 校验写出时会按绝对下标搬运的源区间都在输入缓冲区内；任何越界即判「数据损坏」并就地抛出
+   * （{@link RuntimeException}，交由封包链路 fail-open），从而与「容量不足」的重试路径彻底分开。
+   */
+  private void validateSourceRanges() {
+    int capacity = this.inputBuffer.capacity();
+    checkSourceRange(this.trailingOffset, this.trailingLength, capacity);
+    for (ChunkSectionHolder chunkSection : this.sections) {
+      if (chunkSection != null) {
+        chunkSection.validateSourceRange(capacity);
+      }
+    }
+  }
+
+  private static void checkSourceRange(int offset, int length, int capacity) {
+    if (length < 0 || offset < 0 || (long) offset + length > capacity) {
+      throw new IllegalStateException("区块源字节区间越界（offset=" + offset + ", length=" + length
+          + ", capacity=" + capacity + "）：数据已损坏，放弃改写");
+    }
+  }
+
+  /**
+   * <b>仅测试用</b>：把一个 section 的原始字节区间改成越界值，用于验证「源数据损坏」会在
+   * {@link #finalizeOutput()} 入口被立即拦下（不进入扩容重试、直接 fail-open）。
+   */
+  void corruptSectionRangeForTest(int index, int offset, int length) {
+    ChunkSectionHolder holder = this.sections[index];
+    holder.sectionOffset = offset;
+    holder.sectionLength = length;
   }
 
   private void writeAll(ByteBuf out) {
@@ -206,6 +245,16 @@ public class Chunk implements AutoCloseable {
         return null;
       }
       return new SectionRange(this.sectionOffset, this.sectionLength);
+    }
+
+    /** 校验写出时按绝对下标搬运的两个源区间（未改动 section 的整体区间 / 尾部群系容器）都在输入缓冲区内。 */
+    void validateSourceRange(int inputCapacity) {
+      if (this.sectionLength > 0) {
+        checkSourceRange(this.sectionOffset, this.sectionLength, inputCapacity);
+      }
+      if (this.extraBytes > 0) {
+        checkSourceRange(this.extraOffset, this.extraBytes, inputCapacity);
+      }
     }
 
     public void write(ByteBuf outputBuffer) {

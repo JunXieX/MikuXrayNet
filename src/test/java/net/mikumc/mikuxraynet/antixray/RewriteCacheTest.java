@@ -5,7 +5,11 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Field;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -110,6 +114,73 @@ class RewriteCacheTest {
       Class<?> fieldType = field.getType();
       assertTrue(fieldType.isPrimitive() || fieldType == String.class,
           "键字段只允许基本类型或 String，实际为：" + fieldType.getName());
+    }
+  }
+
+  /** 未被再访问的过期条目不得计入 size()：旧实现按 entries.size() 统计会「虚高」。 */
+  @Test
+  void expiredEntriesAreExcludedFromSize() {
+    RewriteCache<String> cache = cache(8, 10 * SECOND_NANOS);
+    cache.put("world", 0, 0, 1, "a");
+    cache.put("world", 1, 0, 1, "b");
+    assertEquals(2, cache.size());
+
+    clock[0] = 11 * SECOND_NANOS;
+    assertEquals(0, cache.size(), "未被再访问的过期条目不得计入有效条目数");
+  }
+
+  /** 过期条目不得占用淘汰名额：余量够时新条目不得因过期条目占位而被 CLOCK 淘汰。 */
+  @Test
+  void expiredEntriesDoNotConsumeEvictionSlots() {
+    RewriteCache<String> cache = cache(2, 10 * SECOND_NANOS);
+    cache.put("world", 0, 0, 1, "a");
+    cache.get("world", 0, 0, 1); // 置 second-chance 位：旧实现会把它当「有效候选」反复轮转
+    cache.put("world", 1, 0, 1, "b");
+    cache.get("world", 1, 0, 1);
+
+    clock[0] = 11 * SECOND_NANOS; // 两条都过期
+    cache.put("world", 2, 0, 1, "c");
+    cache.put("world", 3, 0, 1, "d");
+
+    assertEquals(2, cache.size(), "过期条目被剔除后只应剩两条有效条目");
+    assertEquals("c", cache.get("world", 2, 0, 1), "新条目不得因过期条目占位而被淘汰");
+    assertEquals("d", cache.get("world", 3, 0, 1), "新条目不得因过期条目占位而被淘汰");
+  }
+
+  /** 并发回填不同键：缩小同步范围（只在新建条目时维护 CLOCK 队列）后不得丢条目。 */
+  @Test
+  void concurrentPutsKeepEveryEntry() throws Exception {
+    RewriteCache<String> cache = cache(1 << 20, 600 * SECOND_NANOS);
+    int threads = 4;
+    int perThread = 500;
+    ExecutorService pool = Executors.newFixedThreadPool(threads);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    CountDownLatch done = new CountDownLatch(threads);
+    try {
+      for (int t = 0; t < threads; t++) {
+        int base = t * perThread;
+        pool.execute(() -> {
+          try {
+            for (int i = 0; i < perThread; i++) {
+              int v = base + i;
+              cache.put("world", v, 0, 1, "v" + v);
+            }
+          } catch (Throwable throwable) {
+            failure.compareAndSet(null, throwable);
+          } finally {
+            done.countDown();
+          }
+        });
+      }
+      assertTrue(done.await(30, TimeUnit.SECONDS), "并发写入必须在超时内完成");
+    } finally {
+      pool.shutdownNow();
+    }
+
+    assertNull(failure.get(), "并发写入不得抛异常：" + failure.get());
+    assertEquals(threads * perThread, cache.size(), "并发写入的每条条目都不得丢失");
+    for (int v = 0; v < threads * perThread; v++) {
+      assertEquals("v" + v, cache.get("world", v, 0, 1), "键 z=" + v);
     }
   }
 }

@@ -51,6 +51,12 @@ import org.bukkit.plugin.Plugin;
  * <p>距离判定所需的玩家位置来自状态缓存（在主线程刷新），因此封包线程无需访问实体位置。
  * 默认丢弃的包类型数量少且只对 AFK 玩家生效：世界粒子与方块破坏动画（两者默认都丢，玩家只要还在
  * 交互/移动/聊天就不会被判定为 AFK，因此真在操作的人不会看到动画中断）。
+ *
+ * <p><b>活动判定只采信未被取消的事件</b>：交互（{@link PlayerInteractEvent}）、移动、传送、聊天这几类
+ * 监听器都标了 {@code ignoreCancelled = true}，即<b>被其它插件取消的事件不计为活动</b>
+ * （{@link PlayerAnimationEvent} 本身不可取消，故其监听器无需该标记、始终计入）。方向刻意保守：
+ * 宁可让挂机玩家多留一会儿，也不把「被取消的交互」误判为正在活动中——后者会让 AFK 降级对该玩家失效
+ * （粒子/动画被继续下发）。请勿移除这些 {@code ignoreCancelled}。
  */
 public final class AfkTracker implements Listener {
 

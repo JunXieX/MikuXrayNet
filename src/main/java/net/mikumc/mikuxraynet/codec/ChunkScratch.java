@@ -26,6 +26,24 @@ final class ChunkScratch {
   /** 每线程空闲池上限：正常串行处理时只需 1 个，留 2 个只作为嵌套解码（同线程同时开两个 Chunk）的余量。 */
   private static final int MAX_IDLE_PER_THREAD = 2;
 
+  /**
+   * 输出缓冲区容量的绝对上限（字节）。合法区块的未压缩负载远小于此值（典型几百 KB 到几 MB），
+   * 上限只为挡住「容量不足 → 翻倍重写」在极端/损坏输入下的指数膨胀：若无上限，从几字节起翻倍
+   * 数十次会先撞上 {@link OutOfMemoryError}，而 {@code Error} <b>不被</b>封包链路的
+   * {@code catch (RuntimeException)} 兜住，会直接冒泡破坏 fail-open 纪律。
+   */
+  static final int MAX_OUTPUT_CAPACITY = 64 * 1024 * 1024;
+
+  /**
+   * 输出缓冲区容量已达绝对上限、无法再扩容。它与「数据损坏」区分开：表示「需要更大的输出缓冲而不可得」，
+   * 由上层按 fail-open 放行原包；是 {@link RuntimeException} 而非 {@code Error}，能被封包链路兜住。
+   */
+  static final class OutputOverflowException extends RuntimeException {
+    OutputOverflowException(String message) {
+      super(message);
+    }
+  }
+
   private static final ThreadLocal<ArrayDeque<ChunkScratch>> IDLE =
       ThreadLocal.withInitial(ArrayDeque::new);
 
@@ -116,9 +134,26 @@ final class ChunkScratch {
     return this.outputArray;
   }
 
-  /** 输出缓冲区容量不足时扩容：至少翻倍，避免输出远大于输入时反复小步扩容。 */
+  /**
+   * 输出缓冲区容量不足时扩容：至少翻倍，避免输出远大于输入时反复小步扩容；容量封顶于
+   * {@link #MAX_OUTPUT_CAPACITY}（见其说明，防止无限翻倍到 OOM）。
+   *
+   * @throws OutputOverflowException 需要的容量超过绝对上限、或已无法再增长（交给上层 fail-open）
+   */
   byte[] growOutput(int minCapacity) {
+    if (minCapacity > MAX_OUTPUT_CAPACITY) {
+      throw new OutputOverflowException(
+          "需要的输出容量 " + minCapacity + " 字节超过绝对上限 " + MAX_OUTPUT_CAPACITY);
+    }
     int capacity = this.outputArray == null ? minCapacity : Math.max(minCapacity, this.outputArray.length * 2);
+    if (capacity > MAX_OUTPUT_CAPACITY) {
+      capacity = MAX_OUTPUT_CAPACITY;
+    }
+    if (this.outputArray != null && capacity <= this.outputArray.length) {
+      // 容量已被上限锁死、无法再增长：显式报「容量不足」而不是返回一个仍不够用的数组
+      throw new OutputOverflowException(
+          "输出容量已达绝对上限 " + MAX_OUTPUT_CAPACITY + " 字节，无法继续扩容");
+    }
     this.outputArray = new byte[Math.max(1, capacity)];
     return this.outputArray;
   }
