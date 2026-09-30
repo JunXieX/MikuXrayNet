@@ -104,6 +104,31 @@ class ZstdSupportTest {
     return server;
   }
 
+  /**
+   * 起一个「重复写入同一块」的本地服务，用 {@code chunkSize × count} 字节响应——用于验证下载体积上限，
+   * 且无需在测试里真的分配那么大的数组（客户端在上限处提前断开，服务端写入失败属预期）。
+   */
+  private static HttpServer serveRepeated(int chunkSize, int count) throws IOException {
+    byte[] chunk = new byte[chunkSize];
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext("/", exchange -> {
+      try {
+        exchange.sendResponseHeaders(200, (long) chunkSize * count);
+        try (var out = exchange.getResponseBody()) {
+          for (int i = 0; i < count; i++) {
+            out.write(chunk);
+          }
+        }
+      } catch (IOException ignored) {
+        // 客户端在体积上限处提前关闭连接：服务端写入随之失败，属预期
+      } finally {
+        exchange.close();
+      }
+    });
+    server.start();
+    return server;
+  }
+
   private static String baseUrlOf(HttpServer server) {
     return "http://127.0.0.1:" + server.getAddress().getPort();
   }
@@ -393,6 +418,29 @@ class ZstdSupportTest {
     assertNull(result, "超时必须返回 null（fail-open）");
     assertTrue(elapsedMillis < 5_000L,
         "等待时间必须有硬上限（1 秒超时 + 少量余量），实际 " + elapsedMillis + " ms");
+  }
+
+  /**
+   * 下载体积上限：响应超过 {@link ZstdSupport#MAX_DOWNLOAD_BYTES} 必须立即中止并拒绝（fail-open），
+   * 不得把超大文件写满磁盘、也不得在 lib 目录留下残留。
+   */
+  @Test
+  void oversizedDownloadIsRejectedAndFailsOpen(@TempDir Path libDir) throws Exception {
+    int chunkSize = 1 << 20; // 1 MiB
+    int count = (int) (ZstdSupport.MAX_DOWNLOAD_BYTES / chunkSize) + 2; // 略超上限
+    HttpServer server = serveRepeated(chunkSize, count);
+    try {
+      ZstdSupport.Codec result =
+          ZstdSupport.downloadCodec(libDir, baseUrlOf(server), "0".repeat(64), 20);
+
+      assertNull(result, "超过体积上限的下载必须被拒绝（返回 null，交由上层回退内置压缩）");
+      try (var entries = Files.list(libDir)) {
+        assertTrue(entries.findAny().isEmpty(),
+            "被上限拒绝的下载不得留下成品或 .tmp 残留：" + libDir);
+      }
+    } finally {
+      server.stop(0);
+    }
   }
 
   /** 加载校验：损坏 / 非 zstd 的 jar 必须被拒绝，且不得覆盖已经可用的探测结论。 */

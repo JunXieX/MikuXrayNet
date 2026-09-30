@@ -8,11 +8,12 @@ import io.netty.buffer.ByteBuf;
 /**
  * 单个 16×16×16 section 的方块数据：方块计数、bitsPerBlock、调色板与位打包索引数组。
  *
- * <p>关键约束（与上游实现一致，勿按「最优」改写）：
+ * <p>关键约束（与上游线格式一致，勿按「最优」改写）：
  * <ul>
  *   <li>bitsPerBlock=0 用单值调色板；读取时位宽 1 保留原值（兼容 FAWE 的非标准区块格式）；
- *       位宽 2..8 会被归一化为 {@code max(4, bitsPerBlock)}；位宽 &gt;8 一律按 direct 处理，
- *       且位宽取自 {@code registryAccessor.getMaxBitsPerBlockState()}；</li>
+ *       位宽 4..8 为间接调色板（{@code max(4, bitsPerBlock)} 仅对 4..8 是无操作）；
+ *       位宽 2..3 视为非法编码并拒绝（旧实现静默归一化为 4 位，见 {@link #setBitsPerBlock} 注释）；
+ *       位宽 &gt;8 一律按 direct 处理，且位宽取自 {@code registryAccessor.getMaxBitsPerBlockState()}；</li>
  *   <li>{@link #grow(int, int)} 升位时会把旧调色板索引整体重映射到新调色板，因此方块状态语义不变，
  *       但调色板索引顺序可能改变；</li>
  *   <li>元素序号为 {@code y << 8 | z << 4 | x}（共 4096 项）；</li>
@@ -63,6 +64,19 @@ public class ChunkSection {
         // 兼容第三方插件（如 FAWE）改写区块后产生的非法 bitsPerBlock == 1
         this.bitsPerBlock = bitsPerBlock;
         this.palette = new IndirectPalette(this.bitsPerBlock, this);
+      } else if (!grow && (bitsPerBlock == 2 || bitsPerBlock == 3)) {
+        // 位宽 2/3 只可能来自损坏数据或非标准写入：原版/Paper 的间接调色板下限就是 4 位，
+        // 绝不会下发 2 或 3。旧实现把它静默归一化成 4 位继续读——可位打包是按「声明的位宽」
+        // 写出的，归一化后每 long 项数与数组长度都会变，于是同一段字节会被<b>按错误位宽重新解释</b>：
+        // 既读出错值，又会多读若干 long、把后续（群系容器/下一个 section）的字节吞进方块数据，
+        // 最终解析错位。这是「碰巧能过」的静默错误，而非可用兼容（真正会发生的 FAWE 场景是
+        // 上面单独保留的 bits==1）。因此与调色板重复值、越界 id 等其它非法编码一致：显式拒绝，
+        // 交由上层解码 fail-open（放行原包、不改写）。
+        //
+        // 只对<b>读取</b>路径（!grow）生效：升位路径 grow() 会从 FAWE 兼容的 1 位逐级 +1 到 2、3，
+        // 那是本插件自己产生的合法中间态，必须继续走下面的 max(4, bits) 直接跳到 4 位。
+        throw new IllegalArgumentException("非法的 bitsPerBlock=" + bitsPerBlock
+            + "（合法：0 单值 / 1 兼容档 / 4..8 间接 / >8 直接）");
       } else if (bitsPerBlock <= 8) {
         this.bitsPerBlock = Math.max(4, bitsPerBlock);
         this.palette = new IndirectPalette(this.bitsPerBlock, this);
@@ -185,6 +199,13 @@ public class ChunkSection {
    */
   public void read(ByteBuf buffer) {
     this.blockCount = buffer.readShort();
+    // blockCount 是有符号 short：合法范围 0..4096（section 体积）。负值只可能来自损坏/非标准数据，
+    // 且会让 isEmpty()/位宽预算等判断落进「非空」这一侧。与其它非法编码（bitsPerBlock 2/3、调色板
+    // 重复值、越界 id）同口径：显式拒绝，交由上层解码 fail-open（放行原包、不改写）。
+    if (this.blockCount < 0) {
+      throw new IllegalArgumentException(
+          "非法的 blockCount=" + this.blockCount + "（section 体积为 0..4096）");
+    }
 
     if (this.versionFlags.hasFluidCount()) {
       this.fluidCount = buffer.readShort();
@@ -265,8 +286,9 @@ public class ChunkSection {
     }
 
     // 频次降序；同频保持原索引顺序（即按原索引升序），保证结果确定（同输入必然同输出，缓存可复用）。
-    // 用 int[] + 内联选择排序代替 Integer[] + Arrays.sort：避免每项装箱/比较器调用；调色板容量
-    // ≤ 1 << 15 但实际 ≤ 256，O(n²) 足够，且排序结果与旧比较器语义逐位一致（主键频次降序、次键索引升序）。
+    // 用 int[] + 内联选择排序代替 Integer[] + Arrays.sort：避免每项装箱/比较器调用；间接调色板
+    // 容量上限就是 256（8 位，{@code 1 << bitsPerBlock} 的最大值），O(n²) 足够，且排序结果与旧比较器
+    // 语义逐位一致（主键频次降序、次键索引升序）。
     int[] order = new int[size];
     for (int i = 0; i < size; i++) {
       order[i] = i;

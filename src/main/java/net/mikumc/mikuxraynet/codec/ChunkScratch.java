@@ -16,7 +16,7 @@ import java.util.Arrays;
  * <ul>
  *   <li>每个线程各持独立实例与独立空闲池（{@link ThreadLocal}），不跨线程共享，无需任何同步；</li>
  *   <li>{@link Chunk} 构造时 {@link #acquire()} 取用，{@link Chunk#close()} 时 {@link #recycle()} 归还；
- *       归还只把 scratch 放回空闲池，不保留任何区块数据（数组下次借出时由借出方重新初始化）；</li>
+ *       归还只把 scratch 放回空闲池，不保留任何区块数据（数组下次借出时由借出方重新初始化或校验）；</li>
  *   <li>调用方忘记 close，scratch 只是失去引用交给 GC，既不泄漏也不影响正确性（下次取用的是新实例）；</li>
  *   <li>空闲池每线程最多保留 {@value #MAX_IDLE_PER_THREAD} 个 scratch，占用有界。</li>
  * </ul>
@@ -65,7 +65,7 @@ final class ChunkScratch {
     }
   }
 
-  /** 借一个长度不小于 {@code size} 的字节数组；内容未初始化，由借出方负责填充（例如全填 0xFF）。 */
+  /** 借一个长度不小于 {@code size} 的字节数组；内容未初始化，由借出方负责填充或校验。 */
   byte[] bytes(int size) {
     if (this.byteCursor < this.byteArrays.size()) {
       byte[] cached = this.byteArrays.get(this.byteCursor);

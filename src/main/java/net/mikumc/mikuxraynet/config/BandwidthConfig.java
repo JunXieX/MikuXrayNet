@@ -33,6 +33,16 @@ public final class BandwidthConfig {
 
   /** 合并半径上限（格）：范围越大越省包且不影响正确性，故放宽到 16。 */
   public static final int MAX_MERGE_RADIUS = 16;
+  /**
+   * 合并半径下限（格，1）。
+   *
+   * <p><b>为什么不许取 0</b>：合并半径 0 表示「只有坐标完全相同（曼哈顿距离 0）的变更才归入同一簇」，
+   * 真实场景下几乎所有变更坐标互不相同，于是 {@code BlockChangeMerger} 仍会把原包<b>入缓冲并延迟一个
+   * 时间窗</b>，却几乎永远拼不出可合并的多条簇——结果是「既省不到包、又给每个变更加了延迟与缓冲开销」
+   * 的纯负收益。要彻底关掉合并请用 {@code block-changes.merge=false}（连缓冲都不建），而不是把半径配 0。
+   * 因此这里设硬下限 1：低于 1 会被抬到 1 并记入明细（供加载路径一次性 WARN）。
+   */
+  public static final int MIN_MERGE_RADIUS = 1;
   /** 单个合并包条目上限：单包容量越大越省包，故放宽到 32768。 */
   public static final int MAX_PER_PACKET_LIMIT = 32768;
   /** 合并时间窗上限（毫秒）：窗口就是「玩家可感知的方块更新延迟上界」，200ms 以上观感明显迟滞。 */
@@ -195,7 +205,9 @@ public final class BandwidthConfig {
             root.getBoolean("block-changes.enabled", true),
             root.getBoolean("block-changes.merge", true),
             // 默认 4（性能优先）：合并更多远处变更，交互半径内不受影响（见 BlockChangeMerger）。
-            clampUpper(Math.max(0, root.getInt("block-changes.merge-radius", 4)),
+            // 下限 1：0 是纯负收益（仍入缓冲延迟却几乎拼不出可合并簇），要关合并请用 merge=false。
+            clampUpper(clampLower(root.getInt("block-changes.merge-radius", 4),
+                MIN_MERGE_RADIUS, "block-changes.merge-radius", clampAdjustments),
                 MAX_MERGE_RADIUS, "block-changes.merge-radius", clampAdjustments),
             clampUpper(Math.max(1, root.getInt("block-changes.max-per-packet", 4096)),
                 MAX_PER_PACKET_LIMIT, "block-changes.max-per-packet", clampAdjustments),

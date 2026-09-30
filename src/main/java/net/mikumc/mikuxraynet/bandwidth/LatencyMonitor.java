@@ -138,17 +138,20 @@ public final class LatencyMonitor implements Listener {
       // 读的必须是 send 视距：与下面写入、以及 restore 的还原严格配对，
       // 否则一次降级+还原会把 view-distance 永久改成原 send 值（见类注释）
       int current = player.getSendViewDistance();
-      if (current <= config.minViewDistance()) {
+      // 生效下限 = max(API 硬下限 2, 配置的 min-view-distance)：配置下限是弱网玩家的体验兜底，
+      // 必须与 API 硬下限取并集，绝不能因为某次钳制被击穿。
+      int floor = Math.max(2, config.minViewDistance());
+      if (current <= floor) {
         return;
       }
-      int target = Math.max(config.minViewDistance(), current - Math.max(1, config.reduceViewDistance()));
-      if (target >= current) {
-        return;
-      }
-      // setSendViewDistance 要求目标 ≤ 玩家当前 view-distance（且落在 [2,32]）：超出就钳到合法范围，
-      // 而不是交给它抛异常（catch 仅作最后兜底）。
-      target = Math.max(2, Math.min(target, player.getViewDistance()));
-      if (target >= current) {
+      int target = Math.max(floor, current - Math.max(1, config.reduceViewDistance()));
+      // setSendViewDistance 要求目标 ≤ 玩家当前 view-distance 且落在 [2,32]：按 API 上限收敛，
+      // 只降不升（target 必 < current）。
+      int apiMax = Math.min(32, player.getViewDistance());
+      target = Math.min(target, apiMax);
+      // 收敛后若仍不低于当前值（无实际降低），或已被压到生效下限之下（服务端 view-distance 比下限还小，
+      // 属异常状态），则放弃本次降级——宁可不动，也绝不把视距降到配置下限以下。
+      if (target >= current || target < floor) {
         return;
       }
       originalViewDistance.put(player.getUniqueId(), current);
@@ -161,17 +164,21 @@ public final class LatencyMonitor implements Listener {
   }
 
   private void restore(Player player) {
-    Integer original = originalViewDistance.remove(player.getUniqueId());
+    // 用 get（而非 remove）取原值：还原失败时保留原值，下一次 tick 仍可重试——
+    // 旧实现先 remove 再 set，一旦 set 抛异常原视距就永久丢失，玩家被永久卡在降级后的视距。
+    Integer original = originalViewDistance.get(player.getUniqueId());
     if (original == null) {
       return;
     }
     try {
       // 与 reduce 配对：还原也写 send 视距（originalViewDistance 记录的正是原 send 值）
       player.setSendViewDistance(original);
-      stats.viewDistanceRestored.increment();
     } catch (Throwable throwable) {
-      plugin.getLogger().fine("还原视距失败：" + throwable.getMessage());
+      plugin.getLogger().fine("还原视距失败（保留原值，下次检查重试）：" + throwable.getMessage());
+      return;
     }
+    originalViewDistance.remove(player.getUniqueId(), original);
+    stats.viewDistanceRestored.increment();
   }
 
   /** 停用兜底：还原全部被下调的视距。 */

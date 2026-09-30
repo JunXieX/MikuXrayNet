@@ -24,7 +24,9 @@ entity-packets:
   # 模块总开关。false = 本模块完全关闭（零开销）。
   enabled: true
 
-  # 取消「零位移」实体位置/朝向包（位移与转向增量全为 0），可明显降低实体密集区的带宽。
+  # 取消「零位移」实体位置包（纯位移包 REL_ENTITY_MOVE 的 dx/dy/dz 全为 0），可降低实体密集区的带宽。
+  # 说明：朝向包（REL_ENTITY_MOVE_LOOK / ENTITY_LOOK）不做此取消——其 yaw/pitch 是「绝对量化角」
+  # （0 表示朝正南 / 平视），不是相对增量；按全 0 取消会让客户端保留旧朝向、产生持久朝向错误。
   skip-zero-movement: true
 
   # 白名单：这些实体类型即使零位移也照常下发（如盔甲架、展示框）。

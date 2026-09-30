@@ -53,7 +53,9 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
  *
  * <p><b>线程纪律</b>：全部磁盘 IO 都在本类自有的单线程
  * （{@code MikuXrayNet-DiskCache}）上执行；写入是「提交即返回」，读取带 50ms 预算，超时按未命中降级，
- * 因此既不会阻塞 Netty 线程，也不会把封包工作线程拖过处理时限。
+ * 收尾（{@link #flush}/{@link #invalidateWorld}）带 50ms 预算、超时只停等不取消任务（由磁盘线程自行跑完），
+ * 因此既不会阻塞 Netty 线程，也不会把封包工作线程拖过处理时限，更不会在世界卸载时卡住主线程。
+ * 该线程的身份用 {@link #DISK_THREAD} 标记判定（不靠线程名，避免被改名/同名外来线程误导）。
  *
  * <p><b>fail-open</b>：任何异常/超时都只记日志并计数，读写统统退化为「未命中 / 不写入」，
  * 绝不影响封包链路与反矿透主流程。
@@ -63,8 +65,23 @@ public final class DiskCacheStore implements AutoCloseable {
   private static final String THREAD_NAME = "MikuXrayNet-DiskCache";
   /** 单次读取的等待预算（毫秒）：超时按未命中处理，保证封包路径不被磁盘拖住。 */
   private static final long READ_TIMEOUT_MILLIS = 50L;
-  /** flush / 关闭类操作的等待预算（毫秒）。 */
-  private static final long FLUSH_TIMEOUT_MILLIS = 5000L;
+  /**
+   * flush / 世界失效（{@link #flush}/{@link #invalidateWorld}）的等待预算（毫秒）。
+   *
+   * <p><b>为什么压到毫秒级</b>：这两条路径会在<b>世界卸载（主线程）</b>与配置热重载上被调用，而磁盘线程
+   * 可能正忙于压缩（整文件重写 + {@code force(true)} + {@code move} 的长任务）。旧实现等 5 秒，
+   * 等于在世界卸载时把主线程卡住最长 5 秒（玩家可感的卡服）。这里只等一小段时间，超时后
+   * <b>不取消任务</b>（见 {@link #submitBounded}）——落盘与关句柄仍由磁盘线程自行跑完，
+   * 因此「最终落盘」语义不变，只是调用方不再干等。
+   */
+  private static final long FLUSH_WAIT_MILLIS = 50L;
+  /**
+   * 关闭（{@link #close()}）排空磁盘线程的等待预算（毫秒）。
+   *
+   * <p>与上面的 {@link #FLUSH_WAIT_MILLIS} 不同，这里必须等得足够久把脏数据真正落盘：close 之后紧接
+   * {@code shutdownNow}，若提前返回，正在进行的 FileChannel IO 会被中断而永久失效（数据丢失）。
+   */
+  private static final long CLOSE_TIMEOUT_MILLIS = 5000L;
   /** 触发压缩回收的垃圾占比（垃圾字节 > 活数据的一半）。 */
   private static final double COMPACT_GARBAGE_RATIO = 0.5D;
   /**
@@ -79,6 +96,18 @@ public final class DiskCacheStore implements AutoCloseable {
 
   /** 区域缓存文件后缀（BufferedLinearV3 的线性 bucket 布局）。 */
   private static final String REGION_FILE_SUFFIX = ".b_linear";
+
+  /**
+   * 「当前线程就是磁盘线程」的身份标记，<b>只由磁盘线程自身在启动时写入</b>（见构造器里的线程工厂）。
+   *
+   * <p><b>为什么不能用线程名判定</b>：线程名是外部可改的。任何外来线程（例如 Folia 的区域线程、
+   * Netty 线程）都能把自己命名为 {@code MikuXrayNet-DiskCache}，从而被误判为磁盘线程并绕过
+   * {@link #submit} 的排队，直接<b>在调用方线程上执行磁盘 IO</b>（拖住热路径）；反过来磁盘线程一旦
+   * 被改名，它自己提交的读取就会去排队等自己 → 必然超时、缓存失效。ThreadLocal 由工作线程写入、
+   * 外来线程读到的恒为 {@code null}，无法伪造，也与 Folia「一区域一线程」的语义天然兼容
+   * （区域线程不会被判成缓存线程）。
+   */
+  private static final ThreadLocal<Boolean> DISK_THREAD = new ThreadLocal<>();
 
   /** 区域坐标键（只含不可变类型，不可能钉住世界对象）。 */
   private record RegionKey(String worldName, int regionX, int regionZ) {
@@ -135,6 +164,8 @@ public final class DiskCacheStore implements AutoCloseable {
   private final Set<RegionKey> entryCounted = ConcurrentHashMap.newKeySet();
   private final long maxFileSizeBytes;
   private final long readTimeoutMillis;
+  /** flush / 世界失效的等待预算（毫秒）；生产为 {@link #FLUSH_WAIT_MILLIS}，测试可放宽。 */
+  private final long flushWaitMillis;
   private final ScheduledExecutorService executor;
   /**
    * 压缩会话是否进行中。
@@ -146,24 +177,53 @@ public final class DiskCacheStore implements AutoCloseable {
 
   private volatile boolean closed;
 
+  /**
+   * {@link #close()} 是否已开始（CAS 保证并发/重复调用只真正排空一次）。
+   *
+   * <p><b>为什么单独需要它</b>：{@code closed} 必须在排空<b>之前</b>置位（见 {@link #close()}），
+   * 而「先置位再排空」会引入「已进入关闭、但排空尚未完成」的中间态；用 CAS 保证这个中间态只被
+   * 一个线程拥有，另一个并发 close 直接返回，不会重复排空。
+   */
+  private final AtomicBoolean closeRequested = new AtomicBoolean();
+
   public DiskCacheStore(Path rootDir, AntiXrayConfig.DiskCache config, Logger logger) {
-    this(rootDir, config, logger, READ_TIMEOUT_MILLIS);
+    this(rootDir, config, logger, READ_TIMEOUT_MILLIS, FLUSH_WAIT_MILLIS);
   }
 
   /**
-   * 测试用构造：可指定读取等待预算。
+   * 测试用构造：可指定读取等待预算（收尾操作沿用同一预算，避免 CI 磁盘抖动被误判为超时）。
    *
    * @param readTimeoutMillis 单次读取的等待上限（毫秒），超时按未命中降级
    */
   DiskCacheStore(Path rootDir, AntiXrayConfig.DiskCache config, Logger logger,
       long readTimeoutMillis) {
+    this(rootDir, config, logger, readTimeoutMillis, readTimeoutMillis);
+  }
+
+  /**
+   * 测试用构造：可分别指定读取与收尾（flush / 世界失效）的等待预算。
+   *
+   * @param readTimeoutMillis 单次读取的等待上限（毫秒），超时按未命中降级
+   * @param flushWaitMillis   flush / 世界失效的等待上限（毫秒）；超时后任务仍由磁盘线程自行跑完
+   */
+  DiskCacheStore(Path rootDir, AntiXrayConfig.DiskCache config, Logger logger,
+      long readTimeoutMillis, long flushWaitMillis) {
     this.rootDir = rootDir;
     this.config = config;
     this.logger = logger;
     this.readTimeoutMillis = Math.max(1L, readTimeoutMillis);
+    this.flushWaitMillis = Math.max(1L, flushWaitMillis);
     this.maxFileSizeBytes = Math.max(1L, config.maxFileSizeMb()) * 1024L * 1024L;
     this.executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
-      Thread thread = new Thread(runnable, THREAD_NAME);
+      Thread thread = new Thread(() -> {
+        // 由磁盘线程自身写入身份标记：只有在磁盘线程内执行时才为 true，外来线程无法伪造（见 DISK_THREAD）
+        DISK_THREAD.set(Boolean.TRUE);
+        try {
+          runnable.run();
+        } finally {
+          DISK_THREAD.remove();
+        }
+      }, THREAD_NAME);
       thread.setDaemon(true);
       return thread;
     });
@@ -260,34 +320,50 @@ public final class DiskCacheStore implements AutoCloseable {
     execute(() -> doPut(worldName, chunkX, chunkZ, configHash, writtenAt, payload));
   }
 
-  /** 世界卸载：落盘 + 关闭该世界的全部句柄（文件保留，下次加载可复用）。 */
+  /**
+   * 世界卸载：落盘 + 关闭该世界的全部句柄（文件保留，下次加载可复用）。
+   *
+   * <p>该调用发生在<b>主线程</b>的世界卸载事件里：最多等 {@link #flushWaitMillis} 毫秒即返回，
+   * 超时后关句柄仍由磁盘线程跑完（见 {@link #submitBounded}），因此不会为等缓存而卡住主线程。
+   */
   public void invalidateWorld(String worldName) {
     if (worldName == null || !usable()) {
       return;
     }
-    submit(() -> {
+    submitBounded(() -> {
       closeWorldHandles(worldName);
       return null;
-    }, FLUSH_TIMEOUT_MILLIS);
+    }, flushWaitMillis);
   }
 
-  /** 立即把所有脏数据落盘（插件停用前置步骤、配置热重载后调用）。 */
+  /**
+   * 把所有脏数据落盘（配置热重载后调用）。
+   *
+   * <p>最多等 {@link #flushWaitMillis} 毫秒即返回（该调用通常在主线程）：超时后落盘仍会由磁盘线程
+   * 自行完成，最终落盘语义不变（见 {@link #submitBounded}）。
+   */
   public void flush() {
     if (!usable()) {
       return;
     }
-    submit(() -> {
+    submitBounded(() -> {
       flushAll();
       return null;
-    }, FLUSH_TIMEOUT_MILLIS);
+    }, flushWaitMillis);
   }
 
   /** 全部落盘并关闭；可重复调用。 */
   @Override
   public void close() {
-    if (closed) {
+    // 必须「先置 closed、再排空」：旧实现把 closed 放在 future.get(...) 之后才置位，于是排空期间
+    // （最长 CLOSE_TIMEOUT_MILLIS ≈ 5s）usable() 仍为 true，工作线程提交的 put/get 会被排到排空任务
+    // 之后执行，在 closeAllHandles 之后重新打开句柄并留在 open 表里——shutdownNow 后无人再关闭它们
+    // （句柄泄漏、文件锁悬挂）。现在 closed 先置位，usable() 立即为 false，新提交一律被拒；
+    // 下面 execute()/submit()/handle() 也都以 closed 为闸，保证「重新打开路径」在 closed 后不可达。
+    if (!closeRequested.compareAndSet(false, true)) {
       return;
     }
+    closed = true;
     try {
       Future<?> future = executor.submit(() -> {
         try {
@@ -297,11 +373,10 @@ public final class DiskCacheStore implements AutoCloseable {
           fail("关闭磁盘缓存时出现异常", throwable);
         }
       });
-      future.get(FLUSH_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+      future.get(CLOSE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
     } catch (Throwable throwable) {
       fail("关闭磁盘缓存超时或异常，已强制结束", throwable);
     }
-    closed = true;
     executor.shutdownNow();
   }
 
@@ -368,6 +443,10 @@ public final class DiskCacheStore implements AutoCloseable {
     int regionX = BufferedLinearV3Format.regionCoordinate(chunkX);
     int regionZ = BufferedLinearV3Format.regionCoordinate(chunkZ);
     Handle handle = handle(worldName, regionX, regionZ, true);
+    if (handle == null) {
+      // 已关闭（handle() 在 closed 后返回 null）：不再打开句柄，直接跳过本次写入
+      return;
+    }
     if (handle.file.lockUnavailable()) {
       // 该文件被其它服务端实例占用：本实例对它停用读写（见 RegionFile#lockUnavailable）。
       // 必须在这里就返回，否则下面会把「写了但没落盘」的条目计进 approximateEntries，白白耗尽额度。
@@ -600,6 +679,11 @@ public final class DiskCacheStore implements AutoCloseable {
   /** 打开（或复用）区域文件句柄；文件头损坏时删除重建（缓存可丢，但不能卡住链路）。 */
   private Handle handle(String worldName, int regionX, int regionZ, boolean create)
       throws IOException {
+    if (closed) {
+      // 关闭后绝不再打开新句柄：这是「重新打开路径在 closed 后不可达」的最后一道闸（前两道是
+      // usable() 与 execute()/submit()）。返回 null 由调用方按未命中/跳过处理。
+      return null;
+    }
     // 键里存<b>sanitize 后</b>的世界名：物理文件就是按 sanitize 名落盘的，若键里存原始名，
     // 「World」「world」两个键会各自解析到同一路径、开出两个句柄互踩（Windows 上 ATOMIC_MOVE 还会失败）。
     String world = sanitize(worldName);
@@ -709,7 +793,9 @@ public final class DiskCacheStore implements AutoCloseable {
 
   /** 提交一个不等待结果的任务（写入、落盘等）。 */
   private void execute(ThrowingRunnable task) {
-    if (executor == null || executor.isShutdown()) {
+    // closed 也视为「不可提交」：关闭排队期间仍可能有工作线程越过 usable() 判定才提交，
+    // 若放行就会在排空之后重新打开句柄（见 close() 说明）。
+    if (closed || executor == null || executor.isShutdown()) {
       return;
     }
     if (pendingOps.get() >= config.queueCapacity()) {
@@ -734,7 +820,8 @@ public final class DiskCacheStore implements AutoCloseable {
 
   /** 提交一个带预算的任务；超时或异常都返回 {@code null}（fail-open）。 */
   private <T> T submit(Callable<T> task, long timeoutMillis) {
-    if (executor == null || executor.isShutdown()) {
+    // 与 execute() 同理：closed 后一律不再提交（关闭中的排空任务由 close() 直接 submit，不走这里）。
+    if (closed || executor == null || executor.isShutdown()) {
       return null;
     }
     if (isCacheThread()) {
@@ -784,8 +871,73 @@ public final class DiskCacheStore implements AutoCloseable {
     }
   }
 
+  /**
+   * 提交一个「最终必须完成、但调用方最多只等 {@code waitMillis}」的收尾任务
+   * （落盘 {@link #flush()} / 关闭指定世界句柄 {@link #invalidateWorld(String)}）。
+   *
+   * <p>与 {@link #submit} 的两点差别：
+   * <ol>
+   *   <li><b>超时不取消任务</b>：落盘与关句柄是必须发生的收尾工作；若像读取那样 {@code cancel(false)}
+   *       把任务从队列里摘掉，世界卸载后的脏数据与句柄就永远无人处理。超时只代表「调用方不再等」，
+   *       任务仍由磁盘线程自行跑完，最终一致性不变；</li>
+   *   <li><b>等待预算压到毫秒级</b>（见 {@link #FLUSH_WAIT_MILLIS}）：世界卸载与配置热重载都在主线程上，
+   *       不能为等磁盘线程（可能正在压缩）而卡住主线程。</li>
+   * </ol>
+   * 队列满时直接跳过、异常只记日志并计数——与 {@link #submit} 一致的 fail-open。
+   */
+  private void submitBounded(Callable<?> task, long waitMillis) {
+    // 与 execute()/submit() 同理：closed 后一律不再提交（关闭中的排空由 close() 直接 submit，不走这里）。
+    if (closed || executor == null || executor.isShutdown()) {
+      return;
+    }
+    if (isCacheThread()) {
+      // 已在磁盘线程内：直接执行，避免自等自（与 submit() 同理）
+      try {
+        task.call();
+      } catch (Throwable throwable) {
+        fail("磁盘缓存收尾操作失败（已在磁盘线程内直接降级）", throwable);
+      }
+      return;
+    }
+    if (pendingOps.get() >= config.queueCapacity()) {
+      return;
+    }
+
+    pendingOps.incrementAndGet();
+    Future<?> future;
+    try {
+      future = executor.submit(() -> {
+        try {
+          task.call();
+        } catch (Throwable throwable) {
+          // 在这里就地记录：调用方超时返回后没人再看 future 的异常，否则失败会被静默吞掉
+          fail("磁盘缓存收尾操作失败（本次按无操作跳过，不影响链路）", throwable);
+        } finally {
+          pendingOps.decrementAndGet();
+        }
+      });
+    } catch (Throwable throwable) {
+      pendingOps.decrementAndGet();
+      fail("磁盘缓存收尾任务提交失败", throwable);
+      return;
+    }
+
+    try {
+      future.get(waitMillis, TimeUnit.MILLISECONDS);
+    } catch (TimeoutException exception) {
+      // 不取消：任务继续排在磁盘线程上跑完（取消会让这次收尾永久丢失，见方法说明）
+      stats.errors.increment();
+    } catch (ExecutionException exception) {
+      // 任务体已自行捕获 Throwable，这里只为满足受检异常签名（正常不可达）
+      fail("磁盘缓存收尾任务执行失败", exception.getCause() == null ? exception : exception.getCause());
+    } catch (InterruptedException exception) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
   private static boolean isCacheThread() {
-    return THREAD_NAME.equals(Thread.currentThread().getName());
+    // 身份判定而非线程名判定：标记只由磁盘线程自己写入，名字被改或被伪造都影响不到它
+    return Boolean.TRUE.equals(DISK_THREAD.get());
   }
 
   private void fail(String message, Throwable throwable) {

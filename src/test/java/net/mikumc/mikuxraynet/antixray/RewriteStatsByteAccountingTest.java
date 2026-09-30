@@ -44,6 +44,27 @@ class RewriteStatsByteAccountingTest {
         "节省恒等于原始 − 输出（口径自洽）");
   }
 
+  /**
+   * 口径锁定：{@code chunksFailed} 是 {@code chunksSkipped} 的<b>子集</b>（失败区块未改写 → 同时计入
+   * 二者），因此二者不互斥、不可相加。生产路径（{@code ProtocolLibAsyncListener#rewrite}）对失败结果
+   * 会先计 {@code chunksFailed}、再走 {@code else} 分支计 {@code chunksSkipped}；本测试按同一模型累加，
+   * 保证「跳过 = 普通跳过 + 失败」「本来就无需改写 = 跳过 − 失败」这条口径不被无意改坏。
+   */
+  @Test
+  void failedChunksAreASubsetOfSkippedNotMutuallyExclusive() {
+    RewriteStats stats = new RewriteStats();
+
+    stats.chunksSkipped.increment();  // 无目标方块的普通跳过（只计「跳过」）
+    stats.chunksFailed.increment();   // 解析失败：先计「失败」……
+    stats.chunksSkipped.increment();  // ……再计「跳过」（失败确实未改写，属其子集）
+
+    Map<String, Long> snapshot = stats.snapshot();
+    assertEquals(2L, snapshot.get("跳过"), "未改写总量含普通跳过与失败两种情形");
+    assertEquals(1L, snapshot.get("失败"), "失败是「跳过」的子集，单独可观测");
+    assertEquals(1L, snapshot.get("跳过") - snapshot.get("失败"),
+        "「本来就无需改写」的数量 = 跳过 − 失败（二者并非互斥，切不可相加）");
+  }
+
   @Test
   void paletteBitsHistogramClampsAndFormats() {
     RewriteStats stats = new RewriteStats();

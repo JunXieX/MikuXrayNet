@@ -170,6 +170,62 @@ public final class ObfuscatedChunkIndex {
   }
 
   /**
+   * 批量注销<b>同一区块</b>内的多个坐标（出站多方块变更包路径，一个 section 只调用一次）。
+   *
+   * <p><b>为什么需要它</b>：{@link #removePosition} 每摘一个坐标都要二分定位后把整个 {@code locals}
+   * 数组整段复制一次；一个 section 最多 4096 个坐标时会退化成 {@code O(k·n)} 的元素拷贝（最坏千万级）。
+   * 这里把同一区块的一批坐标合并成「一次定位 + 一次重建」：先用二分在原始数组里标出全部命中位置，
+   * 再一次性重建，净成本从 {@code O(k·n)} 降到 {@code O(n + k·log n)}。
+   *
+   * <p>与 {@link #removePosition} 语义一致：只摘传入坐标，其它坐标不受影响；清单被摘空时整条移除。
+   * 传入坐标允许重复（重复项只计一次命中）。
+   *
+   * @param coordinates 绝对坐标三元组（{@code x,y,z} 连续存放）；调用方保证它们同属一个区块
+   * @param count       有效坐标个数（前 {@code count} 个三元组）
+   * @return 实际命中并摘除的坐标数
+   */
+  public int removePositions(String worldName, int[] coordinates, int count) {
+    if (worldName == null || coordinates == null || count <= 0 || coordinates.length < count * 3) {
+      return 0;
+    }
+    // 同一 section 的坐标必然落在同一区块：由首坐标导出区块键
+    ChunkKey key = ChunkKey.ofBlock(worldName, coordinates[0], coordinates[2]);
+    int[] hitCount = {0};
+    chunks.computeIfPresent(key, (ignored, entry) -> {
+      int[] locals = entry.locals();
+      int minHeight = entry.minHeight();
+      boolean[] removed = new boolean[locals.length];
+      int hits = 0;
+      for (int i = 0; i < count; i++) {
+        int local = ((coordinates[i * 3 + 1] - minHeight) << 8)
+            | ((coordinates[i * 3 + 2] & 15) << 4) | (coordinates[i * 3] & 15);
+        int found = Arrays.binarySearch(locals, local);
+        if (found >= 0 && !removed[found]) {
+          removed[found] = true;
+          hits++;
+        }
+      }
+      if (hits == 0) {
+        return entry;
+      }
+      hitCount[0] = hits;
+      subtract(totalPositions, hits);
+      if (hits == locals.length) {
+        return null;
+      }
+      int[] reduced = new int[locals.length - hits];
+      int write = 0;
+      for (int i = 0; i < locals.length; i++) {
+        if (!removed[i]) {
+          reduced[write++] = locals[i];
+        }
+      }
+      return new ChunkEntry(minHeight, reduced, entry.updatedAtNanos());
+    });
+    return hitCount[0];
+  }
+
+  /**
    * 查询一个绝对方块坐标当前是否仍在伪装清单里（只读，不修改任何状态）。
    *
    * <p>供事件驱动即时显形的触发判定使用：出站方块变更包的解析线程会调用本方法做

@@ -11,12 +11,32 @@ package net.mikumc.mikuxraynet.bandwidth;
  *
  * <p>同时缓存玩家最后所在的方块坐标与精确坐标：AFK 期间玩家不再移动，因此该缓存可在网络线程
  * 上安全读取用于距离判定，避免在封包线程访问实体位置。
+ *
+ * <p><b>坐标的撕裂读与「允许一步长偏差」的刻意选择（勿当 bug 修）</b>：6 个坐标字段各自是独立
+ * volatile，网络线程在同一位置判定里逐个读取 {@link #x()} / {@link #y()} / {@link #z()} 时，
+ * 理论上可能读到「X 来自本次更新、Z 来自上一次更新」的混合组合，偏差至多一个移动步长。
+ * 这是<b>刻意接受</b>的取舍，原因：
+ * <ol>
+ *   <li>写入只在「跨方块移动」（{@link #touch} 传入 {@code movedToNewBlock=true}）时发生，而
+ *       {@link #touch} 同时会把 {@link #afk} 置为 {@code false} —— 距离判定只在 {@code afk()==true}
+ *       时才被使用，玩家正在移动（坐标在变）时几乎不可能命中该分支；</li>
+ *   <li>即便命中，判定本身只用于决定「是否丢弃一颗远处粒子/破坏动画包」，一步长的位置误差既不会
+ *       丢错（误差远小于默认 16 格距离阈值），也最多造成一颗粒子多留一帧——影响不可感知；</li>
+ *   <li>改为「打包成不可变位置对象一次性发布」只能把 6 次 volatile 读降为 1 次，但消费侧
+ *       （{@code AfkTracker}）仍是分三次调用 {@link #x()} / {@link #y()} / {@link #z()}，
+ *       要真正消除读取侧的混合组合必须同时改调用点；在收益不可感知的前提下，不值得为此改动热路径
+ *       调用方。</li>
+ * </ol>
+ * 因此本类<b>有意</b>保留「允许一步长偏差」的语义；若日后确需严格一致的位置快照，请连同调用点
+ * （一次性取出整组坐标）一起改造，切勿只在本类里加锁或换原子对象——那既解决不了读取侧问题，
+ * 又会给 netty 热路径引入额外开销。</p>
  */
 public final class AfkState {
 
   private volatile long lastActiveMillis;
   private volatile boolean afk;
 
+  /** 最后所在方块的 X（与 {@link #x} 等精确坐标一并由 {@link #touch} 在跨方块移动时刷新）。 */
   private volatile int blockX;
   private volatile int blockY;
   private volatile int blockZ;

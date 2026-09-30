@@ -35,6 +35,8 @@ class LatencyMonitorTest {
   private static final class PlayerState {
     int send;
     int view;
+    /** 置位后，下一次 setSendViewDistance 抛异常（模拟还原失败）。 */
+    boolean failNextSendSet;
     final List<String> sendSets = new ArrayList<>();
     final List<String> viewSets = new ArrayList<>();
   }
@@ -48,6 +50,10 @@ class LatencyMonitorTest {
         case "getViewDistance":
           return state.view;
         case "setSendViewDistance":
+          if (state.failNextSendSet) {
+            state.failNextSendSet = false;
+            throw new IllegalStateException("模拟视距写入失败");
+          }
           state.sendSets.add(String.valueOf(args[0]));
           state.send = (Integer) args[0];
           return null;
@@ -165,6 +171,49 @@ class LatencyMonitorTest {
 
     invoke(monitor, "reduce", player);
     assertTrue(state.sendSets.isEmpty(), "已在最小 send 视距时不降级");
+    assertTrue(state.viewSets.isEmpty());
+  }
+
+  /**
+   * 还原失败必须<b>保留原值</b>以便下一次检查重试：旧实现先 {@code remove} 再 {@code set}，一旦
+   * {@code setSendViewDistance} 抛异常原视距就永久丢失，玩家被永久卡在降级后的视距上。
+   */
+  @Test
+  void restoreFailureKeepsOriginalValueForRetry() throws Exception {
+    LatencyMonitor monitor = new LatencyMonitor(stubPlugin(), config(2, 4), new ThrottleStats());
+    PlayerState state = new PlayerState();
+    state.send = 12;
+    state.view = 12;
+    Player player = stubPlayer(state);
+
+    invoke(monitor, "reduce", player);
+    assertEquals(List.of("10"), state.sendSets, "先降级到 10");
+
+    // 第一次还原抛异常：原值必须保留（map 里仍留有 12），本次不产生任何写入
+    state.failNextSendSet = true;
+    invoke(monitor, "restore", player);
+    assertEquals(List.of("10"), state.sendSets, "还原失败不得改动 send 视距");
+
+    // 模拟下一次 tick 重试：原值仍在，成功写回 12
+    invoke(monitor, "restore", player);
+    assertEquals(List.of("10", "12"), state.sendSets, "失败后重试必须把原值 12 写回");
+
+    // 已成功还原：原值条目已移除，再次调用不得重复写入
+    invoke(monitor, "restore", player);
+    assertEquals(List.of("10", "12"), state.sendSets, "成功还原后不得重复写入");
+  }
+
+  /** 目标收敛后若被压到配置下限之下（服务端 view-distance 比下限还小），放弃降级而不是击穿下限。 */
+  @Test
+  void noReductionWhenClampWouldBreakConfiguredFloor() throws Exception {
+    LatencyMonitor monitor = new LatencyMonitor(stubPlugin(), config(2, 6), new ThrottleStats());
+    PlayerState state = new PlayerState();
+    state.send = 12;
+    state.view = 5; // 服务端 view-distance 小于配置下限 6 → 任何钳制都会击穿下限
+    Player player = stubPlayer(state);
+
+    invoke(monitor, "reduce", player);
+    assertTrue(state.sendSets.isEmpty(), "钳制会击穿视距下限时必须放弃降级，绝不降到下限以下");
     assertTrue(state.viewSets.isEmpty());
   }
 }

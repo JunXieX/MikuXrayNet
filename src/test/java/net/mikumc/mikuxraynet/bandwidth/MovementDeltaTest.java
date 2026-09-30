@@ -6,11 +6,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-/** 零位移判定：覆盖各字段组合（全 0 → 取消；任一非 0 → 放行）。 */
+/**
+ * 零位移取消判定：只有纯位移包（{@code REL_ENTITY_MOVE}）的零位移可取消；朝向包绝不因全 0 取消。
+ */
 class MovementDeltaTest {
 
   @Test
-  @DisplayName("位置增量全为 0 时才判定为冗余")
+  @DisplayName("位置增量全为 0 时才判定为零位移")
   void zeroMoveOnlyWhenAllZero() {
     assertTrue(MovementDelta.isZeroMove((short) 0, (short) 0, (short) 0));
 
@@ -21,27 +23,22 @@ class MovementDeltaTest {
   }
 
   @Test
-  @DisplayName("朝向增量全为 0 时才判定为冗余")
-  void zeroRotationOnlyWhenAllZero() {
-    assertTrue(MovementDelta.isZeroRotation((byte) 0, (byte) 0));
-
-    assertFalse(MovementDelta.isZeroRotation((byte) 1, (byte) 0));
-    assertFalse(MovementDelta.isZeroRotation((byte) 0, (byte) -1));
-    assertFalse(MovementDelta.isZeroRotation((byte) 1, (byte) 1));
+  @DisplayName("纯位移包（carriesRotation=false）：零增量仍取消，任一非 0 放行")
+  void pureMoveZeroDeltaIsCancelled() {
+    assertTrue(MovementDelta.isRedundantEntityUpdate(false, (short) 0, (short) 0, (short) 0),
+        "纯位移包位移全为 0 → 冗余，取消（带宽优化收益保留）");
+    assertFalse(MovementDelta.isRedundantEntityUpdate(false, (short) 1, (short) 0, (short) 0));
+    assertFalse(MovementDelta.isRedundantEntityUpdate(false, (short) 0, (short) 0, (short) -1));
   }
 
   @Test
-  @DisplayName("移动+转向包：位移与转向都为零才取消")
-  void moveAndRotationPacketNeedsBothZero() {
-    // REL_ENTITY_MOVE_LOOK 形态
-    assertTrue(isRedundantMoveLook((short) 0, (short) 0, (short) 0, (byte) 0, (byte) 0));
-    assertFalse(isRedundantMoveLook((short) 0, (short) 0, (short) 0, (byte) 0, (byte) 1));
-    assertFalse(isRedundantMoveLook((short) 0, (short) 1, (short) 0, (byte) 0, (byte) 0));
-    assertFalse(isRedundantMoveLook((short) 1, (short) 1, (short) 1, (byte) 1, (byte) 1));
-  }
-
-  /** 与监听器中的组合判定保持一致。 */
-  private static boolean isRedundantMoveLook(short dx, short dy, short dz, byte yaw, byte pitch) {
-    return MovementDelta.isZeroMove(dx, dy, dz) && MovementDelta.isZeroRotation(yaw, pitch);
+  @DisplayName("朝向包：即便 yaw=0/pitch=0 也必须下发，绝不按全 0 取消")
+  void rotationPacketsAreNeverCancelled() {
+    // REL_ENTITY_MOVE_LOOK / ENTITY_LOOK：yaw/pitch 是绝对量化角，0 表示朝正南 / 平视，不是「无变化」。
+    // 若按全 0 取消，客户端会保留旧朝向 → 产生持久朝向错误（「实体转向为 0」收不到）。
+    assertFalse(MovementDelta.isRedundantEntityUpdate(true, (short) 0, (short) 0, (short) 0),
+        "yaw=0/pitch=0 的朝向包必须下发");
+    assertFalse(MovementDelta.isRedundantEntityUpdate(true, (short) 1, (short) 2, (short) 3),
+        "带非零位移的朝向包同样必须下发");
   }
 }

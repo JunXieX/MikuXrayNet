@@ -3,9 +3,12 @@ package net.mikumc.mikuxraynet.antixray;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import net.mikumc.mikuxraynet.bandwidth.ThrottlePipeline;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
@@ -181,5 +184,53 @@ class WorldBlacklistTest {
         "去空白、跳过空条目并按声明序去重");
     assertNotEquals(config("enabled: true\n").configHash(), config.configHash(),
         "黑名单决定哪些世界完全不改写，必须参与配置指纹");
+  }
+
+  // ---------------------------------------------------------- 实时配置（热重载即时生效）
+
+  /**
+   * 监听器不随热重载重建：其运行期配置读取必须走实时源，reload 替换配置实例后立即取到新值。
+   * {@code configHash / timeout / remove-block-entities / neighbors.enabled} 都必须随新配置变化。
+   */
+  @Test
+  void liveConfigResolutionPicksLatestConfigAfterReload() {
+    AntiXrayConfig startup = config("""
+        enabled: true
+        obfuscation:
+          remove-block-entities: true
+        neighbors:
+          enabled: true
+        advanced:
+          timeout-millis: 1500
+        """);
+    AntiXrayConfig reloaded = config("""
+        enabled: true
+        obfuscation:
+          remove-block-entities: false
+        neighbors:
+          enabled: false
+        advanced:
+          timeout-millis: 2500
+        """);
+    AtomicReference<AntiXrayConfig> live = new AtomicReference<>(startup);
+    Supplier<AntiXrayConfig> supplier = live::get;
+
+    // 启动期：实时源返回的就是启动配置
+    assertSame(startup, ProtocolLibAsyncListener.resolveConfig(startup, supplier));
+    assertEquals(1500, ProtocolLibAsyncListener.resolveConfig(startup, supplier).timeoutMillis());
+
+    // 模拟 reload：只替换配置实例（监听器不重建）
+    live.set(reloaded);
+    AntiXrayConfig current = ProtocolLibAsyncListener.resolveConfig(startup, supplier);
+    assertSame(reloaded, current, "reload 后必须取到「当前」配置（否则旧超时/旧开关继续生效）");
+    assertEquals(2500, current.timeoutMillis(), "timeout 取新值");
+    assertFalse(current.removeBlockEntities(), "remove-block-entities 取新值");
+    assertFalse(current.neighbors().enabled(), "neighbors.enabled 取新值");
+    assertNotEquals(startup.configHash(), current.configHash(),
+        "configHash 随新配置变化（旧磁盘缓存不再命中）");
+
+    // 兼容回落：无实时源 / 实时源返回 null → 启动期配置（不抛异常，fail-open）
+    assertSame(startup, ProtocolLibAsyncListener.resolveConfig(startup, null));
+    assertSame(startup, ProtocolLibAsyncListener.resolveConfig(startup, () -> null));
   }
 }

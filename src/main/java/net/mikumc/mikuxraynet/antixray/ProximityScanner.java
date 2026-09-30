@@ -90,7 +90,9 @@ final class ProximityScanner {
     int centerX = x >> 4;
     int centerZ = z >> 4;
     double maxDistanceSquared = maxDistance * maxDistance;
-    // 最大堆：堆顶是「最差」的候选——距离最大；等距时后到者优先（腾位置时保留先到者）
+    // 最大堆：堆顶是「最差」的候选——距离最大者；距离相同时，到达序号最大者（后到者）在堆顶。
+    // 于是堆满腾位置（offer 里 poll 堆顶）淘汰的总是后到者，等距坐标里先到者得以保留；
+    // 最终输出再按「距离升序、等距先到者在前」还原（见方法末的排序）。
     PriorityQueue<Scored> worst = new PriorityQueue<>((left, right) -> {
       int byDistance = Long.compare(right.distanceSquared(), left.distanceSquared());
       return byDistance != 0 ? byDistance : Integer.compare(right.sequence(), left.sequence());
@@ -196,7 +198,9 @@ final class ProximityScanner {
       return;
     }
     Scored currentWorst = worst.peek();
-    // candidate 优于堆顶（距离更近；等距时更早到达）才值得挤掉它
+    // candidate 严格更近才值得挤掉堆顶。距离相同时不替换：sequence 在每个 candidates() 调用内单调递增，
+    // 新候选的到达序号必然大于堆中任何已有元素，而堆顶在等距者中已是「后到者」（见比较器的次级键），
+    // 所以等距时天然保留先到者——下面的等距分支在当前实现下恒为 false，仅为防御性写法。
     if (Long.compare(distanceSquared, currentWorst.distanceSquared()) < 0
         || (distanceSquared == currentWorst.distanceSquared()
             && sequence < currentWorst.sequence())) {

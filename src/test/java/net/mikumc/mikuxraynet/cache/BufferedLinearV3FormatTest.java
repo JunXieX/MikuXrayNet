@@ -121,6 +121,47 @@ class BufferedLinearV3FormatTest {
         () -> BufferedLinearV3Format.decompress(truncated, 20_000), "截断的压缩数据必须拒绝");
   }
 
+  /**
+   * 超大 rawLength 必须在分配之前被拒：损坏头声明一个超过 {@link BufferedLinearV3Format#MAX_RAW_SIZE}
+   * 的原始长度时，{@code inflate} 会先 {@code new byte[rawLength]} 才失败（旧上限 512 MiB 可让小堆 OOM）。
+   */
+  @Test
+  void oversizedDeclaredRawLengthIsRejectedBeforeAllocation() {
+    byte[] compressed = BufferedLinearV3Format.compress(payload(64));
+
+    assertThrows(IOException.class, () -> BufferedLinearV3Format.decompress(compressed,
+        BufferedLinearV3Format.MAX_RAW_SIZE + 1, BufferedLinearV3Format.COMPRESSION_ZSTD),
+        "声明长度超过上限必须拒绝");
+    assertThrows(IOException.class, () -> BufferedLinearV3Format.decompress(compressed,
+        Integer.MAX_VALUE, BufferedLinearV3Format.COMPRESSION_ZSTD), "声明长度极端巨大必须拒绝");
+    assertThrows(IOException.class, () -> BufferedLinearV3Format.decompress(compressed, -1,
+        BufferedLinearV3Format.COMPRESSION_ZSTD), "负长度必须拒绝");
+  }
+
+  /**
+   * 「大 rawLength + 极小 compressedLength」的压缩比异常头必须被拒（在任何分配之前），
+   * 这是「收紧上限」之外的第二道闸——否则仍会先分配上百 MiB。
+   */
+  @Test
+  void implausibleCompressionRatioIsRejectedBeforeAllocation() {
+    byte[] tiny = {1, 2, 3, 4, 5, 6, 7, 8};
+    int declaredRaw = 32 * 1024 * 1024;
+
+    assertThrows(IOException.class, () -> BufferedLinearV3Format.decompress(tiny, declaredRaw,
+        BufferedLinearV3Format.COMPRESSION_DEFLATE), "压缩比超出合理范围必须按损坏处理");
+  }
+
+  /** 正常数据（含 &gt; 4 MiB 的大桶）不得被压缩比校验误判，仍能正确往返。 */
+  @Test
+  void normalLargePayloadStillPassesRatioSanity() throws IOException {
+    // 半随机（近似不可压缩）的 5 MiB：压缩比接近 1，绝不会触及 sanity 上限
+    byte[] large = payload(5 * 1024 * 1024);
+    byte[] compressed = BufferedLinearV3Format.compress(large);
+
+    assertArrayEquals(large, BufferedLinearV3Format.decompress(compressed, large.length,
+        BufferedLinearV3Format.COMPRESSION_ZSTD), "正常大负载必须照常解出");
+  }
+
   @Test
   void entryRoundTripIsByteIdentical() throws IOException {
     byte[] data = payload(1_024);
@@ -229,6 +270,27 @@ class BufferedLinearV3FormatTest {
       assertNull(entry);
     }
     assertEquals(BufferedLinearV3Format.BUCKET_SIZE, decoded.length);
+  }
+
+  /**
+   * {@code encodeBucket} 按内容精确定容，产出的字节长度必须等于
+   * {@code 64 × 4（每槽位 i32 长度前缀） + Σ(28 条目头 + 负载长度)}：这既是预分配公式的依据，
+   * 也保证没有「空负载按空槽」的口径偏差。
+   */
+  @Test
+  void encodeBucketPreallocatesExactSize() {
+    BufferedLinearV3Format.Entry[] slots =
+        new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
+    slots[0] = new BufferedLinearV3Format.Entry(1L, 100L, 5, payload(300));
+    slots[2] = new BufferedLinearV3Format.Entry(2L, 200L, 6, payload(700));
+    slots[63] = new BufferedLinearV3Format.Entry(3L, 300L, 7, new byte[0]); // 空负载按空槽
+
+    byte[] bucket = BufferedLinearV3Format.encodeBucket(slots, SEED);
+
+    int entryHeaderSize = 4 + 8 + 8 + 4 + 4; // 负载长度 + 代次 + 写入时间 + 配置指纹 + 校验和
+    int expected = BufferedLinearV3Format.BUCKET_SIZE * Integer.BYTES + entryHeaderSize + 300
+        + entryHeaderSize + 700;
+    assertEquals(expected, bucket.length, "桶字节长度必须等于预分配公式算出的长度");
   }
 
   @Test

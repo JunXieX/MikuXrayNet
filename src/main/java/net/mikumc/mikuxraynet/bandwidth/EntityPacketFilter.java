@@ -33,7 +33,11 @@ import org.bukkit.event.Listener;
 import org.bukkit.plugin.Plugin;
 
 /**
- * 零位移实体包抑制：出站的实体位置/朝向增量全为 0 时取消发送。
+ * 零位移实体包抑制：出站的<b>纯位移</b>包（{@code REL_ENTITY_MOVE}）位移全为 0 时取消发送。
+ *
+ * <p><b>朝向包不做零取消</b>：{@code REL_ENTITY_MOVE_LOOK} / {@code ENTITY_LOOK} 里的 yaw/pitch 是
+ * 绝对量化角（0 表示朝正南 / 平视），不是「相对上次的增量」；按全 0 取消会让客户端保留旧朝向，
+ * 产生持久朝向错误。故这两个包一律放行（判定依据见 {@link MovementDelta} 类注释）。
  *
  * <p>拦截对象为 ProtocolLib 的 {@code REL_ENTITY_MOVE} / {@code REL_ENTITY_MOVE_LOOK} /
  * {@code ENTITY_LOOK} 三个包（PacketEvents 中对应 ENTITY_RELATIVE_MOVE /
@@ -196,32 +200,21 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     try {
       PacketContainer packet = event.getPacket();
       PacketType type = event.getPacketType();
-      boolean redundant;
 
-      if (type == PacketType.Play.Server.REL_ENTITY_MOVE) {
-        StructureModifier<Short> deltas = packet.getSpecificModifier(short.class);
-        if (deltas.size() < 3) {
-          pass();
-          return;
-        }
-        redundant = MovementDelta.isZeroMove(deltas.read(0), deltas.read(1), deltas.read(2));
-      } else if (type == PacketType.Play.Server.REL_ENTITY_MOVE_LOOK) {
-        StructureModifier<Short> deltas = packet.getSpecificModifier(short.class);
-        StructureModifier<Byte> angles = packet.getSpecificModifier(byte.class);
-        if (deltas.size() < 3 || angles.size() < 2) {
-          pass();
-          return;
-        }
-        redundant = MovementDelta.isZeroMove(deltas.read(0), deltas.read(1), deltas.read(2))
-            && MovementDelta.isZeroRotation(angles.read(0), angles.read(1));
-      } else {
-        StructureModifier<Byte> angles = packet.getSpecificModifier(byte.class);
-        if (angles.size() < 2) {
-          pass();
-          return;
-        }
-        redundant = MovementDelta.isZeroRotation(angles.read(0), angles.read(1));
+      StructureModifier<Short> deltas = packet.getSpecificModifier(short.class);
+      if (deltas.size() < 3) {
+        // ENTITY_LOOK（只有朝向字节、没有 short 位移字段）会走到这里 → 放行；
+        // 其它字段形态不符的情况同样 fail-open 放行，绝不误判取消。
+        pass();
+        return;
       }
+
+      // 只有纯位移包（REL_ENTITY_MOVE）可做零位移取消；朝向包（REL_ENTITY_MOVE_LOOK / ENTITY_LOOK）
+      // 里的 yaw/pitch 是绝对量化角（0 表示朝正南 / 平视），把全 0 当作「无转向」取消会让客户端
+      // 保留旧朝向（持久朝向错误），因此一律放行（依据见 MovementDelta 类注释）。
+      boolean carriesRotation = type != PacketType.Play.Server.REL_ENTITY_MOVE;
+      boolean redundant = MovementDelta.isRedundantEntityUpdate(carriesRotation,
+          deltas.read(0), deltas.read(1), deltas.read(2));
 
       if (!redundant || isWhitelisted(packet.getIntegers().read(0))) {
         pass();

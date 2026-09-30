@@ -54,13 +54,19 @@ import org.bukkit.plugin.Plugin;
  * 封包线程不触碰实体状态，且刷新跟随实体/区域归属，因此传送等任何位置变化都会在一个 tick 内生效
  * （旧实现依赖 {@code PlayerMoveEvent}，而传送有独立 HandlerList，会按陈旧坐标判错）。
  *
- * <p><b>fail-open</b>：读不出字段、构造失败、校验不通过、玩家离线 —— 一律原样放行原包，绝不丢更新。
+ * <p><b>fail-open</b>：读不出字段、构造失败、玩家离线 —— 一律原样放行原包，绝不丢更新。
  * 原包放行通过 {@link AsyncMarker} 的 {@code signalPacketTransmission} 完成，并用一次性闸保证
  * 「恰好放行一次」。位置快照不可用（尚未建立 / 刷新或读取异常）时同样 fail-open：近身判定按
  * 「立即放行」处理，宁可少合并、绝不制造延迟。
  *
- * <p><b>首包自检</b>：第一次真正发送合并包时会回读刚写入的字段做结构校验；未通过校验前会
- * <em>同时</em>保留原包（重复下发相同方块状态是无害幂等操作），校验通过后才开始取消原包。
+ * <p><b>fail-open 的唯一例外</b>：合并包构造/发送失败时，对「携带的坐标已全部经立即放行先行下发」
+ * 的原包会予以取消（见 {@link #flush} 的 last-write-wins 分支）——此时这些坐标的新态已交付，取消旧态
+ * 原包不构成丢更新，反而避免旧态晚到覆盖新态（方块回退）；未全部先行下发的原包仍照常放行。
+ *
+ * <p><b>结构自检是「每次发送」而非「首包」</b>：{@code sendSection} 每次构造完合并包都会回读刚写入的
+ * 字段做结构校验（单条与多条的路径都做）。校验通过会置 {@code verified}；在第一次成功发送之前
+ * （{@code verified} 仍为 false）合并包照发，但<em>同时</em>保留原包（重复下发相同方块状态是无害的
+ * 幂等操作），此后才开始取消原包。
  */
 public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
@@ -97,9 +103,17 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   private static final class Held {
     private final PacketEvent event;
     private final AtomicBoolean signalled = new AtomicBoolean();
+    /**
+     * 该原包携带的坐标。
+     *
+     * <p>fail-open 放行时据此判断能否安全取消：只有当一个原包携带的坐标<b>全部</b>已经由
+     * 「立即放行」路径先行下发（新态已交付）时，才取消它——否则取消会连带丢掉未放行坐标的更新。
+     */
+    private final List<Coord> coords;
 
-    private Held(PacketEvent event) {
+    private Held(PacketEvent event, List<Coord> coords) {
       this.event = event;
+      this.coords = coords;
     }
   }
 
@@ -169,7 +183,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
   /** 注销监听器并偿还所有正在延迟中的原包。 */
   public void stop() {
-    flushAll();
+    // 顺序很关键：必须先注销异步监听器、再排空。旧顺序（先 flush 再 unregister）在两者之间留了一个
+    // 窗口：封包线程仍可为新建的 Pending 成功 schedule 定时器，随后 shutdownNow 把定时器连其队列一起
+    // 丢弃——该批 held 原包既没被取消也没被放行，只能等 ProtocolLib 超时兜底（停用瞬间滞留原包）。
     if (handler != null) {
       try {
         asynchronousManager.unregisterAsyncHandler(handler);
@@ -178,10 +194,15 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       }
       handler = null;
     }
+    flushAll();
     HandlerList.unregisterAll(this);
     cancelAllPositionRefreshTasks();
     positions.clear();
     flusher.shutdownNow();
+    // 兜底再排空一次：注销与 shutdownNow 之间若仍有在途包成功入缓冲并 schedule 成功（定时器随后被
+    // shutdownNow 丢弃），这里把它们放行；此后 flusher 已 shutdown，再入缓冲会因 schedule 抛异常而
+    // 立即原样放行（见 onPacketSending 的 fail-open 处理），因此停用瞬间绝不滞留任何原包（恰好放行一次）。
+    flushAll();
   }
 
   @EventHandler(ignoreCancelled = true)
@@ -395,7 +416,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         }
         // 先入缓冲、再登记延迟：held.add 若在此之后抛异常，登记过的延迟就再也没人放行（永久卡包）。
         // flush() 的兜底只遍历 target.held，所以条目必须先在里面，登记才能生效。
-        Held entry = new Held(event);
+        Held entry = new Held(event, coordsOf(updates));
         target.held.add(entry);
         // delayRegistered 记录「延迟是否真的登记成功」：未登记则从未延迟，不能 release（那会多减一次）。
         boolean delayRegistered = false;
@@ -480,7 +501,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         // 本窗口内有坐标经「立即放行」先行下发：做 last-write-wins——
         // 合并包只保留未被先行下发的坐标，且原包一律取消（其数据要么已由更新的包交付、
         // 要么由下方的合并结果交付），绝不把旧状态晚发回去覆盖新态。
-        // 注意：此处不套用「首包保留原包自检」的宽松策略——对新态与旧态同坐标的情形，
+        // 注意：此处不套用「首个成功发送前保留原包」的宽松策略——对新态与旧态同坐标的情形，
         // 重复下发旧态即等于回退；改为完全信任 {@link #trySendMerged} 的回读自检（失败即 fail-open 放行）。
         List<List<Update<WrappedBlockData>>> survivors = dropPassed(clusters, passed);
         boolean anySurvivor = false;
@@ -499,8 +520,17 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
           }
           return;
         }
-        // 构造/发送失败：退回既有 fail-open（原包照常放行，绝不丢更新）
+        // 构造/发送失败：退回既有 fail-open（原包照常放行，绝不丢更新）——但本窗口内经「立即放行」
+        // 先行下发过的坐标，其<b>旧态原包必须一并取消</b>：否则旧态晚到会把先到的新态覆盖回去（方块回退）。
+        // 旧实现只对合并路径做 last-write-wins，fail-open 分支会把这些旧态包一起放行，正是「回退重现」的根因。
+        // 注意：Pending.passed 只记坐标不记值，无法重发新态，所以只能「整包取消」——仅当该原包携带的
+        // 坐标全部已先行下发时才取消，避免误丢未放行坐标的更新（跨坐标混合包只能照常放行，交由原包覆盖）。
         stats.blockChangesPassed.add(held.size());
+        for (Held entry : held) {
+          if (allCoordsPassed(entry.coords, passed)) {
+            entry.event.setCancelled(true);
+          }
+        }
         return;
       }
 
@@ -557,6 +587,35 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       survivors.add(kept);
     }
     return survivors;
+  }
+
+  /** 把一批更新折算为坐标清单（供 {@link #allCoordsPassed} 判定原包携带的坐标是否已全部先行下发）。 */
+  private static List<Coord> coordsOf(List<Update<WrappedBlockData>> updates) {
+    List<Coord> coords = new ArrayList<>(updates.size());
+    for (Update<WrappedBlockData> update : updates) {
+      coords.add(new Coord(update.x(), update.y(), update.z()));
+    }
+    return coords;
+  }
+
+  /**
+   * fail-open 放行时：一个原包携带的坐标是否<b>全部</b>已经由「立即放行」路径先行下发。
+   *
+   * <p>是则应取消该原包——其旧状态晚到会把先到的新状态覆盖回去（方块回退）；不是则必须照常放行，
+   * 否则会丢掉未放行坐标的更新。空清单按「不可取消」处理（保守放行）。
+   *
+   * <p>包可见：供离线单测直接驱动该纯逻辑（真实链路依赖 ProtocolLib 封包，离线不可用）。
+   */
+  static boolean allCoordsPassed(List<Coord> coords, Set<Coord> passed) {
+    if (coords.isEmpty()) {
+      return false;
+    }
+    for (Coord coord : coords) {
+      if (!passed.contains(coord)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** 放行一个被延迟的原包，恰好一次。 */

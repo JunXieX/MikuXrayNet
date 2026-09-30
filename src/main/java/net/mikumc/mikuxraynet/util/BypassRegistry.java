@@ -58,9 +58,20 @@ public final class BypassRegistry implements Listener {
   /**
    * 注册登录/退出监听，并对「启用时已在线」的玩家做一次快照判定。可重复调用，异常安全。
    *
+   * <p><b>幂等且清理前一实例</b>：先停用「当前活动实例」再停用自身（若不同），最后再注册。
+   * 旧实现只调 {@code this.stop()}，若换实例启用（stat 命令重建 / 重复 enable），前一实例的
+   * 事件监听仍挂着并继续维护它自己的名单，与 {@link #active} 指向的新实例不一致（stale 名单 +
+   * 监听泄漏：旧实例的 onJoin 更新旧集合，封包线程读的却是新集合）。因此这里显式先清理前一实例。
+   *
    * <p>不注册任何周期任务：权限变更需重进服务器才生效（见类注释）。
    */
   public void start() {
+    // 清理「当前活动实例」（可能是另一个实例）：其监听必须先注销、名单先清空，避免与本次注册的
+    // 监听并存导致名单双份维护、互相不一致（本实例尚未注册，此步对其无副作用）。
+    BypassRegistry previous = active;
+    if (previous != null && previous != this) {
+      previous.stop();
+    }
     stop();
     active = this;
     try {

@@ -220,7 +220,11 @@ final class RegionFile implements AutoCloseable {
   }
 
   /**
-   * 写入文件头与全零偏移表，并把数据区起始位置作为当前文件长度。
+   * 写入文件头与<b>当前偏移表</b>，并把数据区起始位置作为当前文件长度。
+   *
+   * <p>写的是 {@link #positions} 这一刻的内容（方法名里的 EmptyTable 只描述「新建/迁移」这两个主要调用路径：
+   * 此时 positions 全为 0）；{@link #flushBucket} 的兜底路径也复用它，若那里 positions 已非全零，写出的
+   * 就是当前索引而非全零表——因此按「当前偏移表」理解，不能假定恒为全零。
    *
    * <p>头部方案字节<b>取本实例的 {@link #compression}</b>（新文件在构造时已定为
    * {@code currentCompression()}；迁移时已先改为可行方案），保证「声明的方案」与随后 bucket
@@ -464,20 +468,21 @@ final class RegionFile implements AutoCloseable {
         throw exception;
       }
 
-      channel.close();
       try {
+        channel.close();
         try {
           Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException atomicFailure) {
           // 原子移动不被支持（AtomicMoveNotSupportedException）或失败：退回普通替换移动
           Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING);
         }
-      } catch (IOException moveFailure) {
-        // 移动失败：目标文件保持原样（未替换），但 temp 会残留成孤儿文件——失败路径必须清理它，
-        // 否则每次压缩失败都在磁盘上留一个废弃的 .tmp（虽有启动期兜底扫描，但不该依赖它）。
-        // 只删 temp、绝不触碰 path，保证「不破坏原文件」。
+      } catch (IOException failure) {
+        // 关闭旧通道或替换失败：目标文件保持原样（未被替换），但 temp 会残留成孤儿文件——失败路径必须
+        // 清理它，否则每次压缩失败都在磁盘上留一个废弃的 .tmp（虽有启动期兜底扫描，但不该依赖它）。
+        // 只删 temp、绝不触碰 path，保证「不破坏原文件」；把 channel.close() 与 move 收拢进同一清理路径，
+        // 避免「关闭通道抛异常」时既漏删 temp、又漏掉句柄失效的收尾。
         deleteQuietly(temp);
-        throw moveFailure;
+        throw failure;
       }
       reopenChannel();
 

@@ -120,6 +120,24 @@ class ConfigDefaultsTest {
   }
 
   /**
+   * 非法 fov（&gt;360° / 非正）不再静默回落：必须与「低于下限」一样进入一次性 WARN 明细，
+   * 否则管理员写了无效角度会以为它已生效（与其它钳制项口径一致）。
+   */
+  @Test
+  void invalidFrustumFovIsReportedInFloorDetails() {
+    AntiXrayConfig tooWide = AntiXrayConfig.from(yaml("proximity:\n  frustum:\n    fov: 400.0\n"));
+    assertEquals(AntiXrayConfig.FRUSTUM_FOV_FLOOR, tooWide.proximity().frustumFov(), 1.0E-9D,
+        "fov>360 属非法值，回落默认（即下限）");
+    assertTrue(joinedFloors(tooWide).contains("proximity.frustum.fov=400.0"),
+        "fov 非法值必须纳入一次性 WARN 明细（不再静默回落）：" + tooWide.floorAdjustments());
+
+    AntiXrayConfig nonPositive = AntiXrayConfig.from(yaml("proximity:\n  frustum:\n    fov: -10.0\n"));
+    assertEquals(AntiXrayConfig.FRUSTUM_FOV_FLOOR, nonPositive.proximity().frustumFov(), 1.0E-9D);
+    assertTrue(joinedFloors(nonPositive).contains("proximity.frustum.fov=-10.0"),
+        "负角度同样必须留痕：" + nonPositive.floorAdjustments());
+  }
+
+  /**
    * 配置指纹必须是<b>跨进程稳定</b>的固定值（真机回归：磁盘缓存重启后命中率恒为 0 的根因）。
    *
    * <p>指纹曾被「枚举的 identity hash」污染（{@code EffectiveObfuscation.mode} / {@code missingPolicy}），
@@ -139,9 +157,10 @@ class ConfigDefaultsTest {
             mode: all
         """));
 
-    // 2026-09 更新：新增 disk-cache.zstd-sha256 参与指纹（按任务要求），期望值随之变化，
-    // 现存磁盘缓存会一次性失效重建（属正常）。
-    assertEquals(1074535532, config.configHash(),
+    // 2026-09 更新①：新增 disk-cache.zstd-sha256 参与指纹（按任务要求）。
+    // 2026-09 更新②：新增 obfuscation.remove-block-entities 参与指纹（它直接改变写进缓存的区块负载字节）。
+    // 两次改动都会使期望值变化、现存磁盘缓存一次性失效重建（属正常）。
+    assertEquals(-1049098715, config.configHash(),
         "配置指纹必须是跨进程稳定的固定值（不得混入枚举 identity hash / 随机值）");
     // 同一份内容重复解析必须得到同一个值（同一进程内的自洽性）
     assertEquals(config.configHash(), AntiXrayConfig.from(yaml("""
@@ -881,6 +900,24 @@ class ConfigDefaultsTest {
     BandwidthConfig aboveCeiling = BandwidthConfig.from(yaml("latency:\n  min-view-distance: 99\n"));
     assertEquals(BandwidthConfig.MAX_MIN_VIEW_DISTANCE, aboveCeiling.latency().minViewDistance(),
         "超过新上限的值钳制到 16");
+  }
+
+  /**
+   * {@code block-changes.merge-radius} 的新安全下限：0 是纯负收益（原包仍入缓冲并延迟一个时间窗，
+   * 却几乎拼不出可合并的多条簇 → 既省不到包又徒增延迟/开销），故抬到 1 并留痕；
+   * 要彻底关掉合并应使用 {@code block-changes.merge=false}。
+   */
+  @Test
+  void mergeRadiusZeroIsRaisedToFloorAndReported() {
+    BandwidthConfig raised = BandwidthConfig.from(yaml("block-changes:\n  merge-radius: 0\n"));
+    assertEquals(BandwidthConfig.MIN_MERGE_RADIUS, raised.blockChanges().mergeRadius(),
+        "合并半径 0 必须抬到下限 1（0 仍入缓冲延迟却几乎拼不出可合并簇，纯负收益）");
+    assertTrue(String.join("、", raised.clampAdjustments()).contains("block-changes.merge-radius=0"),
+        "抬升必须留下明细供加载时一次性 WARN：" + raised.clampAdjustments());
+
+    BandwidthConfig atFloor = BandwidthConfig.from(yaml("block-changes:\n  merge-radius: 1\n"));
+    assertEquals(1, atFloor.blockChanges().mergeRadius(), "恰好等于下限的值原样生效");
+    assertTrue(atFloor.clampAdjustments().isEmpty(), "取值在下限处不得产生明细");
   }
 
   /**

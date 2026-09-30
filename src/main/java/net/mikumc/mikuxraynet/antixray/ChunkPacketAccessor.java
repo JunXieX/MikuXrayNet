@@ -12,6 +12,10 @@ import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * 区块封包读写入口：把 ProtocolLib 的 {@link PacketContainer} 收敛为「原始 section 字节 + 方块实体列表」。
@@ -42,8 +46,10 @@ import java.util.List;
  * 由于构造器不参与，本类天然免疫构造器签名变化。
  *
  * <p><b>失败语义</b>：字段定位不到 → 构造器抛异常，调用方 fail-open（放行原包、不改写）并给出
- * 一次性中文提示；方块实体剔除所需的字段定位不到 → 静默降级为「不剔除方块实体」，
- * <b>绝不影响</b> buffer 改写与封包格式。
+ * 一次性中文提示；方块实体剔除所需的字段定位不到 → 降级为「不剔除方块实体」（启动期提示可见），
+ * 运行期剔除本身抛异常 → 计数 + 一次性中文提示（见 {@link #recordBlockEntityFilterFailure}），
+ * <b>绝不影响</b> buffer 改写与封包格式；写回未确认生效（{@code verified == false}）时<b>短路跳过剔除</b>
+ * （见 {@link #shouldRemoveBlockEntities}），避免产生「矿可见 + 实体消失」的可检测不一致包。
  */
 public final class ChunkPacketAccessor {
 
@@ -59,6 +65,15 @@ public final class ChunkPacketAccessor {
 
   private static volatile FieldPlan plan;
   private static volatile boolean planResolved;
+
+  /** 与格式头一致的日志通道（本类不做平台初始化，只借同名 logger 输出一次性中文提示）。 */
+  private static final Logger LOGGER = Logger.getLogger("MikuXrayNet");
+
+  /** 方块实体剔除段累计失败次数（诊断用，只增不减；包可见供离线单测验证观测点存在）。 */
+  private static final AtomicInteger BLOCK_ENTITY_FILTER_FAILURES = new AtomicInteger();
+
+  /** 剔除段失效的中文提示只打一次（并发安全），避免热路径反复刷屏。 */
+  private static final AtomicBoolean BLOCK_ENTITY_FILTER_WARNED = new AtomicBoolean();
 
   private final Object chunkData;
   private final FieldPlan fieldPlan;
@@ -113,17 +128,54 @@ public final class ChunkPacketAccessor {
     fieldPlan.buffer().set(chunkData, data);
     boolean verified = fieldPlan.buffer().get(chunkData) == data;
 
-    if (!shouldFilterBlockEntities(removeBlockEntities, localPositions) || !fieldPlan.blockEntityFilterReady()) {
+    if (!shouldRemoveBlockEntities(verified, removeBlockEntities, localPositions,
+        fieldPlan.blockEntityFilterReady())) {
       return verified;
     }
 
-    // 剔除段是「锦上添花」：其任何失败都不得影响上面已经完成的字节改写（降级为不剔除）
+    // 剔除段是「锦上添花」：其任何失败都不得影响上面已经完成的字节改写（降级为不剔除）。
+    // 但绝不静默——计数 + 一次性中文日志，让「保留了一些本应剔除的方块实体」这一降级可见，
+    // 与类注释声明的启动期字段定位结果互为补充（前者说能力有无，这里说运行期是否真的出错）。
     try {
       removeObfuscatedBlockEntities(localPositions, minHeight);
-    } catch (Throwable ignored) {
-      // 降级：方块实体字段结构不符 / List 不可变等，保留原 List（启动日志已说明字段定位结果）
+    } catch (Throwable throwable) {
+      recordBlockEntityFilterFailure(throwable);
     }
     return verified;
+  }
+
+  /**
+   * 是否需要执行方块实体剔除（写回自检结果、配置开关、坐标清单与字段可用性的汇合点；纯函数，离线可测）。
+   *
+   * <p><b>写回未确认生效（{@code verified == false}）时一律短路跳过剔除</b>：此时新字节未必真的写进了
+   * NMS 对象（可能是别的对象、或 ProtocolLib 写的是副本）。若仍按新字节剔掉方块实体，交出去的封包就是
+   * 「原始旧方块状态 + 已被删掉方块实体」——「矿石可见但箱子/刷怪笼实体消失」是可被透视端识别的不一致，
+   * 反而泄露「此处被改写」。宁可保留实体（最多多下发几个实体），也不产生不一致包。
+   */
+  static boolean shouldRemoveBlockEntities(boolean verified, boolean removeBlockEntities,
+      int[] localPositions, boolean blockEntityFilterReady) {
+    return verified && blockEntityFilterReady
+        && shouldFilterBlockEntities(removeBlockEntities, localPositions);
+  }
+
+  /**
+   * 记录剔除段失败（观测点）：累计计数 + 一次性中文提示。
+   *
+   * <p>包可见：供离线单测直接驱动「异常路径有观测点」这一断言（真实链路需 ProtocolLib 运行时，离线不可用）。
+   */
+  static void recordBlockEntityFilterFailure(Throwable throwable) {
+    BLOCK_ENTITY_FILTER_FAILURES.incrementAndGet();
+    if (BLOCK_ENTITY_FILTER_WARNED.compareAndSet(false, true)) {
+      LOGGER.log(Level.WARNING,
+          "区块反矿透：剔除被伪装 section 内的方块实体时出现异常，已降级为「不剔除方块实体」"
+              + "（区块字节改写与封包格式不受影响；此类降级可能导致被伪装的箱子/刷怪笼随包下发）："
+              + throwable);
+    }
+  }
+
+  /** 方块实体剔除段的累计失败次数（诊断用；只增不减，便于排查「实体没被剔掉」）。 */
+  static int blockEntityFilterFailures() {
+    return BLOCK_ENTITY_FILTER_FAILURES.get();
   }
 
   /** 剔除落在被伪装 section 内的方块实体（直接读条目自身的 packedXZ / y 字段判坐标）。 */
@@ -145,10 +197,27 @@ public final class ChunkPacketAccessor {
     }
   }
 
-  /** 读取单个方块实体条目的区块内相对坐标并复用 {@link #isObfuscated} 判定。 */
+  /** 读取单个方块实体条目的区块内相对坐标并复用 {@link #isEntryObfuscated} 判定。 */
   private boolean isObfuscated(Object entry, int[] localPositions, int minHeight) {
-    int packedXz = normalizePackedXz(number(fieldPlan.blockEntityPackedXz().get(entry)));
-    int relativeY = number(fieldPlan.blockEntityY().get(entry)) - minHeight;
+    return isEntryObfuscated(fieldPlan.blockEntityPackedXz().get(entry),
+        fieldPlan.blockEntityY().get(entry), minHeight, localPositions);
+  }
+
+  /**
+   * 由方块实体条目两个坐标字段的<b>原始值</b>判定是否命中伪装清单（纯函数，离线可测）。
+   *
+   * <p><b>读不出明确数值时返回 {@code false}（保留该方块实体）</b>，而不是用 0 冒充合法坐标：packedXZ=0
+   * 恰是合法坐标「section (0,0)」，旧实现把读取失败的坐标当成 0，会把该方块实体误判为命中清单而被删掉，
+   * 产生「矿石可见 + 箱子/刷怪笼实体消失」这一可被透视端识别的强不一致包。这里以「不是 Number」作为明确的
+   * 「不可用」信号，整条跳过（fail-open，与「不剔除方块实体」降级同一口径）。
+   */
+  static boolean isEntryObfuscated(Object rawPackedXz, Object rawY, int minHeight,
+      int[] localPositions) {
+    if (!(rawPackedXz instanceof Number packed) || !(rawY instanceof Number y)) {
+      return false;
+    }
+    int packedXz = normalizePackedXz(packed.intValue());
+    int relativeY = y.intValue() - minHeight;
     // 与 ProtocolLib 同口径：sectionX = packedXZ >> 4，sectionZ = packedXZ & 15
     return isObfuscated(relativeY, packedXz >> 4, packedXz & 15, localPositions);
   }
@@ -164,10 +233,6 @@ public final class ChunkPacketAccessor {
    */
   static int normalizePackedXz(int raw) {
     return raw & 0xFF;
-  }
-
-  private static int number(Object value) {
-    return value instanceof Number number ? number.intValue() : 0;
   }
 
   /**

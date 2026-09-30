@@ -3,12 +3,14 @@ package net.mikumc.mikuxraynet.config;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
+import net.mikumc.mikuxraynet.antixray.RewriteCache;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig.Dimension;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig.ObfuscationMode;
 import org.bukkit.World;
@@ -200,5 +202,32 @@ class AntiXrayDimensionConfigTest {
         "新增末地维度段必须改变指纹（维度选择参与指纹）");
     assertNotEquals(plain.configHash(), netherWeightChanged.configHash(),
         "仅改变地狱维度权重也必须改变指纹");
+  }
+
+  /** remove-block-entities 决定写进缓存的区块负载字节，必须参与 configHash。 */
+  @Test
+  void configHashChangesWhenRemoveBlockEntitiesToggles() {
+    AntiXrayConfig on = config("obfuscation:\n  remove-block-entities: true\n");
+    AntiXrayConfig off = config("obfuscation:\n  remove-block-entities: false\n");
+
+    assertTrue(on.removeBlockEntities(), "键打开时为 true");
+    assertFalse(off.removeBlockEntities(), "键关闭时为 false");
+    assertNotEquals(on.configHash(), off.configHash(),
+        "remove-block-entities 决定是否从区块负载里剔除方块实体数据，必须参与配置指纹");
+  }
+
+  /** 回归：关→开后旧指纹不再命中（旧缓存绝不能按旧指纹被复用）。 */
+  @Test
+  void togglingRemoveBlockEntitiesMissesOldCacheEntry() {
+    AntiXrayConfig off = config("obfuscation:\n  remove-block-entities: false\n");
+    AntiXrayConfig on = config("obfuscation:\n  remove-block-entities: true\n");
+
+    RewriteCache<String> cache = new RewriteCache<>(8, 3600);
+    cache.put("world", 3, 4, off.configHash(), "旧负载（未剔除方块实体）");
+
+    assertEquals("旧负载（未剔除方块实体）", cache.get("world", 3, 4, off.configHash()),
+        "原配置指纹照常命中");
+    assertNull(cache.get("world", 3, 4, on.configHash()),
+        "开启 remove-block-entities 后指纹变化 → 旧缓存不再命中（即使重启也不复用）");
   }
 }

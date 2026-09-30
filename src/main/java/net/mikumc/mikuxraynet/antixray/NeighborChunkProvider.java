@@ -155,12 +155,12 @@ public final class NeighborChunkProvider {
 
     int baseY = world.getMinHeight();
     int height = Math.max(SIDE_LENGTH, world.getMaxHeight() - baseY);
-    NeighborEdges edges = new NeighborEdges(height,
-        captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.X_MINUS),
-        captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.X_PLUS),
-        captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_MINUS),
-        captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_PLUS));
-    putCache(worldName, chunkX, chunkZ, edges);
+    long[] xMinus = captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.X_MINUS);
+    long[] xPlus = captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.X_PLUS);
+    long[] zMinus = captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_MINUS);
+    long[] zPlus = captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_PLUS);
+    NeighborEdges edges = new NeighborEdges(height, xMinus, xPlus, zMinus, zPlus);
+    cacheIfUseful(worldName, chunkX, chunkZ, edges, xMinus, xPlus, zMinus, zPlus);
     return edges;
   }
 
@@ -242,14 +242,29 @@ public final class NeighborChunkProvider {
       return existing;
     }
 
-    NeighborEdges edges = new NeighborEdges(height,
-        captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.X_MINUS, chunkLoaded, query, columnTop),
-        captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.X_PLUS, chunkLoaded, query, columnTop),
-        captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_MINUS, chunkLoaded, query, columnTop),
-        captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_PLUS, chunkLoaded, query, columnTop));
-
-    putCache(worldName, chunkX, chunkZ, edges);
+    long[] xMinus = captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.X_MINUS, chunkLoaded, query, columnTop);
+    long[] xPlus = captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.X_PLUS, chunkLoaded, query, columnTop);
+    long[] zMinus = captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_MINUS, chunkLoaded, query, columnTop);
+    long[] zPlus = captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_PLUS, chunkLoaded, query, columnTop);
+    NeighborEdges edges = new NeighborEdges(height, xMinus, xPlus, zMinus, zPlus);
+    cacheIfUseful(worldName, chunkX, chunkZ, edges, xMinus, xPlus, zMinus, zPlus);
     return edges;
+  }
+
+  /**
+   * 有选择地写入缓存：<b>四个平面全为 {@code null}</b>（四个邻块都不可用）的结果不入缓存。
+   *
+   * <p>方向上安全（缺失平面一律走缺失策略、不留泄漏），但没有任何收益：全缺失通常只出现在「邻块尚未
+   * 加载 / Folia 跨区域」的瞬间，若把它缓存满 {@link #DEFAULT_CACHE_TTL_MILLIS} 的 TTL，邻块随后加载好
+   * 也得等 TTL 过期才会重抓——白白让边界遮挡判定长时间停留在「缺失」态（{@code mode=enclosed} 下边界
+   * 那一圈会迟迟补不齐）。因此只缓存至少含一个可用平面的结果；全缺失时直接返回，让下次访问立即重试。
+   */
+  private void cacheIfUseful(String worldName, int chunkX, int chunkZ, NeighborEdges edges,
+      long[] xMinus, long[] xPlus, long[] zMinus, long[] zPlus) {
+    if (xMinus == null && xPlus == null && zMinus == null && zPlus == null) {
+      return;
+    }
+    putCache(worldName, chunkX, chunkZ, edges);
   }
 
   /**

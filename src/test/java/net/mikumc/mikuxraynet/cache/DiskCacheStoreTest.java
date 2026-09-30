@@ -7,10 +7,17 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import java.util.logging.Logger;
 import java.util.zip.Deflater;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
@@ -289,6 +296,45 @@ class DiskCacheStoreTest {
     assertEquals(0, store.openRegionFiles());
   }
 
+  /**
+   * 关闭进行期间的提交不得重新打开句柄。
+   *
+   * <p>回归：旧实现把 {@code closed} 置位放在 {@code future.get(...)} 之后，排空窗口（最长约 5s）里
+   * {@code usable()} 仍为 true，工作线程提交的写入会排到排空任务之后执行，在 {@code closeAllHandles}
+   * 之后重新打开句柄并留在 open 表里，{@code shutdownNow} 后无人再关闭（句柄泄漏、文件锁悬挂）。
+   * 修正后 {@code closed} 先置位，且 {@code execute()/submit()/handle()} 都以 closed 为闸。
+   *
+   * <p>用「另一个线程持续提交 + 主线程 close」制造并发的提交窗口；断言在修正后<b>恒成立</b>（不受
+   * 调度时序影响），因此不是脆弱用例。
+   */
+  @Test
+  void putDuringCloseNeverLeavesHandlesOpen(@TempDir Path dir) throws Exception {
+    DiskCacheStore store = store(dir, config(1024, 600, 600));
+    store.put(WORLD, 0, 0, 1, randomPayload(64 * 1024, 0));
+    store.flush();
+
+    AtomicBoolean stop = new AtomicBoolean();
+    Thread putter = new Thread(() -> {
+      int chunkX = 1;
+      while (!stop.get()) {
+        store.put(WORLD, chunkX++, 0, 1, randomPayload(64, chunkX));
+      }
+    }, "disk-cache-test-putter");
+
+    putter.start();
+    try {
+      store.close();
+    } finally {
+      stop.set(true);
+      putter.join(5_000L);
+      assertFalse(putter.isAlive(), "提交线程必须能结束（关闭后 put 立即返回，不阻塞）");
+    }
+
+    assertFalse(store.usable(), "close 返回后必须不可用");
+    assertEquals(0, store.openRegionFiles(), "关闭期间/之后的提交不得重新打开任何句柄");
+    store.close(); // 可重复调用
+  }
+
   @Test
   void disabledConfigIsInert(@TempDir Path dir) {
     AntiXrayConfig.DiskCache disabled = new AntiXrayConfig.DiskCache(false, 1024, 16, 600, 2, 600,
@@ -364,6 +410,109 @@ class DiskCacheStoreTest {
           "旧 Deflate 缓存文件必须仍能正确读出（方案字节 0x01）");
       assertEquals(1L, store.stats().hits.sum());
       assertTrue(Files.isRegularFile(file), "旧文件不得被删除");
+    }
+  }
+
+  /**
+   * 世界卸载（主线程）不得为等磁盘缓存而卡顿：磁盘线程被长任务占住时，{@code invalidateWorld}
+   * 必须在等待预算内返回，且超时<b>不取消</b>任务——释放磁盘线程后关句柄仍须最终完成（一致性不破坏）。
+   *
+   * <p>回归：旧实现 {@code submit(..., FLUSH_TIMEOUT_MILLIS)} 会等满 5 秒，而世界卸载发生在主线程，
+   * 磁盘线程若正在压缩（整文件重写 + force + move）就会把主线程卡住最长 5 秒（玩家可感的卡服）。
+   */
+  @Test
+  void invalidateWorldDoesNotBlockCallerWhileDiskThreadIsBusy(@TempDir Path dir) throws Exception {
+    // 收尾等待预算取 50ms，与生产的 FLUSH_WAIT_MILLIS 一致
+    try (DiskCacheStore store = new DiskCacheStore(dir, config(1024, 600, 600), LOGGER,
+        10_000L, 50L)) {
+      store.put(WORLD, 0, 0, 1, payload(128));
+      awaitTrue(() -> store.openRegionFiles() == 1, 5_000L);
+      assertEquals(1, store.openRegionFiles(), "写入后应已打开该世界的区域文件句柄");
+
+      CountDownLatch entered = new CountDownLatch(1);
+      CountDownLatch release = new CountDownLatch(1);
+      diskThreadExecutor(store).execute(() -> {
+        entered.countDown();
+        try {
+          release.await();
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+        }
+      });
+      assertTrue(entered.await(5, TimeUnit.SECONDS), "占住磁盘线程的任务必须已开始执行");
+
+      long startNanos = System.nanoTime();
+      store.invalidateWorld(WORLD);
+      long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+
+      assertTrue(elapsedMillis < 3_000L,
+          "磁盘线程繁忙时世界卸载必须在等待预算内返回（旧实现会阻塞最长 5s），实际 "
+              + elapsedMillis + "ms");
+      assertEquals(1, store.openRegionFiles(),
+          "调用方返回时收尾任务尚未执行（证明磁盘线程确实被占住，等待是被预算截断的）");
+
+      release.countDown();
+      awaitTrue(() -> store.openRegionFiles() == 0, 5_000L);
+      assertEquals(0, store.openRegionFiles(),
+          "超时返回不等于取消：世界失效任务仍须由磁盘线程跑完（句柄最终关闭）");
+    }
+  }
+
+  /**
+   * {@code isCacheThread} 必须是不可伪造的身份判定：只有真正的磁盘线程为 true，
+   * 主线程与「改了同名」的外来线程都必须为 false。
+   *
+   * <p>回归：旧实现按线程名（{@code MikuXrayNet-DiskCache}）判定——外来线程改个同名就会被误判为
+   * 磁盘线程，从而绕过 {@code submit()} 的排队、直接在自己线程上跑磁盘 IO（拖住热路径）；
+   * 磁盘线程一旦被改名，它自己提交的读取又会去排队等自己、必然超时。
+   */
+  @Test
+  void cacheThreadIdentityCannotBeSpoofedByName(@TempDir Path dir) throws Exception {
+    try (DiskCacheStore store = store(dir, config(1024, 600, 600))) {
+      assertFalse(cacheThreadFlag(), "主线程（调用方）不得被判为磁盘线程");
+
+      AtomicBoolean impostorFlag = new AtomicBoolean(true);
+      AtomicBoolean impostorRan = new AtomicBoolean();
+      Thread impostor = new Thread(() -> {
+        impostorFlag.set(cacheThreadFlag());
+        impostorRan.set(true);
+      }, "MikuXrayNet-DiskCache"); // 与真实磁盘线程完全同名
+      impostor.start();
+      impostor.join(5_000L);
+      assertTrue(impostorRan.get(), "伪造线程必须已运行");
+      assertFalse(impostorFlag.get(), "同名外来线程不得被判为磁盘线程（名字判定会被伪造误导）");
+
+      AtomicBoolean realFlag = new AtomicBoolean();
+      diskThreadExecutor(store).submit(() -> realFlag.set(cacheThreadFlag()))
+          .get(5, TimeUnit.SECONDS);
+      assertTrue(realFlag.get(), "真实磁盘线程在自己的线程上必须被判为 true");
+    }
+  }
+
+  /** 反射调用生产代码私有的「是否磁盘线程」判定（不为测试在生产代码开洞）。 */
+  private static boolean cacheThreadFlag() {
+    try {
+      Method method = DiskCacheStore.class.getDeclaredMethod("isCacheThread");
+      method.setAccessible(true);
+      return (boolean) method.invoke(null);
+    } catch (ReflectiveOperationException exception) {
+      throw new AssertionError("无法调用 DiskCacheStore.isCacheThread", exception);
+    }
+  }
+
+  /** 反射取磁盘线程的执行器：用于在磁盘线程上运行任务、或占住它制造「磁盘线程繁忙」。 */
+  private static ScheduledExecutorService diskThreadExecutor(DiskCacheStore store) throws Exception {
+    Field field = DiskCacheStore.class.getDeclaredField("executor");
+    field.setAccessible(true);
+    return (ScheduledExecutorService) field.get(store);
+  }
+
+  /** 轮询等待条件成立（避免固定 sleep 时长造成的脆弱用例）。 */
+  private static void awaitTrue(BooleanSupplier condition, long timeoutMillis)
+      throws InterruptedException {
+    long deadline = System.currentTimeMillis() + timeoutMillis;
+    while (!condition.getAsBoolean() && System.currentTimeMillis() < deadline) {
+      Thread.sleep(10L);
     }
   }
 }

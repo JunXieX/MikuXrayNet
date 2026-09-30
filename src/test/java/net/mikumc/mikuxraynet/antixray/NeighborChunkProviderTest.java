@@ -173,6 +173,30 @@ class NeighborChunkProviderTest {
   }
 
   /**
+   * 四个邻块都不可用（四个平面全 {@code null}）的结果<b>不入缓存</b>：方向安全但无收益，
+   * 缓存只会让「全缺失」这一瞬间状态滞留到 TTL 过期，邻块随后加载也得干等。
+   */
+  @Test
+  void allMissingEdgesAreNotCached() {
+    NeighborChunkProvider provider = new NeighborChunkProvider(8);
+
+    NeighborEdges edges = provider.capture("world", 0, HEIGHT, 4, 7,
+        (chunkX, chunkZ) -> false, QUERY, UNBOUNDED);
+    assertFalse(edges.has(Side.X_MINUS));
+    assertFalse(edges.has(Side.X_PLUS));
+    assertFalse(edges.has(Side.Z_MINUS));
+    assertFalse(edges.has(Side.Z_PLUS));
+    assertNull(provider.cached("world", 4, 7), "全 null 平面不得入缓存（无收益，反让缺失态滞留）");
+    assertEquals(0, provider.size(), "全 null 结果不应占用缓存条目");
+
+    // 邻块随即加载：因未缓存 → 立刻重抓并补齐（无需等 TTL 过期）
+    NeighborEdges refreshed = provider.capture("world", 0, HEIGHT, 4, 7,
+        (chunkX, chunkZ) -> true, QUERY, UNBOUNDED);
+    assertTrue(refreshed.has(Side.X_PLUS), "此前未缓存 → 邻块加载后立刻补齐");
+    assertSame(refreshed, provider.cached("world", 4, 7), "含可用平面的结果正常入缓存");
+  }
+
+  /**
    * 高度上界裁剪的等价性：真实世界里「遮挡方块一定在列上界之内」（上界 = 该列最高非空气方块），
    * 因此裁剪只该省掉读取、不该改变任何一位。
    */

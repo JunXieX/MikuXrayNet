@@ -4,18 +4,26 @@ package net.mikumc.mikuxraynet.codec;
 import io.netty.buffer.ByteBuf;
 
 /**
- * 间接调色板（bitsPerBlock 4..8）：按首次出现顺序为方块状态分配本地索引，索引表长度为 {@code 1 << bitsPerValue}。
+ * 间接调色板（位宽 4..8；另有 FAWE 兼容档位宽 1）：按首次出现顺序为方块状态分配本地索引，
+ * 索引表长度为 {@code 1 << bitsPerValue}。
  *
- * <p>关键约束：索引表写满（或索引达到 0xFF 哨兵值）时调用 {@link ChunkSection#grow(int, int)} 升位——
- * bitsPerValue 为 4~7 时升到 bitsPerValue+1 的间接调色板；8 位写满时 {@code grow(9)} 会直接切换为
- * 直接调色板（位宽取注册表上限），不再有「+1 位」的间接档位。
+ * <p>关键约束：索引表写满（本地索引达到 {@code 1 << bitsPerValue}）时调用 {@link ChunkSection#grow(int, int)} 升位——
+ * 位宽 4~7 时升到 bitsPerValue+1 的间接调色板；位宽 1 的兼容档会经 {@code max(4, bits)} 直接升到 4 位；
+ * 8 位写满（出现第 257 个不同状态）时 {@code grow(9)} 会直接切换为直接调色板（位宽取注册表上限）。
+ * 因此 8 位间接调色板可容纳满 256 项，与原版上限一致。
  * {@code byValue} 以方块状态 id 直接下标，故长度必须覆盖注册表全部方块状态
  * （由 {@link ChunkScratch} 按线程复用，避免每个 section 都新建这张 32 KB 级反查表）。
  *
- * <p><b>复用缓冲不做整表清零</b>：{@code byValue} 是 scratch 复用的大数组，构造时整表 memset 0xFF
- * （注册表全部方块状态，≈2.6 万字节）就是每个 section 一次的无谓开销。改为「用反向表 {@code byId} 校验命中」：
- * 仅当 {@code id < size} 且 {@code byId[id] == value} 时 {@code byValue[value]} 才视为有效，否则按残留处理
- * （与旧实现的 0xFF 哨兵等价）；因此不清零也不会把上一轮登记的条目误判成本调色板已登记。纯查表校验、不新增常驻内存。
+ * <p><b>复用缓冲不做整表清零、也不使用 0xFF 哨兵</b>：{@code byValue} 是 scratch 复用的大数组，构造时整表
+ * memset 0xFF（注册表全部方块状态，≈2.6 万字节）就是每个 section 一次的无谓开销。改为「用反向表 {@code byId}
+ * 校验命中」：仅当 {@code id < size} 且 {@code byId[id] == value} 时 {@code byValue[value]} 才视为有效，否则按
+ * 残留处理；因此不清零也不会把上一轮登记的条目误判成本调色板已登记。纯查表校验、不新增常驻内存。
+ *
+ * <p><b>为什么不能用 0xFF 当「未登记」哨兵</b>：{@code byValue} 是 {@code byte[]}，0xFF 正是 8 位调色板的合法
+ * 索引 255。旧实现在命中判定里额外要求 {@code id != 0xFF}，于是索引 255（调色板第 256 项）永远被判为未登记：
+ * 读取原版产出的 256 项 8 位调色板后，对第 256 项调用 {@code idFor}/{@code contains} 会误走 {@code grow(9)}，
+ * 白白把整个 section 从 8 位间接重编码成 15 位直接（语义不变但开销巨大）。既然命中完全由 {@code byId} 反查校验
+ * 保证，哨兵已无必要，故彻底移除，{@code byId} 数组本身逐项校验、不会因 {@code byValue} 残留而误命中。
  */
 public class IndirectPalette implements Palette {
 
@@ -31,33 +39,21 @@ public class IndirectPalette implements Palette {
     this.bitsPerValue = bitsPerValue;
     this.chunkSection = chunkSection;
 
-    // byValue 由 scratch 复用、内容未初始化：不再整表 memset，命中与否交由 byId 反查校验（见类注释）
+    // byValue 由 scratch 复用、内容未初始化：不做整表 memset，命中与否交由 byId 反查校验（见类注释）
     this.byValue = chunkSection.scratch().bytes(chunkSection.registryAccessor().getUniqueBlockStateCount());
     this.byId = new int[1 << bitsPerValue];
   }
 
-  /*
-   * 8 位调色板的容量取舍（有意为之，勿「顺手修正」）：
-   * byValue 是复用自 ChunkScratch 的 byte[]（32 KB 级，每线程复用，避免每个 section 新建反查表），
-   * 其 0xFF 被用作「未登记」哨兵。byte 只能表示 0..255，因此无法同时表达哨兵与 id=255：
-   * idFor() 在 id 达到 0xFF 时即 grow()。净效果是 bitsPerValue 为 4~8 的间接调色板实际可容纳
-   * (1 << bitsPerValue) - 1 项（8 位为 255 项而非原版理论上限 256 项），即比原版早一档从
-   * 8 位间接升到 direct——受影响的阈值是「写入第 256 个不同方块状态时（而非第 257 个）触发
-   * grow(9) 切到 direct」。读取不受影响：read() 允许 size 到 byId.length（8 位即 256，原版可能
-   * 产出该形态）。不改的直接原因：要容纳 256 项必须把 byValue 换成 short[]/int[] 以留出独立哨兵值，
-   * 反查表内存将增大 2~4 倍，且「256 项时是否升位」会改变既有区块的输出字节（格式/往返语义变化）。
-   * 按「等价优先」原则保留现状并在此显式记录取舍。
-   */
-
   @Override
   public int idFor(int value) {
     int id = this.byValue[value] & 0xFF;
-    // byValue 复用、可能残留上一轮的登记：只有 id 落在已登记区间且反向表自洽才算命中（见类注释）
-    boolean registered = id != 0xFF && id < this.size && this.byId[id] == value;
+    // byValue 复用、可能残留上一轮的登记：只有 id 落在已登记区间且反向表自洽才算命中（见类注释）。
+    // 不能用 0xFF 排除 id=255——那正是 8 位调色板的合法第 256 项。
+    boolean registered = id < this.size && this.byId[id] == value;
     if (!registered) {
       id = this.size++;
 
-      if (id != 0xFF && id < this.byId.length) {
+      if (id < this.byId.length) {
         this.byValue[value] = (byte) id;
         this.byId[id] = value;
       } else {
@@ -95,9 +91,11 @@ public class IndirectPalette implements Palette {
       // 若不在此拦截，后写入的 id 会覆盖 byValue 反查记录，使同一方块状态对应两个索引——后续
       // valueFor(idFor(v)) 可能返回另一个 id，导致本地索引与调色板不一致（静默改写语义）。按 fail-open
       // 约定在此早失败：异常由上层解码兜底，本 section 被拒绝、封包链路不受影响。
-      // 判重同样靠 byId 反查校验（byValue 未清零，可能残留）：仅已在本次循环登记过的 id（< id）且反向自洽才算重复。
+      // 判重同样靠 byId 反查校验（byValue 未清零，可能残留）：仅已在本次循环登记过的 id（< id）且
+      // 反向自洽才算重复。不以 0xFF 排除——0xFF 是合法索引 255，且「曾登记于 255」不可能再触发重复
+      // （255 已是 8 位调色板的最后一项，之后 size 必超容量）。
       int existing = this.byValue[value] & 0xFF;
-      if (existing != 0xFF && existing < id && this.byId[existing] == value) {
+      if (existing < id && this.byId[existing] == value) {
         throw new IndexOutOfBoundsException(
             "duplicate palette value: " + value + " at id " + id);
       }
@@ -141,15 +139,13 @@ public class IndirectPalette implements Palette {
   /**
    * 用保留的值<b>子集</b>重建索引表（裁剪掉未列出的旧条目）。
    *
-   * <p>与 {@link #rebuild(int[])}（全量排列）不同，本方法允许 {@code values} 只包含原值集合的一部分：
-   * 被裁剪条目的 {@code byValue} 反查记录会被清回哨兵值，之后再次遇到这些方块状态时会作为
-   * 新条目重新登记，不会命中残留的旧索引——这是「引用计数为 0 的失效条目裁剪」的正确性前提。
+   * <p>与 {@link #rebuild(int[])}（全量排列）不同，本方法允许 {@code values} 只包含原值集合的一部分。
+   * 正确性由「{@code size} 收缩 + {@code byId} 反查校验」共同保证：命中判定要求
+   * {@code id < size && byId[id] == value}，被裁剪条目的 {@code byValue} 反查记录即使仍残留旧索引，
+   * 也因 {@code byId} 对不上（或索引越界）而不被误命中，之后再次遇到这些方块状态时会作为新条目重新登记。
+   * （不再像过去那样把 {@code byValue} 清回 0xFF：那既是合法索引 255、也与「不使用哨兵」的判定口径相悖。）
    */
   void retain(int[] values) {
-    // 先按旧 size 清空全部反查记录，再登记保留条目（顺序不能反，否则清空会抹掉新登记）
-    for (int id = 0; id < this.size; id++) {
-      this.byValue[this.byId[id]] = (byte) 0xFF;
-    }
     this.size = values.length;
     for (int id = 0; id < values.length; id++) {
       this.byId[id] = values[id];
@@ -167,8 +163,9 @@ public class IndirectPalette implements Palette {
     if (value < 0 || value >= this.byValue.length) {
       return false;
     }
-    // 与 idFor 同一套反查校验：byValue 可能残留上一轮的登记，必须由 byId 确认自洽
+    // 与 idFor 同一套反查校验：byValue 可能残留上一轮的登记，必须由 byId 确认自洽。
+    // 不能排除 0xFF——那是 8 位调色板第 256 项（索引 255）的合法编码。
     int id = this.byValue[value] & 0xFF;
-    return id != 0xFF && id < this.size && this.byId[id] == value;
+    return id < this.size && this.byId[id] == value;
   }
 }

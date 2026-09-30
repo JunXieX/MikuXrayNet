@@ -623,6 +623,10 @@ public final class AntiXrayConfig {
         OcclusionRules.sortedList(this.occlusion.extraNonOccluding()), this.occlusion.fluidCover(),
         // 黑名单决定「哪些世界完全不改写」，参与指纹：切换黑名单后旧缓存（该世界已改写结果）不再复用。
         this.worldBlacklist,
+        // remove-block-entities 直接改变「写进缓存的区块负载字节」（是否从区块封包剔除方块实体数据），
+        // 必须参与指纹：否则开↔关切换后旧缓存仍被命中（即使重启也不生效，管理员只能手动清缓存）。
+        // 纳入后现存磁盘缓存会一次性失效重建（属预期）。
+        this.removeBlockEntities,
         // zstd 下载校验哈希参与指纹（按任务要求）：切换它会让现存磁盘缓存一次性失效重建（属正常）。
         this.diskCache.zstdSha256());
   }
@@ -1023,14 +1027,19 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 视锥竖直全角的生效值：非法值（{@code <=0} / {@code >360}）回落默认，低于
-   * {@link #FRUSTUM_FOV_FLOOR} 时抬升到下限并记入 {@code floorAdjustments}。
+   * 视锥竖直全角的生效值：非法值（NaN / {@code <=0} / {@code >360}）回落默认；低于
+   * {@link #FRUSTUM_FOV_FLOOR} 时抬升到下限——两种情况都记入 {@code floorAdjustments}，
+   * 由加载路径一次性 WARN（绝不静默改用户配置）。
    *
    * <p>升到下限而不是照配置生效的原因见 {@link #FRUSTUM_FOV_FLOOR}：配窄了会让玩家看得见的方块
    * 一直保持伪装（显形判定里只有这一道闸门会「看得见却不发」）。要省带宽请关掉整个视锥剔除。
    */
   private static double frustumFov(double configured, List<String> floorAdjustments) {
     if (Double.isNaN(configured) || configured <= 0.0D || configured > 360.0D) {
+      // 非法值（NaN / 非正 / 超过 360°）与低于下限一样不会照配置生效：纳入统一的一次性 WARN 明细，
+      // 避免出现「管理员写了无效角度、却以为它已生效」的静默落差（与其它钳制项口径一致）。
+      floorAdjustments.add("proximity.frustum.fov=" + configured + "（非法值，回落默认 "
+          + FRUSTUM_FOV_FLOOR + "°）");
       return FRUSTUM_FOV_FLOOR;
     }
     if (configured >= FRUSTUM_FOV_FLOOR) {

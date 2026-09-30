@@ -18,7 +18,9 @@ import io.netty.buffer.Unpooled;
  *
  * <p>分配：调色板反查表、位打包 long 数组与输出缓冲区都由按线程复用的 {@link ChunkScratch} 提供，
  * {@link #close()} 时归还给本线程，供下一个区块复用，避免每个区块都重建这几百 KB 的数组。
- * 因此同一输入不因复用而产生任何字节差异：所有借出的数组在借出方手里都会被完整初始化。
+ * 因此同一输入不因复用而产生任何字节差异：借出的数组在借出方手里都会被完整初始化或校验
+ * （位打包数组与输出缓冲区会清零/写满；调色板反查表 {@code byValue} 不清零，改由 {@code byId}
+ * 反向表逐项校验命中，见 {@link IndirectPalette} 的说明）。
  */
 public class Chunk implements AutoCloseable {
 

@@ -61,6 +61,12 @@ public final class RewriteTask {
    */
   public RewriteTask(int chunkX, int chunkZ, String worldName, AntiXrayConfig.Dimension dimension,
       int minHeight, int sectionCount, long timeoutMillis, Runnable delivery) {
+    // 构造期快速失败：delivery 为空时唯一的放行动作会在首个 signalOnce() 里抛 NPE，异常路径一旦
+    // 被上层吞掉，该封包就永久无人放行（卡包）。宁可在此立刻暴露编程错误，也不留一个「看似正常、
+    // 实则永不放行」的任务。生产路径始终传入非空 lambda，故该分支不会在正常运行中触发。
+    if (delivery == null) {
+      throw new IllegalArgumentException("delivery 放行动作不能为 null：缺失会导致封包永久无人放行");
+    }
     this.chunkX = chunkX;
     this.chunkZ = chunkZ;
     this.worldName = worldName;
@@ -110,9 +116,18 @@ public final class RewriteTask {
     return gate.compareAndSet(GATE_OPEN, GATE_WRITING);
   }
 
-  /** 放行封包，整条链路恰好执行一次。 */
+  /**
+   * 放行封包，整条链路恰好执行一次。
+   *
+   * <p>放行即任务终结，因此把闸门一并推进到终态 {@link #GATE_DONE}（不再停留在 {@code WRITING}）。
+   * 两点理由：① 正常写入路径此前完成后闸门仍停在 {@code WRITING}，语义上像是「还在写」，容易误导；
+   * ② 终态化后，任何迟到的 {@link #releaseOnTimeout()} 都会因 CAS({@code OPEN→DONE}) 失败而返回
+   * false，不会被误计成「超时放行」（先前若在写入前直接 {@code signalOnce()}，闸门仍是 {@code OPEN}，
+   * 迟到的兜底会把已放行的任务再报一次超时）。
+   */
   public void signalOnce() {
     if (signaled.compareAndSet(false, true)) {
+      gate.set(GATE_DONE);
       delivery.run();
     }
   }

@@ -66,6 +66,15 @@ public final class ZstdSupport {
   /** 缺省等待上限（秒）。 */
   public static final int DEFAULT_TIMEOUT_SECONDS = 10;
 
+  /**
+   * 自动下载文件的体积上限：16 MiB。
+   *
+   * <p><b>依据</b>：zstd-jni 1.5.7-15 的平台专用包约 0.4 MB、全平台包约 6.2 MB，16 MiB 对二者都有 2 倍以上
+   * 余量；而「体积远超预期」的响应几乎只可能来自错误源或被劫持/损坏的响应。下载时逐块累计字节数，一旦超过
+   * 此上限立即中止并拒绝（在写满磁盘、耗尽带宽之前），保持「校验失败 → 拒绝并回退内置压缩」的既有语义。
+   */
+  static final long MAX_DOWNLOAD_BYTES = 16L * 1024 * 1024;
+
   /** zstd 来源（仅用于日志）。 */
   public enum Source {
     /** 服务端自带（插件类路径可见）。 */
@@ -611,10 +620,12 @@ public final class ZstdSupport {
   }
 
   /**
-   * 单次下载尝试（一个分类器）：下载 → 非空校验 → 完整性校验（可选）→ 原子替换 → 可加载校验。
+   * 单次下载尝试（一个分类器）：下载（边下边算摘要/计体积）→ 上限与非空校验 → 完整性校验（可选）→
+   * 原子替换 → 可加载校验。
    *
-   * <p>完整性校验只在提供了 {@code expectedSha256} 时执行：不匹配即视为被篡改/损坏，
-   * 删除临时文件并返回 {@code null}（绝不把未通过校验的 jar 落到 lib 目录）。
+   * <p>摘要由 {@link #download} 在下载过程中流式算出，<b>不再对落盘后的临时文件做第二遍读取</b>；
+   * 完整性校验只在提供了 {@code expectedSha256} 时执行：不匹配即视为被篡改/损坏，删除临时文件并返回
+   * {@code null}（原子替换之前就拒绝，绝不把未通过校验的 jar 落到 lib 目录）。
    */
   private static Codec downloadOnce(Path libraryDir, String baseUrl, String classifier,
       String expectedSha256, long timeoutMillis) {
@@ -622,15 +633,14 @@ public final class ZstdSupport {
     Path temp = target.resolveSibling(target.getFileName() + ".tmp");
     try {
       Files.createDirectories(libraryDir);
-      download(downloadUrl(baseUrl, GROUP, ARTIFACT, VERSION, classifier), temp,
+      // 流式下载：返回下载内容的实际 SHA-256（未配置期望哈希时也由 initialize 打印，供服主复制）
+      String actual = download(downloadUrl(baseUrl, GROUP, ARTIFACT, VERSION, classifier), temp,
           (int) Math.min(Integer.MAX_VALUE, Math.max(1L, timeoutMillis)));
+      lastDownloadedSha256 = actual;
       if (!Files.isRegularFile(temp) || Files.size(temp) <= 0L) {
         lastError = "下载文件为空";
         return null;
       }
-      // 无论是否配置期望哈希都计算实际摘要：未配置时由 initialize 打印出来供服主复制（见其说明）
-      String actual = sha256Hex(temp);
-      lastDownloadedSha256 = actual;
       if (expectedSha256 != null && !expectedSha256.isBlank()
           && !actual.equalsIgnoreCase(expectedSha256.trim())) {
         // 摘要不符：视为被篡改/损坏，删除临时文件并拒绝（绝不把未通过校验的 jar 落到 lib 目录）
@@ -660,32 +670,58 @@ public final class ZstdSupport {
   /**
    * 下载到临时文件：在守护线程上执行并以 {@code timeoutMillis} 为**总等待上限**
    * （连接超时 / 读取超时也各自设为该值），保证调用方等待时间有硬上限。
+   *
+   * <p><b>流式校验 + 体积上限</b>：边下载边计算 SHA-256、边累计字节数——① 一旦累计超过
+   * {@link #MAX_DOWNLOAD_BYTES} 立即中止（在写满磁盘/耗尽带宽之前拒绝超大或异常响应）；
+   * ② 返回的摘要直接用于完整性校验，<b>不再对落盘后的临时文件做第二遍读取</b>（校验因此前移到下载过程
+   * 本身；摘要不匹配时调用方仍会在原子替换之前拒绝该临时文件）。
+   *
+   * @return 下载内容的 SHA-256 十六进制小写摘要
    */
-  private static void download(String url, Path target, int timeoutMillis) throws IOException {
+  private static String download(String url, Path target, int timeoutMillis) throws IOException {
     ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
       Thread thread = new Thread(runnable, "MikuXrayNet-ZstdDownload");
       thread.setDaemon(true);
       return thread;
     });
     try {
-      Callable<Void> task = () -> {
+      Callable<String> task = () -> {
         HttpURLConnection connection =
             (HttpURLConnection) URI.create(url).toURL().openConnection();
         connection.setConnectTimeout(timeoutMillis);
         connection.setReadTimeout(timeoutMillis);
         connection.setInstanceFollowRedirects(true);
         connection.setRequestProperty("User-Agent", "MikuXrayNet");
+        MessageDigest digest;
+        try {
+          digest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException impossible) {
+          throw new IOException("JVM 缺少 SHA-256 实现", impossible);
+        }
         try (InputStream in = connection.getInputStream();
             OutputStream out = Files.newOutputStream(target, StandardOpenOption.CREATE,
                 StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
-          in.transferTo(out);
+          byte[] chunk = new byte[8192];
+          long total = 0L;
+          int read;
+          while ((read = in.read(chunk)) >= 0) {
+            if (read == 0) {
+              continue;
+            }
+            total += read;
+            if (total > MAX_DOWNLOAD_BYTES) {
+              throw new IOException("下载体积超过上限 " + MAX_DOWNLOAD_BYTES + " 字节，已拒绝：" + url);
+            }
+            digest.update(chunk, 0, read);
+            out.write(chunk, 0, read);
+          }
         } finally {
           connection.disconnect();
         }
-        return null;
+        return HexFormat.of().formatHex(digest.digest());
       };
-      Future<Void> future = executor.submit(task);
-      future.get(timeoutMillis, TimeUnit.MILLISECONDS);
+      Future<String> future = executor.submit(task);
+      return future.get(timeoutMillis, TimeUnit.MILLISECONDS);
     } catch (TimeoutException exception) {
       throw new IOException("下载超时（" + timeoutMillis + "ms）：" + url, exception);
     } catch (ExecutionException exception) {
@@ -700,7 +736,12 @@ public final class ZstdSupport {
     }
   }
 
-  /** 计算文件的 SHA-256 十六进制小写摘要（用于下载完整性校验；纯 JDK，无额外依赖）。 */
+  /**
+   * 计算文件的 SHA-256 十六进制小写摘要。
+   *
+   * <p>测试专用豁免：生产下载路径已改为在 {@link #download} 过程中<b>流式</b>计算摘要（不再回读文件），
+   * 本方法当前仅单测在用，保留以免破坏测试。
+   */
   static String sha256Hex(Path file) throws IOException {
     try {
       MessageDigest digest = MessageDigest.getInstance("SHA-256");

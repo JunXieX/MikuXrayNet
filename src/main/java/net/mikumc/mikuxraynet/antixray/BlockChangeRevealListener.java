@@ -22,7 +22,8 @@ import org.bukkit.plugin.Plugin;
  *
  * <p><b>为什么需要注销</b>：玩家挖掉一个伪装方块时，服务端会下发真实的变更包；若该坐标仍留在
  * 伪装清单里，邻近显形稍后还会用陈旧数据重复发包（多花带宽，观感也可能闪一下）。所以命中即注销。
- * 这里只摘除<b>变更的那一个坐标</b>（与既有行为一致），该区块其它坐标照常显形。
+ * 单方块变更只摘<b>变更的那一个坐标</b>；多方块变更（一个 section）按 section 聚合，一次批量摘除
+ * 该 section 的全部变更坐标（见 {@link #processChanges}），该区块其它坐标照常显形。
  *
  * <p><b>为什么走异步通道（而不是同步监听）</b>：
  * <ol>
@@ -152,23 +153,160 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     observeChange(player, worldName, position.getX(), position.getY(), position.getZ());
   }
 
-  /** 多方块变更：section 坐标 + 区块内相对坐标（与本插件合并包一致的位置编码）。 */
+  /**
+   * 多方块变更：section 坐标 + 区块内相对坐标（与本插件合并包一致的位置编码）。
+   *
+   * <p><b>为什么按 section 聚合而不是逐坐标</b>：一个 section 最多 4096 个坐标。逐坐标调用会带来
+   * ① 每坐标一次 {@code removePosition}（二分 + 整段数组复制，最坏 {@code O(4096·n)} 元素拷贝）；
+   * ② 每坐标一次邻域初筛；③ 每命中各调度一次显形任务——全部压在 netty 线程上。这里改为：
+   * 先对坐标去重，再交给 {@link #processChanges} 按 section 分组聚合（每 section 一次批量摘除、
+   * 一次初筛、一次调度）。
+   */
   private void unregisterMulti(Player player, PacketContainer packet, String worldName) {
     BlockPosition section = packet.getSectionPositions().readSafely(0);
     short[] positions = packet.getShortArrays().readSafely(0);
-    if (section == null || positions == null) {
+    if (section == null || positions == null || positions.length == 0) {
+      return;
+    }
+    if (isBlacklisted(config, worldName)) {
       return;
     }
 
     int baseX = section.getX() << 4;
     int baseY = section.getY() << 4;
     int baseZ = section.getZ() << 4;
-    for (short packed : positions) {
-      int x = baseX + (packed >> 8 & 15);
-      int z = baseZ + (packed >> 4 & 15);
-      int y = baseY + (packed & 15);
-      observeChange(player, worldName, x, y, z);
+
+    // 坐标去重由 processChanges/SectionBuffer 统一完成（同一 section 内坐标编码唯一）
+    int[] coordinates = new int[positions.length * 3];
+    for (int i = 0; i < positions.length; i++) {
+      short packed = positions[i];
+      coordinates[i * 3] = baseX + (packed >> 8 & 15);
+      coordinates[i * 3 + 1] = baseY + (packed & 15);
+      coordinates[i * 3 + 2] = baseZ + (packed >> 4 & 15);
     }
+
+    processChanges(worldName, coordinates, positions.length, obfuscatedChunkIndex, revealedSet, stats,
+        (changed, changedCount) -> {
+          if (instantRevealer != null && changedCount > 0) {
+            instantRevealer.onSectionChangeObserved(player, worldName, changed, changedCount);
+          }
+        });
+  }
+
+  /**
+   * 一个 section 的调度回调：生产实现交给 {@link ProximityRevealer#onSectionChangeObserved}；
+   * 单测注入计数桩，用来断言「每个 section 恰好调度一次」。
+   */
+  @FunctionalInterface
+  interface SectionDispatch {
+
+    /** 一个 section 的全部变更坐标（已去重，扁平三元组，前 {@code count} 个有效）。 */
+    void dispatch(int[] coordinates, int count);
+  }
+
+  /** 单个 section 收集到的变更坐标（可增长的扁平三元组缓冲，并按 section 内编码去重）。 */
+  private static final class SectionBuffer {
+
+    private final long key;
+    /** 16³ = 4096 个槽位，同一 section 内坐标编码唯一，用于去重。 */
+    private final boolean[] seen = new boolean[4096];
+    private int[] data = new int[48];
+    private int count;
+
+    private SectionBuffer(long key) {
+      this.key = key;
+    }
+
+    private void add(int x, int y, int z) {
+      int slot = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
+      if (seen[slot]) {
+        return;
+      }
+      seen[slot] = true;
+      if (count * 3 + 3 > data.length) {
+        data = java.util.Arrays.copyOf(data, data.length * 2);
+      }
+      data[count * 3] = x;
+      data[count * 3 + 1] = y;
+      data[count * 3 + 2] = z;
+      count++;
+    }
+  }
+
+  /**
+   * 把一批变更坐标（绝对坐标三元组，可能跨多个 section）按 section（chunk + sectionY）分组后聚合处理：
+   * 每个 section 只做一次批量索引摘除、一次邻域初筛、一次调度。
+   *
+   * <p>生产路径的多方块变更包本就只含一个 section，跨 section 分组是为将来/其它调用方保留的通用性；
+   * 包级可见以便离线单测直接喂跨 section 坐标并注入调度计数桩（{@link SectionDispatch}）。
+   *
+   * <p><b>不变式</b>：无论索引是否命中，都要把该坐标的已显形标记同步摘除——索引未命中而标记仍在，
+   * 就是会让「整块跳过」提前成立的孤儿标记（见 {@link #unregisterCoordinate}）。
+   */
+  static void processChanges(String worldName, int[] coordinates, int count,
+      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
+      SectionDispatch dispatch) {
+    if (worldName == null || coordinates == null || count <= 0) {
+      return;
+    }
+
+    java.util.List<SectionBuffer> sections = new java.util.ArrayList<>();
+    for (int i = 0; i < count; i++) {
+      int x = coordinates[i * 3];
+      int y = coordinates[i * 3 + 1];
+      int z = coordinates[i * 3 + 2];
+      long key = sectionKey(x, y, z);
+      SectionBuffer buffer = null;
+      for (int s = 0; s < sections.size(); s++) {
+        if (sections.get(s).key == key) {
+          buffer = sections.get(s);
+          break;
+        }
+      }
+      if (buffer == null) {
+        buffer = new SectionBuffer(key);
+        sections.add(buffer);
+      }
+      buffer.add(x, y, z);
+    }
+
+    for (int s = 0; s < sections.size(); s++) {
+      processSection(worldName, sections.get(s), obfuscatedChunkIndex, revealedSet, stats, dispatch);
+    }
+  }
+
+  /** 处理单个 section：一次批量摘除 + 一次调度。 */
+  private static void processSection(String worldName, SectionBuffer section,
+      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
+      SectionDispatch dispatch) {
+    int removed = 0;
+    if (obfuscatedChunkIndex != null) {
+      removed = obfuscatedChunkIndex.removePositions(worldName, section.data, section.count);
+    }
+    // 已显形标记必须与伪装清单同步摘除：维持「已显形坐标 ⊆ 区块伪装清单」不变式。
+    // 索引未命中也要摘（宁可多摘一次也不能留孤儿标记，见 unregisterCoordinate）。
+    if (revealedSet != null) {
+      for (int i = 0; i < section.count; i++) {
+        revealedSet.removePosition(worldName, section.data[i * 3], section.data[i * 3 + 1],
+            section.data[i * 3 + 2]);
+      }
+    }
+    if (removed > 0 && stats != null) {
+      stats.unregistered.add(removed);
+    }
+    if (dispatch != null) {
+      dispatch.dispatch(section.data, section.count);
+    }
+  }
+
+  /**
+   * section 键：把 {@code (chunkX, sectionY, chunkZ)} 打成单个 long（chunkX/chunkZ 各 22 位、
+   * sectionY 11 位），覆盖世界边界（±3000 万方块 ≈ 区块 ±190 万）与 16 位建筑高度范围，不存在碰撞。
+   */
+  private static long sectionKey(int x, int y, int z) {
+    return ((long) ((x >> 4) & 0x3FFFFF) << 33)
+        | ((long) ((y >> 4) & 0x7FF) << 22)
+        | ((z >> 4) & 0x3FFFFF);
   }
 
   /**
@@ -202,22 +340,25 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   }
 
   /**
-   * 命中即从「伪装区块清单」与「各玩家的已显形标记」中摘除该坐标。
+   * 从「伪装区块清单」与「各玩家的已显形标记」中同步摘除该坐标。
    *
    * <p>两者必须同步摘除，才能维持「已显形坐标 ⊆ 区块伪装清单」这一不变式——「整块已全部显形
    * 则跳过该区块」的判断依赖它。只摘变更的那一个坐标，该区块其它坐标照常显形（与既有行为一致）。
+   *
+   * <p><b>为什么索引未命中也要摘已显形标记（容忍「标记先行」）</b>：邻近显形改为「先标记、再发包」
+   * 后，我们发出的显形包会回显到这里。若另一个玩家已先把该坐标从共享索引里摘掉，本次 {@code removePosition}
+   * 就未命中，但本玩家刚写入的标记仍在——那是一枚孤儿标记（已显形数虚增会让「整块跳过」提前成立，
+   * 真实坐标被长期漏显形）。因此这里无条件摘标记：正常情况无副作用，异常情况恰好清掉孤儿。
    */
   private void unregisterCoordinate(String worldName, int x, int y, int z) {
     if (worldName == null || obfuscatedChunkIndex == null) {
       return;
     }
-    if (!obfuscatedChunkIndex.removePosition(worldName, x, y, z)) {
-      return;
-    }
+    boolean removedFromIndex = obfuscatedChunkIndex.removePosition(worldName, x, y, z);
     if (revealedSet != null) {
       revealedSet.removePosition(worldName, x, y, z);
     }
-    if (stats != null) {
+    if (removedFromIndex && stats != null) {
       stats.unregistered.increment();
     }
   }

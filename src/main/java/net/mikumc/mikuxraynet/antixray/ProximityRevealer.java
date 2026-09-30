@@ -86,7 +86,8 @@ import org.bukkit.util.Vector;
  * {@code proximity.batch-reveal-sends}（默认开启）时把一个周期内通过筛选的坐标累积起来、
  * 周期末一次 {@code sendMultiBlockChange} 发出（Paper 按 16³ 区块段自动合并，每个涉及的段一个包），
  * 失败时退化为逐坐标 {@code sendBlockChange}；关闭时逐坐标发单方块变更包（旧行为，供 A/B 与回退）。
- * 同一坐标只显形一次（发送成功后立即写入该玩家的 {@link RevealedSet}）；区块被重新下发或被卸载时
+ * 同一坐标只显形一次（<b>先写入该玩家的 {@link RevealedSet} 标记、再发包，发送失败则回滚标记</b>，
+ * 理由见 {@link #markThenSend}）；区块被重新下发或被卸载时
  * 该区块的已显形标记一并失效（客户端又会看到伪装结果，必须重新显形）。单个坐标失败只记日志并跳过，
  * 绝不中断整体。
  */
@@ -195,8 +196,9 @@ public final class ProximityRevealer implements Listener {
    * 一个周期（或一次事件触发）内待发的显形批次：只累积「已通过全部筛选、待发包」的坐标与真实方块状态，
    * 周期末由 {@link #flushBatch} 一次发出并逐个写回「已显形」标记。
    *
-   * <p><b>为什么先累积再发</b>：批量合并的前提是「先知道本周期有哪些坐标要发」；同时把标记推迟到
-   * 真正发出之后，保证「已显形标记 ⊆ 客户端真正收到过的坐标」这一不变式不被破坏。
+   * <p><b>为什么先累积再发</b>：批量合并的前提是「先知道本周期有哪些坐标要发」。发包时按
+   * 「<b>先写标记、再发包、失败回滚</b>」的顺序处理（见 {@link #markThenSend}）：标记先行是为了与
+   * 出站监听器的摘除路径对齐，杜绝孤儿标记；发送失败回滚则保证未发出的坐标仍会被后续周期重试。
    * 坐标为绝对方块坐标；方块状态在玩家所属线程读取（见 {@link #sendOne}）。
    */
   private static final class RevealBatch {
@@ -488,11 +490,14 @@ public final class ProximityRevealer implements Listener {
     try {
       workPool.execute(() -> {
         Plan plan = computePlan(eye, coordinates);
-        // 读方块与发包必须回到玩家所属线程
+        // 读方块与发包必须回到玩家所属线程。世界在候选筛选时已捕获（见 reveal 的 world 局部量），
+        // 这里绝不再取 player.getWorld()：异步回调期间玩家可能已切换世界，重取会让「旧世界的候选坐标」
+        // 配上「新世界的 ChunkKey」（污染已显形集合）并发出冗余包。改用捕获的世界，且校验玩家仍在同一
+        // 世界——跨世界则放弃本轮（fail-open，绝不误发/误标）。
         Schedulers.onEntity(plugin, player, () -> {
           try {
-            if (player.isOnline()) {
-              sendCandidates(player, player.getWorld(), null, plan, eye, budget, scanTally);
+            if (player.isOnline() && player.getWorld() == world) {
+              sendCandidates(player, world, null, plan, eye, budget, scanTally);
             }
           } catch (Throwable throwable) {
             logThrottled(throwable);
@@ -623,15 +628,17 @@ public final class ProximityRevealer implements Listener {
     }
 
     if (batch != null) {
-      // 批量模式：先累积，周期末由 flushBatch 一次发出并在成功后才写入「已显形」标记。
+      // 批量模式：先累积，周期末由 flushBatch 一次发出（按「先标记、再发包、失败回滚」处理）。
       // 这里先预扣额度以封住单周期上限；若最终未能发出，由 flushBatch 归还（见其「额度归还」说明）。
       batch.add(x, y, z, data);
       budget.decrement();
       return;
     }
 
-    if (sendSingle(player, world, x, y, z, data)) {
-      markRevealed(player, world, x, y, z);
+    // 单包路径同样「先标记、再发包、失败回滚」（见 markThenSend）
+    BlockData state = data;
+    if (markThenSend(player.getUniqueId(), world.getName(), x, y, z,
+        () -> sendSingle(player, world, x, y, z, state))) {
       stats.revealsSent.increment();
       tally.sent++;
       budget.decrement();
@@ -641,12 +648,66 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
+   * 「先标记、再发包」的单一坐标实现（包级可见，便于离线单测注入可控发送结果验证顺序与回滚）。
+   *
+   * <p><b>为什么先标记</b>：显形包同样会经过本插件的出站监听器（{@link BlockChangeRevealListener}）——
+   * 它看到我们发出的包后会把该坐标从伪装清单与已显形集合同步摘除。若<b>先发包后标记</b>，异步监听器
+   * 可能在发包返回后、标记写入前先跑摘除：那时标记还不存在，摘除对已显形集合是空操作；随后标记才写入，
+   * 于是给一个「索引里已不存在」的坐标留下<b>孤儿标记</b>（已显形数虚增 → 「整块跳过」提前成立 →
+   * 真实未显形坐标被长期漏显形）。先标记后，监听器摘除时能命中并一并摘掉标记，两结构始终自洽。
+   *
+   * <p><b>失败回滚</b>：发送返回 false（未真正发出）时回滚标记，保证该坐标仍被后续周期重试、计数不虚增。
+   *
+   * @param send 返回 true = 确实发出（保留标记）；false = 未发出（回滚标记）
+   * @return {@code send} 的结果
+   */
+  boolean markThenSend(UUID playerId, String worldName, int x, int y, int z,
+      java.util.function.BooleanSupplier send) {
+    if (revealedSet != null) {
+      revealedSet.mark(playerId, ChunkKey.ofBlock(worldName, x, z), x, y, z);
+    }
+    if (send.getAsBoolean()) {
+      return true;
+    }
+    if (revealedSet != null) {
+      revealedSet.removePosition(worldName, x, y, z);
+    }
+    return false;
+  }
+
+  /**
+   * 「先标记整批、再发一个合并包」的批量实现（包级可见，便于离线单测）。
+   * 发送成功则整批保留标记；失败则整批回滚（调用方随后退化为逐坐标 {@link #markThenSend}）。
+   */
+  boolean markThenSendAll(UUID playerId, String worldName, List<int[]> positions,
+      java.util.function.BooleanSupplier send) {
+    if (revealedSet != null) {
+      for (int i = 0; i < positions.size(); i++) {
+        int[] position = positions.get(i);
+        revealedSet.mark(playerId, ChunkKey.ofBlock(worldName, position[0], position[2]),
+            position[0], position[1], position[2]);
+      }
+    }
+    if (send.getAsBoolean()) {
+      return true;
+    }
+    if (revealedSet != null) {
+      for (int i = 0; i < positions.size(); i++) {
+        int[] position = positions.get(i);
+        revealedSet.removePosition(worldName, position[0], position[1], position[2]);
+      }
+    }
+    return false;
+  }
+
+  /**
    * 发出本周期累积的显形（批量模式）：优先一次 {@code Player#sendMultiBlockChange}——Paper 会按
    * 16³ 区块段自行合并，因此「本周期 N 个坐标」通常只产生「涉及的段数」个多方块变更包。
    *
    * <p>只有一个坐标时直接用 {@code sendBlockChange}（单包更小，也与旧行为一致）。
    * 批量调用整体失败时退化为逐坐标 {@code sendBlockChange}（同一条原生通道），单个坐标失败只计数并
-   * 跳过；标记与统计只在「确实发出」后写入，因此发包失败不影响其它坐标、也不污染已显形索引。
+   * 跳过。发包一律走「先标记、再发包、失败回滚」（见 {@link #markThenSend}）：成功发出的坐标保留标记，
+   * 未发出的坐标回滚标记，因此发包失败既不影响其它坐标、也不污染已显形索引，且失败坐标后续仍会重试。
    *
    * <p><b>额度归还</b>：批次坐标是在 {@link #sendOne} 里「先预扣额度再累积」的（用于封住单周期上限），
    * 所以这里对<b>未能发出</b>的坐标（退化路径里 {@code sendBlockChange} 失败）逐个 {@link Budget#refund()}
@@ -657,32 +718,55 @@ public final class ProximityRevealer implements Listener {
       return;
     }
     World world = batch.world;
-    boolean batched = false;
+    UUID playerId = player.getUniqueId();
+    String worldName = world.getName();
+
     if (batch.size() > 1) {
+      // 先标记整批、再发合并包（理由见 markThenSend）：与出站监听器的摘除路径对齐，杜绝孤儿标记。
+      Map<Position, BlockData> changes;
       try {
-        Map<Position, BlockData> changes = new LinkedHashMap<>(batch.size() * 2);
+        changes = new LinkedHashMap<>(batch.size() * 2);
         for (int i = 0; i < batch.size(); i++) {
           int[] position = batch.positions.get(i);
           changes.put(Position.block(position[0], position[1], position[2]), batch.states.get(i));
         }
-        player.sendMultiBlockChange(changes);
-        batched = true;
       } catch (Throwable throwable) {
-        // 退化路径：仍走 Paper 原生单方块变更包，不退回封包自拼
         logThrottled(throwable);
+        changes = null;
       }
+      if (changes != null) {
+        Map<Position, BlockData> payload = changes;
+        boolean sent = markThenSendAll(playerId, worldName, batch.positions, () -> {
+          try {
+            player.sendMultiBlockChange(payload);
+            return true;
+          } catch (Throwable throwable) {
+            // 退化路径：仍走 Paper 原生单方块变更包，不退回封包自拼
+            logThrottled(throwable);
+            return false;
+          }
+        });
+        if (sent) {
+          for (int i = 0; i < batch.size(); i++) {
+            stats.revealsSent.increment();
+            tally.sent++;
+          }
+          return;
+        }
+      }
+      // 合并包构建失败 / 发送失败：标记已整批回滚，退化为逐坐标单包（失败坐标不留标记，后续周期仍会重试）
     }
 
     for (int i = 0; i < batch.size(); i++) {
       int[] position = batch.positions.get(i);
-      if (!batched
-          && !sendSingle(player, world, position[0], position[1], position[2], batch.states.get(i))) {
+      BlockData state = batch.states.get(i);
+      if (!markThenSend(playerId, worldName, position[0], position[1], position[2],
+          () -> sendSingle(player, world, position[0], position[1], position[2], state))) {
         stats.revealsSkipped.increment();
         // 未发出：归还先前在 sendOne 里预扣的额度（本周期上限只应计入真正发出的显形）
         budget.refund();
         continue;
       }
-      markRevealed(player, world, position[0], position[1], position[2]);
       stats.revealsSent.increment();
       tally.sent++;
     }
@@ -697,13 +781,6 @@ public final class ProximityRevealer implements Listener {
       logThrottled(throwable);
       return false;
     }
-  }
-
-  /** 写入「该玩家已显形」标记（与坐标注销、整块跳过判定共用同一不变式）。 */
-  private void markRevealed(Player player, World world, int x, int y, int z) {
-    UUID playerId = player.getUniqueId();
-    String worldName = world.getName();
-    revealedSet.mark(playerId, ChunkKey.ofBlock(worldName, x, z), x, y, z);
   }
 
   /**
@@ -898,6 +975,49 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
+   * 单个 section（一组变更坐标）的即时显形入口（由 {@link BlockChangeRevealListener} 在封包线程调用）。
+   *
+   * <p>语义与 {@link #onBlockChangeObserved} 完全一致（邻域内仍有伪装坐标才调度），但把同一 section 的
+   * 多个变更坐标聚合为「<b>一次初筛 + 一次调度</b>」：逐坐标版本会对每个变更坐标各初筛一次、各调度一个
+   * 任务（一个 section 最多 4096 次），此处只做一次。最终判定仍在玩家所属线程做（见
+   * {@link #revealSectionImmediately}），`恰好一次放行`由 {@link #sendOne} 与已显形标记保证。
+   *
+   * @param coordinates 同一 section 的变更坐标（已去重，扁平三元组，前 {@code count} 个有效）
+   */
+  public void onSectionChangeObserved(Player player, String worldName, int[] coordinates, int count) {
+    if (player == null || worldName == null || coordinates == null || count <= 0
+        || !instant.enabled() || instant.maxPerTick() <= 0) {
+      return;
+    }
+    // 黑名单世界不做事件即时显形（在调度前就返回，避免产生任何任务）：纯判定，不触碰 Bukkit。
+    if (config.isBlacklisted(worldName)) {
+      return;
+    }
+    if (chunkIndex == null || revealedSet == null) {
+      return;
+    }
+    if (hasDisguisedNearSection(chunkIndex, worldName, coordinates, count, instant.radius())) {
+      Schedulers.onEntity(plugin, player,
+          () -> revealSectionImmediately(player, worldName, coordinates, count));
+    }
+  }
+
+  /**
+   * 聚合初筛（纯函数）：整 section 只调用一次，任一变更坐标的曼哈顿邻域内仍有伪装坐标即命中。
+   * 与逐坐标 {@link #hasDisguisedNearby} 的判定逐条等价，命中即短路返回。
+   */
+  static boolean hasDisguisedNearSection(ObfuscatedChunkIndex index, String worldName,
+      int[] coordinates, int count, int radius) {
+    for (int i = 0; i < count; i++) {
+      if (hasDisguisedNearby(index, worldName,
+          coordinates[i * 3], coordinates[i * 3 + 1], coordinates[i * 3 + 2], radius)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * 玩家所属线程：事件显形的最终判定与发包。
    *
    * <p>顺序：直通/在线 → 世界生效 → 曼哈顿半径（变更不在身边则交给周期兜底）→ 区块已加载 →
@@ -953,6 +1073,80 @@ public final class ProximityRevealer implements Listener {
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
+  }
+
+  /**
+   * 玩家所属线程：一个 section 全部变更坐标的即时显形（与逐坐标 {@link #revealImmediately} 等价，
+   * 但只调度一个任务）。对每个变更坐标走同一套判定（身边半径、区块已加载、仍在伪装清单且未显形过），
+   * 候选坐标跨变更坐标去重后复用 {@link #sendOne}，因此结果与逐坐标处理逐条一致。
+   */
+  private void revealSectionImmediately(Player player, String worldName, int[] coordinates, int count) {
+    try {
+      if (!player.isOnline()
+          || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
+        return;
+      }
+      World world = player.getWorld();
+      // 黑名单世界不做任何邻近显形（事件即时）：与周期巡检共用同一判定出口。
+      if (!config.antiXrayAppliesTo(world.getName())) {
+        return;
+      }
+      int radius = instant.radius();
+      Location location = player.getLocation();
+      UUID playerId = player.getUniqueId();
+      long tick = Bukkit.getCurrentTick();
+      Budget budget = new Budget(instantQuota.remaining(playerId, tick, instant.maxPerTick()));
+      if (budget.remaining() <= 0) {
+        return;
+      }
+
+      ProximitySelector.Eye eye = proximity.raycastEnabled() ? eyeOf(player) : null;
+      PassTally tally = new PassTally();
+      RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
+      String liveWorld = world.getName();
+      int[][] offsets = instantOffsets(radius);
+      // 去重：同一候选坐标可能同时落在多个变更坐标的邻域里，只评估一次（保证「恰好一次放行」）
+      java.util.HashSet<Long> evaluated = new java.util.HashSet<>();
+      boolean exhausted = false;
+      for (int i = 0; i < count && !exhausted; i++) {
+        int cx = coordinates[i * 3];
+        int cy = coordinates[i * 3 + 1];
+        int cz = coordinates[i * 3 + 2];
+        // 与逐坐标版本等价：变更坐标不在身边 / 其区块未加载时，跳过该变更坐标的邻域
+        if (!withinManhattanRadius(location.getBlockX(), location.getBlockY(), location.getBlockZ(),
+            cx, cy, cz, radius)) {
+          continue;
+        }
+        if (!world.isChunkLoaded(cx >> 4, cz >> 4)) {
+          continue;
+        }
+        for (int o = 0; o < offsets.length; o++) {
+          if (budget.remaining() <= 0) {
+            exhausted = true;
+            break;
+          }
+          int x = cx + offsets[o][0];
+          int y = cy + offsets[o][1];
+          int z = cz + offsets[o][2];
+          if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
+            continue;
+          }
+          if (!evaluated.add(packCoordinate(x, y, z))) {
+            continue;
+          }
+          sendOne(player, world, x, y, z, eye, budget, tally, batch);
+        }
+      }
+      flushBatch(player, batch, tally, budget);
+      instantQuota.setRemaining(playerId, tick, Math.max(0, budget.remaining()));
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /** 候选坐标打包（仅供聚合显形去重；与 {@link RevealedSet} 同一编码：x/z 各 26 位、y 12 位）。 */
+  private static long packCoordinate(int x, int y, int z) {
+    return ((long) (x & 0x3FFFFFF) << 38) | ((long) (y & 0xFFF) << 26) | (z & 0x3FFFFFF);
   }
 
   /** 纯数据判定：坐标仍在伪装清单（已伪装）且该玩家尚未显形过（与周期显形不重复、同 tick 不重复）。 */

@@ -15,14 +15,22 @@ public final class RewriteStats {
   /** 真正产生字节改动的区块数。 */
   public final LongAdder chunksRewritten = new LongAdder();
 
-  /** 已处理但无需改写的区块数（无目标方块、无改动、解析失败等，原包放行）。 */
+  /**
+   * 已处理但<b>未改写</b>的区块总数（原包放行）：无目标方块 / 无改动 / 解析失败等。
+   *
+   * <p><b>这是「未改写」的总量口径</b>：{@code chunksRewritten + chunksSkipped = 已处理区块总数}。
+   * 注意 {@link #chunksFailed} 是它的<b>子集</b>（解析失败同样属于「未改写」，失败区块会同时计入
+   * 两个计数），因此二者<b>并非互斥</b>，绝不可相加——要得到「本来就无需改写」的数量应取
+   * {@code chunksSkipped − chunksFailed}。
+   */
   public final LongAdder chunksSkipped = new LongAdder();
 
   /**
-   * 解码/重编码抛异常、fail-open 放行原包的区块数。
+   * 解码/重编码抛异常、fail-open 放行原包的区块数；它是 {@link #chunksSkipped} 的<b>子集</b>。
    *
-   * <p>与 {@link #chunksSkipped} 分开计数：后者是「本来就没有可伪装的方块」，前者是「本该伪装却失败了」。
-   * 若这个数持续增长，说明区块二进制布局与预期不符（版本差异 / 第三方插件改写）。
+   * <p>{@link #chunksSkipped} 把两种情形合在一起：「本来就没有可伪装的方块」与「本该伪装却失败了」；
+   * 本计数把后者单独拎出来。失败区块确实未改写，故也计入 {@code chunksSkipped}（{@code chunksFailed ≤
+   * chunksSkipped}，两者不互斥）。若这个数持续增长，说明区块二进制布局与预期不符（版本差异 / 第三方插件改写）。
    */
   public final LongAdder chunksFailed = new LongAdder();
 

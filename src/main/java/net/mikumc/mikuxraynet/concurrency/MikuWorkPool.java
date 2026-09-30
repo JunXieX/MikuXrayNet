@@ -93,6 +93,25 @@ public final class MikuWorkPool implements AutoCloseable {
    *
    * <p>队列已满会抛 {@link java.util.concurrent.RejectedExecutionException}（登记随之解除）；
    * {@link #close()} 时会对其中尚未开始写入的任务做放行兜底。
+   *
+   * <p><b>契约：{@code payload} 必须自行保证「恰好放行一次」原包，且在 {@code finally} 中放行。</b>
+   * 本池只负责「把 payload 跑起来」并在跑完后解除登记；它<b>不知道</b>如何放行该封包，也<b>不会</b>
+   * 替 payload 兜底放行（{@code close()} 的兜底只覆盖「已入队但尚未开始执行」的任务，见
+   * {@link #close()}）。若 payload 在放行前抛异常、或忘记放行，该封包将<b>永久卡住</b>（客户端卡在
+   * 加载界面），直到超时看门狗或停用兜底才可能被放出——因此放行动作必须放进 {@code finally}，
+   * 例如：
+   * <pre>{@code
+   * pool.execute(task, () -> {
+   *   try {
+   *     rewrite(task);          // 改写期间可能抛异常
+   *   } finally {
+   *     task.signalOnce();      // 无论成功与否都必须放行原包（signalOnce 幂等）
+   *   }
+   * });
+   * }</pre>
+   *
+   * <p>同理，payload 内取得写入权（{@link RewriteTask#tryBeginWrite()}）后若放弃改写，也必须调用
+   * {@link RewriteTask#signalOnce()} 放行——放行权一旦拿到就不会再有人替你放行。
    */
   public void execute(RewriteTask task, Runnable payload) {
     pending.add(task);

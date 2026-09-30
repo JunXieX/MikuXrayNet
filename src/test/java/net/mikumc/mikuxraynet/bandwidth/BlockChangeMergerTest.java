@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.comphenix.protocol.wrappers.WrappedBlockData;
@@ -61,5 +62,30 @@ class BlockChangeMergerTest {
         BlockChangeMerger.dropPassed(clusters, Set.of(new BlockChangeMerger.Coord(-3, 69, -8)));
 
     assertEquals(List.of(update), survivors.get(0), "y 不同不得误删");
+  }
+
+  /**
+   * fail-open 放行（合并包构造/发送失败）时：只有当原包携带的坐标<b>全部</b>已由「立即放行」先行下发，
+   * 才应取消该原包——否则旧态晚到会把先到的新态覆盖回去（方块回退）。这正是任务 7 的判据。
+   */
+  @Test
+  @DisplayName("fail-open 时：已全部立即放行的原包应取消，混合/未放行的必须照常放行")
+  void failOpenCancelsOnlyFullyPassedOriginals() {
+    Set<BlockChangeMerger.Coord> passed = Set.of(new BlockChangeMerger.Coord(1, 64, 1));
+
+    assertTrue(BlockChangeMerger.allCoordsPassed(
+            List.of(new BlockChangeMerger.Coord(1, 64, 1)), passed),
+        "原包只带已先行下发的坐标 → 取消（否则旧态覆盖新态）");
+    assertFalse(BlockChangeMerger.allCoordsPassed(
+            List.of(new BlockChangeMerger.Coord(1, 64, 1), new BlockChangeMerger.Coord(2, 64, 2)), passed),
+        "跨坐标混合包：不能取消，否则会丢掉未放行坐标的更新");
+    assertFalse(BlockChangeMerger.allCoordsPassed(
+            List.of(new BlockChangeMerger.Coord(2, 64, 2)), passed),
+        "完全未放行的原包必须照常放行");
+    assertFalse(BlockChangeMerger.allCoordsPassed(List.of(), passed),
+        "空清单保守放行（不可取消）");
+    assertFalse(BlockChangeMerger.allCoordsPassed(List.of(new BlockChangeMerger.Coord(1, 64, 1)),
+            Set.of()),
+        "本窗口没有立即放行记录时不存在可取消的原包");
   }
 }

@@ -96,9 +96,13 @@ public final class OcclusionRules {
     return !hasThinSuffix(name);
   }
 
-  /** 该方块名是否为「薄片族」（仅按名称后缀近似，内部判定用）。 */
-  private static boolean hasThinSuffix(String name) {
-    String normalized = normalize(name);
+  /**
+   * 该方块名是否为「薄片族」（仅按名称后缀近似，内部判定用）。
+   *
+   * <p>入参必须是<b>已归一化</b>的名称：调用方 {@link #isOccluding} 已对名称归一化过一次，
+   * 这里再归一化一遍是多余计算。{@link #normalize} 幂等，去掉这次重复调用结果逐位不变。
+   */
+  private static boolean hasThinSuffix(String normalized) {
     for (String suffix : THIN_NAME_SUFFIXES) {
       if (normalized.endsWith(suffix)) {
         return true;

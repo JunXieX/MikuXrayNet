@@ -160,9 +160,13 @@ public final class EntityCuller implements Listener {
   public void start() {
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     long interval = Math.max(1, config.updateIntervalTicks());
-    // 统一为「每个玩家一条实体调度任务」：Paper 上落在主线程、Folia 上落在区域线程（同一套 API，无需分支）
-    for (Player player : Bukkit.getOnlinePlayers()) {
-      scheduleRecheck(player, interval);
+    // 与 onJoin 保持一致：射线判定关闭时不登记任何周期复检任务——recheck 首行即因 raycast=false 返回，
+    // 若仍为每个在线玩家挂一条任务，只是每周期空跑的纯调度开销。
+    if (config.raycast()) {
+      // 统一为「每个玩家一条实体调度任务」：Paper 上落在主线程、Folia 上落在区域线程（同一套 API，无需分支）
+      for (Player player : Bukkit.getOnlinePlayers()) {
+        scheduleRecheck(player, interval);
+      }
     }
     plugin.getLogger().info("带宽模块已启用：实体射线剔除（强制可见距离 " + config.forceVisibleDistance()
         + " 格，Paper 原生射线，每实体至多 " + config.raySamples() + " 个包围盒顶点）");
@@ -188,12 +192,15 @@ public final class EntityCuller implements Listener {
   public void onQuit(PlayerQuitEvent event) {
     Player player = event.getPlayer();
     cancelRecheckTask(player.getUniqueId());
-    restorePlayer(player);
+    // 退出无需恢复：hideEntity 是「每玩家」的可见性状态，玩家一断开连接，服务端即随实体释放该状态，
+    // 再逐个 showEntity 纯属徒劳（还要在实体所属线程逐个执行）。这里只清账本，语义与「离线玩家
+    // 判定只清账本、不产生恢复计数」一致（见 evaluate 的失效/离线分支）。
+    hidden.remove(player.getUniqueId());
     rotations.remove(player.getUniqueId());
   }
 
   /**
-   * 恢复某玩家当前被隐藏的全部实体并清空其账本（玩家退出 / 复检发现直通时使用）。
+   * 恢复某玩家当前被隐藏的全部实体并清空其账本（复检发现该玩家直通时使用）。
    *
    * <p>Folia：这些实体可能已随玩家走远/传送落在别的区域，读它们的状态会触发 TickThread 校验
    * （先打 ERROR 再抛），因此先问归属，跨区域者直接跳过（随后由其所在区域自然退役）。
@@ -425,8 +432,12 @@ public final class EntityCuller implements Listener {
       double[][] vertices = visibleVertices(eye.getX(), eye.getY(), eye.getZ(),
           box.getMinX(), box.getMinY(), box.getMinZ(), box.getMaxX(), box.getMaxY(), box.getMaxZ());
       int limit = Math.min(Math.max(1, config.raySamples()), vertices.length);
+      // 复用同一枚 Vector 承载每个采样点的射线方向：方向只被 rayTraceBlocks 读取、不被持有，
+      // 且本轮评估始终运行在单一实体所属线程上，反复改写其分量是安全的；省下原先「每个采样点
+      // new 一个 Vector + normalize() 再 new 一个」的分配。
+      Vector direction = new Vector();
       for (int i = 0; i < limit; i++) {
-        if (isClear(world, eye, vertices[i][0], vertices[i][1], vertices[i][2])) {
+        if (isClear(world, eye, vertices[i][0], vertices[i][1], vertices[i][2], direction)) {
           return false;
         }
       }
@@ -444,7 +455,8 @@ public final class EntityCuller implements Listener {
    * <p>{@code FluidCollisionMode.NEVER}：流体不参与射线（水里的实体照常可见）。
    * 命中方块的遮挡判定用 {@code Material#isOccluding()}，不新建 BlockData 对象。
    */
-  private static boolean isClear(World world, Location eye, double x, double y, double z) {
+  private static boolean isClear(World world, Location eye, double x, double y, double z,
+      Vector direction) {
     double dx = x - eye.getX();
     double dy = y - eye.getY();
     double dz = z - eye.getZ();
@@ -452,7 +464,12 @@ public final class EntityCuller implements Listener {
     if (distance < 1.0E-6D) {
       return true;
     }
-    RayTraceResult hit = world.rayTraceBlocks(eye, new Vector(dx, dy, dz).normalize(), distance,
+    // 手写归一化并写入调用方复用的 direction（等价于 new Vector(dx,dy,dz).normalize()，但不新分配对象）
+    double inverse = 1.0D / distance;
+    direction.setX(dx * inverse);
+    direction.setY(dy * inverse);
+    direction.setZ(dz * inverse);
+    RayTraceResult hit = world.rayTraceBlocks(eye, direction, distance,
         FluidCollisionMode.NEVER, true);
     if (hit == null || hit.getHitBlock() == null) {
       return true;

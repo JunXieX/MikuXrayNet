@@ -116,8 +116,37 @@ public final class BufferedLinearV3Format {
   /** 单个条目负载的上限（防止损坏数据造成超大分配）：16 MiB。 */
   public static final int MAX_PAYLOAD_SIZE = 16 * 1024 * 1024;
 
-  /** 单个 bucket 解压后原始数据的上限（防御损坏数据造成超大分配）：512 MiB；理论值为 64 个槽位 × 单条负载上限 {@link #MAX_PAYLOAD_SIZE}（16 MiB）= 1024 MiB。 */
-  public static final int MAX_RAW_SIZE = 512 * 1024 * 1024;
+  /**
+   * 单个 bucket 解压后原始数据的上限（防御损坏数据造成超大分配）：128 MiB。
+   *
+   * <p><b>为什么从 512 MiB 收紧到 128 MiB</b>：桶头里的 {@code rawLength} 直接来自（可能损坏的）文件，
+   * {@link #inflate} 会先 {@code new byte[rawLength]} 再解压——旧上限下「大 rawLength + 极小
+   * compressedLength」的损坏头可以让小堆服务端先发生数百 MiB 的分配、异常才被兜住（分配已经发生）。
+   * 依据：真实区块负载受 {@link #MAX_PAYLOAD_SIZE}（16 MiB）与区块实际编码规模双重约束——Paper/原版
+   * 一个区块的原始网络字节通常几十 KiB、最坏（24 段 × 15 位直接调色板 + 调色板/群系开销，384 高世界）
+   * 也仅约 200 KiB；一个桶最多 64 个区块，实际远小于 13 MiB。128 MiB 对任一现实负载都有 &gt;10 倍余量，
+   * 同时把单次分配的防护上限压到可控范围。理论上限 64 × (4 + 28 + 16 MiB) ≈ 1024 MiB 只在本进程
+   * 主动写入 16 MiB 级负载时才可能触及，而 {@code DiskCacheStore} 的单文件上限与负载上限已先行拦截。
+   */
+  public static final int MAX_RAW_SIZE = 128 * 1024 * 1024;
+
+  /**
+   * 解压前的「压缩比 sanity」上限：声明原始长度超过压缩长度 {@code 8192} 倍即判损坏。
+   *
+   * <p><b>为什么需要</b>：损坏/伪造的桶头可以声明一个很大的 {@code rawLength} 却只带几字节压缩数据，
+   * 单靠 {@link #MAX_RAW_SIZE} 仍会让 {@code inflate} 先分配 128 MiB 才失败。此检查在任何分配之前
+   * 完成，直接把这类头拒之门外（与 {@link #MAX_RAW_SIZE} 一起构成两道闸）。
+   *
+   * <p><b>阈值为什么取 8192，且只对 &gt; {@link #COMPRESSION_RATIO_MIN_RAW} 的声明生效</b>：桶内每个
+   * 条目都带 8 字节「原始字节指纹」（{@code DiskPayload}），指纹近似随机、不可压缩，因此一个桶的压缩
+   * 长度至少有「条目数 × 8 字节」的熵下限；再叠加坐标 int 的熵与区块字节的结构，真实负载的压缩比远
+   * 达不到 8192。反过来，只对 &gt; 4 MiB 的声明校验，可完全避开「小桶（如全空区块）压缩比天然很高」
+   * 的误判（小数据即使压缩比异常也不构成 OOM 风险）。据此取值，正常大区块（含高建筑高度）不会被误判。
+   */
+  static final long MAX_COMPRESSION_RATIO = 8192L;
+
+  /** 触发 {@link #MAX_COMPRESSION_RATIO} 校验所需的最小声明原始长度（4 MiB；见其说明）。 */
+  private static final int COMPRESSION_RATIO_MIN_RAW = 4 << 20;
 
   /**
    * 单条缓存条目：区块代次（<b>已废弃，恒为 0，仅为格式兼容保留</b>）+ 写入时间 + 配置指纹 + 负载。
@@ -385,6 +414,14 @@ public final class BufferedLinearV3Format {
     if (rawLength == 0) {
       return new byte[0];
     }
+    // 压缩比 sanity：必须在任何分配之前完成（inflate 会先 new byte[rawLength] 才解压）。
+    // 声明长度 > 4 MiB 且压缩长度不足其 1/8192 时，只可能来自损坏/伪造的桶头——真实区块负载的
+    // 压缩比远达不到该量级（见常量注释），故直接判损坏，交由调用方 fail-open（该桶当空）。
+    if (rawLength > COMPRESSION_RATIO_MIN_RAW
+        && (long) compressed.length * MAX_COMPRESSION_RATIO < rawLength) {
+      throw new IOException("压缩比异常（声明 " + rawLength + " 字节，压缩数据仅 "
+          + compressed.length + " 字节），已按损坏处理");
+    }
     if (compression == COMPRESSION_ZSTD) {
       return zstdInflate(compressed, rawLength);
     }
@@ -514,7 +551,20 @@ public final class BufferedLinearV3Format {
    * @param hashSeed 条目校验种子
    */
   public static byte[] encodeBucket(Entry[] slots, int hashSeed) {
-    ByteArrayOutputStream out = new ByteArrayOutputStream(4096);
+    // 按内容精确定容，避免初始 4096 字节在典型大桶（几个到几十个区块负载）下反复翻倍重拷，
+    // 也不过度分配。公式：每个空槽 = 1 个长度为 0 的 i32 前缀（4 字节）；每个非空槽 =
+    // 4（长度前缀）+ ENTRY_HEADER_SIZE（条目头，含校验和）+ 负载长度，与下面写出字节数逐项一致。
+    int capacity = 0;
+    for (int i = 0; i < BUCKET_SIZE; i++) {
+      Entry slot = slots != null && i < slots.length ? slots[i] : null;
+      if (slot == null || slot.payload() == null || slot.payload().length == 0) {
+        capacity += Integer.BYTES;
+      } else {
+        capacity += Integer.BYTES + ENTRY_HEADER_SIZE + slot.payload().length;
+      }
+    }
+
+    ByteArrayOutputStream out = new ByteArrayOutputStream(capacity);
     for (int i = 0; i < BUCKET_SIZE; i++) {
       Entry entry = slots != null && i < slots.length ? slots[i] : null;
       if (entry == null || entry.payload() == null || entry.payload().length == 0) {

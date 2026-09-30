@@ -6,9 +6,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.UUID;
+import java.util.logging.Logger;
+import org.bukkit.plugin.Plugin;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -128,5 +133,51 @@ class BypassRegistryTest {
     assertFalse(BypassRegistry.isBypassedNow(null), "null 玩家恒为「不直通」");
     assertFalse(BypassRegistry.isBypassedNow(UUID.randomUUID()),
         "未装配名单时返回 false（与「无直通」一致，fail-open）");
+  }
+
+  /**
+   * 幂等启用：换实例 {@code start()} 时必须清理<b>前一实例</b>的监听与名单（旧实现只清 {@code this}，
+   * 旧实例的监听会继续维护它自己的名单，与 {@code active} 指向的新实例不一致 → stale 名单泄漏）。
+   */
+  @Test
+  void startCleansUpPreviousInstance() {
+    BypassRegistry first = new BypassRegistry(stubPlugin());
+    BypassRegistry second = new BypassRegistry(stubPlugin());
+    try {
+      first.start();
+      UUID player = UUID.randomUUID();
+      first.refresh(player, true);
+      assertTrue(BypassRegistry.isBypassedNow(player), "首个实例启用后其名单生效");
+
+      second.start();
+      assertFalse(BypassRegistry.isBypassedNow(player),
+          "换实例启用时必须清理前一实例的名单（否则 stale 名单泄漏给封包线程）");
+      assertFalse(first.isBypassed(player), "前一实例自身的名单也必须被清空");
+    } finally {
+      second.stop();
+      first.stop();
+    }
+  }
+
+  /**
+   * 离线桩插件：{@code getServer()} 抛异常（离线无 Bukkit），{@code getLogger()} 返回真实 Logger，
+   * 使 {@link BypassRegistry#start()} 走到「初始化失败但不影响名单维护」的兜底分支。
+   */
+  private static Plugin stubPlugin() {
+    Logger logger = Logger.getLogger("BypassRegistryTest");
+    return (Plugin) Proxy.newProxyInstance(Plugin.class.getClassLoader(),
+        new Class<?>[] {Plugin.class}, new InvocationHandler() {
+          @Override
+          public Object invoke(Object proxy, Method method, Object[] args) {
+            return switch (method.getName()) {
+              case "getLogger" -> logger;
+              case "getServer" -> throw new IllegalStateException("离线测试：无 Bukkit 服务端");
+              case "toString" -> "stub-plugin";
+              case "hashCode" -> System.identityHashCode(proxy);
+              case "equals" -> proxy == args[0];
+              default -> null;
+            };
+          }
+        });
   }
 }

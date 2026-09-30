@@ -141,7 +141,14 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final AsynchronousManager asynchronousManager;
   private final RewriteCache<CachedChunk> cache;
   private final NeighborChunkProvider neighborProvider;
-  private final boolean neighborsEnabled;
+  /**
+   * 邻块快照提供者是否可用（等价于 {@code neighborProvider != null}）。
+   *
+   * <p><b>为什么这里不再钉死 {@code neighbors.enabled}</b>：本监听器不随热重载重建，
+   * 而该开关可能在 reload 时被改。是否抓取必须实时读「当前」配置（见 {@link #neighborsNeeded}），
+   * 否则 reload 关闭邻块后仍会继续抓取（承诺的「关闭即零开销」失效），重新开启也不会恢复。
+   */
+  private final boolean neighborsAvailable;
   private final boolean handleChunkBatch;
   /**
    * 伪装区块索引的<b>可变引用</b>（每次读取现取，而非构造期钉死实例）。
@@ -200,7 +207,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     this.asynchronousManager = asynchronousManager;
     this.cache = new RewriteCache<>(config.cacheMaximumSize(), config.cacheExpireAfterAccessSeconds());
     this.neighborProvider = neighborProvider;
-    this.neighborsEnabled = neighborProvider != null && config.neighbors().enabled();
+    // 只记录「提供者是否可用」；是否真的抓取由 neighborsNeeded 实时读当前配置的 neighbors.enabled 决定。
+    this.neighborsAvailable = neighborProvider != null;
     this.handleChunkBatch = handleChunkBatch;
     this.obfuscatedChunkIndex = obfuscatedChunkIndex;
     this.revealedSet = revealedSet;
@@ -300,8 +308,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     int sectionCount = (world.getMaxHeight() - minHeight) / 16;
     // 维度由 World#getEnvironment() 判定（不依赖世界名；CUSTOM 归入 normal），决定用哪段 dimensions 配置。
     AntiXrayConfig.Dimension dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
+    // 超时实时读「当前」配置：reload 改了 advanced.timeout-millis 必须立即生效（本监听器不随 reload 重建）。
+    // 同一区块的任务构造与看门狗注册共用这一个值，保证两者一致。
+    long timeoutMillis = live().timeoutMillis();
     RewriteTask task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
-        world.getName(), dimension, minHeight, sectionCount, config.timeoutMillis(),
+        world.getName(), dimension, minHeight, sectionCount, timeoutMillis,
         gate == null
             ? () -> asynchronousManager.signalPacketTransmission(event)
             : () -> {
@@ -322,7 +333,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         if (task.releaseOnTimeout()) {
           stats.chunksTimedOut.increment();
         }
-      }, config.timeoutMillis());
+      }, timeoutMillis);
     } catch (Throwable throwable) {
       // 已登记延迟但看门狗没注册成功（通常为插件停用中）：走一次放行动作把刚登记的延迟
       // 「用掉」（signalPacketTransmission 即放行本封包），等价于旧实现的「未登记延迟直接放行」。
@@ -387,7 +398,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 先登记额外延迟，再注册放行动作：保证放行永远发生在延迟登记之后
     marker.incrementProcessingDelay();
     try {
-      ScheduledFuture<?> timeout = workPool.scheduleTimeout(gate::forceRelease, config.timeoutMillis());
+      // 超时实时读「当前」配置（reload 立即生效），与区块路径一致。
+      ScheduledFuture<?> timeout = workPool.scheduleTimeout(gate::forceRelease, live().timeoutMillis());
       gate.finish(() -> {
         timeout.cancel(false);
         asynchronousManager.signalPacketTransmission(event);
@@ -407,24 +419,29 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return;
     }
 
+    // 实时读「当前」配置并固定在本轮改写内使用：配置指纹 / remove-block-entities 必须随 reload 生效
+    // （本监听器不随热重载重建），且同一轮里 cache.get 与 cache.put 必须用同一份指纹——
+    // 若每处各读一次、reload 恰好发生在中途，读写键会不一致，导致刚写的条目立刻读不到。
+    AntiXrayConfig current = live();
+
     try {
       if (!task.expired()) {
         byte[] source = accessor.buffer();
         long sourceHash = hash(source);
 
         CachedChunk cached = cache.get(task.worldName(), task.chunkX(), task.chunkZ(),
-            config.configHash());
+            current.configHash());
         if (cached == null || cached.sourceHash() != sourceHash) {
-          cached = loadFromDisk(task, sourceHash);
+          cached = loadFromDisk(task, sourceHash, current);
         }
 
         if (cached != null) {
-          writeBack(accessor, task, cached.data(), cached.positions());
+          writeBack(accessor, task, cached.data(), cached.positions(), current);
         } else {
           NeighborEdges neighbors = neighborsNeeded(task.worldName(), task.dimension())
               ? neighborProvider.cached(task.worldName(), task.chunkX(), task.chunkZ())
               : null;
-          rewrite(task, accessor, source, sourceHash, neighbors);
+          rewrite(task, accessor, source, sourceHash, neighbors, current);
         }
       }
     } catch (Throwable throwable) {
@@ -442,13 +459,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 因此不会把封包处理拖过时限。负载里带原始字节指纹（指纹不符即视为未命中）与<b>被伪装坐标</b>
    * （回填后由 {@link #writeBack} 写回显形索引——否则磁盘命中的区块永远不进索引）。
    */
-  private CachedChunk loadFromDisk(RewriteTask task, long sourceHash) {
+  private CachedChunk loadFromDisk(RewriteTask task, long sourceHash, AntiXrayConfig current) {
     if (diskCache == null || !diskCache.usable()) {
       return null;
     }
     try {
       byte[] payload = diskCache.get(task.worldName(), task.chunkX(), task.chunkZ(),
-          config.configHash());
+          current.configHash());
       if (payload == null) {
         return null;
       }
@@ -460,7 +477,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         return null;
       }
       CachedChunk fromDisk = new CachedChunk(decoded.sourceHash(), decoded.data(), decoded.positions());
-      cache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(), fromDisk);
+      cache.put(task.worldName(), task.chunkX(), task.chunkZ(), current.configHash(), fromDisk);
       return fromDisk;
     } catch (Throwable throwable) {
       logThrottled("读取磁盘缓存失败，已按未命中处理", throwable);
@@ -470,7 +487,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
   /** 改写并回填内存缓存与磁盘缓存。 */
   private void rewrite(RewriteTask task, ChunkPacketAccessor accessor, byte[] source, long sourceHash,
-      NeighborEdges neighbors) {
+      NeighborEdges neighbors, AntiXrayConfig current) {
     // 世界名 + 维度 + 最低 Y 一并传入：world-overrides（按世界名）优先于 dimensions.<维度>，
     // min-y/max-y 过滤与分区伪装表需要把 section 内相对 Y 换算成绝对 Y。
     ObfuscationProcessor.Result result = processor.rewrite(source, task.sectionCount(),
@@ -510,16 +527,16 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     if (resultCacheable(result)) {
       CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions());
-      cache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(), value);
+      cache.put(task.worldName(), task.chunkX(), task.chunkZ(), current.configHash(), value);
       if (diskCache != null) {
         // 磁盘写入是「提交即返回」的异步操作（自有磁盘线程），不阻塞本工作线程；
         // 负载里带上被伪装坐标，磁盘缓存命中时才能重新写入显形索引（见 DiskPayload）。
-        diskCache.put(task.worldName(), task.chunkX(), task.chunkZ(), config.configHash(),
+        diskCache.put(task.worldName(), task.chunkX(), task.chunkZ(), current.configHash(),
             DiskPayload.encode(sourceHash, result.obfuscatedPositions(), result.data()));
       }
     }
     // 失败结果：data == source 且伪装位置为空 → writeBack 直接返回，原包照常下发（fail-open 语义不变）。
-    writeBack(accessor, task, result.data(), result.obfuscatedPositions());
+    writeBack(accessor, task, result.data(), result.obfuscatedPositions(), current);
   }
 
   /**
@@ -615,11 +632,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
   }
 
-  private void writeBack(ChunkPacketAccessor accessor, RewriteTask task, byte[] data, int[] positions) {
+  private void writeBack(ChunkPacketAccessor accessor, RewriteTask task, byte[] data, int[] positions,
+      AntiXrayConfig current) {
     if (positions.length == 0) {
       return;
     }
-    if (!accessor.update(data, positions, task.minHeight(), config.removeBlockEntities())) {
+    // remove-block-entities 实时读「当前」配置：它直接决定写进封包的字节，reload 切换必须立即生效。
+    if (!accessor.update(data, positions, task.minHeight(), current.removeBlockEntities())) {
       // 「算了但没写」：写回后回读不一致（ProtocolLib 版本/封包结构不符），必须留痕
       stats.writeBackFailures.increment();
       logThrottled("区块改写结果未能写回封包（写回后回读不一致），本轮按原包内容放行", null);
@@ -660,7 +679,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 区域线程调度往返。{@code mode=enclosed} 的世界照常抓取。
    */
   private boolean neighborsNeeded(String worldName, AntiXrayConfig.Dimension dimension) {
-    return neighborsEnabled && processor.needsNeighbors(worldName, dimension);
+    // neighbors.enabled 实时读「当前」配置：reload 关闭邻块后立即停止抓取（关闭即零开销），重新开启立即恢复。
+    return neighborsAvailable && live().neighbors().enabled()
+        && processor.needsNeighbors(worldName, dimension);
   }
 
   /** 该玩家是否受本模块影响（直通名单绕过 + 反矿透世界判定）。 */
@@ -669,8 +690,31 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return false;
     }
     // 黑名单判定必须读「当前」配置（本监听器不随热重载重建）：否则 reload 后纳入黑名单的世界仍会被改写。
-    AntiXrayConfig live = liveConfig == null ? null : liveConfig.get();
-    return worldAllowed(live == null ? config : live, player.getWorld().getName());
+    return worldAllowed(live(), player.getWorld().getName());
+  }
+
+  /**
+   * 取「当前」的反矿透配置（实时读取，热重载后立即生效）。
+   *
+   * <p>本监听器<b>不随热重载重建</b>，而 {@link AntiXrayConfig} 实例会被 reload 整体替换。
+   * 凡影响运行期行为的读取——世界黑名单、{@code configHash()}、超时、{@code remove-block-entities}、
+   * {@code neighbors.enabled}——都必须走这里；否则 reload 后仍按启动期配置工作：
+   * 旧指纹继续命中旧缓存（即使配置已变）、新超时不生效、remove-block-entities 切换被忽略。
+   */
+  private AntiXrayConfig live() {
+    return resolveConfig(config, liveConfig);
+  }
+
+  /**
+   * 实时配置解析：{@code liveConfig} 可用且返回非 null 时取它（「当前」配置），否则回落启动期
+   * {@code fallback}。供 {@link #live()} 调用，也兼容 {@code liveConfig == null} 的旧调用方/单测。
+   *
+   * <p>包级可见，便于离线单测直接验证「模拟 reload 替换配置后取到新配置」
+   * （无需实例化整个监听器）。
+   */
+  static AntiXrayConfig resolveConfig(AntiXrayConfig fallback, Supplier<AntiXrayConfig> liveConfig) {
+    AntiXrayConfig current = liveConfig == null ? null : liveConfig.get();
+    return current == null ? fallback : current;
   }
 
   /**

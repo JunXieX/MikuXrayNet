@@ -36,8 +36,19 @@ public final class MikuConfig {
   /** 「带宽配置项超过安全上限被钳制」WARN 的进程级一次性闸门。 */
   private final AtomicBoolean bandwidthClampWarned = new AtomicBoolean();
 
-  private volatile AntiXrayConfig antiXray;
-  private volatile BandwidthConfig bandwidth;
+  /**
+   * 同一代的两份配置（反矿透 + 带宽）的不可变持有者。
+   *
+   * <p><b>为什么要成对发布</b>：这两份配置由同一次 {@link #load()} 一起生成。若各自用一个 volatile
+   * 字段分别写入，reload 瞬间读者可能读到「新一代反矿透 + 旧一代带宽」的混合对（或反之）——一次请求
+   * 里两个模块会按不同代的口径行事，难以复现与排查。改为把这一对不可变对象放进同一个 holder、<b>一次
+   * volatile 写替换</b>，读者从单一 volatile 读取出 holder 后看到的必然是同代的一对配置。
+   */
+  private record Loaded(AntiXrayConfig antiXray, BandwidthConfig bandwidth) {
+  }
+
+  /** 当前生效的配置对；首次 {@link #load()} 之前为 {@code (null, null)}。整体一次替换，保证同代可见。 */
+  private volatile Loaded loaded = new Loaded(null, null);
 
   public MikuConfig(Plugin plugin) {
     this.plugin = plugin;
@@ -56,8 +67,8 @@ public final class MikuConfig {
     AntiXrayConfig loadedAntiXray = loadAntiXray();
     BandwidthConfig loadedBandwidth = loadBandwidth();
 
-    this.antiXray = loadedAntiXray;
-    this.bandwidth = loadedBandwidth;
+    // 成对发布：一次 volatile 写替换整个 holder，读者永远看到同一代的两份配置
+    this.loaded = new Loaded(loadedAntiXray, loadedBandwidth);
 
     if (loadedAntiXray.enabled()) {
       logger.info("反矿透配置已加载（按维度分段）：" + dimensionSummary(loadedAntiXray));
@@ -107,11 +118,11 @@ public final class MikuConfig {
   }
 
   public AntiXrayConfig antiXray() {
-    return antiXray;
+    return loaded.antiXray();
   }
 
   public BandwidthConfig bandwidth() {
-    return bandwidth;
+    return loaded.bandwidth();
   }
 
   /**
@@ -124,7 +135,7 @@ public final class MikuConfig {
     try {
       return AntiXrayConfig.from(read(ANTI_XRAY_FILE));
     } catch (Throwable throwable) {
-      AntiXrayConfig previous = this.antiXray;
+      AntiXrayConfig previous = this.loaded.antiXray();
       if (previous != null) {
         warnFallbackOnce(antiXrayFallbackWarned, ANTI_XRAY_FILE, "已保留上一份配置", throwable);
         return previous;
@@ -139,7 +150,7 @@ public final class MikuConfig {
     try {
       return BandwidthConfig.from(read(BANDWIDTH_FILE));
     } catch (Throwable throwable) {
-      BandwidthConfig previous = this.bandwidth;
+      BandwidthConfig previous = this.loaded.bandwidth();
       if (previous != null) {
         warnFallbackOnce(bandwidthFallbackWarned, BANDWIDTH_FILE, "已保留上一份配置", throwable);
         return previous;

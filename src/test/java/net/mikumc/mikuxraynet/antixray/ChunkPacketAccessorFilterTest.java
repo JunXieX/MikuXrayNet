@@ -28,6 +28,48 @@ class ChunkPacketAccessorFilterTest {
         "没有被伪装坐标时无需剔除（与旧行为一致：localPositions 为空直接返回）");
   }
 
+  /**
+   * 写回未确认生效（{@code verified=false}）时必须短路跳过方块实体剔除：此时新字节未必真的写进了
+   * NMS 对象，若仍剔除实体，交出去的就是「原包旧方块状态 + 已删实体」——可被透视端识别的强不一致，
+   * 反而暴露改写。宁可保留实体，也不产生不一致包。
+   */
+  @Test
+  void unverifiedWriteBackSkipsBlockEntityRemoval() {
+    int[] positions = {0 << 8 | 0 << 4 | 0};
+    assertFalse(ChunkPacketAccessor.shouldRemoveBlockEntities(false, true, positions, true),
+        "写回未确认生效时必须短路跳过剔除（避免「矿可见 + 实体消失」的不一致包）");
+    assertTrue(ChunkPacketAccessor.shouldRemoveBlockEntities(true, true, positions, true),
+        "写回已确认、开关开启、有坐标且字段可用时才剔除");
+  }
+
+  /** 只有「已确认写回 + 字段齐全 + 开关开启 + 有坐标」四个条件同时成立才剔除，任一不满足都保留实体。 */
+  @Test
+  void blockEntityRemovalRequiresEveryPrecondition() {
+    int[] positions = {1 << 8 | 2 << 4 | 3};
+    assertFalse(ChunkPacketAccessor.shouldRemoveBlockEntities(true, false, positions, true),
+        "开关关闭时不剔除");
+    assertFalse(ChunkPacketAccessor.shouldRemoveBlockEntities(true, true, positions, false),
+        "剔除所需字段未定位到（降级）时不剔除");
+    assertFalse(ChunkPacketAccessor.shouldRemoveBlockEntities(true, true, new int[0], true),
+        "没有被伪装坐标时不剔除");
+    assertFalse(ChunkPacketAccessor.shouldRemoveBlockEntities(false, false, new int[0], false),
+        "全部条件都不满足时当然不剔除");
+  }
+
+  /**
+   * 剔除段异常必须有观测点（旧实现 {@code catch (Throwable ignored)} 完全静默）：失败计数递增，
+   * 且一次性中文提示不会因重复调用而抛异常（闸门是静态的，这里只断言计数这一可观测点）。
+   */
+  @Test
+  void blockEntityFilterFailureIsObservable() {
+    int before = ChunkPacketAccessor.blockEntityFilterFailures();
+    ChunkPacketAccessor.recordBlockEntityFilterFailure(new IllegalStateException("模拟字段结构不符"));
+    ChunkPacketAccessor.recordBlockEntityFilterFailure(new IllegalStateException("再次失败"));
+
+    assertEquals(before + 2, ChunkPacketAccessor.blockEntityFilterFailures(),
+        "每次剔除段失败都必须计入观测点（不能再静默吞掉）");
+  }
+
   /** 坐标编码 y << 8 | z << 4 | x：方块实体的绝对 Y 先减 minHeight 再比对。 */
   @Test
   void isObfuscatedMatchesPackedPositions() {
@@ -82,6 +124,26 @@ class ChunkPacketAccessorFilterTest {
 
     assertTrue(ChunkPacketAccessor.isObfuscated(relativeY, 9, 7, positions));
     assertEquals(44, relativeY);
+  }
+
+  /**
+   * 坐标字段读不出明确数值（null / 非数值）时必须整条跳过、保留该方块实体；绝不用 0 冒充合法坐标。
+   *
+   * <p>0 是「section (0,0)」的合法 packedXZ：旧实现把读取失败的坐标当成 0，会命中下面这个合法清单项，
+   * 误删方块实体并产生「矿石可见 + 实体消失」的可检测不一致包。
+   */
+  @Test
+  void unreadableCoordinateFieldsKeepEntry() {
+    int[] positions = {0 << 8 | 0 << 4 | 0}; // (absoluteY - minHeight = 0, sectionZ = 0, sectionX = 0)
+
+    assertTrue(ChunkPacketAccessor.isEntryObfuscated((byte) 0, 0, 0, positions),
+        "两个坐标字段都是合法数值且命中清单 → 需要剔除");
+    assertFalse(ChunkPacketAccessor.isEntryObfuscated(null, 0, 0, positions),
+        "packedXZ 读不出（null）必须按「不可用」跳过，不得当 0 命中 (0,0)");
+    assertFalse(ChunkPacketAccessor.isEntryObfuscated((byte) 0, null, 0, positions),
+        "y 读不出（null）必须按「不可用」跳过");
+    assertFalse(ChunkPacketAccessor.isEntryObfuscated("x", 0, 0, positions),
+        "非数值字段同样视为不可用（不得当 0）");
   }
 
   /**
