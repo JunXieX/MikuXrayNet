@@ -12,7 +12,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -23,6 +26,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 /**
@@ -94,6 +98,10 @@ public final class ZstdSupport {
   private static volatile Codec codec;
   /** 类路径探测是否已完成（只做一次）。 */
   private static volatile boolean probed;
+  /** {@link #initialize} 是否已执行（幂等：重复调用直接返回，不再下载/不再提示）。 */
+  private static volatile boolean initialized;
+  /** 「自动下载未做完整性校验」的 WARN 只打一次。 */
+  private static final AtomicBoolean UNVERIFIED_WARNING = new AtomicBoolean();
   /** 当前来源。 */
   private static volatile Source source = Source.NONE;
   /** 最后一次失败原因（诊断用，只出现在日志里）。 */
@@ -356,6 +364,8 @@ public final class ZstdSupport {
    * <p>成功后 {@link #available()} 恒为 true；失败则保持 false（由 {@link BufferedLinearV3Format}
    * 回退 Deflater）。**本方法不抛异常**，失败只记中文日志。
    *
+   * <p><b>幂等</b>：本方法在一次进程生命周期内只生效一次；重复调用直接返回，不再下载、不再打印任何提示。
+   *
    * @param libraryDir     本插件的 lib 目录（{@code plugins/MikuXrayNet/lib}），可为 null（则跳过②③）
    * @param autoDownload   是否允许自动下载
    * @param downloadUrl    下载源根地址（空白回落 Maven Central）
@@ -364,6 +374,26 @@ public final class ZstdSupport {
    */
   public static void initialize(Path libraryDir, boolean autoDownload, String downloadUrl,
       int timeoutSeconds, Logger logger) {
+    initialize(libraryDir, autoDownload, downloadUrl, null, timeoutSeconds, logger);
+  }
+
+  /**
+   * 同 {@link #initialize(Path, boolean, String, int, Logger)}，但可传入自动下载文件的
+   * <b>期望 SHA-256 十六进制摘要</b>用于供应链完整性校验。
+   *
+   * @param expectedSha256 期望的 SHA-256（十六进制，大小写不敏感）；{@code null}/空白表示不校验
+   *                       （此时会一次性中文 WARN 说明「未校验」）
+   */
+  public static void initialize(Path libraryDir, boolean autoDownload, String downloadUrl,
+      String expectedSha256, int timeoutSeconds, Logger logger) {
+    // 幂等：启动期只解析一次；重复调用不再下载、不再打印任何提示（避免重复日志与重复网络请求）
+    synchronized (LOCK) {
+      if (initialized) {
+        return;
+      }
+      initialized = true;
+    }
+
     codec(); // ① 运行期已有（服务端自带）
     if (codec != null) {
       logger.info(detectionLine() + "；来源=" + source.label());
@@ -390,7 +420,14 @@ public final class ZstdSupport {
 
     // ③ 自动下载（默认开启）
     if (autoDownload) {
-      Codec downloaded = downloadCodec(libraryDir, downloadUrl, timeoutSeconds);
+      if (expectedSha256 == null || expectedSha256.isBlank()) {
+        // 供应链面：未提供期望哈希时无法做完整性校验，至少一次性明确告知（不静默）
+        if (UNVERIFIED_WARNING.compareAndSet(false, true)) {
+          logger.warning(detectionLine() + "；自动下载未提供期望 SHA-256，"
+              + "本次下载仅校验「可加载性」，未做完整性校验（如需校验请在配置中提供期望哈希）");
+        }
+      }
+      Codec downloaded = downloadCodec(libraryDir, downloadUrl, expectedSha256, timeoutSeconds);
       if (downloaded != null) {
         logger.info(detectionLine() + "；来源=" + source.label() + "（"
             + artifactDetail(downloadedClassifier, downloadedBytes) + "）");
@@ -499,6 +536,16 @@ public final class ZstdSupport {
    * 避免下次启动误用坏文件）。任一失败返回 {@code null}，**不抛异常**。
    */
   static Codec downloadCodec(Path libraryDir, String baseUrl, int timeoutSeconds) {
+    return downloadCodec(libraryDir, baseUrl, null, timeoutSeconds);
+  }
+
+  /**
+   * 同 {@link #downloadCodec(Path, String, int)}，但可传入期望 SHA-256 摘要，下载落盘后先校验再加载。
+   *
+   * @param expectedSha256 期望的 SHA-256（十六进制，大小写不敏感）；{@code null}/空白表示不校验
+   */
+  static Codec downloadCodec(Path libraryDir, String baseUrl, String expectedSha256,
+      int timeoutSeconds) {
     if (libraryDir == null) {
       return null;
     }
@@ -512,7 +559,7 @@ public final class ZstdSupport {
         lastError = "下载总等待已用尽（" + Math.max(1, timeoutSeconds) + "s）";
         return null;
       }
-      Codec found = downloadOnce(libraryDir, baseUrl, attempt, remainingMillis);
+      Codec found = downloadOnce(libraryDir, baseUrl, attempt, expectedSha256, remainingMillis);
       if (found != null) {
         install(found, Source.DOWNLOADED);
         return found;
@@ -537,9 +584,14 @@ public final class ZstdSupport {
     return attempts;
   }
 
-  /** 单次下载尝试（一个分类器）：下载 → 非空校验 → 原子替换 → 可加载校验。 */
+  /**
+   * 单次下载尝试（一个分类器）：下载 → 非空校验 → 完整性校验（可选）→ 原子替换 → 可加载校验。
+   *
+   * <p>完整性校验只在提供了 {@code expectedSha256} 时执行：不匹配即视为被篡改/损坏，
+   * 删除临时文件并返回 {@code null}（绝不把未通过校验的 jar 落到 lib 目录）。
+   */
   private static Codec downloadOnce(Path libraryDir, String baseUrl, String classifier,
-      long timeoutMillis) {
+      String expectedSha256, long timeoutMillis) {
     Path target = libraryDir.resolve(jarFileName(ARTIFACT, VERSION, classifier));
     Path temp = target.resolveSibling(target.getFileName() + ".tmp");
     try {
@@ -549,6 +601,13 @@ public final class ZstdSupport {
       if (!Files.isRegularFile(temp) || Files.size(temp) <= 0L) {
         lastError = "下载文件为空";
         return null;
+      }
+      if (expectedSha256 != null && !expectedSha256.isBlank()) {
+        String actual = sha256Hex(temp);
+        if (!actual.equalsIgnoreCase(expectedSha256.trim())) {
+          lastError = "下载文件 SHA-256 校验失败（期望 " + expectedSha256.trim() + "，实际 " + actual + "）";
+          return null;
+        }
       }
       // 先落临时文件再原子替换：中断/超时留下的残留文件永远不会被当成成品
       Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
@@ -609,6 +668,40 @@ public final class ZstdSupport {
     } finally {
       // 只取消、不等待：调用方已经不再阻塞（超时语义），残留线程是守护线程，随进程退出
       executor.shutdownNow();
+    }
+  }
+
+  /** 计算文件的 SHA-256 十六进制小写摘要（用于下载完整性校验；纯 JDK，无额外依赖）。 */
+  static String sha256Hex(Path file) throws IOException {
+    try {
+      MessageDigest digest = MessageDigest.getInstance("SHA-256");
+      try (InputStream in = Files.newInputStream(file)) {
+        byte[] buffer = new byte[8192];
+        int read;
+        while ((read = in.read(buffer)) >= 0) {
+          digest.update(buffer, 0, read);
+        }
+      }
+      return HexFormat.of().formatHex(digest.digest());
+    } catch (NoSuchAlgorithmException impossible) {
+      throw new IOException("JVM 缺少 SHA-256 实现", impossible);
+    }
+  }
+
+  /**
+   * <b>仅测试用</b>：复位启动期状态（探测结论、来源、幂等标记与一次性提示标记），
+   * 便于在同一个 JVM 内独立验证 {@link #initialize} 的幂等性。
+   */
+  static void resetForTest() {
+    synchronized (LOCK) {
+      codec = null;
+      probed = false;
+      initialized = false;
+      source = Source.NONE;
+      lastError = "";
+      downloadedClassifier = "";
+      downloadedBytes = 0L;
+      UNVERIFIED_WARNING.set(false);
     }
   }
 

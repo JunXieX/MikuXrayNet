@@ -3,6 +3,7 @@ package net.mikumc.mikuxraynet.cache;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -10,6 +11,8 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 
 /**
  * 单个区域缓存文件（{@code r.<regionX>.<regionZ>.b_linear}）的读写句柄，格式见 {@link BufferedLinearV3Format}。
@@ -28,6 +31,11 @@ import java.util.Map;
  * 写路径失败由调用方降级为纯内存缓存。
  */
 final class RegionFile implements AutoCloseable {
+
+  private static final Logger LOGGER = Logger.getLogger(RegionFile.class.getName());
+
+  /** 「未取得文件锁」的 WARN 只打一次（多文件被占用时不刷屏）。 */
+  private static final AtomicBoolean LOCK_WARNING = new AtomicBoolean();
 
   /** 条目的保留判定（用于压缩回收时丢弃过期/旧代次条目）。 */
   @FunctionalInterface
@@ -56,6 +64,12 @@ final class RegionFile implements AutoCloseable {
   private final LinkedHashMap<Integer, Boolean> loaded = new LinkedHashMap<>(8, 0.75f, true);
 
   private FileChannel channel;
+  /**
+   * 跨进程排他锁（best-effort）：持有强引用以防 {@link FileLock} 被 GC 而提前释放；
+   * 通道关闭（close / compact 替换文件）时由 JVM 自动释放，故不做显式 release。
+   * 未取得锁时为 {@code null}（fail-open，见 {@link #acquireExclusiveLock()}）。
+   */
+  private FileLock lock;
   private long fileSize;
   private long liveBytes;
   private long garbageBytes;
@@ -69,6 +83,34 @@ final class RegionFile implements AutoCloseable {
     this.hashSeed = hashSeed;
     this.compression = compression;
     this.bucketCacheSize = Math.max(1, bucketCacheSize);
+  }
+
+  /**
+   * best-effort 取一个跨进程排他文件锁，让「两个服务端实例共享同一缓存目录」这一误配有迹可循。
+   *
+   * <p><b>fail-open</b>：取不到锁一律不影响缓存读写与封包链路，只记一次中文 WARN 后以不加锁方式继续。
+   * 取不到的情形有三：① 其他进程已持有（{@code tryLock()} 返回 {@code null}）；② 同一 JVM 内重复加锁
+   * （{@code OverlappingFileLockException}）；③ 文件系统不支持锁。三种都按同一路径降级处理。
+   */
+  private void acquireExclusiveLock() {
+    try {
+      FileLock acquired = channel.tryLock();
+      if (acquired == null) {
+        warnLockUnavailableOnce();
+      } else {
+        this.lock = acquired;
+      }
+    } catch (Throwable throwable) {
+      warnLockUnavailableOnce();
+    }
+  }
+
+  /** 未取得文件锁的中文 WARN 只打一次（多文件被占用时不刷屏）。 */
+  private static void warnLockUnavailableOnce() {
+    if (LOCK_WARNING.compareAndSet(false, true)) {
+      LOGGER.warning("磁盘缓存区域文件已被其他进程占用，未能取得文件锁，本进程将以不加锁方式继续"
+          + "（fail-open，不影响封包链路）；请勿让两个服务端实例共享同一缓存目录");
+    }
   }
 
   /**
@@ -101,6 +143,9 @@ final class RegionFile implements AutoCloseable {
     }
 
     RegionFile file = new RegionFile(path, channel, hashSeed, compression, bucketCacheSize);
+    // 尽早尝试取跨进程排他锁（fail-open）：两个服务端实例共享同一缓存目录时，让后到者知情，
+    // 而不是无声地互相踩。取不到锁不阻断任何读写（见 acquireExclusiveLock）。
+    file.acquireExclusiveLock();
     try {
       if (size <= 0L) {
         // 新建（或刚被清空）的文件：必须先落「文件头 + 全零偏移表」，
@@ -354,12 +399,20 @@ final class RegionFile implements AutoCloseable {
 
       channel.close();
       try {
-        Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-      } catch (IOException atomicFailure) {
-        Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING);
+        try {
+          Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException atomicFailure) {
+          // 原子移动不被支持（AtomicMoveNotSupportedException）或失败：退回普通替换移动
+          Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING);
+        }
+      } catch (IOException moveFailure) {
+        // 移动失败：目标文件保持原样（未替换），但 temp 会残留成孤儿文件——失败路径必须清理它，
+        // 否则每次压缩失败都在磁盘上留一个废弃的 .tmp（虽有启动期兜底扫描，但不该依赖它）。
+        // 只删 temp、绝不触碰 path，保证「不破坏原文件」。
+        deleteQuietly(temp);
+        throw moveFailure;
       }
-      channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ,
-          StandardOpenOption.WRITE);
+      reopenChannel();
 
       for (int bucket = 0; bucket < all.length; bucket++) {
         positions[bucket] = newPositions[bucket];
@@ -468,6 +521,22 @@ final class RegionFile implements AutoCloseable {
       channel.close();
     } catch (IOException ignored) {
       // 打开失败后的关闭异常无需上报
+    }
+  }
+
+  /** 重新打开底层通道（{@link #compact} 用临时文件替换后调用），并重新尝试取文件锁。 */
+  private void reopenChannel() throws IOException {
+    channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ,
+        StandardOpenOption.WRITE);
+    acquireExclusiveLock();
+  }
+
+  /** 尽力删除一个文件；失败只忽略（临时文件删除失败不影响功能）。 */
+  private static void deleteQuietly(Path path) {
+    try {
+      Files.deleteIfExists(path);
+    } catch (Throwable ignored) {
+      // 删除失败无副作用：启动期的 *.tmp 兜底扫描会再清理一次
     }
   }
 

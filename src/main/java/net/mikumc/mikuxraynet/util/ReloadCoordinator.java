@@ -17,8 +17,19 @@ public final class ReloadCoordinator {
   /** 热重载目标（由插件装配提供；单测用桩对象断言调用）。 */
   public interface Target {
 
-    /** 当前配置指纹（任一影响改写结果的配置项变化都会改变它）。 */
-    int fingerprint();
+    /**
+     * <b>反矿透侧</b>配置指纹（任一影响改写结果的 antixray.yml 配置项变化都会改变它，见
+     * {@code AntiXrayConfig#configHash}）。
+     */
+    int antiXrayFingerprint();
+
+    /**
+     * <b>带宽侧</b>配置指纹（bandwidth.yml 各子模块的有效值，见 {@code BandwidthConfig#configHash}）。
+     *
+     * <p>单独给出这一侧，是为了让「只改了 bandwidth.yml」也能被如实报告——旧实现只比对反矿透侧指纹，
+     * 只改带宽配置时会打出「配置指纹未变化」，误导管理员以为改动没被识别。
+     */
+    int bandwidthFingerprint();
 
     /** 重新读取两份配置文件。 */
     void reloadConfiguration();
@@ -57,14 +68,16 @@ public final class ReloadCoordinator {
   public List<String> reload(Target target) {
     List<String> lines = new ArrayList<>();
 
-    int before = safeFingerprint(target);
+    int antiBefore = safeAntiXrayFingerprint(target);
+    int bandwidthBefore = safeBandwidthFingerprint(target);
     try {
       target.reloadConfiguration();
     } catch (Throwable throwable) {
       lines.add("配置重新读取失败，已保留原配置（详见服务端日志）");
       return lines;
     }
-    int after = safeFingerprint(target);
+    int antiAfter = safeAntiXrayFingerprint(target);
+    int bandwidthAfter = safeBandwidthFingerprint(target);
 
     boolean invalidated = false;
     try {
@@ -80,20 +93,39 @@ public final class ReloadCoordinator {
       lines.add("周期任务重启时出现异常，已在日志记录（不影响封包主链路）");
     }
 
-    if (before != after) {
-      lines.add("配置指纹已变化（" + before + " → " + after + "）"
+    // 两侧指纹都比对：只改 bandwidth.yml 时也必须如实指出「带宽侧已变化」，不能因反矿透侧未变就报「未变化」
+    boolean antiChanged = antiBefore != antiAfter;
+    boolean bandwidthChanged = bandwidthBefore != bandwidthAfter;
+    if (antiChanged || bandwidthChanged) {
+      List<String> changes = new ArrayList<>(2);
+      if (antiChanged) {
+        changes.add("反矿透侧（" + antiBefore + " → " + antiAfter + "）");
+      }
+      if (bandwidthChanged) {
+        changes.add("带宽侧（" + bandwidthBefore + " → " + bandwidthAfter + "）");
+      }
+      lines.add("配置指纹变化：" + String.join("、", changes)
           + (invalidated ? "，改写缓存与显形索引已失效" : ""));
     } else {
-      lines.add("配置指纹未变化（" + after + "）" + (invalidated ? "，缓存已按安全起见刷新" : ""));
+      lines.add("两侧配置指纹均未变化（反矿透 " + antiAfter + "，带宽 " + bandwidthAfter + "）"
+          + (invalidated ? "，缓存已按安全起见刷新" : ""));
     }
     lines.add("已热生效：" + String.join("、", APPLIED));
     lines.add("需要重启服务端才生效：" + String.join("、", RESTART_REQUIRED));
     return lines;
   }
 
-  private static int safeFingerprint(Target target) {
+  private static int safeAntiXrayFingerprint(Target target) {
     try {
-      return target.fingerprint();
+      return target.antiXrayFingerprint();
+    } catch (Throwable throwable) {
+      return 0;
+    }
+  }
+
+  private static int safeBandwidthFingerprint(Target target) {
+    try {
+      return target.bandwidthFingerprint();
     } catch (Throwable throwable) {
       return 0;
     }

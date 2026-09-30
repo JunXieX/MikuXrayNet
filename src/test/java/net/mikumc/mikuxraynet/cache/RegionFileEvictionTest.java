@@ -3,9 +3,12 @@ package net.mikumc.mikuxraynet.cache;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -82,6 +85,36 @@ class RegionFileEvictionTest {
       BufferedLinearV3Format.Entry[][] slots = slotsOf(region);
       assertNotNull(slots[0], "落盘失败的桶内存态必须保留（否则写入会丢），等下次 flush/close 重试");
       assertTrue(dirtyOf(region)[0], "落盘失败的桶必须保留脏标记以便下次重试");
+    } finally {
+      region.close();
+    }
+  }
+
+  /**
+   * 压缩回收「移动临时文件失败」时必须清理 .tmp，且不得破坏原文件。
+   *
+   * <p>做法：先把目标路径替换成<b>非空目录</b>（{@code Files.move} 到非空目录必然失败），
+   * 让 {@link RegionFile#compact} 在「临时文件已写出、等待替换正式文件」这一步失败，
+   * 断言临时文件被清理而非残留成孤儿文件。（原文件在移动失败时保持不变。）
+   */
+  @Test
+  void compactMoveFailureCleansTempFileWithoutTouchingTarget(@TempDir Path dir) throws Exception {
+    Path file = dir.resolve("r.0.0.b_linear");
+    Path temp = dir.resolve("r.0.0.b_linear.tmp");
+    RegionFile region = RegionFile.open(file, 2);
+    try {
+      region.put(chunkIndexForBucket(0), entry(1));
+      region.flushDirty();
+
+      // 关闭通道（释放锁/句柄）后把目标路径换成非空目录：此后的 move 一定失败
+      region.killChannelForTest();
+      Files.delete(file);
+      Files.createDirectory(file);
+      Files.write(file.resolve("blocker"), new byte[] {1});
+
+      assertThrows(IOException.class, () -> region.compact(null),
+          "目标路径为非空目录时，压缩的移动必须失败");
+      assertFalse(Files.exists(temp), "移动失败后必须清理临时文件（旧实现会泄漏 .tmp）");
     } finally {
       region.close();
     }

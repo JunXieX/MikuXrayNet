@@ -559,4 +559,101 @@ class ConfigDefaultsTest {
     // diagnostics
     assertEquals(60, config.diagnostics().intervalSeconds(), "周期运行摘要默认 60 秒（0 = 关闭）");
   }
+
+  /**
+   * 带宽配置的「安全上限」：失控值（多打一个 0）被钳制到上限并留下明细（供加载路径一次性 WARN）；
+   * 上限以内的显式值原样生效；默认值不触发钳制——即新增上限不改变任何默认行为。
+   */
+  @Test
+  void bandwidthOptionsAboveSafetyCeilingAreClampedAndReported() {
+    BandwidthConfig config = BandwidthConfig.from(yaml("""
+        block-changes:
+          merge-radius: 999
+          max-per-packet: 1000000
+          merge-window-millis: 100000
+          max-pending-entries: 1000000
+          immediate-radius: 999
+        entity-culling:
+          force-visible-distance: 99999.0
+          update-interval-ticks: 100000
+          recheck-budget: 100000
+        afk:
+          seconds: 100000000
+          distance: 99999.0
+        latency:
+          threshold-millis: 100000000
+          reduce-view-distance: 999
+          sustain-seconds: 100000000
+          min-view-distance: 999
+          check-interval-seconds: 100000000
+        diagnostics:
+          interval-seconds: 100000000
+        """));
+
+    assertEquals(BandwidthConfig.MAX_MERGE_RADIUS, config.blockChanges().mergeRadius());
+    assertEquals(BandwidthConfig.MAX_PER_PACKET_LIMIT, config.blockChanges().maxPerPacket());
+    assertEquals(BandwidthConfig.MAX_MERGE_WINDOW_MILLIS, config.blockChanges().mergeWindowMillis());
+    assertEquals(BandwidthConfig.MAX_PENDING_ENTRIES_LIMIT, config.blockChanges().maxPendingEntries());
+    assertEquals(BandwidthConfig.MAX_IMMEDIATE_RADIUS, config.blockChanges().immediateRadius());
+    assertEquals(BandwidthConfig.MAX_FORCE_VISIBLE_DISTANCE,
+        config.entityCulling().forceVisibleDistance(), 1.0E-9D);
+    assertEquals(BandwidthConfig.MAX_UPDATE_INTERVAL_TICKS, config.entityCulling().updateIntervalTicks());
+    assertEquals(BandwidthConfig.MAX_RECHECK_BUDGET, config.entityCulling().recheckBudget());
+    assertEquals(BandwidthConfig.MAX_AFK_SECONDS, config.afk().seconds());
+    assertEquals(BandwidthConfig.MAX_AFK_DISTANCE, config.afk().distance(), 1.0E-9D);
+    assertEquals(BandwidthConfig.MAX_LATENCY_THRESHOLD_MILLIS, config.latency().thresholdMillis());
+    assertEquals(BandwidthConfig.MAX_REDUCE_VIEW_DISTANCE, config.latency().reduceViewDistance());
+    assertEquals(BandwidthConfig.MAX_SUSTAIN_SECONDS, config.latency().sustainSeconds());
+    assertEquals(BandwidthConfig.MAX_MIN_VIEW_DISTANCE, config.latency().minViewDistance());
+    assertEquals(BandwidthConfig.MAX_CHECK_INTERVAL_SECONDS, config.latency().checkIntervalSeconds());
+    assertEquals(BandwidthConfig.MAX_DIAGNOSTICS_INTERVAL_SECONDS,
+        config.diagnostics().intervalSeconds());
+
+    String details = String.join("、", config.clampAdjustments());
+    assertTrue(details.contains("block-changes.merge-radius=999"), details);
+    assertTrue(details.contains("latency.sustain-seconds=100000000"), details);
+    assertTrue(details.contains("afk.seconds=100000000"), details);
+    assertTrue(details.contains("entity-culling.force-visible-distance=99999.0"), details);
+
+    // 上限以内的显式值原样生效、不产生明细
+    BandwidthConfig inRange = BandwidthConfig.from(yaml("""
+        block-changes:
+          merge-radius: 3
+          max-per-packet: 8192
+          merge-window-millis: 50
+        latency:
+          reduce-view-distance: 8
+        entity-culling:
+          recheck-budget: 20
+        """));
+    assertEquals(3, inRange.blockChanges().mergeRadius(), "上限内的半径原样生效");
+    assertEquals(8192, inRange.blockChanges().maxPerPacket());
+    assertEquals(50, inRange.blockChanges().mergeWindowMillis());
+    assertEquals(8, inRange.latency().reduceViewDistance());
+    assertEquals(20, inRange.entityCulling().recheckBudget());
+    assertTrue(inRange.clampAdjustments().isEmpty(),
+        "上限内的值不得产生钳制明细：" + inRange.clampAdjustments());
+
+    // 默认值（空配置 / 仅总开关）不得触发任何钳制
+    assertTrue(BandwidthConfig.from(yaml("")).clampAdjustments().isEmpty(),
+        "默认值必须全部落在合法区间内（新增上限不得改变默认行为）");
+    assertTrue(BandwidthConfig.from(yaml("enabled: true\n")).clampAdjustments().isEmpty());
+  }
+
+  /**
+   * 带宽配置指纹：跨进程稳定（不混入枚举 identity hash），且随影响行为的带宽项变化——
+   * 热重载据此判断「带宽侧配置是否变化」，只改 bandwidth.yml 时提示语才不会误导。
+   */
+  @Test
+  void bandwidthConfigHashIsStableAndSensitive() {
+    BandwidthConfig base = BandwidthConfig.from(yaml("enabled: true\n"));
+    assertEquals(base.configHash(), BandwidthConfig.from(yaml("enabled: true\n")).configHash(),
+        "同一份带宽配置重复解析必须得到同一指纹");
+    assertNotEquals(base.configHash(),
+        BandwidthConfig.from(yaml("afk:\n  seconds: 600\n")).configHash(),
+        "影响行为的带宽项变化必须改变指纹");
+    assertNotEquals(base.configHash(),
+        BandwidthConfig.from(yaml("block-changes:\n  merge-radius: 3\n")).configHash(),
+        "每个带宽子模块的取值都应参与指纹");
+  }
 }

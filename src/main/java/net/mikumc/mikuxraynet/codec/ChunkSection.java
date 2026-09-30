@@ -264,14 +264,29 @@ public class ChunkSection {
       frequency[this.data.get(i)]++;
     }
 
-    // 频次降序；同频保持原索引顺序，保证结果确定（同输入必然同输出，缓存可复用）
-    Integer[] order = new Integer[size];
+    // 频次降序；同频保持原索引顺序（即按原索引升序），保证结果确定（同输入必然同输出，缓存可复用）。
+    // 用 int[] + 内联选择排序代替 Integer[] + Arrays.sort：避免每项装箱/比较器调用；调色板容量
+    // ≤ 1 << 15 但实际 ≤ 256，O(n²) 足够，且排序结果与旧比较器语义逐位一致（主键频次降序、次键索引升序）。
+    int[] order = new int[size];
     for (int i = 0; i < size; i++) {
       order[i] = i;
     }
-    Arrays.sort(order, (a, b) -> frequency[b] != frequency[a]
-        ? Integer.compare(frequency[b], frequency[a])
-        : Integer.compare(a, b));
+    for (int i = 0; i < size - 1; i++) {
+      int best = i;
+      for (int j = i + 1; j < size; j++) {
+        int candidate = order[j];
+        int current = order[best];
+        if (frequency[candidate] > frequency[current]
+            || (frequency[candidate] == frequency[current] && candidate < current)) {
+          best = j;
+        }
+      }
+      if (best != i) {
+        int swap = order[i];
+        order[i] = order[best];
+        order[best] = swap;
+      }
+    }
 
     int[] remap = new int[size];
     int[] values = new int[size];

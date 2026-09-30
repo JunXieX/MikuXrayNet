@@ -1,6 +1,11 @@
 package net.mikumc.mikuxraynet.config;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 import org.bukkit.configuration.ConfigurationSection;
 
 /**
@@ -16,6 +21,45 @@ public final class BandwidthConfig {
    * （见 {@code EntityCuller#visibleVertices}，小包围盒退化为中心 1 个），配置超过它没有第 8 个点可试。
    */
   public static final int MAX_RAY_SAMPLES = 7;
+
+  /*
+   * 以下为该文件各项的「安全上限」常量：只挡明显失控的配置（多打一个 0、手滑写错），使内存/带宽占用
+   * 有一个可预期的上界。默认值都落在 [下限, 上限] 内，因此新增上限不改变任何默认行为。
+   * 被上限钳制时会记入 clampAdjustments 并由加载路径一次性 WARN（绝不静默改用户配置）。
+   */
+
+  /** 合并半径上限（格）：半径越大越会把「互不相关的变更」粘进同一个合并包，超过此值收益趋零。 */
+  public static final int MAX_MERGE_RADIUS = 8;
+  /** 单个合并包条目上限：条目再多只会放大单个包的体积与丢包重传代价。 */
+  public static final int MAX_PER_PACKET_LIMIT = 16384;
+  /** 合并时间窗上限（毫秒）：窗口就是「玩家能感知的方块更新延迟上界」，超过 1 秒观感明显迟滞。 */
+  public static final int MAX_MERGE_WINDOW_MILLIS = 1000;
+  /** 每玩家待发缓冲条目上限：条目持有方块状态引用，过大只放大单玩家内存占用。 */
+  public static final int MAX_PENDING_ENTRIES_LIMIT = 4096;
+  /** 立即放行半径上限（格）：半径内一律不合并，配得过大几乎等于关闭合并。 */
+  public static final int MAX_IMMEDIATE_RADIUS = 32;
+  /** 强制可见距离上限（格）：超过一个视距（约 512 格）等价于关闭实体剔除。 */
+  public static final double MAX_FORCE_VISIBLE_DISTANCE = 512.0D;
+  /** 遮挡复检周期上限（tick）：比 10 秒还长会让被遮挡的实体迟迟不隐藏。 */
+  public static final int MAX_UPDATE_INTERVAL_TICKS = 200;
+  /** 每周期复检预算上限：预算即每周期主线程射线次数，上限用于防止把主线程打满。 */
+  public static final int MAX_RECHECK_BUDGET = 1024;
+  /** AFK 判定时长上限（秒，1 天）：超过一天的判定几乎不可能触发，只是白占状态。 */
+  public static final int MAX_AFK_SECONDS = 86400;
+  /** AFK 丢包距离上限（格）：超过视距意味着「不论多远都丢」，会误丢玩家可能看到的远处粒子。 */
+  public static final double MAX_AFK_DISTANCE = 512.0D;
+  /** 延迟观察阈值上限（毫秒）：60 秒以上的延迟早已断线，阈值再高永不触发。 */
+  public static final int MAX_LATENCY_THRESHOLD_MILLIS = 60000;
+  /** 单次降视距上限（区块）：降幅超过常见最大视距（32）没有意义。 */
+  public static final int MAX_REDUCE_VIEW_DISTANCE = 32;
+  /** 超阈持续时长上限（秒，1 小时）：超过 1 小时才降视距等于永不触发。 */
+  public static final int MAX_SUSTAIN_SECONDS = 3600;
+  /** 视距下限上限（区块）：下限不应超过常见最大视距。 */
+  public static final int MAX_MIN_VIEW_DISTANCE = 32;
+  /** 延迟采样周期上限（秒，1 小时）：周期过长等于停止巡检。 */
+  public static final int MAX_CHECK_INTERVAL_SECONDS = 3600;
+  /** 诊断摘要周期上限（秒，1 天）：周期过长等于不再输出摘要。 */
+  public static final int MAX_DIAGNOSTICS_INTERVAL_SECONDS = 86400;
 
   /**
    * 零位移实体包抑制。
@@ -102,9 +146,14 @@ public final class BandwidthConfig {
   private final Afk afk;
   private final Latency latency;
   private final Diagnostics diagnostics;
+  /**
+   * 被「安全上限」钳制过的配置键明细（空列表 = 未钳制）；加载时由 {@link #warnIfClampApplied} 一次性 WARN。
+   */
+  private final List<String> clampAdjustments;
 
   private BandwidthConfig(boolean enabled, EntityPackets entityPackets, BlockChanges blockChanges, Palette palette,
-      EntityCulling entityCulling, Afk afk, Latency latency, Diagnostics diagnostics) {
+      EntityCulling entityCulling, Afk afk, Latency latency, Diagnostics diagnostics,
+      List<String> clampAdjustments) {
     this.enabled = enabled;
     this.entityPackets = entityPackets;
     this.blockChanges = blockChanges;
@@ -113,10 +162,18 @@ public final class BandwidthConfig {
     this.afk = afk;
     this.latency = latency;
     this.diagnostics = diagnostics;
+    this.clampAdjustments = clampAdjustments == null ? List.of() : List.copyOf(clampAdjustments);
   }
 
-  /** 从配置根节点解析；缺失项一律取默认值。 */
+  /**
+   * 从配置根节点解析；缺失项一律取默认值。
+   *
+   * <p><b>为什么这里同时有下限与上限</b>：下限（{@code Math.max}）防止 0/负数让功能静默失效；
+   * 上限（{@link #clampUpper} 系列）防止手滑多打一个 0 之类的失控配置把内存/带宽打满。默认值都落在
+   * 区间内，因此新增上限不改变默认行为；被上限钳制的键会记入明细、由 {@link #warnIfClampApplied} 提示。
+   */
   public static BandwidthConfig from(ConfigurationSection root) {
+    List<String> clampAdjustments = new ArrayList<>();
     return new BandwidthConfig(
         root.getBoolean("enabled", true),
         new EntityPackets(
@@ -127,15 +184,20 @@ public final class BandwidthConfig {
         new BlockChanges(
             root.getBoolean("block-changes.enabled", true),
             root.getBoolean("block-changes.merge", true),
-            Math.max(0, root.getInt("block-changes.merge-radius", 2)),
-            Math.max(1, root.getInt("block-changes.max-per-packet", 4096)),
+            clampUpper(Math.max(0, root.getInt("block-changes.merge-radius", 2)),
+                MAX_MERGE_RADIUS, "block-changes.merge-radius", clampAdjustments),
+            clampUpper(Math.max(1, root.getInt("block-changes.max-per-packet", 4096)),
+                MAX_PER_PACKET_LIMIT, "block-changes.max-per-packet", clampAdjustments),
             root.getBoolean("block-changes.resend-on-overflow", true),
             // 默认 20（原为 50）：50ms 的合并窗口会让玩家自己挖方块后的方块更新延迟最多 50ms，
             // 客户端预测受阻 → 出现「顿感」。收紧到 20 后改为 20ms；真正的交互延迟由
             // immediate-radius 消除（近身变更根本不进窗口）。
-            Math.max(1, root.getInt("block-changes.merge-window-millis", 20)),
-            Math.max(1, root.getInt("block-changes.max-pending-entries", 256)),
-            Math.max(0, root.getInt("block-changes.immediate-radius", 8))),
+            clampUpper(Math.max(1, root.getInt("block-changes.merge-window-millis", 20)),
+                MAX_MERGE_WINDOW_MILLIS, "block-changes.merge-window-millis", clampAdjustments),
+            clampUpper(Math.max(1, root.getInt("block-changes.max-pending-entries", 256)),
+                MAX_PENDING_ENTRIES_LIMIT, "block-changes.max-pending-entries", clampAdjustments),
+            clampUpper(Math.max(0, root.getInt("block-changes.immediate-radius", 8)),
+                MAX_IMMEDIATE_RADIUS, "block-changes.immediate-radius", clampAdjustments)),
         new Palette(
             root.getBoolean("palette.enabled", true),
             // 默认 false：实测开启重排会使压缩字节变大且耗时增加（见 Palette 的说明）
@@ -146,29 +208,89 @@ public final class BandwidthConfig {
         new EntityCulling(
             root.getBoolean("entity-culling.enabled", true),
             root.getBoolean("entity-culling.raycast", true),
-            Math.max(0.0D, root.getDouble("entity-culling.force-visible-distance", 32.0D)),
-            Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),
+            clampUpper(Math.max(0.0D, root.getDouble("entity-culling.force-visible-distance", 32.0D)),
+                MAX_FORCE_VISIBLE_DISTANCE, "entity-culling.force-visible-distance", clampAdjustments),
+            clampUpper(Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),
+                MAX_UPDATE_INTERVAL_TICKS, "entity-culling.update-interval-ticks", clampAdjustments),
             // 语义已变：原生射线改造后本键表示「每个实体最多尝试的候选顶点数」（不再表示采样数）。
             // 钳制 1..MAX_RAY_SAMPLES，默认即上限（包围盒至多 7 个可见顶点 → 取上限就是全部顶点都试）。
             Math.max(1, Math.min(MAX_RAY_SAMPLES, root.getInt("entity-culling.ray-samples", MAX_RAY_SAMPLES))),
             // 周期复检预算默认 12：约「每 0.5 秒（10 tick）多复检 12 个可见追踪实体」，
             // 既能在数个周期内发现新遮挡，又不会让主线程每周期读方块次数失控（建议 8~16）。
-            Math.max(1, root.getInt("entity-culling.recheck-budget", 12))),
+            clampUpper(Math.max(1, root.getInt("entity-culling.recheck-budget", 12)),
+                MAX_RECHECK_BUDGET, "entity-culling.recheck-budget", clampAdjustments)),
         new Afk(
             root.getBoolean("afk.enabled", true),
-            Math.max(1, root.getInt("afk.seconds", 300)),
-            Math.max(0.0D, root.getDouble("afk.distance", 16.0D)),
+            clampUpper(Math.max(1, root.getInt("afk.seconds", 300)),
+                MAX_AFK_SECONDS, "afk.seconds", clampAdjustments),
+            clampUpper(Math.max(0.0D, root.getDouble("afk.distance", 16.0D)),
+                MAX_AFK_DISTANCE, "afk.distance", clampAdjustments),
             root.getBoolean("afk.drop-particles", true),
             root.getBoolean("afk.drop-block-break-animation", true)),
         new Latency(
             root.getBoolean("latency.enabled", true),
-            Math.max(1, root.getInt("latency.threshold-millis", 400)),
-            Math.max(1, root.getInt("latency.reduce-view-distance", 2)),
-            Math.max(0, root.getInt("latency.sustain-seconds", 30)),
-            Math.max(1, root.getInt("latency.min-view-distance", 4)),
-            Math.max(1, root.getInt("latency.check-interval-seconds", 5))),
+            clampUpper(Math.max(1, root.getInt("latency.threshold-millis", 400)),
+                MAX_LATENCY_THRESHOLD_MILLIS, "latency.threshold-millis", clampAdjustments),
+            clampUpper(Math.max(1, root.getInt("latency.reduce-view-distance", 2)),
+                MAX_REDUCE_VIEW_DISTANCE, "latency.reduce-view-distance", clampAdjustments),
+            clampUpper(Math.max(0, root.getInt("latency.sustain-seconds", 30)),
+                MAX_SUSTAIN_SECONDS, "latency.sustain-seconds", clampAdjustments),
+            clampUpper(Math.max(1, root.getInt("latency.min-view-distance", 4)),
+                MAX_MIN_VIEW_DISTANCE, "latency.min-view-distance", clampAdjustments),
+            clampUpper(Math.max(1, root.getInt("latency.check-interval-seconds", 5)),
+                MAX_CHECK_INTERVAL_SECONDS, "latency.check-interval-seconds", clampAdjustments)),
         new Diagnostics(
-            Math.max(0, root.getInt("diagnostics.interval-seconds", 60))));
+            clampUpper(Math.max(0, root.getInt("diagnostics.interval-seconds", 60)),
+                MAX_DIAGNOSTICS_INTERVAL_SECONDS, "diagnostics.interval-seconds", clampAdjustments)),
+        clampAdjustments);
+  }
+
+  /** 整数上限钳制：超过上限则取上限并记录明细（供一次性 WARN）。 */
+  private static int clampUpper(int value, int max, String key, List<String> adjustments) {
+    if (value <= max) {
+      return value;
+    }
+    adjustments.add(key + "=" + value + "（上限 " + max + "）");
+    return max;
+  }
+
+  /** 浮点上限钳制：NaN 不满足 {@code > max}，会原样返回（与改动前一致，由使用侧兜底）。 */
+  private static double clampUpper(double value, double max, String key, List<String> adjustments) {
+    if (!(value > max)) {
+      return value;
+    }
+    adjustments.add(key + "=" + value + "（上限 " + max + "）");
+    return max;
+  }
+
+  /**
+   * 被安全上限钳制时的一次性中文 WARN。
+   *
+   * <p>钳制不改变默认行为（默认值都在区间内），只在管理员写了失控值时触发；用进程级一次性闸门避免
+   * 反复 reload 重复刷屏。
+   */
+  public void warnIfClampApplied(Logger logger, AtomicBoolean once) {
+    if (clampAdjustments.isEmpty() || logger == null || !once.compareAndSet(false, true)) {
+      return;
+    }
+    logger.warning("bandwidth.yml 的 " + String.join("、", clampAdjustments)
+        + " 超过安全上限，已按上限生效（防止失控配置把内存/带宽打满；默认值均在上限内）。");
+  }
+
+  /** 被安全上限钳制过的配置键明细（空列表 = 未钳制）；供诊断回显。 */
+  public List<String> clampAdjustments() {
+    return clampAdjustments;
+  }
+
+  /**
+   * 配置指纹（跨进程稳定）：参与哈希的全部字段都是「有规范 hashCode 定义」的类型（字符串/数值/布尔/
+   * 集合），不含枚举 identity hash，因此同一份 bandwidth.yml 在任何 JVM 上得到同一值。
+   *
+   * <p>热重载时用它判断「带宽侧配置是否变化」（见 {@code ReloadCoordinator}）。
+   */
+  public int configHash() {
+    return Objects.hash(enabled, entityPackets, blockChanges, palette, entityCulling, afk, latency,
+        diagnostics);
   }
 
   public boolean enabled() {

@@ -4,6 +4,7 @@ import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.List;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.ThrottlePipeline;
+import net.mikumc.mikuxraynet.bandwidth.ThrottleStats;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.MikuConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
@@ -37,6 +38,13 @@ public final class MikuXrayNet extends JavaPlugin {
 
   private MikuConfig config;
   private ThrottlePipeline throttlePipeline;
+  /**
+   * 带宽统计持有者：<b>插件级唯一</b>，跨热重载复用。
+   *
+   * <p>热重载会重建带宽管线（停旧建新）。若统计由管线自己持有，每次 reload 计数都会归零、
+   * 累计口径失去连续性。把它提到插件层后，管线重建不影响计数，{@code /mxnet status} 字段语义不变。
+   */
+  private final ThrottleStats throttleStats = new ThrottleStats();
   private Diagnostics diagnostics;
   /** 周期运行摘要任务（bandwidth.yml: diagnostics.interval-seconds；0 = 关闭）。 */
   private ScheduledTask diagnosticsTask;
@@ -90,7 +98,8 @@ public final class MikuXrayNet extends JavaPlugin {
 
   /** 带宽优化装配：各子模块独立注册，注册失败只停用该子模块，不影响其它功能。 */
   private void startBandwidth() {
-    ThrottlePipeline pipeline = new ThrottlePipeline(this, config.bandwidth());
+    // 统计持有者跨 reload 复用（throttleStats 为插件级唯一实例）
+    ThrottlePipeline pipeline = new ThrottlePipeline(this, config.bandwidth(), throttleStats);
     try {
       pipeline.start();
     } catch (Throwable throwable) {
@@ -174,8 +183,13 @@ public final class MikuXrayNet extends JavaPlugin {
   public List<String> reloadConfigs() {
     return reloadCoordinator.reload(new ReloadCoordinator.Target() {
       @Override
-      public int fingerprint() {
+      public int antiXrayFingerprint() {
         return config.antiXray().configHash();
+      }
+
+      @Override
+      public int bandwidthFingerprint() {
+        return config.bandwidth().configHash();
       }
 
       @Override

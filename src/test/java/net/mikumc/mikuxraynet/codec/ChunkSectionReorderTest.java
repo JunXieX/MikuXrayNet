@@ -154,6 +154,42 @@ class ChunkSectionReorderTest {
     }
   }
 
+  /**
+   * 同频条目必须按原索引升序稳定排列（结果确定，缓存可复用）。这锁定内联选择排序的次键语义，
+   * 与旧实现 {@code Integer[] + 比较器（次键 Integer.compare(a, b)）} 逐位一致。
+   */
+  @Test
+  void equalFrequencyKeepsOriginalIndexOrder() {
+    int[] palette = {AIR, 10, 20, 30};
+    int[] paletteIndices = new int[4096];
+    // 频次：索引 3 = 2048、索引 1 与 2 各 1000（同频）、索引 0 = 48 → 排序应为 [3,1,2,0]
+    for (int i = 0; i < 1000; i++) {
+      paletteIndices[i] = 1;
+    }
+    for (int i = 1000; i < 2000; i++) {
+      paletteIndices[i] = 2;
+    }
+    for (int i = 2000; i < 2048; i++) {
+      paletteIndices[i] = 0;
+    }
+    for (int i = 2048; i < 4096; i++) {
+      paletteIndices[i] = 3;
+    }
+
+    byte[] raw = new TestChunkBuilder(MODERN)
+        .indirectSection(4, nonAirCount(palette, paletteIndices), 0, palette, paletteIndices, 0, new int[] {1})
+        .build();
+
+    byte[] reencoded;
+    try (Chunk chunk = codec().decode(raw, 1)) {
+      assertTrue(chunk.getSection(0).reorderPaletteByFrequency(false), "存在频次差异时应发生重排");
+      reencoded = chunk.finalizeOutput();
+    }
+
+    assertArrayEquals(new int[] {30, 10, 20, AIR}, readPalette(reencoded),
+        "同频条目必须按原索引升序稳定排列（同输入必然同输出，结果确定）");
+  }
+
   @Test
   void verifyModePassesOnHealthySection() {
     int[] palette = palette(6);

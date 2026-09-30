@@ -1,7 +1,9 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Proxy;
@@ -122,5 +124,29 @@ class ThrottlePipelineTest {
     assertNull(result, "start 抛异常的模块必须返回 null（单独停用该模块）");
     assertTrue(stopped.get(),
         "start 抛异常后必须对同一实例调用 stop()，撤销已注册的监听/已调度的任务，避免 reload 累积泄漏");
+  }
+
+  /**
+   * 统计持有者与管线解耦的回归：热重载会「停旧管线、以新配置重建新管线」，若统计仍由管线自己持有，
+   * 每次 reload 计数就会归零。注入同一个 {@link ThrottleStats} 后，重建的管线必须复用该实例、
+   * 累计计数连续（{@code /mxnet status} 的字段语义不变）。
+   */
+  @Test
+  void statsSurvivePipelineRebuildWhenInjected() {
+    ThrottleStats stats = new ThrottleStats();
+    ThrottlePipeline first = new ThrottlePipeline(pluginStub(), config("enabled: true\n"), stats);
+    first.stats().entityPacketsCancelled.increment();
+    first.stats().blockChangesMerged.add(3L);
+
+    // 模拟 reload：停旧管线后按新配置重建，但统计持有者不变
+    ThrottlePipeline rebuilt = new ThrottlePipeline(pluginStub(), config("enabled: true\n"), stats);
+
+    assertSame(stats, rebuilt.stats(), "重建后的管线必须复用注入的统计持有者");
+    assertEquals(1L, rebuilt.stats().entityPacketsCancelled.sum(), "累计计数不得随管线重建归零");
+    assertEquals(3L, rebuilt.stats().blockChangesMerged.sum(), "累计计数不得随管线重建归零");
+
+    // 不注入时保持旧行为：各自一份新统计（供单测/默认构造使用）
+    ThrottlePipeline standalone = new ThrottlePipeline(pluginStub(), config("enabled: true\n"));
+    assertFalse(standalone.stats() == stats, "未注入时使用独立统计实例");
   }
 }

@@ -59,7 +59,7 @@ public final class ThrottlePipeline {
 
   private final Plugin plugin;
   private final BandwidthConfig config;
-  private final ThrottleStats stats = new ThrottleStats();
+  private final ThrottleStats stats;
 
   private EntityPacketFilter entityPacketFilter;
   private BlockChangeMerger blockChangeMerger;
@@ -70,8 +70,21 @@ public final class ThrottlePipeline {
   private boolean started;
 
   public ThrottlePipeline(Plugin plugin, BandwidthConfig config) {
+    this(plugin, config, new ThrottleStats());
+  }
+
+  /**
+   * 装配方注入统计持有者的构造。
+   *
+   * <p><b>为什么要把 {@link ThrottleStats} 与管线解耦</b>：热重载会 {@code stop()} 旧管线、再以新配置
+   * 重建一个新管线。若统计仍由管线自己 new，则每次 reload 计数都归零，「累计取消／合并／隐藏」等
+   * 计数失去连续性（管理员会误以为功能刚上线或计数丢失）。因此由插件持有唯一的统计实例、传入管线，
+   * 管线重建后统计照常累计，{@code /mxnet status} 字段语义不变。
+   */
+  public ThrottlePipeline(Plugin plugin, BandwidthConfig config, ThrottleStats stats) {
     this.plugin = plugin;
     this.config = config;
+    this.stats = stats == null ? new ThrottleStats() : stats;
   }
 
   /** 装配全部子模块；总开关关闭时不做任何事。 */

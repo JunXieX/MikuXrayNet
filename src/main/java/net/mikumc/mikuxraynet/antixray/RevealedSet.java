@@ -1,6 +1,5 @@
 package net.mikumc.mikuxraynet.antixray;
 
-import java.util.Arrays;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -29,12 +28,134 @@ import java.util.function.LongSupplier;
  */
 public final class RevealedSet {
 
-  /** 单个玩家在一个区块内已显形的坐标（打包为 long）；读写都在条目锁内进行。 */
+  /**
+   * 单个玩家在一个区块内已显形的坐标（打包为 long）；读写都在条目锁内进行。
+   *
+   * <p><b>为什么是「long 开放寻址哈希集」而不是数组线性扫描</b>：{@link #contains} / {@link #mark} 是显形
+   * 热路径上最重的纯内存操作，原先每格都要在数组里持锁线性扫描（真机单区块可达数百个坐标）。改成
+   * 均摊 O(1) 的哈希集后，判重与命中都不再与坐标数线性相关；对外语义（大小、判重、注销、去重）与
+   * 并发纪律（读写一律在 {@link RevealedSet} 的条目锁内）完全不变，且天然无装箱、无额外对象。
+   *
+   * <p>装载因子保持 ≤ 0.5（{@link #add} 翻倍扩容）：线性探测在低装载下冲突极少，实现简单；
+   * 容量为 2 的幂，用位与取模。空槽哨兵用独立的 {@code used} 数组——打包值本身可以是任意 long
+   * （含 0），不能拿某个特殊值当空槽，否则会在坐标恰为该值时误判。
+   */
   static final class Marker {
 
-    private long[] packed = new long[4];
+    private long[] keys = new long[8];
+    private boolean[] used = new boolean[8];
     private int size;
     private volatile long updatedAtNanos;
+
+    /** 已登记坐标数。 */
+    int size() {
+      return size;
+    }
+
+    /** 是否已登记该坐标。 */
+    boolean contains(long value) {
+      int mask = keys.length - 1;
+      int index = probe(value) & mask;
+      while (used[index]) {
+        if (keys[index] == value) {
+          return true;
+        }
+        index = (index + 1) & mask;
+      }
+      return false;
+    }
+
+    /**
+     * 登记一个坐标。
+     *
+     * @return {@code true} 表示本次真正新增；已存在（重复标记）返回 {@code false}
+     */
+    boolean add(long value) {
+      int mask = keys.length - 1;
+      int index = probe(value) & mask;
+      while (used[index]) {
+        if (keys[index] == value) {
+          return false;
+        }
+        index = (index + 1) & mask;
+      }
+      keys[index] = value;
+      used[index] = true;
+      size++;
+      if (size * 2 > keys.length) {
+        grow();
+      }
+      return true;
+    }
+
+    /**
+     * 注销一个坐标。
+     *
+     * <p>用「向后移位删除」而不是墓碑：同一探测簇里位于空洞之后的元素依次前移，保持线性探测的
+     * 「从理想位置出发必能连续走到元素」不变式，因此无需墓碑、也不会让后续查找退化。
+     *
+     * @return {@code true} 表示确实存在并被移除
+     */
+    boolean remove(long value) {
+      int mask = keys.length - 1;
+      int index = probe(value) & mask;
+      while (used[index]) {
+        if (keys[index] == value) {
+          backwardShiftRemove(index, mask);
+          size--;
+          return true;
+        }
+        index = (index + 1) & mask;
+      }
+      return false;
+    }
+
+    /** 翻倍扩容并重哈希（仅在持有条目锁时调用）。 */
+    private void grow() {
+      long[] oldKeys = keys;
+      boolean[] oldUsed = used;
+      keys = new long[oldKeys.length << 1];
+      used = new boolean[keys.length];
+      int mask = keys.length - 1;
+      for (int i = 0; i < oldKeys.length; i++) {
+        if (!oldUsed[i]) {
+          continue;
+        }
+        long value = oldKeys[i];
+        int index = probe(value) & mask;
+        while (used[index]) {
+          index = (index + 1) & mask;
+        }
+        keys[index] = value;
+        used[index] = true;
+      }
+    }
+
+    /** 经典开放寻址删除（Knuth）：把空洞之后同一簇的元素前移，最后把尾部空洞置空。 */
+    private void backwardShiftRemove(int hole, int mask) {
+      int i = hole;
+      int j = i;
+      while (true) {
+        j = (j + 1) & mask;
+        if (!used[j]) {
+          break;
+        }
+        int home = probe(keys[j]) & mask;
+        boolean forward = j > i;
+        if ((forward && (home <= i || home > j)) || (!forward && (home <= i && home > j))) {
+          keys[i] = keys[j];
+          i = j;
+        }
+      }
+      used[i] = false;
+      keys[i] = 0L;
+    }
+
+    /** 打包值的混合哈希：低位常是区块内小坐标，必须充分扩散后再取低位索引。 */
+    private static int probe(long value) {
+      long mixed = value * 0x9E3779B97F4A7C15L;
+      return (int) (mixed ^ (mixed >>> 32));
+    }
   }
 
   private final ConcurrentHashMap<ChunkKey, ConcurrentHashMap<UUID, Marker>> chunks =
@@ -80,7 +201,7 @@ public final class RevealedSet {
       return 0;
     }
     synchronized (marker) {
-      return marker.size;
+      return marker.size();
     }
   }
 
@@ -92,13 +213,8 @@ public final class RevealedSet {
     }
     long packedValue = pack(x, y, z);
     synchronized (marker) {
-      for (int index = 0; index < marker.size; index++) {
-        if (marker.packed[index] == packedValue) {
-          return true;
-        }
-      }
+      return marker.contains(packedValue);
     }
-    return false;
   }
 
   /**
@@ -118,20 +234,15 @@ public final class RevealedSet {
 
     synchronized (marker) {
       marker.updatedAtNanos = clock.getAsLong();
-      for (int index = 0; index < marker.size; index++) {
-        if (marker.packed[index] == packedValue) {
-          return;
-        }
+      if (marker.contains(packedValue)) {
+        return;
       }
       AtomicInteger total = playerTotals.computeIfAbsent(playerId, ignored -> new AtomicInteger());
       if (total.get() >= maxPositionsPerPlayer) {
         droppedByCapacity.increment();
         return;
       }
-      if (marker.size == marker.packed.length) {
-        marker.packed = Arrays.copyOf(marker.packed, marker.size << 1);
-      }
-      marker.packed[marker.size++] = packedValue;
+      marker.add(packedValue);
       total.incrementAndGet();
       registeredTotal.increment();
     }
@@ -163,18 +274,12 @@ public final class RevealedSet {
     for (Map.Entry<UUID, Marker> entry : players.entrySet()) {
       Marker marker = entry.getValue();
       synchronized (marker) {
-        for (int index = 0; index < marker.size; index++) {
-          if (marker.packed[index] != packedValue) {
-            continue;
-          }
-          // 交换删除：条目内坐标无序，用末项填补空洞即可
-          marker.packed[index] = marker.packed[--marker.size];
-          marker.packed[marker.size] = 0L;
-          AtomicInteger total = playerTotals.get(entry.getKey());
-          if (total != null) {
-            subtract(total, 1);
-          }
-          break;
+        if (!marker.remove(packedValue)) {
+          continue;
+        }
+        AtomicInteger total = playerTotals.get(entry.getKey());
+        if (total != null) {
+          subtract(total, 1);
         }
       }
     }
@@ -193,7 +298,7 @@ public final class RevealedSet {
       }
       Marker marker = entry.getValue();
       synchronized (marker) {
-        subtract(total, marker.size);
+        subtract(total, marker.size());
       }
     }
   }
@@ -250,7 +355,7 @@ public final class RevealedSet {
           if (nowNanos - marker.updatedAtNanos <= expireNanos) {
             continue;
           }
-          removed = marker.size;
+          removed = marker.size();
         }
         if (players.remove(entry.getKey(), marker)) {
           AtomicInteger total = playerTotals.get(entry.getKey());

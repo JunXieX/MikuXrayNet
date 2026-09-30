@@ -10,8 +10,20 @@ package net.mikumc.mikuxraynet.codec;
  */
 public class SimpleVarBitBuffer implements VarBitBuffer {
 
+  /**
+   * 位打包数组长度：{@code ceil(size / entriesPerLong)}。
+   *
+   * <p>为什么用整数运算：旧写法 {@code (float) size / ...} 依赖 float 的 24 位有效位，{@code size}
+   * 很大时会先丢精度、再 {@code Math.ceil} 可能算出偏小（或偏大）的长度；而该长度会参与写出与
+   * 读取时的长度校验（构造出的数组与之不符即抛错），精度误差会变成功能性失败。
+   * 整数形式 {@code (size + entriesPerLong - 1) / entriesPerLong} 对任意 int 范围都精确。
+   */
   public static int calculateArraySize(int bitsPerEntry, int size) {
-    return bitsPerEntry == 0 ? 0 : (int) Math.ceil((float) size / (64 / bitsPerEntry));
+    if (bitsPerEntry == 0) {
+      return 0;
+    }
+    int entriesPerLong = 64 / bitsPerEntry;
+    return (size + entriesPerLong - 1) / entriesPerLong;
   }
 
   private final int bitsPerEntry;
@@ -29,7 +41,9 @@ public class SimpleVarBitBuffer implements VarBitBuffer {
   SimpleVarBitBuffer(int bitsPerEntry, int size, long[] buffer) {
     this.bitsPerEntry = bitsPerEntry;
     this.entriesPerLong = 64 / bitsPerEntry;
-    this.adjustmentMask = (1L << bitsPerEntry) - 1L;
+    // bitsPerEntry == 64 时 (1L << 64) 是未定义行为（Java 移位按 64 取模，等价于 1L << 0，
+    // 掩码会算成 0，取/写值全被抹零）。显式用 -1L 表示「低 64 位全 1」的满掩码。
+    this.adjustmentMask = bitsPerEntry >= 64 ? -1L : (1L << bitsPerEntry) - 1L;
 
     this.size = size;
     this.buffer = buffer;

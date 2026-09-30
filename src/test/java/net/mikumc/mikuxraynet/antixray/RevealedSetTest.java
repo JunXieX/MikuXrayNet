@@ -2,10 +2,15 @@ package net.mikumc.mikuxraynet.antixray;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -212,5 +217,77 @@ class RevealedSetTest {
 
     assertEquals(0L, revealed.droppedByCapacity(), "正常量级下安全阀必须恒为 0");
     assertEquals(49, revealed.markerCount());
+  }
+
+  /**
+   * 开放寻址哈希集的扩容：跨越初始容量（8）后每条坐标仍可命中；注销一半（含跨扩容的探测簇）后
+   * 其余坐标的可达性不得被「向后移位删除」破坏。这是把线性扫描换成哈希集后最容易写错的两处。
+   */
+  @Test
+  void growsBeyondInitialCapacityAndKeepsMembership() {
+    RevealedSet revealed = revealed(1 << 20, 60 * SECOND_NANOS);
+    ChunkKey key = chunk(0, 0);
+    int count = 1500;
+    for (int i = 0; i < count; i++) {
+      revealed.mark(PLAYER, key, i & 15, i >> 4, i % 7);
+    }
+    assertEquals(count, revealed.sizeFor(PLAYER, key), "扩容后不得丢条目");
+
+    for (int i = 0; i < count; i += 2) {
+      revealed.removePosition(WORLD, i & 15, i >> 4, i % 7);
+    }
+    assertEquals(count / 2, revealed.sizeFor(PLAYER, key), "注销后计数必须精确");
+    assertEquals(count / 2, revealed.positionCount());
+    for (int i = 0; i < count; i++) {
+      assertEquals((i & 1) == 1, revealed.contains(PLAYER, key, i & 15, i >> 4, i % 7),
+          "删除不得破坏同簇其它条目的可达性：i=" + i);
+    }
+  }
+
+  /**
+   * 并发读写：多条线程同时标记 + 立即读取。标记与读取都在同一条目锁内，因此「标记后立刻读」必须成立；
+   * 结束后每条坐标恰好登记一次（去重 + 并发写入不丢条目）。
+   */
+  @Test
+  void concurrentMarksAndReadsKeepEveryEntry() throws Exception {
+    RevealedSet revealed = revealed(1 << 20, 600 * SECOND_NANOS);
+    ChunkKey key = chunk(0, 0);
+    int threads = 4;
+    int perThread = 400;
+    ExecutorService pool = Executors.newFixedThreadPool(threads);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    CountDownLatch start = new CountDownLatch(1);
+    CountDownLatch done = new CountDownLatch(threads);
+    try {
+      for (int t = 0; t < threads; t++) {
+        int base = t * perThread;
+        pool.execute(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < perThread; i++) {
+              int v = base + i;
+              revealed.mark(PLAYER, key, v & 15, v >> 4, 0);
+              assertTrue(revealed.contains(PLAYER, key, v & 15, v >> 4, 0),
+                  "同线程内标记后必须立即可见：v=" + v);
+            }
+          } catch (Throwable throwable) {
+            failure.compareAndSet(null, throwable);
+          } finally {
+            done.countDown();
+          }
+        });
+      }
+      start.countDown();
+      assertTrue(done.await(30, TimeUnit.SECONDS), "并发标记必须在超时内完成");
+    } finally {
+      pool.shutdownNow();
+    }
+
+    assertNull(failure.get(), "并发标记/读取不得抛异常：" + failure.get());
+    assertEquals(threads * perThread, revealed.sizeFor(PLAYER, key),
+        "并发写入的每条坐标都必须登记且仅一次");
+    for (int v = 0; v < threads * perThread; v++) {
+      assertTrue(revealed.contains(PLAYER, key, v & 15, v >> 4, 0), "v=" + v);
+    }
   }
 }

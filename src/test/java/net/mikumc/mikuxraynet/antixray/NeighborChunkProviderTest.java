@@ -7,11 +7,14 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider.ChunkLoadedCheck;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider.ColumnTopQuery;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider.OcclusionQuery;
+import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider.SideSnapshot;
 import net.mikumc.mikuxraynet.antixray.NeighborEdges.Side;
 import org.junit.jupiter.api.Test;
 
@@ -212,6 +215,49 @@ class NeighborChunkProviderTest {
     assertArrayEquals(NeighborChunkProvider.capturePlane(0, HEIGHT, Side.Z_PLUS, 4, 7, QUERY, UNBOUNDED),
         plane, "退回全高度后结果必须与旧行为一致");
     assertEquals(16 * HEIGHT, reads.get(), "退回后逐格读完整个高度");
+  }
+
+  /**
+   * 快照来源（{@code ChunkSnapshot} 路径）的坐标换算：贴边层必须读邻块「区块内」对应的那一列
+   * （X_PLUS → localX=0、X_MINUS → localX=15、Z_PLUS → localZ=0、Z_MINUS → localZ=15），
+   * 且结果与「直接按世界坐标查询」逐位一致——这是把逐格世界读取换成邻块快照后最容易写错的地方。
+   */
+  @Test
+  void sideSnapshotIsReadAtNeighborLocalCoordinates() {
+    // 位置相关（不只是 y）的遮挡函数：若世界坐标→区块内坐标换算写错，结果就会与期望不一致
+    OcclusionQuery band = (x, y, z) -> y >= 20 && ((x + z) & 1) == 0;
+    for (Side side : Side.values()) {
+      int[] neighbor = NeighborChunkProvider.neighborChunk(side, 4, 7);
+      int originX = neighbor[0] << 4;
+      int originZ = neighbor[1] << 4;
+      Set<Integer> localXs = new HashSet<>();
+      Set<Integer> localZs = new HashSet<>();
+      SideSnapshot stub = new SideSnapshot() {
+        @Override
+        public boolean isOccluding(int localX, int localY, int localZ) {
+          localXs.add(localX);
+          localZs.add(localZ);
+          return band.isOccluding(originX + localX, localY, originZ + localZ);
+        }
+
+        @Override
+        public int highestBlockY(int localX, int localZ) {
+          return 25;
+        }
+      };
+
+      long[] fromSnapshot = NeighborChunkProvider.captureSideFromSnapshot(
+          0, HEIGHT, side, 4, 7, neighbor[0], neighbor[1], stub);
+      long[] expected = NeighborChunkProvider.capturePlane(0, HEIGHT, side, 4, 7, band, (x, z) -> 25);
+
+      assertArrayEquals(expected, fromSnapshot, "快照路径必须与按世界坐标查询逐位一致：side=" + side);
+      switch (side) {
+        case X_PLUS -> assertEquals(Set.of(0), localXs, "X_PLUS 侧只读邻块 localX=0");
+        case X_MINUS -> assertEquals(Set.of(15), localXs, "X_MINUS 侧只读邻块 localX=15");
+        case Z_PLUS -> assertEquals(Set.of(0), localZs, "Z_PLUS 侧只读邻块 localZ=0");
+        case Z_MINUS -> assertEquals(Set.of(15), localZs, "Z_MINUS 侧只读邻块 localZ=15");
+      }
+    }
   }
 
   /** 整列为空的列（上界在世界最低高度之下）一位都不读。 */

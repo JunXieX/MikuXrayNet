@@ -3,7 +3,7 @@ package net.mikumc.mikuxraynet.antixray;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.function.LongSupplier;
-import org.bukkit.HeightMap;
+import org.bukkit.ChunkSnapshot;
 import org.bukkit.World;
 
 /**
@@ -17,11 +17,16 @@ import org.bukkit.World;
  * 区域线程调用；{@link #cached(String, int, int)} 与返回的 {@link NeighborEdges} 是纯数据，可在工作线程
  * 任意读取。本类不持有 World / Chunk / Player 引用（键只有世界名与两个整数），世界卸载时整体失效即可。
  *
- * <p><b>按列高度上界裁剪扫描</b>：每列先问一次 {@code World#getHighestBlockYAt(x, z, HeightMap.WORLD_SURFACE)}
- * （该列<b>最高非空气方块</b>的 Y），只读到那一格为止——上界之上必是空气、必不遮挡，位保持 0，
- * 与逐格读的结果<b>逐格等价</b>。主世界 384 高度里通常只有下半部分有方块，这一步省掉大部分读取
- * （见 {@link #capturePlane} 的说明与 {@code antixray.yml} 中 {@code neighbors} 段的代价标注）。
- * 上界查询本身极便宜（直接读区块的高度图数组），失败时该列退回全高度扫描，只损失优化、不改变结果。
+ * <p><b>一次抓取、稳定读取</b>：生产路径先用 {@code Chunk#getChunkSnapshot(true,false,false)} 把每个邻块
+ * 抓成一份快照（一次复制该区块的方块数据与高度图），随后所有逐格读取都走快照的区块内数组查询——
+ * 不再经世界→区块解析（遮挡判定仍用 {@code BlockData#isOccluding()}，与旧实现逐格等价）。快照只在本
+ * 方法内短暂存活，不进入缓存，抓取逻辑仍可离线构造桩验证（见 {@link SideSnapshot}）。
+ *
+ * <p><b>按列高度上界裁剪扫描</b>：每列先问一次该列的「最高非空气方块」Y（生产实现直接读快照自带
+ * 高度图 {@code ChunkSnapshot#getHighestBlockYAt}），只读到那一格为止——上界之上必是空气、必不遮挡，
+ * 位保持 0，与逐格读的结果<b>逐格等价</b>。主世界 384 高度里通常只有下半部分有方块，这一步省掉大部分
+ * 读取（见 {@link #capturePlane} 的说明与 {@code antixray.yml} 中 {@code neighbors} 段的代价标注）。
+ * 上界查询本身极便宜，失败时该列退回全高度扫描，只损失优化、不改变结果。
  *
  * <p><b>容量与过期</b>：LRU 有界缓存，键为 {@code (世界名, chunkX, chunkZ)}；每格只占 1 bit，
  * 故每条约 {@code 4 × 16 × 世界高度 / 8} 字节 = {@code 4 × 高度 / 2} 字节
@@ -50,13 +55,25 @@ public final class NeighborChunkProvider {
   /**
    * 列高度上界查询：返回该列<b>最高非空气方块</b>的 Y（该列在世界上界内没有方块时返回世界最低 Y 之下）。
    *
-   * <p>生产实现为 {@code World#getHighestBlockYAt(x, z, HeightMap.WORLD_SURFACE)}（直接读区块高度图数组，
-   * 不做逐格扫描）；单测可注入假实现。语义要求只有一条：<b>返回值的上方不许再出现非空气方块</b>——
-   * 上界之上必为空气，也就必不遮挡。
+   * <p>生产实现读邻块快照自带的高度图（{@code ChunkSnapshot#getHighestBlockYAt}，直接读高度图数组，
+ * 不做逐格扫描）；单测可注入假实现。语义要求只有一条：<b>返回值的上方不许再出现非空气方块</b>——
+ * 上界之上必为空气，也就必不遮挡。
    */
   @FunctionalInterface
   interface ColumnTopQuery {
     int topNonAirY(int x, int z);
+  }
+
+  /**
+   * 邻块贴边数据来源：生产实现包一层 {@link ChunkSnapshot}（区块内坐标，一次抓取、稳定读取），
+   * 单测可注入桩以离线验证「世界坐标 → 邻块区块内坐标」的换算。
+   */
+  interface SideSnapshot {
+    /** 区块内坐标（localX 0..15、localY 0..世界高度-1、localZ 0..15）的方块是否完全遮挡。 */
+    boolean isOccluding(int localX, int localY, int localZ);
+
+    /** 区块内列 (localX, localZ) 的最高非空气方块的世界 Y（快照自带高度图）。 */
+    int highestBlockY(int localX, int localZ);
   }
 
   private static final int SIDE_LENGTH = 16;
@@ -138,9 +155,75 @@ public final class NeighborChunkProvider {
 
     int baseY = world.getMinHeight();
     int height = Math.max(SIDE_LENGTH, world.getMaxHeight() - baseY);
-    return capture(worldName, baseY, height, chunkX, chunkZ, world::isChunkLoaded,
-        (x, y, z) -> world.getBlockData(x, y, z).isOccluding(),
-        (x, z) -> world.getHighestBlockYAt(x, z, HeightMap.WORLD_SURFACE));
+    NeighborEdges edges = new NeighborEdges(height,
+        captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.X_MINUS),
+        captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.X_PLUS),
+        captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_MINUS),
+        captureSideFromWorld(world, baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_PLUS));
+    putCache(worldName, chunkX, chunkZ, edges);
+    return edges;
+  }
+
+  /**
+   * 抓取一侧邻块（生产路径）。
+   *
+   * <p><b>为什么改用 {@code Chunk#getChunkSnapshot}</b>：旧实现对贴边层逐格调用
+   * {@code World#getBlockData(x,y,z).isOccluding()}——每次都要经世界→区块解析、并新建一个
+   * {@code BlockData} 快照对象；贴边层在真实地形下常有上千次读取。改为先把邻块抓成一份
+   * {@link ChunkSnapshot}（<b>一次</b>复制该区块的方块数据与高度图），随后所有读取都走快照的
+   * 区块内数组查询：不再经世界→区块解析，且整层来自同一时刻的一致副本（不会边读边被方块变更改动）。
+   *
+   * <p><b>内存</b>：快照只在本方法内短暂存活（抓完即弃），不进入缓存——缓存里仍只有按位打包的
+   * {@code long[]} 平面（每条约 {@code 4×16×高度/8} 字节）。因此峰值内存是一次快照的大小，与旧实现的
+   * 「同时最多一个 BlockData」相比更高，但换取的是读取次数的显著下降（抓取仅在 {@code mode=enclosed}
+   * 世界发生，且有 30 秒 TTL 缓存兜底）。
+   *
+   * <p><b>遮挡判定仍走 {@code BlockData#isOccluding()}</b>（与旧实现逐格等价）。刻意不用
+   * {@code Material#isOccluding()}：新版 Paper 上它会经注册表解析出 BlockType，既依赖服务端运行时，
+   * 也不保证与方块状态级判定完全一致——语义等价优先。
+   */
+  private long[] captureSideFromWorld(World world, int baseY, int height, int chunkX, int chunkZ,
+      NeighborEdges.Side side) {
+    try {
+      int[] neighbor = neighborChunk(side, chunkX, chunkZ);
+      if (!world.isChunkLoaded(neighbor[0], neighbor[1])) {
+        return null;
+      }
+      // includeMaxBlockY=true 才能用快照自带高度图做「按列裁剪」（等价于旧 World#getHighestBlockYAt）
+      ChunkSnapshot snapshot = world.getChunkAt(neighbor[0], neighbor[1])
+          .getChunkSnapshot(true, false, false);
+      return captureSideFromSnapshot(baseY, height, side, chunkX, chunkZ, neighbor[0], neighbor[1],
+          new SideSnapshot() {
+            @Override
+            public boolean isOccluding(int localX, int localY, int localZ) {
+              return snapshot.getBlockData(localX, localY, localZ).isOccluding();
+            }
+
+            @Override
+            public int highestBlockY(int localX, int localZ) {
+              return snapshot.getHighestBlockYAt(localX, localZ);
+            }
+          });
+    } catch (Throwable throwable) {
+      // Folia 跨区域访问、世界卸载等：一律按缺失处理，交由缺失策略决定（默认 hide，不留泄漏）
+      return null;
+    }
+  }
+
+  /**
+   * 从「邻块区块内坐标」的贴边数据来源抓取一侧平面（纯逻辑，不触碰 Bukkit；单测可注入桩）。
+   *
+   * <p>把 {@link #capturePlane} 需要的「世界坐标查询」映射为快照的区块内坐标：世界 x/z 减去邻块原点
+   * 得到 localX/localZ，世界 y 减去 {@code baseY} 得到快照的 y 索引。列高度上界由快照高度图直接给出
+   * （已是世界 Y，与 {@link ColumnTopQuery} 的契约一致）。
+   */
+  static long[] captureSideFromSnapshot(int baseY, int height, NeighborEdges.Side side,
+      int chunkX, int chunkZ, int neighborChunkX, int neighborChunkZ, SideSnapshot snapshot) {
+    int originX = neighborChunkX << 4;
+    int originZ = neighborChunkZ << 4;
+    return capturePlane(baseY, height, side, chunkX, chunkZ,
+        (x, y, z) -> snapshot.isOccluding(x - originX, y - baseY, z - originZ),
+        (x, z) -> snapshot.highestBlockY(x - originX, z - originZ));
   }
 
   /**
@@ -165,14 +248,22 @@ public final class NeighborChunkProvider {
         captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_MINUS, chunkLoaded, query, columnTop),
         captureSide(baseY, height, chunkX, chunkZ, NeighborEdges.Side.Z_PLUS, chunkLoaded, query, columnTop));
 
-    // 写入时刻起算 TTL：缓存不能永久持有陈旧（含 null 平面）的快照，到期后重抓。
+    putCache(worldName, chunkX, chunkZ, edges);
+    return edges;
+  }
+
+  /**
+   * 写入缓存：TTL 从写入时刻起算。
+   *
+   * <p>缓存不能永久持有陈旧（含 null 平面）的快照，到期后重抓——见类注释的 TTL 说明。
+   */
+  private void putCache(String worldName, int chunkX, int chunkZ, NeighborEdges edges) {
     long expiresAt = cacheTtlNanos <= 0L
         ? Long.MAX_VALUE
         : nanoClock.getAsLong() + cacheTtlNanos;
     synchronized (cache) {
       cache.put(new ChunkKey(worldName, chunkX, chunkZ), new CacheEntry(edges, expiresAt));
     }
-    return edges;
   }
 
   private long[] captureSide(int baseY, int height, int chunkX, int chunkZ, NeighborEdges.Side side,
@@ -192,11 +283,10 @@ public final class NeighborChunkProvider {
   /**
    * 抓取请求方某一侧的贴边层（纯逻辑；坐标换算见 {@link #worldPosition}）。
    *
-   * <p><b>按列高度上界裁剪</b>：每列先问一次 {@link ColumnTopQuery}（生产实现 =
-   * {@code World#getHighestBlockYAt(x, z, HeightMap.WORLD_SURFACE)}），只读到「该列最高非空气方块」
+   * <p><b>按列高度上界裁剪</b>：每列先问一次 {@link ColumnTopQuery}（生产实现读邻块快照自带的高度图
+   * {@code ChunkSnapshot#getHighestBlockYAt}），只读到「该列最高非空气方块」
    * 那一格为止（<b>含</b>该格）。裁掉的那些格子必是空气、必不遮挡，位保持 0，因此平面内容与
-   * 「全高度逐格读」逐格等价；主世界 384 高度里通常只有下半部分有方块，于是省掉大部分
-   * {@code world.getBlockData(...)} 调用（实测单次约 31.6 ns，见项目记忆的 P3 测量）。
+   * 「全高度逐格读」逐格等价；主世界 384 高度里通常只有下半部分有方块，于是省掉大部分快照读取。
    *
    * @return 位打包的遮挡平面（长度为 {@code ceil(height × 16 / 64)}），位下标为 {@code y << 4 | localOther}
    */

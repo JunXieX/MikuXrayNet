@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -23,6 +24,7 @@ import java.util.zip.Deflater;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -36,6 +38,12 @@ import org.junit.jupiter.api.io.TempDir;
  * 「看不到 zstd」的场景用平台类加载器（不含应用类路径）来构造。
  */
 class ZstdSupportTest {
+
+  /** 每个用例前复位 ZstdSupport 的启动期静态状态（initialize 已改为幂等，需隔离）。 */
+  @BeforeEach
+  void resetZstdState() {
+    ZstdSupport.resetForTest();
+  }
 
   private static byte[] payload(int length) {
     byte[] data = new byte[length];
@@ -305,6 +313,33 @@ class ZstdSupportTest {
     assertFalse(Files.exists(libDir.resolve(
         ZstdSupport.jarFileName(ZstdSupport.ARTIFACT, ZstdSupport.VERSION))),
         "①命中后不得发起下载（lib 目录必须为空）");
+  }
+
+  /** 幂等：重复调用 {@code initialize} 不得重复下载、不得重复打印任何提示。 */
+  @Test
+  void repeatedInitializeDoesNotRepeatDownloadsOrPrompts(@TempDir Path libDir) throws Exception {
+    RecordingLogger logger = new RecordingLogger();
+
+    ZstdSupport.initialize(libDir, true, "http://127.0.0.1:1/", 1, logger);
+    int linesAfterFirst = logger.lines.size();
+
+    ZstdSupport.initialize(libDir, true, "http://127.0.0.1:1/", 1, logger);
+
+    assertEquals(linesAfterFirst, logger.lines.size(),
+        "重复调用 initialize 必须幂等：不重复下载、不重复提示");
+    try (var entries = Files.list(libDir)) {
+      assertTrue(entries.findAny().isEmpty(), "重复调用不得产生任何下载文件");
+    }
+  }
+
+  /** SHA-256 摘要必须与标准实现一致（用于自动下载的完整性校验）。 */
+  @Test
+  void sha256HexMatchesKnownDigest(@TempDir Path dir) throws Exception {
+    Path file = dir.resolve("payload.bin");
+    Files.write(file, "abc".getBytes(StandardCharsets.US_ASCII));
+
+    assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ZstdSupport.sha256Hex(file), "SHA-256 摘要必须与标准实现一致");
   }
 
   // ------------------------------------------------------------------ ③ 下载失败 / 超时

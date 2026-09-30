@@ -32,6 +32,19 @@ public class IndirectPalette implements Palette {
     this.byId = new int[1 << bitsPerValue];
   }
 
+  /*
+   * 8 位调色板的容量取舍（有意为之，勿「顺手修正」）：
+   * byValue 是复用自 ChunkScratch 的 byte[]（32 KB 级，每线程复用，避免每个 section 新建反查表），
+   * 其 0xFF 被用作「未登记」哨兵。byte 只能表示 0..255，因此无法同时表达哨兵与 id=255：
+   * idFor() 在 id 达到 0xFF 时即 grow()。净效果是 bitsPerValue 为 4~8 的间接调色板实际可容纳
+   * (1 << bitsPerValue) - 1 项（8 位为 255 项而非原版理论上限 256 项），即比原版早一档从
+   * 8 位间接升到 direct——受影响的阈值是「写入第 256 个不同方块状态时（而非第 257 个）触发
+   * grow(9) 切到 direct」。读取不受影响：read() 允许 size 到 byId.length（8 位即 256，原版可能
+   * 产出该形态）。不改的直接原因：要容纳 256 项必须把 byValue 换成 short[]/int[] 以留出独立哨兵值，
+   * 反查表内存将增大 2~4 倍，且「256 项时是否升位」会改变既有区块的输出字节（格式/往返语义变化）。
+   * 按「等价优先」原则保留现状并在此显式记录取舍。
+   */
+
   @Override
   public int idFor(int value) {
     int id = this.byValue[value] & 0xFF;
@@ -71,6 +84,14 @@ public class IndirectPalette implements Palette {
       if (value < 0 || value >= this.byValue.length) {
         throw new IndexOutOfBoundsException(
             "block state id out of range: " + value + " (registry " + this.byValue.length + ")");
+      }
+      // 同一调色板里不允许重复的方块状态值：合法数据由写入端按「首次出现顺序」去重，重复即数据损坏。
+      // 若不在此拦截，后写入的 id 会覆盖 byValue 反查记录，使同一方块状态对应两个索引——后续
+      // valueFor(idFor(v)) 可能返回另一个 id，导致本地索引与调色板不一致（静默改写语义）。按 fail-open
+      // 约定在此早失败：异常由上层解码兜底，本 section 被拒绝、封包链路不受影响。
+      if ((this.byValue[value] & 0xFF) != 0xFF) {
+        throw new IndexOutOfBoundsException(
+            "duplicate palette value: " + value + " at id " + id);
       }
       this.byId[id] = value;
       this.byValue[value] = (byte) id;

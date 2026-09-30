@@ -1,14 +1,19 @@
 package net.mikumc.mikuxraynet.util;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.File;
+import java.nio.file.Path;
 import java.util.List;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * 状态/转储文本格式化：给定固定计数器，断言输出包含关键字段且格式稳定。
@@ -236,5 +241,47 @@ class DiagnosticsTest {
     String moduleOff = String.join("\n",
         Diagnostics.formatStatus(fixed(bandwidth("palette:\n  enabled: false\n"))));
     assertTrue(moduleOff.contains("调色板重排 关闭（模块未启用，不做任何重排）"), moduleOff);
+  }
+
+  /**
+   * 转储文件名必须带毫秒且同名时追加序号：旧实现用秒级时间戳，同一秒内的两次 dump 会互相覆盖，
+   * 直接毁掉「前后对照」这类排查证据。
+   */
+  @Test
+  void dumpFileNameNeverCollidesWithinSameStamp(@TempDir Path dir) throws Exception {
+    String stamp = "20260924-120000-123";
+    File first = Diagnostics.newDumpFile(dir.toFile(), stamp);
+    assertTrue(first.createNewFile(), "首份转储能创建");
+    assertEquals("dump-" + stamp + ".txt", first.getName(), "文件名格式为 dump-<时间戳>.txt");
+
+    File second = Diagnostics.newDumpFile(dir.toFile(), stamp);
+    assertNotEquals(first.getName(), second.getName(), "同一时间戳的第二次转储必须换名，绝不覆盖已有文件");
+    assertTrue(second.createNewFile(), "第二次转储同样能创建（不撞名）");
+  }
+
+  /** 转储保留上限：超出后按修改时间删除最旧的，且绝不碰非 dump 文件。 */
+  @Test
+  void dumpsArePrunedToRetentionLimit(@TempDir Path dir) throws Exception {
+    for (int i = 0; i < 25; i++) {
+      File file = new File(dir.toFile(),
+          "dump-20260924-1200" + String.format("%02d", i) + "-000.txt");
+      assertTrue(file.createNewFile());
+      assertTrue(file.setLastModified(1_000_000L + i * 1000L), "测试依赖可设置修改时间");
+    }
+    File unrelated = new File(dir.toFile(), "notes.txt");
+    assertTrue(unrelated.createNewFile());
+
+    int removed = Diagnostics.pruneOldDumps(dir.toFile(), 10);
+
+    assertEquals(15, removed, "应删除最旧的 15 份");
+    File[] remaining = dir.toFile().listFiles((d, name) -> name.startsWith("dump-"));
+    assertEquals(10, remaining.length, "保留份数必须等于上限");
+    for (File file : remaining) {
+      assertTrue(file.lastModified() >= 1_015_000L, "保留的必须是最新的 10 份：" + file.getName());
+    }
+    assertTrue(unrelated.isFile(), "非 dump 文件不得被清理");
+
+    // 未超上限时不做任何删除
+    assertEquals(0, Diagnostics.pruneOldDumps(dir.toFile(), 20), "未超上限时不应删除");
   }
 }

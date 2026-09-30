@@ -33,6 +33,8 @@ public final class MikuConfig {
   private final AtomicBoolean antiXrayFallbackWarned = new AtomicBoolean();
   /** 「带宽配置解析失败已保留上一份/改用默认」WARN 的进程级一次性闸门。 */
   private final AtomicBoolean bandwidthFallbackWarned = new AtomicBoolean();
+  /** 「带宽配置项超过安全上限被钳制」WARN 的进程级一次性闸门。 */
+  private final AtomicBoolean bandwidthClampWarned = new AtomicBoolean();
 
   private volatile AntiXrayConfig antiXray;
   private volatile BandwidthConfig bandwidth;
@@ -79,6 +81,8 @@ public final class MikuConfig {
       logger.warning("配置里的 tag(...) 无法识别（不在内置 tag 映射表中），对应条目已忽略："
           + loadedAntiXray.unresolvedTags());
     }
+    // 配置项超过安全上限（失控值）时按上限生效并一次性提示，绝不静默改用户配置
+    loadedBandwidth.warnIfClampApplied(logger, bandwidthClampWarned);
     logger.info("带宽配置已加载：总开关 " + (loadedBandwidth.enabled() ? "开启" : "关闭"));
   }
 

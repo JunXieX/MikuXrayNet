@@ -123,8 +123,15 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   private final AtomicInteger errorCounter = new AtomicInteger();
   /** 「位置快照不可用 → 近身判定一律立即放行」的一次性提示闸。 */
   private final AtomicBoolean snapshotFailOpenNoticed = new AtomicBoolean();
-  /** 启动期「方块数据契约探测」只做一次（重复 start 不重复探测/刷屏）。 */
-  private final AtomicBoolean blockDataProbeDone = new AtomicBoolean();
+  /**
+   * 「方块数据契约探测」的<b>进程内</b>一次性闸门（{@code static}）。
+   *
+   * <p><b>为什么必须静态</b>：热重载会重建 {@link BlockChangeMerger} 实例，实例级闸门会被重置 →
+   * 每次 reload 都重新探测一遍 ProtocolLib 的静态契约、并（在失败时）重复刷屏同一条 WARN。
+   * 该契约在一个 JVM 进程内不会变（同一份 ProtocolLib/服务端类加载结果），因此探测结果天然可复用：
+   * 进程内只探测一次，reload 不重复探测、不重复告警。
+   */
+  private static final AtomicBoolean blockDataProbeDone = new AtomicBoolean();
 
   private volatile boolean verified;
   private AsyncListenerHandler handler;

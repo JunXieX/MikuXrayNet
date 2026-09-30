@@ -7,6 +7,8 @@ import java.nio.file.Files;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import net.mikumc.mikuxraynet.AntiXrayRuntime;
@@ -39,7 +41,22 @@ import org.bukkit.Bukkit;
  */
 public final class Diagnostics {
 
-  private static final DateTimeFormatter FILE_STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
+  /**
+   * 转储文件名/导出时间的时间戳格式。
+   *
+   * <p><b>为什么带毫秒</b>：旧实现只到秒，同一秒内连续执行两次 {@code dump} 会用同一个文件名，
+   * 后一次<b>静默覆盖</b>前一次——排查「连续两次 dump 对比」时证据就没了。加上毫秒后同秒不再撞名；
+   * 极端情况（同一毫秒两次、或系统时钟回拨）由 {@link #newDumpFile} 追加递增序号兜底，绝不覆盖。
+   */
+  private static final DateTimeFormatter FILE_STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS");
+
+  /**
+   * 转储文件的保留上限：目录里最多保留这么多份 {@code dump-*.txt}，超出后按修改时间删除最旧的。
+   *
+   * <p><b>为什么需要上限</b>：转储是排查工具、不是运行数据，长期反复执行会无限累积（每份几十 KB）。
+   * 取 20 份足以覆盖「近期多次排查」的对照需求，同时把目录占用限制在一个可预期的量级。
+   */
+  static final int MAX_DUMP_FILES = 20;
 
   /**
    * 全部指标与配置的不可变快照（测试可构造固定值断言格式）。
@@ -179,16 +196,60 @@ public final class Diagnostics {
     return formatDump(snapshot(), timestamp);
   }
 
-  /** 生成并写入转储文件，返回文件对象（目录不存在会自动创建）。 */
+  /** 生成并写入转储文件，返回文件对象（目录不存在会自动创建；超出保留上限时清理最旧的转储）。 */
   public File writeDump() throws IOException {
     String stamp = LocalDateTime.now().format(FILE_STAMP);
     File folder = plugin.getDataFolder();
     if (!folder.isDirectory() && !folder.mkdirs() && !folder.isDirectory()) {
       throw new IOException("无法创建数据目录：" + folder.getAbsolutePath());
     }
-    File file = new File(folder, "dump-" + stamp + ".txt");
+    File file = newDumpFile(folder, stamp);
     Files.writeString(file.toPath(), dumpText(stamp), StandardCharsets.UTF_8);
+    int removed = pruneOldDumps(folder, MAX_DUMP_FILES);
+    if (removed > 0) {
+      // 只做一次 INFO：清理是正常行为，不需要 WARN 级别的噪音
+      plugin.getLogger().info("诊断转储保留最近 " + MAX_DUMP_FILES + " 份，已清理最旧的 " + removed + " 份");
+    }
     return file;
+  }
+
+  /**
+   * 生成本次转储的文件对象（不写入），文件名形如 {@code dump-<stamp>.txt}。
+   *
+   * <p>同名已存在时追加 {@code -1}、{@code -2}… 直到不冲突：毫秒戳已基本消除同秒撞名，这里是兜底，
+   * 保证任何情况下都<b>不会覆盖</b>已有转储。
+   */
+  static File newDumpFile(File folder, String stamp) {
+    File file = new File(folder, "dump-" + stamp + ".txt");
+    int suffix = 1;
+    while (file.exists()) {
+      file = new File(folder, "dump-" + stamp + "-" + suffix++ + ".txt");
+    }
+    return file;
+  }
+
+  /**
+   * 把目录里的 {@code dump-*.txt} 控制在 {@code keep} 份以内，按修改时间删除最旧的。
+   *
+   * <p>fail-open：只处理本插件命名的转储文件（不碰其它文件），删除失败也不抛异常（最多晚一轮再清）。
+   *
+   * @return 实际删除的份数
+   */
+  static int pruneOldDumps(File folder, int keep) {
+    int limit = Math.max(1, keep);
+    File[] dumps = folder.listFiles(
+        (dir, name) -> name.startsWith("dump-") && name.endsWith(".txt"));
+    if (dumps == null || dumps.length <= limit) {
+      return 0;
+    }
+    Arrays.sort(dumps, Comparator.comparingLong(File::lastModified).thenComparing(File::getName));
+    int removed = 0;
+    for (int i = 0; i < dumps.length - limit; i++) {
+      if (dumps[i].delete()) {
+        removed++;
+      }
+    }
+    return removed;
   }
 
   /** 从插件各模块拉取一次实时快照；任何缺失模块按 0 / 未启用处理（各组空对象兜底）。 */
