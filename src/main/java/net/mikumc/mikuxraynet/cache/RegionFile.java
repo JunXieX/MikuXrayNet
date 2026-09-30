@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -65,11 +66,18 @@ final class RegionFile implements AutoCloseable {
 
   private FileChannel channel;
   /**
-   * 跨进程排他锁（best-effort）：持有强引用以防 {@link FileLock} 被 GC 而提前释放；
+   * 跨进程排他锁：持有强引用以防 {@link FileLock} 被 GC 而提前释放；
    * 通道关闭（close / compact 替换文件）时由 JVM 自动释放，故不做显式 release。
-   * 未取得锁时为 {@code null}（fail-open，见 {@link #acquireExclusiveLock()}）。
+   * 「同 JVM 自持」时不重复持锁，保持 {@code null}（见 {@link #acquireLock(java.nio.channels.FileChannel)}）。
    */
   private FileLock lock;
+  /**
+   * 跨进程锁被其它进程占用（{@code tryLock} 返回 null 或抛异常）时置 true：本实例对该文件
+   * <b>读写全部停用</b>——读一律视为未命中、写一律跳过，只打一次性中文 WARN。
+   * <p>这是「两个服务端实例共享同一缓存目录」这一误配下的正确行为：既然锁不在本进程手里，
+   * 就不能再读写该文件，否则两个实例会互相踩（旧行为是「只 WARN 后照常读写」）。
+   */
+  private boolean lockUnavailable;
   private long fileSize;
   private long liveBytes;
   private long garbageBytes;
@@ -77,41 +85,74 @@ final class RegionFile implements AutoCloseable {
   private boolean closed;
 
   private RegionFile(Path path, FileChannel channel, int hashSeed, byte compression,
-      int bucketCacheSize) {
+      int bucketCacheSize, boolean lockUnavailable) {
     this.path = path;
     this.channel = channel;
     this.hashSeed = hashSeed;
     this.compression = compression;
     this.bucketCacheSize = Math.max(1, bucketCacheSize);
+    this.lockUnavailable = lockUnavailable;
+  }
+
+  /** 取锁结果：{@code lock} 为取得的锁（自持或占用时为 {@code null}）；{@code occupied} = 被其它进程占用。 */
+  private record LockHold(FileLock lock, boolean occupied) {
   }
 
   /**
-   * best-effort 取一个跨进程排他文件锁，让「两个服务端实例共享同一缓存目录」这一误配有迹可循。
+   * 尝试取跨进程排他文件锁，并把结果归为两类（<b>必须在读取文件内容之前调用</b>）。
    *
-   * <p><b>fail-open</b>：取不到锁一律不影响缓存读写与封包链路，只记一次中文 WARN 后以不加锁方式继续。
-   * 取不到的情形有三：① 其他进程已持有（{@code tryLock()} 返回 {@code null}）；② 同一 JVM 内重复加锁
-   * （{@code OverlappingFileLockException}）；③ 文件系统不支持锁。三种都按同一路径降级处理。
+   * <p><b>被占用（{@code occupied=true}）就停用本实例的读写</b>（见 {@link #lockUnavailable}），而不是旧
+   * 行为的「只 WARN 后照常读写」：「两个服务端实例共享同一缓存目录」时，锁在对方手里说明该文件此刻归
+   * 对方所有，本实例再去读写只会与对方互相踩。停用后读退化为未命中、写被跳过，交给上层回退重算，功能
+   * 毫发无损（fail-open）。
+   *
+   * <p><b>关键例外——同 JVM 自持</b>：{@code tryLock()} 抛 {@link OverlappingFileLockException} 表示锁
+   * 被<b>本 JVM 的另一个句柄</b>持有（reload / 重开时旧句柄尚未关闭，或并发开同一文件），这不是「另一个
+   * 服务端实例」。此时按<b>可用</b>处理且本实例不重复持锁，否则会把本进程自己的磁盘缓存永久停用。
+   * 判定依据：{@code FileLock} 的重叠检测在同一 JVM 内以文件为键，抛此异常即证明锁属于本进程；
+   * 跨进程占用只会让 {@code tryLock()} 返回 {@code null}。
    */
-  private void acquireExclusiveLock() {
+  private static LockHold acquireLock(FileChannel channel) {
+    Boolean override = lockOutcomeOverrideForTest;
+    if (override != null) {
+      // 测试注入（见 lockOutcomeOverrideForTest）：只替换「判定」，读写降级逻辑仍是生产代码
+      return new LockHold(null, !override); // true = 按自持（可用）；false = 按占用（停用）
+    }
     try {
       FileLock acquired = channel.tryLock();
-      if (acquired == null) {
-        warnLockUnavailableOnce();
-      } else {
-        this.lock = acquired;
-      }
+      return new LockHold(acquired, acquired == null);
     } catch (Throwable throwable) {
-      warnLockUnavailableOnce();
+      return new LockHold(null, !isSelfHeld(throwable));
     }
   }
 
-  /** 未取得文件锁的中文 WARN 只打一次（多文件被占用时不刷屏）。 */
+  /**
+   * 同 JVM 自持判定：只有 {@link OverlappingFileLockException} 表示锁被<b>本 JVM 的其它句柄</b>持有
+   * （{@code FileLock} 的重叠检测在同一 JVM 内以文件为键）；跨进程占用则表现为 {@code tryLock()} 返回
+   * {@code null}。此处单独成函数以便回归测试直接断言该映射。
+   */
+  static boolean isSelfHeld(Throwable throwable) {
+    return throwable instanceof OverlappingFileLockException;
+  }
+
+  /** 锁不可用的中文 WARN 只打一次（多文件被占用时不刷屏）。 */
   private static void warnLockUnavailableOnce() {
     if (LOCK_WARNING.compareAndSet(false, true)) {
-      LOGGER.warning("磁盘缓存区域文件已被其他进程占用，未能取得文件锁，本进程将以不加锁方式继续"
-          + "（fail-open，不影响封包链路）；请勿让两个服务端实例共享同一缓存目录");
+      LOGGER.warning("磁盘缓存区域文件已被其它进程占用，本实例对它的磁盘缓存已停用"
+          + "（读视为未命中、写被跳过，功能不受影响）；请勿让两个服务端实例共享同一缓存目录");
     }
   }
+
+  /**
+   * <b>仅测试用</b>：强制 {@link #acquireLock(FileChannel)} 的判定结果（{@code null} = 走真实
+   * {@code tryLock()}；{@code true} = 按「同 JVM 自持」；{@code false} = 按「被其它进程占用」）。
+   *
+   * <p><b>为什么必须注入</b>：本机（Windows）的 {@code FileLock} 是<b>强制锁</b>——同一 JVM 的另一
+   * 句柄持锁时，新句柄的读写会被操作系统直接拒绝（实测：「另一个程序已锁定文件的一部分，进程无法访问」），
+   * 因此无法用真实锁在同一进程内复现「自持」与「被占用」两种判定并完成读写。注入只替换「判定」本身，
+   * 读/写降级与提示仍是生产代码，测试因此是确定性的。
+   */
+  static volatile Boolean lockOutcomeOverrideForTest;
 
   /**
    * 打开（必要时创建）区域文件。
@@ -121,6 +162,18 @@ final class RegionFile implements AutoCloseable {
   static RegionFile open(Path path, int bucketCacheSize) throws IOException {
     FileChannel channel = FileChannel.open(path,
         StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+    // 先取锁、再读文件内容：被占用时立即停用，绝不尝试读取对方正在写的文件。
+    // 顺序很关键——Windows 的 FileLock 是强制锁，读被占用文件的区域会直接抛 IOException
+    //（实测「另一个程序已锁定文件的一部分」）；若先读头，open 会失败而不是优雅停用。
+    LockHold hold = acquireLock(channel);
+    if (hold.occupied()) {
+      warnLockUnavailableOnce();
+      // 停用态：不读头、不建索引，返回一个只在内存里的「空壳」句柄——后续 get 一律未命中、
+      // put/flush/compact 一律跳过（见各方法开头的判定），功能不受影响（fail-open）。
+      return new RegionFile(path, channel, BufferedLinearV3Format.DEFAULT_HASH_SEED,
+          BufferedLinearV3Format.currentCompression(), bucketCacheSize, true);
+    }
+
     int hashSeed = BufferedLinearV3Format.DEFAULT_HASH_SEED;
     byte compression = BufferedLinearV3Format.currentCompression();
     long size = channel.size();
@@ -142,10 +195,9 @@ final class RegionFile implements AutoCloseable {
       throw exception;
     }
 
-    RegionFile file = new RegionFile(path, channel, hashSeed, compression, bucketCacheSize);
-    // 尽早尝试取跨进程排他锁（fail-open）：两个服务端实例共享同一缓存目录时，让后到者知情，
-    // 而不是无声地互相踩。取不到锁不阻断任何读写（见 acquireExclusiveLock）。
-    file.acquireExclusiveLock();
+    RegionFile file = new RegionFile(path, channel, hashSeed, compression, bucketCacheSize, false);
+    // 已取得的锁必须持强引用（防止被 GC 提前释放）；「同 JVM 自持」时 hold.lock() 为 null（不重复持锁）。
+    file.lock = hold.lock();
     try {
       if (size <= 0L) {
         // 新建（或刚被清空）的文件：必须先落「文件头 + 全零偏移表」，
@@ -248,8 +300,12 @@ final class RegionFile implements AutoCloseable {
 
   // ------------------------------------------------------------------ 读
 
-  /** 读取一个区块的条目；不存在或损坏时为 {@code null}。 */
+  /** 读取一个区块的条目；不存在、损坏、或该文件已被其它进程占用时为 {@code null}。 */
   BufferedLinearV3Format.Entry get(int chunkIndex) {
+    if (lockUnavailable) {
+      // 该文件归其它进程所有：一律视为未命中，交给上层回退重算（fail-open）
+      return null;
+    }
     BufferedLinearV3Format.Entry[] bucketSlots = ensureLoaded(bucketIndex(chunkIndex));
     return bucketSlots == null ? null : bucketSlots[slotInBucket(chunkIndex)];
   }
@@ -262,6 +318,9 @@ final class RegionFile implements AutoCloseable {
    * @return true 表示覆盖了已有条目
    */
   boolean put(int chunkIndex, BufferedLinearV3Format.Entry entry) {
+    if (lockUnavailable) {
+      return false; // 该文件归其它进程所有：跳过写（不落盘、不报错），交给上层
+    }
     BufferedLinearV3Format.Entry[] bucketSlots = ensureLoaded(bucketIndex(chunkIndex));
     int slot = slotInBucket(chunkIndex);
     boolean replaced = bucketSlots[slot] != null;
@@ -272,6 +331,9 @@ final class RegionFile implements AutoCloseable {
 
   /** 清空一个区块的条目（惰性清理过期/旧代次条目时使用）。 */
   boolean clear(int chunkIndex) {
+    if (lockUnavailable) {
+      return false; // 该文件归其它进程所有：跳过（不落盘、不报错）
+    }
     BufferedLinearV3Format.Entry[] bucketSlots = ensureLoaded(bucketIndex(chunkIndex));
     int slot = slotInBucket(chunkIndex);
     if (bucketSlots[slot] == null) {
@@ -284,6 +346,9 @@ final class RegionFile implements AutoCloseable {
 
   /** 把所有脏 bucket 追加写入文件并回填偏移表；返回是否真的写过。 */
   boolean flushDirty() throws IOException {
+    if (lockUnavailable) {
+      return false; // 该文件归其它进程所有：跳过落盘（不报错）
+    }
     boolean wrote = false;
     for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
       if (dirty[bucket] && slots[bucket] != null) {
@@ -342,6 +407,9 @@ final class RegionFile implements AutoCloseable {
    * 可控的放大换掉高频整文件重写。
    */
   int compact(EntryFilter keep) throws IOException {
+    if (lockUnavailable) {
+      return 0; // 该文件归其它进程所有：跳过整文件重写（不落盘、不报错）
+    }
     compacting = true;
     try {
       BufferedLinearV3Format.Entry[][] all =
@@ -461,11 +529,23 @@ final class RegionFile implements AutoCloseable {
   }
 
   boolean isEmptyFile() {
+    if (lockUnavailable) {
+      // 该文件归其它进程所有：绝不能因「看起来空」而被本进程删除（那会毁掉对方的缓存）
+      return false;
+    }
     return liveBytes <= 0L && !isDirty();
   }
 
   Path path() {
     return path;
+  }
+
+  /**
+   * 该文件是否因跨进程锁被其它进程占用而被停用（读一律未命中、写一律跳过）。
+   * 供调用方跳过「写了但没落盘」的记账，避免白白耗尽条目额度（见 {@code DiskCacheStore#doPut}）。
+   */
+  boolean lockUnavailable() {
+    return lockUnavailable;
   }
 
   // ------------------------------------------------------------------ 关闭
@@ -524,11 +604,19 @@ final class RegionFile implements AutoCloseable {
     }
   }
 
-  /** 重新打开底层通道（{@link #compact} 用临时文件替换后调用），并重新尝试取文件锁。 */
+  /** 重新打开底层通道（{@link #compact} 用临时文件替换后调用），并重新取文件锁。 */
   private void reopenChannel() throws IOException {
     channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ,
         StandardOpenOption.WRITE);
-    acquireExclusiveLock();
+    LockHold hold = acquireLock(channel);
+    this.lock = hold.lock();
+    if (hold.occupied()) {
+      // 替换后（若还能替换成功）锁已被别的进程抢走：同样停用读写，避免与对方互相踩
+      this.lockUnavailable = true;
+      warnLockUnavailableOnce();
+    } else {
+      this.lockUnavailable = false;
+    }
   }
 
   /** 尽力删除一个文件；失败只忽略（临时文件删除失败不影响功能）。 */
@@ -606,6 +694,9 @@ final class RegionFile implements AutoCloseable {
    * <p>fail-open：单个 bucket 损坏只少计它自己（计数偏小只影响写入上限的保守度，不影响缓存读写）。
    */
   int countEntriesOnDisk() {
+    if (lockUnavailable) {
+      return 0; // 该文件归其它进程所有：不读它的内容，计为 0（计数偏小只影响上限保守度）
+    }
     int count = 0;
     for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
       if (positions[bucket] <= 0L) {

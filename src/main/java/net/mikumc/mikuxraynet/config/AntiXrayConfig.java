@@ -352,11 +352,13 @@ public final class AntiXrayConfig {
    * @param zstdAutoDownload           zstd 前置缺失时是否自动下载（默认 true）
    * @param zstdDownloadUrl            zstd 下载源根地址（默认 Maven Central；可换阿里云镜像）
    * @param zstdTimeoutSeconds         zstd 下载的总等待上限（秒；超时即失败并回退，默认 10）
+   * @param zstdSha256                 自动下载文件的期望 SHA-256（十六进制，已归一为小写）；
+   *                                   {@code ""} = 不校验（默认），非空则下载后校验，不匹配即拒绝使用该 jar
    */
   public record DiskCache(boolean enabled, int maxEntries, int maxFileSizeMb, int expireSeconds,
       int bucketCacheSize, int idleCloseSeconds, int maintenanceIntervalSeconds, int compactPerPass,
       int queueCapacity, boolean zstdAutoDownload, String zstdDownloadUrl,
-      int zstdTimeoutSeconds) {
+      int zstdTimeoutSeconds, String zstdSha256) {
   }
 
   /**
@@ -575,7 +577,9 @@ public final class AntiXrayConfig {
         OcclusionRules.sortedList(this.occlusion.extraOccluding()),
         OcclusionRules.sortedList(this.occlusion.extraNonOccluding()), this.occlusion.fluidCover(),
         // 黑名单决定「哪些世界完全不改写」，参与指纹：切换黑名单后旧缓存（该世界已改写结果）不再复用。
-        this.worldBlacklist);
+        this.worldBlacklist,
+        // zstd 下载校验哈希参与指纹（按任务要求）：切换它会让现存磁盘缓存一次性失效重建（属正常）。
+        this.diskCache.zstdSha256());
   }
 
   /** 把某覆盖段合并到某维度的生效值上（覆盖值优先，未覆盖回落维度值）。 */
@@ -622,6 +626,17 @@ public final class AntiXrayConfig {
   private static String zstdDownloadUrl(ConfigurationSection root) {
     String url = root.getString("disk-cache.zstd.download-url", DEFAULT_ZSTD_DOWNLOAD_URL);
     return url == null || url.isBlank() ? DEFAULT_ZSTD_DOWNLOAD_URL : url.trim();
+  }
+
+  /**
+   * zstd 下载文件的期望 SHA-256：缺失/空白 → {@code ""}（不校验）。
+   *
+   * <p>归一为小写：SHA-256 的十六进制摘要大小写不敏感（比较用 {@code equalsIgnoreCase}），
+   * 统一小写可避免「仅大小写不同」的两份配置算出不同指纹（指纹要求「哈希有规范定义」，见构造期说明）。
+   */
+  private static String zstdSha256(ConfigurationSection root) {
+    String hash = root.getString("disk-cache.zstd-sha256", "");
+    return hash == null ? "" : hash.trim().toLowerCase(Locale.ROOT);
   }
 
   /** 从配置根节点解析。 */
@@ -724,10 +739,12 @@ public final class AntiXrayConfig {
             Math.max(1, root.getInt("disk-cache.maintenance-interval-seconds", 30)),
             Math.max(1, root.getInt("disk-cache.compact-per-pass", 4)),
             Math.max(1, root.getInt("disk-cache.queue-capacity", 256)),
-            // zstd 前置：服务端自带则直接用；没有则按这三键决定是否自动下载（见 ZstdSupport）
+            // zstd 前置：服务端自带则直接用；没有则按这几键决定是否自动下载与校验（见 ZstdSupport）
             root.getBoolean("disk-cache.zstd.auto-download", true),
             zstdDownloadUrl(root),
-            Math.max(1, root.getInt("disk-cache.zstd.timeout-seconds", 10))),
+            Math.max(1, root.getInt("disk-cache.zstd.timeout-seconds", 10)),
+            // 下载文件的期望 SHA-256：留空 = 不校验（默认）
+            zstdSha256(root)),
         PlatformSupport.Mode.parse(root.getString("advanced.platform", "auto")),
         // 未配置时的内置兜底必须与打包 antixray.yml 的默认值保持一致（有单测对照）
         root.getInt("cache.maximum-size", 40960),

@@ -135,7 +135,7 @@ public final class AntiXrayRuntime {
     if (diskCacheConfig.enabled()) {
       ZstdSupport.initialize(new File(plugin.getDataFolder(), "lib").toPath(),
           diskCacheConfig.zstdAutoDownload(), diskCacheConfig.zstdDownloadUrl(),
-          diskCacheConfig.zstdTimeoutSeconds(), logger);
+          diskCacheConfig.zstdSha256(), diskCacheConfig.zstdTimeoutSeconds(), logger);
       diskCache = new DiskCacheStore(new File(plugin.getDataFolder(), "cache").toPath(),
           diskCacheConfig, logger);
     }

@@ -8,7 +8,10 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.sun.net.httpserver.HttpServer;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -82,6 +85,27 @@ class ZstdSupportTest {
       throw new IllegalStateException("测试用 YAML 不合法", exception);
     }
     return configuration;
+  }
+
+  /** 起一个只服务根路径的本地 HTTP 服务（回环地址 + 随机端口），用于确定性验证下载（不依赖外网）。 */
+  private static HttpServer serve(byte[] body) throws IOException {
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext("/", exchange -> {
+      try {
+        exchange.sendResponseHeaders(200, body.length);
+        try (var out = exchange.getResponseBody()) {
+          out.write(body);
+        }
+      } finally {
+        exchange.close();
+      }
+    });
+    server.start();
+    return server;
+  }
+
+  private static String baseUrlOf(HttpServer server) {
+    return "http://127.0.0.1:" + server.getAddress().getPort();
   }
 
   /** 收集日志行的测试用 Logger（不向父级传播，避免刷屏）。 */
@@ -395,7 +419,52 @@ class ZstdSupportTest {
         "必须使用独立类加载器（服务端没有该前置时不能依赖父层）");
   }
 
-  // ------------------------------------------------------------------ ④ 配置键
+  // ------------------------------------------------------------------ ④ 下载完整性校验（期望 SHA-256）
+
+  /**
+   * 键非空且实际摘要不符 → <b>拒绝该 jar 并回退</b>：返回 null、不落盘（含 .tmp 残留）、不抛异常。
+   *
+   * <p>用本地回环 HTTP 服务提供内容（非外网），因此下载本身成功；被拒绝的唯一原因就是摘要不符。
+   */
+  @Test
+  void sha256MismatchRejectsDownloadedJarAndFallsBack(@TempDir Path libDir) throws Exception {
+    byte[] body = "not-the-real-jar".getBytes(StandardCharsets.US_ASCII);
+    HttpServer server = serve(body);
+    try {
+      ZstdSupport.Codec result =
+          ZstdSupport.downloadCodec(libDir, baseUrlOf(server), "0".repeat(64), 5);
+
+      assertNull(result, "SHA-256 不匹配必须拒绝该 jar（返回 null，交由上层回退内置压缩）");
+      try (var entries = Files.list(libDir)) {
+        assertTrue(entries.findAny().isEmpty(),
+            "校验失败的 jar 不得落到 lib 目录（含 .tmp 残留）：" + libDir);
+      }
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  /** 未配置期望哈希时，仍必须计算下载文件的「实际 SHA-256」（供服主复制填入 disk-cache.zstd-sha256）。 */
+  @Test
+  void actualSha256IsComputedEvenWithoutExpectedHash(@TempDir Path libDir) throws Exception {
+    byte[] body = "payload-for-hash".getBytes(StandardCharsets.US_ASCII);
+    Path source = libDir.resolve("source.bin");
+    Files.write(source, body);
+    String expected = ZstdSupport.sha256Hex(source);
+
+    HttpServer server = serve(body);
+    try {
+      // 该内容不是合法 jar → 加载必失败并返回 null；但「实际 SHA-256」必须已被计算出来
+      ZstdSupport.Codec result = ZstdSupport.downloadCodec(libDir, baseUrlOf(server), null, 5);
+      assertNull(result, "非 jar 内容无法加载（返回 null）");
+      assertEquals(expected, ZstdSupport.lastDownloadedSha256(),
+          "未配置期望哈希时仍必须计算并保留实际 SHA-256（供服主复制）");
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  // ------------------------------------------------------------------ ⑤ 配置键
 
   /** 三个新键的默认值与开关：缺省回落 + 显式覆盖 + 空白源归一。 */
   @Test
@@ -429,5 +498,42 @@ class ZstdSupportTest {
     assertEquals(AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, blank.diskCache().zstdDownloadUrl(),
         "空白源必须回落 Maven Central");
     assertEquals(1, blank.diskCache().zstdTimeoutSeconds(), "超时下限为 1 秒（0 会被抬到 1）");
+  }
+
+  /** 新增键 {@code disk-cache.zstd-sha256}：缺键 → 默认空串且不抛；空白归一；大小写归一为小写。 */
+  @Test
+  void zstdSha256ConfigFallsBackToEmptyWithoutThrowing() {
+    AntiXrayConfig defaults = AntiXrayConfig.from(yaml("enabled: true\n"));
+    assertEquals("", defaults.diskCache().zstdSha256(),
+        "缺键时必须取默认空串（不校验），且不得抛异常");
+
+    AntiXrayConfig blank = AntiXrayConfig.from(yaml("""
+        enabled: true
+        disk-cache:
+          zstd-sha256: "   "
+        """));
+    assertEquals("", blank.diskCache().zstdSha256(), "空白值归一为空串");
+
+    AntiXrayConfig upper = AntiXrayConfig.from(yaml("""
+        enabled: true
+        disk-cache:
+          zstd-sha256: "ABCDEF0123"
+        """));
+    assertEquals("abcdef0123", upper.diskCache().zstdSha256(),
+        "十六进制大小写不敏感，统一归一为小写以保证指纹稳定");
+  }
+
+  /** 幂等：带期望哈希重复调用 {@code initialize} 同样不得重复下载、不得重复提示。 */
+  @Test
+  void repeatedInitializeWithExpectedHashIsIdempotent(@TempDir Path libDir) {
+    RecordingLogger logger = new RecordingLogger();
+
+    ZstdSupport.initialize(libDir, true, "http://127.0.0.1:1/", "a".repeat(64), 1, logger);
+    int linesAfterFirst = logger.lines.size();
+
+    ZstdSupport.initialize(libDir, true, "http://127.0.0.1:1/", "a".repeat(64), 1, logger);
+
+    assertEquals(linesAfterFirst, logger.lines.size(),
+        "带期望哈希重复调用 initialize 必须幂等（不重复提示/下载）");
   }
 }

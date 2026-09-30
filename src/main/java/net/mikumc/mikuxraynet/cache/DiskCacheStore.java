@@ -368,6 +368,11 @@ public final class DiskCacheStore implements AutoCloseable {
     int regionX = BufferedLinearV3Format.regionCoordinate(chunkX);
     int regionZ = BufferedLinearV3Format.regionCoordinate(chunkZ);
     Handle handle = handle(worldName, regionX, regionZ, true);
+    if (handle.file.lockUnavailable()) {
+      // 该文件被其它服务端实例占用：本实例对它停用读写（见 RegionFile#lockUnavailable）。
+      // 必须在这里就返回，否则下面会把「写了但没落盘」的条目计进 approximateEntries，白白耗尽额度。
+      return;
+    }
     if (handle.file.sizeBytes() + handle.pendingBytes >= maxFileSizeBytes) {
       // 单文件上限：既看已落盘字节，也看尚未 append 的待落盘字节
       // （bucket 是整块追加的，只看已落盘大小会让首次落盘一次性冲破上限）

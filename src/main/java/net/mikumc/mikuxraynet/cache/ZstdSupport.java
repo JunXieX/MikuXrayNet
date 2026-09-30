@@ -109,6 +109,15 @@ public final class ZstdSupport {
   /** 最近一次成功下载使用的分类器（空 = 全平台包）与体积，仅用于启动日志。 */
   private static volatile String downloadedClassifier = "";
   private static volatile long downloadedBytes;
+  /**
+   * 最近一次下载落盘文件的<b>实际 SHA-256</b>（十六进制小写）。
+   *
+   * <p>无论是否配置了期望哈希都计算：未配置时由 {@link #initialize} 一次性打印出来供服主复制；
+   * 配置了期望哈希时它也是校验用的「实际值」。
+   */
+  private static volatile String lastDownloadedSha256 = "";
+  /** 本次下载是否因 SHA-256 不匹配而被拒绝（用于打印更有针对性的中文 WARN）。 */
+  private static volatile boolean hashMismatchDetected;
 
   private ZstdSupport() {
   }
@@ -382,7 +391,8 @@ public final class ZstdSupport {
    * <b>期望 SHA-256 十六进制摘要</b>用于供应链完整性校验。
    *
    * @param expectedSha256 期望的 SHA-256（十六进制，大小写不敏感）；{@code null}/空白表示不校验
-   *                       （此时会一次性中文 WARN 说明「未校验」）
+   *                       （此时仍会计算并一次性打印下载文件的「实际 SHA-256」供服主复制；
+   *                       非空时下载后即校验，不匹配则该 jar 被拒绝、回退内置压缩并打印中文 WARN）
    */
   public static void initialize(Path libraryDir, boolean autoDownload, String downloadUrl,
       String expectedSha256, int timeoutSeconds, Logger logger) {
@@ -420,17 +430,31 @@ public final class ZstdSupport {
 
     // ③ 自动下载（默认开启）
     if (autoDownload) {
-      if (expectedSha256 == null || expectedSha256.isBlank()) {
-        // 供应链面：未提供期望哈希时无法做完整性校验，至少一次性明确告知（不静默）
-        if (UNVERIFIED_WARNING.compareAndSet(false, true)) {
-          logger.warning(detectionLine() + "；自动下载未提供期望 SHA-256，"
-              + "本次下载仅校验「可加载性」，未做完整性校验（如需校验请在配置中提供期望哈希）");
-        }
+      boolean verify = expectedSha256 != null && !expectedSha256.isBlank();
+      if (!verify && UNVERIFIED_WARNING.compareAndSet(false, true)) {
+        // 供应链面：未提供期望哈希时无法做完整性校验，至少要一次性明确告知（不静默）
+        logger.warning(detectionLine() + "；自动下载未配置期望 SHA-256（disk-cache.zstd-sha256 为空），"
+            + "本次下载仅校验「可加载性」，未做完整性校验；如需校验请把下面打印的实际 SHA-256 填回配置");
       }
       Codec downloaded = downloadCodec(libraryDir, downloadUrl, expectedSha256, timeoutSeconds);
       if (downloaded != null) {
         logger.info(detectionLine() + "；来源=" + source.label() + "（"
             + artifactDetail(downloadedClassifier, downloadedBytes) + "）");
+        if (verify) {
+          logger.info("ZSTD 前置：下载文件已通过 SHA-256 校验（" + lastDownloadedSha256 + "）");
+        } else if (!lastDownloadedSha256.isEmpty()) {
+          // 未配置期望哈希：把实际值一次性打印出来，供服主复制填入 disk-cache.zstd-sha256（幂等，不会重复）
+          logger.info("ZSTD 前置：已计算实际 SHA-256：" + lastDownloadedSha256
+              + "，可填入 disk-cache.zstd-sha256 以启用校验");
+        }
+        return;
+      }
+      if (verify && hashMismatchDetected) {
+        // 下载成功但摘要不符：该 jar 已被拒绝（未落盘），回退内置压缩（fail-open）
+        logger.warning(detectionLine() + "；自动下载的 jar SHA-256 校验未通过，已拒绝使用该文件"
+            + "（期望 " + expectedSha256.trim() + "，实际 "
+            + (lastDownloadedSha256.isEmpty() ? "无" : lastDownloadedSha256)
+            + "），已回退内置压缩（磁盘缓存仍可用，压缩率略低）");
         return;
       }
       logger.warning(detectionLine() + "；自动下载失败，已回退内置压缩（磁盘缓存仍可用，压缩率略低）"
@@ -553,6 +577,8 @@ public final class ZstdSupport {
         System.nanoTime() + TimeUnit.SECONDS.toNanos(Math.max(1, timeoutSeconds));
     downloadedClassifier = "";
     downloadedBytes = 0L;
+    lastDownloadedSha256 = "";
+    hashMismatchDetected = false;
     for (String attempt : downloadClassifiers(platformClassifier())) {
       long remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
       if (remainingMillis <= 0L) {
@@ -602,12 +628,15 @@ public final class ZstdSupport {
         lastError = "下载文件为空";
         return null;
       }
-      if (expectedSha256 != null && !expectedSha256.isBlank()) {
-        String actual = sha256Hex(temp);
-        if (!actual.equalsIgnoreCase(expectedSha256.trim())) {
-          lastError = "下载文件 SHA-256 校验失败（期望 " + expectedSha256.trim() + "，实际 " + actual + "）";
-          return null;
-        }
+      // 无论是否配置期望哈希都计算实际摘要：未配置时由 initialize 打印出来供服主复制（见其说明）
+      String actual = sha256Hex(temp);
+      lastDownloadedSha256 = actual;
+      if (expectedSha256 != null && !expectedSha256.isBlank()
+          && !actual.equalsIgnoreCase(expectedSha256.trim())) {
+        // 摘要不符：视为被篡改/损坏，删除临时文件并拒绝（绝不把未通过校验的 jar 落到 lib 目录）
+        lastError = "下载文件 SHA-256 校验失败（期望 " + expectedSha256.trim() + "，实际 " + actual + "）";
+        hashMismatchDetected = true;
+        return null;
       }
       // 先落临时文件再原子替换：中断/超时留下的残留文件永远不会被当成成品
       Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
@@ -701,8 +730,15 @@ public final class ZstdSupport {
       lastError = "";
       downloadedClassifier = "";
       downloadedBytes = 0L;
+      lastDownloadedSha256 = "";
+      hashMismatchDetected = false;
       UNVERIFIED_WARNING.set(false);
     }
+  }
+
+  /** <b>仅测试用</b>：最近一次下载落盘文件的实际 SHA-256（十六进制小写）；无下载时为空串。 */
+  static String lastDownloadedSha256() {
+    return lastDownloadedSha256;
   }
 
   private static void closeQuietly(URLClassLoader loader) {

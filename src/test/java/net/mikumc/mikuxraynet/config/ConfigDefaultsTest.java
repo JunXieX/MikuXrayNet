@@ -139,9 +139,9 @@ class ConfigDefaultsTest {
             mode: all
         """));
 
-    // 2026-09 更新：权重表改为按有序 entry 列表参与指纹（顺序敏感），期望值随之变化，
+    // 2026-09 更新：新增 disk-cache.zstd-sha256 参与指纹（按任务要求），期望值随之变化，
     // 现存磁盘缓存会一次性失效重建（属正常）。
-    assertEquals(-519526892, config.configHash(),
+    assertEquals(1074535532, config.configHash(),
         "配置指纹必须是跨进程稳定的固定值（不得混入枚举 identity hash / 随机值）");
     // 同一份内容重复解析必须得到同一个值（同一进程内的自洽性）
     assertEquals(config.configHash(), AntiXrayConfig.from(yaml("""
@@ -482,7 +482,7 @@ class ConfigDefaultsTest {
     assertTrue(config.proximity().batchRevealSends(),
         "显形包批量合并默认开启（Paper 原生多方块变更包，关掉即回退为逐坐标单包）");
 
-    // disk-cache 全部 13 键
+    // disk-cache 全部 14 键
     assertTrue(config.diskCache().enabled(), "磁盘缓存默认开启");
     assertEquals(20000, config.diskCache().maxEntries(), "条目总数上限默认 20000");
     assertEquals(16, config.diskCache().maxFileSizeMb(), "单区域文件上限默认 16 MB");
@@ -501,6 +501,8 @@ class ConfigDefaultsTest {
     assertEquals(AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL, config.diskCache().zstdDownloadUrl(),
         "zstd 下载源默认 Maven Central");
     assertEquals(10, config.diskCache().zstdTimeoutSeconds(), "zstd 下载超时默认 10 秒");
+    assertEquals("", config.diskCache().zstdSha256(),
+        "zstd 下载校验哈希默认空串（不校验；缺键也不得抛异常）");
 
     // cache 两键（改写结果的内存缓存）
     assertEquals(40960, config.cacheMaximumSize(),
