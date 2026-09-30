@@ -336,22 +336,27 @@ class ConfigDefaultsTest {
   void bandwidthBlockChangeDefaultsFollowMiningStutterFix() {
     BandwidthConfig config = BandwidthConfig.from(yaml("enabled: true\n"));
 
-    assertEquals(8, config.blockChanges().immediateRadius(), "近身变更立即放行半径默认 8 格");
-    assertEquals(20, config.blockChanges().mergeWindowMillis(), "合并窗口默认收紧到 20ms");
+    assertEquals(8, config.blockChanges().immediateRadius(),
+        "近身变更立即放行半径默认 8 格（体验兜底，保持不降）");
+    assertEquals(40, config.blockChanges().mergeWindowMillis(),
+        "合并窗口默认 40ms（性能优先：更长时间窗更省包；实时手感由立即放行半径兜底）");
+    assertEquals(4, config.blockChanges().mergeRadius(),
+        "合并半径默认 4（性能优先：合并更多远处变更，交互半径内不受影响）");
   }
 
   /**
-   * 实体剔除周期复检预算默认 24（保守档，优先不影响玩家体验；旧建议区间 8~16、旧默认 12）：
+   * 实体剔除周期复检预算默认 12（性能优先，兼顾收敛速度与每周期主线程射线次数；建议区间 8~24）：
    * 必须有非零默认值，否则「先可见、之后才被挡住」的实体在本轮轮转分片下会收敛过慢（预算过小）
-   * 或每周期读方块次数失控（预算过大）。复检周期同时收紧到 5 tick（原 10），切换更及时。
+   * 或每周期读方块次数失控（预算过大）。复检周期同时回落到 10 tick（性能优先）。
    */
   @Test
-  void entityCullingRecheckBudgetDefaultsToTwentyFour() {
+  void entityCullingRecheckBudgetDefaultsToTwelve() {
     BandwidthConfig config = BandwidthConfig.from(yaml("enabled: true\n"));
 
-    assertEquals(24, config.entityCulling().recheckBudget(),
-        "周期复检预算默认 24（保守档，收敛更快；旧建议区间 8~16）");
-    assertEquals(5, config.entityCulling().updateIntervalTicks(), "复检周期默认收紧到 5 tick（保守档）");
+    assertEquals(12, config.entityCulling().recheckBudget(),
+        "周期复检预算默认 12（性能优先；建议区间 8~24）");
+    assertEquals(10, config.entityCulling().updateIntervalTicks(),
+        "复检周期默认 10 tick（性能优先）");
   }
 
   /** 非法值（0 / 负数）必须保守钳制到至少 1，避免复检完全不推进。 */
@@ -377,7 +382,7 @@ class ConfigDefaultsTest {
 
     assertTrue(config.entityCulling().raycast(), "同段其它键照常生效（不受已删除键影响）");
     assertEquals(6, config.entityCulling().raySamples(), "同段其它键仍按显式取值解析");
-    assertEquals(5, config.entityCulling().updateIntervalTicks(), "未写的键仍回落默认值");
+    assertEquals(10, config.entityCulling().updateIntervalTicks(), "未写的键仍回落默认值");
   }
 
   /**
@@ -537,7 +542,7 @@ class ConfigDefaultsTest {
         """));
 
     assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_MAX, config.proximity().distance(), 1.0E-9D,
-        "邻近显形距离超过上限必须钳制到 256 格（扫描量 O(r²)，防止把主线程拖住）");
+        "邻近显形距离超过上限必须钳制到 128 格（扫描量 O(r²)，防止把主线程拖住）");
     assertEquals(AntiXrayConfig.PROXIMITY_RAY_SAMPLES_MAX, config.proximity().raycastSamples(),
         "候选点数超过有效上限必须钳制到 5（暴露面上至多 5 个候选点）");
     assertEquals(AntiXrayConfig.NEIGHBORS_CACHE_MAXIMUM_MAX, config.neighbors().cacheMaximumSize(),
@@ -614,7 +619,7 @@ class ConfigDefaultsTest {
 
     // block-changes 其余键
     assertTrue(config.blockChanges().merge(), "邻域合并行为开关默认开启");
-    assertEquals(2, config.blockChanges().mergeRadius(), "合并邻域半径默认 2（曼哈顿距离）");
+    assertEquals(4, config.blockChanges().mergeRadius(), "合并邻域半径默认 4（性能优先，曼哈顿距离）");
     assertEquals(4096, config.blockChanges().maxPerPacket(), "单合并包上限默认 4096 条变更");
     assertTrue(config.blockChanges().resendOnOverflow(), "超限拆分续发默认开启");
     assertEquals(256, config.blockChanges().maxPendingEntries(), "待发缓冲上限默认 256 条");
@@ -624,8 +629,8 @@ class ConfigDefaultsTest {
 
     // entity-culling 其余键（threads 键已彻底删除，其残留配置的兼容性见下方专项测试）
     assertTrue(config.entityCulling().raycast(), "实体射线判定默认开启");
-    assertEquals(64.0D, config.entityCulling().forceVisibleDistance(), 1.0E-9D,
-        "强制可见距离默认 64 格（保守档，优先不影响玩家体验；旧默认 32）");
+    assertEquals(32.0D, config.entityCulling().forceVisibleDistance(), 1.0E-9D,
+        "强制可见距离默认 32 格（性能优先，设计兜底值）");
     assertEquals(BandwidthConfig.MAX_RAY_SAMPLES, config.entityCulling().raySamples(),
         "候选顶点数默认取上限 7（包围盒可见顶点最多 7 个，钳制 1..7）");
 
@@ -633,14 +638,14 @@ class ConfigDefaultsTest {
     assertEquals(300, config.afk().seconds(), "AFK 判定默认 300 秒无操作");
     assertEquals(16.0D, config.afk().distance(), 1.0E-9D, "AFK 低价值包丢弃距离默认 16 格");
     assertTrue(config.afk().dropParticles(), "AFK 丢弃粒子包默认保留 true（数量最多、价值最低）");
-    assertFalse(config.afk().dropBlockBreakAnimation(),
-        "AFK 默认不再丢弃破坏动画包（保守档；破坏动画与正在发生的事相关，丢掉会让 AFK 玩家回头看到动作中断）");
+    assertTrue(config.afk().dropBlockBreakAnimation(),
+        "AFK 默认丢弃破坏动画包（性能优先；玩家体验由「AFK 判定只看真实操作」兜底）");
 
-    // latency 全部键（保守档：更晚介入、降幅更小、保底更高）
-    assertEquals(1000, config.latency().thresholdMillis(), "延迟观察阈值默认 1000 毫秒（旧默认 400）");
-    assertEquals(60, config.latency().sustainSeconds(), "持续超阈 60 秒才真正降视距（旧默认 30）");
-    assertEquals(1, config.latency().reduceViewDistance(), "触发后降视距默认 1（旧默认 2）");
-    assertEquals(6, config.latency().minViewDistance(), "视距下限默认 6（旧默认 4）");
+    // latency 全部键（性能优先：更早介入、降幅略大，体验由下限与持续时间门槛兜底）
+    assertEquals(400, config.latency().thresholdMillis(), "延迟观察阈值默认 400 毫秒");
+    assertEquals(30, config.latency().sustainSeconds(), "持续超阈 30 秒才真正降视距");
+    assertEquals(2, config.latency().reduceViewDistance(), "触发后降视距默认 2");
+    assertEquals(6, config.latency().minViewDistance(), "视距下限默认 6（体验兜底）");
     assertEquals(5, config.latency().checkIntervalSeconds(), "延迟采样周期默认 5 秒");
 
     // diagnostics
@@ -709,14 +714,16 @@ class ConfigDefaultsTest {
           max-per-packet: 8192
           merge-window-millis: 50
         latency:
-          reduce-view-distance: 8
+          reduce-view-distance: 3
+          min-view-distance: 6
         entity-culling:
           recheck-budget: 20
         """));
     assertEquals(3, inRange.blockChanges().mergeRadius(), "上限内的半径原样生效");
     assertEquals(8192, inRange.blockChanges().maxPerPacket());
     assertEquals(50, inRange.blockChanges().mergeWindowMillis());
-    assertEquals(8, inRange.latency().reduceViewDistance());
+    assertEquals(3, inRange.latency().reduceViewDistance(), "上限内的降视距原样生效（新上限 4）");
+    assertEquals(6, inRange.latency().minViewDistance(), "下限之上的视距下限原样生效");
     assertEquals(20, inRange.entityCulling().recheckBudget());
     assertTrue(inRange.clampAdjustments().isEmpty(),
         "上限内的值不得产生钳制明细：" + inRange.clampAdjustments());
@@ -728,46 +735,152 @@ class ConfigDefaultsTest {
   }
 
   /**
-   * 本版「保守档」默认值全部落在合法钳制区间内：把它们逐键显式写进 YAML（等价于服主按注释原样替换）
-   * 既不得触发上限钳制、也不得触发下限兜底，因此不会打出任何「被钳制」WARN。
+   * 本轮重定的安全上限 / 下限逐键钉死，并验证「恰好等于边界」原样生效、「越界一格」被钳制。
    *
-   * <p>同时锁定这组默认值本身（防被无意改回更激进的旧值）。
+   * <p>设计原则：取「即使调到极限也不影响玩家体验」的值——越高越安全的键放宽上限，越高越有害的键收到
+   * 安全极限；且每个新上限都必须 ≥ 该键默认值（否则默认值自身会被钳制）。
    */
   @Test
-  void conservativeDefaultsAreWithinClampRangeAndProduceNoWarn() {
-    BandwidthConfig explicit = BandwidthConfig.from(yaml("""
+  void bandwidthSafetyCeilingsMatchRedesignedLimits() {
+    assertEquals(16, BandwidthConfig.MAX_MERGE_RADIUS);
+    assertEquals(32768, BandwidthConfig.MAX_PER_PACKET_LIMIT);
+    assertEquals(200, BandwidthConfig.MAX_MERGE_WINDOW_MILLIS);
+    assertEquals(8192, BandwidthConfig.MAX_PENDING_ENTRIES_LIMIT);
+    assertEquals(64, BandwidthConfig.MAX_IMMEDIATE_RADIUS);
+    assertEquals(1024.0D, BandwidthConfig.MAX_FORCE_VISIBLE_DISTANCE, 1.0E-9D);
+    assertEquals(40, BandwidthConfig.MAX_UPDATE_INTERVAL_TICKS);
+    assertEquals(2048, BandwidthConfig.MAX_RECHECK_BUDGET);
+    assertEquals(86400, BandwidthConfig.MAX_AFK_SECONDS);
+    assertEquals(1024.0D, BandwidthConfig.MAX_AFK_DISTANCE, 1.0E-9D);
+    assertEquals(60000, BandwidthConfig.MAX_LATENCY_THRESHOLD_MILLIS);
+    assertEquals(4, BandwidthConfig.MAX_REDUCE_VIEW_DISTANCE);
+    assertEquals(3600, BandwidthConfig.MAX_SUSTAIN_SECONDS);
+    assertEquals(16, BandwidthConfig.MAX_MIN_VIEW_DISTANCE);
+    assertEquals(6, BandwidthConfig.MIN_VIEW_DISTANCE_FLOOR);
+    assertEquals(3600, BandwidthConfig.MAX_CHECK_INTERVAL_SECONDS);
+    assertEquals(86400, BandwidthConfig.MAX_DIAGNOSTICS_INTERVAL_SECONDS);
+
+    // 新上限都必须 ≥ 对应默认值（否则默认值自身会被钳制并打出误导性 WARN）
+    BandwidthConfig defaults = BandwidthConfig.from(yaml(""));
+    assertTrue(defaults.blockChanges().mergeRadius() <= BandwidthConfig.MAX_MERGE_RADIUS);
+    assertTrue(defaults.blockChanges().mergeWindowMillis() <= BandwidthConfig.MAX_MERGE_WINDOW_MILLIS);
+    assertTrue(defaults.blockChanges().immediateRadius() <= BandwidthConfig.MAX_IMMEDIATE_RADIUS);
+    assertTrue(defaults.entityCulling().forceVisibleDistance() <= BandwidthConfig.MAX_FORCE_VISIBLE_DISTANCE);
+    assertTrue(defaults.entityCulling().updateIntervalTicks() <= BandwidthConfig.MAX_UPDATE_INTERVAL_TICKS);
+    assertTrue(defaults.entityCulling().recheckBudget() <= BandwidthConfig.MAX_RECHECK_BUDGET);
+    assertTrue(defaults.afk().distance() <= BandwidthConfig.MAX_AFK_DISTANCE);
+    assertTrue(defaults.latency().reduceViewDistance() <= BandwidthConfig.MAX_REDUCE_VIEW_DISTANCE);
+    assertTrue(defaults.latency().minViewDistance() <= BandwidthConfig.MAX_MIN_VIEW_DISTANCE);
+    assertTrue(defaults.latency().minViewDistance() >= BandwidthConfig.MIN_VIEW_DISTANCE_FLOOR);
+
+    // 恰好等于边界：原样生效且不产生明细；越界一格：被钳制
+    BandwidthConfig atCeiling = BandwidthConfig.from(yaml("""
+        block-changes:
+          merge-window-millis: 200
         entity-culling:
-          force-visible-distance: 64.0
-          update-interval-ticks: 5
-          recheck-budget: 24
+          update-interval-ticks: 40
+        afk:
+          distance: 1024.0
+        latency:
+          reduce-view-distance: 4
+        """));
+    assertEquals(200, atCeiling.blockChanges().mergeWindowMillis(), "恰好等于上限原样生效");
+    assertEquals(40, atCeiling.entityCulling().updateIntervalTicks());
+    assertEquals(1024.0D, atCeiling.afk().distance(), 1.0E-9D);
+    assertEquals(4, atCeiling.latency().reduceViewDistance());
+    assertTrue(atCeiling.clampAdjustments().isEmpty(),
+        "恰好等于上限不得产生明细：" + atCeiling.clampAdjustments());
+
+    BandwidthConfig justOver = BandwidthConfig.from(yaml("""
+        block-changes:
+          merge-window-millis: 201
+        entity-culling:
+          update-interval-ticks: 41
+        afk:
+          distance: 1025.0
+        latency:
+          reduce-view-distance: 5
+        """));
+    assertEquals(BandwidthConfig.MAX_MERGE_WINDOW_MILLIS, justOver.blockChanges().mergeWindowMillis(),
+        "超过一格也必须钳制到上限");
+    assertEquals(BandwidthConfig.MAX_UPDATE_INTERVAL_TICKS, justOver.entityCulling().updateIntervalTicks());
+    assertEquals(BandwidthConfig.MAX_AFK_DISTANCE, justOver.afk().distance(), 1.0E-9D);
+    assertEquals(BandwidthConfig.MAX_REDUCE_VIEW_DISTANCE, justOver.latency().reduceViewDistance());
+  }
+
+  /**
+   * 本版「性能优先」默认值全部落在合法钳制区间内：把它们逐键显式写进 YAML（等价于服主按注释原样替换）
+   * 既不得触发上限钳制、也不得触发下限兜底，因此不会打出任何「被钳制」WARN。
+   *
+   * <p>同时锁定这组默认值本身（防被无意改回更保守的更省带宽档，或改出越界值）。
+   */
+  @Test
+  void performanceFirstDefaultsAreWithinClampRangeAndProduceNoWarn() {
+    BandwidthConfig explicit = BandwidthConfig.from(yaml("""
+        block-changes:
+          merge-radius: 4
+          merge-window-millis: 40
+          immediate-radius: 8
+        entity-culling:
+          force-visible-distance: 32.0
+          update-interval-ticks: 10
+          recheck-budget: 12
         afk:
           drop-particles: true
-          drop-block-break-animation: false
+          drop-block-break-animation: true
         latency:
-          threshold-millis: 1000
-          sustain-seconds: 60
-          reduce-view-distance: 1
+          threshold-millis: 400
+          sustain-seconds: 30
+          reduce-view-distance: 2
           min-view-distance: 6
         """));
 
     assertTrue(explicit.clampAdjustments().isEmpty(),
-        "保守档默认值不得触发任何钳制明细（否则会出现误导性 WARN）：" + explicit.clampAdjustments());
-    assertEquals(64.0D, explicit.entityCulling().forceVisibleDistance(), 1.0E-9D);
-    assertEquals(5, explicit.entityCulling().updateIntervalTicks());
-    assertEquals(24, explicit.entityCulling().recheckBudget());
+        "性能优先默认值不得触发任何钳制明细（否则会出现误导性 WARN）：" + explicit.clampAdjustments());
+    assertEquals(4, explicit.blockChanges().mergeRadius());
+    assertEquals(40, explicit.blockChanges().mergeWindowMillis());
+    assertEquals(8, explicit.blockChanges().immediateRadius());
+    assertEquals(32.0D, explicit.entityCulling().forceVisibleDistance(), 1.0E-9D);
+    assertEquals(10, explicit.entityCulling().updateIntervalTicks());
+    assertEquals(12, explicit.entityCulling().recheckBudget());
     assertTrue(explicit.afk().dropParticles());
-    assertFalse(explicit.afk().dropBlockBreakAnimation());
-    assertEquals(1000, explicit.latency().thresholdMillis());
-    assertEquals(60, explicit.latency().sustainSeconds());
-    assertEquals(1, explicit.latency().reduceViewDistance());
+    assertTrue(explicit.afk().dropBlockBreakAnimation());
+    assertEquals(400, explicit.latency().thresholdMillis());
+    assertEquals(30, explicit.latency().sustainSeconds());
+    assertEquals(2, explicit.latency().reduceViewDistance());
     assertEquals(6, explicit.latency().minViewDistance());
 
     // 缺省（空配置）与显式写入必须解析出完全相同的生效值
     BandwidthConfig byDefault = BandwidthConfig.from(yaml(""));
-    assertEquals(byDefault.entityCulling(), explicit.entityCulling(), "缺省与显式保守档的实体剔除取值必须一致");
-    assertEquals(byDefault.afk(), explicit.afk(), "缺省与显式保守档的 AFK 取值必须一致");
-    assertEquals(byDefault.latency(), explicit.latency(), "缺省与显式保守档的延迟降视距取值必须一致");
+    assertEquals(byDefault.blockChanges(), explicit.blockChanges(),
+        "缺省与显式性能优先档的方块合并取值必须一致");
+    assertEquals(byDefault.entityCulling(), explicit.entityCulling(), "缺省与显式性能优先档的实体剔除取值必须一致");
+    assertEquals(byDefault.afk(), explicit.afk(), "缺省与显式性能优先档的 AFK 取值必须一致");
+    assertEquals(byDefault.latency(), explicit.latency(), "缺省与显式性能优先档的延迟降视距取值必须一致");
     assertTrue(byDefault.clampAdjustments().isEmpty(), "缺省默认值同样不得触发钳制");
+  }
+
+  /**
+   * {@code latency.min-view-distance} 是本轮新增安全下限的键：默认 6，低于 6 会被抬升到 6 并留痕。
+   *
+   * <p>本项是「视距最多降到多少」的体验兜底——旧值 4 会让弱网玩家几乎看不见周围，故设硬下限；
+   * 同时校验新上限（16）与默认值（6）都落在区间内。
+   */
+  @Test
+  void minViewDistanceBelowFloorIsRaisedAndReported() {
+    BandwidthConfig raised = BandwidthConfig.from(yaml("latency:\n  min-view-distance: 4\n"));
+    assertEquals(BandwidthConfig.MIN_VIEW_DISTANCE_FLOOR, raised.latency().minViewDistance(),
+        "旧值 4 必须被抬升到新的安全下限 6");
+    assertTrue(String.join("、", raised.clampAdjustments()).contains("latency.min-view-distance=4"),
+        "抬升必须留下明细供加载时一次性 WARN：" + raised.clampAdjustments());
+
+    BandwidthConfig atFloor = BandwidthConfig.from(yaml("latency:\n  min-view-distance: 6\n"));
+    assertEquals(6, atFloor.latency().minViewDistance(), "恰好等于下限的值原样生效");
+    assertTrue(atFloor.clampAdjustments().isEmpty(), "取值在下限处不得产生明细");
+
+    BandwidthConfig aboveCeiling = BandwidthConfig.from(yaml("latency:\n  min-view-distance: 99\n"));
+    assertEquals(BandwidthConfig.MAX_MIN_VIEW_DISTANCE, aboveCeiling.latency().minViewDistance(),
+        "超过新上限的值钳制到 16");
   }
 
   /**
@@ -787,7 +900,7 @@ class ConfigDefaultsTest {
           distance: .nan
         """));
 
-    assertEquals(64.0D, nan.entityCulling().forceVisibleDistance(), 1.0E-9D, "NaN 必须回落默认 64");
+    assertEquals(32.0D, nan.entityCulling().forceVisibleDistance(), 1.0E-9D, "NaN 必须回落默认 32");
     assertEquals(16.0D, nan.afk().distance(), 1.0E-9D, "NaN 必须回落默认 16");
     String nanDetails = String.join("、", nan.clampAdjustments());
     assertTrue(nanDetails.contains("entity-culling.force-visible-distance"), nanDetails);
@@ -802,7 +915,7 @@ class ConfigDefaultsTest {
         afk:
           distance: -.inf
         """));
-    assertEquals(64.0D, inf.entityCulling().forceVisibleDistance(), 1.0E-9D, "+Inf 必须回落默认 64");
+    assertEquals(32.0D, inf.entityCulling().forceVisibleDistance(), 1.0E-9D, "+Inf 必须回落默认 32");
     assertEquals(16.0D, inf.afk().distance(), 1.0E-9D, "-Inf 必须回落默认 16（而不是被 Math.max 悄悄抬成 0）");
     assertEquals(base.configHash(), inf.configHash(), "±Inf 回落默认后指纹同样必须稳定");
   }

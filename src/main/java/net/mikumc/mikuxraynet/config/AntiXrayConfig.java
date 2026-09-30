@@ -297,9 +297,9 @@ public final class AntiXrayConfig {
    *
    * <p><b>为什么设上限</b>：每个巡检周期要对玩家周围该半径内的区块做候选扫描，扫描量随半径<b>平方增长</b>
    * （O(r²)）。手滑把 64 多打一位成 640（甚至几千）会让每周期扫描的区块数暴涨几十倍，直接把主线程拖住。
-   * 256 格已远大于一个视距，再大也只是提前把远处矿物亮给玩家，故上限取 256。
+   * 128 格已远大于一个视距，再大也只是提前把远处矿物亮给玩家，故上限取 128。
    */
-  public static final double PROXIMITY_DISTANCE_MAX = 256.0D;
+  public static final double PROXIMITY_DISTANCE_MAX = 128.0D;
 
   /**
    * {@code proximity.raycast.samples}（每方块最多尝试的候选点数）的有效上限。

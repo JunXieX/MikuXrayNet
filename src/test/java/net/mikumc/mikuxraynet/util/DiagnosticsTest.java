@@ -143,8 +143,8 @@ class DiagnosticsTest {
     assertTrue(capped.contains("配置安全上限已回落：proximity.distance=4096.0"),
         "dump 必须回显被回落的安全上限键：" + capped);
     assertTrue(capped.contains("cache.maximum-size=409600"), capped);
-    assertTrue(capped.contains("distance=256.0"),
-        "dump 的有效值必须是被回落后的上限（256 格）：" + capped);
+    assertTrue(capped.contains("distance=128.0"),
+        "dump 的有效值必须是被回落后的上限（128 格）：" + capped);
   }
 
   @Test

@@ -12,7 +12,8 @@ import org.bukkit.configuration.ConfigurationSection;
  * 带宽优化配置（对应 {@code bandwidth.yml}）。
  *
  * <p>只承载「已解析的纯数据」，不含任何 Bukkit 世界引用，可安全地在工作线程读取。
- * 缺失项一律回落到内置默认值，并对明显不合理的取值（0、负数）做保守钳制。
+ * 缺失项一律回落到内置默认值（性能优先并保障玩家体验），并对失控取值做安全钳制：超过「安全上限」取上限、
+ * 低于「安全下限」取下限，使任何合法配置在极限处也不影响玩家体验。
  */
 public final class BandwidthConfig {
 
@@ -23,39 +24,46 @@ public final class BandwidthConfig {
   public static final int MAX_RAY_SAMPLES = 7;
 
   /*
-   * 以下为该文件各项的「安全上限」常量：只挡明显失控的配置（多打一个 0、手滑写错），使内存/带宽占用
-   * 有一个可预期的上界。默认值都落在 [下限, 上限] 内，因此新增上限不改变任何默认行为。
-   * 被上限钳制时会记入 clampAdjustments 并由加载路径一次性 WARN（绝不静默改用户配置）。
+   * 以下为该文件各项的「安全上限 / 下限」常量：只挡明显失控的配置（多打一个 0、手滑写错），使内存/带宽
+   * 占用有一个可预期的上界。取值原则是「即使调到极限也不影响玩家体验」——对「越高越安全」的键把上限
+   * 放宽（正常调优撞不到），对「越高越有害」的键把上限收到安全极限；默认值都落在 [下限, 上限] 内，
+   * 因此这些边界不改变任何默认行为。被钳制时会记入 clampAdjustments 并由加载路径一次性 WARN
+   *（绝不静默改用户配置）。
    */
 
-  /** 合并半径上限（格）：半径越大越会把「互不相关的变更」粘进同一个合并包，超过此值收益趋零。 */
-  public static final int MAX_MERGE_RADIUS = 8;
-  /** 单个合并包条目上限：条目再多只会放大单个包的体积与丢包重传代价。 */
-  public static final int MAX_PER_PACKET_LIMIT = 16384;
-  /** 合并时间窗上限（毫秒）：窗口就是「玩家能感知的方块更新延迟上界」，超过 1 秒观感明显迟滞。 */
-  public static final int MAX_MERGE_WINDOW_MILLIS = 1000;
-  /** 每玩家待发缓冲条目上限：条目持有方块状态引用，过大只放大单玩家内存占用。 */
-  public static final int MAX_PENDING_ENTRIES_LIMIT = 4096;
-  /** 立即放行半径上限（格）：半径内一律不合并，配得过大几乎等于关闭合并。 */
-  public static final int MAX_IMMEDIATE_RADIUS = 32;
-  /** 强制可见距离上限（格）：超过一个视距（约 512 格）等价于关闭实体剔除。 */
-  public static final double MAX_FORCE_VISIBLE_DISTANCE = 512.0D;
-  /** 遮挡复检周期上限（tick）：比 10 秒还长会让被遮挡的实体迟迟不隐藏。 */
-  public static final int MAX_UPDATE_INTERVAL_TICKS = 200;
-  /** 每周期复检预算上限：预算即每周期主线程射线次数，上限用于防止把主线程打满。 */
-  public static final int MAX_RECHECK_BUDGET = 1024;
+  /** 合并半径上限（格）：范围越大越省包且不影响正确性，故放宽到 16。 */
+  public static final int MAX_MERGE_RADIUS = 16;
+  /** 单个合并包条目上限：单包容量越大越省包，故放宽到 32768。 */
+  public static final int MAX_PER_PACKET_LIMIT = 32768;
+  /** 合并时间窗上限（毫秒）：窗口就是「玩家可感知的方块更新延迟上界」，200ms 以上观感明显迟滞。 */
+  public static final int MAX_MERGE_WINDOW_MILLIS = 200;
+  /** 每玩家待发缓冲条目上限：缓冲越大越省包（内存可控），故放宽到 8192。 */
+  public static final int MAX_PENDING_ENTRIES_LIMIT = 8192;
+  /** 立即放行半径上限（格）：半径内一律不合并，越大越不影响手感，故放宽到 64。 */
+  public static final int MAX_IMMEDIATE_RADIUS = 64;
+  /** 强制可见距离上限（格）：越大越多实体不被剔除、越安全，故放宽到 1024。 */
+  public static final double MAX_FORCE_VISIBLE_DISTANCE = 1024.0D;
+  /** 遮挡复检周期上限（tick）：40 tick（2 秒）再长会让「误藏」持续过久，可被玩家感知。 */
+  public static final int MAX_UPDATE_INTERVAL_TICKS = 40;
+  /** 每周期复检预算上限：预算即每周期主线程射线次数，越大收敛越快、越安全，故放宽到 2048。 */
+  public static final int MAX_RECHECK_BUDGET = 2048;
   /** AFK 判定时长上限（秒，1 天）：超过一天的判定几乎不可能触发，只是白占状态。 */
   public static final int MAX_AFK_SECONDS = 86400;
-  /** AFK 丢包距离上限（格）：超过视距意味着「不论多远都丢」，会误丢玩家可能看到的远处粒子。 */
-  public static final double MAX_AFK_DISTANCE = 512.0D;
+  /** AFK 丢包距离上限（格）：越大越少误丢玩家看得见的远处包，故放宽到 1024。 */
+  public static final double MAX_AFK_DISTANCE = 1024.0D;
   /** 延迟观察阈值上限（毫秒）：60 秒以上的延迟早已断线，阈值再高永不触发。 */
   public static final int MAX_LATENCY_THRESHOLD_MILLIS = 60000;
-  /** 单次降视距上限（区块）：降幅超过常见最大视距（32）没有意义。 */
-  public static final int MAX_REDUCE_VIEW_DISTANCE = 32;
+  /** 单次降视距上限（区块）：一次降 32 格会让弱网玩家几乎看不见，收到安全极限 4。 */
+  public static final int MAX_REDUCE_VIEW_DISTANCE = 4;
   /** 超阈持续时长上限（秒，1 小时）：超过 1 小时才降视距等于永不触发。 */
   public static final int MAX_SUSTAIN_SECONDS = 3600;
-  /** 视距下限上限（区块）：下限不应超过常见最大视距。 */
-  public static final int MAX_MIN_VIEW_DISTANCE = 32;
+  /** 视距下限上限（区块）：不应超过常见最大视距，取 16。 */
+  public static final int MAX_MIN_VIEW_DISTANCE = 16;
+  /**
+   * 视距下限下限（区块，6）：本项是「视距最多降到多少」的兜底，配得太低等于体验崩塌，故设安全下限；
+   * 低于 6 会被抬到 6 并记入明细（供加载路径一次性 WARN）。
+   */
+  public static final int MIN_VIEW_DISTANCE_FLOOR = 6;
   /** 延迟采样周期上限（秒，1 小时）：周期过长等于停止巡检。 */
   public static final int MAX_CHECK_INTERVAL_SECONDS = 3600;
   /** 诊断摘要周期上限（秒，1 天）：周期过长等于不再输出摘要。 */
@@ -108,8 +116,8 @@ public final class BandwidthConfig {
    * @param enabled  模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
    * @param raycast  行为开关：依据视线射线剔除被遮挡实体；仅在 {@code enabled=true} 时生效。
    * @param recheckBudget 周期复检预算：除「已隐藏实体每周期全部复检」外，每周期额外按轮转分片
-   *                      复检的「可见追踪实体」条数上限（默认 24——保守档，取值偏高以尽快收敛；
-   *                      旧建议区间 8~16、旧默认 12）。
+   *                      复检的「可见追踪实体」条数上限（默认 12——性能优先档，兼顾收敛速度与每周期
+   *                      主线程射线次数；建议区间 8~24）。
    *                      <p>为什么需要它：实体进入追踪范围那一刻（{@code PlayerTrackEntityEvent}）只评估一次，
    *                      若实体是「先可见、之后才被墙/地形挡住」，只复检已隐藏集合永远发现不了它。
    *                      轮转分片让复检在 {@code ceil(追踪数 / recheckBudget)} 个周期内覆盖全部追踪实体
@@ -148,7 +156,7 @@ public final class BandwidthConfig {
   private final Latency latency;
   private final Diagnostics diagnostics;
   /**
-   * 被「安全上限」钳制过的配置键明细（空列表 = 未钳制）；加载时由 {@link #warnIfClampApplied} 一次性 WARN。
+   * 被「安全上限 / 下限」钳制过的配置键明细（空列表 = 未钳制）；加载时由 {@link #warnIfClampApplied} 一次性 WARN。
    */
   private final List<String> clampAdjustments;
 
@@ -169,9 +177,10 @@ public final class BandwidthConfig {
   /**
    * 从配置根节点解析；缺失项一律取默认值。
    *
-   * <p><b>为什么这里同时有下限与上限</b>：下限（{@code Math.max}）防止 0/负数让功能静默失效；
-   * 上限（{@link #clampUpper} 系列）防止手滑多打一个 0 之类的失控配置把内存/带宽打满。默认值都落在
-   * 区间内，因此新增上限不改变默认行为；被上限钳制的键会记入明细、由 {@link #warnIfClampApplied} 提示。
+   * <p><b>为什么这里同时有下限与上限</b>：硬下限（{@code Math.max} 与 {@link #clampLower}）防止 0/负数
+   * 让功能静默失效、或把「视距下限」之类体验兜底项配到崩；上限（{@link #clampUpper} 系列）防止手滑多打
+   * 一个 0 之类的失控配置把内存/带宽打满。边界取值都遵循「调到极限也不影响玩家体验」，默认值全部落在
+   * 区间内，因此这些边界不改变默认行为；被钳制的键会记入明细、由 {@link #warnIfClampApplied} 提示。
    */
   public static BandwidthConfig from(ConfigurationSection root) {
     List<String> clampAdjustments = new ArrayList<>();
@@ -185,15 +194,15 @@ public final class BandwidthConfig {
         new BlockChanges(
             root.getBoolean("block-changes.enabled", true),
             root.getBoolean("block-changes.merge", true),
-            clampUpper(Math.max(0, root.getInt("block-changes.merge-radius", 2)),
+            // 默认 4（性能优先）：合并更多远处变更，交互半径内不受影响（见 BlockChangeMerger）。
+            clampUpper(Math.max(0, root.getInt("block-changes.merge-radius", 4)),
                 MAX_MERGE_RADIUS, "block-changes.merge-radius", clampAdjustments),
             clampUpper(Math.max(1, root.getInt("block-changes.max-per-packet", 4096)),
                 MAX_PER_PACKET_LIMIT, "block-changes.max-per-packet", clampAdjustments),
             root.getBoolean("block-changes.resend-on-overflow", true),
-            // 默认 20（原为 50）：50ms 的合并窗口会让玩家自己挖方块后的方块更新延迟最多 50ms，
-            // 客户端预测受阻 → 出现「顿感」。收紧到 20 后改为 20ms；真正的交互延迟由
-            // immediate-radius 消除（近身变更根本不进窗口）。
-            clampUpper(Math.max(1, root.getInt("block-changes.merge-window-millis", 20)),
+            // 默认 40（性能优先）：更长时间窗合并更多变更、更省包；玩家挖/放方块的实时手感由
+            // immediate-radius（默认 8 格内原包立即放行）兜底，因此窗口略长也不会出现「顿感」。
+            clampUpper(Math.max(1, root.getInt("block-changes.merge-window-millis", 40)),
                 MAX_MERGE_WINDOW_MILLIS, "block-changes.merge-window-millis", clampAdjustments),
             clampUpper(Math.max(1, root.getInt("block-changes.max-pending-entries", 256)),
                 MAX_PENDING_ENTRIES_LIMIT, "block-changes.max-pending-entries", clampAdjustments),
@@ -209,18 +218,20 @@ public final class BandwidthConfig {
         new EntityCulling(
             root.getBoolean("entity-culling.enabled", true),
             root.getBoolean("entity-culling.raycast", true),
-            // 默认 64（保守档，原 32）：覆盖绝大多数近身/视野中心实体，基本不会误藏玩家觉得该看见的实体。
-            clampUpper(root.getDouble("entity-culling.force-visible-distance", 64.0D),
-                64.0D, MAX_FORCE_VISIBLE_DISTANCE, "entity-culling.force-visible-distance", clampAdjustments),
-            // 默认 5（保守档，原 10）：复检更勤，遮挡/可见切换更及时，玩家几乎察觉不到剔除存在。
-            clampUpper(Math.max(1, root.getInt("entity-culling.update-interval-ticks", 5)),
+            // 默认 32（性能优先，回落到设计兜底值）：剔除更多远处实体以省包；近身/视野中心的实体
+            // 仍在强制可见范围内放行，玩家不易察觉剔除在发生。
+            clampUpper(root.getDouble("entity-culling.force-visible-distance", 32.0D),
+                32.0D, MAX_FORCE_VISIBLE_DISTANCE, "entity-culling.force-visible-distance", clampAdjustments),
+            // 默认 10（性能优先）：复检更省 CPU；遮挡/可见切换的延迟由「已隐藏实体每周期全量复检」
+            // 兜底，玩家几乎察觉不到。
+            clampUpper(Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),
                 MAX_UPDATE_INTERVAL_TICKS, "entity-culling.update-interval-ticks", clampAdjustments),
             // 语义已变：原生射线改造后本键表示「每个实体最多尝试的候选顶点数」（不再表示采样数）。
             // 钳制 1..MAX_RAY_SAMPLES，默认即上限（包围盒至多 7 个可见顶点 → 取上限就是全部顶点都试）。
             Math.max(1, Math.min(MAX_RAY_SAMPLES, root.getInt("entity-culling.ray-samples", MAX_RAY_SAMPLES))),
-            // 周期复检预算默认 24（保守档，原 12）：约「每 0.25 秒（5 tick）多复检 24 个可见追踪实体」，
-            // 收敛更快、更不容易出现「明明被挡住却还在显示」；旧建议区间 8~16。
-            clampUpper(Math.max(1, root.getInt("entity-culling.recheck-budget", 24)),
+            // 周期复检预算默认 12（性能优先）：约「每 0.5 秒（10 tick）多复检 12 个可见追踪实体」，
+            // 兼顾收敛速度与每周期主线程射线次数；建议区间 8~24。
+            clampUpper(Math.max(1, root.getInt("entity-culling.recheck-budget", 12)),
                 MAX_RECHECK_BUDGET, "entity-culling.recheck-budget", clampAdjustments)),
         new Afk(
             root.getBoolean("afk.enabled", true),
@@ -229,22 +240,23 @@ public final class BandwidthConfig {
             clampUpper(root.getDouble("afk.distance", 16.0D),
                 16.0D, MAX_AFK_DISTANCE, "afk.distance", clampAdjustments),
             root.getBoolean("afk.drop-particles", true),
-            // 默认 false（保守档，原 true）：破坏动画与「正在发生的事」直接相关，丢掉会让 AFK 玩家
-            // 回头时看到动作中断，故默认不丢；更省带宽可改回 true。
-            root.getBoolean("afk.drop-block-break-animation", false)),
+            // 默认 true（性能优先）：破坏动画包数量可观，丢弃可省带宽；玩家体验由「AFK 判定只看真实操作」
+            // 兜底——只要玩家还在交互/移动/聊天就不会被判定为 AFK，因此真在操作的人看不到动画中断。
+            root.getBoolean("afk.drop-block-break-animation", true)),
         new Latency(
             root.getBoolean("latency.enabled", true),
-            // 默认 1000（保守档，原 400）：只有明显卡顿才进入观察，正常网络绝不触发降视距。
-            clampUpper(Math.max(1, root.getInt("latency.threshold-millis", 1000)),
+            // 默认 400（性能优先）：更早发现卡顿并介入；仅有明显持续卡顿才会触发（见 sustain-seconds）。
+            clampUpper(Math.max(1, root.getInt("latency.threshold-millis", 400)),
                 MAX_LATENCY_THRESHOLD_MILLIS, "latency.threshold-millis", clampAdjustments),
-            // 默认 1（保守档，原 2）：降幅最小，玩家几乎察觉不到画面变化。
-            clampUpper(Math.max(1, root.getInt("latency.reduce-view-distance", 1)),
+            // 默认 2（性能优先）：降幅略大更省带宽；由 min-view-distance 与持续时间门槛兜底体验。
+            clampUpper(Math.max(1, root.getInt("latency.reduce-view-distance", 2)),
                 MAX_REDUCE_VIEW_DISTANCE, "latency.reduce-view-distance", clampAdjustments),
-            // 默认 60（保守档，原 30）：要求持续一分钟才动作，几乎排除偶发抖动。
-            clampUpper(Math.max(0, root.getInt("latency.sustain-seconds", 60)),
+            // 默认 30（性能优先）：仍需持续 30 秒才动作，足以排除偶发抖动。
+            clampUpper(Math.max(0, root.getInt("latency.sustain-seconds", 30)),
                 MAX_SUSTAIN_SECONDS, "latency.sustain-seconds", clampAdjustments),
-            // 默认 6（保守档，原 4）：保底视距更高，即使触发降视距也不影响正常观察。
-            clampUpper(Math.max(1, root.getInt("latency.min-view-distance", 6)),
+            // 默认 6：体验兜底——视距下限低于 6 会让弱网玩家几乎看不见，故设安全下限 6（低于下限会被抬升并 WARN）。
+            clampUpper(clampLower(root.getInt("latency.min-view-distance", 6),
+                MIN_VIEW_DISTANCE_FLOOR, "latency.min-view-distance", clampAdjustments),
                 MAX_MIN_VIEW_DISTANCE, "latency.min-view-distance", clampAdjustments),
             clampUpper(Math.max(1, root.getInt("latency.check-interval-seconds", 5)),
                 MAX_CHECK_INTERVAL_SECONDS, "latency.check-interval-seconds", clampAdjustments)),
@@ -261,6 +273,15 @@ public final class BandwidthConfig {
     }
     adjustments.add(key + "=" + value + "（上限 " + max + "）");
     return max;
+  }
+
+  /** 整数下限钳制：低于下限则取下限并记录明细（供一次性 WARN）。 */
+  private static int clampLower(int value, int min, String key, List<String> adjustments) {
+    if (value >= min) {
+      return value;
+    }
+    adjustments.add(key + "=" + value + "（下限 " + min + "）");
+    return min;
   }
 
   /**
@@ -296,11 +317,12 @@ public final class BandwidthConfig {
       return;
     }
     logger.warning("bandwidth.yml 的 " + String.join("、", clampAdjustments)
-        + " 超出安全范围，已按安全值生效（超上限取上限、非有限值回落默认；默认值均在范围内）。"
-        + "这是为了防止失控配置把内存/带宽打满，也避免无效值污染配置指纹导致磁盘缓存整体失效。");
+        + " 超出安全范围，已按安全值生效（超上限取上限、低于下限取下限、非有限值回落默认；默认值均在范围内）。"
+        + "这是为了让「调到极限也不影响玩家体验」：防止失控配置把内存/带宽打满，也避免影响体验的取值被直接采用，"
+        + "同时避免无效值污染配置指纹导致磁盘缓存整体失效。");
   }
 
-  /** 被安全上限钳制过的配置键明细（空列表 = 未钳制）；供诊断回显。 */
+  /** 被安全上限 / 下限钳制过的配置键明细（空列表 = 未钳制）；供诊断回显。 */
   public List<String> clampAdjustments() {
     return clampAdjustments;
   }

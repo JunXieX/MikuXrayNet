@@ -49,7 +49,8 @@ import org.bukkit.plugin.Plugin;
  * 因此符合 Folia「worker 与网络线程不触碰实体」的要求。
  *
  * <p>距离判定所需的玩家位置来自状态缓存（在主线程刷新），因此封包线程无需访问实体位置。
- * 默认丢弃的包类型保守且数量少：世界粒子与方块破坏动画。
+ * 默认丢弃的包类型数量少且只对 AFK 玩家生效：世界粒子与方块破坏动画（两者默认都丢，玩家只要还在
+ * 交互/移动/聊天就不会被判定为 AFK，因此真在操作的人不会看到动画中断）。
  */
 public final class AfkTracker implements Listener {
 
