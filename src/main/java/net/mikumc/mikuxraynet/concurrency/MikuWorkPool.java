@@ -140,8 +140,10 @@ public final class MikuWorkPool implements AutoCloseable {
    * 放行（其内部经 CAS 抢到写入权后转调 {@code signalOnce()}），
    * 否则 shutdownNow 丢弃的排队任务会让对应封包永远无人放行（客户端卡加载界面）。
    *
-   * <p>放行顺序上先 {@code shutdownNow} 再兜底：队列一旦排空就不会再有排队任务被启动，
-   * 而正在写入中的任务由其工作线程自行放行，兜底不得碰它们，避免「包已发出却仍在改写」的写回竞争。
+   * <p>放行顺序上「先取登记表快照 → 再 {@code shutdownNow} → 最后按快照兜底」：快照在中断工作线程之前
+   * 取出，因此「已出队但尚未开始写」的任务也一定被覆盖（若先 shutdownNow，被中断的 payload 可能已自行
+   * 注销，兜底会漏掉它）；排空队列同样保证不会再有排队任务被启动，而正在写入中的任务由其工作线程自行放行，
+   * 兜底不得碰它们，避免「包已发出却仍在改写」的写回竞争。
    *
    * <p>这里用 {@link RewriteTask#releaseOnTimeout()} 的<b>原子 CAS</b>（写入权 OPEN → DONE）而不是
    * 「先看 {@code isWriting()} 再放行」：后者是 check-then-act，在「工作线程刚把任务从队列取出、
@@ -154,8 +156,15 @@ public final class MikuWorkPool implements AutoCloseable {
    */
   @Override
   public void close() {
+    // 先取登记表快照、再 shutdownNow。
+    // 为什么不能先 shutdownNow：它会立刻中断工作线程，而被中断的 payload 可能在自己的 finally 里
+    // 先行注销（pending.remove），于是 close 随后遍历登记表时已经看不到这个任务 ——
+    // 该任务「已出队但尚未开始写」，既没被兜底放行、也没人改写（CI 上稳定复现「放行 0 次」）。
+    // 快照在中断前取出，保证这类任务一定被兜底覆盖；CAS 仍保证「恰好一次」：
+    // 若工作线程已抢到写入权，兜底会因 CAS 失败而不放行，改由工作线程自行放行。
+    Set<RewriteTask> snapshot = Set.copyOf(pending);
     this.executor.shutdownNow();
-    for (RewriteTask task : pending) {
+    for (RewriteTask task : snapshot) {
       try {
         task.releaseOnTimeout();
       } catch (Throwable ignored) {
