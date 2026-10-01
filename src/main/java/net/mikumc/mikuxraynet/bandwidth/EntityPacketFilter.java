@@ -26,6 +26,7 @@ import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
+import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
@@ -128,9 +129,16 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     // 只有解析不出的条目才回退到字符串比较（见 unresolvedWhitelist）。
     Set<EntityType> types = EnumSet.noneOf(EntityType.class);
     Set<String> unresolved = new HashSet<>(this.whitelist);
+    int keyless = 0;
     for (EntityType type : EntityType.values()) {
       // EntityType 的 path（不带命名空间、全小写）正是白名单归一化后的形态，取它不产生字符串分配
-      String path = type.getKey().getKey();
+      String path = keyPathOrNull(type);
+      if (path == null) {
+        // 无键类型（部分服务端/衍生端会附加 UNKNOWN 之类的条目）：跳过即可，
+        // 绝不因单个条目让整个带宽模块装配失败（真机已复现过一次）。
+        keyless++;
+        continue;
+      }
       if (this.whitelist.contains(path)) {
         types.add(type);
         unresolved.remove(path);
@@ -138,6 +146,10 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     }
     this.whitelistedTypes = types;
     this.unresolvedWhitelist = unresolved;
+    if (keyless > 0) {
+      plugin.getLogger().warning("检测到 " + keyless + " 个实体类型没有命名空间键（部分服务端/衍生端会附加此类条目），"
+          + "已跳过它们；不影响其余实体类型的白名单判定与零位移包取消");
+    }
   }
 
   /** 注册监听器；白名单非空时启动实体类型索引的增量维护与低频兜底重建。 */
@@ -336,15 +348,42 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
   private String typeKeyFor(EntityType type) {
     if (whitelistedTypes.contains(type)) {
       // 命中项取 EntityType 的 path（引用既有常量，不新建字符串）
-      return type.getKey().getKey();
+      String path = keyPathOrNull(type);
+      if (path != null) {
+        return path;
+      }
     }
     if (!unresolvedWhitelist.isEmpty()) {
-      String typeKey = normalize(type.getKey().toString());
-      if (whitelist.contains(typeKey)) {
-        return typeKey;
+      String path = keyPathOrNull(type);
+      if (path != null) {
+        String typeKey = normalize(path);
+        if (whitelist.contains(typeKey)) {
+          return typeKey;
+        }
       }
     }
     return null;
+  }
+
+  /**
+   * 取实体类型的命名空间路径（形如 {@code armor_stand}）。
+   *
+   * <p><b>为什么要 try/catch 而不是直接 {@code type.getKey().getKey()}</b>：部分服务端与其衍生端会在
+   * {@code EntityType} 里附加没有命名空间键的条目（如 UNKNOWN），对它取键会抛
+   * {@link IllegalArgumentException}。旧实现在构造期遍历 {@code EntityType.values()} 时对每个类型都取键，
+   * 一旦碰到这类条目就会让**整个带宽子模块装配失败**（真机已复现）；热路径的字符串回退同样会踩到。
+   * 这类条目一律按「解析不出」处理，由既有回退/跳过逻辑兜底，绝不因此中断装配或抛到封包链路。
+   *
+   * @return 路径键；类型没有键（或服务端未提供键）时返回 {@code null}
+   */
+  static String keyPathOrNull(EntityType type) {
+    NamespacedKey key;
+    try {
+      key = type.getKey();
+    } catch (IllegalArgumentException keylessType) {
+      return null;
+    }
+    return key == null ? null : key.getKey();
   }
 
   private static Set<String> normalizeAll(Set<String> values) {
