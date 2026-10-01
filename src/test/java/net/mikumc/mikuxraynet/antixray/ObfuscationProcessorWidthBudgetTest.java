@@ -79,8 +79,8 @@ class ObfuscationProcessorWidthBudgetTest {
     return new ObfuscationProcessor(codec(), blockId -> true, targets, replacementIds, cumulative,
         false, true,
         widthBudget
-            ? new ObfuscationProcessor.PaletteOptions(false, false, true)
-            : new ObfuscationProcessor.PaletteOptions(false, false, false),
+            ? new ObfuscationProcessor.PaletteOptions(false, true)
+            : new ObfuscationProcessor.PaletteOptions(false, false),
         true);
   }
 

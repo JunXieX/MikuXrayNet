@@ -229,7 +229,7 @@ public class ChunkSection {
     }
   }
 
-  /** 该 section 是否被外部通过 {@link #setBlockState}（或调色板重排/裁剪）改写。 */
+  /** 该 section 是否被外部通过 {@link #setBlockState}（或调色板裁剪/降级）改写。 */
   public boolean isModified() {
     return this.modified;
   }
@@ -249,92 +249,13 @@ public class ChunkSection {
     return this.palette.contains(stateId);
   }
 
-  /** 按序号读出全部 4096 个方块状态（供重排自检与单测；不改变任何状态）。 */
+  /** 按序号读出全部 4096 个方块状态（供裁剪/降级自检与单测；不改变任何状态）。 */
   public int[] readAllBlockStates() {
     int[] states = new int[SECTION_VOLUME];
     for (int i = 0; i < states.length; i++) {
       states[i] = this.getBlockState(i);
     }
     return states;
-  }
-
-  /**
-   * 按出现频次重排调色板：出现次数多的方块状态排到低位索引，从而让位打包数据产生更多 0 位、提升网络压缩率。
-   *
-   * <p>只对间接调色板生效（单值/直接调色板没有可重排的调色板段，返回 false）。调色板值与位打包索引
-   * 同步重映射，因此方块状态语义完全不变；位宽与方块计数不动。
-   *
-   * @param verify true 时对重排前后的方块序列做自检，不一致即抛 {@link IllegalStateException}
-   *               （由调用方 fail-open）；会额外分配两份 4096 长数组，仅在配置开启时使用
-   * @return 是否实际发生了重排
-   */
-  public boolean reorderPaletteByFrequency(boolean verify) {
-    if (!(this.palette instanceof IndirectPalette indirectPalette)) {
-      return false;
-    }
-
-    int size = indirectPalette.paletteSize();
-    if (size <= 1) {
-      return false;
-    }
-
-    int[] before = verify ? readAllBlockStates() : null;
-
-    int[] frequency = new int[size];
-    for (int i = 0; i < SECTION_VOLUME; i++) {
-      frequency[this.data.get(i)]++;
-    }
-
-    // 频次降序；同频保持原索引顺序（即按原索引升序），保证结果确定（同输入必然同输出，缓存可复用）。
-    // 用 int[] + 内联选择排序代替 Integer[] + Arrays.sort：避免每项装箱/比较器调用；间接调色板
-    // 容量上限就是 256（8 位，{@code 1 << bitsPerBlock} 的最大值），O(n²) 足够，且排序结果与旧比较器
-    // 语义逐位一致（主键频次降序、次键索引升序）。
-    int[] order = new int[size];
-    for (int i = 0; i < size; i++) {
-      order[i] = i;
-    }
-    for (int i = 0; i < size - 1; i++) {
-      int best = i;
-      for (int j = i + 1; j < size; j++) {
-        int candidate = order[j];
-        int current = order[best];
-        if (frequency[candidate] > frequency[current]
-            || (frequency[candidate] == frequency[current] && candidate < current)) {
-          best = j;
-        }
-      }
-      if (best != i) {
-        int swap = order[i];
-        order[i] = order[best];
-        order[best] = swap;
-      }
-    }
-
-    int[] remap = new int[size];
-    int[] values = new int[size];
-    boolean changed = false;
-    for (int newId = 0; newId < size; newId++) {
-      int oldId = order[newId];
-      remap[oldId] = newId;
-      values[newId] = indirectPalette.valueAt(oldId);
-      if (oldId != newId) {
-        changed = true;
-      }
-    }
-    if (!changed) {
-      return false;
-    }
-
-    for (int i = 0; i < SECTION_VOLUME; i++) {
-      this.data.set(i, remap[this.data.get(i)]);
-    }
-    indirectPalette.rebuild(values);
-    this.modified = true;
-
-    if (verify && !Arrays.equals(before, readAllBlockStates())) {
-      throw new IllegalStateException("调色板重排自检失败：方块序列发生变化");
-    }
-    return true;
   }
 
   /**
@@ -395,7 +316,8 @@ public class ChunkSection {
     }
 
     // 3) 计算裁剪后的最小位宽并重建：kept ≤ size ⇒ targetBits ≤ bitsPerBlock，位宽单调不增
-    //   （间接调色板下限 4 位；kept=1 时也保持 4 位间接，不迁移到单值调色板）
+    //   （间接调色板下限 4 位）。kept==1 时本方法仍是 4 位间接——更省的「单值调色板」表示由
+    //   {@link #downgradePalette(boolean)} 在其后单独完成（职责分离：此处只做裁剪与常规降位）。
     int targetBits = Math.max(4, 32 - Integer.numberOfLeadingZeros(kept - 1));
 
     if (targetBits == this.bitsPerBlock) {
@@ -418,6 +340,115 @@ public class ChunkSection {
 
     if (verify && !Arrays.equals(before, readAllBlockStates())) {
       throw new IllegalStateException("调色板裁剪自检失败：方块序列发生变化");
+    }
+    return true;
+  }
+
+  /**
+   * 调色板降级收尾：紧跟在 {@link #compactPalette(boolean)} 之后调用，把「收缩后仍偏大的」表示换成
+   * 线格式允许的更省表示，是「位宽预算封顶」的第二段收益。
+   *
+   * <p><b>为什么需要</b>：{@code compactPalette} 只做「按引用计数裁剪 + 位宽下压」，其下限是 4 位间接调色板：
+   * <ul>
+   *   <li><b>被引用状态数 == 1</b> 时它仍写 4 位间接调色板（4096 个索引 ≈ 2048 字节），而协议允许
+   *       <b>单值调色板</b>（{@code bitsPerBlock=0}：只写一个 VarInt 状态 id、无索引数组，约 10 字节）。
+   *       地下纯石头区把矿脉全部伪装成石头后整节只剩一种方块，属常见且白白多花约 2KB/节 的场景；</li>
+   *   <li><b>直接调色板（15 位）</b>改写后若被引用状态数 ≤ 256，应降回间接调色板并取最小位宽（4~8 位），
+   *       而不是继续写 15 位——原实现完全不处理直接调色板。</li>
+   * </ul>
+   *
+   * <p><b>语义与不变式</b>：只做「同一状态集合的等价重编码」，方块状态序列逐格不变；位宽<b>单调不增</b>
+   * （间接 → 单值降为 0；直接 15 位 → 间接 ≤ 8 位）。不满足降级条件（被引用状态数 &gt; 256、或版本不支持
+   * 单值调色板时的间接输入）返回 false 且不改动任何状态。
+   *
+   * <p><b>空节/全空气边界</b>：只按「数据实际引用的状态」判定，{@code blockCount} 与流体计数一律不动——
+   * 因此绝不会把「一种方块的实心节」错判成空节，也不会改变任何方块语义。
+   *
+   * <p>失败（内部不变量被破坏）由调用方兜底：放弃降级、保留已完成替换的结果（宁可包体大，不可漏伪装）。
+   *
+   * @param verify true 时对降级前后的方块序列做自检，不一致即抛 {@link IllegalStateException}
+   *               （由调用方 fail-open）；会额外分配两份 4096 长数组，仅在配置开启时使用
+   * @return 是否实际发生了降级
+   */
+  public boolean downgradePalette(boolean verify) {
+    if (this.bitsPerBlock == 0) {
+      return false; // 已是单值调色板，无需降级
+    }
+    boolean direct = this.palette instanceof DirectPalette;
+    boolean indirect = this.palette instanceof IndirectPalette;
+    if (!direct && !indirect) {
+      return false;
+    }
+    if (indirect && this.palette.size() == 0) {
+      // 空调色板（损坏/异常输入）：数据里任何索引都越界。此处不降级，交由既有路径处理，
+      // 避免把一个「本可原样搬运」的节变成非预期异常。
+      return false;
+    }
+
+    int[] before = verify ? readAllBlockStates() : null;
+
+    // 统计数据实际引用到的「方块状态」集合（首次出现顺序；上限 257，超过 256 即无法降为间接）。
+    // 直接调色板的数据值即状态 id；间接调色板的数据值是本地索引，需经调色板换算成状态 id。
+    // 用线性查找而非哈希：降级只在「确实需要」时发生，且最多看 256 个不同状态，代价可忽略。
+    Palette currentPalette = this.palette;
+    int[] states = new int[257];
+    int distinct = 0;
+    for (int i = 0; i < SECTION_VOLUME; i++) {
+      int state = direct ? this.data.get(i) : currentPalette.valueFor(this.data.get(i));
+      boolean seen = false;
+      for (int j = 0; j < distinct; j++) {
+        if (states[j] == state) {
+          seen = true;
+          break;
+        }
+      }
+      if (!seen) {
+        if (distinct == states.length - 1) {
+          return false; // 引用状态数 > 256：无法降为间接，保持原表示（直接调色板继续用）
+        }
+        states[distinct++] = state;
+      }
+    }
+    if (distinct == 0) {
+      return false; // 无数据可读/空调色板：不降级（既不动损坏数据，也不把有方块的节错判成空）
+    }
+
+    if (distinct == 1) {
+      if (versionFlags.hasSingleValuePalette()) {
+        // 单值调色板：只写一个 VarInt 状态 id、无位打包数据（ZeroVarBitBuffer 恒读 0）。
+        // 为什么直接改字段而不复用 setBitsPerBlock：后者只能从 0 起建调色板（SingleValuePalette 初值 -1/0），
+        // 无法承载这里已知的唯一状态 id。
+        this.bitsPerBlock = 0;
+        this.palette = new SingleValuePalette(this, states[0]);
+        this.data = new ZeroVarBitBuffer(SECTION_VOLUME);
+        this.modified = true;
+        if (verify && !Arrays.equals(before, readAllBlockStates())) {
+          throw new IllegalStateException("调色板降级自检失败：方块序列发生变化");
+        }
+        return true;
+      }
+      // 版本不支持单值调色板：退化为最小位宽间接（4 位），语义不变（下面 indirect 分支会拦住，不会重复降级）
+    }
+
+    if (indirect) {
+      // 间接调色板经 compactPalette 收缩后，位宽已满足位宽-条目数的最小对应关系（除非上面 distinct==1 已降为单值）；
+      // 此处不再重复重建，保持「位宽单调不增」且不做无谓拷贝。
+      return false;
+    }
+
+    // 直接调色板 → 间接调色板：位宽取满足状态数的最小值（间接下限 4 位，上限 8 位）。
+    int targetBits = Math.max(4, 32 - Integer.numberOfLeadingZeros(distinct - 1));
+    VarBitBuffer oldData = this.data;
+    this.setBitsPerBlock(targetBits, true);
+    IndirectPalette rebuilt = (IndirectPalette) this.palette;
+    for (int i = 0; i < SECTION_VOLUME; i++) {
+      // oldData.get(i) 即方块状态 id（直接调色板语义），idFor 按首次出现顺序分配本地索引
+      this.data.set(i, rebuilt.idFor(oldData.get(i)));
+    }
+    this.modified = true;
+
+    if (verify && !Arrays.equals(before, readAllBlockStates())) {
+      throw new IllegalStateException("调色板降级自检失败：方块序列发生变化");
     }
     return true;
   }

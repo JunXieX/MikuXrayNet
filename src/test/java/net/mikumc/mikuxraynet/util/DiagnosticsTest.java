@@ -250,23 +250,24 @@ class DiagnosticsTest {
   }
 
   /**
-   * 调色板重排的回显必须把「模块总开关」与「行为开关 reorder」合成一句无歧义中文：
-   * 只打印 {@code palette.enabled()} 会输出「调色板重排 true」，而真正决定是否重排的是 reorder（默认 false）。
+   * 调色板压缩的回显必须把「模块总开关」与「行为开关 width-budget」合成一句无歧义中文：
+   * 只打印 {@code palette.enabled()} 会输出「调色板压缩 true」，而真正决定是否收缩/降级的是 width-budget。
    */
   @Test
   void paletteSwitchIsUnambiguous() {
-    String defaultOff = String.join("\n",
+    String defaultOn = String.join("\n",
         Diagnostics.formatStatus(fixed(bandwidth("enabled: true\n"))));
-    assertTrue(defaultOff.contains("调色板重排 关闭（模块启用但 reorder=false，不做任何重排）"),
-        "模块启用 + reorder=false 时必须明确写「不做任何重排」：" + defaultOff);
+    assertTrue(defaultOn.contains("调色板压缩 启用（改写后收缩 + 单值/低位宽降级）"),
+        "模块启用 + width-budget 默认 true 时必须写明收缩/降级：" + defaultOn);
 
-    String reorderOn = String.join("\n",
-        Diagnostics.formatStatus(fixed(bandwidth("palette:\n  reorder: true\n"))));
-    assertTrue(reorderOn.contains("调色板重排 启用（reorder=true）"), reorderOn);
+    String budgetOff = String.join("\n",
+        Diagnostics.formatStatus(fixed(bandwidth("palette:\n  width-budget: false\n"))));
+    assertTrue(budgetOff.contains("调色板压缩 关闭（模块启用但 width-budget=false，不做任何收缩/降级）"),
+        budgetOff);
 
     String moduleOff = String.join("\n",
         Diagnostics.formatStatus(fixed(bandwidth("palette:\n  enabled: false\n"))));
-    assertTrue(moduleOff.contains("调色板重排 关闭（模块未启用，不做任何重排）"), moduleOff);
+    assertTrue(moduleOff.contains("调色板压缩 关闭（模块未启用，不做任何收缩/降级）"), moduleOff);
   }
 
   /**

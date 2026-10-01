@@ -392,7 +392,7 @@ class PeRealDataOcclusionTest {
     ChunkCodec codec = new ChunkCodec(registry, ChunkVersionFlags.PAPER_26_2);
     ObfuscationProcessor processor = new ObfuscationProcessor(codec, registry::isOccluding, targets,
         new int[] {stoneId}, new int[] {1}, false, true,
-        ObfuscationProcessor.PaletteOptions.DISABLED);
+        new ObfuscationProcessor.PaletteOptions(false, false));
 
     ObfuscationProcessor.Result result = processor.rewrite(source, 1, 42L, null);
 
@@ -430,7 +430,7 @@ class PeRealDataOcclusionTest {
     ChunkCodec codec = new ChunkCodec(registry, ChunkVersionFlags.PAPER_26_2);
     ObfuscationProcessor processor = new ObfuscationProcessor(codec, registry::isOccluding, targets,
         new int[] {stoneId}, new int[] {1}, false, true,
-        ObfuscationProcessor.PaletteOptions.DISABLED);
+        new ObfuscationProcessor.PaletteOptions(false, false));
 
     ObfuscationProcessor.Result result = processor.rewrite(source, 1, 42L, null);
 

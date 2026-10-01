@@ -473,28 +473,27 @@ public final class Diagnostics {
     return "带宽开关：总开关 " + c.enabled()
         + "｜零位移取消 " + c.entityPackets().enabled()
         + "｜变更合并 " + c.blockChanges().enabled()
-        + "｜调色板重排 " + paletteSwitch(c.palette())
+        + "｜调色板压缩 " + paletteSwitch(c.palette())
         + "｜实体剔除 " + c.entityCulling().enabled()
         + "｜AFK 降级 " + afkSwitch(c.afk())
         + "｜高延迟降视距 " + c.latency().enabled();
   }
 
   /**
-   * 调色板重排的开关回显。
+   * 调色板压缩的开关回显。
    *
-   * <p><b>为什么不直接打印 {@code palette.enabled()}</b>：调色板模块有「总开关」与「行为开关 reorder」
-   * 两层，真正的重排只由 {@code reorder} 决定（默认 false，实测重排会使压缩字节变大）。
-   * 只打印模块总开关时会出现「调色板重排 true」这种极易被误读为「重排已启用」的输出，
-   * 因此这里把两层的实际效果合成一句无歧义的中文。
+   * <p><b>为什么按「实际是否发生收缩/降级」回显</b>：调色板模块有「总开关」与「行为开关 width-budget」
+   * 两层，真正的收缩/降级只由 {@code width-budget} 决定（默认 true）。只打印模块总开关会出现
+   * 「调色板压缩 true」这种极易被误读为「已在收缩」的输出，因此这里把两层的实际效果合成一句无歧义的中文。
    */
   private static String paletteSwitch(BandwidthConfig.Palette palette) {
     if (!palette.enabled()) {
-      return "关闭（模块未启用，不做任何重排）";
+      return "关闭（模块未启用，不做任何收缩/降级）";
     }
-    if (!palette.reorder()) {
-      return "关闭（模块启用但 reorder=false，不做任何重排）";
+    if (!palette.widthBudget()) {
+      return "关闭（模块启用但 width-budget=false，不做任何收缩/降级）";
     }
-    return "启用（reorder=true）";
+    return "启用（改写后收缩 + 单值/低位宽降级）";
   }
 
   /**
@@ -658,7 +657,6 @@ public final class Diagnostics {
         .append("，resend-on-overflow=").append(c.blockChanges().resendOnOverflow())
         .append("，max-pending-entries=").append(c.blockChanges().maxPendingEntries()).append('\n');
     sb.append("palette.enabled=").append(c.palette().enabled())
-        .append("，reorder=").append(c.palette().reorder())
         .append("，strict-verify=").append(c.palette().strictVerify())
         .append("，width-budget=").append(c.palette().widthBudget()).append('\n');
     sb.append("entity-culling.enabled=").append(c.entityCulling().enabled())

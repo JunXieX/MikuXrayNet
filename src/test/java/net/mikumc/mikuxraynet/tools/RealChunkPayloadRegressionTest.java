@@ -382,7 +382,7 @@ class RealChunkPayloadRegressionTest {
     }
     // 真机配置：layer-obfuscation=false，neighbors.missing-policy=hide（离线无邻块快照，按缺失处理）
     return new ObfuscationProcessor(codec, registry::isOccluding, targets, replacementIds, cumulative,
-        false, true, ObfuscationProcessor.PaletteOptions.DISABLED);
+        false, true, new ObfuscationProcessor.PaletteOptions(false, false));
   }
 
   /** 读取随插件打包的 {@code antixray.yml} 里主世界维度的 {@code hide-blocks}（不依赖 Bukkit YAML）。 */

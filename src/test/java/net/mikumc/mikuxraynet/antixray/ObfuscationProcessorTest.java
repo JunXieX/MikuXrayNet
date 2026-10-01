@@ -350,7 +350,7 @@ class ObfuscationProcessorTest {
     targets.set(DIAMOND_ORE);
     return new ObfuscationProcessor(new ChunkCodec(registry(), MODERN), blockId -> blockId != AIR,
         targets, new int[] {STONE}, new int[] {1}, false, missingPolicyHide,
-        ObfuscationProcessor.PaletteOptions.DISABLED);
+        new ObfuscationProcessor.PaletteOptions(false, false));
   }
 
   /** {@code obfuscation.mode: all} 的处理器：所有目标矿一律伪装，不做 6 面遮挡判定。 */
@@ -359,14 +359,14 @@ class ObfuscationProcessorTest {
     targets.set(DIAMOND_ORE);
     return new ObfuscationProcessor(new ChunkCodec(registry(), MODERN), blockId -> blockId != AIR,
         targets, new int[] {STONE}, new int[] {1}, false, false,
-        ObfuscationProcessor.PaletteOptions.DISABLED, true);
+        new ObfuscationProcessor.PaletteOptions(false, false), true);
   }
 
   /** 未生效档案（没有隐藏方块）：改写整体跳过。 */
   private static ObfuscationProcessor inactiveProcessor() {
     return new ObfuscationProcessor(new ChunkCodec(registry(), MODERN), blockId -> blockId != AIR,
         new BitSet(), new int[] {STONE}, new int[] {1}, false, false,
-        ObfuscationProcessor.PaletteOptions.DISABLED);
+        new ObfuscationProcessor.PaletteOptions(false, false));
   }
 
   private static int index(int x, int y, int z) {

@@ -16,8 +16,8 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
 
 /**
- * 反矿透核心：对单个区块做「6 面正交遮挡判定 + 按权重随机替换」，并可顺带做调色板压缩重排、
- * 位宽预算封顶与失效条目裁剪。
+ * 反矿透核心：对单个区块做「6 面正交遮挡判定 + 按权重随机替换」，并可顺带做调色板压缩与位宽预算封顶
+ * （改写后裁剪失效条目、按状态数降位宽、并在可能时降级为单值/间接调色板表示）。
  *
  * <p><b>判定语义</b>：由 {@code dimensions.<维度>.mode} 选择（<b>按维度独立</b>）——
  * <ul>
@@ -46,7 +46,8 @@ import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
  * <p><b>位宽预算封顶（P0-1）</b>：改写每个 section 前把「所有候选表合计将引入的新状态数」与当前
  * 位宽容量（{@code 1 << bitsPerBlock} − 已有条目数）对账，超预算时各候选表只保留已在调色板内的
  * 伪装方块（避免升位）；改写后裁剪引用计数为 0 的失效条目（被替换掉的矿）并在可能时降位宽，
- * 位宽<b>单调不增</b>。仅当调色板内候选完全耗尽才允许 grow（逃生口）——
+ * 位宽<b>单调不增</b>；再对被引用状态数只剩 1 的节降级为单值调色板、对 ≤256 状态的直接调色板
+ * 降级为间接调色板。仅当调色板内候选完全耗尽才允许 grow（逃生口）——
  * <b>红线：宁可包体大，不可漏伪装</b>；任何裁剪失败只放弃体积优化，不回滚已完成的替换。
  *
  * <p><b>关键优化</b>：
@@ -67,11 +68,8 @@ public final class ObfuscationProcessor {
   private static final int SECTION_VOLUME = 4096;
   private static final int[] NO_POSITIONS = new int[0];
 
-  /** 调色板选项：压缩重排 + 自检 + 位宽预算封顶。 */
-  public record PaletteOptions(boolean reorder, boolean strictVerify, boolean widthBudget) {
-
-    /** 全关（保持 P0-1 之前的行为：不重排、不封顶、不裁剪）。 */
-    public static final PaletteOptions DISABLED = new PaletteOptions(false, false, false);
+  /** 调色板选项：压缩收缩 + 自检 + 位宽预算封顶（含单值/低位宽降级）。 */
+  public record PaletteOptions(boolean strictVerify, boolean widthBudget) {
   }
 
   /**
@@ -395,7 +393,7 @@ public final class ObfuscationProcessor {
    * @param cumulativeWeights 与 {@code replacementIds} 等长的累计权重（严格递增，末项为总权重）
    * @param layerObfuscation  true 时同一高度层统一使用同一种伪装方块
    * @param missingPolicyHide 邻块数据缺失时是否视为遮挡（true=宁可多伪装）
-   * @param paletteOptions    调色板重排选项
+   * @param paletteOptions    调色板压缩选项（自检 / 位宽预算封顶，含单值/低位宽降级）
    *
    * <p>测试专用豁免：生产装配一律走 {@link #create}，本构造当前仅单测在用，保留以免破坏测试。
    */
@@ -508,7 +506,7 @@ public final class ObfuscationProcessor {
   }
 
   /**
-   * 兼容构造：邻块缺失按「暴露」处理、不做调色板重排、模式为 enclosed（即接入邻块快照之前的行为）。
+   * 兼容构造：邻块缺失按「暴露」处理、不做调色板压缩、模式为 enclosed（即接入邻块快照之前的行为）。
    *
    * <p>测试专用豁免：生产装配一律走 {@link #create}（或 9 参完整构造），本构造当前仅单测在用，
    * 保留以免破坏既有测试。
@@ -516,7 +514,7 @@ public final class ObfuscationProcessor {
   public ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, BitSet targets,
       int[] replacementIds, int[] cumulativeWeights, boolean layerObfuscation) {
     this(codec, occlusionTable, targets, replacementIds, cumulativeWeights, layerObfuscation, false,
-        PaletteOptions.DISABLED);
+        new PaletteOptions(false, false));
   }
 
   /**
@@ -768,18 +766,16 @@ public final class ObfuscationProcessor {
             sectionBits = new int[sectionCount];
             Arrays.fill(sectionBits, -1);
           }
-          // 位宽预算封顶收尾（P0-1）：裁剪引用计数为 0 的失效条目并在可能时降位宽。
+          // 位宽预算封顶收尾（P0-1）：裁剪引用计数为 0 的失效条目并在可能时降位宽，随后把
+          // 「只剩一种方块」的节降级为单值调色板、把 ≤256 状态的直接调色板降为间接调色板。
           // 失败只放弃体积优化，绝不回滚已完成的替换（宁可包体大，不可漏伪装）。
           if (paletteOptions.widthBudget()) {
             try {
-              section.compactPalette(false);
+              section.compactPalette(paletteOptions.strictVerify());
+              section.downgradePalette(paletteOptions.strictVerify());
             } catch (RuntimeException pruneFailure) {
-              // 裁剪失败：保留替换结果原样（可能已 grow），伪装正确性不受影响
+              // 裁剪/降级失败：保留替换结果原样（可能已 grow），伪装正确性不受影响
             }
-          }
-          // 调色板压缩重排只作用于被改动的 section：未改动的 section 保持原字节（选择性重编码的前提）
-          if (paletteOptions.reorder()) {
-            section.reorderPaletteByFrequency(paletteOptions.strictVerify());
           }
           sectionBits[sectionIndex] = section.bitsPerBlock();
         }

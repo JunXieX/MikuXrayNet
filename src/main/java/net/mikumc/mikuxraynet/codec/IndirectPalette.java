@@ -124,22 +124,9 @@ public class IndirectPalette implements Palette {
   }
 
   /**
-   * 用新的值顺序重建索引表（{@code values} 必须是原值集合的一个排列）。
-   *
-   * <p>用于调色板重排：索引表与 {@code byValue} 反查表一并更新，语义不变。
-   */
-  void rebuild(int[] values) {
-    this.size = values.length;
-    for (int id = 0; id < values.length; id++) {
-      this.byId[id] = values[id];
-      this.byValue[values[id]] = (byte) id;
-    }
-  }
-
-  /**
    * 用保留的值<b>子集</b>重建索引表（裁剪掉未列出的旧条目）。
    *
-   * <p>与 {@link #rebuild(int[])}（全量排列）不同，本方法允许 {@code values} 只包含原值集合的一部分。
+   * <p>与「全量排列」不同，本方法允许 {@code values} 只包含原值集合的一部分。
    * 正确性由「{@code size} 收缩 + {@code byId} 反查校验」共同保证：命中判定要求
    * {@code id < size && byId[id] == value}，被裁剪条目的 {@code byValue} 反查记录即使仍残留旧索引，
    * 也因 {@code byId} 对不上（或索引越界）而不被误命中，之后再次遇到这些方块状态时会作为新条目重新登记。

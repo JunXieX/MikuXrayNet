@@ -71,7 +71,7 @@ class UseBlockBelowObfuscationTest {
       boolean obfuscateAll) {
     return new ObfuscationProcessor(new ChunkCodec(registry(), MODERN),
         blockId -> blockId != AIR, oreTargets(), new int[] {fallback}, new int[] {1}, false,
-        true, ObfuscationProcessor.PaletteOptions.DISABLED, obfuscateAll, useBlockBelow,
+        true, new ObfuscationProcessor.PaletteOptions(false, false), obfuscateAll, useBlockBelow,
         BELOW_USABLE);
   }
 
@@ -270,7 +270,7 @@ class UseBlockBelowObfuscationTest {
                 netherrack: 1
         """);
     return new ObfuscationProcessor(new ChunkCodec(registry(), MODERN), blockId -> blockId != AIR,
-        false, true, ObfuscationProcessor.PaletteOptions.DISABLED, true, BELOW_USABLE,
+        false, true, new ObfuscationProcessor.PaletteOptions(false, false), true, BELOW_USABLE,
         defaultProfile, new ObfuscationProcessor.WorldProfile[] {netherProfile}, config);
   }
 
@@ -325,7 +325,7 @@ class UseBlockBelowObfuscationTest {
     // widthBudget 开启；候选表=[石头]（在调色板内 → 候选本身不超预算，但剩余空位为 0）
     ObfuscationProcessor processor = new ObfuscationProcessor(new ChunkCodec(registry(), MODERN),
         blockId -> blockId != AIR, oreTargets(), new int[] {STONE}, new int[] {1}, false,
-        true, new ObfuscationProcessor.PaletteOptions(false, false, true), true, true,
+        true, new ObfuscationProcessor.PaletteOptions(false, true), true, true,
         BELOW_USABLE);
     ObfuscationProcessor.Result result = processor.rewrite(source, 2, 42L, null, null, 0);
 
@@ -348,7 +348,7 @@ class UseBlockBelowObfuscationTest {
 
     ObfuscationProcessor processor = new ObfuscationProcessor(new ChunkCodec(registry(), MODERN),
         blockId -> blockId != AIR, oreTargets(), new int[] {STONE}, new int[] {1}, false,
-        true, new ObfuscationProcessor.PaletteOptions(false, false, true), true, true,
+        true, new ObfuscationProcessor.PaletteOptions(false, true), true, true,
         BELOW_USABLE);
     ObfuscationProcessor.Result result = processor.rewrite(source, 2, 42L, null, null, 0);
 
@@ -380,7 +380,7 @@ class UseBlockBelowObfuscationTest {
 
     ObfuscationProcessor processor = new ObfuscationProcessor(new ChunkCodec(registry(), MODERN),
         blockId -> blockId != AIR, oreTargets(), new int[] {STONE}, new int[] {1}, false,
-        true, new ObfuscationProcessor.PaletteOptions(false, false, true), true, true,
+        true, new ObfuscationProcessor.PaletteOptions(false, true), true, true,
         BELOW_USABLE);
     ObfuscationProcessor.Result result = processor.rewrite(source, 2, 42L, null, null, 0);
 

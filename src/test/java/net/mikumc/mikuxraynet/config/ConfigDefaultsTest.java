@@ -452,7 +452,7 @@ class ConfigDefaultsTest {
 
   /**
    * 新增的各模块总开关（{@code *.enabled}）默认必须为 true —— 补开关不得改变既有行为。
-   * 同时锁住 {@code palette.reorder} 仍为 false（zlib/zstd 两种压缩口径实测均无收益）。
+   * 同时锁住 {@code palette.width-budget} 默认开启（收缩/降级收益），且 {@code palette.strict-verify} 默认关闭。
    */
   @Test
   void bandwidthModuleSwitchesDefaultToEnabled() {
@@ -461,10 +461,11 @@ class ConfigDefaultsTest {
     assertTrue(config.entityPackets().enabled(), "零位移实体包取消默认启用");
     assertTrue(config.blockChanges().enabled(), "方块变更合并默认启用");
     assertTrue(config.palette().enabled(), "调色板模块默认启用");
+    assertTrue(config.palette().widthBudget(), "调色板位宽预算（含单值/低位宽降级）默认启用");
+    assertFalse(config.palette().strictVerify(), "调色板自检默认关闭（仅在排查问题时开启）");
     assertTrue(config.entityCulling().enabled(), "实体射线剔除默认启用");
     assertTrue(config.afk().enabled(), "AFK 降级默认启用（新增开关不得改变既有行为）");
     assertTrue(config.latency().enabled(), "高延迟降视距默认启用（新增开关不得改变既有行为）");
-    assertFalse(config.palette().reorder(), "调色板重排默认保持 false（两种压缩口径实测均无收益）");
   }
 
   /** 各模块总开关可被显式关闭（false），用于确认开关确实接入了配置解析。 */
@@ -676,8 +677,9 @@ class ConfigDefaultsTest {
     assertTrue(config.blockChanges().resendOnOverflow(), "超限拆分续发默认开启");
     assertEquals(256, config.blockChanges().maxPendingEntries(), "待发缓冲上限默认 256 条");
 
-    // palette：strict-verify（reorder 默认已在既有测试锁定为 false）
-    assertFalse(config.palette().strictVerify(), "重排自检默认关闭（仅 reorder=true 时有意义）");
+    // palette：strict-verify / width-budget（width-budget 默认已在既有测试锁定为 true）
+    assertFalse(config.palette().strictVerify(), "调色板收缩/降级自检默认关闭（仅 width-budget=true 时有意义）");
+    assertTrue(config.palette().widthBudget(), "调色板位宽预算（含单值/低位宽降级）默认开启");
 
     // entity-culling 其余键（threads 键已彻底删除，其残留配置的兼容性见下方专项测试）
     assertTrue(config.entityCulling().raycast(), "实体射线判定默认开启");

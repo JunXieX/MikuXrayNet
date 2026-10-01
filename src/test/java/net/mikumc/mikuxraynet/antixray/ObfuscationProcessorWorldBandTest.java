@@ -115,8 +115,8 @@ class ObfuscationProcessorWorldBandTest {
       boolean widthBudget) {
     return new ObfuscationProcessor(codec(), blockId -> true, false, true,
         widthBudget
-            ? new ObfuscationProcessor.PaletteOptions(false, false, true)
-            : ObfuscationProcessor.PaletteOptions.DISABLED,
+            ? new ObfuscationProcessor.PaletteOptions(false, true)
+            : new ObfuscationProcessor.PaletteOptions(false, false),
         false, null, profile, new ObfuscationProcessor.WorldProfile[0], null);
   }
 
@@ -359,7 +359,7 @@ class ObfuscationProcessorWorldBandTest {
     ObfuscationProcessor.WorldProfile starredProfile =
         profile(new int[] {STONE}, new int[0], 16, 32);
     ObfuscationProcessor processor = new ObfuscationProcessor(codec(), blockId -> true, false, true,
-        ObfuscationProcessor.PaletteOptions.DISABLED, false, null,
+        new ObfuscationProcessor.PaletteOptions(false, false), false, null,
         defaultProfile, new ObfuscationProcessor.WorldProfile[] {netherProfile, starredProfile},
         config);
 
@@ -395,7 +395,7 @@ class ObfuscationProcessorWorldBandTest {
         new BitSet(), new int[0], new int[0], new int[0], new int[0],
         new int[0][], new int[0][], Integer.MIN_VALUE, Integer.MAX_VALUE, true);
     ObfuscationProcessor processor = new ObfuscationProcessor(codec(), blockId -> true, false, true,
-        ObfuscationProcessor.PaletteOptions.DISABLED, false, null,
+        new ObfuscationProcessor.PaletteOptions(false, false), false, null,
         empty, new ObfuscationProcessor.WorldProfile[0], null);
 
     assertFalse(processor.isActive(), "空档案不具备生效条件");

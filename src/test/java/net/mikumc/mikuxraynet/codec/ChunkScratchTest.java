@@ -68,7 +68,7 @@ class ChunkScratchTest {
 
     int[] indices = new int[SECTION_VOLUME];
     for (int i = 0; i < indices.length; i++) {
-      // 高频状态落在最后一个索引（重排应把它提到索引 0）
+      // 高频状态落在最后一个索引（数据分布刻意不均匀，用于暴露位打包/复用问题）
       indices[i] = i < 4000 ? palette.length - 1 : i % 7;
     }
 
@@ -78,8 +78,8 @@ class ChunkScratchTest {
         .build();
   }
 
-  /** 一次「解码 → 改写 → 重排 → 重编码」；返回字节结果与读回的方块序列。 */
-  private record Outcome(byte[] encoded, int[] states, boolean sectionZeroReordered) {
+  /** 一次「解码 → 改写 → 重编码」；返回字节结果与读回的方块序列。 */
+  private record Outcome(byte[] encoded, int[] states) {
   }
 
   private static Outcome runOnce(ChunkCodec codec, byte[] raw) {
@@ -89,14 +89,12 @@ class ChunkScratchTest {
       // section 1：单值调色板改第二种方块 → 触发升位到间接调色板
       chunk.getSection(1).setBlockState(0, 0, 0, 23456);
 
-      boolean reordered = chunk.getSection(0).reorderPaletteByFrequency(false);
-
       int[] states = new int[SECTION_COUNT * SECTION_VOLUME];
       for (int section = 0; section < SECTION_COUNT; section++) {
         int[] local = chunk.getSection(section).readAllBlockStates();
         System.arraycopy(local, 0, states, section * SECTION_VOLUME, SECTION_VOLUME);
       }
-      return new Outcome(chunk.finalizeOutput(), states, reordered);
+      return new Outcome(chunk.finalizeOutput(), states);
     }
   }
 
@@ -107,7 +105,6 @@ class ChunkScratchTest {
 
     Outcome first = runOnce(codec, raw);
     assertEquals(SECTION_COUNT * SECTION_VOLUME, first.states().length);
-    assertTrue(first.sectionZeroReordered(), "高频状态不在低位索引时应当发生重排");
     assertEquals(12345, first.states()[3 << 8 | 2 << 4 | 0], "section 0 的改写必须生效");
     assertEquals(23456, first.states()[SECTION_VOLUME], "section 1 的改写必须生效");
     // 池化数组复用后必须得到完全相同的字节：任何残留位/残留反查表都会在这里暴露
@@ -115,7 +112,6 @@ class ChunkScratchTest {
       Outcome next = runOnce(codec, raw);
       assertArrayEquals(first.encoded(), next.encoded(), "第 " + round + " 轮复用的重编码字节必须一致");
       assertArrayEquals(first.states(), next.states(), "第 " + round + " 轮复用的方块序列必须一致");
-      assertTrue(next.sectionZeroReordered(), "第 " + round + " 轮仍应发生重排");
     }
   }
 

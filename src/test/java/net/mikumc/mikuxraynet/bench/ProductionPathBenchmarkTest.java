@@ -157,10 +157,10 @@ class ProductionPathBenchmarkTest {
 
     // 与 antixray.yml 默认一致：stone 权重 10、deepslate 权重 8（累计权重 {10, 18}）。
     // netherrack 在桩注册表中无对应状态，故省略；layer-obfuscation=false；missing-policy=hide。
-    // 调色板重排取 PaletteOptions.DISABLED —— 与 bandwidth.yml: palette.reorder 的新默认值 false 一致。
+    // 调色板压缩关闭（widthBudget=false）——与「未改写前」的既有行为一致（不做收缩/降级）。
     return new ObfuscationProcessor(codec, registry::isOccluding, targets,
         new int[] {BenchFixtures.STONE, BenchFixtures.DEEPSLATE}, new int[] {10, 18},
-        false, true, ObfuscationProcessor.PaletteOptions.DISABLED);
+        false, true, new ObfuscationProcessor.PaletteOptions(false, false));
   }
 
   /**
@@ -418,7 +418,7 @@ class ProductionPathBenchmarkTest {
         + "遮挡表与目标位图由**离线桩注册表**（`StubRegistry`，不依赖 PacketEvents 平台初始化）提供\n");
     report.append("- 配置口径（与 antixray.yml 默认一致）：隐藏集合 = 6 种矿；伪装权重 stone:10 / deepslate:8；"
         + "层状伪装关闭；邻块缺失策略 hide\n");
-    report.append("- 调色板重排取 `PaletteOptions.DISABLED`，与 `bandwidth.yml: palette.reorder` 的新默认值 false 一致\n");
+    report.append("- 调色板压缩关闭（`PaletteOptions(false, false)`）：本节只测净改写路径，不含收缩/降级\n");
     report.append("- 先在所有形态之间**轮转预热 ").append(GLOBAL_WARMUP_ROUNDS)
         .append(" 轮**，再逐形态预热 ").append(WARMUP_ROUNDS).append(" 轮、测量 ").append(rounds)
         .append(" 轮；耗时取中位数；分配量为每轮 `getThreadAllocatedBytes` 差值\n");

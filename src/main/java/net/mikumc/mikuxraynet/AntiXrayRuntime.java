@@ -100,14 +100,13 @@ public final class AntiXrayRuntime {
 
     BlockStateRegistry registry = packetEventsHook.registry();
     ChunkCodec codec = new ChunkCodec(registry, versionFlags());
-    // 调色板压缩重排/位宽预算封顶由 bandwidth.yml 的 palette 段控制（与反矿透共用同一次编码）。
-    // palette.enabled=false（或带宽总开关关闭）时取 DISABLED，即完全不重排、不封顶，零开销。
+    // 调色板压缩/位宽预算封顶（含单值/低位宽降级）由 bandwidth.yml 的 palette 段控制（与反矿透共用同一次编码）。
+    // palette.enabled=false（或带宽总开关关闭）时 widthBudget=false，即完全不收缩、不降级，零开销。
     BandwidthConfig.Palette palette = config.bandwidth().palette();
     boolean paletteUsable = config.bandwidth().enabled() && palette.enabled();
     ObfuscationProcessor processor = ObfuscationProcessor.create(codec, registry, antiXray, logger,
-        new ObfuscationProcessor.PaletteOptions(paletteUsable && palette.reorder(),
-            paletteUsable && palette.strictVerify(),
-            // P0-1 位宽预算封顶（默认开）：修包体膨胀 + 拿降位宽收益
+        new ObfuscationProcessor.PaletteOptions(paletteUsable && palette.strictVerify(),
+            // P0-1 位宽预算封顶（默认开）：修包体膨胀 + 拿降位宽/单值降级收益
             paletteUsable && palette.widthBudget()));
     if (!processor.isActive()) {
       logger.warning("未解析到有效的隐藏方块或伪装方块，反矿透模块停用（请检查 antixray.yml）");

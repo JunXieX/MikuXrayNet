@@ -58,9 +58,9 @@ public final class ReloadCoordinator {
       "邻块快照开关/缺失策略/容量",
       "反矿透工作线程数与队列容量",
       "区块改写超时与改写缓存容量/过期",
-      // 调色板三键在启动期被固化为编码链路的 PaletteOptions（见 AntiXrayRuntime.startAntiXray），
-      // reload 只重启显形/带宽任务、不重建编码器，故这三键改了必须重启（含 reorder / width-budget / strict-verify）。
-      "调色板重排 / 位宽预算封顶 / 严格自检（palette.reorder / width-budget / strict-verify）");
+      // 调色板两键在启动期被固化为编码链路的 PaletteOptions（见 AntiXrayRuntime.startAntiXray），
+      // reload 只重启显形/带宽任务、不重建编码器，故这两键改了必须重启（含 width-budget / strict-verify）。
+      "调色板压缩 / 位宽预算封顶 / 严格自检（palette.width-budget / strict-verify）");
 
   /**
    * 执行一次热重载。

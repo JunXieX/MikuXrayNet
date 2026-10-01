@@ -89,7 +89,7 @@ class ObfuscationProcessorFluidRuleTest {
     ObfuscationProcessor.WorldProfile profile = profile();
     return new ObfuscationProcessor(new ChunkCodec(registry(), MODERN),
         blockId -> blockId != AIR && blockId != LAVA, false, true,
-        ObfuscationProcessor.PaletteOptions.DISABLED, state -> state != AIR, profile,
+        new ObfuscationProcessor.PaletteOptions(false, false), state -> state != AIR, profile,
         new ObfuscationProcessor.WorldProfile[] {profile, profile, profile},
         new ObfuscationProcessor.WorldProfile[0][3], null, fluidCover,
         blockId -> blockId == LAVA);

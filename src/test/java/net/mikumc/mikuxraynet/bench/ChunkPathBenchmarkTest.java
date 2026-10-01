@@ -31,14 +31,14 @@ import static org.junit.jupiter.api.Assertions.fail;
  *   <li>输出字节：重编码后整列字节数（确定性）；</li>
  *   <li>压缩字节：对整列字节分别做两种压缩——zlib（level {@code 6}，与 Minecraft 区块包默认压缩级别一致，
  *       <b>网络封包口径</b>）与 ZSTD（level {@code 3}，<b>磁盘缓存口径</b>，真实调用
- *       {@code com.github.luben.zstd.Zstd.compress(data, 3)}）——后的长度（确定性）。
- *       调色板重排只改索引排列、不改位宽与数组长度，因此<b>原始字节长度恒等</b>，带宽收益只能体现在压缩字节上；</li>
+ *       {@code com.github.luben.zstd.Zstd.compress(data, 3)}）后的长度（确定性）。
+ *       调色板收缩/降级会减少调色板条目并降低位宽（甚至改为单值调色板），因此原始字节与压缩字节都会下降；</li>
  *   <li>语义：同一输入 + 同一批改写下，各路径编码出的方块序列（24×4096 项）必须逐项相同，
  *       并额外做双向交叉解码（自研读 PE 字节、PE 读自研字节），不一致立即失败并打印差异位置。</li>
  * </ul>
  *
- * <p>形态集合取 {@link BenchFixtures#productionShapes()}（全实心 / 稀疏矿脉 / 洞穴 / 乱序调色板 / 主世界地下），
- * 以便在同一批负载上对「调色板频次重排」在两种压缩口径下的收益做可复现的对照。
+ * 形态集合取 {@link BenchFixtures#productionShapes()}（全实心 / 稀疏矿脉 / 洞穴 / 乱序调色板 / 主世界地下），
+ * 以便在同一批负载上对「调色板收缩 + 单值/低位宽降级」在两种压缩口径下的收益做可复现的对照。
  *
  * <p>断言只覆盖「语义一致 + 各路径都能稳定完成 + 数值被成功采集」，不断言「谁更快」——
  * CI 机器的耗时列会抖动，结论由读者看表得出。PacketEvents 路径若离线不可用，则跳过该路径并报告原因，而不是失败。
@@ -69,7 +69,7 @@ class ChunkPathBenchmarkTest {
   /** 一行测量结果。 */
   private record Row(String shape, int edits, String path, long medianNanos, long minNanos, long maxNanos,
       long allocatedBytes, int outputBytes, int compressedBytes, int compressedZstdBytes, double zeroRatio,
-      int reorderedSections) {
+      int compactedSections) {
   }
 
   @Test
@@ -77,35 +77,35 @@ class ChunkPathBenchmarkTest {
     long startedAt = System.nanoTime();
 
     List<BenchFixtures.Fixture> fixtures = BenchFixtures.productionShapes();
-    OurCodecPath codecWithoutReorder = new OurCodecPath(false);
-    OurCodecPath codecWithReorder = new OurCodecPath(true);
-    List<ChunkPath> ourPaths = List.of(codecWithoutReorder, codecWithReorder);
+    OurCodecPath codecWithoutCompact = new OurCodecPath(false);
+    OurCodecPath codecWithCompact = new OurCodecPath(true);
+    List<ChunkPath> ourPaths = List.of(codecWithoutCompact, codecWithCompact);
 
     String peUnavailableReason = probePePath(fixtures.getFirst());
     ChunkPath pePath = peUnavailableReason == null ? new PeModelPath() : null;
 
     // 1) 语义校验：同一输入 + 同一批改写，期望序列由「原始列的方块序列 + 改写」推出
     for (BenchFixtures.Fixture fixture : fixtures) {
-      int[] baseStates = codecWithoutReorder.readStates(fixture.bytes());
+      int[] baseStates = codecWithoutCompact.readStates(fixture.bytes());
       for (int editCount : EDIT_COUNTS) {
         BenchFixtures.Edit[] edits = BenchFixtures.edits(editCount);
         int[] expected = expectedStates(baseStates, edits);
         String label = fixture.name() + " / 改写 " + editCount;
 
-        byte[] outputWithoutReorder = codecWithoutReorder.encode(fixture.bytes(), edits);
-        assertSameSequence("自研 codec（" + label + "）", expected, codecWithoutReorder.readStates(outputWithoutReorder));
+        byte[] outputWithoutCompact = codecWithoutCompact.encode(fixture.bytes(), edits);
+        assertSameSequence("自研 codec（" + label + "）", expected, codecWithoutCompact.readStates(outputWithoutCompact));
 
-        byte[] outputWithReorder = codecWithReorder.encode(fixture.bytes(), edits);
-        assertSameSequence("自研 codec + 重排（" + label + "）", expected, codecWithReorder.readStates(outputWithReorder));
-        // 重排只重排调色板顺序与位打包索引，不得改变输出长度（位宽、调色板条目数都不变）
-        assertTrue(outputWithReorder.length <= outputWithoutReorder.length,
-            "开启重排不得使输出变长（" + label + "）：" + outputWithReorder.length + " > " + outputWithoutReorder.length);
+        byte[] outputWithCompact = codecWithCompact.encode(fixture.bytes(), edits);
+        assertSameSequence("自研 codec + 收缩降级（" + label + "）", expected, codecWithCompact.readStates(outputWithCompact));
+        // 收缩/降级只做等价重编码（裁剪失效条目、降位宽、单值/间接降级），不得改变方块序列、也不得使输出变长
+        assertTrue(outputWithCompact.length <= outputWithoutCompact.length,
+            "开启收缩/降级不得使输出变长（" + label + "）：" + outputWithCompact.length + " > " + outputWithoutCompact.length);
 
         if (pePath != null) {
           byte[] peOutput = pePath.encode(fixture.bytes(), edits);
           assertSameSequence("PacketEvents 模型（" + label + "）", expected, pePath.readStates(peOutput));
-          assertSameSequence("交叉解码：PE 读自研字节（" + label + "）", expected, pePath.readStates(outputWithReorder));
-          assertSameSequence("交叉解码：自研读 PE 字节（" + label + "）", expected, codecWithoutReorder.readStates(peOutput));
+          assertSameSequence("交叉解码：PE 读自研字节（" + label + "）", expected, pePath.readStates(outputWithCompact));
+          assertSameSequence("交叉解码：自研读 PE 字节（" + label + "）", expected, codecWithoutCompact.readStates(peOutput));
         }
       }
     }
@@ -264,10 +264,10 @@ class ChunkPathBenchmarkTest {
     Arrays.sort(durations);
     Arrays.sort(allocations);
 
-    int reordered = path instanceof OurCodecPath ourCodec ? ourCodec.reorderedSections() : 0;
+    int compacted = path instanceof OurCodecPath ourCodec ? ourCodec.compactedSections() : 0;
     return new Row(fixture.name(), edits.length, path.name(), durations[rounds / 2], durations[0],
         durations[rounds - 1], allocations[rounds / 2], firstOutput.length, compressedBytes(firstOutput),
-        compressedBytesZstd(firstOutput), zeroRatio(firstOutput), reordered);
+        compressedBytesZstd(firstOutput), zeroRatio(firstOutput), compacted);
   }
 
   /** JVM 的线程分配量统计；不支持则返回 {@code null}（报告里标注该列不可用）。 */
@@ -323,7 +323,7 @@ class ChunkPathBenchmarkTest {
     }
   }
 
-  /** 零字节占比：调色板重排的直接效果就是让位打包数据出现更多 0 位，从而更容易被压缩。 */
+  /** 零字节占比：位打包索引越小，数据里的 0 位越多，越容易被压缩。 */
   private static double zeroRatio(byte[] data) {
     int zeros = 0;
     for (byte value : data) {
@@ -365,7 +365,7 @@ class ChunkPathBenchmarkTest {
     }
 
     report.append("## 1. 逐行测量\n\n");
-    report.append("| 形态 | 修改数 | 路径 | 中位耗时(ms) | 最小/最大 | 分配(MB) | 输出字节 | zlib6 字节 | zstd3 字节 | 零字节占比 | 重排 section |\n");
+    report.append("| 形态 | 修改数 | 路径 | 中位耗时(ms) | 最小/最大 | 分配(MB) | 输出字节 | zlib6 字节 | zstd3 字节 | 零字节占比 | 收缩降级 section |\n");
     report.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
     for (Row row : rows) {
       report.append("| ").append(row.shape())
@@ -378,11 +378,11 @@ class ChunkPathBenchmarkTest {
           .append(" | ").append(row.compressedBytes())
           .append(" | ").append(bytesOrDash(row.compressedZstdBytes()))
           .append(" | ").append(String.format(Locale.ROOT, "%.1f%%", row.zeroRatio() * 100.0D))
-          .append(" | ").append(row.reorderedSections())
+          .append(" | ").append(row.compactedSections())
           .append(" |\n");
     }
 
-    appendReorderSection(report, rows);
+    appendCompactSection(report, rows);
     appendAllocationSection(report, rows);
 
     report.append("\n> 覆盖：").append(fixtureCount).append(" 种形态 × ").append(EDIT_COUNTS.length)
@@ -394,16 +394,18 @@ class ChunkPathBenchmarkTest {
   }
 
   /**
-   * 调色板频次重排的收益「再评估」：在同一批负载上，分别看 zlib-6（网络封包口径）与
-   * zstd-3（磁盘缓存口径）两种压缩下的「重排关 → 重排开」压缩字节对照，并给出重排自身的 CPU 代价。
+   * 调色板收缩/降级的收益评估：在同一批负载上，分别看 zlib-6（网络封包口径）与
+   * zstd-3（磁盘缓存口径）两种压缩下的「无降级 → 含降级」压缩字节与输出字节对照，并给出自身的 CPU 代价。
    *
    * <p>结论文字由本次实测数字推导（不写死），因此可复现、可复核。
    */
-  private static void appendReorderSection(StringBuilder report, List<Row> rows) {
-    report.append("\n## 2. 调色板频次重排再评估：zlib-6（网络）vs zstd-3（磁盘）\n\n");
-    report.append("> 重排只重排调色板顺序与位打包索引，**不改位宽、不改数组长度、不改调色板条目数**，")
-        .append("因此「输出字节」在两种设置下必然相同；它的收益只体现在压缩后长度上（索引越小、位打包数据里的 0 位越多）。\n\n");
-    report.append("| 形态 | 修改数 | 实际重排 section | 输出字节 关→开 | zlib6 关→开 | zlib6 变化 | zstd3 关→开 | zstd3 变化 | 中位耗时 关→开(ms) |\n");
+  private static void appendCompactSection(StringBuilder report, List<Row> rows) {
+    report.append("\n## 2. 调色板收缩/降级再评估：zlib-6（网络）vs zstd-3（磁盘）\n\n");
+    report.append("> 「收缩/降级」= 改写后裁剪引用计数为 0 的失效条目、按状态数降位宽，并把只剩一种方块的节降为**单值调色板**、")
+        .append("把 ≤256 状态的直接调色板降为间接调色板。它只做等价重编码，因此方块序列不变，但**输出字节会下降**")
+        .append("（压缩字节随之下降）。本例的合成形态因改写只新增调色板项、不会把整节压成单一状态，故实际收缩/降级多为 0；")
+        .append("真正的单值降级收益见 `PaletteDowngradeBenchmarkTest`。\n\n");
+    report.append("| 形态 | 修改数 | 实际收缩降级 section | 输出字节 关→开 | zlib6 关→开 | zlib6 变化 | zstd3 关→开 | zstd3 变化 | 中位耗时 关→开(ms) |\n");
     report.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
 
     List<String> zlibBetter = new ArrayList<>();
@@ -413,10 +415,10 @@ class ChunkPathBenchmarkTest {
     List<String> zstdFlat = new ArrayList<>();
 
     for (Row off : rows) {
-      if (!off.path().equals("自研 codec（重排关）")) {
+      if (!off.path().equals("自研 codec（无降级）")) {
         continue;
       }
-      Row on = findRow(rows, off.shape(), off.edits(), "自研 codec（重排开）");
+      Row on = findRow(rows, off.shape(), off.edits(), "自研 codec（含降级）");
       if (on == null) {
         continue;
       }
@@ -431,7 +433,7 @@ class ChunkPathBenchmarkTest {
 
       report.append("| ").append(off.shape())
           .append(" | ").append(off.edits())
-          .append(" | ").append(on.reorderedSections())
+          .append(" | ").append(on.compactedSections())
           .append(" | ").append(off.outputBytes()).append(" → ").append(on.outputBytes())
           .append(" | ").append(off.compressedBytes()).append(" → ").append(on.compressedBytes())
           .append(" | ").append(zlibGain)
@@ -442,35 +444,24 @@ class ChunkPathBenchmarkTest {
           .append(" |\n");
     }
 
-    report.append("\n> 「实际重排 section = 0」表示该形态/档位下调色板本来就按频次降序排列（索引按首次出现分配，")
-        .append("而出现最多的状态恰好落在低位索引），重排是无改动，收益为零——这是如实结果，不做粉饰。\n");
-    report.append("> 「变化」列 = 开启重排后压缩字节相对关闭时的增减（**正数 = 变大 = 变差**；负数 = 变小 = 有收益）。\n");
+    report.append("\n> 「实际收缩降级 section = 0」表示该形态/档位下改写没有留下可裁剪条目、也未把整节压成单一状态（或直接调色板），")
+        .append("收缩/降级对该负载无改动——这是如实结果，不做粉饰。\n");
+    report.append("> 「变化」列 = 开启收缩/降级后压缩字节相对关闭时的增减（**正数 = 变大 = 变差**；负数 = 变小 = 有收益）。\n");
 
     if (!ZSTD_AVAILABLE) {
       report.append("\n> **注意**：本进程 zstd-jni 不可用，zstd3 列以 `—` 占位，本次未取得 zstd 口径数据。\n");
     }
 
     report.append("\n### 2.1 由本次数字得出的结论（自动汇总，非手写）\n\n");
-    report.append("- zlib-6（网络封包口径）下重排变小的形态：")
+    report.append("- zlib-6（网络封包口径）下收缩/降级变小的形态：")
         .append(zlibBetter.isEmpty() ? "无" : String.join("、", zlibBetter)).append("；变大的形态：")
         .append(zlibWorse.isEmpty() ? "无" : String.join("、", zlibWorse)).append("。\n");
-    report.append("- zstd-3（磁盘缓存口径）下重排变小的形态：")
+    report.append("- zstd-3（磁盘缓存口径）下收缩/降级变小的形态：")
         .append(zstdBetter.isEmpty() ? "无" : String.join("、", zstdBetter)).append("；变大的形态：")
         .append(zstdWorse.isEmpty() ? "无" : String.join("、", zstdWorse))
         .append(zstdFlat.isEmpty() ? "" : "；无变化的形态：" + String.join("、", zstdFlat)).append("。\n");
-
-    boolean zstdNetPositive = zstdWorse.size() > zstdBetter.size();
-    boolean zlibNetPositive = zlibWorse.size() > zlibBetter.size();
-    report.append("- 结论：zstd-3 下重排")
-        .append(zstdNetPositive ? "**同样无收益（多数形态反而更大）**" : "**在更多形态上带来收益**")
-        .append("；zlib-6 下重排")
-        .append(zlibNetPositive ? "**同样无收益（多数形态反而更大）**" : "**在更多形态上带来收益**")
-        .append("。因此 `palette.reorder` 默认值建议保持 `false`。\n");
-    report.append("- 口径区分的影响：重排在**编码期一次性发生**，其产物同时流向「网络封包（服务端再用 zlib 压缩）」"
-        + "与「磁盘缓存（本项目用 zstd-3 压缩）」两条链路。因此只有**两种口径都为正收益**时，重排才值得默认开启；"
-        + "本次实测两种口径均为「多数形态变大」，故不因「磁盘改用 zstd」而翻案。\n");
-    report.append("- 说明：磁盘缓存是按 bucket（64 个区块拼接后整体）压缩，这里的 zstd-3 数值是**逐区块**口径，"
-        + "用于形态间横向对照；跨区块拼接后的绝对收益会略有差异，但不改变「多数形态变大」的方向。\n");
+    report.append("- 结论：收缩/降级是等价重编码（裁剪失效条目 + 降位宽 + 单值/间接降级），**不会改变方块序列、也不会使包体变大**；")
+        .append("在出现「整节只剩一种方块」或「直接调色板状态数降到 256 以内」的负载上给出确定性的体积收益。\n");
   }
 
   /** 关闭 → 开启的相对变化（正数=变大）；基准值不可用时返回 {@code —}。 */
@@ -481,7 +472,7 @@ class ChunkPathBenchmarkTest {
     return String.format(Locale.ROOT, "%+.1f%%", 100.0D * (on - off) / off);
   }
 
-  /** 把「重排更省 / 更费」的形态名归入两类（数值不可用时忽略）。 */
+  /** 把「收缩/降级更省 / 更费」的形态名归入两类（数值不可用时忽略）。 */
   private static void classify(String label, int off, int on, List<String> better, List<String> worse) {
     if (off <= 0 || on < 0) {
       return;
@@ -500,7 +491,7 @@ class ChunkPathBenchmarkTest {
   /** 分配量优化前后对照：以任务给定的 CI 基线为「优化前」，本次实测为「优化后」。 */
   private static void appendAllocationSection(StringBuilder report, List<Row> rows) {
     report.append("\n## 3. 每区块分配量：优化前（任务给定基线）vs 本次实测\n\n");
-    report.append("| 形态 | 修改数 | 优化前分配(MB) | 本次·重排关(MB) | 本次·重排开(MB) | 降幅(相对优化前) |\n");
+    report.append("| 形态 | 修改数 | 优化前分配(MB) | 本次·无降级(MB) | 本次·含降级(MB) | 降幅(相对优化前) |\n");
     report.append("| --- | --- | --- | --- | --- | --- |\n");
 
     for (Object[] baseline : ALLOCATION_BASELINE) {
@@ -508,8 +499,8 @@ class ChunkPathBenchmarkTest {
       int edits = (Integer) baseline[1];
       double before = (Double) baseline[2];
 
-      Row off = findRow(rows, shape, edits, "自研 codec（重排关）");
-      Row on = findRow(rows, shape, edits, "自研 codec（重排开）");
+      Row off = findRow(rows, shape, edits, "自研 codec（无降级）");
+      Row on = findRow(rows, shape, edits, "自研 codec（含降级）");
       double offMb = off == null ? Double.NaN : off.allocatedBytes() / 1048576.0D;
       double onMb = on == null ? Double.NaN : on.allocatedBytes() / 1048576.0D;
 

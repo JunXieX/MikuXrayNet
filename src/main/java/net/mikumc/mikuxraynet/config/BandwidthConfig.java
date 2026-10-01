@@ -103,21 +103,23 @@ public final class BandwidthConfig {
   }
 
   /**
-   * 调色板重排。
+   * 调色板压缩（改写后的调色板收缩与降级）。
    *
-   * @param enabled      模块总开关：为 {@code false} 时本模块完全不生效（反矿透编码链路取 {@code DISABLED}）。
-   * @param reorder      行为开关，默认 {@code false}：CI 实测表明开启重排使压缩字节普遍变大——
-   *                     zlib level 6（网络封包口径）下全实心 +2.9%、稀疏矿脉 +4.9%~+6.4%、
-   *                     乱序调色板 +1.4%~+2.3%；ZSTD level 3（磁盘缓存口径）下全实心 +8.3%、
-   *                     稀疏矿脉 +1.6%~+11.0%、乱序调色板 +6.4%~+8.4%。仅洞穴与主世界地下略优（约 -0.3%~-3.6%），
-   *                     而耗时普遍增至约 4~6 倍。故默认关闭；{@code strictVerify} 亦仅在 {@code reorder=true} 时有意义。
-   * @param strictVerify 重排自检（仅在 {@code reorder=true} 时有意义）。
+   * <p><b>历史说明</b>：本段曾提供「按频次重排」（{@code reorder}）开关，实测多数形态反而使压缩字节变大
+   * （合成形态 +2.3% ~ +11.0%，仅洞穴/地下形态略优），故已<b>彻底移除</b>，不留「会变差的开关」。
+   * 如未来要重新引入类似的索引重排，请先在同一批负载上取得两种压缩口径（zlib-6 / zstd-3）都为正收益的证据。
+   *
+   * @param enabled      模块总开关：为 {@code false} 时本模块完全不生效（反矿透编码链路 widthBudget=false）。
+   * @param strictVerify 收缩/降级后做一次一致性自检，不一致即放弃本区块的改写、按原包放行。
+   *                     仅在 {@code widthBudget=true} 时有意义、且会略微增加开销，排查问题时才建议开启。
    * @param widthBudget  位宽预算封顶（P0-1，默认 {@code true}）：改写前把「可能引入的新状态数」与当前位宽
    *                     容量对账，优先选用已在调色板内的伪装方块避免升位；改写后裁剪引用计数为 0 的
-   *                     失效条目并在可能时降位宽（位宽单调不增）。修复「4 位 section 被替换成下界岩后
-   *                     升到 5 位、包体膨胀约 25%」的问题，兼得降位宽收益。关闭时走原路径（只升不降）。
+   *                     失效条目并在可能时降位宽（位宽单调不增），再把「只剩一种方块」的节降级为单值
+   *                     调色板、把 ≤256 状态的直接调色板降为间接调色板。修复「4 位 section 被替换成
+   *                     下界岩后升到 5 位、包体膨胀约 25%」的问题，兼得降位宽与单值降级收益。
+   *                     关闭时走原路径（只升不降）。
    */
-  public record Palette(boolean enabled, boolean reorder, boolean strictVerify, boolean widthBudget) {
+  public record Palette(boolean enabled, boolean strictVerify, boolean widthBudget) {
   }
 
   /**
@@ -222,10 +224,8 @@ public final class BandwidthConfig {
                 MAX_IMMEDIATE_RADIUS, "block-changes.immediate-radius", clampAdjustments)),
         new Palette(
             root.getBoolean("palette.enabled", true),
-            // 默认 false：实测开启重排会使压缩字节变大且耗时增加（见 Palette 的说明）
-            root.getBoolean("palette.reorder", false),
             root.getBoolean("palette.strict-verify", false),
-            // P0-1 位宽预算封顶，默认 true：修复「调色板写满后替换升位 → 包体膨胀」并拿降位宽收益
+            // P0-1 位宽预算封顶，默认 true：修「调色板写满后替换升位 → 包体膨胀」并拿降位宽/单值降级收益
             root.getBoolean("palette.width-budget", true)),
         new EntityCulling(
             root.getBoolean("entity-culling.enabled", true),
