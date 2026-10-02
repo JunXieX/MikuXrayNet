@@ -226,8 +226,27 @@ public final class RevealedSet {
    * 功能不降级、更不会漏显形。
    */
   void mark(UUID playerId, ChunkKey key, int x, int y, int z) {
+    markIfAbsent(playerId, key, x, y, z);
+  }
+
+  /**
+   * 原子「复核 + 标记」：在同一临界区内判断该坐标是否已登记，未登记才写入。
+   *
+   * <p><b>为什么需要它</b>：显形发包前必须复核「本坐标是否已被（同 tick 的另一条路径）显形过」——
+   * 若先 {@link #contains} 再 {@link #mark}，两个动作之间有窗口，跨路径同 tick 竞争时会重复发包
+   * （客户端无感但纯属浪费）。把「判重 + 写入」并进同一把条目锁，发送侧即可依据返回值做到「恰好一次」：
+   * 返回 {@code false} 表示已被别人登记，本次不应再发。
+   *
+   * <p>锁序与 {@link #mark} 完全一致（{@code chunks} 映射监视器 → 条目锁），不引入新的加锁顺序，
+   * 因此不会与 {@code expire} / {@code clearChunk} / {@code removePositions} 形成死锁。
+   *
+   * @return {@code true} = 本次真正新登记（或安全阀放弃登记 / 无玩家标识，按「可发送」处理，fail-open）；
+   *         {@code false} = 该坐标本已登记，调用方应跳过本次发包
+   */
+  boolean markIfAbsent(UUID playerId, ChunkKey key, int x, int y, int z) {
     if (playerId == null) {
-      return;
+      // 无玩家标识：无法按玩家去重，按「可发送」处理（fail-open，绝不漏显形）
+      return true;
     }
     long packedValue = pack(x, y, z);
     while (true) {
@@ -248,17 +267,18 @@ public final class RevealedSet {
           }
           marker.updatedAtNanos = clock.getAsLong();
           if (marker.contains(packedValue)) {
-            return;
+            return false;
           }
           AtomicInteger total = playerTotals.computeIfAbsent(playerId, ignored -> new AtomicInteger());
           if (total.get() >= maxPositionsPerPlayer) {
             droppedByCapacity.increment();
-            return;
+            // 安全阀放弃登记：本次未记录，按「可发送」处理（fail-open，绝不漏显形）
+            return true;
           }
           marker.add(packedValue);
           total.incrementAndGet();
           registeredTotal.increment();
-          return;
+          return true;
         }
       }
     }

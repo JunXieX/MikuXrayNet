@@ -18,8 +18,9 @@ import org.junit.jupiter.api.Test;
  * 出站监听器会回显我们自己发出的显形包并摘除索引 + 标记——只要标记先行，摘除就能命中并一并摘掉标记，
  * 不会留下孤儿标记；发送失败则回滚标记，保证该坐标仍被后续周期重试。
  *
- * <p>离线可直接驱动 {@link ProximityRevealer#markThenSend} / {@link ProximityRevealer#markThenSendAll}
- * （包级可见的发送缝），用布尔桩模拟「发包返回前异步监听器先跑摘除」的交错顺序，无需真实 Player/World。
+ * <p>离线可直接驱动 {@link ProximityRevealer#markThenSend} / {@link ProximityRevealer#claimForSend} /
+ * {@link ProximityRevealer#sendBatchOrRollback}（包级可见的发送缝），用布尔桩模拟「发包返回前异步监听器
+ * 先跑摘除」的交错顺序，无需真实 Player/World。
  */
 class RevealMarkOrderingTest {
 
@@ -98,19 +99,60 @@ class RevealMarkOrderingTest {
         "发送失败的坐标后续周期必须仍会被选出重试");
   }
 
-  /** 批量合并包：先标记整批再发；失败整批回滚、成功整批保留。 */
+  /** 批量合并包：原子复核 + 标记整批，再发一个合并包；失败整批回滚、成功整批保留。 */
   @Test
-  void batchMarksBeforeSendAndRollsBackAllOnFailure() {
+  void batchClaimsOnceMarksBeforeSendAndRollsBackAllOnFailure() {
     index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
     ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
     List<int[]> positions = List.of(new int[] {1, 64, 1}, new int[] {2, 64, 1});
 
-    assertFalse(revealer.markThenSendAll(PLAYER, WORLD, positions, () -> false),
+    int[] fresh = revealer.claimForSend(PLAYER, WORLD, positions);
+    assertEquals(2, fresh.length, "两个坐标都应新登记");
+    assertEquals(2, revealed.sizeFor(PLAYER, key), "标记必须先于发包写入（与摘除路径对齐）");
+
+    assertFalse(revealer.sendBatchOrRollback(PLAYER, WORLD, positions, fresh, () -> false),
         "合并包未发出");
     assertEquals(0, revealed.sizeFor(PLAYER, key), "合并包失败 → 整批标记回滚，不留虚增计数");
 
-    assertTrue(revealer.markThenSendAll(PLAYER, WORLD, positions, () -> true),
+    int[] again = revealer.claimForSend(PLAYER, WORLD, positions);
+    assertEquals(2, again.length, "回滚后可重新登记");
+    assertTrue(revealer.sendBatchOrRollback(PLAYER, WORLD, positions, again, () -> true),
         "合并包已发出");
     assertEquals(2, revealed.sizeFor(PLAYER, key), "合并包成功 → 整批标记保留");
+  }
+
+  /**
+   * <b>跨路径「恰好一次」</b>：同一坐标在同一 tick 先由周期批量路径（{@link ProximityRevealer#claimForSend}）
+   * 登记，再由事件即时路径（{@link ProximityRevealer#markThenSend}）触发——单包路径的原子复核必须发现
+   * 该坐标已显形并跳过发送，绝不重复发包、也不把这次计入「发送」。
+   */
+  @Test
+  void sameCoordinateTriggeredByBothPathsWithinTickSendsOnce() {
+    ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
+    int[] sends = {0};
+
+    // 周期批量路径：原子复核 + 标记成功 → 该坐标进入本次待发包集合
+    int[] fresh = revealer.claimForSend(PLAYER, WORLD, List.of(new int[] {1, 64, 1}));
+    assertEquals(1, fresh.length, "首个路径应登记成功");
+    assertEquals(1, revealed.sizeFor(PLAYER, key));
+
+    // 事件即时路径：同 tick 对同一坐标走单包路径 → 复核发现已显形 → 跳过发送
+    boolean instantSent = revealer.markThenSend(PLAYER, WORLD, 1, 64, 1, () -> {
+      sends[0]++;
+      return true;
+    });
+    assertFalse(instantSent, "该坐标已由另一路径登记：即时路径必须跳过发送");
+    assertEquals(0, sends[0], "同一坐标在同 tick 不得重复发包");
+    assertEquals(1, revealed.sizeFor(PLAYER, key), "跳过不得改动既有标记（计数仍为 1）");
+
+    // 反向顺序同样只发一次：即时路径先发，批量路径再复核必须得到 0 个待发
+    boolean directSent = revealer.markThenSend(PLAYER, WORLD, 5, 64, 5, () -> {
+      sends[0]++;
+      return true;
+    });
+    assertTrue(directSent, "首次触发的即时路径正常发包");
+    int[] secondClaim = revealer.claimForSend(PLAYER, WORLD, List.of(new int[] {5, 64, 5}));
+    assertEquals(0, secondClaim.length, "已显形坐标不得再次进入批量发包集合");
+    assertEquals(1, sends[0], "同一坐标跨两条路径合计只真正发包一次");
   }
 }

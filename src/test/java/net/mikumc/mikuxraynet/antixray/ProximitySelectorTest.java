@@ -596,4 +596,105 @@ class ProximitySelectorTest {
     assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, lavaAbove, SAMPLES, probe(eye, lavaAbove)),
         "不带 fluidCover 的重载默认 false，行为不变");
   }
+
+  // ---------------------------------------------------------------- 视锥「先粗后细」等价性（③）
+
+  /**
+   * 断言「粗筛 + 精判」与「仅精判」逐坐标全等。
+   *
+   * <p>粗筛被设计为精判接受集的<b>严格超集</b>（只允许放行过多），因此两者必须<strong>完全相等</strong>：
+   * 若粗筛多剔除任何一个精判会显形的坐标，这里就会不等而失败——这正是「不减少显形」红线的机器证明。
+   */
+  private static void assertFrustumEquivalent(ProximitySelector.Eye eye, int x, int y, int z,
+      double minDistance, double fov) {
+    boolean combined = ProximitySelector.withinFrustum(eye, x, y, z, minDistance, fov);
+    boolean precise = ProximitySelector.preciseWithinFrustum(eye, x, y, z, minDistance, fov);
+    assertEquals(precise, combined,
+        "粗筛后判定必须与仅精判全等：eye=" + eye + " block=(" + x + "," + y + "," + z + ")"
+            + " min=" + minDistance + " fov=" + fov);
+  }
+
+  /** 穷举网格：多组 fov / 最小距离 / 视线方向（含各象限、正上正下、0 向量退化）× 目标网格。 */
+  @Test
+  void coarsePrefilterIsEquivalentToPreciseOnExhaustiveGrid() {
+    double[] fovs = {0.0D, 1.0D, 2.0D, 30.0D, 80.0D, 110.0D, 179.9D, 180.0D, 200.0D, -5.0D};
+    double[] minDistances = {0.0D, 0.5D, 4.0D, 16.0D};
+    double[][] directions = {
+        {0.0D, 0.0D, 0.0D}, {0.0D, 0.0D, 1.0D}, {0.0D, 0.0D, -1.0D}, {1.0D, 0.0D, 0.0D},
+        {-1.0D, 0.0D, 0.0D}, {0.0D, 1.0D, 0.0D}, {0.0D, -1.0D, 0.0D},
+        {0.3D, 0.2D, -0.9D}, {-0.7D, 0.6D, 0.4D}, {0.05D, 0.0D, -0.049D}, {0.9D, -0.1D, 0.2D}};
+    double[] eyeXs = {0.5D, 0.0D}; // 0.0 = 眼位贴方块棱角
+    int[] ys = {56, 64, 72};
+    int compared = 0;
+    for (double fov : fovs) {
+      for (double min : minDistances) {
+        for (double eyeX : eyeXs) {
+          for (double[] dir : directions) {
+            ProximitySelector.Eye eye =
+                ProximitySelector.eye(eyeX, 64.62D, 0.5D, dir[0], dir[1], dir[2]);
+            for (int x = -12; x <= 12; x += 4) {
+              for (int y : ys) {
+                for (int z = -12; z <= 12; z += 4) {
+                  assertFrustumEquivalent(eye, x, y, z, min, fov);
+                  compared++;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    assertTrue(compared > 100_000, "等价性语料规模必须足够大：" + compared);
+  }
+
+  /** 随机语料：随机眼位 / 视线（含极端与跨象限）/ 目标 / fov / 最小距离，逐条比对。 */
+  @Test
+  void coarsePrefilterIsEquivalentToPreciseOnRandomCorpus() {
+    java.util.Random random = new java.util.Random(20261002L);
+    int samples = 120_000;
+    for (int i = 0; i < samples; i++) {
+      ProximitySelector.Eye eye = ProximitySelector.eye(
+          random.nextDouble() * 64.0D - 32.0D, random.nextDouble() * 64.0D,
+          random.nextDouble() * 64.0D - 32.0D,
+          random.nextDouble() * 4.0D - 2.0D, random.nextDouble() * 4.0D - 2.0D,
+          random.nextDouble() * 4.0D - 2.0D);
+      assertFrustumEquivalent(eye,
+          random.nextInt(-40, 41), random.nextInt(-40, 41), random.nextInt(-40, 41),
+          random.nextDouble() * 20.0D, random.nextDouble() * 200.0D - 10.0D);
+    }
+  }
+
+  /** 边界语料：最小距离边界（距离平方恰等于豁免平方及其两侧）、0/极端视线、俯仰与水平边界附近。 */
+  @Test
+  void coarsePrefilterIsEquivalentAtBoundaries() {
+    ProximitySelector.Eye axis = ProximitySelector.eye(0.5D, 64.5D, 0.5D, 0.0D, 0.0D, 1.0D);
+    for (int d : new int[] {1, 4, 16}) {
+      // 方块中心 y/z 与眼位对齐 → 距离恰为 d；min 取 d 的左右极近值覆盖边界
+      assertFrustumEquivalent(axis, 0, 64, d, (double) d, 80.0D);
+      assertFrustumEquivalent(axis, 0, 64, d, (double) d - 0.001D, 80.0D);
+      assertFrustumEquivalent(axis, 0, 64, d, (double) d + 0.001D, 80.0D);
+    }
+
+    // 视线为 0 向量（退化为 +Z）、极端正上 / 正下
+    ProximitySelector.Eye zero = ProximitySelector.eye(0.5D, 64.5D, 0.5D, 0.0D, 0.0D, 0.0D);
+    ProximitySelector.Eye up = ProximitySelector.eye(0.5D, 64.5D, 0.5D, 0.0D, 1.0D, 0.0D);
+    ProximitySelector.Eye down = ProximitySelector.eye(0.5D, 64.5D, 0.5D, 0.0D, -1.0D, 0.0D);
+    for (ProximitySelector.Eye eye : new ProximitySelector.Eye[] {zero, up, down}) {
+      for (int x = -8; x <= 8; x += 2) {
+        for (int y = -8; y <= 8; y += 2) {
+          for (int z = -8; z <= 8; z += 2) {
+            assertFrustumEquivalent(eye, x, 64 + y, z, 0.0D, 110.0D);
+            assertFrustumEquivalent(eye, x, 64 + y, z, 16.0D, 80.0D);
+          }
+        }
+      }
+    }
+
+    // 竖直约 40°（fov=80 的竖直半角）与水平约 56°（16:9 水平半角）边界两侧
+    for (int[] block : new int[][] {
+        {0, 69, 6}, {0, 70, 6}, {0, 69, 5}, {0, 70, 7},
+        {5, 64, 5}, {6, 64, 5}, {7, 64, 4}, {7, 64, 5}, {7, 64, 6}}) {
+      assertFrustumEquivalent(axis, block[0], block[1], block[2], 4.0D, 80.0D);
+    }
+  }
 }

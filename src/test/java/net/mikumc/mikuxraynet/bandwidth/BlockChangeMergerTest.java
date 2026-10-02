@@ -88,4 +88,46 @@ class BlockChangeMergerTest {
             Set.of()),
         "本窗口没有立即放行记录时不存在可取消的原包");
   }
+
+  /**
+   * 「已聚合批量包直接放行」判定是纯函数：只依包形态 + 包自身坐标数量，不看玩家/世界。
+   *
+   * <p>真实链路依赖 ProtocolLib 封包与异步放行，离线不可用；这里直接驱动被抽出的纯函数
+   * {@link BlockChangeMerger#bypassesMerge}——它正是 {@code onPacketSending} 在近身立即放行之后、
+   * 进入 Pending 之前所走的同一个判定：返回 true 即提前 return，原包不进缓冲、不登记延迟。
+   */
+  @Test
+  @DisplayName("达到阈值的批量包直通（不进合并窗口、不延迟），阈值本身也算达标")
+  void batchedPacketAtOrAboveThresholdBypassesMerge() {
+    assertTrue(BlockChangeMerger.bypassesMerge(true, BlockChangeMerger.MULTI_BLOCK_BATCH_THRESHOLD),
+        "达阈值即直通（含边界）");
+    assertTrue(BlockChangeMerger.bypassesMerge(true, 64), "反矿透显形段包（数十坐标）直通");
+    assertTrue(BlockChangeMerger.bypassesMerge(true, 4096), "整段显形包直通");
+  }
+
+  @Test
+  @DisplayName("未达阈值的批量包仍走原合并路径（判定为 false，行为不变）")
+  void belowThresholdPacketStillMerges() {
+    assertFalse(BlockChangeMerger.bypassesMerge(true, BlockChangeMerger.MULTI_BLOCK_BATCH_THRESHOLD - 1),
+        "差一个坐标即不直通——小批量仍值得合并");
+    assertFalse(BlockChangeMerger.bypassesMerge(true, 2), "两坐标小批量的合并收益仍在");
+  }
+
+  @Test
+  @DisplayName("单坐标包不受影响：BLOCK_CHANGE 恒不直通，单坐标 MULTI 也不直通")
+  void singleCoordinatePacketIsUnaffected() {
+    assertFalse(BlockChangeMerger.bypassesMerge(false, 1), "单坐标 BLOCK_CHANGE 照常走原路径");
+    assertFalse(BlockChangeMerger.bypassesMerge(true, 1), "即便形式是多条，单坐标也不直通");
+    assertFalse(BlockChangeMerger.bypassesMerge(true, 0), "空包不直通（交由既有空包分支处理）");
+  }
+
+  @Test
+  @DisplayName("判定仅由坐标数量决定（纯函数）：同输入同输出，且与包形态共同决定")
+  void bypassDecisionDependsOnlyOnShapeAndCount() {
+    for (int n = 0; n <= BlockChangeMerger.MULTI_BLOCK_BATCH_THRESHOLD + 3; n++) {
+      assertEquals(n >= BlockChangeMerger.MULTI_BLOCK_BATCH_THRESHOLD,
+          BlockChangeMerger.bypassesMerge(true, n), "MULTI 包：仅由坐标数决定");
+      assertFalse(BlockChangeMerger.bypassesMerge(false, n), "非 MULTI 包：任何坐标数都不直通");
+    }
+  }
 }

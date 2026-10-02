@@ -658,13 +658,29 @@ public final class ProximityRevealer implements Listener {
    *
    * <p><b>失败回滚</b>：发送返回 false（未真正发出）时回滚标记，保证该坐标仍被后续周期重试、计数不虚增。
    *
+   * <p><b>发包前复核（恰好一次）</b>：标记写入用的是原子「复核 + 标记」（{@link RevealedSet#markIfAbsent}），
+   * 若该坐标已被本 tick 的另一条路径（周期巡检 / 事件即时）显形，则直接返回 false 跳过发送——
+   * 既不重复发包、也不把这次计入「发送」（调用方按失败处理，计入「跳过」且不扣发包额度）。
+   *
    * @param send 返回 true = 确实发出（保留标记）；false = 未发出（回滚标记）
-   * @return {@code send} 的结果
+   * @return {@code send} 的结果；该坐标已显形而未发送时返回 false
    */
   boolean markThenSend(UUID playerId, String worldName, int x, int y, int z,
       java.util.function.BooleanSupplier send) {
     if (revealedSet != null) {
-      revealedSet.mark(playerId, ChunkKey.ofBlock(worldName, x, z), x, y, z);
+      boolean claimed;
+      try {
+        // 发包前的原子复核：在同一临界区（RevealedSet.markIfAbsent）判重 + 标记，
+        // 已显形者（本 tick 另一条路径刚发过）直接跳过发送，既不重复发包也不误改计数。
+        claimed = revealedSet.markIfAbsent(playerId, ChunkKey.ofBlock(worldName, x, z), x, y, z);
+      } catch (Throwable throwable) {
+        // 复核失败 fail-open：无法判重就照常发送，绝不漏显形（最坏重复一次，客户端无感）
+        logThrottled(throwable);
+        claimed = true;
+      }
+      if (!claimed) {
+        return false;
+      }
     }
     if (send.getAsBoolean()) {
       return true;
@@ -676,24 +692,56 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 「先标记整批、再发一个合并包」的批量实现（包级可见，便于离线单测）。
-   * 发送成功则整批保留标记；失败则整批回滚（调用方随后退化为逐坐标 {@link #markThenSend}）。
+   * 批量显形的原子「复核 + 标记」步（包级可见，便于离线单测）。
+   *
+   * <p>逐个坐标在写入标记的同一临界区内（{@link RevealedSet#markIfAbsent}）确认它本周期尚未显形：
+   * 只把「本次真正新登记、需要发包」的坐标下标返回，已显形者被跳过（不标记、不发包），
+   * 从而拦下周期巡检与事件即时显形跨路径同 tick 的重复候选（见 {@link #flushBatch}）。
+   *
+   * <p>复核抛异常时按「需要发包」处理（fail-open）：无法判重就照常发送，绝不漏显形。
+   *
+   * @return 需要发包的坐标下标（对应 {@code positions}）；无新登记时为空数组
    */
-  boolean markThenSendAll(UUID playerId, String worldName, List<int[]> positions,
-      java.util.function.BooleanSupplier send) {
-    if (revealedSet != null) {
-      for (int i = 0; i < positions.size(); i++) {
-        int[] position = positions.get(i);
-        revealedSet.mark(playerId, ChunkKey.ofBlock(worldName, position[0], position[2]),
-            position[0], position[1], position[2]);
+  int[] claimForSend(UUID playerId, String worldName, List<int[]> positions) {
+    int[] claimed = new int[positions.size()];
+    int count = 0;
+    for (int i = 0; i < positions.size(); i++) {
+      int[] position = positions.get(i);
+      boolean fresh;
+      if (revealedSet == null) {
+        fresh = true;
+      } else {
+        try {
+          fresh = revealedSet.markIfAbsent(playerId,
+              ChunkKey.ofBlock(worldName, position[0], position[2]),
+              position[0], position[1], position[2]);
+        } catch (Throwable throwable) {
+          logThrottled(throwable);
+          fresh = true;
+        }
+      }
+      if (fresh) {
+        claimed[count++] = i;
       }
     }
+    return java.util.Arrays.copyOf(claimed, count);
+  }
+
+  /**
+   * 合并包的「发包 + 失败整批回滚」步（包级可见，便于离线单测）。
+   *
+   * <p>调用方已在 {@link #claimForSend} 里完成原子复核与标记，这里只负责把 {@code fresh} 这批坐标
+   * 一次发出；发送失败则回滚这些坐标的标记（返回 false，调用方随后退化为逐坐标 {@link #markThenSend}，
+   * 未发出的坐标后续周期仍会重试）。
+   */
+  boolean sendBatchOrRollback(UUID playerId, String worldName, List<int[]> positions, int[] fresh,
+      java.util.function.BooleanSupplier send) {
     if (send.getAsBoolean()) {
       return true;
     }
     if (revealedSet != null) {
-      for (int i = 0; i < positions.size(); i++) {
-        int[] position = positions.get(i);
+      for (int index : fresh) {
+        int[] position = positions.get(index);
         revealedSet.removePosition(worldName, position[0], position[1], position[2]);
       }
     }
@@ -709,9 +757,13 @@ public final class ProximityRevealer implements Listener {
    * 跳过。发包一律走「先标记、再发包、失败回滚」（见 {@link #markThenSend}）：成功发出的坐标保留标记，
    * 未发出的坐标回滚标记，因此发包失败既不影响其它坐标、也不污染已显形索引，且失败坐标后续仍会重试。
    *
+   * <p><b>发包前复核（恰好一次）</b>：批次在累积时仅按「候选未显形」过滤，跨路径（周期巡检与事件即时
+   * 显形共用本方法）同 tick 仍可能对同一坐标各累积一次。因此发包容纳集合由 {@link #claimForSend} 在
+   * 「判重 + 标记」的同一临界区内定夺：已显形者不进入本次发包集合（既不重复发包，也不计入「发送」）。
+   *
    * <p><b>额度归还</b>：批次坐标是在 {@link #sendOne} 里「先预扣额度再累积」的（用于封住单周期上限），
-   * 所以这里对<b>未能发出</b>的坐标（退化路径里 {@code sendBlockChange} 失败）逐个 {@link Budget#refund()}
-   * 归还额度；成功发出的不归还，维持「每周期上限」语义。
+   * 因此这里对<b>未能发出</b>的坐标（被复核跳过、或退化路径里 {@code sendBlockChange} 失败）逐个
+   * {@link Budget#refund()} 归还额度；成功发出的不归还，维持「每周期上限」语义。
    */
   private void flushBatch(Player player, RevealBatch batch, PassTally tally, Budget budget) {
     if (batch == null || batch.size() == 0) {
@@ -721,14 +773,30 @@ public final class ProximityRevealer implements Listener {
     UUID playerId = player.getUniqueId();
     String worldName = world.getName();
 
-    if (batch.size() > 1) {
-      // 先标记整批、再发合并包（理由见 markThenSend）：与出站监听器的摘除路径对齐，杜绝孤儿标记。
+    // 原子复核 + 标记：只对「本周期尚未显形、本次真正新登记」的坐标发包（见 claimForSend）。
+    int[] fresh = claimForSend(playerId, worldName, batch.positions);
+    int skipped = batch.size() - fresh.length;
+    if (skipped > 0) {
+      // 已显形者：不计入「发送」，归还 sendOne 里预扣的额度（额度只为真正发出的显形保留）
+      stats.revealsSkipped.add(skipped);
+      for (int i = 0; i < skipped; i++) {
+        budget.refund();
+      }
+    }
+    if (fresh.length == 0) {
+      return;
+    }
+
+    // 标记由 claimForSend 写好；合并包失败时 sendBatchOrRollback 会整批回滚，届时逐坐标重新「复核 + 标记」。
+    boolean marksWritten = true;
+    if (fresh.length > 1) {
       Map<Position, BlockData> changes;
       try {
-        changes = new LinkedHashMap<>(batch.size() * 2);
-        for (int i = 0; i < batch.size(); i++) {
-          int[] position = batch.positions.get(i);
-          changes.put(Position.block(position[0], position[1], position[2]), batch.states.get(i));
+        changes = new LinkedHashMap<>(fresh.length * 2);
+        for (int index : fresh) {
+          int[] position = batch.positions.get(index);
+          changes.put(Position.block(position[0], position[1], position[2]),
+              batch.states.get(index));
         }
       } catch (Throwable throwable) {
         logThrottled(throwable);
@@ -736,7 +804,7 @@ public final class ProximityRevealer implements Listener {
       }
       if (changes != null) {
         Map<Position, BlockData> payload = changes;
-        boolean sent = markThenSendAll(playerId, worldName, batch.positions, () -> {
+        boolean sent = sendBatchOrRollback(playerId, worldName, batch.positions, fresh, () -> {
           try {
             player.sendMultiBlockChange(payload);
             return true;
@@ -747,21 +815,33 @@ public final class ProximityRevealer implements Listener {
           }
         });
         if (sent) {
-          for (int i = 0; i < batch.size(); i++) {
+          for (int i = 0; i < fresh.length; i++) {
             stats.revealsSent.increment();
             tally.sent++;
           }
           return;
         }
+        marksWritten = false; // 合并包未发出 → 本批标记已整批回滚
       }
-      // 合并包构建失败 / 发送失败：标记已整批回滚，退化为逐坐标单包（失败坐标不留标记，后续周期仍会重试）
+      // changes 构建失败：标记仍在（marksWritten 保持 true），落到下面的逐坐标单包
     }
 
-    for (int i = 0; i < batch.size(); i++) {
-      int[] position = batch.positions.get(i);
-      BlockData state = batch.states.get(i);
-      if (!markThenSend(playerId, worldName, position[0], position[1], position[2],
-          () -> sendSingle(player, world, position[0], position[1], position[2], state))) {
+    for (int index : fresh) {
+      int[] position = batch.positions.get(index);
+      BlockData state = batch.states.get(index);
+      boolean sent;
+      if (marksWritten) {
+        // 标记已在 claimForSend 写好：发送成功即保留，失败则回滚（该坐标仍在伪装清单里，后续周期重试）
+        sent = sendSingle(player, world, position[0], position[1], position[2], state);
+        if (!sent && revealedSet != null) {
+          revealedSet.removePosition(worldName, position[0], position[1], position[2]);
+        }
+      } else {
+        // 合并包已回滚本批标记：逐坐标重新走「先复核 + 标记、再发包、失败回滚」（见 markThenSend）
+        sent = markThenSend(playerId, worldName, position[0], position[1], position[2],
+            () -> sendSingle(player, world, position[0], position[1], position[2], state));
+      }
+      if (!sent) {
         stats.revealsSkipped.increment();
         // 未发出：归还先前在 sendOne 里预扣的额度（本周期上限只应计入真正发出的显形）
         budget.refund();

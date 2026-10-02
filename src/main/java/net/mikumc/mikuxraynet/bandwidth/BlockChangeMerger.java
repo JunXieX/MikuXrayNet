@@ -68,6 +68,14 @@ import org.bukkit.plugin.Plugin;
  * （{@code verified} 仍为 false）合并包照发，但<em>同时</em>保留原包（重复下发相同方块状态是无害的
  * 幂等操作），此后才开始取消原包。
  *
+ * <p><b>已聚合的批量包直接放行</b>：{@code MULTI_BLOCK_CHANGE} 若携带的坐标数达到
+ * {@link #MULTI_BLOCK_BATCH_THRESHOLD}，视为「本已是一次批量下发」（反矿透的邻近显形正是
+ * 由 Paper 原生 {@code sendMultiBlockChange} 按区块段一次性发出），直接放行原包——不进 Pending、
+ * 不延迟、不重编码。此类包再进合并窗口的边际收益极小，却要额外吃满 {@code merge-window-millis}
+ * （默认 40ms）的延迟（超过立即放行半径的显形变更尤为明显）。判定只看包自身的坐标数量（不看玩家、
+ * 不看世界），且放在近身立即放行之后：近身的批量包仍走上面那条路径（会登记 {@code passed} 以做
+ * last-write-wins），这里只兜住不会被近身判定截获的远处显形包。
+ *
  * <p><b>last-write-wins 的微秒级残余窗口（已接受，勿当 bug 修）</b>：{@code passed} 集合是在
  * 持锁的临界区里「读取 + 剔除旧态」的，但把合并包发到客户端、以及取消原包，都发生在<b>释放锁之后</b>。
  * 因此「本窗口内某坐标经立即放行先行下发」与「合并包真正抵达客户端」之间存在一个微秒级窗口：
@@ -83,6 +91,31 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
   /** 方块坐标（用于「本窗口内已立即放行的坐标」做 last-write-wins 判定）。 */
   record Coord(int x, int y, int z) {
+  }
+
+  /**
+   * 「已聚合批量」的坐标数阈值：{@code MULTI_BLOCK_CHANGE} 携带的坐标数达到该值即视为
+   * 本已是一次批量化下发，直接放行、不进合并缓冲。
+   *
+   * <p><b>为什么取 8</b>：合并窗口的收益来自把「分散的小变更」拼成更少的包——坐标数很少
+   * （约 2~7 个）的批量仍可能与邻域变更拼包，值得合并；达到 8 个以上时本包已是成形的批量下发
+   * （反矿透显形包按区块段一次发出，通常数十至上千个坐标），再进 40ms 窗口拼包的边际收益极小，
+   * 却要额外付「解析 → 缓冲 → 延迟 → 重编码」的成本。8 与默认立即放行半径（8 格）同量级、便于理解。
+   * 做成常量便于日后按基准数据调整。
+   */
+  static final int MULTI_BLOCK_BATCH_THRESHOLD = 8;
+
+  /**
+   * 纯函数判定：一个出站方块变更包是否「已聚合成批量」而应直接放行、不进合并窗口。
+   *
+   * <p>只依赖包形态（是否为 {@code MULTI_BLOCK_CHANGE}）与包自身携带的坐标数量，<b>不看玩家、
+   * 不看世界</b>，便于离线单测。{@code BLOCK_CHANGE} 恒只含 1 个坐标，因此永远走原合并路径。
+   *
+   * @param multiBlockChange 该包是否为 {@code MULTI_BLOCK_CHANGE}
+   * @param coordCount       该包携带的坐标数
+   */
+  static boolean bypassesMerge(boolean multiBlockChange, int coordCount) {
+    return multiBlockChange && coordCount >= MULTI_BLOCK_BATCH_THRESHOLD;
   }
 
   /**
@@ -402,6 +435,16 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       // 记录本窗口内已立即下发的坐标：合并窗口内可能有同一方块的旧状态仍在缓冲，
       // 若不剔除会在窗口到期后晚到并把新态覆盖回去（方块短暂回退）。
       rememberImmediatelyPassed(player.getUniqueId(), updates);
+      stats.blockChangesPassed.increment();
+      return;
+    }
+
+    // 已聚合的批量包（MULTI_BLOCK_CHANGE 且坐标数达阈值）直接放行：不进 Pending、不登记延迟、
+    // 不重编码，原包按原样流出——「恰好放行一次」。放在近身立即放行之后，因此近身的批量包仍走上面
+    // 那条路径（登记 passed 做 last-write-wins），这里只兜住不会被近身判定截获的远处显形包。
+    // 刻意不登记 passed：这类包坐标多且远离玩家，若把整包坐标记入 passed，会把合并窗口内同坐标的
+    // 更新一并从合并结果里剔除、可能丢掉真正更新的更新；而放行原包本身已是「恰好一次」的完整交付。
+    if (bypassesMerge(event.getPacketType() == PacketType.Play.Server.MULTI_BLOCK_CHANGE, updates.size())) {
       stats.blockChangesPassed.increment();
       return;
     }

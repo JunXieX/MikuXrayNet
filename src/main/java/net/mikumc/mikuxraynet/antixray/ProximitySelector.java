@@ -19,6 +19,8 @@ import java.util.List;
  * fov=110 时竖直半角 55°、水平半角约 68°，恰好覆盖「客户端 FOV 开到上限 110 + 16:9」的整个可视区，
  * 因此不会剔除玩家看得见的坐标；而旧实现按「圆锥半角 40°」判定，水平方向过窄，
  * 真机日志表现为 87% 的候选被误剔）。距眼睛不超过 {@code minDistance} 时豁免视锥判定。
+ * 判定本身「先粗后细」（{@link #withinFrustum} 内联一次点积粗筛 → {@link #preciseWithinFrustum} 两轴精判）：
+ * 粗筛是精判接受集的<b>严格超集</b>，只省 worker CPU，逐坐标的显形结果与仅用精判完全一致。
  *
  * <p><b>为什么这里必须「宁可多显形」</b>：被剔除的候选既不发包也不记已显形，因此一次误剔就等于
  * 「玩家明明看得见的方块一直保持伪装」——只有事件显形（挖开/放置触发的方块变更）才不经过本判定，
@@ -136,6 +138,15 @@ public final class ProximitySelector {
    * 竖直方向用与视线的仰角之差 ≤ {@code fov/2}；水平方向用偏航角之差 ≤ 水平半角
    * （{@code atan(tan(fov/2) × 16/9)}）。视线或目标近似正上/正下时水平角不可靠，只按竖直轴判定。
    *
+   * <p><b>先粗后细</b>：精判前先做一次点积粗筛。设视线与目标方向夹角为 θ，精判接受集必满足
+   * θ ≤ {@code fov/2} + 水平半角（两轴角差之和是球面角距上界：先沿子午线再沿纬线可走一条长
+   * ≤ |Δ仰角|+|Δ偏航| 的折线连接两点，测地距离不超过折线长；视线或目标近似正上/正下时精判跳过
+   * 水平轴，两轴角差 ≤ {@code fov/2} 叠加「近似竖直」阈值最多约 5.7°，同样落在上界内）。水平半角恒
+   * &lt; 90°，故取更宽松的 {@code R = fov/2 + 90°}：θ &gt; R 必在精判接受集之外，粗筛据此排除
+   * 绝不会多剔除任何精判会显形的坐标（严格超集，逐坐标结果不变）。判据（视线已归一化）：
+   * θ &gt; R ⇔ {@code dot < −|d|·sin(fov/2)}，只含一次点积 + 一次 {@code sin}。
+   * 最小距离豁免、fov 越界（不剔除）、眼位与目标重合一律在粗筛之前放行。
+   *
    * @param eye                  眼睛与视线方向
    * @param blockX               目标方块 X（取方块中心参与计算）
    * @param blockY               目标方块 Y
@@ -145,6 +156,48 @@ public final class ProximitySelector {
    * @return true 表示应当继续参与显形流程
    */
   public static boolean withinFrustum(Eye eye, int blockX, int blockY, int blockZ,
+      double minDistance, double fovDegrees) {
+    if (eye == null) {
+      return true;
+    }
+
+    // 早退与几何量只算一次，供粗筛与精判共用（避免粗筛反而多算一遍）。
+    double dx = blockX + 0.5D - eye.x();
+    double dy = blockY + 0.5D - eye.y();
+    double dz = blockZ + 0.5D - eye.z();
+
+    double distanceSquared = dx * dx + dy * dy + dz * dz;
+    double exemption = Math.max(0.0D, minDistance);
+    if (distanceSquared <= exemption * exemption) {
+      return true;
+    }
+    if (fovDegrees <= 0.0D || fovDegrees >= 180.0D) {
+      return true;
+    }
+
+    double distance = Math.sqrt(distanceSquared);
+    if (distance < 1.0E-6D) {
+      return true;
+    }
+
+    double verticalHalf = Math.toRadians(fovDegrees / 2.0D);
+
+    // 粗筛（先粗后细）：一次点积快速排除「与视线夹角明显超过视锥可接受范围」的候选，见下方法注释。
+    // 它是精判接受集的严格超集（只可能放行过多，绝不许多剔除），故逐坐标结果与仅精判完全一致。
+    double dot = dx * eye.dirX() + dy * eye.dirY() + dz * eye.dirZ();
+    // dot = |d|·cosθ；θ > fov/2 + 90° ⇔ dot < -|d|·sin(fov/2)
+    if (dot < -distance * Math.sin(verticalHalf)) {
+      return false;
+    }
+
+    return preciseWithinFrustumCore(eye, dx, dy, dz, distance, verticalHalf);
+  }
+
+  /**
+   * 视锥精判的完整参照实现（等价性单测用）：<b>粗筛引入前的旧行为</b>，此处独立保留，单测把
+   * {@link #withinFrustum}（粗筛 + 精判）与它逐坐标比对，保证粗筛绝不改变任何判定结果。
+   */
+  static boolean preciseWithinFrustum(Eye eye, int blockX, int blockY, int blockZ,
       double minDistance, double fovDegrees) {
     if (eye == null) {
       return true;
@@ -168,11 +221,16 @@ public final class ProximitySelector {
       return true;
     }
 
+    return preciseWithinFrustumCore(eye, dx, dy, dz, distance,
+        Math.toRadians(fovDegrees / 2.0D));
+  }
+
+  /** 精判核心（两轴判定）：入参为已算好的向量与光学量，供 {@link #withinFrustum} 与其参照实现共用。 */
+  private static boolean preciseWithinFrustumCore(Eye eye, double dx, double dy, double dz,
+      double distance, double verticalHalf) {
     double targetX = dx / distance;
     double targetY = dy / distance;
     double targetZ = dz / distance;
-
-    double verticalHalf = Math.toRadians(fovDegrees / 2.0D);
 
     // ① 竖直轴：目标仰角与视线仰角之差不超过竖直半角（矩形投影的上下边界）
     double pitchDifference =
