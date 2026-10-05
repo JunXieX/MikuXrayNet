@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -78,8 +79,10 @@ public final class DiskCacheStore implements AutoCloseable {
   /**
    * 关闭（{@link #close()}）排空磁盘线程的等待预算（毫秒）。
    *
-   * <p>与上面的 {@link #FLUSH_WAIT_MILLIS} 不同，这里必须等得足够久把脏数据真正落盘：close 之后紧接
-   * {@code shutdownNow}，若提前返回，正在进行的 FileChannel IO 会被中断而永久失效（数据丢失）。
+   * <p>与上面的 {@link #FLUSH_WAIT_MILLIS} 不同，这里必须等得足够久把脏数据真正落盘：close 走
+   * {@code shutdown()}（有序关闭）而不是 {@code shutdownNow()}，超过本预算只记一条中文 WARN，
+   * <b>绝不中断</b>正在进行的 FileChannel 写——FileChannel 一旦被中断即永久失效，脏 bucket 反而会
+   * 彻底丢失（与类注释承诺的「最终落盘」直接矛盾）。
    */
   private static final long CLOSE_TIMEOUT_MILLIS = 5000L;
   /** 触发压缩回收的垃圾占比（垃圾字节 > 活数据的一半）。 */
@@ -128,6 +131,22 @@ public final class DiskCacheStore implements AutoCloseable {
      * （实测出现过 16MB 上限却写出 30MB 文件）。
      */
     private long pendingBytes;
+
+    /**
+     * 每个 bucket 已计入 {@link #pendingBytes} 的整桶编码长度（只有磁盘线程访问）。
+     *
+     * <p><b>为什么按桶而非按负载记账</b>：flush 追加的是<b>整块 bucket</b>（最多 64 个槽位），旧实现只把
+     * 本次 payload 长度累加进 {@link #pendingBytes}，严重低估了实际会写入文件的字节数——文件早已冲破
+     * {@code max-file-size-mb}，上限判定却迟迟不触发、压缩回收也被一并推迟。改为：每次写入把「该桶整桶
+     * 编码长度」相对上次的增量并入 {@link #pendingBytes}，使上限判定反映真正会被 append 的数据量。
+     */
+    private final long[] pendingBucketBytes = new long[BufferedLinearV3Format.BUCKET_COUNT];
+
+    /** 待落盘记账清零（该文件的整桶数据已随 flush / 压缩完整落到文件）。 */
+    private void clearPending() {
+      pendingBytes = 0L;
+      Arrays.fill(pendingBucketBytes, 0L);
+    }
 
     /**
      * 本句柄当前「计入」{@link #approximateEntries} 的条目数（只有磁盘线程访问）。
@@ -365,7 +384,7 @@ public final class DiskCacheStore implements AutoCloseable {
     }
     closed = true;
     try {
-      Future<?> future = executor.submit(() -> {
+      executor.submit(() -> {
         try {
           flushAll();
           closeAllHandles();
@@ -373,11 +392,23 @@ public final class DiskCacheStore implements AutoCloseable {
           fail("关闭磁盘缓存时出现异常", throwable);
         }
       });
-      future.get(CLOSE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
     } catch (Throwable throwable) {
-      fail("关闭磁盘缓存超时或异常，已强制结束", throwable);
+      fail("关闭磁盘缓存的最终落盘任务提交失败", throwable);
     }
-    executor.shutdownNow();
+    // 有序关闭（shutdown 而非 shutdownNow）：不再接受新任务，但让正在执行/已入队的落盘任务自然跑完，
+    // 从而兑现「close 会把脏数据最终落盘」的承诺。绝不 shutdownNow——那会中断正在进行的 FileChannel
+    // 写，而 FileChannel 被中断即永久失效，脏 bucket 反而彻底丢失。
+    executor.shutdown();
+    try {
+      if (!executor.awaitTermination(CLOSE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
+        // 硬截止：只提示一次，且不做任何中断。中断只会毁掉正在进行的写、把「可能未持久化」变成
+        // 「彻底丢失」；不打断则磁盘线程会在队列排空后自行结束（fail-open，缓存只是可选加速）。
+        logger.warning("磁盘缓存关闭超过 " + CLOSE_TIMEOUT_MILLIS + "ms 仍未排空，"
+            + "部分缓存条目可能未能持久化（缓存只是可选加速，不影响封包链路与反矿透本身）");
+      }
+    } catch (InterruptedException exception) {
+      Thread.currentThread().interrupt();
+    }
   }
 
   /** 计数（命中率、拒绝与异常等）。 */
@@ -461,13 +492,19 @@ public final class DiskCacheStore implements AutoCloseable {
 
     BufferedLinearV3Format.Entry entry =
         new BufferedLinearV3Format.Entry(0L, writtenAt, configHash, payload);
-    boolean replaced = handle.file.put(BufferedLinearV3Format.chunkIndex(chunkX, chunkZ), entry);
+    int chunkIndex = BufferedLinearV3Format.chunkIndex(chunkX, chunkZ);
+    boolean replaced = handle.file.put(chunkIndex, entry);
     if (!replaced) {
       handle.accountedEntries++;
       approximateEntries.incrementAndGet();
     }
-    // 该负载会在 flushDirty 时随所属 bucket 整块 append；bucket 重写产生的旧副本计入垃圾，由压缩回收
-    handle.pendingBytes += payload.length;
+    // 该负载会在 flushDirty 时随所属 bucket <b>整块</b> append：按「该桶整桶编码长度」的增量记账，
+    // 而不是只加本次 payload 长度——bucket 是整块追加的，后者会严重低估上限判定所需的数据量。
+    // 桶重写产生的旧副本计入垃圾，由压缩回收。
+    int bucket = BufferedLinearV3Format.bucketIndex(chunkIndex);
+    long bucketBytes = handle.file.encodedBucketSizeEstimate(bucket);
+    handle.pendingBytes += bucketBytes - handle.pendingBucketBytes[bucket];
+    handle.pendingBucketBytes[bucket] = bucketBytes;
   }
 
   /** 维护任务：落盘 → 压缩回收 → 关闭闲置句柄（全部在磁盘线程执行）。 */
@@ -492,7 +529,7 @@ public final class DiskCacheStore implements AutoCloseable {
           handle.file.flushDirty();
         }
         // 无论是否真的写过，此刻内存里的负载都已（随 bucket 整块）落到文件：待落盘记账清零
-        handle.pendingBytes = 0L;
+        handle.clearPending();
       } catch (Throwable throwable) {
         if (!handle.file.channelOpen()) {
           // 通道已永久失效（FileChannel 一旦被线程中断或外部关闭就无法再用）。此时句柄留在表里、
@@ -591,7 +628,7 @@ public final class DiskCacheStore implements AutoCloseable {
         approximateEntries.updateAndGet(value -> Math.max(0, value - dropped));
       }
       // 压缩会把内存里的全部 bucket（含脏的）整文件重写：待落盘记账随之清零
-      handle.pendingBytes = 0L;
+      handle.clearPending();
     } catch (Throwable throwable) {
       // 压缩失败：句柄可能已不可用（例如文件被外部删除），直接关闭并让它下次重新打开
       fail("磁盘缓存压缩回收失败，已关闭该区域文件句柄：" + handle.file.path(), throwable);

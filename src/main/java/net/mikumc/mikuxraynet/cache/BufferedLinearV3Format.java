@@ -561,23 +561,11 @@ public final class BufferedLinearV3Format {
    * @param hashSeed 条目校验种子
    */
   public static byte[] encodeBucket(Entry[] slots, int hashSeed) {
-    // 按内容精确定容，避免初始 4096 字节在典型大桶（几个到几十个区块负载）下反复翻倍重拷，
-    // 也不过度分配。公式：每个空槽 = 1 个长度为 0 的 i32 前缀（4 字节）；每个非空槽 =
-    // 4（长度前缀）+ ENTRY_HEADER_SIZE（条目头，含校验和）+ 负载长度，与下面写出字节数逐项一致。
-    int capacity = 0;
-    for (int i = 0; i < BUCKET_SIZE; i++) {
-      Entry slot = slots != null && i < slots.length ? slots[i] : null;
-      if (slot == null || slot.payload() == null || slot.payload().length == 0) {
-        capacity += Integer.BYTES;
-      } else {
-        capacity += Integer.BYTES + ENTRY_HEADER_SIZE + slot.payload().length;
-      }
-    }
-
-    // 容量已逐槽精确算好，直接把每条条目写进结果数组——不再走 ByteArrayOutputStream + toByteArray() 的
-    // 「先写进中间缓冲、再整块复制一份」双重拷贝，也不再为每个条目单独分配一个编码临时数组
-    // （桶是热路径：一个区域文件最多 16 个桶会被反复重编码）。写出字节与 encodeEntry 完全一致。
-    byte[] out = new byte[capacity];
+    // 容量已按内容精确算好（见 encodedBucketLength），直接把每条条目写进结果数组——不再走
+    // ByteArrayOutputStream + toByteArray() 的「先写进中间缓冲、再整块复制一份」双重拷贝，也不再为每个
+    // 条目单独分配一个编码临时数组（桶是热路径：一个区域文件最多 16 个桶会被反复重编码）。
+    // 写出字节与 encodeEntry 完全一致。
+    byte[] out = new byte[encodedBucketLength(slots)];
     int offset = 0;
     for (int i = 0; i < BUCKET_SIZE; i++) {
       Entry entry = slots != null && i < slots.length ? slots[i] : null;
@@ -596,6 +584,28 @@ public final class BufferedLinearV3Format {
       offset += payload.length;
     }
     return out;
+  }
+
+  /**
+   * 一个 bucket 编码后的字节长度（与 {@link #encodeBucket} 的定容公式逐项一致，但<b>不实际编码</b>）。
+   *
+   * <p>公式：每个空槽 = 1 个长度为 0 的 i32 前缀（4 字节）；每个非空槽 =
+   * 4（长度前缀）+ {@link #ENTRY_HEADER_SIZE}（条目头，含校验和）+ 负载长度。
+   *
+   * <p>供 {@code DiskCacheStore} 做「单文件大小上限」的待落盘记账：flush 追加的是<b>整块 bucket</b>，
+   * 必须按整桶长度而非单条 payload 估算，否则文件会冲破上限而判定不触发（见该类 Handle 的记账说明）。
+   */
+  static int encodedBucketLength(Entry[] slots) {
+    int capacity = 0;
+    for (int i = 0; i < BUCKET_SIZE; i++) {
+      Entry slot = slots != null && i < slots.length ? slots[i] : null;
+      if (slot == null || slot.payload() == null || slot.payload().length == 0) {
+        capacity += Integer.BYTES;
+      } else {
+        capacity += Integer.BYTES + ENTRY_HEADER_SIZE + slot.payload().length;
+      }
+    }
+    return capacity;
   }
 
   /**

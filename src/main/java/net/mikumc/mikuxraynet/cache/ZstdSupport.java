@@ -648,8 +648,14 @@ public final class ZstdSupport {
         hashMismatchDetected = true;
         return null;
       }
-      // 先落临时文件再原子替换：中断/超时留下的残留文件永远不会被当成成品
-      Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
+      // 先落临时文件再原子替换：中断/超时留下的残留文件永远不会被当成成品。
+      // 优先 ATOMIC_MOVE（同一文件系统内为「要么旧、要么新」的原子替换）；文件系统不支持时
+      // （AtomicMoveNotSupportedException）退回普通替换移动，行为与旧实现一致。
+      try {
+        Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+      } catch (IOException atomicFailure) {
+        Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
+      }
       Codec found = loadFromJar(target);
       if (found == null) {
         Files.deleteIfExists(target);

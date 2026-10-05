@@ -491,9 +491,18 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       }
     }
 
-    // 条目超限：立即冲刷，避免缓冲无界增长
+    // 条目超限：立即冲刷，避免缓冲无界增长。
+    // 关键：绝不在这条共享的异步封包线程上内联跑整段合并（聚簇 + 构包 + 可能数千方块的发送）——
+    // 那会阻塞所有玩家的出站封包处理。改投到唯一的 MikuXrayNet-BlockMerge 线程执行；
+    // flush(Pending) 自带「恰好一次」闸（Pending.flushed 的 CAS + 同步块），与窗口定时器并发触发也不会重复交付。
     if (overflow) {
-      flush(target);
+      Pending flushTarget = target;
+      try {
+        flusher.execute(() -> flush(flushTarget));
+      } catch (Throwable rejected) {
+        // 执行器已 shutdown（拒绝提交）：退回内联冲刷，语义与改动前一致，保证原包不滞留（恰好放行一次）
+        flush(flushTarget);
+      }
     }
   }
 
@@ -777,6 +786,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       packet.getSectionPositions().writeSafely(0, new BlockPosition(section.x(), section.y(), section.z()));
       packet.getBlockDataArrays().writeSafely(0, data);
       packet.getShortArrays().writeSafely(0, positions);
+      // trustEdges 不写：编译期 ProtocolLib（5.3.0）未为本包提供该字段的类型化访问器
+      // （MultiBlockChangeInfo 只含 location/data/chunk，jar 内也搜不到 trustEdges），其结构由运行时
+      // 服务端包类反射得出，无法在编译期确认存在；此处不发明 API（不盲写 getBooleans 的某个下标，
+      // 以免在字段布局不同的服务端上写错字段）。合并包由本模块自行构造，未设置该布尔时沿用默认值，
+      // 语义为「不信任边缘」，安全侧成立。
 
       // 回读自检：字段必须真实存在且条目数与写入一致，否则视为结构不可用（fail-open）
       short[] readPositions = packet.getShortArrays().readSafely(0);

@@ -1070,12 +1070,64 @@ public final class ProximityRevealer implements Listener {
    */
   static boolean hasDisguisedNearby(ObfuscatedChunkIndex index, String worldName,
       int x, int y, int z, int radius) {
+    // 邻域偏移是固定的、且只落在至多 4 个区块里：按区块复用 ChunkKey，避免每个偏移都新建一个
+    // （一个塞满 4096 坐标的 MULTI_BLOCK_CHANGE 默认约 10 万次查找，是封包线程上最大的一笔分配）。
+    ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
+    keys.begin(worldName);
     for (int[] offset : instantOffsets(radius)) {
-      if (index.containsPosition(worldName, x + offset[0], y + offset[1], z + offset[2])) {
+      int blockX = x + offset[0];
+      int blockY = y + offset[1];
+      int blockZ = z + offset[2];
+      if (index.containsPosition(keys.keyFor(blockX, blockZ), blockX, blockY, blockZ)) {
         return true;
       }
     }
     return false;
+  }
+
+  /**
+   * 邻域初筛的区块键小缓存（线程本地复用，零分配）。
+   *
+   * <p>半径上限为 {@code 8}（配置解析已钳制，见 {@link #instantOffsets}），故一次邻域查找涉及的方块
+   * 横向只跨 ±8 格（不足一个区块），涉及的区块数至多 {@code 2×2 = 4} 个（{@code x>>4} 与 {@code z>>4}
+   * 各两个取值）。容量 4 正好覆盖；万一超出（防御性）则退化为每次新建键，语义不变。
+   */
+  private static final class ChunkKeyCache {
+
+    private static final ThreadLocal<ChunkKeyCache> LOCAL =
+        ThreadLocal.withInitial(ChunkKeyCache::new);
+    private static final int CAPACITY = 4;
+
+    private final int[] chunkXs = new int[CAPACITY];
+    private final int[] chunkZs = new int[CAPACITY];
+    private final ChunkKey[] keys = new ChunkKey[CAPACITY];
+    private String worldName;
+    private int size;
+
+    /** 开始一次邻域初筛（重置缓存）。 */
+    void begin(String worldName) {
+      this.worldName = worldName;
+      this.size = 0;
+    }
+
+    /** 取该方块坐标所在区块的键（命中已缓存的区块则复用，避免每次查找都新建）。 */
+    ChunkKey keyFor(int x, int z) {
+      int cx = x >> 4;
+      int cz = z >> 4;
+      for (int i = 0; i < size; i++) {
+        if (chunkXs[i] == cx && chunkZs[i] == cz) {
+          return keys[i];
+        }
+      }
+      ChunkKey key = new ChunkKey(worldName, cx, cz);
+      if (size < CAPACITY) {
+        chunkXs[size] = cx;
+        chunkZs[size] = cz;
+        keys[size] = key;
+        size++;
+      }
+      return key;
+    }
   }
 
   /**

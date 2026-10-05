@@ -16,20 +16,21 @@ import net.mikumc.mikuxraynet.command.MikuCommand;
  * Brigadier 命令（Paper 官方推荐做法）。paper-plugin.yml 下 Paper 不会从 YAML 注册任何命令
  * （PaperPluginClassLoader#init 以 Map.of() 填充 PluginDescriptionFile#commands），故命令只能由代码注册。
  *
- * <p><b>为什么删除了旧的纯 Bukkit/Spigot 回退</b>：旧实现在「非 Paper 核心」上退回按 plugin.yml 取回
+ * <p><b>为什么删除了旧的纯 Bukkit/Spigot 回退</b>：旧实现在「非 Paper 核心」上退回按传统描述取回
  * {@link org.bukkit.command.PluginCommand} 并绑定执行器。但本项目的回显走 Paper Adventure
  * {@link net.kyori.adventure.text.Component}（{@code CommandSender#sendMessage(Component)}），
  * Spigot 的 {@code CommandSender} <b>没有</b>该重载——一旦命中该回退路径必然 {@link NoSuchMethodError}。
  * 这是一条「只会在错误平台上炸、正常平台永不走到」的死路径，本项目也不做 Spigot 兼容，故整体删除，
- * 只保留 Paper Brigadier 一条路径（plugin.yml 的 commands 段仍保留，仅供两份描述的元数据一致性守门）。
+ * 只保留 Paper Brigadier 一条路径（传统 {@code plugin.yml} 也已随之下线，改由 {@code paper-plugin.yml}
+ * 作为唯一插件描述；其 commands 段仅作元数据，由 PluginDescriptionConsistencyTest 守门）。
  *
  * <p><b>守门声明</b>：下面的 {@link #COMMAND_NAME} / {@link #COMMAND_ALIASES} /
- * {@link #COMMAND_PERMISSION} 必须与两份插件描述（plugin.yml 与 paper-plugin.yml）的 commands 段
- * 逐字一致，由 {@code PluginDescriptionConsistencyTest} 守门（含「代码常量 ↔ 两份 yml」的对照断言）。
+ * {@link #COMMAND_PERMISSION} 必须与 {@code paper-plugin.yml} 的 commands 段逐字一致，
+ * 由 {@code PluginDescriptionConsistencyTest} 守门（含「代码常量 ↔ 插件描述」的对照断言）。
  */
 final class CommandRegistrar {
 
-  /** 管理命令名（两份插件描述与代码注册三处必须一致，由 PluginDescriptionConsistencyTest 守门）。 */
+  /** 管理命令名（插件描述与代码注册两处必须一致，由 PluginDescriptionConsistencyTest 守门）。 */
   static final String COMMAND_NAME = "mikuxraynet";
   static final String COMMAND_DESCRIPTION = "MikuXrayNet 管理命令";
   static final String COMMAND_PERMISSION = "mikuxraynet.admin";

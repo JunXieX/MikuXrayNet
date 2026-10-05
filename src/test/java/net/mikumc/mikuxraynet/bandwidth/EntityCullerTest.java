@@ -10,12 +10,12 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
@@ -193,48 +193,103 @@ class EntityCullerTest {
   /**
    * 本次缺陷的端到端回归：实体「先可见、之后才被墙挡住」→ 在有限周期内被隐藏。
    *
-   * <p>用 {@link EntityCuller.TrackedRotation} 模拟周期复检的轮转推进（纯逻辑），评估仍走真实的
-   * {@link EntityCuller#evaluate} 账本，因此不依赖 Bukkit 调度。
+   * <p><b>刻意走真实入口</b>：实体经 {@code onTrack}（入场首评）登记进轮转队列，再经真实的
+   * {@code recheck}（周期复检 → 通道②轮转分片 → 射线判定 → 隐藏）。若实现里再现「复检在到达
+   * evaluate 前提前返回」的缺陷，本用例的 {@code entitiesHidden} / {@code hiddenCount} 会恒为 0 而失败。
+   *
+   * <p>遮挡结论由注入的 {@link EntityCuller.Occlusion} 给出：离线环境连 {@code Material} 都初始化不了
+   * （{@code org.bukkit.Registry} 不可用），真实的 {@code World#rayTraceBlocks} 结果无从成立，故本用例
+   * 只验证「复检链路与账本/计数」，不验证射线本身。
    */
   @Test
   void entityThatBecomesOccludedAfterBeingVisibleIsHiddenWithinBoundedCycles() {
     ThrottleStats stats = new ThrottleStats();
     int budget = 10;
-    EntityCuller culler = newCuller(stats, budget);
     PlayerStub player = new PlayerStub();
     WorldStub world = new WorldStub();
+    AtomicBoolean occluded = new AtomicBoolean(false);
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, budget), stats,
+        entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> occluded.get());
 
-    EntityCuller.TrackedRotation rotation = new EntityCuller.TrackedRotation();
-    List<EntityStub> stubs = new ArrayList<>();
+    // 50 个追踪实体，位置远离玩家（超出强制可见距离 2 格）→ 走射线判定通道
     for (int i = 0; i < 50; i++) {
       EntityStub stub = new EntityStub(3000 + i, world);
-      stubs.add(stub);
-      rotation.add(stub.proxy());
+      culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), stub.proxy()));
     }
 
-    // 阶段一：实体刚入场、视线通畅 → 一轮完整轮转内不得隐藏任何实体
-    runRotation(rotation, budget, player, culler, false);
+    // 阶段一：入场首评时视线通畅 → 一个有限周期内不得隐藏任何实体
+    runRecheckCycles(culler, player, budget, 50);
     assertEquals(0L, stats.entitiesHidden.sum(), "视线通畅时不得隐藏（先可见阶段的正常状态）");
     assertEquals(0, culler.hiddenCount());
 
-    // 阶段二：之后才建墙遮挡 → 同一轮转在一个有限周期内必然再次覆盖到它并隐藏
-    runRotation(rotation, budget, player, culler, true);
+    // 阶段二：之后才被墙挡住 → 轮转分片在有限周期内必然再次覆盖到它们并隐藏
+    occluded.set(true);
+    runRecheckCycles(culler, player, budget, 50);
     assertEquals(50L, stats.entitiesHidden.sum(),
-        "「先可见后被遮挡」的实体必须在有限周期内被隐藏（旧实现此处恒为 0）");
+        "「先可见后被遮挡」的实体必须经真实复检链路被隐藏（旧实现此处恒为 0）");
+    assertEquals(50L, stats.recheckHidden.sum(), "「复检致隐藏」计数必须反映真实收敛（而非恒为 0）");
     assertEquals(50, culler.hiddenCount());
   }
 
-  /** 走一轮完整轮转：每个被选中的实体都用真实评估入口判定一次。 */
-  private static void runRotation(EntityCuller.TrackedRotation rotation, int budget, PlayerStub player,
-      EntityCuller culler, boolean allBlocked) {
-    int cycles = 0;
-    int maxCycles = (rotation.size() + budget - 1) / budget;
-    while (cycles < maxCycles) {
-      for (Entity entity : rotation.nextBatch(budget, Set.of())) {
-        culler.evaluate(player.proxy(), entity, allBlocked);
-      }
-      cycles++;
+  /** 走 {@code ceil(size / budget)} 个复检周期，使轮转分片覆盖全部追踪实体。 */
+  private static void runRecheckCycles(EntityCuller culler, PlayerStub player, int budget, int size) {
+    int cycles = (size + budget - 1) / budget;
+    for (int i = 0; i < cycles; i++) {
+      culler.recheck(player.proxy());
     }
+  }
+
+  /**
+   * 通道①成本有界：已隐藏实体即使「视线已通畅」，只要仍在强制可见距离外就不打射线、不被复活。
+   *
+   * <p>这正是旧实现提前返回所要保护的场景（远距离账本条目会随会话累积大量长射线）。若有人把通道①
+   * 也改成允许远距离打射线，本用例会因实体被恢复而失败。
+   */
+  @Test
+  void farHiddenEntityIsNotRevivedByTheRestoreChannel() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    AtomicBoolean occluded = new AtomicBoolean(true);
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 3), stats,
+        entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> occluded.get());
+
+    EntityStub far = new EntityStub(7101, world); // 默认位置 (100,65,100)，远超强制可见距离 2 格
+    culler.evaluate(player.proxy(), far.proxy(), true);
+    assertEquals(1, culler.hiddenCount());
+
+    occluded.set(false); // 视线变通畅，但实体仍在远距离
+    runRecheckCycles(culler, player, 3, 1);
+    assertEquals(1, culler.hiddenCount(), "远距离已隐藏实体不得被通道①打射线复活（成本有界）");
+    assertEquals(0L, stats.recheckShown.sum(), "通道①对远距离实体不产生恢复");
+  }
+
+  /**
+   * 强制可见距离内的实体一律可见（安全策略）：即便判定为被遮挡，复检也必须把它恢复为可见，
+   * 绝不隐藏它。
+   */
+  @Test
+  void entityWithinForceVisibleDistanceIsRestoredAndNeverHidden() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    // 始终判为被遮挡：安全策略若失效，近处实体就会被隐藏
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 3), stats,
+        entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> true);
+
+    // 与玩家重合（强制可见距离内）；直接置为隐藏，模拟「曾被隐藏」
+    EntityStub near = new EntityStub(7201, world, 0.5D, 65.0D, 0.5D);
+    culler.evaluate(player.proxy(), near.proxy(), true);
+    assertEquals(1, culler.hiddenCount());
+    long hiddenBefore = stats.entitiesHidden.sum();
+
+    culler.recheck(player.proxy());
+    assertEquals(0, culler.hiddenCount(), "强制可见距离内的隐藏实体必须被恢复（安全策略）");
+    assertEquals(1L, stats.recheckShown.sum(), "恢复应计入「复检致恢复」");
+    assertEquals(hiddenBefore, stats.entitiesHidden.sum(), "强制可见距离内绝不新增隐藏");
   }
 
   /**
@@ -309,7 +364,8 @@ class EntityCullerTest {
     PlayerStub player = new PlayerStub();
     WorldStub world = new WorldStub();
 
-    // 3 个「入场即被遮挡」的实体：位置离玩家很远（不触发强制可见）→ 复检时走射线判定，保持隐藏
+    // 3 个「入场即被遮挡」的实体：位置离玩家很远（不触发强制可见）→ 复检走通道①；
+    // 通道①只做近距离恢复（RESTORE_ONLY），远距离不打射线，故它们保持隐藏，仍计入「复检提交数」
     for (int i = 0; i < 3; i++) {
       culler.evaluate(player.proxy(), new EntityStub(4000 + i, world).proxy(), true);
     }
@@ -558,6 +614,10 @@ class EntityCullerTest {
         case "hasPermission" -> throw new UnsupportedOperationException(
             "EntityCuller 不得查询 Bukkit 权限，直通判定只读 BypassRegistry 登录期快照");
         case "getLocation", "getEyeLocation" -> location;
+        // 强制可见距离闸门改用零分配坐标 getter（不再 new Location）读取玩家位置
+        case "getX" -> location.getX();
+        case "getY" -> location.getY();
+        case "getZ" -> location.getZ();
         case "hideEntity" -> null;
         case "showEntity" -> {
           showCalls.incrementAndGet();
@@ -624,6 +684,13 @@ class EntityCullerTest {
         case "getWorld" -> world.proxy();
         case "getLocation" -> location;
         case "getBoundingBox" -> box;
+        // 强制可见距离闸门改用零分配坐标 getter
+        case "getX" -> location.getX();
+        case "getY" -> location.getY();
+        case "getZ" -> location.getZ();
+        // 载具/乘客关系：默认无关（getPassengers 必须返回非 null，否则 isEmpty 会 NPE）
+        case "getPassengers" -> List.of();
+        case "getVehicle" -> null;
         default -> defaultValue(method.getReturnType());
       };
     }

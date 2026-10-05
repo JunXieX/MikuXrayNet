@@ -355,7 +355,49 @@ public final class RevealedSet {
     }
   }
 
-  /** 使一个区块的全部玩家的已显形标记失效（区块卸载 / 区块被重新下发时调用）。 */
+  /**
+   * 只清<b>某个玩家</b>在该区块的已显形标记（区块封包重发给该玩家时调用）。
+   *
+   * <p><b>为什么需要它</b>：{@link #clearChunk(ChunkKey)} 会清掉该区块<b>所有</b>玩家的标记，
+   * 但区块封包通常只重发给一个玩家——其余玩家的客户端仍保留我们此前发回的真实方块，把它们一并作废
+   * 只会让它们在下一个巡检周期里把同样的坐标<b>重复显形</b>一遍（纯浪费带宽与主线程开销）。
+   *
+   * <p>锁序与 {@link #mark} / {@link #clearChunk} 完全一致（区块映射监视器 → 条目锁），
+   * 并复用同一套判活与计数扣减口径（见 {@link #clearPlayer}）。
+   */
+  void clearChunk(ChunkKey key, UUID playerId) {
+    if (playerId == null) {
+      // 无玩家标识（理论上不会发生）：退回整体失效，语义更保守
+      clearChunk(key);
+      return;
+    }
+    ConcurrentHashMap<UUID, Marker> players = chunks.get(key);
+    if (players == null) {
+      return;
+    }
+    synchronized (players) {
+      if (chunks.get(key) != players) {
+        return; // 已被并行摘除：它已按其 size 扣减过，这里不再重复扣
+      }
+      Marker marker = players.get(playerId);
+      if (marker != null) {
+        synchronized (marker) {
+          if (players.remove(playerId, marker)) {
+            AtomicInteger total = playerTotals.get(playerId);
+            if (total != null) {
+              subtract(total, marker.size());
+            }
+          }
+        }
+      }
+      // 摘除空映射前必须仍持「映射监视器」（mark 写入时也持它），避免并发 mark 写进被摘掉的孤儿映射
+      if (players.isEmpty()) {
+        chunks.remove(key, players);
+      }
+    }
+  }
+
+  /** 使一个区块的全部玩家的已显形标记失效（区块卸载 / 世界卸载时调用）。 */
   void clearChunk(ChunkKey key) {
     ConcurrentHashMap<UUID, Marker> players = chunks.get(key);
     if (players == null) {

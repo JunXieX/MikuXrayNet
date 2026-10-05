@@ -27,6 +27,32 @@ public final class MikuWorkPool implements AutoCloseable {
   private final int queueCapacity;
 
   /**
+   * 队列占用的近似计数（锁-free）：提交时 +1、任务「开始执行」时 -1，故它统计的是「已提交但尚未开始
+   * 执行」的任务数，≈ {@code ArrayBlockingQueue} 当前长度。
+   *
+   * <p><b>为什么用自维护计数而不是 {@code getQueue().remainingCapacity()}</b>：后者要拿
+   * {@code ArrayBlockingQueue} 的内部锁，而封包线程对<b>每个</b>区块封包都要先 {@link #hasCapacity()}
+   * 再 {@link #execute}，于是同一个包要两次抢队列锁、还要与轮询同队列的工作线程争锁。本计数只做原子
+   * 加减，调用方在提交前读一次即可，不再触碰队列锁。
+   *
+   * <p><b>为什么「开始执行即 -1」而非「执行完毕才 -1」</b>：后者会把正在运行的任务也算进占用，取值
+   * 会大于真实队列长度，可能在本有大量空位时误报「无容量」；「开始执行即 -1」逼近真实队列长度，
+   * 与 {@code queueCapacity} 比较的语义最接近。
+   *
+   * <p><b>为什么允许近似</b>：本值只是提交前的优化提示，正确性不依赖它——所有调用方都会捕获
+   * {@link java.util.concurrent.RejectedExecutionException} 并以「原包放行」兜底（fail-open），
+   * 或退回当前线程直接处理。并发提交下它可能有极小瞬时偏差，属可接受。
+   *
+   * <p><b>如何保证不永久漂高</b>：每次 +1 都恰好对应一次 -1——要么任务开始执行时 -1，要么提交被拒时
+   * 在 catch 中 -1；{@link #close()} 会将其清零并置 {@link #closed}。因此即便曾抛过异常，本值也只会
+   * 短暂偏高、不会永久上报「无容量」。
+   */
+  private final AtomicInteger queuedTasks = new AtomicInteger();
+
+  /** 是否已关闭；关闭后 {@link #hasCapacity()} 一律返回 false（提交必然被拒）。 */
+  private volatile boolean closed;
+
+  /**
    * 已提交、尚未执行完毕的改写任务登记。
    *
    * <p><b>为什么需要</b>：{@code close()} 时 {@code shutdownNow} 会把队列里还没跑的任务一并丢弃——
@@ -78,14 +104,30 @@ public final class MikuWorkPool implements AutoCloseable {
     return this.queueCapacity;
   }
 
-  /** 队列是否还有空位；false 表示此刻提交会被拒绝。 */
+  /**
+   * 队列是否还有空位；false 表示此刻提交很可能被拒绝。
+   *
+   * <p>锁-free 近似判断（见 {@link #queuedTasks}）：本值仅供参考，调用方仍必须处理
+   * {@link java.util.concurrent.RejectedExecutionException}。关闭后一律返回 false。
+   */
   public boolean hasCapacity() {
-    return this.executor.getQueue().remainingCapacity() > 0;
+    return !this.closed && this.queuedTasks.get() < this.queueCapacity;
   }
 
   /** 提交任务；队列已满会抛 {@link java.util.concurrent.RejectedExecutionException}。 */
   public void execute(Runnable task) {
-    this.executor.execute(task);
+    this.queuedTasks.incrementAndGet();
+    try {
+      this.executor.execute(() -> {
+        // 一开始执行就撤销占用：本计数只近似「排队中」的任务数（见 queuedTasks 说明）
+        this.queuedTasks.decrementAndGet();
+        task.run();
+      });
+    } catch (Throwable throwable) {
+      // 提交被拒：必须撤销刚才的 +1，否则计数会永久漂高、hasCapacity 永远返回 false
+      this.queuedTasks.decrementAndGet();
+      throw throwable;
+    }
   }
 
   /**
@@ -115,8 +157,11 @@ public final class MikuWorkPool implements AutoCloseable {
    */
   public void execute(RewriteTask task, Runnable payload) {
     pending.add(task);
+    this.queuedTasks.incrementAndGet();
     try {
       this.executor.execute(() -> {
+        // 一开始执行就撤销占用：本计数只近似「排队中」的任务数（见 queuedTasks 说明）
+        this.queuedTasks.decrementAndGet();
         try {
           payload.run();
         } finally {
@@ -125,6 +170,8 @@ public final class MikuWorkPool implements AutoCloseable {
       });
     } catch (Throwable throwable) {
       pending.remove(task);
+      // 提交被拒：撤销 +1，避免计数漂高导致 hasCapacity 永远返回 false
+      this.queuedTasks.decrementAndGet();
       throw throwable;
     }
   }
@@ -156,6 +203,8 @@ public final class MikuWorkPool implements AutoCloseable {
    */
   @Override
   public void close() {
+    // 先置关闭标志：关闭后 hasCapacity 一律 false（提交必然被拒），调用方随即走 fail-open。
+    this.closed = true;
     // 先取登记表快照、再 shutdownNow。
     // 为什么不能先 shutdownNow：它会立刻中断工作线程，而被中断的 payload 可能在自己的 finally 里
     // 先行注销（pending.remove），于是 close 随后遍历登记表时已经看不到这个任务 ——
@@ -172,6 +221,9 @@ public final class MikuWorkPool implements AutoCloseable {
       }
     }
     pending.clear();
+    // 队列里被 shutdownNow 丢弃的任务永远不会「开始执行」，其 +1 也就永远不会被撤销；清零避免计数残留。
+    // （关闭后 hasCapacity 因 closed 已恒为 false，本值不再影响任何结果，仅作清理以免诊断口径失真。）
+    this.queuedTasks.set(0);
     this.watchdog.shutdownNow();
   }
 }

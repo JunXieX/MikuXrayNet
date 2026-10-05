@@ -132,9 +132,13 @@ public class Chunk implements AutoCloseable {
           // 让 scratch 与 outputBuffer 双双放弃对它的引用——scratch 下次另分配（detachOutput），本对象
           // 再 finalizeOutput 也会写进新缓冲，绝不会就地改写已移交的数组；数组长度恰为 readable，长度精确。
           this.scratch.detachOutput();
+          ByteBuf previousOut = out;
           this.outputBuffer = Unpooled.wrappedBuffer(
               this.scratch.outputArray(Math.max(1, array.length)));
           this.outputBuffer.clear();
+          // 交出数组后旧包装已无引用价值：立即释放，避免「替换即释放」的记账约定被破坏
+          // （当前是 Unpooled 堆包装、不涉及池化内存，但一旦将来换成池化/直接缓冲，漏放就是真泄漏）。
+          releaseQuietly(previousOut);
           return array;
         }
         // 未写满（复用数组偏大）：必须复制出长度精确的独立数组，不能把偏大的复用数组交出去

@@ -239,21 +239,34 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
       PacketContainer packet = event.getPacket();
       PacketType type = event.getPacketType();
 
-      StructureModifier<Short> deltas = packet.getSpecificModifier(short.class);
-      if (deltas.size() < 3) {
-        // ENTITY_LOOK（只有朝向字节、没有 short 位移字段）会走到这里 → 放行；
-        // 其它字段形态不符的情况同样 fail-open 放行，绝不误判取消。
+      // 只有纯位移包（REL_ENTITY_MOVE）才可能被判为冗余取消；朝向包（REL_ENTITY_MOVE_LOOK / ENTITY_LOOK）
+      // 里的 yaw/pitch 是绝对量化角（0 表示朝正南 / 平视），按全 0 取消会让客户端保留旧朝向（持久朝向错误，
+      // 依据见 MovementDelta 类注释），因此一律放行。提前在这里返回还顺带省下为朝向包构造 short 位移
+      // StructureModifier 的分配（ProtocolLib 的类型化访问器每次都会 new 一个 StructureModifier）。
+      if (type != PacketType.Play.Server.REL_ENTITY_MOVE) {
         pass();
         return;
       }
 
-      // 只有纯位移包（REL_ENTITY_MOVE）可做零位移取消；朝向包（REL_ENTITY_MOVE_LOOK / ENTITY_LOOK）
-      // 里的 yaw/pitch 是绝对量化角（0 表示朝正南 / 平视），把全 0 当作「无转向」取消会让客户端
-      // 保留旧朝向（持久朝向错误），因此一律放行（依据见 MovementDelta 类注释）。
-      boolean carriesRotation = type != PacketType.Play.Server.REL_ENTITY_MOVE;
-      boolean redundant = MovementDelta.isRedundantEntityUpdate(carriesRotation,
+      // 纯位移包：读取 dx/dy/dz。字段形态不符（不同服务端版本的字段布局差异）时 fail-open 放行，绝不误判取消。
+      StructureModifier<Short> deltas = packet.getSpecificModifier(short.class);
+      if (deltas.size() < 3) {
+        pass();
+        return;
+      }
+
+      // 注：零位移取消会一并丢弃本包的 onGround 布尔。要修它必须按 entityId 维护「上次已下发的 onGround」
+      // 才能判断该布尔是否携带新信息，而这需要与实体「加入/离开世界」事件配套的淘汰逻辑；该事件仅在 Paper
+      // 上登记（Folia 下无法安全枚举实体、维护不了该索引），在 Folia 上该表会无界增长（内存泄漏风险）——
+      // 而 Folia 恰恰是 onGround 丢弃最严重的平台（其白名单索引为空 → isWhitelisted 恒 false → 所有零位移包
+      // 都会被取消）。即便改用「容量封顶 + 清空」换取有界，也要在每个相对移动包（本项正是要削减开销的热路径）
+      // 上多读一次布尔、多一次映射操作，得不偿失。权衡后此处保持不变：onGround 偶发滞后属低风险观感问题，
+      // 无界状态 / 热路径加负的风险更高。
+      boolean redundant = MovementDelta.isRedundantEntityUpdate(false,
           deltas.read(0), deltas.read(1), deltas.read(2));
 
+      // getIntegers() 仅在确认冗余后才调用：该访问器同样每次都 new 一个 StructureModifier，放到条件分支里
+      // 可避免在热路径（每个实体每 tick 的相对移动）上为「非冗余」包白白分配一次。
       if (!redundant || isWhitelisted(packet.getIntegers().read(0))) {
         pass();
         return;

@@ -556,6 +556,18 @@ public final class ObfuscationProcessor {
         overrideProfiles, config, config.occlusion().fluidCover(), registry::isFluidCover);
   }
 
+  /**
+   * 参与重写字节的调色板选项指纹：{@code strict-verify} 与 {@code width-budget} 都会改变重写后的区块字节，
+   * 因此必须与 {@link AntiXrayConfig#configHash()} 一起构成缓存键——否则改动 bandwidth.yml 的 palette 段后，
+   * 旧缓存条目仍按原指纹命中（默认磁盘 7 天才过期），表现为「改了配置不生效」。
+   *
+   * <p>这两个选项在插件启用时固化进本处理器（改动需重启），故该指纹在进程内恒定、按重启后的新配置变化，
+   * 正好符合「一次重启即让旧缓存失效重建」的预期。
+   */
+  public int paletteFingerprint() {
+    return (paletteOptions.strictVerify() ? 1 : 0) | (paletteOptions.widthBudget() ? 2 : 0);
+  }
+
   /** 是否具备生效条件（任一维度档案或任一世界覆盖档案的目标与伪装候选都已解析）。 */
   public boolean isActive() {
     for (WorldProfile profile : dimensionProfiles) {

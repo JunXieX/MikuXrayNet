@@ -29,6 +29,8 @@ public final class NeighborEdges {
   private final long[] xPlus;
   private final long[] zMinus;
   private final long[] zPlus;
+  /** 内容指纹（构造期算一次）：供调用方把「本次改写实际用到的快照内容」并入缓存键。 */
+  private final long contentFingerprint;
 
   public NeighborEdges(int height, long[] xMinus, long[] xPlus, long[] zMinus, long[] zPlus) {
     this.height = height;
@@ -36,6 +38,37 @@ public final class NeighborEdges {
     this.xPlus = xPlus;
     this.zMinus = zMinus;
     this.zPlus = zPlus;
+    this.contentFingerprint = fingerprint(height, xMinus, xPlus, zMinus, zPlus);
+  }
+
+  /**
+   * 快照内容指纹。
+   *
+   * <p><b>为什么需要它</b>：{@code mode=enclosed} 的改写结果依赖邻块贴边快照的遮挡位，
+   * 而快照内容会随邻块方块变化。若缓存键只看「本区块原始字节」，邻块变化后本区块字节未变，
+   * 缓存就会继续返回按<b>旧邻块</b>算出的结果。调用方把本值并入缓存键即可让这类条目自然失效。
+   *
+   * <p>构造期计算一次（本类字段全部 final、构造后不可变，故可在工作线程安全读取）；数据量为
+   * 「4 个平面 × height×16 位」（主世界约 384 个 long），开销可忽略。缺失的平面（{@code null}）
+   * 以独立哨兵参与，保证「缺失」与「非空平面」不会算出同一指纹。
+   */
+  public long contentFingerprint() {
+    return contentFingerprint;
+  }
+
+  /** FNV-1a 64：对高度 + 各平面内容（含 null 标记）做一次性摘要。 */
+  private static long fingerprint(int height, long[]... planes) {
+    long hash = 0xcbf29ce484222325L ^ height;
+    for (long[] plane : planes) {
+      // 先混入「平面是否存在/长度」：缺失平面与长度为 0 的平面必须与「有内容」区分开
+      hash = (hash ^ (plane == null ? 0x9E3779B97F4A7C15L : plane.length)) * 0x100000001b3L;
+      if (plane != null) {
+        for (long value : plane) {
+          hash = (hash ^ value) * 0x100000001b3L;
+        }
+      }
+    }
+    return hash;
   }
 
   /** 一个平面的位数（{@code height × 16}）。 */

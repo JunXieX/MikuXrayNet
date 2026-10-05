@@ -326,6 +326,24 @@ public final class AntiXrayConfig {
   public static final int CACHE_MAXIMUM_SIZE_MAX = 65536;
 
   /**
+   * {@code advanced.threads}（反矿透改写工作线程数）的安全上限。
+   *
+   * <p>每个 worker 线程各持一份按线程复用的编解码 scratch（调色板反查表 + 位打包数组 + 输出缓冲，
+   * 可达 MB 级常驻），线程数直接决定这部分常驻内存与内核调度开销。默认 0 表示「按 CPU 自动」（上限 4），
+   * 正常配置远低于本上限；上限只为拦住手滑多打一位数（如 100000）造成的线程风暴。
+   */
+  public static final int ADVANCED_THREADS_MAX = 64;
+
+  /**
+   * {@code advanced.queue-capacity}（改写任务队列容量）的安全上限。
+   *
+   * <p><b>队列里钉着封包</b>：每个排队项持有一个 {@code RewriteTask} 与其对应的区块封包（单个区块
+   * 未压缩负载通常几十~几百 KB），因此队列容量直接等于「积压时最多钉住多少内存」。
+   * 默认 2048 已足够吸收突发；上限用于拦住手滑多打一位数（如 10000000）导致的巨数组分配与内存打满。
+   */
+  public static final int ADVANCED_QUEUE_CAPACITY_MAX = 8192;
+
+  /**
    * 邻近显形：玩家靠近曾被伪装的坐标时，主动把该坐标的真实方块发回客户端。
    *
    * @param distance              触发显形的距离（格，三维欧氏距离，等于阈值也算命中）；
@@ -807,9 +825,15 @@ public final class AntiXrayConfig {
         clampCeiling(root.getInt("cache.maximum-size", 40960), 1,
             CACHE_MAXIMUM_SIZE_MAX, "cache.maximum-size", ceilingAdjustments),
         root.getInt("cache.expire-after-access-seconds", 600),
-        root.getInt("advanced.threads", 0),
+        // 上限见 ADVANCED_THREADS_MAX：每个 worker 各持一份按线程复用的编解码 scratch，
+        // 手滑多打一位数会同时放大线程数与这部分常驻内存。
+        clampCeiling(root.getInt("advanced.threads", 0), 0, ADVANCED_THREADS_MAX,
+            "advanced.threads", ceilingAdjustments),
         root.getInt("advanced.timeout-millis", 2500),
-        root.getInt("advanced.queue-capacity", 2048),
+        // 上限见 ADVANCED_QUEUE_CAPACITY_MAX：每个排队项都钉着一个区块封包，
+        // 队列容量直接决定积压时钉住多少内存。
+        clampCeiling(root.getInt("advanced.queue-capacity", 2048), 1, ADVANCED_QUEUE_CAPACITY_MAX,
+            "advanced.queue-capacity", ceilingAdjustments),
         unknownTags,
         overrides,
         worldBlacklist,

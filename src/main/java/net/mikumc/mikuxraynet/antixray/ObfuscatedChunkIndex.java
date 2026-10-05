@@ -122,9 +122,15 @@ public final class ObfuscatedChunkIndex {
 
     ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
     ChunkEntry entry = new ChunkEntry(minHeight, localPositions, clock.getAsLong());
-    ChunkEntry previous = chunks.put(key, entry);
-    int delta = localPositions.length - (previous == null ? 0 : previous.size());
-    totalPositions.updateAndGet(current -> Math.max(0, current + delta));
+    // 用 compute 原子地「取旧值 + 装新值」：旧实现先 put 再另算 delta，同键并发 recordChunk 时
+    // 两个线程可能读到同一个旧条目，导致 totalPositions 被重复加减（只影响安全阀诊断口径，
+    // 且已夹在 0 以上；这里改为原子口径，与 RevealedSet 的计数纪律对齐）。
+    int[] delta = {0};
+    chunks.compute(key, (ignored, previous) -> {
+      delta[0] = localPositions.length - (previous == null ? 0 : previous.size());
+      return entry;
+    });
+    totalPositions.updateAndGet(current -> Math.max(0, current + delta[0]));
     return localPositions.length;
   }
 
@@ -243,7 +249,22 @@ public final class ObfuscatedChunkIndex {
     if (worldName == null) {
       return false;
     }
-    ChunkEntry entry = chunks.get(new ChunkKey(worldName, x >> 4, z >> 4));
+    return containsPosition(new ChunkKey(worldName, x >> 4, z >> 4), x, y, z);
+  }
+
+  /**
+   * 以「调用方已算好的区块键」查询（只读）。
+   *
+   * <p><b>为什么要这个重载</b>：邻域初筛会对同一个坐标的每个曼哈顿偏移各查一次（默认半径 2 → 25 次），
+   * 而这些偏移只落在至多 4 个区块里。若每次都走上面那个重载，就会为每次查找新建一个 {@link ChunkKey}
+   * ——一个塞满 4096 坐标的 {@code MULTI_BLOCK_CHANGE} 因此产生约 10 万个短命对象，全部落在共享的
+   * 封包解析线程上。调用方按区块缓存键后，这次分配降到 O(涉及区块数)。
+   */
+  public boolean containsPosition(ChunkKey key, int x, int y, int z) {
+    if (key == null) {
+      return false;
+    }
+    ChunkEntry entry = chunks.get(key);
     if (entry == null) {
       return false;
     }

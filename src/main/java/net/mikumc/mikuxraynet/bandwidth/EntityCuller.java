@@ -51,20 +51,29 @@ import org.bukkit.util.Vector;
  *
  * <p><b>周期复检的两条通道</b>（修复「先可见、之后才被挡住」实体永不隐藏的缺陷）：
  * <ol>
- *   <li>已隐藏实体：<b>每周期全部复检</b>，可见即尽快恢复（既有行为，不退化）；</li>
- *   <li>其余追踪实体：按<b>轮转分片</b>每周期只复检 {@code entity-culling.recheck-budget} 个，
- *       游标推进，故 {@code ceil(追踪数 / budget)} 个周期内必然覆盖全部追踪实体——
- *       这样实体入场时可见、之后才被墙/地形挡住的场景也能被收敛到隐藏。</li>
+ *   <li><b>通道①·已隐藏实体</b>：每周期全部复检，但只做<b>近距离恢复</b>——只有当实体重新进入强制
+ *       可见距离时才 {@code showIfHidden}；超出该距离一律不打射线（成本有界，见 {@link RecheckMode}）。</li>
+ *   <li><b>通道②·其余追踪实体</b>：按<b>轮转分片</b>每周期只复检 {@code entity-culling.recheck-budget}
+ *       个，游标推进，故 {@code ceil(追踪数 / budget)} 个周期内必然覆盖全部追踪实体。该通道允许对超出
+ *       强制可见距离的实体<b>打射线并隐藏</b>——这正是「入场时可见、之后才被墙/地形挡住」的实体能被
+ *       收敛到隐藏的<b>唯一</b>路径；每条射线的成本已由 {@code recheck-budget} 封顶。</li>
  * </ol>
  * 两条通道都复用同一套评估链路（实体所属线程做原生射线并 hide/show），不另写一套。
- * <b>距离闸门</b>：两条通道都只对「在强制可见距离内」的实体做恢复（{@code showIfHidden}），
- * 超出该距离时直接跳过（不再打射线）——避免玩家走远后、实体仍留在常加载区块时每周期累积大量远距离射线。
- * 入场那一刻的首评（{@code onTrack}）不受此闸门限制，因此「远距离实体照常被剔除」这一行为不变。
+ * <b>距离闸门</b>：任何通道内、处于强制可见距离内的实体一律可见（{@code showIfHidden}），绝不隐藏——
+ * 这是既有的安全策略。入场那一刻的首评（{@code onTrack}）不受距离闸门限制，故「远距离实体照常被剔除」
+ * 这一行为不变。
  */
 public final class EntityCuller implements Listener {
 
   /** 单个小体积实体（如物品、投掷物）只取中心顶点即可。 */
   private static final double SMALL_BOX = 0.25D;
+
+  /**
+   * 单条遮挡射线的最大长度（格）。射线只用于判断「眼睛与实体之间是否有遮挡方块」；实体一旦超出该长度，
+   * 说明它已远超常见实体追踪距离（通常 48~128 格），此时把射线截断只会退回 fail-open（判为通畅、保持可见），
+   * 绝不误藏。加上限是为了避免「玩家走远、实体仍留在常加载区块」时每条射线都射向极远处带来的无谓开销。
+   */
+  private static final double MAX_RAY_LENGTH = 128.0D;
 
   private final Plugin plugin;
   private final BandwidthConfig.EntityCulling config;
@@ -73,6 +82,8 @@ public final class EntityCuller implements Listener {
   private final EntityOwnership ownership;
   /** 直通判定（只读 BypassRegistry 的登录期快照；见 {@link BypassLookup}）。 */
   private final BypassLookup bypass;
+  /** 遮挡判定（生产实现为本类的 Paper 原生射线；离线单测可注入确定性结果，见 {@link Occlusion}）。 */
+  private final Occlusion occlusion;
   private final double forceVisibleSquared;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
@@ -115,11 +126,25 @@ public final class EntityCuller implements Listener {
    */
   EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
       EntityOwnership ownership, BypassLookup bypass) {
+    this(plugin, config, stats, ownership, bypass, null);
+  }
+
+  /**
+   * 完整构造（追加遮挡判定注入；离线单测可对归属 / 直通 / 遮挡三者全部注入假实现）。
+   *
+   * <p>{@code occlusion} 为 {@code null} 时回落生产实现 {@link #isFullyOccluded}（Paper 原生射线）；
+   * 提供该注入点是因为离线环境连 {@code Material} 都初始化不了（{@code org.bukkit.Registry} 不可用），
+   * 真实的 {@code World#rayTraceBlocks} 判定结果无从成立，而「复检能否真正隐藏实体」这条链路又必须被
+   * 端到端回归（见 {@code EntityCullerTest}）。
+   */
+  EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
+      EntityOwnership ownership, BypassLookup bypass, Occlusion occlusion) {
     this.plugin = plugin;
     this.config = config;
     this.stats = stats;
     this.ownership = ownership;
     this.bypass = bypass == null ? BypassRegistry::isBypassedNow : bypass;
+    this.occlusion = occlusion == null ? this::isFullyOccluded : occlusion;
     this.forceVisibleSquared = config.forceVisibleDistance() * config.forceVisibleDistance();
   }
 
@@ -164,6 +189,39 @@ public final class EntityCuller implements Listener {
   @FunctionalInterface
   interface BypassLookup {
     boolean isBypassed(UUID playerId);
+  }
+
+  /**
+   * 遮挡判定：该实体是否被完全遮挡（所有可见顶点射线都不通畅）。
+   *
+   * <p>生产实现为本类的 Paper 原生射线 {@link #isFullyOccluded}；离线单测注入确定性结果，
+   * 以便端到端验证「复检能否真正隐藏实体」这条链路（离线无法初始化 {@code Material}）。
+   */
+  @FunctionalInterface
+  interface Occlusion {
+    boolean isFullyOccluded(Player player, Entity entity);
+  }
+
+  /**
+   * 周期复检通道语义：决定「实体超出强制可见距离时」还能不能打射线。
+   *
+   * <p><b>为什么必须显式区分</b>：本轮修复前用单一的 {@code fromRecheck} 布尔同时承担了「计数归属」与
+   * 「超出强制可见距离后不再打射线」两件事，导致<b>两条</b>复检通道都在到达 {@code evaluate} 前提前返回，
+   * 实体一旦「入场时可见、之后才被挡住」就再也不会被隐藏，{@code recheckHidden} 恒为 0（与类注释矛盾）。
+   */
+  private enum RecheckMode {
+    /** 入场首评（{@code onTrack}）：不受距离闸门限制，远距离实体照常打射线并可能隐藏。 */
+    INITIAL,
+    /**
+     * 通道①·已隐藏实体复检：只做「强制可见距离内的恢复」，超出距离一律不打射线。
+     * 这些账本条目可能随玩家走远而长期滞留，若每周期都打射线则成本随会话无界增长。
+     */
+    RESTORE_ONLY,
+    /**
+     * 通道②·轮转分片复检：数量已由 {@code entity-culling.recheck-budget} 封顶，故允许对超出强制可见
+     * 距离的实体打射线并隐藏——这是「先可见、之后才被挡住」能被收敛到隐藏的关键；成本上界＝每周期预算次。
+     */
+    ROTATION
   }
 
   /** 注册事件监听与周期复检任务。 */
@@ -306,7 +364,7 @@ public final class EntityCuller implements Listener {
     }
     // 登记进轮转队列：这是「入场那一刻评估一次」之外的兜底，保证之后出现的遮挡也能被发现
     rotation(player.getUniqueId()).add(entity);
-    submitRaycast(player, entity, false);
+    submitRaycast(player, entity, RecheckMode.INITIAL);
   }
 
   /** 实体离开追踪范围时从轮转队列摘除（否则队列会无界增长，并浪费复检预算）。 */
@@ -349,15 +407,14 @@ public final class EntityCuller implements Listener {
     }
 
     // ① 已隐藏实体：每周期全量复检（既有行为）。
-    //    用「键（加入时捕获的 entityId）+ 归属判定」遍历：玩家走远/传送后这些实体可能已在别的区域，
+    //    用「加入时捕获的 entityId + 归属判定」遍历：玩家走远/传送后这些实体可能已在别的区域，
     //    读它们的任何状态都会触发 Folia 线程校验（先打 ERROR 再抛异常），因此先问能不能碰，不能则整轮跳过。
+    //    本通道只做「强制可见距离内的恢复」（RESTORE_ONLY）：远距离不打射线，成本有界。
     Map<Integer, Entity> hiddenMap = hidden.get(playerId);
     if (hiddenMap != null && !hiddenMap.isEmpty()) {
-      // 就地遍历（不再每周期拷贝一份 entrySet），失效键先收集、遍历结束后统一删除。
+      List<Entity> stale = null;
       // hiddenMap 是并发 Map，遍历中 submitRaycast 可能增删；弱一致迭代不会抛异常。
-      List<Integer> stale = null;
-      for (Map.Entry<Integer, Entity> entry : hiddenMap.entrySet()) {
-        Entity entity = entry.getValue();
+      for (Entity entity : hiddenMap.values()) {
         if (!owns(entity)) {
           continue;
         }
@@ -365,20 +422,23 @@ public final class EntityCuller implements Listener {
           if (stale == null) {
             stale = new ArrayList<>(4);
           }
-          stale.add(entry.getKey());
+          stale.add(entity);
           continue;
         }
         stats.recheckSubmitted.increment();
-        submitRaycast(player, entity, true);
+        submitRaycast(player, entity, RecheckMode.RESTORE_ONLY);
       }
       if (stale != null) {
-        for (Integer key : stale) {
-          hiddenMap.remove(key);
+        for (Entity entity : stale) {
+          // 仅摘除「同一实例」：entityId 会被复用，按 id 删会把后来占用该 id 的新实体误删
+          hiddenMap.remove(entity.getEntityId(), entity);
         }
       }
     }
 
-    // ② 其余追踪实体：轮转分片，每周期只取一小批（已隐藏者由 ① 负责，这里跳过）
+    // ② 其余追踪实体：轮转分片，每周期只取一小批（已隐藏者由 ① 负责，这里跳过）。
+    //    本通道允许打射线隐藏（ROTATION）：这是「先可见、之后才被挡住」能被收敛到隐藏的唯一路径，
+    //    成本由 recheck-budget 封顶（每周期至多少量射线）。
     TrackedRotation rotation = rotations.get(playerId);
     if (rotation == null) {
       return;
@@ -393,47 +453,69 @@ public final class EntityCuller implements Listener {
         continue;
       }
       stats.recheckSubmitted.increment();
-      submitRaycast(player, entity, true);
+      submitRaycast(player, entity, RecheckMode.ROTATION);
     }
   }
 
   /**
-   * 在实体所属线程直接评估：抓取眼睛坐标与包围盒顶点 → 原生射线判定 → hide/show。
+   * 在实体所属线程直接评估：距离闸门 → 原生射线判定 → hide/show。
    *
    * <p>不再有 worker 往返与 {@code int[]} 路径分配：{@code World#rayTraceBlocks} 是 Bukkit API，
    * 必须在实体所属线程调用（事件与周期复检本就落在该线程上）。
    *
-   * <p>{@code fromRecheck} 仅用于统计归属（不影响判定逻辑）。
+   * <p>{@code mode} 决定「实体超出强制可见距离时」是否打射线（见 {@link RecheckMode}）：
+   * <ul>
+   *   <li>{@link RecheckMode#INITIAL}（入场首评）与 {@link RecheckMode#ROTATION}（轮转分片复检）：
+   *       允许对远距离实体打射线并隐藏，因此 {@code evaluate} 里的 hide 分支可达——这正是复检能够
+   *       真正收敛到隐藏的入口；</li>
+   *   <li>{@link RecheckMode#RESTORE_ONLY}（已隐藏实体复检）：超出距离一律不打射线，只等实体重新回到
+   *       强制可见距离内再恢复，成本有界。</li>
+   * </ul>
+   * 无论哪条通道，处于强制可见距离内的实体一律 {@code showIfHidden}（安全策略：绝不隐藏近处实体）。
    */
-  private void submitRaycast(Player player, Entity entity, boolean fromRecheck) {
+  private void submitRaycast(Player player, Entity entity, RecheckMode mode) {
     // 烟花被隐藏会破坏鞘翅飞行体验，直接跳过
     if (entity instanceof Firework) {
       return;
     }
     try {
-      // 强制可见距离内一律不剔除——复检通道同样适用，避免轮转复检把近处实体误藏。
-      // 注：这里刻意保留 Location#distanceSquared（而非零分配 getter 版）：它对「任一 Location 无世界」
-      // 会抛异常，而离线单测的替身 Location 正是无世界——该异常被下面的 catch 兜住（fail-open），
-      // 是既有 EntityCullerTest 复检账本用例的既有前提；改成 getter 版会让那些用例真正走进射线判定，
-      // 而离线环境连 Material 都初始化不了（org.bukkit.Registry 不可用），判定结果无从成立。
-      if (player.getLocation().distanceSquared(entity.getLocation()) <= forceVisibleSquared) {
-        showIfHidden(player, entity);
+      // 强制可见距离内一律可见（安全策略）：实体只要在近处，任何通道都不得隐藏它，最多恢复显示。
+      // 这里用坐标 getter 手算距离（不再 new 两个 Location）：既省下每次评估的固定分配，
+      // 也避免 Location#distanceSquared 在「实体未加载 / 两侧世界不一致」时抛异常——失败方向一致
+      // （判不出距离时宁可当作「近」→ 只 show 不 hide，绝不误藏）。fromRecheck 仅用于计数归属。
+      if (withinForceVisible(player, entity)) {
+        evaluate(player, entity, false, mode != RecheckMode.INITIAL);
         return;
       }
-      // 复检通道：超出强制可见距离的实体不再打射线。
-      // 「玩家走远后实体仍留在常加载区块（出生点刷怪塔等）」时，这些账本条目会让复检通道每周期
-      // 对每个远距离实体打至多 ray-samples 条无距离上限的射线，会话越长累积越多。这里直接跳过：
-      // 账本条目保留（不能摘——Paper 的 hideEntity 状态跨 untrack 仍生效，账本是我们「重进追踪范围时
-      // 该不该 showEntity」的唯一依据），待实体重新进入强制可见距离时，上面的 showIfHidden 分支会恢复它。
-      // 入场那一刻的首评（fromRecheck=false）仍会打射线，故「远距离实体照常剔除」这一行为不变。
-      if (fromRecheck) {
+      // 超出强制可见距离：
+      //  ① RESTORE_ONLY：不打射线（远距离账本条目可能长期滞留，每周期打射线会让成本随会话无界增长）。
+      //     账本条目保留——Paper 的 hideEntity 状态跨 untrack 仍生效，账本是「重新进入强制可见距离时
+      //     该不该 showEntity」的唯一依据；实体一旦回到近处，上面的 showIfHidden 分支即恢复它。
+      //  ② ROTATION：允许打射线并隐藏。数量已由 recheck-budget 封顶，故成本有界（每周期至多预算次射线）。
+      //  ③ INITIAL：入场首评不受距离闸门限制，远距离实体照常剔除（既有行为不变）。
+      if (mode == RecheckMode.RESTORE_ONLY) {
         return;
       }
-      evaluate(player, entity, isFullyOccluded(player, entity), fromRecheck);
+      evaluate(player, entity, occlusion.isFullyOccluded(player, entity), mode != RecheckMode.INITIAL);
     } catch (Throwable throwable) {
       // 任意失败都按「保持可见」处理（fail-open：绝不误藏实体）
       logThrottled(throwable);
     }
+  }
+
+  /**
+   * 玩家与实体的欧氏距离是否在强制可见距离内（零分配：直接用坐标 getter，不 new {@link Location}）。
+   *
+   * <p>刻意不用 {@code Location#distanceSquared}：那会为玩家与实体各 new 一个 {@code Location}，
+   * 是每次评估的一笔固定分配，且它要求两侧都带世界，实体未加载时会直接抛异常。坐标 getter 在任何
+   * 情况下都可用，失败方向也一致（判不出距离时按「近」处理 → 只 showIfHidden，绝不误藏）。
+   * 生产环境里被追踪的实体必与玩家同世界（追踪事件只对同世界实体触发），故无需再做世界比较。
+   */
+  private boolean withinForceVisible(Player player, Entity entity) {
+    double dx = player.getX() - entity.getX();
+    double dy = player.getY() - entity.getY();
+    double dz = player.getZ() - entity.getZ();
+    return dx * dx + dy * dy + dz * dz <= forceVisibleSquared;
   }
 
   /**
@@ -492,7 +574,9 @@ public final class EntityCuller implements Listener {
     direction.setX(dx * inverse);
     direction.setY(dy * inverse);
     direction.setZ(dz * inverse);
-    RayTraceResult hit = world.rayTraceBlocks(eye, direction, distance,
+    // 射线长度封顶：实体在追踪范围边缘时 eye→顶点可能达上百格，截断到 MAX_RAY_LENGTH；
+    // 截断只会让更远的遮挡方块打不到而返回「通畅」（fail-open 保持可见），绝不改变「近处命中的遮挡判定」。
+    RayTraceResult hit = world.rayTraceBlocks(eye, direction, Math.min(distance, MAX_RAY_LENGTH),
         FluidCollisionMode.NEVER, true);
     if (hit == null || hit.getHitBlock() == null) {
       return true;
@@ -557,19 +641,44 @@ public final class EntityCuller implements Listener {
    */
   void evaluate(Player player, Entity entity, boolean allBlocked, boolean fromRecheck) {
     if (!entity.isValid() || !player.isOnline()) {
-      Map<Integer, Entity> map = hidden.get(player.getUniqueId());
-      if (map != null) {
-        map.remove(entity.getEntityId());
-      }
+      removeLedgerEntry(player.getUniqueId(), entity);
       return;
     }
 
-    if (allBlocked) {
+    // 载具/乘客关系：整条骑乘链必须一律可见。隐藏「载有乘客的载具」会让未被隐藏的乘客（玩家永不被隐藏）
+    // 看起来悬空骑行；隐藏「本身是乘客的实体」会让载具看起来无人。因此只要该实体与任何乘客/载具存在
+    // 关系，就把 allBlocked 视为无效 → 走 showIfHidden 保持/恢复可见（fail-open 的确定性规则）。
+    if (allBlocked && !hasVehicleRelation(entity)) {
       if (hide(player, entity) && fromRecheck) {
         stats.recheckHidden.increment();
       }
     } else if (showIfHidden(player, entity) && fromRecheck) {
       stats.recheckShown.increment();
+    }
+  }
+
+  /**
+   * 该实体是否与载具/乘客存在关系（自身载有乘客，或本身是乘客 / 骑在载具上）。
+   *
+   * <p>读取失败时按「存在关系」处理（不剔除）：剔除是可选优化，fail-open 保持可见最安全。
+   */
+  private static boolean hasVehicleRelation(Entity entity) {
+    try {
+      return !entity.getPassengers().isEmpty() || entity.getVehicle() != null;
+    } catch (Throwable throwable) {
+      return true;
+    }
+  }
+
+  /**
+   * 从账本摘除某实体的条目（仅在条目正是<b>同一实例</b>时才摘）。
+   *
+   * <p>entityId 会被服务端复用：若只按 id 摘除，可能误删「后来占用该 id 的另一个实体」的条目。
+   */
+  private void removeLedgerEntry(UUID playerId, Entity entity) {
+    Map<Integer, Entity> map = hidden.get(playerId);
+    if (map != null) {
+      map.remove(entity.getEntityId(), entity);
     }
   }
 
@@ -581,7 +690,9 @@ public final class EntityCuller implements Listener {
     }
     Map<Integer, Entity> map = hidden.computeIfAbsent(player.getUniqueId(),
         uuid -> new ConcurrentHashMap<>());
-    if (map.containsKey(entity.getEntityId())) {
+    // 仅当账本里该 id 正是「同一实例」时才算已隐藏。若该 id 对应的是一枚已消失的旧实例（entityId 被复用），
+    // 则覆盖登记新实体——否则复用该 id 的新实体会永远无法被隐藏（账本被旧条目挡住）。
+    if (map.get(entity.getEntityId()) == entity) {
       return false;
     }
     try {
@@ -598,9 +709,15 @@ public final class EntityCuller implements Listener {
   /** @return 是否真的从账本摘除并执行了 showEntity（未隐藏 / 实体已失效时为 false）。 */
   private boolean showIfHidden(Player player, Entity entity) {
     Map<Integer, Entity> map = hidden.get(player.getUniqueId());
-    if (map == null || map.remove(entity.getEntityId()) == null) {
+    if (map == null) {
       return false;
     }
+    // 只认「同一实例」的账本条目：若按 id 摘除，会把后来复用该 id 的另一个实体的条目一并删掉，
+    // 从而对从未被隐藏的新实体误发 showEntity，且该新实体再也无法被隐藏（账本被误清）。
+    if (map.get(entity.getEntityId()) != entity) {
+      return false;
+    }
+    map.remove(entity.getEntityId(), entity);
     return show(player, entity);
   }
 

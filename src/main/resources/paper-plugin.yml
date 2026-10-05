@@ -15,10 +15,12 @@
 #   · 键名风格：Paper 用 kebab-case（join-classpath / api-version …），
 #     已用 configurate 4.2.0 离线实测「kebab-case 键 → camelCase 字段」映射成立
 #
-# 【为什么与 plugin.yml 两份并存】
-#   1) Paper 系核心（Paper/Leaf 等）只认本文件，且会「整体忽略」plugin.yml（不是合并）；
-#   2) 纯 Bukkit/Spigot 或老核心不认 paper-plugin.yml，会回退去读 plugin.yml；
-#   3) 因此两份描述的公共字段必须逐字一致，由 PluginDescriptionConsistencyTest 守门。
+# 【为什么只有这一份描述】
+#   1) Paper 系核心（Paper/Leaf/Folia 等）只认本文件；传统 plugin.yml 在本项目已删除——
+#      本项目本就只适配 Paper 系核心（Brigadier 命令注册、Adventure 回显、区域调度器），
+#      保留一份永不生效的传统描述只会带来两处元数据漂移的风险；
+#   2) 因此本文件是唯一的插件描述：字段完整性、命令常量一致性、Folia 声明都在构建期由
+#      PluginDescriptionConsistencyTest 守门。
 # ============================================================================
 name: MikuXrayNet
 version: '${project.version}'          # 由 Maven 资源过滤替换为真实版本号
@@ -28,7 +30,7 @@ api-version: '26.2'
 authors:
   - JunXieX
 description: MikuMC 服务器原创插件｜作者 JunXieX｜交流群 1105054380
-# 默认即 POSTWORLD，此处显式写出以表明本插件不在 STARTUP 阶段加载（与 plugin.yml 行为一致）。
+# 默认即 POSTWORLD，此处显式写出以表明本插件不在 STARTUP 阶段加载。
 load: POSTWORLD
 
 # ---------------------------------------------------------------------------
@@ -87,11 +89,10 @@ dependencies:
       join-classpath: false
 
 # ---------------------------------------------------------------------------
-# 权限段：结构（node → description / default / children）与 plugin.yml 完全一致，
-# 因为 Paper 的 PermissionConfigurationSerializer 最终调用的是 Bukkit 的
-# Permission#loadPermission(name, Map, defaultPerm, output)，即同一套语义。
+# 权限段：Paper 的 PermissionConfigurationSerializer 最终调用的仍是 Bukkit 的
+# Permission#loadPermission(name, Map, defaultPerm, output)，即传统语义。
 # 默认值随 default-permission（本处各项都显式写了 default，故不涉及）。
-# 必须与 plugin.yml 逐字一致，由 PluginDescriptionConsistencyTest 守门。
+# 权限名与 default 由 PluginDescriptionConsistencyTest 与代码常量/README 对照守门。
 # ---------------------------------------------------------------------------
 permissions:
   mikuxraynet.*:
@@ -121,8 +122,7 @@ permissions:
     default: false
 
 # ---------------------------------------------------------------------------
-# 【重要】以下两段在 Paper 上是「惰性」的（写了也完全不生效），保留只为与 plugin.yml 字段一致，
-# 便于两份描述对照维护；真正的行为由代码承担，详见各段注释。
+# 【重要】本段在 Paper 上是「惰性」的（写了也不会据此注册命令），真正的注册由代码承担。
 #
 # commands：Paper 明确不支持在 paper-plugin.yml 里声明命令。
 #   证据 1（文档）：https://docs.papermc.io/paper/dev/getting-started/paper-plugins/#commands
@@ -133,12 +133,11 @@ permissions:
 #     PaperPluginMeta 本身也没有 commands 字段。
 #   证据 3（源码）：PaperPluginInstanceManager#enablePlugin 只在
 #     plugin.getPluginMeta() instanceof PluginDescriptionFile（传统插件）时才解析 YAML 命令。
-#   应对（现代写法）：命令改由 MikuXrayNet#registerCommand 在 onEnable 内经 Paper 生命周期事件
+#   应对（现代写法）：命令由 CommandRegistrar 在启用期经 Paper 生命周期事件
 #     LifecycleEvents.COMMANDS 注册（Commands#register(label, description, aliases, BasicCommand)），
-#     签名已在本项目编译目标 paper-api 26.2.build.129-stable 上用 javap 核实；
-#     纯 Bukkit/Spigot 无该生命周期 API，回退到 plugin.yml 的 commands 段 + PluginCommand#setExecutor。
-#   本段仅为「两份描述字段对齐」而保留；在纯 Bukkit/Spigot 上 paper-plugin.yml 不会被读取，
-#   那里由 plugin.yml 的 commands 段生效。
+#     签名已在本项目编译目标 paper-api 26.2.build.129-stable 上用 javap 核实。
+#   为什么仍保留本段：本项目已删除 plugin.yml，这里是唯一对外可见的「命令 ←→ 权限」元数据，
+#   由 PluginDescriptionConsistencyTest 与 CommandRegistrar 的代码常量逐字对照守门。
 # ---------------------------------------------------------------------------
 commands:
   mikuxraynet:
@@ -151,9 +150,9 @@ commands:
     permission-message: 你没有权限使用该命令
 
 # ---------------------------------------------------------------------------
-# folia-supported：不是 paper-plugin.yml 的字段（PaperPluginMeta 字段清单中不存在，
-#   它是传统 plugin.yml 的字段，由 Folia/Leaf 的 PluginDescriptionFile 补丁读取）。
-#   保留在此仅为与 plugin.yml 字段一致；Paper 路径上该标记不生效 —— 这是本次改用
-#   现代描述引入的既有能力差异，已在交付报告中列为「真机复验点」。
+# folia-supported：本项目适配 Folia，必须声明。
+#   plugin.yml 已删除，本文件是唯一描述，因此这里是该标记的唯一声明点；缺失时 Folia 核心
+#   会拒绝加载本插件（PluginDescriptionConsistencyTest 已在构建期守门，防止被误删）。
+#   真机复验点（本项目唯一无法离线验证处）：请在实际 Folia 26.x 上确认该键被解析生效。
 # ---------------------------------------------------------------------------
 folia-supported: true

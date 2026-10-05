@@ -1,7 +1,7 @@
 package net.mikumc.mikuxraynet.antixray;
 
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.ArrayDeque;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
 import org.bukkit.ChunkSnapshot;
 import org.bukkit.World;
@@ -28,9 +28,14 @@ import org.bukkit.World;
  * 读取（见 {@link #capturePlane} 的说明与 {@code antixray.yml} 中 {@code neighbors} 段的代价标注）。
  * 上界查询本身极便宜，失败时该列退回全高度扫描，只损失优化、不改变结果。
  *
- * <p><b>容量与过期</b>：LRU 有界缓存，键为 {@code (世界名, chunkX, chunkZ)}；每格只占 1 bit，
+ * <p><b>容量与过期</b>：近似 LRU 有界缓存，键为 {@code (世界名, chunkX, chunkZ)}；每格只占 1 bit，
  * 故每条约 {@code 4 × 16 × 世界高度 / 8} 字节 = {@code 4 × 高度 / 2} 字节
  * （主世界 384 高度约 3 KB），默认上限见 {@code antixray.yml} 的 {@code neighbors.cache-maximum-size}。
+ *
+ * <p><b>并发</b>：读取（{@link #cached}）走无锁 {@link ConcurrentHashMap}，只写条目上 volatile 的
+ * second-chance 位；写入与淘汰（{@link #putCache}）在 {@link #clockLock} 内串行维护一条 CLOCK 环形
+ * 队列（近似 LRU，与 {@link RewriteCache} 同一套手法）。这样 ProtocolLib 异步封包线程与所有改写工作
+ * 线程可并发读取，{@code mode=enclosed} 下不再被全局 monitor 逐个串行化。
  *
  * <p><b>为什么还要 TTL</b>：快照里的平面可能含 {@code null}（邻块未加载 / Folia 跨区域 / 世界卸载），
  * 也可能在抓取后因邻块被挖开/放置而失真。<b>方块变更不会使本缓存失效</b>（不像改写缓存有内容指纹），
@@ -86,17 +91,56 @@ public final class NeighborChunkProvider {
    */
   static final long DEFAULT_CACHE_TTL_MILLIS = 30_000L;
 
+  /**
+   * 每次新建条目时摊还清理的环节点数上限（与 {@link RewriteCache} 同一取舍）。
+   *
+   * <p>为什么要「摊还」而非一次性全扫：全扫是 O(n)、会把并发回填重新串行化；固定小常数让每次
+   * {@link #putCache} 只付 O(1)。环上 n 个节点约需 n/该常数 次写入被完整巡检一遍。取 8 是在
+   * 「死节点 / 过期冷条目回收及时性」与「单次写入开销」之间的折中。
+   */
+  private static final int CLEANUP_NODES_PER_PUT = 8;
+
   private final int cacheMaximumSize;
   private final long cacheTtlNanos;
   private final LongSupplier nanoClock;
-  private final Map<ChunkKey, CacheEntry> cache;
+
+  /** 主存储：读取完全无锁。 */
+  private final ConcurrentHashMap<ChunkKey, CacheEntry> entries = new ConcurrentHashMap<>();
+  /**
+   * second-chance 环形队列（CLOCK 手）。只在「真正新建条目」与失效方法的同步块内增删；同键覆盖与
+   * 读取路径均不碰它，因此读路径不需要任何锁。队首是「最久未被再访问」的淘汰候选。
+   */
+  private final ArrayDeque<CacheEntry> clockQueue = new ArrayDeque<>();
+  /**
+   * CLOCK 环形队列 / 淘汰结构的专用锁。
+   *
+   * <p><b>为什么从「方法级 {@code synchronized (cache)}」缩小到这把锁</b>：旧实现对访问序
+   * {@code LinkedHashMap} 的读（{@link #cached}）与写（{@link #putCache}）都加全局 monitor，而本缓存
+   * 会被 ProtocolLib 异步封包线程与所有改写工作线程读取，{@code mode=enclosed} 下所有工作线程因此被
+   * 逐个串行化。读取改走 {@code ConcurrentHashMap} 后完全不加锁，真正需要互斥的只剩「环形队列增删 +
+   * 淘汰扫描」，故收敛到本锁。
+   */
+  private final Object clockLock = new Object();
 
   /** 缓存键：只含不可变类型，不钉住世界对象。 */
   private record ChunkKey(String worldName, int chunkX, int chunkZ) {
   }
 
   /** 缓存条目：快照 + 到期时刻（纳秒）。{@code expiresAtNanos == Long.MAX_VALUE} 表示永不过期。 */
-  private record CacheEntry(NeighborEdges edges, long expiresAtNanos) {
+  private static final class CacheEntry {
+    private final ChunkKey key;
+    /** 值可被同键覆盖（原地更新），避免覆盖时在环形队列里留下重复节点。 */
+    private volatile NeighborEdges edges;
+    private volatile long expiresAtNanos;
+    /** second-chance 位：被读取过即置 true；淘汰扫描时给一次「第二次机会」。 */
+    private volatile boolean referenced;
+
+    private CacheEntry(ChunkKey key, NeighborEdges edges, long expiresAtNanos) {
+      this.key = key;
+      this.edges = edges;
+      this.expiresAtNanos = expiresAtNanos;
+      this.referenced = false;
+    }
   }
 
   public NeighborChunkProvider(int cacheMaximumSize) {
@@ -113,12 +157,6 @@ public final class NeighborChunkProvider {
     this.cacheMaximumSize = Math.max(1, cacheMaximumSize);
     this.cacheTtlNanos = cacheTtlMillis <= 0 ? 0L : cacheTtlMillis * 1_000_000L;
     this.nanoClock = nanoClock;
-    this.cache = new LinkedHashMap<>(16, 0.75f, true) {
-      @Override
-      protected boolean removeEldestEntry(Map.Entry<ChunkKey, CacheEntry> eldest) {
-        return size() > NeighborChunkProvider.this.cacheMaximumSize;
-      }
-    };
   }
 
   /**
@@ -127,18 +165,18 @@ public final class NeighborChunkProvider {
    * <p>过期条目在读取时立即移除，因此调用方拿到 {@code null} 后走既有缺失策略（fail-open）。
    */
   public NeighborEdges cached(String worldName, int chunkX, int chunkZ) {
-    ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
-    synchronized (cache) {
-      CacheEntry entry = cache.get(key);
-      if (entry == null) {
-        return null;
-      }
-      if (entry.expiresAtNanos() != Long.MAX_VALUE && nanoClock.getAsLong() >= entry.expiresAtNanos()) {
-        cache.remove(key);
-        return null;
-      }
-      return entry.edges();
+    // 无锁读取：不再获取全局 monitor，也不再改动 LRU 链表（改由 volatile second-chance 位近似）。
+    CacheEntry entry = entries.get(new ChunkKey(worldName, chunkX, chunkZ));
+    if (entry == null) {
+      return null;
     }
+    if (entry.expiresAtNanos != Long.MAX_VALUE && nanoClock.getAsLong() >= entry.expiresAtNanos) {
+      entries.remove(entry.key, entry);
+      return null;
+    }
+    // 打标「被访问过」：仅写 volatile 位，无需加锁；淘汰扫描据此给一次「第二次机会」（近似 LRU）。
+    entry.referenced = true;
+    return entry.edges;
   }
 
   /**
@@ -276,9 +314,84 @@ public final class NeighborChunkProvider {
     long expiresAt = cacheTtlNanos <= 0L
         ? Long.MAX_VALUE
         : nanoClock.getAsLong() + cacheTtlNanos;
-    synchronized (cache) {
-      cache.put(new ChunkKey(worldName, chunkX, chunkZ), new CacheEntry(edges, expiresAt));
+    ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
+    CacheEntry entry = new CacheEntry(key, edges, expiresAt);
+    CacheEntry previous = entries.putIfAbsent(key, entry);
+    if (previous != null) {
+      // 同键（含并发）覆盖：原地更新，绝不在环形队列里留下重复节点
+      previous.edges = edges;
+      previous.expiresAtNanos = expiresAt;
+      previous.referenced = true;
+      return;
     }
+    // 只有「真正新建条目」才进入同步块维护环形队列并做淘汰/清理——把串行范围缩到最小
+    synchronized (clockLock) {
+      clockQueue.addLast(entry);
+      evictOverflow();
+      // 顶满淘汰只在超容量时触发，冷条目的过期回收与死节点清理由此摊还处理
+      amortizedCleanup();
+    }
+  }
+
+  /**
+   * second-chance / CLOCK 淘汰：<b>先剔除已过期条目</b>（它们不该占淘汰名额、也不该挤掉仍有效的
+   * 条目），队列里已被移除的陈旧节点直接丢弃，被访问过的条目让一次机会。
+   */
+  private void evictOverflow() {
+    long now = nanoClock.getAsLong();
+    while (entries.size() > cacheMaximumSize) {
+      CacheEntry candidate = clockQueue.pollFirst();
+      if (candidate == null) {
+        // 理论上不会发生：每个存活条目在创建时都已入队
+        return;
+      }
+      if (entries.get(candidate.key) != candidate) {
+        continue; // 陈旧节点（该键已被过期移除 / 失效）
+      }
+      if (isExpired(candidate, now)) {
+        entries.remove(candidate.key, candidate);
+        continue;
+      }
+      if (candidate.referenced) {
+        candidate.referenced = false;
+        clockQueue.addLast(candidate);
+        continue;
+      }
+      entries.remove(candidate.key, candidate);
+    }
+  }
+
+  /**
+   * 摊还清理：从 CLOCK 环队首起最多巡检 {@value #CLEANUP_NODES_PER_PUT} 个节点，处理两件事——
+   * <ul>
+   *   <li><b>丢弃死节点</b>：键已被 {@link #cached} 的过期检查或失效方法移除、却仍在环里的陈旧引用，
+   *       直接丢弃，避免环随「读到过期即移除」的条目无限增长；</li>
+   *   <li><b>主动剔除过期冷条目</b>：写入一次后永不再被 {@code cached} 的条目，按 {@code expiresAtNanos}
+   *       判定已过期即从主存储移除，兑现 TTL 的回收承诺。</li>
+   * </ul>
+   * 仍有效的节点原样轮转回队尾（<b>不改动其 second-chance 位</b>）。只在 {@link #clockLock} 内调用，
+   * 每次最多常量条，均摊成本 O(1)。
+   */
+  private void amortizedCleanup() {
+    long now = nanoClock.getAsLong();
+    for (int inspected = 0; inspected < CLEANUP_NODES_PER_PUT; inspected++) {
+      CacheEntry candidate = clockQueue.pollFirst();
+      if (candidate == null) {
+        return;
+      }
+      if (entries.get(candidate.key) != candidate) {
+        continue; // 死节点：键已被移除，环里只剩陈旧引用，直接丢弃
+      }
+      if (isExpired(candidate, now)) {
+        entries.remove(candidate.key, candidate); // 过期冷条目：主动回收
+        continue;
+      }
+      clockQueue.addLast(candidate); // 仍有效：原样轮转回队尾（保留 referenced 位）
+    }
+  }
+
+  private static boolean isExpired(CacheEntry entry, long now) {
+    return entry.expiresAtNanos != Long.MAX_VALUE && now >= entry.expiresAtNanos;
   }
 
   private long[] captureSide(int baseY, int height, int chunkX, int chunkZ, NeighborEdges.Side side,
@@ -365,22 +478,22 @@ public final class NeighborChunkProvider {
 
   /** 使某个世界的全部快照失效（世界卸载时调用）。 */
   public void invalidateWorld(String worldName) {
-    synchronized (cache) {
-      cache.keySet().removeIf(key -> key.worldName().equals(worldName));
+    synchronized (clockLock) {
+      entries.keySet().removeIf(key -> key.worldName().equals(worldName));
+      clockQueue.removeIf(entry -> entry.key.worldName().equals(worldName));
     }
   }
 
   /** 使全部快照失效（配置热重载时调用）。 */
   public void invalidateAll() {
-    synchronized (cache) {
-      cache.clear();
+    synchronized (clockLock) {
+      entries.clear();
+      clockQueue.clear();
     }
   }
 
   /** 当前缓存条目数（诊断用）。 */
   public int size() {
-    synchronized (cache) {
-      return cache.size();
-    }
+    return entries.size();
   }
 }
