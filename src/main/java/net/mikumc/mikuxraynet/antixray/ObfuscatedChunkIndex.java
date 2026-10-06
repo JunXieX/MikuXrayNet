@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.antixray;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -99,11 +100,18 @@ public final class ObfuscatedChunkIndex {
     this.clock = clock;
   }
 
+  /** 无移除时共享的空数组（避免常见路径——覆盖后集合未变——的每次分配）。 */
+  private static final int[] NO_REMOVALS = new int[0];
+
   /**
    * 记录/覆盖一个区块的被伪装坐标（区块封包改写路径，工作线程调用）。
    *
    * <p>无论哪个玩家触发的改写，都只是覆盖这一条——同一区块只存一份，内存不随玩家数增长。
    * 传入数组是改写结果里的数组（此后不再被修改），直接共享、不复制。
+   *
+   * <p>覆盖会改变清单内容，因此<b>需要同步维护各玩家已显形标记</b>的调用方应改用
+   * {@link #recordChunkWithRemovals}（见其说明）；本方法保持原语义，仅供「不关心移除差集」的
+   * 调用方与单测使用。
    *
    * @param minHeight      该世界最低建筑高度
    * @param localPositions 区块内相对坐标，编码为 {@code 区块内相对Y << 8 | z << 4 | x}
@@ -111,13 +119,73 @@ public final class ObfuscatedChunkIndex {
    */
   public int recordChunk(String worldName, int chunkX, int chunkZ, int minHeight,
       int[] localPositions) {
+    int[] removed = recordChunkInternal(worldName, chunkX, chunkZ, minHeight, localPositions, null);
+    return removed == null ? 0 : localPositions.length;
+  }
+
+  /**
+   * 记录/覆盖，并返回「本次覆盖<b>移除掉</b>的旧坐标」（同为区块内相对坐标编码）。
+   *
+   * <p><b>为什么需要移除差集</b>：覆盖共享索引条目后，其它玩家在「已被移出清单的坐标」上的已显形
+   * 标记若不同步摘除，就会成为孤儿标记——{@code RevealedSet.sizeFor} 虚增会让邻近显形的「整块跳过」
+   * （{@code sizeFor >= entry.size()}）提前成立，真实未显形坐标被周期性跳过（标记又被扫描 touch 续期，
+   * 玩家留在扫描半径内时永不过期）。这正是 {@link RevealedSet} 类注释声明的
+   * 「已显形坐标 ⊆ 区块当前清单」不变式的破坏。
+   *
+   * <p>差集在 {@code chunks.compute}（与覆盖同一临界区）内计算，与覆盖原子生效；两个数组均为升序
+   * （生产写入不变式：改写按 section→元素序生成、摘除保持相对顺序），故用归并求差，常见路径
+   * （集合未变）零分配。
+   *
+   * @return 被移除的旧坐标（升序）；未记录（入参非法或容量安全阀放弃，清单未变）与「已记录但无移除」
+   *         两种情况都返回共享空数组，调用方以 {@code length == 0} 判定「无需摘除标记」即可
+   */
+  public int[] recordChunkWithRemovals(String worldName, int chunkX, int chunkZ, int minHeight,
+      int[] localPositions) {
+    return recordChunkWithRemovals(worldName, chunkX, chunkZ, minHeight, localPositions, null);
+  }
+
+  /**
+   * 记录/覆盖，并返回移除差集；同时把「因容量安全阀被淘汰的其它区块键」收集到 {@code evictedOut}。
+   *
+   * <p><b>为什么需要淘汰清单</b>：{@link #makeRoomFor} 在坐标总量触顶时会按「最旧优先」<b>整体移除</b>
+   * 其它区块的索引条目。这些区块的清单随之消失，而其坐标上各玩家的已显形标记仍在——若不摘除就成了
+   * 孤儿标记，会让邻近显形的「整块跳过」提前成立、真实坐标漏显形（与覆盖差集同一类不变式破坏）。
+   * 调用方（{@code writeBack}）据此对每个被淘汰的区块执行一次「全部玩家标记作废」。
+   *
+   * <p>常态（未触顶）零分配：调用方可先用 {@link #mayEvict} 判断是否需要准备容器，
+   * 只有真的可能淘汰时才传入非 null 的列表。
+   *
+   * @param evictedChunksOut 非 null 时收集被淘汰的区块键（可能为空列表）；null 表示调用方不关心
+   */
+  public int[] recordChunkWithRemovals(String worldName, int chunkX, int chunkZ, int minHeight,
+      int[] localPositions, List<ChunkKey> evictedChunksOut) {
+    int[] removed = recordChunkInternal(worldName, chunkX, chunkZ, minHeight, localPositions,
+        evictedChunksOut);
+    return removed == null ? NO_REMOVALS : removed;
+  }
+
+  /**
+   * 本次记录是否会触发容量安全阀淘汰（{@code 坐标总量 + 本次量 > 上限}）。
+   *
+   * <p>供调用方在热路径上做「是否需要准备淘汰收集容器」的零分配预判：常态下只读一次原子计数。
+   */
+  public boolean mayEvict(int incoming) {
+    return totalPositions.get() + incoming > maxPositions;
+  }
+
+  /**
+   * 覆盖记录的公共实现：返回 {@code null} 表示未记录；否则返回「旧清单 ∖ 新清单」的移除差集
+   * （升序，可能为共享空数组 {@link #NO_REMOVALS}）。仅供本类公开入口委托使用。
+   */
+  private int[] recordChunkInternal(String worldName, int chunkX, int chunkZ, int minHeight,
+      int[] localPositions, List<ChunkKey> evictedChunksOut) {
     if (worldName == null || localPositions == null || localPositions.length == 0) {
-      return 0;
+      return null;
     }
     // 安全阀：正常运营下永不触发；触顶时按「最旧优先」淘汰其它区块来腾位置，仍放不下才放弃本次记录
-    if (!makeRoomFor(localPositions.length)) {
+    if (!makeRoomFor(localPositions.length, evictedChunksOut)) {
       evictedByCapacity.add(localPositions.length);
-      return 0;
+      return null;
     }
 
     ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
@@ -125,13 +193,66 @@ public final class ObfuscatedChunkIndex {
     // 用 compute 原子地「取旧值 + 装新值」：旧实现先 put 再另算 delta，同键并发 recordChunk 时
     // 两个线程可能读到同一个旧条目，导致 totalPositions 被重复加减（只影响安全阀诊断口径，
     // 且已夹在 0 以上；这里改为原子口径，与 RevealedSet 的计数纪律对齐）。
+    // 移除差集同样在 compute 内算：与覆盖原子生效，并发覆盖不会拿到过期的旧清单去算差集。
     int[] delta = {0};
+    int[][] removedHolder = {NO_REMOVALS};
     chunks.compute(key, (ignored, previous) -> {
       delta[0] = localPositions.length - (previous == null ? 0 : previous.size());
+      removedHolder[0] = previous == null ? NO_REMOVALS
+          : removedByOverwrite(previous.locals(), localPositions);
       return entry;
     });
     totalPositions.updateAndGet(current -> Math.max(0, current + delta[0]));
-    return localPositions.length;
+    return removedHolder[0];
+  }
+
+  /**
+   * 求「旧清单 ∖ 新清单」的移除差集（两者均升序、无重复——生产写入不变式）。
+   *
+   * <p>两趟归并：第一趟只计数（集合未变时常见路径——改写确定性重登记同一份数组——零分配直接返回），
+   * 有移除才分配精确长度的数组走第二趟。
+   *
+   * <p><b>无序入参的失败方向（仅可能来自绕过生产写入方的外部调用）</b>：错序会让指针越过本该匹配的
+   * 元素，产生<b>越摘</b>——把仍存在于新清单里的坐标误报为 removed。后果只是多摘一枚标记，
+   * 该坐标下次巡检<b>重复显形一次</b>（浪费一次带宽，仍满足 revealed ⊆ listing 不变式），
+   * 属安全方向；而「本应摘除却漏摘」（会虚增 sizeFor、破坏不变式）在此算法下结构性不可能——
+   * 旧清单元素在新清单中找不到匹配位必然计入。生产输入（改写输出 + 摘除保序）恒为严格升序，不可达。
+   */
+  private static int[] removedByOverwrite(int[] previousLocals, int[] newLocals) {
+    if (previousLocals == newLocals) {
+      return NO_REMOVALS;
+    }
+    int count = 0;
+    int j = 0;
+    for (int i = 0; i < previousLocals.length; i++) {
+      int value = previousLocals[i];
+      while (j < newLocals.length && newLocals[j] < value) {
+        j++;
+      }
+      if (j >= newLocals.length || newLocals[j] > value) {
+        count++;
+      } else {
+        j++;
+      }
+    }
+    if (count == 0) {
+      return NO_REMOVALS;
+    }
+    int[] removed = new int[count];
+    int write = 0;
+    j = 0;
+    for (int i = 0; i < previousLocals.length; i++) {
+      int value = previousLocals[i];
+      while (j < newLocals.length && newLocals[j] < value) {
+        j++;
+      }
+      if (j >= newLocals.length || newLocals[j] > value) {
+        removed[write++] = value;
+      } else {
+        j++;
+      }
+    }
+    return removed;
   }
 
   /** 取出区块条目，并刷新其活跃时间（供邻近显形扫描使用；未命中返回 {@code null}）。 */
@@ -355,7 +476,7 @@ public final class ObfuscatedChunkIndex {
    *
    * @return 是否已为 {@code incoming} 个坐标腾出空间
    */
-  private boolean makeRoomFor(int incoming) {
+  private boolean makeRoomFor(int incoming, List<ChunkKey> evictedChunksOut) {
     if (totalPositions.get() + incoming <= maxPositions) {
       return true;
     }
@@ -375,6 +496,10 @@ public final class ObfuscatedChunkIndex {
       if (removed != null) {
         subtract(totalPositions, removed.size());
         evictedByCapacity.add(removed.size());
+        if (evictedChunksOut != null) {
+          // 交给调用方去作废该区块上所有玩家的已显形标记（索引条目已整体消失，标记会成孤儿）
+          evictedChunksOut.add(oldestKey);
+        }
       }
     }
     return totalPositions.get() + incoming <= maxPositions;

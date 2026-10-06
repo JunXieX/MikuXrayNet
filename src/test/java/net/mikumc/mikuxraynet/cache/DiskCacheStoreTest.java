@@ -515,4 +515,60 @@ class DiskCacheStoreTest {
       Thread.sleep(10L);
     }
   }
+
+  /** 反射读「已提交但尚未开始执行」的近似计数：泄漏会让它在多次超时后累积不降。 */
+  private static int pendingOps(DiskCacheStore store) throws Exception {
+    Field field = DiskCacheStore.class.getDeclaredField("pendingOps");
+    field.setAccessible(true);
+    return ((java.util.concurrent.atomic.AtomicInteger) field.get(store)).get();
+  }
+
+  /** 反射调用生产代码私有的带预算提交（读取路径正是走它）。 */
+  @SuppressWarnings("unchecked")
+  private static <T> T submitWithBudget(DiskCacheStore store, java.util.concurrent.Callable<T> task,
+      long timeoutMillis) throws Exception {
+    Method method = DiskCacheStore.class.getDeclaredMethod("submit",
+        java.util.concurrent.Callable.class, long.class);
+    method.setAccessible(true);
+    return (T) method.invoke(store, task, timeoutMillis);
+  }
+
+  /**
+   * <b>本轮修复回归</b>：读超时取消「尚未开始执行」的任务时，必须自行偿还 {@code pendingOps}。
+   *
+   * <p>修复前只调 {@code future.cancel(false)}：未启动的 FutureTask 会直接转 CANCELLED，
+   * 其 callable 永不运行 → 递减用的 {@code finally} 永不执行 → 计数每超时一次永久 +1；
+   * 累积到 {@code queue-capacity} 后 {@code put}/{@code submit} 双双提前返回，磁盘缓存被静默彻底停用。
+   */
+  @Test
+  void readTimeoutDoesNotLeakPendingOperations(@TempDir Path dir) throws Exception {
+    DiskCacheStore store = store(dir, config(100, 3600, 300));
+    CountDownLatch release = new CountDownLatch(1);
+    try {
+      // 占住唯一的磁盘线程（直接投给执行器，不经过 pendingOps 记账），使后续任务只能排队
+      diskThreadExecutor(store).submit(() -> {
+        release.await();
+        return null;
+      });
+      Thread.sleep(100L); // 让占位任务真正开始执行
+
+      // 排队中的读：30ms 预算远小于磁盘线程被占住的时长 → 必然超时（且该任务尚未开始执行）
+      Object result = submitWithBudget(store, () -> "late", 30L);
+      assertNull(result, "排队中即超时的读必须按未命中返回（fail-open）");
+
+      release.countDown();
+      awaitTrue(() -> {
+        try {
+          return pendingOps(store) == 0;
+        } catch (Exception exception) {
+          return false;
+        }
+      }, 5000L);
+      assertEquals(0, pendingOps(store),
+          "超时取消不得泄漏 pendingOps——泄漏累积到 queue-capacity 后磁盘缓存会被静默停用");
+    } finally {
+      release.countDown();
+      store.close();
+    }
+  }
 }

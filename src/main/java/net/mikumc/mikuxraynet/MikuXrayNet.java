@@ -215,6 +215,12 @@ public final class MikuXrayNet extends JavaPlugin {
         // 摘要间隔可随热重载变更（0 = 关闭）
         startDiagnosticsTask();
       }
+
+      @Override
+      public String configurationFallbackNote() {
+        // 解析失败时配置会被保留/回落，必须在重载回显里如实告知——否则管理员会以为新文件已生效
+        return config.fallbackNote();
+      }
     });
   }
 

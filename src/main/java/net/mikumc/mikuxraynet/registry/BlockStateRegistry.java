@@ -86,6 +86,19 @@ public final class BlockStateRegistry implements RegistryAccessor {
    */
   public static BlockStateRegistry build(Collection<String> extraOccluding,
       Collection<String> extraNonOccluding) {
+    return build(extraOccluding, extraNonOccluding, null);
+  }
+
+  /**
+   * 同 {@link #build(Collection, Collection)}，但把「探测结果不确定」这类告警交给调用方的插件 logger。
+   *
+   * <p><b>为什么要传 logger</b>：{@code plugin.getLogger()} 是 Bukkit 的 {@code PluginLogger}（名字为
+   * 插件主类全名、带 {@code [MikuXrayNet]} 前缀、受插件日志级别统一约束），而
+   * {@code Logger.getLogger("MikuXrayNet")} 是另一个 JUL logger —— 那条告警既没有前缀、也不随插件日志
+   * 配置走，运维很难把它与插件关联起来。传入为 {@code null} 时才回落到 JUL 兜底（离线单测场景）。
+   */
+  public static BlockStateRegistry build(Collection<String> extraOccluding,
+      Collection<String> extraNonOccluding, Logger logger) {
     Set<String> occludingOverrides = OcclusionRules.normalizeAll(extraOccluding);
     Set<String> nonOccludingOverrides = OcclusionRules.normalizeAll(extraNonOccluding);
 
@@ -96,7 +109,7 @@ public final class BlockStateRegistry implements RegistryAccessor {
     if (probe.uncertain()) {
       // 扫到上限仍存在有效状态：无法确定映射是否更大 → 位宽宁大不小（宁可多占几 bit，绝不漏判高位状态）
       width = Math.max(width, ceilLog2(MAX_STATE_SCAN));
-      warnUncertainProbe(count, width);
+      warnUncertainProbe(count, width, logger);
     }
 
     BitSet airStates = new BitSet(count);
@@ -273,14 +286,20 @@ public final class BlockStateRegistry implements RegistryAccessor {
     }
   }
 
-  /** 探测结果不确定时的一次性中文 WARN：位宽已按上限保守放大（仅影响体积、不影响正确性）。 */
-  private static void warnUncertainProbe(int stateCount, int width) {
+  /**
+   * 探测结果不确定时的一次性中文 WARN：位宽已按上限保守放大（仅影响体积、不影响正确性）。
+   *
+   * <p>优先走调用方传入的插件 logger（带 {@code [MikuXrayNet]} 前缀、受插件日志级别约束）；
+   * 未传入（离线单测）时才回落到 JUL 兜底。
+   */
+  private static void warnUncertainProbe(int stateCount, int width, Logger logger) {
     if (!UNCERTAIN_PROBE_WARNED.compareAndSet(false, true)) {
       return;
     }
-    Logger.getLogger("MikuXrayNet").warning("方块状态映射探测结果不确定：扫描到上限仍存在有效状态"
+    String message = "方块状态映射探测结果不确定：扫描到上限仍存在有效状态"
         + "（最大 id + 1 = " + stateCount + "），已保守把直接格式位宽放大到 " + width
-        + "（宁大不小，避免高位状态被漏判导致反矿透静默失效）。请检查 PacketEvents 版本是否匹配服务端。");
+        + "（宁大不小，避免高位状态被漏判导致反矿透静默失效）。请检查 PacketEvents 版本是否匹配服务端。";
+    (logger != null ? logger : Logger.getLogger("MikuXrayNet")).warning(message);
   }
 
   private static int ceilLog2(int value) {

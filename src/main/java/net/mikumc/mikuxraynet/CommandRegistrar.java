@@ -8,6 +8,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.command.MikuCommand;
+import net.mikumc.mikuxraynet.util.Constants;
 
 /**
  * 管理命令注册器：把 {@code /mikuxraynet}（别名 {@code mxnet} / {@code mxr}）注册到服务端。
@@ -33,7 +34,7 @@ final class CommandRegistrar {
   /** 管理命令名（插件描述与代码注册两处必须一致，由 PluginDescriptionConsistencyTest 守门）。 */
   static final String COMMAND_NAME = "mikuxraynet";
   static final String COMMAND_DESCRIPTION = "MikuXrayNet 管理命令";
-  static final String COMMAND_PERMISSION = "mikuxraynet.admin";
+  static final String COMMAND_PERMISSION = Constants.ADMIN_PERMISSION;
   static final List<String> COMMAND_ALIASES = List.of("mxnet", "mxr");
 
   private final MikuXrayNet plugin;

@@ -236,6 +236,20 @@ public final class ProximityRevealer implements Listener {
   private final MikuWorkPool workPool;
   private final AtomicInteger errorCounter = new AtomicInteger();
   private final AtomicLong passes = new AtomicLong();
+  /**
+   * 上次过期清理的纳秒时刻（过期清理的时间门控；见 {@link #maybeExpire}）。
+   *
+   * <p>与 {@link #passes} 分开：{@code passes} 只用于「扫描分片轮转」（每个玩家每轮各推进一次是合理的），
+   * 过期清理则必须与在线人数无关，故改用独立的时刻计数 + CAS。
+   */
+  private final AtomicLong lastExpireNanos = new AtomicLong();
+  /**
+   * 过期清理的周期窗口（纳秒）= 巡检周期 × {@value #EXPIRE_EVERY_PASSES}。
+   *
+   * <p>按「巡检周期」而非固定墙钟常数计算：巡检周期配得长（省 CPU）时，过期清理也相应变稀疏，
+   * 二者保持同一节奏，不会出现「几天才巡检一次却每秒全量扫描」的反常组合。
+   */
+  private final long expirePeriodNanos;
   private final AtomicBoolean firstRevealDiagnosed = new AtomicBoolean();
   /** 「显形索引安全阀触发」只提示一次（CAS 抢占），避免每轮巡检刷屏。 */
   private final AtomicBoolean capacityWarned = new AtomicBoolean();
@@ -277,6 +291,10 @@ public final class ProximityRevealer implements Listener {
     this.stats = stats;
     this.bypassRegistry = bypassRegistry;
     this.workPool = workPool;
+    // 过期清理窗口 = 巡检周期 × EXPIRE_EVERY_PASSES（tick→纳秒：1 tick = 50ms）。
+    // 对巡检周期做上限钳制（≤1 小时）再相乘，避免极端配置把乘法推到溢出。
+    long ticks = Math.max(1L, Math.min(72_000L, proximity.intervalTicks()));
+    this.expirePeriodNanos = ticks * 50_000_000L * EXPIRE_EVERY_PASSES;
   }
 
   /** 启动巡检：非 Folia 为统一主线程任务；Folia 为各玩家的区域任务（句柄按 UUID 保存，见 entityTasks）。 */
@@ -686,7 +704,8 @@ public final class ProximityRevealer implements Listener {
       return true;
     }
     if (revealedSet != null) {
-      revealedSet.removePosition(worldName, x, y, z);
+      // 只回滚「本次这个玩家」的标记：其它玩家此前成功收到的显形仍有效，连带摘除只会让它们重复显形
+      revealedSet.removePosition(playerId, worldName, x, y, z);
     }
     return false;
   }
@@ -742,7 +761,8 @@ public final class ProximityRevealer implements Listener {
     if (revealedSet != null) {
       for (int index : fresh) {
         int[] position = positions.get(index);
-        revealedSet.removePosition(worldName, position[0], position[1], position[2]);
+        // 只回滚本玩家的标记（同 markThenSend）：其它玩家的有效显形不该被连带作废
+        revealedSet.removePosition(playerId, worldName, position[0], position[1], position[2]);
       }
     }
     return false;
@@ -834,7 +854,8 @@ public final class ProximityRevealer implements Listener {
         // 标记已在 claimForSend 写好：发送成功即保留，失败则回滚（该坐标仍在伪装清单里，后续周期重试）
         sent = sendSingle(player, world, position[0], position[1], position[2], state);
         if (!sent && revealedSet != null) {
-          revealedSet.removePosition(worldName, position[0], position[1], position[2]);
+          // 只回滚本玩家的标记（同 markThenSend），避免连带作废其它玩家的有效显形
+          revealedSet.removePosition(playerId, worldName, position[0], position[1], position[2]);
         }
       } else {
         // 合并包已回滚本批标记：逐坐标重新走「先复核 + 标记、再发包、失败回滚」（见 markThenSend）
@@ -979,7 +1000,14 @@ public final class ProximityRevealer implements Listener {
    * 同一 entry 只会被真正移除一次，计数扣减不会重复。
    */
   private void maybeExpire() {
-    if (passes.incrementAndGet() % EXPIRE_EVERY_PASSES != 0L) {
+    // 「距上次清理是否已过一个完整周期窗口」用<b>时间</b>判断，而不是「每 N 次巡检」：
+    // Folia 下每个玩家各有一条区域任务、各自调用本方法，若按巡检次数计数，过期频率会随在线人数
+    // 线性放大（20 人时几乎每周期触发一次 O(全服条目) 的全量扫描 + 一次工作池提交），
+    // 与类注释声明的「约 4 秒一次」严重不符。时间门控在两种平台、任意在线人数下频率都恒定；
+    // CAS 保证并发调用中只有一条路径真正执行。
+    long now = System.nanoTime();
+    long last = lastExpireNanos.get();
+    if (now - last < expirePeriodNanos || !lastExpireNanos.compareAndSet(last, now)) {
       return;
     }
     if (workPool != null && workPool.hasCapacity()) {
@@ -1268,6 +1296,12 @@ public final class ProximityRevealer implements Listener {
       // 三维空间（半径 8 时 17³≈5k 格 × 大量变更点），哈希反而更省；若将来改位图，必须证明去掉装箱后
       // 「每个绝对坐标仍只评估一次」——否则会重复发包（over-reveal）或漏去重（同一坐标多次 sendOne）。
       java.util.HashSet<Long> evaluated = new java.util.HashSet<>();
+      // 评估次数上限：budget 只在「成功发包」时递减，因此若候选<b>全部未命中</b>（邻域里大多是已显形、
+      // 或已不在伪装清单里的坐标），内层循环会一路跑满 count × offsets——radius=8 时每个变更坐标有
+      // 数百个偏移，一个 section（最多 4096 个变更坐标）可达数十万次判定，且全部落在玩家实体线程
+      // （Paper 主线程 / Folia 区域线程）。周期巡检有 MAX_EVALUATIONS_PER_PASS 兜底，这里同样加硬上限：
+      // 触顶即停，剩余候选交给同 tick 的后续事件或下一个巡检周期处理（显形只延迟、不丢失）。
+      int evaluationsLeft = MAX_EVALUATIONS_PER_PASS;
       boolean exhausted = false;
       for (int i = 0; i < count && !exhausted; i++) {
         int cx = coordinates[i * 3];
@@ -1282,13 +1316,14 @@ public final class ProximityRevealer implements Listener {
           continue;
         }
         for (int o = 0; o < offsets.length; o++) {
-          if (budget.remaining() <= 0) {
+          if (budget.remaining() <= 0 || evaluationsLeft <= 0) {
             exhausted = true;
             break;
           }
           int x = cx + offsets[o][0];
           int y = cy + offsets[o][1];
           int z = cz + offsets[o][2];
+          evaluationsLeft--;
           if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
             continue;
           }

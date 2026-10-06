@@ -10,6 +10,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import net.mikumc.mikuxraynet.util.Constants;
 import org.junit.jupiter.api.Test;
 import org.yaml.snakeyaml.Yaml;
 
@@ -117,8 +118,54 @@ class PluginDescriptionConsistencyTest {
         MODERN + " 的命令 aliases 与代码常量 COMMAND_ALIASES 不一致");
   }
 
-  // ---------------------------------------------------------------- 工具方法
+  /**
+   * 权限节点 ↔ 插件描述的对照守门。
+   *
+   * <p><b>为什么必须有这条</b>：{@code paper-plugin.yml} 的 permissions 段此前声称「由本测试守门」，
+   * 实际只断言了命令段——四个权限节点（含 {@code mikuxraynet.bypass}）没有任何构建期保护。
+   * 权限名一旦写错（尤其大小写），直通判定或子命令鉴权会永远失败，而构建、启动全部正常，
+   * 属于最难排查的一类静默失效。这里把「代码常量 ↔ 描述 YAML」逐字对上，并校验父子关系。
+   */
+  @Test
+  void 权限节点与插件描述一致() {
+    Map<String, Object> permissions = child(load(MODERN), "permissions");
+    assertNotNull(permissions, MODERN + " 缺少 permissions 段");
 
+    for (String node : List.of(Constants.ALL_PERMISSION, Constants.ADMIN_PERMISSION,
+        Constants.STATUS_PERMISSION, Constants.DUMP_PERMISSION, Constants.RELOAD_PERMISSION,
+        Constants.BYPASS_PERMISSION)) {
+      assertNotNull(permissions.get(node),
+          MODERN + " 缺少权限节点 " + node + "（代码常量已引用它，描述必须同步声明）");
+    }
+
+    // 父子关系：通配节点 -> admin/bypass；admin -> status/dump/reload
+    Map<String, Object> all = asMap(permissions.get(Constants.ALL_PERMISSION));
+    Map<String, Object> allChildren = child(all, "children");
+    assertNotNull(allChildren, Constants.ALL_PERMISSION + " 必须有 children");
+    assertTrue(Boolean.TRUE.equals(allChildren.get(Constants.ADMIN_PERMISSION)),
+        Constants.ALL_PERMISSION + " 应包含子节点 " + Constants.ADMIN_PERMISSION);
+    assertTrue(Boolean.TRUE.equals(allChildren.get(Constants.BYPASS_PERMISSION)),
+        Constants.ALL_PERMISSION + " 应包含子节点 " + Constants.BYPASS_PERMISSION);
+
+    Map<String, Object> admin = asMap(permissions.get(Constants.ADMIN_PERMISSION));
+    Map<String, Object> adminChildren = child(admin, "children");
+    assertNotNull(adminChildren, Constants.ADMIN_PERMISSION + " 必须有 children");
+    for (String node : List.of(Constants.STATUS_PERMISSION, Constants.DUMP_PERMISSION,
+        Constants.RELOAD_PERMISSION)) {
+      assertTrue(Boolean.TRUE.equals(adminChildren.get(node)),
+          Constants.ADMIN_PERMISSION + " 应包含子节点 " + node);
+    }
+
+    // 命令段的 permission 必须就是 admin 节点（Brigadier 的 requires 判定用它）
+    Map<String, Object> commands = child(load(MODERN), "commands");
+    Map<String, Object> command = asMap(commands == null
+        ? null : commands.get(CommandRegistrar.COMMAND_NAME));
+    assertNotNull(command, MODERN + " 缺少命令 " + CommandRegistrar.COMMAND_NAME);
+    assertEquals(Constants.ADMIN_PERMISSION, String.valueOf(command.get("permission")),
+        "命令的 permission 必须等于 " + Constants.ADMIN_PERMISSION + "（命令注册用的是它）");
+  }
+
+  // ---------------------------------------------------------------- 工具方法
   @SuppressWarnings("unchecked")
   private static Map<String, Object> load(String resource) {
     try (InputStream input = PluginDescriptionConsistencyTest.class.getResourceAsStream(resource)) {

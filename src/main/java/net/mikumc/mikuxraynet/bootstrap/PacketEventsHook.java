@@ -46,7 +46,7 @@ public final class PacketEventsHook {
 
       ServerVersion version = api.getServerManager().getVersion();
       this.releaseName = version == null ? "未知" : version.getReleaseName();
-      this.registry = BlockStateRegistry.build(extraOccluding, extraNonOccluding);
+      this.registry = BlockStateRegistry.build(extraOccluding, extraNonOccluding, logger);
 
       logger.info("方块状态映射构建完成：服务端版本 " + releaseName
           + "，状态数 " + registry.getUniqueBlockStateCount()

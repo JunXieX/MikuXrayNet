@@ -149,8 +149,8 @@ final class ProximityScanner {
           if (revealed.contains(playerId, key, blockX, blockY, blockZ)) {
             continue;
           }
-          offer(worst, new ObfuscatedChunkIndex.Position(blockX, blockY, blockZ),
-              distanceSq, sequence++, limit);
+          // 传原始分量而非先构造 Position：堆满之后绝大多数候选注定被淘汰，只有真正入堆时才需要对象
+          offer(worst, blockX, blockY, blockZ, distanceSq, sequence++, limit);
         }
       }
     }
@@ -188,13 +188,14 @@ final class ProximityScanner {
   /**
    * 往容量上限为 {@code limit} 的最大堆里放一个候选：堆满时淘汰堆顶（最差者）。
    *
-   * <p>先与堆顶比较、只有确实值得入堆才构造 {@link Scored}：堆满后的绝大多数候选注定被淘汰，
-   * 这样可以省掉它们的对象分配。
+   * <p><b>入参是原始分量而非 {@code Position}</b>：先与堆顶比较、只有确实值得入堆才构造
+   * {@link Scored}（进而构造 {@link ObfuscatedChunkIndex.Position}）。堆满后的绝大多数候选注定被淘汰，
+   * 而候选总数可达数千（见类注释），若由调用方预先构造 Position，这些对象全都是白分配的。
    */
-  private static void offer(PriorityQueue<Scored> worst, ObfuscatedChunkIndex.Position position,
+  private static void offer(PriorityQueue<Scored> worst, int x, int y, int z,
       long distanceSquared, int sequence, int limit) {
     if (worst.size() < limit) {
-      worst.add(new Scored(position, distanceSquared, sequence));
+      worst.add(new Scored(new ObfuscatedChunkIndex.Position(x, y, z), distanceSquared, sequence));
       return;
     }
     Scored currentWorst = worst.peek();
@@ -205,7 +206,7 @@ final class ProximityScanner {
         || (distanceSquared == currentWorst.distanceSquared()
             && sequence < currentWorst.sequence())) {
       worst.poll();
-      worst.add(new Scored(position, distanceSquared, sequence));
+      worst.add(new Scored(new ObfuscatedChunkIndex.Position(x, y, z), distanceSquared, sequence));
     }
   }
 

@@ -28,6 +28,19 @@ public final class DiskPayload {
   }
 
   /**
+   * 一条负载编码后的字节数（与 {@link #encode} 的定容公式逐项一致，但<b>不实际编码</b>）。
+   *
+   * <p>供上层在真正编码前做容量/限长预判：编码要分配并整块拷贝改写后的区块字节（几十~几百 KB），
+   * 若磁盘缓存此刻已被拒收（条目达上限 / 磁盘线程积压），这次分配与拷贝纯属浪费——登录风暴下
+   * 会变成可观的 GC 压力。用本方法先算长度、再决定是否编码。
+   */
+  public static int encodedLength(int[] positions, byte[] data) {
+    int count = positions == null ? 0 : positions.length;
+    int chunkLength = data == null ? 0 : data.length;
+    return HEADER_SIZE + count * Integer.BYTES + chunkLength;
+  }
+
+  /**
    * 编码一条负载。
    *
    * <p><b>编解码刻意不对称，空负载由上层拒绝</b>：本方法允许 {@code data} 为 {@code null} 或空（照常写出

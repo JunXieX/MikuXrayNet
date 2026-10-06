@@ -175,4 +175,52 @@ class RegionFileHardeningTest {
       reader.close();
     }
   }
+
+  /**
+   * <b>本轮修复回归</b>：懒加载桶上的 {@code clear} 必须物化后真正清除并返回 {@code true}。
+   *
+   * <p>修复前：{@code readSlot} 只建 {@code lazyBuckets} 而不填 {@code slots}，{@code clear} 见
+   * {@code slots[bucket] == null} 恒返回 {@code false} → 陈旧条目（过期 / 换配置）既清不掉、
+   * 调用方 {@code DiskCacheStore#removeEntry} 也因 false 不扣计数，且此后<b>每次读取都重复单槽解码</b>
+   * （直到 put 覆盖或维护压缩）。物化只解已在内存的 raw（无磁盘 IO），且 dirty 置位后落盘真删。
+   */
+  @Test
+  void clearOnLazyLoadedBucketMaterializesAndRemovesSlot(@TempDir Path dir) throws Exception {
+    Path file = dir.resolve("r.0.0.b_linear");
+
+    RegionFile writer = RegionFile.open(file, 2);
+    try {
+      writer.put(chunkIndexForBucket(0), entry(5));
+      writer.put(chunkIndexForBucket(0) + 1, entry(9)); // 同桶第 2 个槽位（对照组）
+      writer.flushDirty();
+    } finally {
+      writer.close();
+    }
+
+    RegionFile reader = RegionFile.open(file, 2);
+    try {
+      assertTrue(loadedOf(reader).isEmpty(), "前置：新实例不应预加载任何桶");
+      assertNotNull(reader.get(chunkIndexForBucket(0)),
+          "前置：先读一次，让桶进入懒加载态（只物化槽位表）");
+      assertTrue(reader.clear(chunkIndexForBucket(0)),
+          "懒桶上的 clear 必须物化后就地清除并返回 true（修复前恒 false → 陈旧条目滞留）");
+      assertNull(reader.get(chunkIndexForBucket(0)), "已清除的条目不得再被读出");
+      assertNotNull(reader.get(chunkIndexForBucket(0) + 1),
+          "同桶对照条目必须不受影响（物化不得误伤其它槽位）");
+
+      // dirty 置位后落盘：flush + 重开，被清条目必须真的从磁盘消失
+      reader.flushDirty();
+    } finally {
+      reader.close();
+    }
+
+    RegionFile reopened = RegionFile.open(file, 2);
+    try {
+      assertNull(reopened.get(chunkIndexForBucket(0)),
+          "clear 的脏标记必须落盘：重开后被清条目已从磁盘删除");
+      assertNotNull(reopened.get(chunkIndexForBucket(0) + 1), "同桶对照条目重开后仍在");
+    } finally {
+      reopened.close();
+    }
+  }
 }

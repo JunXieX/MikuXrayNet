@@ -39,6 +39,17 @@ public final class ReloadCoordinator {
 
     /** 按新配置重建/重启周期任务（邻近显形、AFK、延迟巡检）。 */
     void restartPeriodicTasks();
+
+    /**
+     * 最近一次「重新读取配置」中发生的解析失败说明（{@code null} = 两份文件都正常解析）。
+     *
+     * <p><b>为什么必须上报</b>：配置文件解析失败时 {@code MikuConfig} 会<b>保留上一份有效配置</b>并只在
+     * 控制台 WARN——于是游戏内的重载回显会打出「指纹未变化 + 已热生效」，管理员根本不知道新文件被拒绝、
+     * 自己刚做的修改并没有生效。默认实现返回 {@code null}，便于测试替身不改代码。
+     */
+    default String configurationFallbackNote() {
+      return null;
+    }
   }
 
   /** 本次热重载后已即时生效的配置项。 */
@@ -111,6 +122,17 @@ public final class ReloadCoordinator {
     } else {
       lines.add("两侧配置指纹均未变化（反矿透 " + antiAfter + "，带宽 " + bandwidthAfter + "）"
           + (invalidated ? "，缓存已按安全起见刷新" : ""));
+    }
+    // 配置解析失败时 MikuConfig 会保留上一份配置：此时「已热生效」是误导——必须显式指出新文件被拒绝
+    String fallbackNote;
+    try {
+      fallbackNote = target.configurationFallbackNote();
+    } catch (Throwable throwable) {
+      fallbackNote = null;
+    }
+    if (fallbackNote != null) {
+      lines.add("注意：本次重载有配置文件解析失败，" + fallbackNote
+          + "——上面显示的指纹与生效项并非来自你刚修改的文件，请检查语法后重新重载");
     }
     lines.add("已热生效：" + String.join("、", APPLIED));
     lines.add("需要重启服务端才生效：" + String.join("、", RESTART_REQUIRED));

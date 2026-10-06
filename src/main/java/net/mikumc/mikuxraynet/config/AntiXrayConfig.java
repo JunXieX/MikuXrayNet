@@ -311,6 +311,14 @@ public final class AntiXrayConfig {
   public static final int PROXIMITY_RAY_SAMPLES_MAX = 5;
 
   /**
+   * {@code proximity.instant-reveal.radius}（事件驱动即时显形的邻域半径）的有效上限。
+   *
+   * <p>该半径决定「一个方块变更要连带检查周围多少格」——判定量随半径的三次方增长
+   * （半径 8 时每个变更坐标要查 17³ 量级的邻域）。默认 2，钳制区间 1..8（与立即放行半径同量级）。
+   */
+  public static final int PROXIMITY_INSTANT_RADIUS_MAX = 8;
+
+  /**
    * {@code neighbors.cache-maximum-size}（邻块贴边快照缓存条目上限）的安全上限。
    *
    * <p>快照按位打包（每格 1 bit），约 3 KB/条；16384 条约 48 MB。再大只放大内存占用而无精度收益。
@@ -342,6 +350,63 @@ public final class AntiXrayConfig {
    * 默认 2048 已足够吸收突发；上限用于拦住手滑多打一位数（如 10000000）导致的巨数组分配与内存打满。
    */
   public static final int ADVANCED_QUEUE_CAPACITY_MAX = 8192;
+
+  /**
+   * {@code disk-cache.max-entries}（磁盘缓存条目上限）的安全上限。
+   *
+   * <p>条目上限直接决定磁盘占用与启动期扫描量（默认 20000 条约 200~600 MB）。上限只为拦住手滑多打
+   * 一位数（如 200000000）造成的磁盘打满与超长启动扫描，取值远高于正常调优范围。
+   */
+  public static final int DISK_CACHE_MAX_ENTRIES_MAX = 2_000_000;
+
+  /**
+   * {@code disk-cache.max-file-size-mb}（单个区域文件大小上限）的安全上限。
+   *
+   * <p>压缩回收会把整个区域文件读进内存重写，单文件越大，这一瞬间的内存尖峰越高。
+   * 上限 1024 MB（1 GB）远超默认 16 MB 与正常调优范围，只为拦住手滑多打一位数。
+   */
+  public static final int DISK_CACHE_MAX_FILE_SIZE_MB_MAX = 1024;
+
+  /**
+   * {@code disk-cache.bucket-cache-size}（每个区域文件常驻内存的 bucket 数）的安全上限。
+   *
+   * <p>一个区域文件只有 {@code BufferedLinearV3Format.BUCKET_COUNT}（16）个 bucket，故该值超过 16
+   * 之后不再有任何收益（LRU 永远装得下全部桶）。上限取 16 的整数倍留出余量，拦住误配大数。
+   */
+  public static final int DISK_CACHE_BUCKET_CACHE_SIZE_MAX = 64;
+
+  /**
+   * {@code disk-cache.maintenance-interval-seconds}（维护周期）的安全上限。
+   *
+   * <p>该周期同时驱动「脏 bucket 落盘」「压缩回收」与「关闭闲置文件句柄」。配得过大（如 86400）
+   * 会让这三件事事实上停摆：脏数据长期只在内存、文件句柄不再关闭。上限 3600 秒（1 小时）
+   * 已足够宽松，只拦住「误把秒当毫秒」之类的量级错误。
+   */
+  public static final int DISK_CACHE_MAINTENANCE_INTERVAL_MAX_SECONDS = 3600;
+
+  /**
+   * {@code disk-cache.zstd.timeout-seconds}（自动下载 zstd 的超时）的安全上限。
+   *
+   * <p><b>为什么必须有上限</b>：该超时用于 {@code ZstdSupport.initialize}，而后者在
+   * {@code onEnable} 的<b>主线程</b>上同步等待下载完成——配得过大（如 3600）会在网络黑洞时把
+   * 开服卡住任意久。上限 120 秒既允许慢速镜像完成下载，又保证开服不会被无限期拖住。
+   */
+  public static final int DISK_CACHE_ZSTD_TIMEOUT_MAX_SECONDS = 120;
+
+  /**
+   * {@code proximity.max-positions}（伪装坐标总量安全阀）的安全上限。
+   *
+   * <p>这是「正常运营绝不该触发」的安全阀；每个坐标在索引里约占 4 字节 + 容器开销。
+   * 上限 33554432（约 3200 万）对应约 128 MB 量级的索引占用，只为拦住手滑多打一位数。
+   */
+  public static final int PROXIMITY_MAX_POSITIONS_MAX = 33_554_432;
+
+  /**
+   * {@code proximity.max-positions-per-player}（单玩家已显形坐标安全阀）的安全上限。
+   *
+   * <p>同样只在异常态触发。上限 4194304（约 400 万）对应单玩家约 16 MB 量级，拦住误配大数。
+   */
+  public static final int PROXIMITY_MAX_POSITIONS_PER_PLAYER_MAX = 4_194_304;
 
   /**
    * 邻近显形：玩家靠近曾被伪装的坐标时，主动把该坐标的真实方块发回客户端。
@@ -758,7 +823,8 @@ public final class AntiXrayConfig {
             //（单次抓取实测约 0.776 ms，现按列高度上界裁剪后更少）。
             // 下限 1（否则缓存恒空、退化为每次重复抓取），上限见 NEIGHBORS_CACHE_MAXIMUM_MAX。
             clampCeiling(root.getInt("neighbors.cache-maximum-size", 2048), 1,
-                NEIGHBORS_CACHE_MAXIMUM_MAX, "neighbors.cache-maximum-size", ceilingAdjustments)),
+                NEIGHBORS_CACHE_MAXIMUM_MAX, "neighbors.cache-maximum-size", floorAdjustments,
+                ceilingAdjustments)),
         new Occlusion(
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-occluding")),
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding")),
@@ -777,8 +843,14 @@ public final class AntiXrayConfig {
             Math.max(1, root.getInt("proximity.max-reveals-per-tick", 256)),
             // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处。
             Math.max(1, root.getInt("proximity.expire-seconds", 300)),
-            Math.max(1, root.getInt("proximity.max-positions", 4194304)),
-            Math.max(1, root.getInt("proximity.max-positions-per-player", 524288)),
+            // 安全阀容量见 PROXIMITY_MAX_POSITIONS(_PER_PLAYER)_MAX：两个键都只在异常态触发，
+            // 但同样需要上限，否则误配大数会让「安全阀」失效、内存失去上界。
+            clampCeiling(root.getInt("proximity.max-positions", 4194304), 1,
+                PROXIMITY_MAX_POSITIONS_MAX, "proximity.max-positions", floorAdjustments,
+                ceilingAdjustments),
+            clampCeiling(root.getInt("proximity.max-positions-per-player", 524288), 1,
+                PROXIMITY_MAX_POSITIONS_PER_PLAYER_MAX, "proximity.max-positions-per-player",
+                floorAdjustments, ceilingAdjustments),
             root.getBoolean("proximity.frustum.enabled", true),
             // 视锥两键都有安全下限（见 FRUSTUM_FOV_FLOOR / FRUSTUM_MIN_DISTANCE_FLOOR）：
             // 配得比客户端可视范围更窄会让「玩家看得见的方块」保持伪装，因此低于下限时按下限生效，
@@ -790,11 +862,16 @@ public final class AntiXrayConfig {
             root.getBoolean("proximity.raycast.enabled", true),
             // 语义已变：原生射线改造后本键表示「每方块最多尝试的候选点数」（不再表示采样数）。
             // 钳制 1..PROXIMITY_RAY_SAMPLES_MAX（有效上限 = 暴露面上的候选点数），默认 4。
-            Math.max(1, Math.min(PROXIMITY_RAY_SAMPLES_MAX,
-                root.getInt("proximity.raycast.samples", 4))),
+            // 用 clampCeiling 而非裸 Math.min/max：两端钳制都留痕，管理员能看到配置已被改写。
+            clampCeiling(root.getInt("proximity.raycast.samples", 4), 1, PROXIMITY_RAY_SAMPLES_MAX,
+                "proximity.raycast.samples", floorAdjustments, ceilingAdjustments),
             new InstantReveal(
                 root.getBoolean("proximity.instant-reveal.enabled", true),
-                Math.max(1, Math.min(8, root.getInt("proximity.instant-reveal.radius", 2))),
+                // 半径同时受「下限 1」与「上限 8」约束（见 PROXIMITY_INSTANT_RADIUS_MAX）：
+                // 旧实现用裸 Math.min/Math.max 静默钳制，管理员看不出配置已被改写，故改为两端留痕。
+                clampCeiling(root.getInt("proximity.instant-reveal.radius", 2), 1,
+                    PROXIMITY_INSTANT_RADIUS_MAX, "proximity.instant-reveal.radius", floorAdjustments,
+                    ceilingAdjustments),
                 Math.max(0, root.getInt("proximity.instant-reveal.max-per-tick", 16))),
             Math.max(0, root.getInt("proximity.over-reveal-sampling", 20)),
             // 批量合并显形包（默认开启）：把一个周期内的显形用 Paper 原生多方块变更包一次发出。
@@ -802,38 +879,55 @@ public final class AntiXrayConfig {
             root.getBoolean("proximity.batch-reveal-sends", true)),
         new DiskCache(
             root.getBoolean("disk-cache.enabled", true),
-            Math.max(1, root.getInt("disk-cache.max-entries", 20000)),
-            Math.max(1, root.getInt("disk-cache.max-file-size-mb", 16)),
+            // 上限见 DISK_CACHE_MAX_ENTRIES_MAX：条目上限直接决定磁盘占用与启动期扫描量。
+            clampCeiling(root.getInt("disk-cache.max-entries", 20000), 1,
+                DISK_CACHE_MAX_ENTRIES_MAX, "disk-cache.max-entries", floorAdjustments,
+                ceilingAdjustments),
+            // 上限见 DISK_CACHE_MAX_FILE_SIZE_MB_MAX：压缩回收会把整个区域文件读进内存重写。
+            clampCeiling(root.getInt("disk-cache.max-file-size-mb", 16), 1,
+                DISK_CACHE_MAX_FILE_SIZE_MB_MAX, "disk-cache.max-file-size-mb", floorAdjustments,
+                ceilingAdjustments),
             // 过期秒数有安全下限（见 DISK_CACHE_EXPIRE_FLOOR_SECONDS）：从写入时刻算的过期时间配得比
             // 两次启动的间隔还短，条目在重启后必然已过期，磁盘缓存等于白写（真机命中率恒为 0 的根因）。
             diskCacheExpireSeconds(root.getInt("disk-cache.expire-seconds", 7 * 24 * 60 * 60),
                 floorAdjustments),
-            Math.max(1, root.getInt("disk-cache.bucket-cache-size", 8)),
+            // 上限见 DISK_CACHE_BUCKET_CACHE_SIZE_MAX：区域文件只有 16 个 bucket，配大无收益。
+            clampCeiling(root.getInt("disk-cache.bucket-cache-size", 8), 1,
+                DISK_CACHE_BUCKET_CACHE_SIZE_MAX, "disk-cache.bucket-cache-size", floorAdjustments,
+                ceilingAdjustments),
             Math.max(1, root.getInt("disk-cache.idle-close-seconds", 300)),
-            Math.max(1, root.getInt("disk-cache.maintenance-interval-seconds", 30)),
+            // 上限见 DISK_CACHE_MAINTENANCE_INTERVAL_MAX_SECONDS：该周期驱动落盘/压缩/关句柄，
+            // 配得过大等于让这三件事事实停摆。
+            clampCeiling(root.getInt("disk-cache.maintenance-interval-seconds", 30), 1,
+                DISK_CACHE_MAINTENANCE_INTERVAL_MAX_SECONDS,
+                "disk-cache.maintenance-interval-seconds", floorAdjustments, ceilingAdjustments),
             Math.max(1, root.getInt("disk-cache.compact-per-pass", 4)),
             Math.max(1, root.getInt("disk-cache.queue-capacity", 256)),
             // zstd 前置：服务端自带则直接用；没有则按这几键决定是否自动下载与校验（见 ZstdSupport）
             root.getBoolean("disk-cache.zstd.auto-download", true),
             zstdDownloadUrl(root),
-            Math.max(1, root.getInt("disk-cache.zstd.timeout-seconds", 10)),
+            // 上限见 DISK_CACHE_ZSTD_TIMEOUT_MAX_SECONDS：该超时在 onEnable 主线程上同步等待下载，
+            // 配得过大则网络黑洞时开服可被卡任意久。
+            clampCeiling(root.getInt("disk-cache.zstd.timeout-seconds", 10), 1,
+                DISK_CACHE_ZSTD_TIMEOUT_MAX_SECONDS, "disk-cache.zstd.timeout-seconds",
+                floorAdjustments, ceilingAdjustments),
             // 下载文件的期望 SHA-256：留空 = 不校验（默认）
             zstdSha256(root)),
         PlatformSupport.Mode.parse(root.getString("advanced.platform", "auto")),
         // 未配置时的内置兜底必须与打包 antixray.yml 的默认值保持一致（有单测对照）
         // 上限见 CACHE_MAXIMUM_SIZE_MAX：每条约 20~25 KB，饱和时内存占用与条目数成正比。
         clampCeiling(root.getInt("cache.maximum-size", 40960), 1,
-            CACHE_MAXIMUM_SIZE_MAX, "cache.maximum-size", ceilingAdjustments),
+            CACHE_MAXIMUM_SIZE_MAX, "cache.maximum-size", floorAdjustments, ceilingAdjustments),
         root.getInt("cache.expire-after-access-seconds", 600),
         // 上限见 ADVANCED_THREADS_MAX：每个 worker 各持一份按线程复用的编解码 scratch，
         // 手滑多打一位数会同时放大线程数与这部分常驻内存。
         clampCeiling(root.getInt("advanced.threads", 0), 0, ADVANCED_THREADS_MAX,
-            "advanced.threads", ceilingAdjustments),
+            "advanced.threads", floorAdjustments, ceilingAdjustments),
         root.getInt("advanced.timeout-millis", 2500),
         // 上限见 ADVANCED_QUEUE_CAPACITY_MAX：每个排队项都钉着一个区块封包，
         // 队列容量直接决定积压时钉住多少内存。
         clampCeiling(root.getInt("advanced.queue-capacity", 2048), 1, ADVANCED_QUEUE_CAPACITY_MAX,
-            "advanced.queue-capacity", ceilingAdjustments),
+            "advanced.queue-capacity", floorAdjustments, ceilingAdjustments),
         unknownTags,
         overrides,
         worldBlacklist,
@@ -880,7 +974,13 @@ public final class AntiXrayConfig {
       List<String> raw = section.getStringList("hide-blocks");
       // 显式配了空清单 → 仍回落内置默认（避免「配了但配空 → 该维度完全不伪装」的静默失效）
       if (!raw.isEmpty()) {
-        hideBlocks = List.copyOf(expandTags(raw, unknownTags));
+        List<String> expanded = expandTags(raw, unknownTags);
+        // 展开后为空 = 清单里<b>全部</b>是识别不了的 tag(...)（误配置，如把 diamond_ores 拼错）。
+        // 这种情况必须同样回落内置默认：一旦接受空清单，该维度会一个方块都不伪装（世界档案 targets
+        // 为空 → active()=false），而插件因其它维度仍 active 而正常启动，管理员极难察觉。
+        if (!expanded.isEmpty()) {
+          hideBlocks = List.copyOf(expanded);
+        }
       }
     }
     Map<String, Integer> weights = parseWeights(
@@ -977,7 +1077,14 @@ public final class AntiXrayConfig {
       List<String> hideBlocks = null;
       if (world.contains("hide-blocks")) {
         List<String> raw = world.getStringList("hide-blocks");
-        hideBlocks = raw.isEmpty() ? List.of() : List.copyOf(expandTags(raw, unknownTags));
+        if (raw.isEmpty()) {
+          hideBlocks = List.of(); // 显式空清单 = 有意的「该世界不伪装」
+        } else {
+          List<String> expanded = expandTags(raw, unknownTags);
+          // 展开后为空 = 清单里全是识别不了的 tag(...)（误配置）。保持 null（回落维度值），
+          // 绝不把误配置当成「该世界不伪装」——那会让该世界一个方块都不伪装且无从察觉。
+          hideBlocks = expanded.isEmpty() ? null : List.copyOf(expanded);
+        }
       }
       Map<String, Integer> replacementWeights = null;
       if (world.contains("replacement-weights")) {
@@ -1109,17 +1216,24 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 整数上限钳制：非有限值不适用，仅对整数取值做「下限 max(minimum) + 上限 min(maximum)」；
-   * 上限被触发时记入 {@code ceilingAdjustments}（供加载时一次性 WARN）。
+   * 整数钳制：取值做「下限 {@code max(minimum)} + 上限 {@code min(maximum)}」。
+   *
+   * <p><b>两端都留痕</b>：下限被抬升记入 {@code floorAdjustments}、上限被压低记入
+   * {@code ceilingAdjustments}，由加载路径一次性 WARN（与 {@link #proximityDistance} 同口径）。
+   * 旧实现的下限分支是静默 {@code Math.max}，管理员把值写成 0/负数时配置被改写却看不到任何提示
+   * （而 yml 注释里写着「不得低于 X」），与「绝不静默改用户配置」的项目约定相矛盾。
    */
   private static int clampCeiling(int value, int minimum, int maximum, String key,
-      List<String> ceilingAdjustments) {
-    int floored = Math.max(minimum, value);
-    if (floored > maximum) {
+      List<String> floorAdjustments, List<String> ceilingAdjustments) {
+    if (value < minimum) {
+      floorAdjustments.add(key + "=" + value + "（下限 " + minimum + "）");
+      return minimum;
+    }
+    if (value > maximum) {
       ceilingAdjustments.add(key + "=" + value + "（上限 " + maximum + "）");
       return maximum;
     }
-    return floored;
+    return value;
   }
 
   /**

@@ -6,8 +6,10 @@ import com.comphenix.protocol.async.AsyncMarker;
 import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketEvent;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -334,8 +336,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     if (marker == null) {
       return;
     }
-    // 队列满：直接放行原包，不登记延迟
+    // 队列满：直接放行原包，不登记延迟。
+    // 必须计数：这是唯一「本区块完全未伪装、矿物以真实状态下发」的路径，若不计数，
+    // 现象是「改写数看起来正常但玩家能透视」，无法归因（见 RewriteStats#chunksSkippedQueueFull）。
     if (!workPool.hasCapacity()) {
+      stats.chunksSkippedQueueFull.increment();
       return;
     }
 
@@ -626,10 +631,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions());
       cache.put(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint, value);
       if (diskCache != null) {
-        // 磁盘写入是「提交即返回」的异步操作（自有磁盘线程），不阻塞本工作线程；
+        // 写入是「提交即返回」的异步操作（自有磁盘线程），不阻塞本工作线程。
+        // 用惰性负载重载：先按编码后的长度判定容量，通过后才真正编码——编码要分配并整块拷贝
+        // 改写后的区块字节（几十~几百 KB），被拒时（条目达上限 / 磁盘线程积压）这次拷贝纯属浪费。
         // 负载里带上被伪装坐标，磁盘缓存命中时才能重新写入显形索引（见 DiskPayload）。
         diskCache.put(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint,
-            DiskPayload.encode(sourceHash, result.obfuscatedPositions(), result.data()));
+            DiskPayload.encodedLength(result.obfuscatedPositions(), result.data()),
+            () -> DiskPayload.encode(sourceHash, result.obfuscatedPositions(), result.data()));
       }
     }
     // 失败结果：data == source 且伪装位置为空 → writeBack 直接返回，原包照常下发（fail-open 语义不变）。
@@ -739,6 +747,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private void writeBack(ChunkPacketAccessor accessor, RewriteTask task, byte[] data, int[] positions,
       AntiXrayConfig current, UUID playerId) {
     if (positions.length == 0) {
+      // 本次改写结果「一个坐标都没伪装」（无目标方块 / 矿已被挖空 / 配置变更后不再匹配）：
+      // 既不能写回封包，也不能就此返回——该区块若此前登记过坐标，其索引条目与各玩家的已显形标记
+      // 会全部变成陈旧数据（继续为「本次并未伪装」的坐标发冗余显形包）。这里显式失效该区块的登记。
+      ObfuscatedChunkIndex staleIndex = index();
+      if (staleIndex != null) {
+        staleIndex.invalidateChunk(task.worldName(), task.chunkX(), task.chunkZ());
+        RevealedSet staleRevealed = revealed();
+        if (staleRevealed != null) {
+          staleRevealed.clearChunk(new ChunkKey(task.worldName(), task.chunkX(), task.chunkZ()));
+        }
+      }
       return;
     }
     // remove-block-entities 实时读「当前」配置：它直接决定写进封包的字节，reload 切换必须立即生效。
@@ -759,16 +778,60 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 索引走可变引用：热重载关闭 proximity 后引用被置空，这里直接跳过，不再登记（真正零开销且与面板一致）。
     ObfuscatedChunkIndex index = index();
     if (index != null) {
-      index.recordChunk(task.worldName(), task.chunkX(), task.chunkZ(),
-          task.minHeight(), positions);
+      // 用差集接口覆盖：本次覆盖会把「旧清单有、新清单没有」的坐标移出共享索引（如 enclosed 模式下
+      // 邻块指纹翻转导致边界坐标改写结果变化）。这些坐标上<b>所有玩家</b>的已显形标记必须同步摘除——
+      // 否则标记虚增会让邻近显形的「整块跳过」（sizeFor >= entry.size）提前成立，真实未显形坐标被
+      // 周期性跳过（标记又被扫描 touch 续期、玩家不离开扫描半径就永不过期）。
+      // 这正是 RevealedSet 类注释声明的「已显形坐标 ⊆ 区块当前清单」不变式，覆盖路径必须维护它。
+      // 容量安全阀可能为腾位置而整体淘汰其它区块：那些区块的索引条目随之消失，其坐标上各玩家的
+      // 已显形标记必须同步作废，否则成为孤儿标记（sizeFor 虚增 → 「整块跳过」提前成立 → 真实坐标漏显形）。
+      // 常态下 mayEvict 为 false，零分配；只有真的可能淘汰时才准备容器。
+      List<ChunkKey> evictedChunks = index.mayEvict(positions.length) ? new ArrayList<>(4) : null;
+      int[] removedLocals =
+          index.recordChunkWithRemovals(task.worldName(), task.chunkX(), task.chunkZ(),
+              task.minHeight(), positions, evictedChunks);
       RevealedSet revealed = revealed();
       if (revealed != null) {
-        // 区块被重新下发 → 该玩家客户端又拿回了伪装结果，其在该区块的已显形标记必须作废
-        // （重新记录后这些坐标会再次被显形）。只作废该玩家：其它玩家的客户端仍显示我们此前发回的真实
-        // 方块，把它们一并清掉只会让它们下个周期重复显形一遍（纯浪费带宽与主线程开销）。
+        if (evictedChunks != null) {
+          for (ChunkKey evictedKey : evictedChunks) {
+            // 索引条目已整体消失：该区块上「所有玩家」的已显形标记都必须作废
+            revealed.clearChunk(evictedKey);
+          }
+        }
+        if (removedLocals.length > 0) {
+          // 局部坐标 → 绝对坐标三元组（removePositions 按首坐标导出区块键，同区块批量摘除）
+          int[] absolute = toAbsoluteCoordinates(task.chunkX(), task.chunkZ(), task.minHeight(),
+              removedLocals);
+          revealed.removePositions(task.worldName(), absolute, removedLocals.length);
+        }
+        // 本包接收者的客户端又拿回了伪装结果，其在该区块的标记全部作废（重新记录后会再次显形）。
+        // 只作废该玩家：其它玩家的客户端仍显示我们此前发回的真实方块，把它们一并清掉只会让
+        // 它们下个周期重复显形一遍（纯浪费带宽与主线程开销）。
         revealed.clearChunk(new ChunkKey(task.worldName(), task.chunkX(), task.chunkZ()), playerId);
       }
     }
+  }
+
+  /**
+   * 把区块内局部坐标编码差集转为「绝对坐标三元组」（{@code x,y,z} 连续存放），供
+   * {@link RevealedSet#removePositions} 批量摘除。
+   *
+   * <p><b>编码必须与另两处互逆</b>：{@link ObfuscatedChunkIndex#removePosition} 的编码
+   * （{@code (y-minHeight)<<8 | (z&15)<<4 | (x&15)}）与 {@link ProximityScanner} 的解码
+   * （{@code (chunkX<<4)|(local&15)} 等）。{@code relY = local>>8} 恒非负（登记时 {@code y ≥ minHeight}），
+   * 故算术移位无符号问题；负 chunkX 经 {@code (chunkX<<4)|低4位} 与 {@code x>>4} 可逆。
+   *
+   * <p>包级可见，供离线单测直接驱动三方编码互逆性（真实链路依赖封包上下文，离线不可达）。
+   */
+  static int[] toAbsoluteCoordinates(int chunkX, int chunkZ, int minHeight, int[] removedLocals) {
+    int[] absolute = new int[removedLocals.length * 3];
+    for (int i = 0; i < removedLocals.length; i++) {
+      int local = removedLocals[i];
+      absolute[i * 3] = (chunkX << 4) | (local & 15);
+      absolute[i * 3 + 1] = minHeight + (local >> 8);
+      absolute[i * 3 + 2] = (chunkZ << 4) | ((local >> 4) & 15);
+    }
+    return absolute;
   }
 
   /** 取「当前」的伪装区块索引（可变引用）；未启用或已被热重载关闭时返回 {@code null}。 */

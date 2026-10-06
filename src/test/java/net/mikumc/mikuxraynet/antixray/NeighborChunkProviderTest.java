@@ -117,9 +117,44 @@ class NeighborChunkProviderTest {
 
     clock.set(1_000_000_000L); // 距写入恰好 1000 ms = TTL，视为过期
     assertNull(provider.cached("world", 4, 7), "超过 TTL 后按未命中（不再永久缓存）");
+    assertEquals(0, provider.size(), "复核确认过期时条目必须真的从主存储移除（而非只返回 null）");
 
     NeighborEdges refreshed = provider.capture("world", 0, HEIGHT, 4, 7, loaded, QUERY, UNBOUNDED);
     assertSame(refreshed, provider.cached("world", 4, 7), "过期后重抓应回到命中");
+  }
+
+  /**
+   * <b>本轮修复回归（竞态复核分支）</b>：外层判定「已过期」后、bin 锁内复核之前条目被并发
+   * {@code putCache} 刚刷新——复核必须<b>保留</b>该条目并把存活值返回给调用方，绝不能按过期删除
+   * （旧实现锁外 {@code remove(key, entry)} 会 value 匹配命中同一对象、把刚刷新的条目整个误删，
+   * 白白多抓一次）。
+   *
+   * <p>单线程确定性驱动：脚本时钟在武装后的<b>第一次读</b>（外层判定）返回过期时刻、之后
+   * （bin 锁内复核）返回未过期时刻——语义上等价于「复核瞬间条目刚被刷新」。
+   */
+  @Test
+  void recheckKeepsEntryIfRefreshedBetweenExpiryCheckAndRemoval() {
+    AtomicLong clock = new AtomicLong(0L);
+    java.util.concurrent.atomic.AtomicBoolean armed = new java.util.concurrent.atomic.AtomicBoolean();
+    java.util.concurrent.atomic.AtomicBoolean firstArmedRead =
+        new java.util.concurrent.atomic.AtomicBoolean(true);
+    java.util.function.LongSupplier scripted = () -> {
+      if (!armed.get()) {
+        return clock.get();
+      }
+      // 武装后第一读 = cached() 外层判定：距写入 2000ms > TTL 1000ms → 判过期；
+      // 第二读 = computeIfPresent 复核：返回写入后 500ms < TTL → 未过期（等价于刚被刷新）
+      return firstArmedRead.getAndSet(false) ? 2_000_000_000L : 500_000_000L;
+    };
+    NeighborChunkProvider provider = new NeighborChunkProvider(8, 1000L, scripted);
+    ChunkLoadedCheck loaded = (chunkX, chunkZ) -> true;
+
+    NeighborEdges first = provider.capture("world", 0, HEIGHT, 4, 7, loaded, QUERY, UNBOUNDED);
+    armed.set(true);
+
+    assertSame(first, provider.cached("world", 4, 7),
+        "复核发现未过期（刚被并发刷新）时必须采用存活值，绝不误删");
+    assertEquals(1, provider.size(), "误删不会发生：条目仍在主存储中");
   }
 
   /**

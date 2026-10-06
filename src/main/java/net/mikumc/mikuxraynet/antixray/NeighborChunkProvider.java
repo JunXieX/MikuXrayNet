@@ -162,21 +162,32 @@ public final class NeighborChunkProvider {
   /**
    * 读取已缓存的快照；未命中或已过期返回 {@code null}（不做任何 Bukkit 访问，可在任意线程调用）。
    *
-   * <p>过期条目在读取时立即移除，因此调用方拿到 {@code null} 后走既有缺失策略（fail-open）。
+   * <p>过期条目在读取时移除（<b>bin 锁内复核后才删</b>，见 {@link #putCache} 的竞态说明）；
+   * 若复核期间被并发刷新，则采用新值、省一次重抓。
    */
   public NeighborEdges cached(String worldName, int chunkX, int chunkZ) {
     // 无锁读取：不再获取全局 monitor，也不再改动 LRU 链表（改由 volatile second-chance 位近似）。
-    CacheEntry entry = entries.get(new ChunkKey(worldName, chunkX, chunkZ));
+    ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
+    CacheEntry entry = entries.get(key);
     if (entry == null) {
       return null;
     }
-    if (entry.expiresAtNanos != Long.MAX_VALUE && nanoClock.getAsLong() >= entry.expiresAtNanos) {
-      entries.remove(entry.key, entry);
+    if (!isExpired(entry, nanoClock.getAsLong())) {
+      // 打标「被访问过」：仅写 volatile 位，无需加锁；淘汰扫描据此给一次「第二次机会」（近似 LRU）。
+      entry.referenced = true;
+      return entry.edges;
+    }
+    // 已过期：computeIfPresent 在 CHM 的 bin 锁内复核「当前值仍过期」才移除——与 putCache 的
+    // 同键刷新（同样在 bin 锁内）互斥。旧实现是「锁外判过期 → remove(key, entry)」：刷新可插入
+    // 两者之间，value 匹配仍命中同一对象，把刚刷新的条目整个误删（1.8.0 引入的竞态）。
+    // 复核未删（已被刷新 / 键已被重建）时 computeIfPresent 返回存活值——直接采用，不浪费重抓。
+    CacheEntry current = entries.computeIfPresent(key,
+        (k, v) -> isExpired(v, nanoClock.getAsLong()) ? null : v);
+    if (current == null) {
       return null;
     }
-    // 打标「被访问过」：仅写 volatile 位，无需加锁；淘汰扫描据此给一次「第二次机会」（近似 LRU）。
-    entry.referenced = true;
-    return entry.edges;
+    current.referenced = true;
+    return current.edges;
   }
 
   /**
@@ -309,28 +320,62 @@ public final class NeighborChunkProvider {
    * 写入缓存：TTL 从写入时刻起算。
    *
    * <p>缓存不能永久持有陈旧（含 null 平面）的快照，到期后重抓——见类注释的 TTL 说明。
+   *
+   * <p><b>并发</b>：建/刷一律走 {@code entries.compute}（在 CHM 的 <b>bin 锁</b>内完成）——同键的
+   * 「原地刷新」必须与 {@link #cached} 的「过期复核移除」（computeIfPresent，同一把 bin 锁）互斥。
+   * 旧实现 {@code putIfAbsent} 返回后<b>锁外</b>写字段，读方可在「判过期」与「remove」之间插入刷新，
+   * value 匹配同一对象照样删除，把刚刷新的条目误删（后果：多一次重抓）。
+   * 注意锁序：compute 返回后 bin 锁已释放，才允许拿 {@code clockLock}（全程 clockLock → bin，
+   * 绝不嵌套反向）。
    */
   private void putCache(String worldName, int chunkX, int chunkZ, NeighborEdges edges) {
     long expiresAt = cacheTtlNanos <= 0L
         ? Long.MAX_VALUE
         : nanoClock.getAsLong() + cacheTtlNanos;
     ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
-    CacheEntry entry = new CacheEntry(key, edges, expiresAt);
-    CacheEntry previous = entries.putIfAbsent(key, entry);
-    if (previous != null) {
-      // 同键（含并发）覆盖：原地更新，绝不在环形队列里留下重复节点
-      previous.edges = edges;
-      previous.expiresAtNanos = expiresAt;
-      previous.referenced = true;
-      return;
+    CacheEntry[] created = new CacheEntry[1];
+    entries.compute(key, (k, previous) -> {
+      if (previous != null) {
+        // 同键（含并发）原地刷新：字段写入被 compute 的 bin 锁包裹，与 cached() 的复核移除互斥
+        previous.edges = edges;
+        previous.expiresAtNanos = expiresAt;
+        previous.referenced = true;
+        return previous;
+      }
+      CacheEntry fresh = new CacheEntry(k, edges, expiresAt);
+      created[0] = fresh;
+      return fresh;
+    });
+    if (created[0] == null) {
+      return; // 原地刷新：节点已在环里，不重复入队
     }
-    // 只有「真正新建条目」才进入同步块维护环形队列并做淘汰/清理——把串行范围缩到最小
+    // 只有「真正新建条目」才进入同步块维护环形队列并做淘汰/清理——把串行范围缩到最小。
+    // 若条目在 compute 返回后、入队前被并发摘除，入队的只是死节点，由摊还清理/淘汰的
+    // 「entries.get(key) != candidate」判据丢弃，无泄漏。
     synchronized (clockLock) {
-      clockQueue.addLast(entry);
+      clockQueue.addLast(created[0]);
       evictOverflow();
       // 顶满淘汰只在超容量时触发，冷条目的过期回收与死节点清理由此摊还处理
       amortizedCleanup();
     }
+  }
+
+  /**
+   * 原子「复核过期 + 移除」：在 CHM 的 bin 锁内确认条目<b>仍过期</b>且<b>仍是本次观察到的那个对象</b>
+   * 才删，与 {@link #putCache} 的同键刷新互斥（见其注释），且绝不误删「已被摘除又重建」的新条目。
+   *
+   * @return {@code true} = 已移除；{@code false} = 未删（已刷新，或键已被重建/不存在）
+   */
+  private boolean removeIfExpired(ChunkKey key, CacheEntry expected) {
+    boolean[] removed = new boolean[1];
+    entries.computeIfPresent(key, (k, v) -> {
+      if (v == expected && isExpired(v, nanoClock.getAsLong())) {
+        removed[0] = true;
+        return null;
+      }
+      return v;
+    });
+    return removed[0];
   }
 
   /**
@@ -349,14 +394,21 @@ public final class NeighborChunkProvider {
         continue; // 陈旧节点（该键已被过期移除 / 失效）
       }
       if (isExpired(candidate, now)) {
-        entries.remove(candidate.key, candidate);
-        continue;
+        // 原子复核后移除（bin 锁内）：淘汰在 clockLock 内运行，而 putCache 的刷新在 bin 锁内、
+        // 不持 clockLock——锁外判过期可能把「判定后刚被刷新」的条目误删（与 cached() 同一类竞态）。
+        // 复核未删（期间刚被刷新）时不得丢弃队列节点，否则该条目成为「环外孤儿」——容量淘汰再也
+        // 看不到它（只能靠 TTL 读取回收），落到下方按存活条目走 second-chance 轮转。
+        if (removeIfExpired(candidate.key, candidate)) {
+          continue; // 真已移除：条目与节点一起丢弃
+        }
       }
       if (candidate.referenced) {
         candidate.referenced = false;
         clockQueue.addLast(candidate);
         continue;
       }
+      // 容量淘汰（非过期）：value 匹配删除；若并发刷新抢先改了同一对象，条目仍是同一实例、
+      // 删除连带节点一起生效，不会产生孤儿节点
       entries.remove(candidate.key, candidate);
     }
   }
@@ -382,11 +434,12 @@ public final class NeighborChunkProvider {
       if (entries.get(candidate.key) != candidate) {
         continue; // 死节点：键已被移除，环里只剩陈旧引用，直接丢弃
       }
-      if (isExpired(candidate, now)) {
-        entries.remove(candidate.key, candidate); // 过期冷条目：主动回收
+      // 过期冷条目：bin 锁内复核后回收，条目与节点一起丢弃；复核未删（期间刚被刷新）则落到
+      // 下方轮转回队尾——绝不能在未删除时丢节点（那会留下「环外孤儿」，容量淘汰再也看不到它）
+      if (isExpired(candidate, now) && removeIfExpired(candidate.key, candidate)) {
         continue;
       }
-      clockQueue.addLast(candidate); // 仍有效：原样轮转回队尾（保留 referenced 位）
+      clockQueue.addLast(candidate); // 仍有效（含刚被刷新的）：原样轮转回队尾（保留 referenced 位）
     }
   }
 

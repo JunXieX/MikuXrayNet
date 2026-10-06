@@ -534,11 +534,18 @@ final class RegionFile implements AutoCloseable {
   /**
    * 清空一个区块的条目（惰性清理过期/旧代次条目时使用）。
    *
-   * <p><b>轻量路径（绝不触发整桶解码）</b>：只在桶「已经整桶解码」时就地清空槽位；桶未被加载、或只做了
-   * 懒加载（见 {@link #readSlot}）时直接返回 {@code false}，<b>不为清一个槽位把整桶 64 个条目解码进
-   * 内存</b>。这样读路径上的过期/配置不符清理不会额外付出「整桶 decode」的开销（读路径只担保 50ms
-   * 预算），磁盘上的陈旧条目改由维护期压缩回收（{@code DiskCacheStore#keepEntry} 按过期时间丢弃）兜底；
-   * 语义仍是 fail-open，未清即为「未删」，调用方的计数不会因此多减。
+   * <p><b>三种桶状态</b>：
+   * <ul>
+   *   <li>已整桶解码（{@code slots[bucket] != null}）→ 直接就地清空槽位并置 {@code dirty}（轻量）；</li>
+   *   <li>懒加载过（{@link #readSlot} 只物化了 {@code lazyBuckets}）→ <b>先物化整桶再清</b>。物化只
+   *       解已在内存的 {@code lazy.raw}（<b>无磁盘 IO</b>），且只在「确实要删」这条罕见路径发生
+   *       （条目过期 / 换配置）；若不物化，陈旧条目会滞留并在此后<b>每次读取都重复单槽解码</b>
+   *       （直到 put 覆盖或维护压缩），且 clear 必须返回 {@code true} 才能让调用方的条目计数
+   *       正确扣减（{@code DiskCacheStore#removeEntry}），否则磁盘与计数会背离。清完置 dirty，
+   *       下次 {@link #flushDirty} 把该桶从磁盘真正删除；</li>
+   *   <li>从未加载 → 返回 {@code false}（<b>绝不为清一个槽位把整桶从磁盘解码</b>，见
+   *       {@code RegionFileHardeningTest#clearOnUnloadedBucketDoesNotForceDecode}）。</li>
+   * </ul>
    */
   boolean clear(int chunkIndex) {
     if (lockUnavailable) {
@@ -547,7 +554,15 @@ final class RegionFile implements AutoCloseable {
     int bucket = bucketIndex(chunkIndex);
     BufferedLinearV3Format.Entry[] bucketSlots = slots[bucket];
     if (bucketSlots == null) {
-      return false; // 桶未加载：不为它解码，交给维护期回收
+      if (lazyBuckets[bucket] == null) {
+        return false; // 从未加载：不为它解码（磁盘 IO 一律不发生），交给维护期回收
+      }
+      // 懒加载桶：物化（仅内存解码，无磁盘 IO）后走正常清除，使 dirty 能真正落盘删掉陈旧条目
+      ensureLoaded(bucket);
+      bucketSlots = slots[bucket];
+      if (bucketSlots == null) {
+        return false; // 物化失败（防御性）：按未清除处理，计数不扣
+      }
     }
     loaded.get(bucket); // 与 ensureLoaded 一致地标记为最近使用，保持 LRU 语义
     int slot = slotInBucket(chunkIndex);
@@ -1048,14 +1063,22 @@ final class RegionFile implements AutoCloseable {
    * @return 可安全移除的桶下标；{@code -1} 表示当前没有可安全驱逐的桶
    */
   private int selectEvictableVictim(int pinned) {
-    // 直接遍历 loaded：循环体只调 flushBucket/writePosTable（都不触碰 loaded），不会结构化修改，
-    // 因此无需先复制 keySet 快照（那会在每次驱逐时多分配一个列表）
+    // 第一趟：优先选「干净」的牺牲桶——驱逐它不需要任何磁盘 IO。
+    // 为什么必须先找干净的：本方法也会被<b>读路径</b>调用（懒加载新桶时的 LRU 驱逐），而下面那条
+    // 「脏桶先落盘再驱逐」的路径会同步执行 flushBucket（encodeBucket + zstd 压缩 + append 写）
+    // 与 writePosTable——一次区块读取就可能内联一次桶压缩与磁盘写，足以击穿 50 ms 读预算
+    // （超时即记未命中 → 上层回退整块重写，命中率下降）。先挑干净的即可在绝大多数情况下完全避开它。
+    // 直接遍历 loaded：循环体只读 dirty/slots（不触碰 loaded），无需先复制 keySet 快照。
     for (Integer candidate : loaded.keySet()) {
-      if (candidate == pinned) {
-        continue;
-      }
-      if (!dirty[candidate] || slots[candidate] == null) {
+      if (candidate != pinned && (!dirty[candidate] || slots[candidate] == null)) {
         return candidate;
+      }
+    }
+    // 第二趟：已加载的桶全是脏的（写入密集期），只能落盘后驱逐——脏数据必须先写入，否则丢失。
+    // 逐个尝试（某个桶落盘失败时保留其脏标记并换下一个），全部失败才放弃本轮驱逐。
+    for (Integer candidate : loaded.keySet()) {
+      if (candidate == pinned || !dirty[candidate] || slots[candidate] == null) {
+        continue;
       }
       try {
         flushBucket(candidate);

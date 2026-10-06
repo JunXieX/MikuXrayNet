@@ -315,15 +315,30 @@ public final class DiskCacheStore implements AutoCloseable {
   }
 
   /**
-   * 写入一个区块的缓存负载（提交即返回，实际落盘由磁盘线程完成）。
+   * 惰性负载：只在确认「会被接收」之后才求值编码。
    *
-   * <p>负载由调用方自行编码（含原始字节指纹），本类只当作不透明字节保存。
+   * <p><b>为什么需要它</b>：调用方（区块改写路径）编码负载要 {@code ByteBuffer.allocate} 并整块拷贝
+   * 改写后的区块字节（几十~几百 KB）。若此刻磁盘缓存必然拒收（条目达上限 / 磁盘线程积压 / 负载超长），
+   * 这次分配与拷贝纯属浪费——登录风暴下会放大 GC 压力。把编码推迟到容量判定通过之后即可完全避免。
    */
-  public void put(String worldName, int chunkX, int chunkZ, int configHash, byte[] payload) {
-    if (!usable() || worldName == null || payload == null || payload.length == 0) {
+  @FunctionalInterface
+  public interface PayloadSupplier {
+    byte[] get();
+  }
+
+  /**
+   * 写入一个区块的缓存负载；{@code payload} 只在通过全部容量判定后才被求值。
+   *
+   * @param encodedBytes   编码后的字节数（用于「超长」与容量判定，必须先于编码算出，见
+   *                       {@link DiskPayload#encodedLength}）
+   * @param payload        惰性负载工厂（通过判定后调用一次）
+   */
+  public void put(String worldName, int chunkX, int chunkZ, int configHash, int encodedBytes,
+      PayloadSupplier payload) {
+    if (!usable() || worldName == null || encodedBytes <= 0) {
       return;
     }
-    if (payload.length > BufferedLinearV3Format.MAX_PAYLOAD_SIZE) {
+    if (encodedBytes > BufferedLinearV3Format.MAX_PAYLOAD_SIZE) {
       stats.rejectedByCapacity.increment();
       return;
     }
@@ -332,11 +347,29 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
     if (pendingOps.get() >= config.queueCapacity()) {
+      stats.rejectedByBacklog.increment(); // 此前静默返回：积压导致写入被丢弃必须可见
       return;
     }
-
+    byte[] encoded = payload.get();
+    if (encoded == null || encoded.length == 0) {
+      return;
+    }
     long writtenAt = System.currentTimeMillis();
-    execute(() -> doPut(worldName, chunkX, chunkZ, configHash, writtenAt, payload));
+    execute(() -> doPut(worldName, chunkX, chunkZ, configHash, writtenAt, encoded));
+  }
+
+  /**
+   * 写入一个区块的缓存负载（提交即返回，实际落盘由磁盘线程完成）。
+   *
+   * <p>负载由调用方自行编码（含原始字节指纹），本类只当作不透明字节保存。
+   * 若调用方尚未编码、且希望「被拒时不白做整块拷贝」，请改用
+   * {@link #put(String, int, int, int, int, PayloadSupplier)}。
+   */
+  public void put(String worldName, int chunkX, int chunkZ, int configHash, byte[] payload) {
+    if (payload == null) {
+      return;
+    }
+    put(worldName, chunkX, chunkZ, configHash, payload.length, () -> payload);
   }
 
   /**
@@ -844,6 +877,7 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
     if (pendingOps.get() >= config.queueCapacity()) {
+      stats.rejectedByBacklog.increment();
       return;
     }
     pendingOps.incrementAndGet();
@@ -878,6 +912,7 @@ public final class DiskCacheStore implements AutoCloseable {
       }
     }
     if (pendingOps.get() >= config.queueCapacity()) {
+      stats.rejectedByBacklog.increment(); // 读因积压被拒即降级为未命中，必须可见（否则只表现为命中率偏低）
       return null;
     }
 
@@ -904,7 +939,16 @@ public final class DiskCacheStore implements AutoCloseable {
       // 而 FileChannel 一被中断就永久关闭（ClosedByInterruptException）→ 该区域文件句柄作废，
       // 且脏 bucket 无法再落盘（真机上表现为每 30 秒一条 ClosedChannelException）。
       // 读超时的语义本来就是「本次按未命中降级」，任务稍后自行跑完即可，无需打断。
-      future.cancel(false);
+      //
+      // pendingOps 必须精确偿还：计数在提交前自增，唯一的递减点在任务 lambda 的 finally 里。
+      // 若任务「尚未被工作线程取出」，cancel(false) 会把 FutureTask 直接置为 CANCELLED，
+      // 该 callable 永不执行 → 其 finally 永不运行 → 计数每超时一次永久 +1；
+      // 累积到 queueCapacity 后（put 与 submit 都以它为门限）磁盘缓存会静默彻底停用，直到重启。
+      // 因此：cancel 返回 true（确认任务未运行、finally 不会执行）时由本线程补一次递减；
+      // cancel 返回 false 说明任务已在运行或已完成，其 finally 会（或已经）递减，不得重复扣减。
+      if (future.cancel(false)) {
+        pendingOps.decrementAndGet();
+      }
       stats.errors.increment();
       return null;
     } catch (ExecutionException exception) {
@@ -945,6 +989,7 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
     if (pendingOps.get() >= config.queueCapacity()) {
+      stats.rejectedByBacklog.increment(); // 收尾操作（落盘/关句柄）被跳过：脏数据滞留内存更久，必须可见
       return;
     }
 

@@ -157,7 +157,12 @@ public class Chunk implements AutoCloseable {
           throw new ChunkScratch.OutputOverflowException(
               "区块重编码输出超过绝对上限 " + ChunkScratch.MAX_OUTPUT_CAPACITY + " 字节，放弃改写");
         }
+        // 扩容替换输出缓冲同样遵循「替换即释放」（与上方零拷贝分支同约定）：旧包装已无引用价值，
+        // 不释放其 refCnt 会永远停在 1。注意先算后换——growOutput 可能抛 OutputOverflowException，
+        // 抛出时旧缓冲必须仍在本对象手里（由 close() 释放），故不得提前释放。
+        ByteBuf previousOut = out;
         this.outputBuffer = Unpooled.wrappedBuffer(this.scratch.growOutput(out.capacity() + 1));
+        releaseQuietly(previousOut);
       }
     }
   }

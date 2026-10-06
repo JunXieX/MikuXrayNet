@@ -35,14 +35,14 @@ class DiagnosticsTest {
   private static Diagnostics.Snapshot fixed(BandwidthConfig bandwidth) {
     return new Diagnostics.Snapshot(
         new Diagnostics.Snapshot.Env(true, true, false, true, 1, "Paper 1.20.4", "25", "1.2.5"),
-        new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 100L, 331L, 5L, 2L, 1L, 2L,
+        new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
             0L, 0L, 0L, "无采样"),
         new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 40L, 6L),
         new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L),
         new Diagnostics.Snapshot.Throttle(20L, 30L, 4L, 40L, 12L,
             6L, 5L, 4, 40L, 7L, 3L, 2, 3L, 8L, 9L, 4L, 5L, 25_000_000L),
         new Diagnostics.Snapshot.Pool(4, 2, 10, 2048),
-        new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2, 4L, 5L, 6L, 1L, 0L),
+        new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2, 4L, 5L, 6L, 1L, 0L, 0L),
         null, bandwidth);
   }
 
@@ -179,9 +179,9 @@ class DiagnosticsTest {
         "状态面板必须暴露单线程合并冲刷的次数与耗时（极端配置下的延迟瓶颈观测口径）：" + text);
     assertTrue(text.contains("磁盘缓存"), text);
     assertTrue(text.contains("命中率 75.0%"), text);
-    // 「命中率为什么异常」的自证口径：过期清理 / 负载被拒 / 写入被拒 / 异常必须可见
-    assertTrue(text.contains("过期清理 4，负载被拒 5，写入被拒 7，异常 0"),
-        "磁盘缓存必须分列过期清理、负载被拒、写入被拒与异常，否则「命中率异常」无法自证：" + text);
+    // 「命中率为什么异常」的自证口径：过期清理 / 负载被拒 / 写入被拒 / 积压被拒 / 异常必须可见
+    assertTrue(text.contains("过期清理 4，负载被拒 5，写入被拒 7，积压被拒 0，异常 0"),
+        "磁盘缓存必须分列过期清理、负载被拒、写入被拒、积压被拒与异常，否则「命中率异常」无法自证：" + text);
     assertTrue(text.contains("==== MikuXrayNet 运行状态（v1.2.5） ===="),
         "状态面板首行必须回显插件版本（区分不同构建的日志靠它）：" + text);
     assertTrue(text.contains("带宽"), text);

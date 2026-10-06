@@ -50,6 +50,12 @@ public final class MikuConfig {
   /** 当前生效的配置对；首次 {@link #load()} 之前为 {@code (null, null)}。整体一次替换，保证同代可见。 */
   private volatile Loaded loaded = new Loaded(null, null);
 
+  /**
+   * 最近一次加载的回退说明（{@code null} = 正常）：解析失败时用于在重载回显里如实告知管理员
+   * 「你刚改的文件没有被采用」。由加载线程写、命令线程读，故为 {@code volatile}。
+   */
+  private volatile String fallbackNote;
+
   public MikuConfig(Plugin plugin) {
     this.plugin = plugin;
     this.logger = plugin.getLogger();
@@ -64,6 +70,8 @@ public final class MikuConfig {
    * 保证 {@link #antiXray()} / {@link #bandwidth()} 永远非 {@code null}。
    */
   public void load() {
+    // 每轮加载先清空上一轮的回退说明：只反映「本次」重载的结果
+    this.fallbackNote = null;
     AntiXrayConfig loadedAntiXray = loadAntiXray();
     BandwidthConfig loadedBandwidth = loadBandwidth();
 
@@ -126,6 +134,16 @@ public final class MikuConfig {
   }
 
   /**
+   * 最近一次 {@link #load()} 中发生的「解析失败后回退」说明（{@code null} = 两份文件都正常解析）。
+   *
+   * <p>供重载回显使用：解析失败时会保留上一份配置（见 {@link #loadAntiXray()}），此时若仍只打
+   * 「指纹未变化 + 已热生效」，管理员会误以为刚修改的文件已生效，实际改动被整份忽略。
+   */
+  public String fallbackNote() {
+    return fallbackNote;
+  }
+
+  /**
    * 读取并解析反矿透配置，任何 {@code Throwable}（含解析期间抛出的 {@code Error}）都不冒泡。
    *
    * <p>失败语义：已有上一份有效配置则原样保留；首次加载即失败则回落到「全部键缺失」的内置默认
@@ -138,9 +156,11 @@ public final class MikuConfig {
       AntiXrayConfig previous = this.loaded.antiXray();
       if (previous != null) {
         warnFallbackOnce(antiXrayFallbackWarned, ANTI_XRAY_FILE, "已保留上一份配置", throwable);
+        this.fallbackNote = ANTI_XRAY_FILE + " 解析失败，已保留上一份配置";
         return previous;
       }
       warnFallbackOnce(antiXrayFallbackWarned, ANTI_XRAY_FILE, "已改用内置默认配置", throwable);
+      this.fallbackNote = ANTI_XRAY_FILE + " 解析失败，已改用内置默认配置";
       return AntiXrayConfig.from(new YamlConfiguration());
     }
   }
@@ -153,9 +173,11 @@ public final class MikuConfig {
       BandwidthConfig previous = this.loaded.bandwidth();
       if (previous != null) {
         warnFallbackOnce(bandwidthFallbackWarned, BANDWIDTH_FILE, "已保留上一份配置", throwable);
+        this.fallbackNote = BANDWIDTH_FILE + " 解析失败，已保留上一份配置";
         return previous;
       }
       warnFallbackOnce(bandwidthFallbackWarned, BANDWIDTH_FILE, "已改用内置默认配置", throwable);
+      this.fallbackNote = BANDWIDTH_FILE + " 解析失败，已改用内置默认配置";
       return BandwidthConfig.from(new YamlConfiguration());
     }
   }

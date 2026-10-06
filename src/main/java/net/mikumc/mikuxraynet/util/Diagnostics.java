@@ -97,12 +97,12 @@ public final class Diagnostics {
      */
     public record Rewrite(long cacheHits, long cacheMisses, int cacheEntries,
         long chunksRewritten, long blocksReplaced, long chunksSkipped, long chunksFailed,
-        long writeBackFailures, long chunksTimedOut,
+        long writeBackFailures, long chunksTimedOut, long chunksSkippedQueueFull,
         long bytesOriginal, long bytesOutput, long bytesSaved, String paletteBitsSummary) {
 
       /** 反矿透未启用时的零值兜底。 */
       public static final Rewrite EMPTY =
-          new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, "无采样");
+          new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, "无采样");
     }
 
     /** 邻近显形域：显形发包与视锥/射线剔除计数，以及过度显形的抽样统计。 */
@@ -153,11 +153,11 @@ public final class Diagnostics {
      */
     public record DiskCache(long hits, long misses, int entries, int openFiles,
         long expiredRemoved, long payloadRejected, long rejectedByCapacity, long rejectedBySize,
-        long errors) {
+        long rejectedByBacklog, long errors) {
 
       /** 磁盘缓存未启用时的零值兜底。 */
       public static final DiskCache EMPTY =
-          new DiskCache(0L, 0L, 0, 0, 0L, 0L, 0L, 0L, 0L);
+          new DiskCache(0L, 0L, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L);
     }
   }
 
@@ -278,6 +278,7 @@ public final class Diagnostics {
             rewriteStats.chunksRewritten.sum(), rewriteStats.blocksReplaced.sum(),
             rewriteStats.chunksSkipped.sum(), rewriteStats.chunksFailed.sum(),
             rewriteStats.writeBackFailures.sum(), rewriteStats.chunksTimedOut.sum(),
+            rewriteStats.chunksSkippedQueueFull.sum(),
             rewriteStats.bytesOriginal.sum(), rewriteStats.bytesOutput.sum(),
             rewriteStats.bytesSaved.sum(), rewriteStats.paletteBitsSummary());
     Snapshot.Proximity proximity = proximityStats == null ? Snapshot.Proximity.EMPTY
@@ -314,6 +315,7 @@ public final class Diagnostics {
             // 「读到但被拒」由改写侧统计（负载解封与字节指纹比对在那里做）：此处借用同一次快照的数值
             rewriteStats == null ? 0L : rewriteStats.diskPayloadRejected.sum(),
             diskCache.stats().rejectedByCapacity.sum(), diskCache.stats().rejectedBySize.sum(),
+            diskCache.stats().rejectedByBacklog.sum(),
             diskCache.stats().errors.sum());
 
     return new Snapshot(
@@ -350,7 +352,10 @@ public final class Diagnostics {
     lines.add("区块改写：改写 " + s.rewrite().chunksRewritten() + "，替换方块 " + s.rewrite().blocksReplaced()
         + "，跳过 " + s.rewrite().chunksSkipped()
         + "，异常 " + s.rewrite().chunksFailed() + "，写回失败 " + s.rewrite().writeBackFailures()
-        + "，超时放行 " + s.rewrite().chunksTimedOut());
+        + "，超时放行 " + s.rewrite().chunksTimedOut()
+        // 「因队列满整块未伪装」单列：它意味着该区块的矿物以真实状态下发（对透视端可见），
+        // 是本模块唯一的功能性静默失效，必须与「跳过」区分开。
+        + "，队列满未伪装 " + s.rewrite().chunksSkippedQueueFull());
     // 字节口径（P0-1）：只统计真正改写的区块（未改动/失败放行的原样字节不采样，避免稀释比例）。
     // 节省比例 = 节省字节 / 原始字节；开启 palette.width-budget 后这一行应体现「封顶+裁剪」的收益。
     lines.add(bytesLine(s.rewrite()));
@@ -382,6 +387,9 @@ public final class Diagnostics {
         + "｜过期清理 " + s.diskCache().expiredRemoved()
         + "，负载被拒 " + s.diskCache().payloadRejected()
         + "，写入被拒 " + (s.diskCache().rejectedByCapacity() + s.diskCache().rejectedBySize())
+        // 积压被拒单列：它不代表配置上限在拦，而是磁盘线程跟不上（压缩/落盘成瓶颈），
+        // 处理方式与调容量上限完全不同，因此不与「写入被拒」合并。
+        + "，积压被拒 " + s.diskCache().rejectedByBacklog()
         + "，异常 " + s.diskCache().errors());
     lines.add("带宽：零位移取消 " + s.throttle().entityPacketsCancelled()
         + "（放行 " + s.throttle().entityPacketsPassed() + "），合并批次 "

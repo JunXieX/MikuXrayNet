@@ -37,6 +37,15 @@ public final class RewriteStats {
   /** 处理超时、由看门狗放行原包的次数。 */
   public final LongAdder chunksTimedOut = new LongAdder();
 
+  /**
+   * 因改写队列已满而<b>直接放行原包</b>（本区块完全未伪装）的区块数。
+   *
+   * <p><b>为什么必须单列</b>：这是唯一「功能静默失效」的路径——该区块以真实矿物下发，对透视端完全可见。
+   * 此前它不递增任何计数器，表现为「改写数看起来正常、但玩家能透视」，无法归因。该计数持续增长说明
+   * 改写吞吐已被打满（{@code advanced.queue-capacity} 耗尽），应降低负载或评估加大队列/线程。
+   */
+  public final LongAdder chunksSkippedQueueFull = new LongAdder();
+
   /** 改写字节已算出但未能写回封包的次数（字段直写未生效，写回后回读 self-check 失败）。 */
   public final LongAdder writeBackFailures = new LongAdder();
 

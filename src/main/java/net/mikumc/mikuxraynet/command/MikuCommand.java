@@ -7,6 +7,7 @@ import java.util.Locale;
 import java.util.logging.Level;
 import net.kyori.adventure.text.Component;
 import net.mikumc.mikuxraynet.MikuXrayNet;
+import net.mikumc.mikuxraynet.util.Constants;
 import net.mikumc.mikuxraynet.util.Diagnostics;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
@@ -22,9 +23,15 @@ import org.bukkit.command.TabCompleter;
  */
 public final class MikuCommand implements CommandExecutor, TabCompleter {
 
-  private static final String PERMISSION_STATUS = "mikuxraynet.status";
-  private static final String PERMISSION_DUMP = "mikuxraynet.dump";
-  private static final String PERMISSION_RELOAD = "mikuxraynet.reload";
+  /**
+   * 三个子命令的权限节点统一取自 {@link Constants}（唯一出处）。
+   *
+   * <p>此前是写在本类里的私有字面量，与 {@code paper-plugin.yml} 的 {@code permissions} 段之间
+   * 没有任何构建期对照——改错权限名（例如大小写写错）不会报错，却会让对应子命令永远无权可用。
+   */
+  private static final String PERMISSION_STATUS = Constants.STATUS_PERMISSION;
+  private static final String PERMISSION_DUMP = Constants.DUMP_PERMISSION;
+  private static final String PERMISSION_RELOAD = Constants.RELOAD_PERMISSION;
   private static final List<String> SUBCOMMANDS = List.of("status", "dump", "reload");
 
   private final MikuXrayNet plugin;

@@ -1,5 +1,6 @@
 package net.mikumc.mikuxraynet.antixray;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -106,8 +107,112 @@ class ObfuscatedChunkIndexTest {
     assertEquals(6, index.positionCount());
   }
 
-  // ------------------------------------------------------------------ 失效时机
+  // ---------------------------------------------------- 覆盖差集（recordChunkWithRemovals）
 
+  /**
+   * <b>核心断言</b>：覆盖清单时返回「旧清单 ∖ 新清单」的移除差集，且计数同步更新。
+   * 这是 writeBack 摘除<b>所有玩家</b>孤儿标记的数据源——差集漏报会让
+   * {@code RevealedSet.sizeFor} 虚增、邻近显形的「整块跳过」提前成立（本轮修复的 major 缺陷）。
+   */
+  @Test
+  void overwriteRemovalsAreExactlyTheOldCoordinatesMissingFromTheNewList() {
+    ObfuscatedChunkIndex index = index(1_000_000, 60 * SECOND_NANOS);
+    int a = local(MIN_HEIGHT, 1, 64, 1);
+    int b = local(MIN_HEIGHT, 2, 64, 1);
+    int c = local(MIN_HEIGHT, 3, 64, 1);
+    int d = local(MIN_HEIGHT, 4, 64, 1);
+
+    // 首次登记：无旧清单 → 差集为空
+    assertArrayEquals(new int[0],
+        index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {a, b, c}),
+        "首次登记没有旧清单，差集必为空");
+    assertEquals(3, index.positionCount());
+
+    // 收缩 + 新增混合：a 被移除（差集必须报出）、d 是新增（不得出现在差集里）
+    assertArrayEquals(new int[] {a},
+        index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {b, c, d}),
+        "收缩覆盖必须精确返回「旧有而新无」的坐标（漏报=孤儿标记=整块跳过提前成立）");
+    assertEquals(3, index.positionCount(), "覆盖以新清单为准：3 个坐标（a 出、d 进）");
+
+    // 同内容、不同数组实例（缓存失效重算路径）：无移除
+    assertArrayEquals(new int[0],
+        index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {b, c, d}),
+        "集合未变时差集必为空（零分配快速路径的语义前提）");
+
+    // 同一数组引用（缓存命中重登记路径）：引用相等快速路径
+    int[] same = {b, c, d};
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, same);
+    assertArrayEquals(new int[0],
+        index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, same),
+        "重登记同一份数组（引用相等）时差集必为空");
+
+    // 完全不相交：全部旧坐标被移除
+    assertArrayEquals(new int[] {b, c, d},
+        index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {a}),
+        "完全替换时旧清单全部计入差集");
+    assertEquals(1, index.positionCount());
+
+    // 空清单：不覆盖既有条目（既有语义），差集为空
+    assertArrayEquals(new int[0],
+        index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[0]),
+        "空清单不覆盖（沿用旧 recordChunk 语义），差集必为空");
+    assertEquals(1, index.positionCount(), "空清单不得改变既有条目");
+  }
+
+  /**
+   * 部分摘除后的清单仍保持升序（差集归并的前提），且差集与随后的二分查找（{@code removePosition}）口径一致。
+   */
+  @Test
+  void removalsAfterCoordinateExtractionStayConsistentWithBinarySearch() {
+    ObfuscatedChunkIndex index = index(1_000_000, 60 * SECOND_NANOS);
+    int a = local(MIN_HEIGHT, 1, 64, 1);
+    int b = local(MIN_HEIGHT, 2, 64, 1);
+    int c = local(MIN_HEIGHT, 3, 64, 1);
+
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {a, b, c});
+    assertTrue(index.removePosition(WORLD, 1, 64, 1), "前置：摘除 a");
+
+    // 覆盖为 {b, d}：旧清单是 {b, c}（a 已被摘除）→ 差集 = 旧有而新无 = {c}；d 是新增不得入差集
+    int d = local(MIN_HEIGHT, 4, 64, 1);
+    assertArrayEquals(new int[] {c},
+        index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {b, d}),
+        "摘除后再覆盖：差集必须精确（c 报出、a 不得重复报出、d 不得误报）");
+
+    // 再覆盖收缩 {d}：b 被移出 → 差集报 b
+    assertArrayEquals(new int[] {b},
+        index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {d}),
+        "收缩覆盖必须报出被移出的 b");
+    assertEquals(1, index.positionCount());
+    assertTrue(index.containsPosition(WORLD, 4, 64, 1), "d 仍在清单");
+    assertFalse(index.containsPosition(WORLD, 2, 64, 1), "b 已移出清单");
+  }
+
+  /**
+   * <b>本轮修复回归</b>：容量安全阀淘汰其它区块时，必须把被淘汰的区块键交给调用方，
+   * 使它能同步作废那些坐标上「所有玩家」的已显形标记——否则孤儿标记会让邻近显形的
+   * 「整块跳过」（{@code sizeFor >= entry.size}）提前成立，真实坐标漏显形。
+   */
+  @Test
+  void capacityEvictionReportsEvictedChunkKeys() {
+    // 上限刚好容纳一个区块的 2 个坐标：登记第二个区块时必然淘汰第一个
+    ObfuscatedChunkIndex index = index(2, 60 * SECOND_NANOS);
+    int a = local(MIN_HEIGHT, 1, 64, 1);
+    int b = local(MIN_HEIGHT, 2, 64, 1);
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {a, b});
+
+    assertTrue(index.mayEvict(2), "前置：本次登记会越过安全阀上限（调用方据此准备收集容器）");
+
+    java.util.List<ChunkKey> evicted = new java.util.ArrayList<>();
+    index.recordChunkWithRemovals(WORLD, 1, 0, MIN_HEIGHT, new int[] {a, b}, evicted);
+
+    assertEquals(1, evicted.size(),
+        "被安全阀淘汰的区块键必须交给调用方（用于作废其坐标上的已显形标记）");
+    assertEquals(new ChunkKey(WORLD, 0, 0), evicted.get(0), "淘汰的应是最旧的区块");
+    assertNull(index.entry(new ChunkKey(WORLD, 0, 0)), "被淘汰区块的索引条目必须整体消失");
+    assertNotNull(index.entry(new ChunkKey(WORLD, 1, 0)), "本次登记的区块必须正常写入");
+  }
+
+  // ------------------------------------------------------------------ 失效时机
   @Test
   void removePositionOnlyDropsThatCoordinate() {
     ObfuscatedChunkIndex index = index(1_000_000, 60 * SECOND_NANOS);

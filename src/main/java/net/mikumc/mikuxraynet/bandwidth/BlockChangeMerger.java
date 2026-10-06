@@ -73,8 +73,9 @@ import org.bukkit.plugin.Plugin;
  * 由 Paper 原生 {@code sendMultiBlockChange} 按区块段一次性发出），直接放行原包——不进 Pending、
  * 不延迟、不重编码。此类包再进合并窗口的边际收益极小，却要额外吃满 {@code merge-window-millis}
  * （默认 40ms）的延迟（超过立即放行半径的显形变更尤为明显）。判定只看包自身的坐标数量（不看玩家、
- * 不看世界），且放在近身立即放行之后：近身的批量包仍走上面那条路径（会登记 {@code passed} 以做
- * last-write-wins），这里只兜住不会被近身判定截获的远处显形包。
+ * 不看世界），且放在近身立即放行之后：近身的批量包仍走上面那条路径（会登记覆盖标记以做
+ * last-write-wins），这里只兜住不会被近身判定截获的远处显形包——<b>同样登记</b>覆盖标记，
+ * 否则缓冲里同坐标的旧态会在窗口到期时把本包刚下发的新态覆盖回去（方块回退）。
  *
  * <p><b>last-write-wins 的微秒级残余窗口（已接受，勿当 bug 修）</b>：{@code passed} 集合是在
  * 持锁的临界区里「读取 + 剔除旧态」的，但把合并包发到客户端、以及取消原包，都发生在<b>释放锁之后</b>。
@@ -121,8 +122,12 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   /**
    * 每个玩家的待发缓冲。
    *
-   * <p><b>已立即放行的坐标</b>（{@link #passed}）：本窗口内经「立即放行」路径先行下发的坐标——
-   * 窗口到期构造合并包前据此把缓冲里的<b>旧状态</b>剔除，避免旧态晚到覆盖先到的新态（方块短暂回退）。
+   * <p><b>已有更新下发的坐标</b>（{@link #passed}）：本窗口内经「近身立即放行」或「远距离直通批量包」
+   * 把<b>新状态</b>直接交给客户端的坐标——窗口到期构造合并包前据此把缓冲里的<b>旧状态</b>剔除，
+   * 避免旧态晚到覆盖先到的新态（方块短暂回退）。
+   *
+   * <p><b>「过时」是相对的、可撤销</b>：同坐标若之后又被重新缓冲，{@code onPacketSending} 会立即把
+   * 该坐标从本集合移除（此刻缓冲条目才是最新的）——因此它不会把「更新的变更」当旧态误删。
    * 只在持有该 {@code Pending} 的锁内读写。
    */
   private static final class Pending {
@@ -132,6 +137,15 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     private final BlockChangeBatch<WrappedBlockData> batch;
     private ScheduledFuture<?> timer;
     private final AtomicBoolean flushed = new AtomicBoolean();
+    /**
+     * 溢出冲刷是否已排入冲刷线程（只在 {@code synchronized (target)} 内读写）。
+     *
+     * <p><b>为什么需要它</b>：{@link BlockChangeBatch#add} 一旦达到上限<b>此后每个包都返回 true</b>
+     * （超限即真），而首个冲刷任务从提交到执行存在窗口；窗口内到达的每个溢出包都会再排一个
+     * {@code flush} 任务——它们会因 {@code flushed} CAS 全部成 no-op，但白占单线程冲刷队列。
+     * 加此闸后同一 Pending 至多排一次，窗口内的后续溢出包直接复用在途任务。
+     */
+    private boolean overflowFlushScheduled;
 
     private Pending(UUID uuid, int maxEntries) {
       this.uuid = uuid;
@@ -144,16 +158,22 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     private final PacketEvent event;
     private final AtomicBoolean signalled = new AtomicBoolean();
     /**
-     * 该原包携带的坐标。
+     * 该原包携带的更新。
      *
-     * <p>fail-open 放行时据此判断能否安全取消：只有当一个原包携带的坐标<b>全部</b>已经由
-     * 「立即放行」路径先行下发（新态已交付）时，才取消它——否则取消会连带丢掉未放行坐标的更新。
+     * <p><b>为什么存原始更新而不是折算好的坐标清单</b>：坐标清单只在 fail-open 的
+     * {@link #allCoordsPassed} 判定里用得到（罕见路径），而对每个被延迟的包都折算一遍，
+     * 会在封包热路径上产生「ArrayList + 每个坐标一个 Coord」的固定分配（每 tick 全服大量相对/方块
+     * 变更包都会走这里）。改为惰性折算，把这份开销推迟到真正需要时（{@link #coordsOf}）。
      */
-    private final List<Coord> coords;
+    private final List<Update<WrappedBlockData>> updates;
 
-    private Held(PacketEvent event, List<Coord> coords) {
+    private Held(PacketEvent event, List<Update<WrappedBlockData>> updates) {
       this.event = event;
-      this.coords = coords;
+      this.updates = updates;
+    }
+
+    List<Update<WrappedBlockData>> updates() {
+      return updates;
     }
   }
 
@@ -432,25 +452,28 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     // 近身变更立即放行：不登记延迟、不入缓冲，原包按原样流出。
     // 这样玩家自己挖/放方块时的方块更新不会被合并窗口拖延，客户端预测得以立即确认（消除顿感）。
     if (shouldPassThroughImmediately(player.getUniqueId(), updates)) {
-      // 记录本窗口内已立即下发的坐标：合并窗口内可能有同一方块的旧状态仍在缓冲，
-      // 若不剔除会在窗口到期后晚到并把新态覆盖回去（方块短暂回退）。
-      rememberImmediatelyPassed(player.getUniqueId(), updates);
+      // 记录本窗口内已有更新下发的坐标：合并窗口内可能有同一方块的旧状态仍在缓冲，
+      // 若不标记会在窗口到期后晚到并把新态覆盖回去（方块短暂回退）。
+      rememberDelivered(player.getUniqueId(), updates);
       stats.blockChangesPassed.increment();
       return;
     }
 
     // 已聚合的批量包（MULTI_BLOCK_CHANGE 且坐标数达阈值）直接放行：不进 Pending、不登记延迟、
     // 不重编码，原包按原样流出——「恰好放行一次」。放在近身立即放行之后，因此近身的批量包仍走上面
-    // 那条路径（登记 passed 做 last-write-wins），这里只兜住不会被近身判定截获的远处显形包。
-    // 刻意不登记 passed：这类包坐标多且远离玩家，若把整包坐标记入 passed，会把合并窗口内同坐标的
-    // 更新一并从合并结果里剔除、可能丢掉真正更新的更新；而放行原包本身已是「恰好一次」的完整交付。
+    // 那条路径（登记覆盖标记做 last-write-wins），这里只兜住不会被近身判定截获的远处显形包。
+    //
+    // 这类包同样要登记「这些坐标已有更新下发」：否则若缓冲里还留着同坐标的<b>旧态</b>条目，
+    // 窗口到期会把旧态写回客户端，覆盖刚由本包下发的<b>新态</b>（方块回退）。
+    // 不必担心误删新态：同坐标若之后又被重新缓冲，缓冲循环会撤销该标记（见上面的 remove）。
     if (bypassesMerge(event.getPacketType() == PacketType.Play.Server.MULTI_BLOCK_CHANGE, updates.size())) {
+      rememberDelivered(player.getUniqueId(), updates);
       stats.blockChangesPassed.increment();
       return;
     }
 
     Pending target;
-    boolean overflow = false;
+    boolean scheduleOverflowFlush = false;
     // 与 flush() 在同一把锁内判定「缓冲是否已被冲刷」：若已冲刷则重取新缓冲，
     // 否则会把原包加进已废弃的缓冲里，导致该包永远得不到放行（卡包）。
     while (true) {
@@ -460,13 +483,16 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         if (target.flushed.get()) {
           continue;
         }
-        overflow = false;
+        boolean overflow = false;
         for (Update<WrappedBlockData> update : updates) {
           overflow |= target.batch.add(update.x(), update.y(), update.z(), update.value());
+          // 本坐标刚被重新缓冲：此刻缓冲条目才是最新的，必须撤销「已被更新下发覆盖」的标记。
+          // 否则上一轮「立即放行 / 直通批量包」留下的标记会在 flush 时把这条更新的变更当旧态误删（丢更新）。
+          target.passed.remove(new Coord(update.x(), update.y(), update.z()));
         }
         // 先入缓冲、再登记延迟：held.add 若在此之后抛异常，登记过的延迟就再也没人放行（永久卡包）。
         // flush() 的兜底只遍历 target.held，所以条目必须先在里面，登记才能生效。
-        Held entry = new Held(event, coordsOf(updates));
+        Held entry = new Held(event, updates);
         target.held.add(entry);
         // delayRegistered 记录「延迟是否真的登记成功」：未登记则从未延迟，不能 release（那会多减一次）。
         boolean delayRegistered = false;
@@ -487,6 +513,13 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
           }
           logThrottled(throwable);
         }
+        // 溢出调度闸（synchronized(target) 内置位）：只有「本 Pending 尚未排过溢出冲刷」才排任务。
+        // add 达上限后每个后续包都返回 overflow=true，但首个任务执行前的窗口内重复排队只是空转
+        //（flushed CAS 全 no-op，还会把 blockMergeFlushes 统计注水）。置位与判定同锁，不丢排不重排。
+        if (overflow && !target.overflowFlushScheduled) {
+          target.overflowFlushScheduled = true;
+          scheduleOverflowFlush = true;
+        }
         break;
       }
     }
@@ -495,7 +528,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     // 关键：绝不在这条共享的异步封包线程上内联跑整段合并（聚簇 + 构包 + 可能数千方块的发送）——
     // 那会阻塞所有玩家的出站封包处理。改投到唯一的 MikuXrayNet-BlockMerge 线程执行；
     // flush(Pending) 自带「恰好一次」闸（Pending.flushed 的 CAS + 同步块），与窗口定时器并发触发也不会重复交付。
-    if (overflow) {
+    if (scheduleOverflowFlush) {
       Pending flushTarget = target;
       try {
         flusher.execute(() -> flush(flushTarget));
@@ -507,12 +540,19 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   }
 
   /**
-   * 记录本窗口内已通过「立即放行」路径下发的坐标（供 {@link #flush} 做 last-write-wins）。
+   * 记录本窗口内「已有更新下发」的坐标（供 {@link #sendOrPass} 做 last-write-wins）。
+   *
+   * <p>两条路径都会调用：近身<b>立即放行</b>与远距离<b>直通批量包</b>——它们都把新状态直接交给了
+   * 客户端，而缓冲里可能还留着同一坐标的旧状态。
+   *
+   * <p>语义是「此刻缓冲里的同坐标条目已过时」，不是「该坐标永久不可再发」：同坐标若之后又被缓冲，
+   * 缓冲循环会立即撤销该标记（见 {@code onPacketSending} 的 {@code passed.remove}），
+   * 因此不会误删更新后的新态。
    *
    * <p>只在已有待发缓冲时记录：没有缓冲就不可能有会被旧态覆盖的条目。与 {@code flush}
    * 共用同一把锁，保证「记录」与「冲刷时读取」不交错。
    */
-  private void rememberImmediatelyPassed(UUID playerId, List<Update<WrappedBlockData>> updates) {
+  private void rememberDelivered(UUID playerId, List<Update<WrappedBlockData>> updates) {
     Pending target = pending.get(playerId);
     if (target == null) {
       return;
@@ -529,112 +569,63 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   }
 
   /**
-   * 冲刷某玩家的缓冲：构造合并包并放行/取消原包，并记录<b>单线程冲刷耗时</b>诊断计数。
+   * 冲刷某玩家的缓冲：构造合并包并放行/取消原包。
    *
    * <p>冲刷跑在唯一的 {@code MikuXrayNet-BlockMerge} 线程上，是极端配置下的延迟瓶颈。这里只加
    * 「次数 + 累计耗时」两个无锁计数（纯观测，不改变任何行为、不引入任何并发），
    * 供 {@code /mxnet status} 观测「平均一次冲刷的成本」是否随配置/负载恶化。
+   *
+   * <p><b>统计口径</b>：只统计<b>确实处理了被延迟原包</b>的调用（{@code flushInternal} 抢到写入权且
+   * 缓冲非空）。窗口定时器与溢出冲刷可能对同一 Pending 并发触发、重复调用本方法——那些 no-op 不得
+   * 计入「冲刷次数/耗时」，否则突发流量下 flushes 虚高、平均耗时被 0 耗时空转稀释，诊断口径失真。
    */
   private void flush(Pending target) {
     long startNanos = System.nanoTime();
-    try {
-      flushInternal(target);
-    } finally {
+    boolean performed = flushInternal(target);
+    if (performed) {
       stats.blockMergeFlushes.increment();
       stats.blockMergeFlushNanos.add(System.nanoTime() - startNanos);
     }
   }
 
-  /** 冲刷主体（计时由 {@link #flush} 包在外层）。 */
-  private void flushInternal(Pending target) {
-    List<Held> held;
-    List<List<Update<WrappedBlockData>>> clusters;
-    Set<Coord> passed;
-    ScheduledFuture<?> timer;
-    synchronized (target) {
-      // 「是否已冲刷」与缓冲读写共用同一把锁，保证不会边冲刷边追加
-      if (!target.flushed.compareAndSet(false, true)) {
-        return;
-      }
-      pending.remove(target.uuid, target);
-      timer = target.timer;
-      target.timer = null;
-      held = new ArrayList<>(target.held);
-      target.held.clear();
-      clusters = target.batch.drainClusters(config.mergeRadius());
-      // 本窗口内经立即放行先行下发的坐标：缓冲里的同一坐标属旧状态，必须剔除
-      passed = target.passed.isEmpty() ? Set.of() : new HashSet<>(target.passed);
-    }
-    if (timer != null) {
-      timer.cancel(false);
-    }
-    if (held.isEmpty()) {
-      return;
-    }
-
+  /**
+   * 冲刷主体；返回 {@code true} 表示本次<b>确实处理了被延迟的原包</b>（调用方据此计入统计），
+   * {@code false} = 无实包可处理（CAS 已被并发抢占，或缓冲为空——后者只做摘除 Pending 与取消
+   * 定时器的清理，不该算作一次「冲刷」）。
+   *
+   * <p><b>为什么整个主体都在 try/finally 内</b>：CAS 一旦成功（写入权归本线程）且已从 pending 摘除，
+   * 后续任何步骤（拷贝 held、{@code drainClusters}、取定时器、构包发送）抛异常都会让这些原包
+   * <b>永久无人放行</b>——因为后续所有 {@code flush}（含 {@code stop()} 的 flushAll）都会因 CAS 失败
+   * 变成 no-op，而异常还会被调度执行器静默吞掉（无日志）。把 held 先置为空列表、让 finally 无条件
+   * 遍历放行，即可保证「取得写入权 ⇒ 恰好放行一次」这一不变量在任何路径（含 Error）下都成立。
+   */
+  private boolean flushInternal(Pending target) {
+    List<Held> held = List.of();
+    List<List<Update<WrappedBlockData>>> clusters = List.of();
+    Set<Coord> passed = Set.of();
+    ScheduledFuture<?> timer = null;
     try {
-      if (!passed.isEmpty()) {
-        // 本窗口内有坐标经「立即放行」先行下发：做 last-write-wins——
-        // 合并包只保留未被先行下发的坐标，且原包一律取消（其数据要么已由更新的包交付、
-        // 要么由下方的合并结果交付），绝不把旧状态晚发回去覆盖新态。
-        // 注意：此处不套用「首个成功发送前保留原包」的宽松策略——对新态与旧态同坐标的情形，
-        // 重复下发旧态即等于回退；改为完全信任 {@link #trySendMerged} 的回读自检（失败即 fail-open 放行）。
-        List<List<Update<WrappedBlockData>>> survivors = dropPassed(clusters, passed);
-        boolean anySurvivor = false;
-        for (List<Update<WrappedBlockData>> cluster : survivors) {
-          if (!cluster.isEmpty()) {
-            anySurvivor = true;
-            break;
-          }
+      synchronized (target) {
+        // 「是否已冲刷」与缓冲读写共用同一把锁，保证不会边冲刷边追加
+        if (!target.flushed.compareAndSet(false, true)) {
+          return false;
         }
-        if (!anySurvivor || trySendMerged(held.get(0).event.getPlayer(), survivors)) {
-          stats.blockMergeBatches.increment();
-          stats.blockChangesMerged.add(held.size());
-          for (Held entry : held) {
-            entry.event.setCancelled(true);
-            release(entry);
-          }
-          return;
-        }
-        // 构造/发送失败：退回既有 fail-open（原包照常放行，绝不丢更新）——但本窗口内经「立即放行」
-        // 先行下发过的坐标，其<b>旧态原包必须一并取消</b>：否则旧态晚到会把先到的新态覆盖回去（方块回退）。
-        // 旧实现只对合并路径做 last-write-wins，fail-open 分支会把这些旧态包一起放行，正是「回退重现」的根因。
-        // 注意：Pending.passed 只记坐标不记值，无法重发新态，所以只能「整包取消」——仅当该原包携带的
-        // 坐标全部已先行下发时才取消，避免误丢未放行坐标的更新（跨坐标混合包只能照常放行，交由原包覆盖）。
-        stats.blockChangesPassed.add(held.size());
-        for (Held entry : held) {
-          if (allCoordsPassed(entry.coords, passed)) {
-            entry.event.setCancelled(true);
-          }
-        }
-        return;
+        pending.remove(target.uuid, target);
+        timer = target.timer;
+        target.timer = null;
+        held = new ArrayList<>(target.held);
+        target.held.clear();
+        clusters = target.batch.drainClusters(config.mergeRadius());
+        // 本窗口内「已有更新下发覆盖过」的坐标：缓冲里的同一坐标属旧状态，必须剔除
+        passed = target.passed.isEmpty() ? Set.of() : new HashSet<>(target.passed);
       }
-
-      boolean mergeable = false;
-      if (held.size() >= 2) {
-        for (List<Update<WrappedBlockData>> cluster : clusters) {
-          if (cluster.size() >= 2) {
-            mergeable = true;
-            break;
-          }
-        }
+      if (timer != null) {
+        timer.cancel(false);
       }
-      if (mergeable) {
-        boolean wasVerified = verified;
-        if (trySendMerged(held.get(0).event.getPlayer(), clusters)) {
-          if (wasVerified) {
-            // 已通过结构自检：取消原包（更新已由合并包交付）
-            stats.blockMergeBatches.increment();
-            stats.blockChangesMerged.add(held.size());
-            for (Held entry : held) {
-              entry.event.setCancelled(true);
-              release(entry);
-            }
-            return;
-          }
-        }
+      if (held.isEmpty()) {
+        return false; // 只有清理、没有实包：不计入「冲刷次数/耗时」
       }
-      stats.blockChangesPassed.add(held.size());
+      sendOrPass(held, clusters, passed);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     } finally {
@@ -643,10 +634,89 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         release(entry);
       }
     }
+    return true;
   }
 
   /**
-   * 从簇中剔除「本窗口已经立即放行过」的坐标（last-write-wins：只保留未被先行下发者）。
+   * 冲刷的投递主体：按 last-write-wins 把缓冲结果构造成合并包发出，并决定各原包取消还是放行。
+   *
+   * <p><b>不自行放行</b>：所有出口的兜底放行由 {@link #flushInternal} 的 finally 统一完成。
+   */
+  private void sendOrPass(List<Held> held, List<List<Update<WrappedBlockData>>> clusters,
+      Set<Coord> passed) {
+    if (!passed.isEmpty()) {
+      // 本窗口内有坐标经「更新于缓冲条目」的路径先行下发（近身立即放行 / 远距离直通批量包）：
+      // 做 last-write-wins——合并包只保留未被更新下发覆盖的坐标，其余原包一律取消（其数据要么已由
+      // 更新的包交付、要么由下方的合并结果交付），绝不把旧状态晚发回去覆盖新态。
+      // 注意：此处不套用「首个成功发送前保留原包」的宽松策略——对新态与旧态同坐标的情形，
+      // 重复下发旧态即等于回退；改为完全信任 {@link #trySendMerged} 的回读自检（失败即 fail-open 放行）。
+      List<List<Update<WrappedBlockData>>> survivors = dropPassed(clusters, passed);
+      boolean anySurvivor = false;
+      for (List<Update<WrappedBlockData>> cluster : survivors) {
+        if (!cluster.isEmpty()) {
+          anySurvivor = true;
+          break;
+        }
+      }
+      if (!anySurvivor) {
+        // 所有坐标都已有更新的下发：无需发包，取消原包即可（更新已交付）。
+        // 不计 blockMergeBatches——本次没有发出任何合并包，计入会让「合并批次」虚高。
+        stats.blockChangesMerged.add(held.size());
+        for (Held entry : held) {
+          entry.event.setCancelled(true);
+        }
+        return;
+      }
+      if (trySendMerged(held.get(0).event.getPlayer(), survivors)) {
+        stats.blockMergeBatches.increment();
+        stats.blockChangesMerged.add(held.size());
+        for (Held entry : held) {
+          entry.event.setCancelled(true);
+        }
+        return;
+      }
+      // 构造/发送失败：退回既有 fail-open（原包照常放行，绝不丢更新）——但本窗口内已有更新下发的
+      // 坐标，其<b>旧态原包必须一并取消</b>：否则旧态晚到会把先到的新态覆盖回去（方块回退）。
+      // 注意：passed 只记坐标不记值，无法重发新态，所以只能「整包取消」——仅当该原包携带的坐标
+      // 全部已有更新下发时才取消，避免误丢未下发坐标的更新（跨坐标混合包只能照常放行）。
+      int cancelled = 0;
+      for (Held entry : held) {
+        if (allCoordsPassed(coordsOf(entry.updates()), passed)) {
+          entry.event.setCancelled(true);
+          cancelled++;
+        }
+      }
+      // 只把真正放行的计入「放行」：被取消的原包并未下发，计入会让「放行数」虚高
+      stats.blockChangesPassed.add(held.size() - cancelled);
+      return;
+    }
+
+    boolean mergeable = false;
+    if (held.size() >= 2) {
+      for (List<Update<WrappedBlockData>> cluster : clusters) {
+        if (cluster.size() >= 2) {
+          mergeable = true;
+          break;
+        }
+      }
+    }
+    if (mergeable) {
+      boolean wasVerified = verified;
+      if (trySendMerged(held.get(0).event.getPlayer(), clusters) && wasVerified) {
+        // 已通过结构自检：取消原包（更新已由合并包交付）
+        stats.blockMergeBatches.increment();
+        stats.blockChangesMerged.add(held.size());
+        for (Held entry : held) {
+          entry.event.setCancelled(true);
+        }
+        return;
+      }
+    }
+    stats.blockChangesPassed.add(held.size());
+  }
+
+  /**
+   * 从簇中剔除「本窗口内已有更新下发覆盖过」的坐标（last-write-wins：只保留未被更新下发者）。
    *
    * <p>包可见：供离线单测直接驱动该纯逻辑（真实链路依赖 ProtocolLib 封包，离线不可用）。
    */

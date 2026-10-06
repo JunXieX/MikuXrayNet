@@ -1,5 +1,6 @@
 package net.mikumc.mikuxraynet.antixray;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -250,6 +251,100 @@ class ProximityScannerTest {
     revealed.clearChunk(key);
     assertNull(index.entry(key));
     assertEquals(0, revealed.sizeFor(PLAYER, key));
+  }
+
+  /**
+   * <b>维护点④（本轮修复的 major 缺陷回归）</b>：区块重发、清单<b>收缩</b>时，writeBack 的真实顺序
+   * ——{@code recordChunkWithRemovals} 取差集 → 局部坐标转绝对 → {@code removePositions}
+   * 摘除<b>所有玩家</b>在被移出坐标上的标记 → {@code clearChunk(key, 接收者)}。
+   *
+   * <p>修复前只做最后一步：其它玩家在「已移出清单坐标」上的标记成为孤儿，{@code sizeFor} 虚增，
+   * 让「整块跳过」（{@code sizeFor >= entry.size}）提前成立——新增坐标 D 被周期性跳过、永不显形
+   * （标记又被扫描 touch 续期，玩家不离开扫描半径就永不过期）。
+   */
+  @Test
+  void writeBackShrinkSequenceEvictsOrphanMarkersForAllPlayers() {
+    ObfuscatedChunkIndex index = index();
+    RevealedSet revealed = revealed();
+    ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
+    int a = local(1, 64, 1);
+    int b = local(2, 64, 1);
+    int c = local(3, 64, 1);
+    int d = local(4, 64, 1);
+
+    // 旧清单 {A,B,C}，另一玩家（非接收者）已整块显形
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {a, b, c});
+    revealAll(scan(index, revealed, OTHER_PLAYER, 16.0D, 64, null), revealed, OTHER_PLAYER);
+    assertEquals(3, revealed.sizeFor(OTHER_PLAYER, key), "前置：另一玩家整块显形");
+
+    // writeBack 序列：新清单 {B,C,D}（A 移出、D 新增）→ 差集 → 转绝对坐标 → 全玩家摘除 → 只清接收者
+    int[] removed = index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {b, c, d});
+    assertArrayEquals(new int[] {a}, removed, "差集必须报出被移出的 A");
+    int[] absolute = ProtocolLibAsyncListener.toAbsoluteCoordinates(0, 0, MIN_HEIGHT, removed);
+    assertEquals(1, absolute.length / 3, "转为一个绝对坐标三元组");
+    assertEquals(1, absolute[0], "局部 x=1 → 绝对 x=1（区块 0 内）");
+    assertEquals(64, absolute[1], "局部 relY=128 → 绝对 y=-64+128=64");
+    assertEquals(1, absolute[2], "局部 z=1 → 绝对 z=1");
+    revealed.removePositions(WORLD, absolute, absolute.length / 3);
+    revealed.clearChunk(key, PLAYER); // 本包接收者（本用例中无标记，等价 no-op）
+
+    // 核心不变式：孤儿标记已被摘除 → 不整块跳过 → 新增坐标 D 必须入选
+    assertEquals(2, revealed.sizeFor(OTHER_PLAYER, key),
+        "A 上的孤儿标记必须随差集摘除（修复前为 3 → 3>=3 整块跳过 → D 永不显形）");
+    List<ObfuscatedChunkIndex.Position> found =
+        scan(index, revealed, OTHER_PLAYER, 16.0D, 64, null);
+    assertEquals(1, found.size(), "整块跳过不得提前成立：仍须评估未显形坐标");
+    assertEquals(new ObfuscatedChunkIndex.Position(4, 64, 1), found.get(0), "新增坐标 D 必须入选");
+  }
+
+  /**
+   * 局部↔绝对坐标转换与索引编码的互逆性（writeBack 摘标记的编码基础）：
+   * {@link ProtocolLibAsyncListener#toAbsoluteCoordinates} 的输出必须能被
+   * {@link RevealedSet} 按与登记时相同的打包方式命中，且与 {@link ProximityScanner} 的解码一致。
+   */
+  @Test
+  void absoluteCoordinateConversionRoundTripsAgainstIndexAndScannerDecoding() {
+    ObfuscatedChunkIndex index = index();
+    RevealedSet revealed = revealed();
+    // 每行 {chunkX, chunkZ, x1, z1, x2, z2, absY}：覆盖区块四角、负 chunk、世界高度极值
+    int[][] cases = {
+        {0, 0, 0, 0, 15, 15, MIN_HEIGHT},
+        {0, 0, 15, 0, 0, 15, 64},
+        {-1, -1, 15, 15, 0, 0, 64},
+        {7, -3, 8, 8, 8, 8, 319},
+    };
+    for (int[] box : cases) {
+      int chunkX = box[0];
+      int chunkZ = box[1];
+      for (int x : new int[] {box[2], box[4]}) {
+        for (int z : new int[] {box[3], box[5]}) {
+          int absY = box[6];
+          int local = ((absY - MIN_HEIGHT) << 8) | ((z & 15) << 4) | (x & 15);
+          int[] absolute = ProtocolLibAsyncListener.toAbsoluteCoordinates(
+              chunkX, chunkZ, MIN_HEIGHT, new int[] {local});
+          int absX = (chunkX << 4) | (x & 15);
+          int absZ = (chunkZ << 4) | (z & 15);
+          assertEquals(absX, absolute[0], "编码互逆：x（chunkX=" + chunkX + "）");
+          assertEquals(absY, absolute[1], "编码互逆：y");
+          assertEquals(absZ, absolute[2], "编码互逆：z（chunkZ=" + chunkZ + "）");
+
+          // 反向：绝对坐标重新按登记口径打包，必须与原局部编码一致（与 removePosition 同式）
+          int reencoded = ((absolute[1] - MIN_HEIGHT) << 8)
+              | ((absolute[2] & 15) << 4) | (absolute[0] & 15);
+          assertEquals(local, reencoded, "绝对→局部重编码必须还原原值");
+
+          // 端到端：登记 → 转换 → 摘除，标记必须被命中
+          index.recordChunk(WORLD, chunkX, chunkZ, MIN_HEIGHT, new int[] {local});
+          revealed.mark(OTHER_PLAYER, ChunkKey.ofBlock(WORLD, absX, absZ), absX, absY, absZ);
+          int[] converted = ProtocolLibAsyncListener.toAbsoluteCoordinates(
+              chunkX, chunkZ, MIN_HEIGHT, new int[] {local});
+          revealed.removePositions(WORLD, converted, 1);
+          assertFalse(revealed.contains(OTHER_PLAYER,
+                  ChunkKey.ofBlock(WORLD, absX, absZ), absX, absY, absZ),
+              "转换后的绝对坐标必须命中登记时的标记（互逆失败=摘不到=孤儿标记）");
+        }
+      }
+    }
   }
 
   // ------------------------------------------------------------------ 玩家隔离

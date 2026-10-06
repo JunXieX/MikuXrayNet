@@ -304,6 +304,47 @@ public final class RevealedSet {
   }
 
   /**
+   * 只注销<b>某一个玩家</b>在该坐标的已显形标记（发包失败回滚时调用）。
+   *
+   * <p><b>为什么不能复用全局版本</b>：{@link #removePosition(String, int, int, int)} 会摘除该坐标上
+   * <b>所有玩家</b>的标记。回滚场景里失败的只是「本次这个玩家」的发包——其它玩家此前成功收到的显形
+   * 仍然有效，把它们一并摘掉只会让它们在下一个巡检周期重复显形一遍（白白多发包 + 多占主线程）。
+   * 摘除方向本身是安全的（不会造成漏显形、也不破坏不变式），因此这只是效率问题，但成本极低。
+   *
+   * <p>锁序与计数口径完全复用 {@link #clearChunk(ChunkKey, UUID)} 的「判活 + 实例匹配 + 扣减」。
+   */
+  void removePosition(UUID playerId, String worldName, int x, int y, int z) {
+    if (playerId == null || worldName == null) {
+      // 无玩家标识（理论上不会发生）：保守退回全局摘除，语义不弱于调用方预期
+      removePosition(worldName, x, y, z);
+      return;
+    }
+    ChunkKey key = ChunkKey.ofBlock(worldName, x, z);
+    ConcurrentHashMap<UUID, Marker> players = chunks.get(key);
+    if (players == null) {
+      return;
+    }
+    synchronized (players) {
+      // 判活同构：映射已被并行摘除时它已按 size 扣减过，这里不再重复扣
+      if (chunks.get(key) != players) {
+        return;
+      }
+      Marker marker = players.get(playerId);
+      if (marker == null) {
+        return;
+      }
+      synchronized (marker) {
+        if (marker.remove(pack(x, y, z))) {
+          AtomicInteger total = playerTotals.get(playerId);
+          if (total != null) {
+            subtract(total, 1);
+          }
+        }
+      }
+    }
+  }
+
+  /**
    * 批量注销<b>同一区块</b>内的多个坐标的已显形标记（出站多方块变更包路径，一个 section 只调用一次）。
    *
    * <p><b>为什么需要它</b>：逐坐标调用会为每个坐标重复一次 {@code ChunkKey.ofBlock} + 映射查找
