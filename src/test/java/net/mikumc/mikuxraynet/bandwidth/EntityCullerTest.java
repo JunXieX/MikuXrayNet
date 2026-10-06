@@ -129,10 +129,11 @@ class EntityCullerTest {
     culler.evaluate(player.proxy(), second.proxy(), true);
     assertEquals(2, culler.hiddenCount());
 
-    Map<Integer, Entity> drained = culler.drainPlayer(player.id());
+    Map<Integer, EntityCuller.HiddenEntry> drained = culler.drainPlayer(player.id());
     assertEquals(2, drained.size(), "全量恢复入口必须交出全部隐藏实体");
     assertTrue(drained.containsKey(first.id()), "交出的清单必须含第一个实体");
     assertTrue(drained.containsKey(second.id()), "交出的清单必须含第二个实体");
+    assertEquals(first.proxy(), drained.get(first.id()).entity(), "交出的条目必须携带原实体实例");
     assertEquals(0, culler.hiddenCount(), "交出后账本必须清空");
     assertTrue(culler.drainPlayer(player.id()).isEmpty(), "重复交出必须得到空表（幂等，异常安全）");
   }
@@ -209,7 +210,7 @@ class EntityCullerTest {
     WorldStub world = new WorldStub();
     AtomicBoolean occluded = new AtomicBoolean(false);
     EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
-        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, budget), stats,
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, budget, frustumOff()), stats,
         entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> occluded.get());
 
     // 50 个追踪实体，位置远离玩家（超出强制可见距离 2 格）→ 走射线判定通道
@@ -253,7 +254,7 @@ class EntityCullerTest {
     WorldStub world = new WorldStub();
     AtomicBoolean occluded = new AtomicBoolean(true);
     EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
-        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 3), stats,
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 3, frustumOff()), stats,
         entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> occluded.get());
 
     EntityStub far = new EntityStub(7101, world); // 默认位置 (100,65,100)，远超强制可见距离 2 格
@@ -277,7 +278,7 @@ class EntityCullerTest {
     WorldStub world = new WorldStub();
     // 始终判为被遮挡：安全策略若失效，近处实体就会被隐藏
     EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
-        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 3), stats,
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 3, frustumOff()), stats,
         entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> true);
 
     // 与玩家重合（强制可见距离内）；直接置为隐藏，模拟「曾被隐藏」
@@ -308,7 +309,7 @@ class EntityCullerTest {
     EntityStub foreign = new EntityStub(7001, world);
     EntityStub owned = new EntityStub(7002, world);
     EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
-        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 7, 3), stats,
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 7, 3, frustumOff()), stats,
         entity -> entity != foreign.proxy(), playerId -> false);
 
     // 先在「同区域」时把两者隐藏（此时读状态合法），随后 foreign 离开本区域
@@ -340,7 +341,7 @@ class EntityCullerTest {
     WorldStub world = new WorldStub();
     EntityStub foreign = new EntityStub(8001, world);
     EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
-        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 7, 3), stats,
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 7, 3, frustumOff()), stats,
         entity -> entity != foreign.proxy(), playerId -> false);
 
     culler.evaluate(player.proxy(), foreign.proxy(), true);
@@ -422,7 +423,7 @@ class EntityCullerTest {
     EntityStub second = new EntityStub(6102, world);
     // 注入「该玩家在登录期快照中」；归属默认按本区域（与生产 Paper 行为一致）
     EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
-        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12), stats,
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12, frustumOff()), stats,
         entity -> true, playerId -> playerId.equals(player.id()));
 
     culler.evaluate(player.proxy(), first.proxy(), true);
@@ -450,7 +451,7 @@ class EntityCullerTest {
     EntityStub entity = new EntityStub(6201, world);
     // 快照里没有该玩家（登录时未带权限）
     EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
-        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12), stats,
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12, frustumOff()), stats,
         owned -> true, playerId -> false);
 
     culler.evaluate(player.proxy(), entity.proxy(), true);
@@ -530,6 +531,112 @@ class EntityCullerTest {
     field.setBoolean(culler, true);
   }
 
+  // ------------------------------------------------- 视锥剔除（entity-culling.frustum）
+
+  /**
+   * 视锥剔除：位于视野锥之外、且在距离门之外的实体被隐藏；玩家转头后，复检以<b>纯数学</b>复判把它恢复
+   * （不打射线）。这正是「转头后 ≤ 1 个复检周期补发」的实现，也是该子项不产生「转头就永久消失」的关键。
+   */
+  @Test
+  void entityBehindThePlayerIsHiddenAndRestoredAfterTurning() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    // 遮挡实现恒为「不遮挡」：本次隐藏只可能来自视锥剔除，从而钉死隐藏来源
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 2.0D)),
+        stats, entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> false);
+
+    // 玩家朝 +Z（yaw=0）看向前方；实体在其<b>斜后方</b>且距离约 141 格（远超距离门 2 格）
+    EntityStub behind = new EntityStub(9101, world, 100.0D, 65.0D, -100.0D);
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), behind.proxy()));
+
+    assertEquals(1L, stats.frustumHidden.sum(), "锥外 + 超距的实体必须被视锥剔除隐藏");
+    assertEquals(1, culler.hiddenCount());
+    assertEquals(0L, stats.entitiesShown.sum());
+
+    // 仍背对着它：复检不得恢复（否则会在转头前反复显隐）
+    culler.recheck(player.proxy());
+    assertEquals(1, culler.hiddenCount(), "仍在锥外时复检不得恢复");
+    assertEquals(0L, stats.frustumShown.sum());
+
+    // 转头面向它：下一次复检按纯数学复判恢复（打射线的遮挡通道判为不遮挡，故实体保持可见）
+    player.faceYaw(-135.0F);
+    culler.recheck(player.proxy());
+
+    assertEquals(0, culler.hiddenCount(), "回到视野锥内必须恢复显示（转头后 ≤ 1 个复检周期）");
+    assertEquals(1L, stats.frustumShown.sum(), "视锥恢复必须计入「视锥剔除·恢复」口径");
+    assertEquals(1L, stats.entitiesShown.sum());
+  }
+
+  /** 视野锥内的实体不做视锥剔除（即便距离很远）；这是「玩家看得见的实体绝不隐藏」的红线。 */
+  @Test
+  void entityInsideFrustumIsNeverHiddenByFrustumCulling() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 2.0D)),
+        stats, entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> false);
+
+    // 玩家朝 +Z；实体在正前偏 45°（在 110° FOV 的水平视野内）、距离约 141 格
+    EntityStub front = new EntityStub(9102, world, 100.0D, 65.0D, 100.0D);
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), front.proxy()));
+
+    assertEquals(0, culler.hiddenCount(), "视野锥内的实体绝不能被视锥剔除");
+    assertEquals(0L, stats.frustumHidden.sum());
+  }
+
+  /** 视锥距离门：锥外但未超过距离门的实体不剔除（避免近处实体在转头瞬间「消失再出现」）。 */
+  @Test
+  void entityOutsideFrustumWithinDistanceGateIsKeptVisible() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    // 距离门 200 格：实体在斜后方但只有约 141 格 → 未超过距离门，不得剔除
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 200.0D)),
+        stats, entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> false);
+
+    EntityStub behind = new EntityStub(9103, world, 100.0D, 65.0D, -100.0D);
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), behind.proxy()));
+
+    assertEquals(0, culler.hiddenCount(), "未超过距离门时不得做视锥剔除");
+    assertEquals(0L, stats.frustumHidden.sum());
+  }
+
+  /**
+   * 不振荡红线：因<b>射线遮挡</b>隐藏的远距离实体，即便玩家转头把它转出视野锥，复检也不得恢复它
+   * （它不是视锥隐藏的条目）。否则「锥内恢复 → 轮转射线再隐藏」会每周期反复显隐。
+   */
+  @Test
+  void occlusionHiddenEntityIsNotRestoredByTheFrustumChannel() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 2.0D)),
+        stats, entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> true);
+
+    // 视野锥内 + 判为被遮挡 → 由射线通道隐藏（账本标记 frustumCulled=false）
+    EntityStub front = new EntityStub(9104, world, 100.0D, 65.0D, 100.0D);
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), front.proxy()));
+    assertEquals(1, culler.hiddenCount());
+    assertEquals(0L, stats.frustumHidden.sum(), "视野锥内隐藏只能来自射线通道，不得计入视锥口径");
+
+    // 转头把它转出视野锥：它现在是「锥外」，但并非视锥隐藏的条目 → 复检不得恢复
+    player.faceYaw(180.0F);
+    culler.recheck(player.proxy());
+
+    assertEquals(1, culler.hiddenCount(),
+        "射线隐藏的实体不得被视锥通道恢复（否则会与轮转射线反复显隐）");
+    assertEquals(0L, stats.frustumShown.sum());
+  }
+
   private static Set<Integer> idsOf(List<Entity> entities) {
     Set<Integer> ids = new HashSet<>();
     for (Entity entity : entities) {
@@ -539,9 +646,16 @@ class EntityCullerTest {
   }
 
   private static EntityCuller newCuller(ThrottleStats stats, int recheckBudget) {
-    // 启用实体剔除与射线判定；强制可见距离 2 格，均为不影响本测试的取值
+    // 启用实体剔除与射线判定；强制可见距离 2 格，均为不影响本测试的取值。
+    // 视锥剔除默认关闭：既有用例只关心射线遮挡链路，不应受新子项影响（视锥行为由专门的用例覆盖）。
     return new EntityCuller(new PluginStub().proxy(),
-        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, recheckBudget), stats);
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, recheckBudget, frustumOff()),
+        stats);
+  }
+
+  /** 关闭视锥剔除的子项（既有用例用）：FOV/距离门取值在此配置下无意义。 */
+  private static BandwidthConfig.EntityCulling.Frustum frustumOff() {
+    return new BandwidthConfig.EntityCulling.Frustum(false, 110.0D, 0.0D);
   }
 
   /** 接口方法的默认返回值（未显式打桩的方法一律走这里）。 */
@@ -598,6 +712,11 @@ class EntityCullerTest {
 
     UUID id() {
       return id;
+    }
+
+    /** 转头：视锥判定的方向来自 {@code Location#getDirection()}，改 yaw 即可模拟玩家转身。 */
+    void faceYaw(float yaw) {
+      location.setYaw(yaw);
     }
 
     @Override

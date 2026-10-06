@@ -13,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
+import net.mikumc.mikuxraynet.antixray.ProximitySelector;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
@@ -49,10 +50,24 @@ import org.bukkit.util.Vector;
  * <p>安全策略：强制可见距离内的实体一律可见；只有当包围盒的所有可见顶点射线都被遮挡时才隐藏
  * （宁可少隐藏，也不隐藏可见实体）；玩家自身、其它玩家与烟花不做剔除。
  *
+ * <p><b>视锥剔除（{@code entity-culling.frustum}）</b>：在「被墙完全挡住」之外，再剔除
+ * 「位于视野锥之外、且在距离门之外」的实体（玩家背后 / 侧后根本看不到的实体），连射线都省下。
+ * 视锥数学直接复用邻近显形的 {@link ProximitySelector#withinFrustum}，保证与反矿透侧行为一致；
+ * 距离门取 {@code max(frustum.min-distance, force-visible-distance)}，因此近身实体绝不会因视锥被剔除
+ * （与「强制可见距离内一律可见」这条安全策略一致）。
+ *
+ * <p><b>视锥隐藏的恢复为什么要单独记账</b>：实体在锥外只说明「此刻看不到」，玩家一转头就会重新看到，
+ * 而周期复检的通道①对远距离实体一律不打射线（成本有界）。若视锥隐藏与射线隐藏共用一套账本，
+ * 通道①就无从区分「该在回到视野内时恢复」与「该等它靠近再恢复」。因此账本为每条记录带上
+ * {@code frustumCulled} 标记：只有视锥隐藏的条目才在通道①里做<b>纯数学</b>的锥内复判，一旦实体重新
+ * 回到视野锥内（或不再满足距离门）立刻恢复显示——这就是「转头后 ≤ 1 个复检周期补发」的实现。
+ *
  * <p><b>周期复检的两条通道</b>（修复「先可见、之后才被挡住」实体永不隐藏的缺陷）：
  * <ol>
- *   <li><b>通道①·已隐藏实体</b>：每周期全部复检，但只做<b>近距离恢复</b>——只有当实体重新进入强制
- *       可见距离时才 {@code showIfHidden}；超出该距离一律不打射线（成本有界，见 {@link RecheckMode}）。</li>
+ *   <li><b>通道①·已隐藏实体</b>：每周期全部复检，但只做<b>近距离恢复</b>——实体重新进入强制
+ *       可见距离时 {@code showIfHidden}；超出该距离一律不打射线（成本有界，见 {@link RecheckMode}）。
+ *       额外只对<b>视锥隐藏</b>的条目做一次纯数学的锥内复判（不打射线）：一旦它回到视野锥内立即恢复，
+ *       保证「转头后 ≤ 1 个复检周期重新出现」。</li>
  *   <li><b>通道②·其余追踪实体</b>：按<b>轮转分片</b>每周期只复检 {@code entity-culling.recheck-budget}
  *       个，游标推进，故 {@code ceil(追踪数 / budget)} 个周期内必然覆盖全部追踪实体。该通道允许对超出
  *       强制可见距离的实体<b>打射线并隐藏</b>——这正是「入场时可见、之后才被墙/地形挡住」的实体能被
@@ -85,10 +100,26 @@ public final class EntityCuller implements Listener {
   /** 遮挡判定（生产实现为本类的 Paper 原生射线；离线单测可注入确定性结果，见 {@link Occlusion}）。 */
   private final Occlusion occlusion;
   private final double forceVisibleSquared;
+  /** 视锥剔除子项是否启用。 */
+  private final boolean frustumCulling;
+  /** 视锥竖直张开全角（度），直接交给 {@link ProximitySelector#withinFrustum}。 */
+  private final double frustumFov;
+  /** 视锥剔除距离门的平方（格²）＝ {@code max(frustum.min-distance, force-visible-distance)}²。 */
+  private final double frustumGateSquared;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
-  /** 玩家 → 已被隐藏的实体（entityId → Entity）。 */
-  private final ConcurrentHashMap<UUID, Map<Integer, Entity>> hidden = new ConcurrentHashMap<>();
+  /**
+   * 账本条目：被隐藏的实体 + 它是否「因视锥剔除而隐藏」。
+   *
+   * <p>标记决定周期复检通道①如何对待远距离条目：{@code frustumCulled=true} 的条目在实体重新回到
+   * 视野锥内时要立刻恢复（纯数学复判）；{@code false}（射线遮挡隐藏）的条目保持既有行为（等实体靠近）。
+   * 没有这个标记就无从区分，只能二选一，必然造成「转头后远处实体长期不出现」或「远距离射线成本无界」。
+   */
+  record HiddenEntry(Entity entity, boolean frustumCulled) {
+  }
+
+  /** 玩家 → 已被隐藏的实体（entityId → {@link HiddenEntry}）。 */
+  private final ConcurrentHashMap<UUID, Map<Integer, HiddenEntry>> hidden = new ConcurrentHashMap<>();
   /** 玩家 → 该玩家当前追踪的实体轮转队列（周期复检切分片用，见 {@link TrackedRotation}）。 */
   private final ConcurrentHashMap<UUID, TrackedRotation> rotations = new ConcurrentHashMap<>();
 
@@ -146,6 +177,25 @@ public final class EntityCuller implements Listener {
     this.bypass = bypass == null ? BypassRegistry::isBypassedNow : bypass;
     this.occlusion = occlusion == null ? this::isFullyOccluded : occlusion;
     this.forceVisibleSquared = config.forceVisibleDistance() * config.forceVisibleDistance();
+    BandwidthConfig.EntityCulling.Frustum frustum = config.frustum();
+    this.frustumCulling = frustum != null && frustum.enabled();
+    this.frustumFov = frustum == null ? 0.0D : frustum.fov();
+    // 距离门 = max(视锥距离门, 强制可见距离)：强制可见距离内一律不剔除是硬安全策略，
+    // 因此视锥距离门配得更小时只会被强制可见距离兜住，绝不会削弱安全策略。
+    double gate = frustum == null
+        ? config.forceVisibleDistance()
+        : Math.max(frustum.minDistance(), config.forceVisibleDistance());
+    this.frustumGateSquared = gate * gate;
+  }
+
+  /**
+   * 本模块是否需要运行（射线剔除与视锥剔除任一开启）。
+   *
+   * <p>两者共用同一套「追踪登记 + 周期复检 + 线程归属」骨架，因此只要有一个开启就必须注册并调度；
+   * 两个都关时本模块完全不注册（由 {@code ThrottlePipeline.plan} 决定，零开销）。
+   */
+  private boolean active() {
+    return config.raycast() || frustumCulling;
   }
 
   /**
@@ -228,16 +278,20 @@ public final class EntityCuller implements Listener {
   public void start() {
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     long interval = Math.max(1, config.updateIntervalTicks());
-    // 与 onJoin 保持一致：射线判定关闭时不登记任何周期复检任务——recheck 首行即因 raycast=false 返回，
-    // 若仍为每个在线玩家挂一条任务，只是每周期空跑的纯调度开销。
-    if (config.raycast()) {
+    // 与 onJoin 保持一致：两个行为开关（raycast / frustum）全关时不登记任何周期复检任务——
+    // recheck 首行即因 !active() 返回，若仍为每个在线玩家挂一条任务，只是每周期空跑的纯调度开销。
+    if (active()) {
       // 统一为「每个玩家一条实体调度任务」：Paper 上落在主线程、Folia 上落在区域线程（同一套 API，无需分支）
       for (Player player : Bukkit.getOnlinePlayers()) {
         scheduleRecheck(player, interval);
       }
     }
-    plugin.getLogger().info("带宽模块已启用：实体射线剔除（强制可见距离 " + config.forceVisibleDistance()
-        + " 格，Paper 原生射线，每实体至多 " + config.raySamples() + " 个包围盒顶点）");
+    plugin.getLogger().info("带宽模块已启用：实体剔除（强制可见距离 " + config.forceVisibleDistance()
+        + " 格；射线遮挡 " + (config.raycast()
+            ? "开（Paper 原生射线，每实体至多 " + config.raySamples() + " 个包围盒顶点）" : "关")
+        + "；视锥剔除 " + (frustumCulling
+            ? "开（距离门 " + Math.sqrt(frustumGateSquared) + " 格，FOV " + frustumFov + "°）" : "关")
+        + "）");
   }
 
   /** 注销监听、恢复全部被隐藏实体。 */
@@ -254,7 +308,7 @@ public final class EntityCuller implements Listener {
 
   @EventHandler(ignoreCancelled = true)
   public void onJoin(PlayerJoinEvent event) {
-    if (!config.raycast()) {
+    if (!active()) {
       return;
     }
     scheduleRecheck(event.getPlayer(), Math.max(1, config.updateIntervalTicks()));
@@ -278,7 +332,8 @@ public final class EntityCuller implements Listener {
    * （先打 ERROR 再抛），因此先问归属，跨区域者直接跳过（随后由其所在区域自然退役）。
    */
   private void restorePlayer(Player player) {
-    for (Entity entity : drainPlayer(player.getUniqueId()).values()) {
+    for (HiddenEntry entry : drainPlayer(player.getUniqueId()).values()) {
+      Entity entity = entry.entity();
       if (!owns(entity)) {
         continue;
       }
@@ -295,19 +350,19 @@ public final class EntityCuller implements Listener {
    */
   public int hiddenCount() {
     int total = 0;
-    for (Map<Integer, Entity> map : hidden.values()) {
+    for (Map<Integer, HiddenEntry> map : hidden.values()) {
       total += map.size();
     }
     return total;
   }
 
   /** 取出并从登记表移除某玩家的全部隐藏实体（玩家退出 / 插件停用时的全量恢复入口）；无记录返回空表。 */
-  Map<Integer, Entity> drainPlayer(UUID playerId) {
-    Map<Integer, Entity> map = hidden.get(playerId);
+  Map<Integer, HiddenEntry> drainPlayer(UUID playerId) {
+    Map<Integer, HiddenEntry> map = hidden.get(playerId);
     if (map == null) {
       return Map.of();
     }
-    Map<Integer, Entity> drained = new LinkedHashMap<>(map);
+    Map<Integer, HiddenEntry> drained = new LinkedHashMap<>(map);
     hidden.remove(playerId, map);
     return drained;
   }
@@ -341,7 +396,7 @@ public final class EntityCuller implements Listener {
 
   @EventHandler(ignoreCancelled = true)
   public void onTrack(PlayerTrackEntityEvent event) {
-    if (!config.raycast()) {
+    if (!active()) {
       return;
     }
     Player player = event.getPlayer();
@@ -370,7 +425,7 @@ public final class EntityCuller implements Listener {
   /** 实体离开追踪范围时从轮转队列摘除（否则队列会无界增长，并浪费复检预算）。 */
   @EventHandler(ignoreCancelled = true)
   public void onUntrack(PlayerUntrackEntityEvent event) {
-    if (!config.raycast()) {
+    if (!active()) {
       return;
     }
     TrackedRotation rotation = rotations.get(event.getPlayer().getUniqueId());
@@ -392,7 +447,7 @@ public final class EntityCuller implements Listener {
    * <p>包可见：供离线单测直接驱动「轮转分片 + 预算」账本行为（真实链路依赖 Bukkit 调度，离线不可用）。
    */
   void recheck(Player player) {
-    if (stopping || !config.raycast() || !player.isOnline()) {
+    if (stopping || !active() || !player.isOnline()) {
       return;
     }
     UUID playerId = player.getUniqueId();
@@ -410,11 +465,12 @@ public final class EntityCuller implements Listener {
     //    用「加入时捕获的 entityId + 归属判定」遍历：玩家走远/传送后这些实体可能已在别的区域，
     //    读它们的任何状态都会触发 Folia 线程校验（先打 ERROR 再抛异常），因此先问能不能碰，不能则整轮跳过。
     //    本通道只做「强制可见距离内的恢复」（RESTORE_ONLY）：远距离不打射线，成本有界。
-    Map<Integer, Entity> hiddenMap = hidden.get(playerId);
+    Map<Integer, HiddenEntry> hiddenMap = hidden.get(playerId);
     if (hiddenMap != null && !hiddenMap.isEmpty()) {
       List<Entity> stale = null;
-      // hiddenMap 是并发 Map，遍历中 submitRaycast 可能增删；弱一致迭代不会抛异常。
-      for (Entity entity : hiddenMap.values()) {
+      // hiddenMap 是并发 Map，遍历中 submitRaycast / showIfHidden 可能增删；弱一致迭代不会抛异常。
+      for (HiddenEntry entry : hiddenMap.values()) {
+        Entity entity = entry.entity();
         if (!owns(entity)) {
           continue;
         }
@@ -425,13 +481,25 @@ public final class EntityCuller implements Listener {
           stale.add(entity);
           continue;
         }
+        // 计数口径不变：每条「本区域 + 有效」的已隐藏记录每周期都算一次复检提交
         stats.recheckSubmitted.increment();
-        submitRaycast(player, entity, RecheckMode.RESTORE_ONLY);
+        if (withinForceVisible(player, entity)) {
+          submitRaycast(player, entity, RecheckMode.RESTORE_ONLY);
+          continue;
+        }
+        // 远距离：只有「因视锥剔除而隐藏」的条目才做廉价的锥内复判（纯数学，不打射线）。
+        // 一旦实体重新回到视野锥内、或不再满足距离门，立刻恢复显示——这就是「转头后 ≤ 1 个复检周期补发」。
+        // 射线遮挡隐藏的条目（frustumCulled=false）保持既有行为：等实体靠近或被重新追踪，不打射线（成本有界）。
+        if (entry.frustumCulled() && !frustumCullable(player, entity)
+            && showIfHidden(player, entity)) {
+          stats.recheckShown.increment();
+          stats.frustumShown.increment();
+        }
       }
       if (stale != null) {
         for (Entity entity : stale) {
           // 仅摘除「同一实例」：entityId 会被复用，按 id 删会把后来占用该 id 的新实体误删
-          hiddenMap.remove(entity.getEntityId(), entity);
+          removeLedgerEntry(playerId, entity);
         }
       }
     }
@@ -491,15 +559,68 @@ public final class EntityCuller implements Listener {
       //  ① RESTORE_ONLY：不打射线（远距离账本条目可能长期滞留，每周期打射线会让成本随会话无界增长）。
       //     账本条目保留——Paper 的 hideEntity 状态跨 untrack 仍生效，账本是「重新进入强制可见距离时
       //     该不该 showEntity」的唯一依据；实体一旦回到近处，上面的 showIfHidden 分支即恢复它。
+      //     视锥隐藏条目的「回到视野锥内即恢复」由 recheck 通道①的纯数学复判负责（见那里的注释）。
       //  ② ROTATION：允许打射线并隐藏。数量已由 recheck-budget 封顶，故成本有界（每周期至多预算次射线）。
       //  ③ INITIAL：入场首评不受距离闸门限制，远距离实体照常剔除（既有行为不变）。
       if (mode == RecheckMode.RESTORE_ONLY) {
         return;
       }
-      evaluate(player, entity, occlusion.isFullyOccluded(player, entity), mode != RecheckMode.INITIAL);
+      // 视锥剔除优先：锥外 + 超距的实体根本看不到，直接隐藏，连射线都省下（判定成本仅一次视锥数学）。
+      if (frustumCullable(player, entity)) {
+        evaluate(player, entity, true, mode != RecheckMode.INITIAL, true);
+        return;
+      }
+      // 射线遮挡判定：raycast=false（只开视锥剔除）时按「不遮挡」处理，实体保持可见。
+      evaluate(player, entity, config.raycast() && occlusion.isFullyOccluded(player, entity),
+          mode != RecheckMode.INITIAL);
     } catch (Throwable throwable) {
       // 任意失败都按「保持可见」处理（fail-open：绝不误藏实体）
       logThrottled(throwable);
+    }
+  }
+
+  /**
+   * 该实体此刻是否满足「视锥剔除」条件：超出距离门、且位于玩家视野锥之外。
+   *
+   * <p>距离门为 {@code max(frustum.min-distance, force-visible-distance)}（构造期已算好平方），
+   * 因此强制可见距离内永不为 true——与「近距强制可见」这条安全策略一致。
+   *
+   * <p>视锥判定复用邻近显形的 {@link ProximitySelector#withinFrustum}（同一套数学，两处行为一致）；
+   * 任何读取失败都按「在锥内」处理（返回 false，不剔除），遵循 fail-open。
+   */
+  private boolean frustumCullable(Player player, Entity entity) {
+    if (!frustumCulling) {
+      return false;
+    }
+    double dx = player.getX() - entity.getX();
+    double dy = player.getY() - entity.getY();
+    double dz = player.getZ() - entity.getZ();
+    if (dx * dx + dy * dy + dz * dz <= frustumGateSquared) {
+      return false;
+    }
+    return !insideFrustum(player, entity);
+  }
+
+  /**
+   * 实体是否位于玩家视野锥内（复用邻近显形的视锥数学）。
+   *
+   * <p>失败方向：任何异常都返回 {@code true}（视为「在锥内」→ 不剔除），绝不因判定失败而误藏实体。
+   * 距离豁免传 0——距离门已在 {@link #frustumCullable} 里判过，这里只做纯角度判定。
+   */
+  private boolean insideFrustum(Player player, Entity entity) {
+    if (!frustumCulling) {
+      return true;
+    }
+    try {
+      Location eye = player.getEyeLocation();
+      Vector direction = eye.getDirection();
+      ProximitySelector.Eye snapshot = ProximitySelector.eye(eye.getX(), eye.getY(), eye.getZ(),
+          direction.getX(), direction.getY(), direction.getZ());
+      return ProximitySelector.withinFrustum(snapshot, entity.getX(), entity.getY(), entity.getZ(),
+          0.0D, frustumFov);
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+      return true;
     }
   }
 
@@ -640,6 +761,16 @@ public final class EntityCuller implements Listener {
    * @param fromRecheck 是否来自周期复检：仅用于把计数归入「复检致隐藏 / 复检致恢复」，不影响判定逻辑
    */
   void evaluate(Player player, Entity entity, boolean allBlocked, boolean fromRecheck) {
+    evaluate(player, entity, allBlocked, fromRecheck, false);
+  }
+
+  /**
+   * 评估入口（追加「是否因视锥剔除而隐藏」的标记；包可见：供离线单测驱动账本标记行为）。
+   *
+   * @param frustumCulled 本次隐藏是否由视锥剔除给出（仅在该次确实发生隐藏时被记入账本）
+   */
+  void evaluate(Player player, Entity entity, boolean allBlocked, boolean fromRecheck,
+      boolean frustumCulled) {
     if (!entity.isValid() || !player.isOnline()) {
       removeLedgerEntry(player.getUniqueId(), entity);
       return;
@@ -649,8 +780,13 @@ public final class EntityCuller implements Listener {
     // 看起来悬空骑行；隐藏「本身是乘客的实体」会让载具看起来无人。因此只要该实体与任何乘客/载具存在
     // 关系，就把 allBlocked 视为无效 → 走 showIfHidden 保持/恢复可见（fail-open 的确定性规则）。
     if (allBlocked && !hasVehicleRelation(entity)) {
-      if (hide(player, entity) && fromRecheck) {
-        stats.recheckHidden.increment();
+      if (hide(player, entity, frustumCulled)) {
+        if (fromRecheck) {
+          stats.recheckHidden.increment();
+        }
+        if (frustumCulled) {
+          stats.frustumHidden.increment();
+        }
       }
     } else if (showIfHidden(player, entity) && fromRecheck) {
       stats.recheckShown.increment();
@@ -676,28 +812,37 @@ public final class EntityCuller implements Listener {
    * <p>entityId 会被服务端复用：若只按 id 摘除，可能误删「后来占用该 id 的另一个实体」的条目。
    */
   private void removeLedgerEntry(UUID playerId, Entity entity) {
-    Map<Integer, Entity> map = hidden.get(playerId);
+    Map<Integer, HiddenEntry> map = hidden.get(playerId);
     if (map != null) {
-      map.remove(entity.getEntityId(), entity);
+      HiddenEntry existing = map.get(entity.getEntityId());
+      if (existing != null && existing.entity() == entity) {
+        map.remove(entity.getEntityId(), existing);
+      }
     }
   }
 
   /** @return 是否真的新登记并执行了 hideEntity（已隐藏 / 失败时为 false）。 */
-  private boolean hide(Player player, Entity entity) {
+  private boolean hide(Player player, Entity entity, boolean frustumCulled) {
     if (stopping) {
       // 停用已开始：绝不再新登记隐藏（否则会把刚被 restoreAll 恢复的实体重新藏回）
       return false;
     }
-    Map<Integer, Entity> map = hidden.computeIfAbsent(player.getUniqueId(),
+    Map<Integer, HiddenEntry> map = hidden.computeIfAbsent(player.getUniqueId(),
         uuid -> new ConcurrentHashMap<>());
     // 仅当账本里该 id 正是「同一实例」时才算已隐藏。若该 id 对应的是一枚已消失的旧实例（entityId 被复用），
     // 则覆盖登记新实体——否则复用该 id 的新实体会永远无法被隐藏（账本被旧条目挡住）。
-    if (map.get(entity.getEntityId()) == entity) {
+    HiddenEntry existing = map.get(entity.getEntityId());
+    if (existing != null && existing.entity() == entity) {
+      // 已隐藏。仅升级标记：由射线遮挡改判为「视锥隐藏」时必须改写标记，否则通道①会把它当成射线隐藏，
+      // 导致玩家转头后它永远不会被恢复（这正是标记存在的意义）。
+      if (frustumCulled && !existing.frustumCulled()) {
+        map.put(entity.getEntityId(), new HiddenEntry(entity, true));
+      }
       return false;
     }
     try {
       player.hideEntity(plugin, entity);
-      map.put(entity.getEntityId(), entity);
+      map.put(entity.getEntityId(), new HiddenEntry(entity, frustumCulled));
       stats.entitiesHidden.increment();
       return true;
     } catch (Throwable throwable) {
@@ -708,16 +853,17 @@ public final class EntityCuller implements Listener {
 
   /** @return 是否真的从账本摘除并执行了 showEntity（未隐藏 / 实体已失效时为 false）。 */
   private boolean showIfHidden(Player player, Entity entity) {
-    Map<Integer, Entity> map = hidden.get(player.getUniqueId());
+    Map<Integer, HiddenEntry> map = hidden.get(player.getUniqueId());
     if (map == null) {
       return false;
     }
     // 只认「同一实例」的账本条目：若按 id 摘除，会把后来复用该 id 的另一个实体的条目一并删掉，
     // 从而对从未被隐藏的新实体误发 showEntity，且该新实体再也无法被隐藏（账本被误清）。
-    if (map.get(entity.getEntityId()) != entity) {
+    HiddenEntry existing = map.get(entity.getEntityId());
+    if (existing == null || existing.entity() != entity) {
       return false;
     }
-    map.remove(entity.getEntityId(), entity);
+    map.remove(entity.getEntityId(), existing);
     return show(player, entity);
   }
 
@@ -748,11 +894,12 @@ public final class EntityCuller implements Listener {
   private void restoreAll() {
     boolean stillEnabled = plugin.isEnabled();
     for (Player player : Bukkit.getOnlinePlayers()) {
-      Map<Integer, Entity> drained = drainPlayer(player.getUniqueId());
+      Map<Integer, HiddenEntry> drained = drainPlayer(player.getUniqueId());
       if (drained.isEmpty()) {
         continue;
       }
-      for (Entity entity : drained.values()) {
+      for (HiddenEntry entry : drained.values()) {
+        Entity entity = entry.entity();
         if (stillEnabled) {
           // 热重载路径：回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
           Schedulers.onEntity(plugin, player, () -> restoreWithRetry(player, entity, true));

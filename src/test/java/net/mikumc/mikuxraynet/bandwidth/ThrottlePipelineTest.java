@@ -42,8 +42,29 @@ class ThrottlePipelineTest {
     assertTrue(plan.entityPackets(), "默认应注册零位移实体包取消");
     assertTrue(plan.blockChanges(), "默认应注册方块变更合并");
     assertTrue(plan.entityCulling(), "默认应注册实体射线剔除");
+    assertTrue(plan.entityMetadata(), "默认应注册实体元数据不变值剔除");
     assertTrue(plan.afk(), "默认应注册 AFK 降级");
     assertTrue(plan.latency(), "默认应注册高延迟降视距");
+  }
+
+  /** 实体剔除的注册决策由「射线遮挡 / 视锥剔除」两个子项共同决定：任一开启就必须注册，两者都关才不注册。 */
+  @Test
+  void entityCullingRegistersWhenEitherSubSwitchIsOn() {
+    assertTrue(ThrottlePipeline.plan(config("entity-culling:\n  raycast: false\n")).entityCulling(),
+        "只开视锥剔除时仍必须注册（否则视锥剔除永远不会生效）");
+    assertFalse(ThrottlePipeline.plan(
+        config("entity-culling:\n  raycast: false\n  frustum:\n    enabled: false\n"))
+        .entityCulling(), "两个子项全关时本模块必须完全不注册");
+  }
+
+  /** 元数据剔除模块可独立关闭（protocolLib 可用性由 start() 判定，不在 plan 里）。 */
+  @Test
+  void entityMetadataDisabledIsNotRegistered() {
+    assertFalse(ThrottlePipeline.plan(
+        config("entity-metadata:\n  enabled: false\n")).entityMetadata(),
+        "entity-metadata.enabled=false 时必须完全不注册");
+    assertTrue(ThrottlePipeline.plan(config("entity-culling:\n  enabled: false\n")).entityMetadata(),
+        "关闭实体剔除不得影响元数据剔除模块");
   }
 
   @Test
@@ -67,11 +88,12 @@ class ThrottlePipelineTest {
     assertFalse(ThrottlePipeline.plan(config("entity-packets:\n  enabled: false\n")).entityPackets());
     assertFalse(ThrottlePipeline.plan(config("block-changes:\n  enabled: false\n")).blockChanges());
     assertFalse(ThrottlePipeline.plan(config("entity-culling:\n  enabled: false\n")).entityCulling());
+    assertFalse(ThrottlePipeline.plan(config("entity-metadata:\n  enabled: false\n")).entityMetadata());
 
     // 每个用例都只关一个模块，其余仍应注册（互相独立）
     ThrottlePipeline.ModulePlan onlyAfkOff = ThrottlePipeline.plan(config("afk:\n  enabled: false\n"));
     assertTrue(onlyAfkOff.entityPackets() && onlyAfkOff.blockChanges()
-        && onlyAfkOff.entityCulling() && onlyAfkOff.latency());
+        && onlyAfkOff.entityCulling() && onlyAfkOff.entityMetadata() && onlyAfkOff.latency());
   }
 
   @Test
@@ -81,17 +103,21 @@ class ThrottlePipelineTest {
     assertFalse(plan.entityPackets(), "总开关关闭时不注册任何子模块");
     assertFalse(plan.blockChanges());
     assertFalse(plan.entityCulling());
+    assertFalse(plan.entityMetadata());
     assertFalse(plan.afk());
     assertFalse(plan.latency());
   }
 
   @Test
   void behaviorSwitchOffAlsoSkipsRegistration() {
-    // 行为开关关闭等同于该模块不注册（避免注册一个「什么都不做」的空壳，仍要付出监听器开销）
+    // 行为开关关闭等同于该模块不注册（避免注册一个「什么都不做」的空壳，仍要付出监听器开销）。
+    // 实体剔除有两个行为子项：只关 raycast 时仍会做视锥剔除，故必须两个都关才算「不注册」。
     assertFalse(ThrottlePipeline.plan(
         config("entity-packets:\n  skip-zero-movement: false\n")).entityPackets());
     assertFalse(ThrottlePipeline.plan(config("block-changes:\n  merge: false\n")).blockChanges());
-    assertFalse(ThrottlePipeline.plan(config("entity-culling:\n  raycast: false\n")).entityCulling());
+    assertFalse(ThrottlePipeline.plan(
+        config("entity-culling:\n  raycast: false\n  frustum:\n    enabled: false\n"))
+        .entityCulling());
   }
 
   /** 仅用于 register 单测：getLogger() 之外的调用不被触发，故其余方法一律返回 null 即可。 */

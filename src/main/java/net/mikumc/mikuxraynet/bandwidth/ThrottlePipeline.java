@@ -18,7 +18,9 @@ import org.bukkit.plugin.Plugin;
  * <ul>
  *   <li>{@link EntityPacketFilter} 零位移实体包取消（{@code entity-packets.enabled}）；</li>
  *   <li>{@link BlockChangeMerger} 方块变更合并（{@code block-changes.enabled}，时间窗与缓冲上限保守）；</li>
- *   <li>{@link EntityCuller} 实体射线剔除（{@code entity-culling.enabled}，强制可见距离 32 格）；</li>
+ *   <li>{@link EntityCuller} 实体剔除（{@code entity-culling.enabled}，强制可见距离 32 格；
+ *       含 {@code entity-culling.frustum} 视锥剔除子项）；</li>
+ *   <li>{@link EntityMetadataFilter} 实体元数据不变值剔除（{@code entity-metadata.enabled}）；</li>
  *   <li>{@link AfkTracker} AFK 降级 + 低价值包按距离丢弃（{@code afk.enabled}，丢包类型保守）；</li>
  *   <li>{@link LatencyMonitor} 高延迟降视距（{@code latency.enabled}，需持续超阈值）。</li>
  * </ul>
@@ -32,14 +34,15 @@ public final class ThrottlePipeline {
   /**
    * 各带宽子模块的注册决策（纯函数，仅由配置推导，便于离线单测「关闭即不注册」）。
    *
-   * @param entityPackets 零位移实体包取消是否会注册
-   * @param blockChanges  方块变更合并是否会注册
-   * @param entityCulling 实体射线剔除是否会注册
-   * @param afk           AFK 降级是否会注册
-   * @param latency       高延迟降视距是否会注册
+   * @param entityPackets  零位移实体包取消是否会注册
+   * @param blockChanges   方块变更合并是否会注册
+   * @param entityCulling  实体剔除（射线遮挡 / 视锥剔除任一开启）是否会注册
+   * @param entityMetadata 实体元数据不变值剔除是否会注册
+   * @param afk            AFK 降级是否会注册
+   * @param latency        高延迟降视距是否会注册
    */
   public record ModulePlan(boolean entityPackets, boolean blockChanges, boolean entityCulling,
-      boolean afk, boolean latency) {
+      boolean entityMetadata, boolean afk, boolean latency) {
   }
 
   /**
@@ -49,10 +52,16 @@ public final class ThrottlePipeline {
    */
   public static ModulePlan plan(BandwidthConfig config) {
     boolean master = config.enabled();
+    // 实体剔除：射线遮挡与视锥剔除共用同一套「追踪登记 + 周期复检」骨架，任一开启就必须注册；
+    // 两者都关时完全不注册（零开销）。
+    boolean entityCulling = config.entityCulling().enabled()
+        && (config.entityCulling().raycast()
+            || (config.entityCulling().frustum() != null && config.entityCulling().frustum().enabled()));
     return new ModulePlan(
         master && config.entityPackets().enabled() && config.entityPackets().skipZeroMovement(),
         master && config.blockChanges().enabled() && config.blockChanges().merge(),
-        master && config.entityCulling().enabled() && config.entityCulling().raycast(),
+        master && entityCulling,
+        master && config.entityMetadata().enabled(),
         // AFK 模块只看总开关：即使两个 drop-* 行为开关全为 false，它仍会注册以跟踪并统计 AFK 状态
         // （「仅计时不丢包」），因此不能在 plan 里直接判为「未启用」。实际会丢弃哪些包由
         // AfkTracker 的启动日志与 /mxnet status 的「AFK 降级」回显明确写出，避免被误读成「丢包已生效」。
@@ -67,6 +76,7 @@ public final class ThrottlePipeline {
   private EntityPacketFilter entityPacketFilter;
   private BlockChangeMerger blockChangeMerger;
   private EntityCuller entityCuller;
+  private EntityMetadataFilter entityMetadataFilter;
   private AfkTracker afkTracker;
   private LatencyMonitor latencyMonitor;
 
@@ -145,8 +155,20 @@ public final class ThrottlePipeline {
           () -> new EntityCuller(plugin, config.entityCulling(), stats),
           EntityCuller::start, EntityCuller::stop);
     } else {
-      logDisabled("实体射线剔除", config.entityCulling().enabled()
-          ? "entity-culling.raycast" : "entity-culling.enabled");
+      logDisabled("实体剔除（射线遮挡 / 视锥剔除）", config.entityCulling().enabled()
+          ? "entity-culling.raycast 与 entity-culling.frustum.enabled 均为 false"
+          : "entity-culling.enabled");
+    }
+    if (plan.entityMetadata()) {
+      if (manager == null) {
+        plugin.getLogger().warning("实体元数据不变值剔除需要 ProtocolLib，已停用");
+      } else {
+        entityMetadataFilter = register(
+            () -> new EntityMetadataFilter(plugin, manager, config.entityMetadata(), stats),
+            EntityMetadataFilter::start, EntityMetadataFilter::stop);
+      }
+    } else {
+      logDisabled("实体元数据不变值剔除", "entity-metadata.enabled");
     }
     if (plan.afk()) {
       afkTracker = register(
@@ -174,11 +196,13 @@ public final class ThrottlePipeline {
     started = false;
     close("高延迟降视距", latencyMonitor, LatencyMonitor::stop);
     close("AFK 降级", afkTracker, AfkTracker::stop);
-    close("实体射线剔除", entityCuller, EntityCuller::stop);
+    close("实体元数据不变值剔除", entityMetadataFilter, EntityMetadataFilter::stop);
+    close("实体剔除（射线遮挡 / 视锥剔除）", entityCuller, EntityCuller::stop);
     close("方块变更合并", blockChangeMerger, BlockChangeMerger::stop);
     close("零位移实体包取消", entityPacketFilter, EntityPacketFilter::stop);
     latencyMonitor = null;
     afkTracker = null;
+    entityMetadataFilter = null;
     entityCuller = null;
     blockChangeMerger = null;
     entityPacketFilter = null;

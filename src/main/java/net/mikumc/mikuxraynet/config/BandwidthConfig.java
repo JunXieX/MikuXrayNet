@@ -78,6 +78,22 @@ public final class BandwidthConfig {
   public static final int MAX_CHECK_INTERVAL_SECONDS = 3600;
   /** 诊断摘要周期上限（秒，1 天）：周期过长等于不再输出摘要。 */
   public static final int MAX_DIAGNOSTICS_INTERVAL_SECONDS = 86400;
+  /**
+   * 视锥剔除「距离门」上限（格）：距离门越大越多实体不被剔除、越安全，故与强制可见距离同口径放宽到 1024。
+   */
+  public static final double MAX_FRUSTUM_MIN_DISTANCE = 1024.0D;
+  /**
+   * 视锥竖直张开全角上限（度，175）：接近 180 即「几乎不做视锥剔除」，留 5 度余量避免出现
+   * 「配了 180 却仍在剔除」的困惑（{@code >=180} 本身也会被判定为不做剔除）。
+   */
+  public static final double MAX_FRUSTUM_FOV = 175.0D;
+  /**
+   * 视锥竖直张开全角下限（度，30）：比 30 更窄时，玩家视野边缘（甚至屏内）的实体也会被剔除，
+   * 属明显的观感损伤配置，故设安全下限；低于 30 会被抬到 30 并记入明细（供加载路径一次性 WARN）。
+   */
+  public static final double MIN_FRUSTUM_FOV = 30.0D;
+  /** 元数据缓存「每玩家实体数」上限：越高越省包（内存可控），故放宽到 4096。 */
+  public static final int MAX_METADATA_TRACKED_PER_PLAYER = 4096;
 
   /**
    * 零位移实体包抑制。
@@ -140,9 +156,45 @@ public final class BandwidthConfig {
    *                   {@code World#rayTraceBlocks} 后不再表示采样数）；钳制 1..{@value #MAX_RAY_SAMPLES}，
    *                   默认 {@value #MAX_RAY_SAMPLES}——包围盒「朝向玩家一侧」的可见顶点最多
    *                   {@value #MAX_RAY_SAMPLES} 个，取到上限即「全部顶点都试」。
+   * @param frustum    视锥剔除子项（见 {@link Frustum}）：在「被墙完全挡住」之外，再剔除
+   *                   「位于视野锥之外、且在距离门之外」的实体（玩家背后 / 侧后看不见的实体）。
    */
   public record EntityCulling(boolean enabled, boolean raycast, double forceVisibleDistance,
-      int updateIntervalTicks, int raySamples, int recheckBudget) {
+      int updateIntervalTicks, int raySamples, int recheckBudget, Frustum frustum) {
+
+    /**
+     * 视锥剔除子项。
+     *
+     * <p><b>为什么需要距离门</b>：实体在视野锥外只说明「此刻看不到」，玩家一转头就会重新看到。
+     * 若不设距离门，近处实体在转头瞬间会「消失再出现」，观感明显。距离门把视锥剔除限制在
+     * 「锥外 + 超距」的实体上，近身区域仍由 {@code force-visible-distance} 硬保证可见。
+     *
+     * <p><b>有效距离门 = max({@code minDistance}, {@code force-visible-distance})</b>：强制可见距离内
+     * 一律不剔除是既有的安全策略，因此距离门配得比强制可见距离小不会产生额外效果（不会削弱安全策略）。
+     *
+     * @param enabled     子开关：为 {@code false} 时不做任何视锥判定（仍保留射线剔除）。
+     * @param fov         竖直方向的视野张开<b>全角</b>（度）。默认 {@code 110}＝客户端可设置的最大 FOV，
+     *                    取它可保证「玩家把 FOV 拉满也看不到被我们剔除的实体」；钳制
+     *                    {@value #MIN_FRUSTUM_FOV}..{@value #MAX_FRUSTUM_FOV}。调小更省带宽，但玩家 FOV
+     *                    开得较大时可能看到实体「迟一步出现」。
+     * @param minDistance 距离门（格）：不超过该距离的实体永不做视锥剔除；上限
+     *                    {@value #MAX_FRUSTUM_MIN_DISTANCE}（越大越多实体不被剔除、越安全）。
+     */
+    public record Frustum(boolean enabled, double fov, double minDistance) {
+    }
+  }
+
+  /**
+   * 实体元数据「不变值剔除」。
+   *
+   * <p>{@code ENTITY_METADATA} 包中「与上次已下发给该玩家的值完全相同」的条目不再重发；整包全部冗余
+   * 时直接取消该包。很多插件每 tick 重设实体名 / 血量等元数据，客户端其实早已持有同样的值。
+   *
+   * @param enabled             模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
+   * @param maxTrackedPerPlayer 每名玩家最多缓存的实体数：超出即整体清空（只短期少省一点包，不影响正确性，
+   *                            且计入安全阀计数可供诊断）；上限 {@value #MAX_METADATA_TRACKED_PER_PLAYER}。
+   */
+  public record EntityMetadata(boolean enabled, int maxTrackedPerPlayer) {
   }
 
   /** AFK 降级。{@code enabled} 为模块总开关，关闭时本模块完全不注册（零开销）。 */
@@ -164,6 +216,7 @@ public final class BandwidthConfig {
   private final BlockChanges blockChanges;
   private final Palette palette;
   private final EntityCulling entityCulling;
+  private final EntityMetadata entityMetadata;
   private final Afk afk;
   private final Latency latency;
   private final Diagnostics diagnostics;
@@ -173,13 +226,14 @@ public final class BandwidthConfig {
   private final List<String> clampAdjustments;
 
   private BandwidthConfig(boolean enabled, EntityPackets entityPackets, BlockChanges blockChanges, Palette palette,
-      EntityCulling entityCulling, Afk afk, Latency latency, Diagnostics diagnostics,
-      List<String> clampAdjustments) {
+      EntityCulling entityCulling, EntityMetadata entityMetadata, Afk afk, Latency latency,
+      Diagnostics diagnostics, List<String> clampAdjustments) {
     this.enabled = enabled;
     this.entityPackets = entityPackets;
     this.blockChanges = blockChanges;
     this.palette = palette;
     this.entityCulling = entityCulling;
+    this.entityMetadata = entityMetadata;
     this.afk = afk;
     this.latency = latency;
     this.diagnostics = diagnostics;
@@ -244,7 +298,24 @@ public final class BandwidthConfig {
             // 周期复检预算默认 12（性能优先）：约「每 0.5 秒（10 tick）多复检 12 个可见追踪实体」，
             // 兼顾收敛速度与每周期主线程射线次数；建议区间 8~24。
             clampUpper(Math.max(1, root.getInt("entity-culling.recheck-budget", 12)),
-                MAX_RECHECK_BUDGET, "entity-culling.recheck-budget", clampAdjustments)),
+                MAX_RECHECK_BUDGET, "entity-culling.recheck-budget", clampAdjustments),
+            new EntityCulling.Frustum(
+                root.getBoolean("entity-culling.frustum.enabled", true),
+                // FOV 默认 110（客户端可设置的最大值）：取最大保证「玩家把 FOV 拉满也看不到被剔除的实体」，
+                // 属安全优先的默认；先查上限（拦非有限值/过大），再查下限（拦过窄）。
+                clampLower(clampUpper(root.getDouble("entity-culling.frustum.fov", 110.0D),
+                    110.0D, MAX_FRUSTUM_FOV, "entity-culling.frustum.fov", clampAdjustments),
+                    MIN_FRUSTUM_FOV, "entity-culling.frustum.fov", clampAdjustments),
+                // 距离门默认 24（性能优先）：更远才允许视锥剔除；其有效值为
+                // max(本值, force-visible-distance)，故默认下实际从强制可见距离 32 格起生效。
+                clampUpper(root.getDouble("entity-culling.frustum.min-distance", 24.0D),
+                    24.0D, MAX_FRUSTUM_MIN_DISTANCE, "entity-culling.frustum.min-distance",
+                    clampAdjustments))),
+        new EntityMetadata(
+            root.getBoolean("entity-metadata.enabled", true),
+            clampUpper(Math.max(1, root.getInt("entity-metadata.max-tracked-per-player", 256)),
+                MAX_METADATA_TRACKED_PER_PLAYER, "entity-metadata.max-tracked-per-player",
+                clampAdjustments)),
         new Afk(
             root.getBoolean("afk.enabled", true),
             clampUpper(Math.max(1, root.getInt("afk.seconds", 300)),
@@ -289,6 +360,20 @@ public final class BandwidthConfig {
 
   /** 整数下限钳制：低于下限则取下限并记录明细（供一次性 WARN）。 */
   private static int clampLower(int value, int min, String key, List<String> adjustments) {
+    if (value >= min) {
+      return value;
+    }
+    adjustments.add(key + "=" + value + "（下限 " + min + "）");
+    return min;
+  }
+
+  /**
+   * 浮点下限钳制：低于下限则取下限并记录明细（供一次性 WARN）。
+   *
+   * <p>调用顺序恒为「先 {@link #clampUpper} 再本方法」：非有限值（NaN / ±Inf）已在上限钳制里回落默认值，
+   * 因此这里不必再单独处理（{@code NaN >= min} 为 false，若不先拦会静默归到下限值）。
+   */
+  private static double clampLower(double value, double min, String key, List<String> adjustments) {
     if (value >= min) {
       return value;
     }
@@ -352,8 +437,8 @@ public final class BandwidthConfig {
    * <p>热重载时用它判断「带宽侧配置是否变化」（见 {@code ReloadCoordinator}）。
    */
   public int configHash() {
-    return Objects.hash(enabled, entityPackets, blockChanges, palette, entityCulling, afk, latency,
-        diagnostics);
+    return Objects.hash(enabled, entityPackets, blockChanges, palette, entityCulling, entityMetadata,
+        afk, latency, diagnostics);
   }
 
   public boolean enabled() {
@@ -374,6 +459,10 @@ public final class BandwidthConfig {
 
   public EntityCulling entityCulling() {
     return entityCulling;
+  }
+
+  public EntityMetadata entityMetadata() {
+    return entityMetadata;
   }
 
   public Afk afk() {

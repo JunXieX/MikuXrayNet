@@ -157,14 +157,26 @@ public final class ProximitySelector {
    */
   public static boolean withinFrustum(Eye eye, int blockX, int blockY, int blockZ,
       double minDistance, double fovDegrees) {
+    // 方块坐标取中心（+0.5）；实体等任意坐标点走下面的双精度重载，两者共用同一套数学。
+    return withinFrustum(eye, blockX + 0.5D, blockY + 0.5D, blockZ + 0.5D, minDistance, fovDegrees);
+  }
+
+  /**
+   * 同 {@link #withinFrustum(Eye, int, int, int, double, double)}，但目标点为<b>任意双精度坐标</b>。
+   *
+   * <p>供实体剔除复用同一套视锥数学：实体中心不是方块格中心，直接传实体坐标即可，避免「取整到方块」
+   * 带来的判定偏差（取整会让锥边缘的实体结果与真实视线不一致）。
+   */
+  public static boolean withinFrustum(Eye eye, double x, double y, double z,
+      double minDistance, double fovDegrees) {
     if (eye == null) {
       return true;
     }
 
     // 早退与几何量只算一次，供粗筛与精判共用（避免粗筛反而多算一遍）。
-    double dx = blockX + 0.5D - eye.x();
-    double dy = blockY + 0.5D - eye.y();
-    double dz = blockZ + 0.5D - eye.z();
+    double dx = x - eye.x();
+    double dy = y - eye.y();
+    double dz = z - eye.z();
 
     double distanceSquared = dx * dx + dy * dy + dz * dz;
     double exemption = Math.max(0.0D, minDistance);
@@ -199,13 +211,20 @@ public final class ProximitySelector {
    */
   static boolean preciseWithinFrustum(Eye eye, int blockX, int blockY, int blockZ,
       double minDistance, double fovDegrees) {
+    return preciseWithinFrustum(eye, blockX + 0.5D, blockY + 0.5D, blockZ + 0.5D, minDistance,
+        fovDegrees);
+  }
+
+  /** 精判参照点的任意双精度坐标版本（与 {@link #preciseWithinFrustum(Eye, int, int, int, double, double)} 同义）。 */
+  static boolean preciseWithinFrustum(Eye eye, double x, double y, double z,
+      double minDistance, double fovDegrees) {
     if (eye == null) {
       return true;
     }
 
-    double dx = blockX + 0.5D - eye.x();
-    double dy = blockY + 0.5D - eye.y();
-    double dz = blockZ + 0.5D - eye.z();
+    double dx = x - eye.x();
+    double dy = y - eye.y();
+    double dz = z - eye.z();
 
     double distanceSquared = dx * dx + dy * dy + dz * dz;
     double exemption = Math.max(0.0D, minDistance);
