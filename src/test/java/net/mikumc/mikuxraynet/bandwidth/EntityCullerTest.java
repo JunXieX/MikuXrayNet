@@ -18,6 +18,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
+import net.kyori.adventure.text.Component;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import org.bukkit.Location;
 import org.bukkit.Material;
@@ -349,7 +350,12 @@ class EntityCullerTest {
     int readsBeforeQuit = foreign.stateReads();
     foreign.foreign = true;
 
-    assertDoesNotThrow(() -> culler.onQuit(new PlayerQuitEvent(player.proxy(), (String) null)),
+    // 用非废弃构造：Paper 已把退出消息迁到 Adventure Component，并把带 QuitReason 的 3 参重载作为
+    // 唯一未标记待移除的入口（两个 2 参重载 (Player, String) 与 (Player, Component) 均 forRemoval=true）。
+    // 本用例只驱动 onQuit 读 getPlayer()，消息与退出原因的内容都无关紧要。
+    assertDoesNotThrow(
+        () -> culler.onQuit(new PlayerQuitEvent(player.proxy(), Component.empty(),
+            PlayerQuitEvent.QuitReason.DISCONNECTED)),
         "退出恢复不得因跨区域实体抛异常");
     assertEquals(readsBeforeQuit, foreign.stateReads(),
         "跨区域实体的任何状态读取都会在 Folia 上刷 ERROR，退出恢复必须完全跳过它");
