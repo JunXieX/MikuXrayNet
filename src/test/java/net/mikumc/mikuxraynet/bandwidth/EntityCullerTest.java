@@ -637,6 +637,91 @@ class EntityCullerTest {
     assertEquals(0L, stats.frustumShown.sum());
   }
 
+  /**
+   * 大型实体的视锥角点回归：中心已在锥外、但包围盒有一角仍在锥内时必须判为<b>可见</b>。
+   *
+   * <p>只看中心会让末影龙 / 巨人这类实体在「中心出锥、身体仍占屏幕边缘」时被误藏，表现为平移视角时
+   * 「闪现」。此处把玩家朝 +Z（yaw 0），实体中心偏航约 80°（超出水平半角约 68.5° → 锥外），
+   * 而靠近视线一侧的角偏航约 64.5°（锥内）。
+   */
+  @Test
+  void largeEntityWhoseCenterIsOutsideButCornerIsInsideIsNotCulled() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 2.0D)),
+        stats, entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> false);
+
+    // 中心 (99, 65, 17.9)：偏航约 80°（锥外）；包围盒 40×40，中心与 location 一致
+    EntityStub large = new EntityStub(9201, world, 99.0D, 65.0D, 17.9D);
+    large.box(79.0D, 64.0D, -2.1D, 119.0D, 66.0D, 37.9D);
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), large.proxy()));
+
+    assertEquals(0, culler.hiddenCount(),
+        "中心在锥外但包围盒角在锥内时不得剔除（否则大型实体在屏幕边缘会「闪现」）");
+    assertEquals(0L, stats.frustumHidden.sum());
+  }
+
+  /** 对照：大型实体完全在玩家背后（中心与四角全在锥外）时，仍必须被视锥剔除。 */
+  @Test
+  void largeEntityFullyOutsideTheFrustumIsStillCulled() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 2.0D)),
+        stats, entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> false);
+
+    EntityStub large = new EntityStub(9202, world, 100.0D, 65.0D, -100.0D);
+    large.box(80.0D, 64.0D, -120.0D, 120.0D, 66.0D, -80.0D);
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), large.proxy()));
+
+    assertEquals(1L, stats.frustumHidden.sum(), "完全在视野之外的实体仍必须被剔除");
+    assertEquals(1, culler.hiddenCount());
+  }
+
+  /**
+   * 视锥计数的标记升级回归：账本条目由「射线隐藏」升级为「视锥隐藏」时必须补计一次
+   * {@code frustumHidden}，否则恢复侧（通道①）会计 {@code frustumShown} 而隐藏侧从未计过，
+   * {@code /mxnet status} 会出现「视锥剔除 恢复 > 隐藏」的自相矛盾。
+   */
+  @Test
+  void frustumMarkerUpgradeIsCountedSoHiddenAndShownStayConsistent() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    // 遮挡实现恒为「不遮挡」：步骤①直接传 allBlocked=true 造出射线隐藏的账本条目，
+    // 步骤③转头后轮转通道的射线判定返回「不遮挡」→ 不会把刚恢复的实体又藏回去（隔离出纯计数语义）
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 2.0D)),
+        stats, entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> false);
+
+    // ① 先由射线遮挡通道隐藏（账本标记 frustumCulled=false）
+    EntityStub behind = new EntityStub(9301, world, 100.0D, 65.0D, -100.0D);
+    culler.evaluate(player.proxy(), behind.proxy(), true);
+    assertEquals(1L, stats.entitiesHidden.sum());
+    assertEquals(0L, stats.frustumHidden.sum(), "射线隐藏不得计入视锥口径");
+
+    // ② 重新追踪：该实体此刻「锥外 + 超距」→ 标记升级为视锥隐藏，必须补计一次
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), behind.proxy()));
+    assertEquals(1, culler.hiddenCount(), "标记升级不得重复登记（仍是同一条账本）");
+    assertEquals(1L, stats.entitiesHidden.sum(), "标记升级不是「新隐藏」，不得再计一次总隐藏数");
+    assertEquals(1L, stats.frustumHidden.sum(), "标记由射线升级为视锥时必须补计视锥隐藏");
+
+    // ③ 转头朝它 → 通道①按视锥条目恢复
+    player.faceYaw(-135.0F);
+    culler.recheck(player.proxy());
+
+    assertEquals(0, culler.hiddenCount(), "回到视野锥内必须恢复");
+    assertEquals(1L, stats.frustumShown.sum());
+    assertEquals(stats.frustumHidden.sum(), stats.frustumShown.sum(),
+        "视锥「隐藏 / 恢复」两侧口径必须自洽（恢复不得多于隐藏）");
+  }
+
   private static Set<Integer> idsOf(List<Entity> entities) {
     Set<Integer> ids = new HashSet<>();
     for (Entity entity : entities) {
@@ -754,7 +839,7 @@ class EntityCullerTest {
     private final WorldStub world;
     private final Entity proxy;
     private final Location location;
-    private final BoundingBox box;
+    private volatile BoundingBox box;
     private volatile boolean valid = true;
     /** 模拟「实体已离开本区域」：任何状态读取都像 Folia 那样抛异常（真机还会先打一条 ERROR）。 */
     private volatile boolean foreign;
@@ -772,6 +857,11 @@ class EntityCullerTest {
       this.box = new BoundingBox(x, y, z, x + 0.6D, y + 1.8D, z + 0.6D);
       this.proxy = (Entity) Proxy.newProxyInstance(
           Entity.class.getClassLoader(), new Class<?>[] {Entity.class}, this);
+    }
+
+    /** 覆盖包围盒（大型实体的视锥角点回归用）：须让包围盒中心与 {@code location} 一致。 */
+    void box(double minX, double minY, double minZ, double maxX, double maxY, double maxZ) {
+      this.box = new BoundingBox(minX, minY, minZ, maxX, maxY, maxZ);
     }
 
     Entity proxy() {

@@ -74,6 +74,27 @@ class BandwidthFrustumConfigTest {
         tooLarge.entityMetadata().maxTrackedPerPlayer());
   }
 
+  /**
+   * 钳制明细「每个键至多一条」：{@code fov} 配负值时，若串联「上限钳制 + 下限钳制」会为同一个键记两条
+   * （先记「低于下限 0，按 0 生效」、再记「下限 30」），管理员会以为改了两处。单趟区间钳制只应记一条。
+   */
+  @Test
+  void negativeFovRecordsExactlyOneAdjustmentNote() {
+    BandwidthConfig clamped = config("""
+        entity-culling:
+          frustum:
+            fov: -5.0
+        """);
+
+    assertEquals(BandwidthConfig.MIN_FRUSTUM_FOV, clamped.entityCulling().frustum().fov(),
+        "负值 FOV 必须被抬到安全下限 30");
+    long notes = clamped.clampAdjustments().stream()
+        .filter(entry -> entry.startsWith("entity-culling.frustum.fov="))
+        .count();
+    assertEquals(1L, notes,
+        "同一个键至多一条钳制明细（重复记账会让管理员误以为改了两处）：" + clamped.clampAdjustments());
+  }
+
   /** 新增配置键必须参与配置指纹：否则改 frustum 参数后热重载与磁盘缓存判定会失灵。 */
   @Test
   void newKeysParticipateInConfigFingerprint() {

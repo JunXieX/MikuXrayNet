@@ -302,10 +302,11 @@ public final class BandwidthConfig {
             new EntityCulling.Frustum(
                 root.getBoolean("entity-culling.frustum.enabled", true),
                 // FOV 默认 110（客户端可设置的最大值）：取最大保证「玩家把 FOV 拉满也看不到被剔除的实体」，
-                // 属安全优先的默认；先查上限（拦非有限值/过大），再查下限（拦过窄）。
-                clampLower(clampUpper(root.getDouble("entity-culling.frustum.fov", 110.0D),
-                    110.0D, MAX_FRUSTUM_FOV, "entity-culling.frustum.fov", clampAdjustments),
-                    MIN_FRUSTUM_FOV, "entity-culling.frustum.fov", clampAdjustments),
+                // 属安全优先的默认。两端都要钳（过窄会剔掉屏内实体、过宽等于不做视锥剔除），
+                // 用单趟 clampRange 而非串联上下限钳制，避免负值被记两条明细。
+                clampRange(root.getDouble("entity-culling.frustum.fov", 110.0D),
+                    110.0D, MIN_FRUSTUM_FOV, MAX_FRUSTUM_FOV, "entity-culling.frustum.fov",
+                    clampAdjustments),
                 // 距离门默认 24（性能优先）：更远才允许视锥剔除；其有效值为
                 // max(本值, force-visible-distance)，故默认下实际从强制可见距离 32 格起生效。
                 clampUpper(root.getDouble("entity-culling.frustum.min-distance", 24.0D),
@@ -368,17 +369,30 @@ public final class BandwidthConfig {
   }
 
   /**
-   * 浮点下限钳制：低于下限则取下限并记录明细（供一次性 WARN）。
+   * 浮点<b>区间</b>钳制（单趟，至多记一条明细）。
    *
-   * <p>调用顺序恒为「先 {@link #clampUpper} 再本方法」：非有限值（NaN / ±Inf）已在上限钳制里回落默认值，
-   * 因此这里不必再单独处理（{@code NaN >= min} 为 false，若不先拦会静默归到下限值）。
+   * <p><b>为什么需要它，而不是串联 {@link #clampUpper} 与一个下限钳制</b>：两端钳制串联时，同一个键
+   * 可能被记两条明细——例如 {@code fov} 配 {@code -5}，先被上限钳制记为「低于下限 0，按 0 生效」，
+   * 再被下限钳制记为「低于下限 30」，管理员会以为改的是两个地方。单趟处理保证<b>每个键至多一条</b>。
+   *
+   * <p>非有限值（NaN / ±Inf）无法参与比较，一律回落默认值并留痕（不拦会让无效值污染配置指纹，
+   * 详见 {@link #clampUpper} 的说明）。
    */
-  private static double clampLower(double value, double min, String key, List<String> adjustments) {
-    if (value >= min) {
-      return value;
+  private static double clampRange(double value, double defaultValue, double min, double max,
+      String key, List<String> adjustments) {
+    if (!Double.isFinite(value)) {
+      adjustments.add(key + "=" + value + "（非有限值，回落默认 " + defaultValue + "）");
+      return defaultValue;
     }
-    adjustments.add(key + "=" + value + "（下限 " + min + "）");
-    return min;
+    if (value < min) {
+      adjustments.add(key + "=" + value + "（下限 " + min + "）");
+      return min;
+    }
+    if (value > max) {
+      adjustments.add(key + "=" + value + "（上限 " + max + "）");
+      return max;
+    }
+    return value;
   }
 
   /**

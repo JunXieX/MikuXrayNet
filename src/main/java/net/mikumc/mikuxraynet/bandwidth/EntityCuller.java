@@ -604,6 +604,11 @@ public final class EntityCuller implements Listener {
   /**
    * 实体是否位于玩家视野锥内（复用邻近显形的视锥数学）。
    *
+   * <p><b>先中心、后包围盒角（快路径 + 慢路径）</b>：绝大多数实体中心在锥内，此时只做一次视锥判定即返回，
+   * 成本与只看中心时一致；只有当中心已在锥外时，才额外试包围盒<b>水平 4 个角</b>（取包围盒中高）。
+   * 只看中心会让大型实体（末影龙、巨人等）在「中心出锥、身体仍占屏幕边缘」时被误藏，表现为平移视角
+   * 时「闪现」——补上角点判定后，只要有一角在锥内即判为可见，绝不误藏。
+   *
    * <p>失败方向：任何异常都返回 {@code true}（视为「在锥内」→ 不剔除），绝不因判定失败而误藏实体。
    * 距离豁免传 0——距离门已在 {@link #frustumCullable} 里判过，这里只做纯角度判定。
    */
@@ -616,8 +621,22 @@ public final class EntityCuller implements Listener {
       Vector direction = eye.getDirection();
       ProximitySelector.Eye snapshot = ProximitySelector.eye(eye.getX(), eye.getY(), eye.getZ(),
           direction.getX(), direction.getY(), direction.getZ());
-      return ProximitySelector.withinFrustum(snapshot, entity.getX(), entity.getY(), entity.getZ(),
-          0.0D, frustumFov);
+      // 快路径：中心在锥内 → 直接可见（常见情形只多这一次判定，成本不变）
+      if (ProximitySelector.withinFrustum(snapshot, entity.getX(), entity.getY(), entity.getZ(),
+          0.0D, frustumFov)) {
+        return true;
+      }
+      // 慢路径：中心已在锥外，再试包围盒水平 4 个角——任一在锥内即判可见（大型实体不被误藏）
+      BoundingBox box = entity.getBoundingBox();
+      double midY = (box.getMinY() + box.getMaxY()) / 2.0D;
+      for (double x : new double[] {box.getMinX(), box.getMaxX()}) {
+        for (double z : new double[] {box.getMinZ(), box.getMaxZ()}) {
+          if (ProximitySelector.withinFrustum(snapshot, x, midY, z, 0.0D, frustumFov)) {
+            return true;
+          }
+        }
+      }
+      return false;
     } catch (Throwable throwable) {
       logThrottled(throwable);
       return true;
@@ -837,6 +856,10 @@ public final class EntityCuller implements Listener {
       // 导致玩家转头后它永远不会被恢复（这正是标记存在的意义）。
       if (frustumCulled && !existing.frustumCulled()) {
         map.put(entity.getEntityId(), new HiddenEntry(entity, true));
+        // 这里必须自己计数：hide() 返回 false（没有新发生隐藏），所以 evaluate() 里受 if (hide(...))
+        // 保护的 frustumHidden 不会递增；而该条目此后会被通道①按视锥条目恢复并计 frustumShown。
+        // 不补这一笔，/mxnet status 的「视锥剔除 隐藏/恢复」会出现「恢复 > 隐藏」的自相矛盾。
+        stats.frustumHidden.increment();
       }
       return false;
     }

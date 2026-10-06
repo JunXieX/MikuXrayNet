@@ -16,6 +16,13 @@ import java.util.Objects;
  *
  * <p><b>为什么既要判 {@code containsKey} 又要判值</b>：值本身可以是 {@code null}（合法的元数据值），
  * 因此「上次值是 null」与「从未下发过」必须区分开——前者可删，后者必须下发。
+ *
+ * <p><b>为什么「同一引用 + 类型可能可变」也要算变化</b>：缓存里存的是值的<b>引用</b>。若某插件持有可变值
+ * 对象、原地修改后仍以同一引用重发，那么 {@code equals(自己, 自己)} 恒为 true，据此剔除会让客户端
+ * <b>永远收不到</b>这次更新（而缓存已指向被改后的对象，自认为最新）。同一引用无法证明「内容没变」，
+ * 故对非已知不可变类型一律改判为变化。反向的「引用相同但内容绝不可能变」只对
+ * {@link #isKnownImmutable} 列出的类型成立，那里仍按值去重，避免元数据里最常见的布尔/小整数条目
+ * 因包装类型驻留而永远无法去重。
  */
 final class MetadataDelta {
 
@@ -36,12 +43,46 @@ final class MetadataDelta {
     for (int i = 0; i < indices.length; i++) {
       int index = indices[i];
       Object value = values[i];
-      // containsKey 而非 get != null：区分「上次下发过 null」与「从未下发过」
-      if (!cache.containsKey(index) || !Objects.equals(cache.get(index), value)) {
+      if (changed(cache, index, value)) {
         changed[count++] = i;
       }
       cache.put(index, value);
     }
     return Arrays.copyOf(changed, count);
+  }
+
+  /**
+   * 该条目是否需要下发（判定规则见类注释）。
+   *
+   * <p>顺序很关键：先判「从未下发过」（必须下发），再判「同一引用且类型可能可变」（无法证明未变，
+   * 必须下发），最后才按 {@link Objects#equals} 判值——值相等即说明客户端已持有，可安全剔除。
+   */
+  private static boolean changed(Map<Integer, Object> cache, int index, Object value) {
+    // containsKey 而非 get != null：区分「上次下发过 null」与「从未下发过」
+    if (!cache.containsKey(index)) {
+      return true;
+    }
+    Object cached = cache.get(index);
+    if (cached == value && !isKnownImmutable(value)) {
+      // 同一引用且类型可能被原地修改：无法证明内容未变 → 宁可多发一次，绝不误丢更新
+      return true;
+    }
+    return !Objects.equals(cached, value);
+  }
+
+  /**
+   * 内容绝不可能被原地修改、因此「引用相同」即可安全按值去重的类型。
+   *
+   * <p>{@code Boolean}、小整数等包装值以及字符串字面量在 JVM 里是<b>驻留单例 / 复用实例</b>——引用天然
+   * 相同，但内容永不改变。若不把这类排除，元数据中最常见的布尔与小整数条目将永远判为「变化」，
+   * 使本模块在真实负载下几乎失去作用。{@code Number} 覆盖全部包装数值类型（含 BigInteger/BigDecimal）。
+   */
+  private static boolean isKnownImmutable(Object value) {
+    return value == null
+        || value instanceof String
+        || value instanceof Number
+        || value instanceof Boolean
+        || value instanceof Character
+        || value instanceof Enum<?>;
   }
 }
