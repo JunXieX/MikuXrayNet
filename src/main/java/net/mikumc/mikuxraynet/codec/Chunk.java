@@ -160,8 +160,14 @@ public class Chunk implements AutoCloseable {
         // 扩容替换输出缓冲同样遵循「替换即释放」（与上方零拷贝分支同约定）：旧包装已无引用价值，
         // 不释放其 refCnt 会永远停在 1。注意先算后换——growOutput 可能抛 OutputOverflowException，
         // 抛出时旧缓冲必须仍在本对象手里（由 close() 释放），故不得提前释放。
+        // 请求按翻倍语义（而非只比当前大 1 字节）：输出数组一旦超过保留上限（或已被零拷贝移交），
+        // scratch 就不再驻留它、growOutput 只能按请求量分配；若这里只请求 capacity+1，每轮重试仅多
+        // 1 字节，最坏退化为 O(n²)（大区块/异常输入下反复整块重写）。请求翻倍即恢复几何级数增长。
+        // 仍封顶于绝对上限，避免「需要 50 MiB，却因翻倍请求 80 MiB」直接把本可完成的改写判成溢出。
+        int required = Math.min(Math.max(out.capacity() + 1, out.capacity() * 2),
+            ChunkScratch.MAX_OUTPUT_CAPACITY);
         ByteBuf previousOut = out;
-        this.outputBuffer = Unpooled.wrappedBuffer(this.scratch.growOutput(out.capacity() + 1));
+        this.outputBuffer = Unpooled.wrappedBuffer(this.scratch.growOutput(required));
         releaseQuietly(previousOut);
       }
     }

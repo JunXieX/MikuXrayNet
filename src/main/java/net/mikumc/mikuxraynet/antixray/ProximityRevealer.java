@@ -115,6 +115,19 @@ public final class ProximityRevealer implements Listener {
   private static final int MAX_EVALUATIONS_PER_PASS = 256;
 
   /**
+   * 单个 section 的邻域初筛（封包线程）允许的最大「探测」次数：每个变更坐标 × 每个曼哈顿偏移算一次。
+   *
+   * <p><b>为什么需要</b>：{@link #hasDisguisedNearSection} 对每个变更坐标遍历全部曼哈顿偏移
+   * （半径 8 时约 833 个），且无任何次数上限；当邻域内没有伪装坐标（短路失效）时，满载的
+   * {@code MULTI_BLOCK_CHANGE}（最多 4096 个坐标）会在 netty 线程上造成约 340 万次索引查找。
+   * 实体侧同类循环有 {@link #MAX_EVALUATIONS_PER_PASS} 兜底，这里同样加一个硬上限。
+   *
+   * <p>取 {@code 64K}：足以完整扫描约 {@code 78} 个变更坐标的邻域——现实中的变更包坐标数远小于此
+   * （方块交互个位数、爆炸几十个），因此正常路径不会被截断；同时把最坏工作量压到原值的约五十分之一。
+   */
+  private static final int MAX_NEARBY_PROBES_PER_PACKET = 64 * 1024;
+
+  /**
    * 附近区块的分片数：每次巡检只看其中一片（{@link ProximityScanner#shardOf} 决定某个区块属于哪片）。
    *
    * <p><b>为什么必须分片</b>：被视锥/射线剔除的候选不发包也不记已显形，而候选窗口又有硬上限
@@ -129,6 +142,17 @@ public final class ProximityRevealer implements Listener {
    * 事件显形当 tick 还原，因此这里宁可偏向覆盖速度。
    */
   private static final int SCAN_SHARDS = 4;
+
+  /**
+   * 显形回显的判定窗口（纳秒，2 秒）。
+   *
+   * <p>只需覆盖「显形包发出 → 本插件出站监听器看到该包」的极短延迟；取得过长会把「玩家紧接着挖掉
+   * 刚显形的那块」误判成回显，从而留下一枚陈旧索引条目（可自愈但不必要）。
+   */
+  private static final long REVEAL_ECHO_WINDOW_NANOS = 2_000_000_000L;
+
+  /** 每玩家回显标记条数上界：正常只需容纳「一个周期内发出的显形数」，超限整体清空（只少判一次回显）。 */
+  private static final int REVEAL_ECHO_MAX_PER_PLAYER = 8192;
 
   /**
    * 单次巡检的发包额度（非 Folia 为全服合计，Folia 为每个玩家各自的巡检）。
@@ -235,12 +259,17 @@ public final class ProximityRevealer implements Listener {
   private final BypassRegistry bypassRegistry;
   private final MikuWorkPool workPool;
   private final AtomicInteger errorCounter = new AtomicInteger();
-  private final AtomicLong passes = new AtomicLong();
   /**
-   * 上次过期清理的纳秒时刻（过期清理的时间门控；见 {@link #maybeExpire}）。
+   * Paper 侧的巡检轮次计数（用于扫描分片轮转）。
    *
-   * <p>与 {@link #passes} 分开：{@code passes} 只用于「扫描分片轮转」（每个玩家每轮各推进一次是合理的），
-   * 过期清理则必须与在线人数无关，故改用独立的时刻计数 + CAS。
+   * <p>Paper 只有一条全局任务（{@code passAll}），因此一个全局轮次计数即可；Folia 各玩家任务独立，
+   * 分片计数必须<b>按玩家</b>保存在 {@link #entityScans} 里（原因见 {@link #pass}）。
+   */
+  private final AtomicLong globalPasses = new AtomicLong();
+  /**
+   * 上一次过期清理的纳秒时刻（过期清理的时间门控；见 {@link #maybeExpire}）。
+   *
+   * <p>过期清理必须与在线人数无关，因此用独立的时刻计数 + CAS，而不是「每 N 次巡检」。
    */
   private final AtomicLong lastExpireNanos = new AtomicLong();
   /**
@@ -263,13 +292,38 @@ public final class ProximityRevealer implements Listener {
   private ScheduledTask globalTask;
 
   /**
-   * Folia 每玩家的区域巡检任务句柄（按 UUID 保存）。
+   * Folia 每玩家的区域巡检任务句柄 + 该玩家的分片轮转计数。
    *
-   * <p><b>为什么必须保存</b>：{@code repeatOnEntity} 返回的句柄若被丢弃，{@link #stop()} 就只取消了
+   * <p><b>为什么把分片计数放在这里（与任务句柄同一个条目）</b>：它与任务严格同生命周期——任务被取消
+   * 就该一并丢弃。合成一条既省一次 map 查找，也保证「取消任务」与「清理计数」永远不会漏掉一半
+   * （若单独放一张表，就必须在 {@code stop()} 与 {@code onQuit()} 两处同步清理，漏一处即无界增长）。
+   *
+   * <p><b>为什么必须保存句柄</b>：{@code repeatOnEntity} 返回的句柄若被丢弃，{@link #stop()} 就只取消了
    * 全局任务，Folia 上各玩家的区域任务会在插件停用后继续跑到实体退役为止——句柄泄漏 + 停用后
    * 仍在发包。这里逐一保存，停用与玩家退出时全部取消。
    */
-  private final ConcurrentHashMap<UUID, ScheduledTask> entityTasks = new ConcurrentHashMap<>();
+  private record EntityScan(ScheduledTask task, AtomicLong passes) {
+  }
+
+  private final ConcurrentHashMap<UUID, EntityScan> entityScans = new ConcurrentHashMap<>();
+
+  /**
+   * 显形回显窗口：玩家 → (世界 + 坐标) → 过期时刻（纳秒）。
+   *
+   * <p><b>为什么需要它</b>：我们发出的显形包会经 {@link BlockChangeRevealListener} 回显。若把回显当成
+   * 「真实方块变更」，监听器会把该坐标从<b>按区块全服共享</b>的伪装索引里摘掉——于是甲玩家被显形后，
+   * 乙玩家对同一坐标再也无法被主动显形（乙客户端仍持伪装区块，只能等区块重载才恢复）。
+   * 有了这个短期标记，监听器就能区分「我们自己刚发的回显」与「真实变更」：前者只保留、不摘共享索引。
+   *
+   * <p><b>有界</b>：条目在窗口到期后由「消费即删」或整体清空回收，每玩家另设条数上界；
+   * 玩家退出与插件停用时整体释放。
+   */
+  private final ConcurrentHashMap<UUID, ConcurrentHashMap<EchoKey, Long>> revealEcho =
+      new ConcurrentHashMap<>();
+
+  /** 回显标记的键：世界名 + 方块坐标（record 自带 equals/hashCode，避免手工位打包的碰撞风险）。 */
+  private record EchoKey(String world, int x, int y, int z) {
+  }
 
   /**
    * @param protocolManager ProtocolLib 协议管理器。<b>保留形参以维持既有装配签名</b>——显形发包已改用
@@ -297,7 +351,7 @@ public final class ProximityRevealer implements Listener {
     this.expirePeriodNanos = ticks * 50_000_000L * EXPIRE_EVERY_PASSES;
   }
 
-  /** 启动巡检：非 Folia 为统一主线程任务；Folia 为各玩家的区域任务（句柄按 UUID 保存，见 entityTasks）。 */
+  /** 启动巡检：非 Folia 为统一主线程任务；Folia 为各玩家的区域任务（句柄与分片计数按 UUID 保存，见 entityScans）。 */
   public void start() {
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     long interval = Math.max(1, proximity.intervalTicks());
@@ -330,24 +384,26 @@ public final class ProximityRevealer implements Listener {
       globalTask = null;
     }
     // Folia 每玩家任务句柄全部取消：句柄若被丢弃，区域任务会在停用后继续跑到实体退役（泄漏）
-    for (ScheduledTask task : entityTasks.values()) {
+    for (EntityScan scan : entityScans.values()) {
       try {
-        task.cancel();
+        scan.task().cancel();
       } catch (Throwable ignored) {
         // 任务可能已随实体退役结束，取消失败可忽略
       }
     }
-    entityTasks.clear();
+    entityScans.clear();
     HandlerList.unregisterAll(this);
     chunkIndex.clear();
     revealedSet.clear();
+    revealEcho.clear();
   }
 
-  /** 在玩家所属线程上启动周期巡检并保存句柄（调度失败则无句柄可存）。 */
+  /** 在玩家所属线程上启动周期巡检并保存句柄与分片计数（调度失败则无句柄可存）。 */
   private void scheduleEntityTask(Player player, long interval) {
     ScheduledTask task = Schedulers.repeatOnEntity(plugin, player, interval, interval, () -> pass(player));
     if (task != null) {
-      entityTasks.put(player.getUniqueId(), task);
+      // 计数随句柄一起建：任务首次执行至少在一个周期之后，故 pass() 读到的一定是本条目
+      entityScans.put(player.getUniqueId(), new EntityScan(task, new AtomicLong()));
     }
   }
 
@@ -362,16 +418,18 @@ public final class ProximityRevealer implements Listener {
   /** 玩家登出：取消其巡检任务句柄，并清理其已显形标记，避免为离线玩家保留坐标。 */
   @EventHandler(ignoreCancelled = true)
   public void onQuit(PlayerQuitEvent event) {
-    ScheduledTask task = entityTasks.remove(event.getPlayer().getUniqueId());
-    if (task != null) {
+    EntityScan scan = entityScans.remove(event.getPlayer().getUniqueId());
+    if (scan != null) {
       try {
-        task.cancel();
+        scan.task().cancel();
       } catch (Throwable ignored) {
         // 任务可能已随实体退役结束，取消失败可忽略
       }
     }
     revealedSet.clearPlayer(event.getPlayer().getUniqueId());
     instantQuota.clear(event.getPlayer().getUniqueId());
+    // 离线玩家的回显记号一并释放（否则会滞留到窗口过期，白白占内存）
+    revealEcho.remove(event.getPlayer().getUniqueId());
   }
 
   /**
@@ -409,8 +467,10 @@ public final class ProximityRevealer implements Listener {
   private void passAll() {
     warnIfCapacityExceeded();
     maybeExpire();
-    // 本轮看哪一片：同一轮里所有玩家看同一片（分片轮转的节奏只与巡检次数有关，见 SCAN_SHARDS）
-    int shard = scanShard();
+    // 本轮看哪一片：同一轮里所有玩家看同一片（分片轮转的节奏只与巡检次数有关，见 SCAN_SHARDS）。
+    // 按「巡检轮次」推进，而不是按墙钟时间取模——服务器掉 tick 时墙钟会跑在实际巡检前面，
+    // 反而会让一部分分片被整轮跳过。
+    int shard = shardFor(globalPasses.incrementAndGet());
     Budget budget = new Budget(limit());
     for (Player player : Bukkit.getOnlinePlayers()) {
       if (budget.remaining() <= 0) {
@@ -428,16 +488,31 @@ public final class ProximityRevealer implements Listener {
   private void pass(Player player) {
     warnIfCapacityExceeded();
     maybeExpire();
+    // 分片计数必须<b>按玩家</b>推进：Folia 下每个玩家各有一条独立任务，若共用一个全局计数，
+    // 在线人数恰为 SCAN_SHARDS 的倍数时，单个玩家在相邻两次巡检之间会被其他玩家把计数推进正好
+    // SCAN_SHARDS 次，于是它每轮都读到同一分片——其周围 (SCAN_SHARDS-1)/SCAN_SHARDS 的伪装区块
+    // 再也不会被周期扫描到（洞穴里裸露的矿一直显示为伪装方块）。
+    EntityScan scan = entityScans.get(player.getUniqueId());
+    long round = scan == null ? 1L : scan.passes().incrementAndGet();
     try {
-      reveal(player, new Budget(limit()), scanShard());
+      reveal(player, new Budget(limit()), shardFor(round));
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
   }
 
-  /** 本轮的分片下标（按巡检次数轮转；{@code passes} 每轮恰好自增一次，见 {@link #maybeExpire}）。 */
-  private int scanShard() {
-    return (int) Math.floorMod(passes.get(), (long) SCAN_SHARDS);
+  /**
+   * 由「本次是第几次巡检」算出本轮的分片下标（纯函数，可离线单测）。
+   *
+   * <p><b>为什么按巡检次数而不是墙钟时间取模</b>：掉 tick 时墙钟窗口会跑在实际巡检前面（任务间隔按
+   * tick 计），按时间取模会让一部分分片整轮被跳过；按次数推进则严格每 {@value #SCAN_SHARDS} 次巡检
+   * 覆盖全部区块，与类注释的保证一致。
+   *
+   * <p><b>为什么调用方必须提供「按玩家」的巡检次数</b>：见 {@link #pass}——Folia 下每个玩家各有独立
+   * 任务，共用全局计数会让在线人数为 {@value #SCAN_SHARDS} 倍数时单个玩家的分片恒定不变。
+   */
+  static int shardFor(long round) {
+    return (int) Math.floorMod(round, (long) SCAN_SHARDS);
   }
 
   /**
@@ -701,6 +776,8 @@ public final class ProximityRevealer implements Listener {
       }
     }
     if (send.getAsBoolean()) {
+      // 记号：本次确实为该玩家发出了该坐标的显形包，出站监听器看到的同坐标变更即判为回显
+      markOurReveal(playerId, worldName, x, y, z);
       return true;
     }
     if (revealedSet != null) {
@@ -708,6 +785,54 @@ public final class ProximityRevealer implements Listener {
       revealedSet.removePosition(playerId, worldName, x, y, z);
     }
     return false;
+  }
+
+  /**
+   * 记下「刚为该玩家发出了该坐标的显形包」，供 {@link BlockChangeRevealListener} 识别回显。
+   *
+   * <p>本条不影响任何显形判定，纯粹是一枚短寿命记号：漏记只会退化为「照旧摘共享索引」（即修复前的
+   * 行为），绝不产生新故障。因此任何异常都只记日志。
+   */
+  private void markOurReveal(UUID playerId, String worldName, int x, int y, int z) {
+    if (playerId == null || worldName == null) {
+      return;
+    }
+    try {
+      ConcurrentHashMap<EchoKey, Long> perPlayer =
+          revealEcho.computeIfAbsent(playerId, id -> new ConcurrentHashMap<>());
+      if (perPlayer.size() >= REVEAL_ECHO_MAX_PER_PLAYER) {
+        // 上界兜底：满即整体清空（只可能少判一次回显，不影响正确性）
+        perPlayer.clear();
+      }
+      perPlayer.put(new EchoKey(worldName, x, y, z),
+          System.nanoTime() + REVEAL_ECHO_WINDOW_NANOS);
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /**
+   * 判断该坐标的变更是否为「本插件刚发出的显形回显」，命中即<b>消费</b>该记号（保证同坐标只判一次：
+   * 之后真正的方块变更不会被误判为回显）。
+   *
+   * <p>语义：返回 {@code true} = 这是回显，服务端内容没变，调用方<b>不得</b>摘除共享伪装索引。
+   * 记号缺失或已过期返回 {@code false}（按真实变更处理），异常同样返回 false（fail-open 到既有行为）。
+   */
+  public boolean consumeOurRevealEcho(UUID playerId, String worldName, int x, int y, int z) {
+    if (playerId == null || worldName == null) {
+      return false;
+    }
+    try {
+      ConcurrentHashMap<EchoKey, Long> perPlayer = revealEcho.get(playerId);
+      if (perPlayer == null) {
+        return false;
+      }
+      Long expiry = perPlayer.remove(new EchoKey(worldName, x, y, z));
+      return expiry != null && expiry >= System.nanoTime();
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+      return false;
+    }
   }
 
   /**
@@ -740,6 +865,9 @@ public final class ProximityRevealer implements Listener {
         }
       }
       if (fresh) {
+        // 记号：这批坐标即将发包（合并包失败会整批回滚已显形标记，回显记号最多久留 2 秒即失效，
+        // 因此不需要为它单独做回滚）
+        markOurReveal(playerId, worldName, position[0], position[1], position[2]);
         claimed[count++] = i;
       }
     }
@@ -1189,13 +1317,32 @@ public final class ProximityRevealer implements Listener {
   /**
    * 聚合初筛（纯函数）：整 section 只调用一次，任一变更坐标的曼哈顿邻域内仍有伪装坐标即命中。
    * 与逐坐标 {@link #hasDisguisedNearby} 的判定逐条等价，命中即短路返回。
+   *
+   * <p>带总探测次数上限（见 {@link #MAX_NEARBY_PROBES_PER_PACKET}）。<b>触顶时返回 true</b>：本方法的用途是
+   * 「判断附近是否还有伪装方块、以决定要不要做显形」，方向是<b>宁可返回「有」也不能漏</b>——漏判会让该次
+   * 区块变更后本应显形的坐标没显形（真正是否显形仍由后续链路按限额与去重决定）。
    */
   static boolean hasDisguisedNearSection(ObfuscatedChunkIndex index, String worldName,
       int[] coordinates, int count, int radius) {
+    ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
+    keys.begin(worldName);
+    int[][] offsets = instantOffsets(radius);
+    int probesLeft = MAX_NEARBY_PROBES_PER_PACKET;
     for (int i = 0; i < count; i++) {
-      if (hasDisguisedNearby(index, worldName,
-          coordinates[i * 3], coordinates[i * 3 + 1], coordinates[i * 3 + 2], radius)) {
-        return true;
+      int x = coordinates[i * 3];
+      int y = coordinates[i * 3 + 1];
+      int z = coordinates[i * 3 + 2];
+      for (int o = 0; o < offsets.length; o++) {
+        if (probesLeft <= 0) {
+          return true; // 触顶：保守判定为「附近有伪装坐标」，绝不因限额而漏显形
+        }
+        probesLeft--;
+        int blockX = x + offsets[o][0];
+        int blockY = y + offsets[o][1];
+        int blockZ = z + offsets[o][2];
+        if (index.containsPosition(keys.keyFor(blockX, blockZ), blockX, blockY, blockZ)) {
+          return true;
+        }
       }
     }
     return false;

@@ -227,6 +227,22 @@ public class ChunkSection {
     for (int i = 0; i < data.length; i++) {
       data[i] = buffer.readLong();
     }
+
+    // 位打包数据里每个索引都必须 < 调色板条目数：越界索引会让 IndirectPalette.valueFor 抛
+    // IndexOutOfBoundsException、compactPalette 抛 ArrayIndexOutOfBoundsException——虽然最终被上层兜住
+    // （整区块放弃改写 = fail-open），但会掩盖真实原因。故与 blockCount、bitsPerBlock 2/3、调色板重复值等
+    // 非法编码同口径：显式拒绝，交由上层解码 fail-open。
+    // 只对间接调色板生效：单值调色板索引恒为 0（条目数恒为 1），直接调色板存的是全局状态 id、无条目表。
+    if (this.palette instanceof IndirectPalette) {
+      int entries = this.palette.size();
+      for (int i = 0; i < SECTION_VOLUME; i++) {
+        int index = this.data.get(i);
+        if (index >= entries) {
+          throw new IllegalArgumentException(
+              "非法的调色板索引 " + index + "（调色板条目数 " + entries + "）");
+        }
+      }
+    }
   }
 
   /** 该 section 是否被外部通过 {@link #setBlockState}（或调色板裁剪/降级）改写。 */

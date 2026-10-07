@@ -408,6 +408,33 @@ public final class AntiXrayConfig {
    */
   public static final int PROXIMITY_MAX_POSITIONS_PER_PLAYER_MAX = 4_194_304;
 
+  /*
+   * 以下为「只有下限、原先没有上限」的资源型键补齐的安全上限：它们都直接决定单次/单周期的
+   * 工作量或常驻内存，手滑多打一位数即可造成每 tick 巨额发包、队列风暴或内存暴涨。
+   * 取值原则与其它 MAX 常量一致——正常调优撞不到，只拦失控配置。
+   */
+
+  /** {@code proximity.interval-ticks} 上限（tick）：200 tick = 10 秒，再长等于「几乎不做邻近显形」。 */
+  public static final int PROXIMITY_INTERVAL_TICKS_MAX = 200;
+  /** {@code proximity.max-reveals-per-tick} 上限：单次巡检的发包上限，防一次巡检打出包风暴。 */
+  public static final int PROXIMITY_MAX_REVEALS_PER_TICK_MAX = 100_000;
+  /** {@code proximity.expire-seconds} 上限（秒，1 天）：再长等于条目永不自然过期。 */
+  public static final int PROXIMITY_EXPIRE_SECONDS_MAX = 86_400;
+  /** {@code proximity.instant-reveal.max-per-tick} 上限：事件即时显形的每 tick 限额。 */
+  public static final int PROXIMITY_INSTANT_MAX_PER_TICK_MAX = 100_000;
+  /** {@code proximity.over-reveal-sampling} 上限（抽样分母）：只影响诊断计数，防溢出即可。 */
+  public static final int PROXIMITY_OVER_REVEAL_SAMPLING_MAX = 1_000_000;
+  /** {@code disk-cache.idle-close-seconds} 上限（秒，1 天）：再长等于区域文件句柄永不回收。 */
+  public static final int DISK_CACHE_IDLE_CLOSE_SECONDS_MAX = 86_400;
+  /** {@code disk-cache.compact-per-pass} 上限：单次维护最多压缩回收的区域文件数（全量重写，代价高）。 */
+  public static final int DISK_CACHE_COMPACT_PER_PASS_MAX = 4_096;
+  /** {@code disk-cache.queue-capacity} 上限：每个排队项都钉着一份区块负载。 */
+  public static final int DISK_CACHE_QUEUE_CAPACITY_MAX = 65_536;
+  /** {@code cache.expire-after-access-seconds} 上限（秒，1 天）：再长等于改写缓存条目永不淘汰。 */
+  public static final int CACHE_EXPIRE_AFTER_ACCESS_SECONDS_MAX = 86_400;
+  /** {@code advanced.timeout-millis} 上限（毫秒，60 秒）：改写超时，配大等于放弃「超时放行」兜底。 */
+  public static final int ADVANCED_TIMEOUT_MILLIS_MAX = 60_000;
+
   /**
    * 邻近显形：玩家靠近曾被伪装的坐标时，主动把该坐标的真实方块发回客户端。
    *
@@ -838,11 +865,15 @@ public final class AntiXrayConfig {
             proximityDistance(root.getDouble("proximity.distance", 64.0D), floorAdjustments,
                 ceilingAdjustments),
             // 默认 4（原为 5）：显形周期越短，「石头还没变回来」的窗口越小。
-            Math.max(1, root.getInt("proximity.interval-ticks", 4)),
+            clampCeiling(root.getInt("proximity.interval-ticks", 4), 1, PROXIMITY_INTERVAL_TICKS_MAX,
+                "proximity.interval-ticks", floorAdjustments, ceilingAdjustments),
             // 默认 256（原为 128）：配合扩大到 64 格的距离，候选数量随之上升，单次额度也要相应放大。
-            Math.max(1, root.getInt("proximity.max-reveals-per-tick", 256)),
+            clampCeiling(root.getInt("proximity.max-reveals-per-tick", 256), 1,
+                PROXIMITY_MAX_REVEALS_PER_TICK_MAX, "proximity.max-reveals-per-tick",
+                floorAdjustments, ceilingAdjustments),
             // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处。
-            Math.max(1, root.getInt("proximity.expire-seconds", 300)),
+            clampCeiling(root.getInt("proximity.expire-seconds", 300), 1, PROXIMITY_EXPIRE_SECONDS_MAX,
+                "proximity.expire-seconds", floorAdjustments, ceilingAdjustments),
             // 安全阀容量见 PROXIMITY_MAX_POSITIONS(_PER_PLAYER)_MAX：两个键都只在异常态触发，
             // 但同样需要上限，否则误配大数会让「安全阀」失效、内存失去上界。
             clampCeiling(root.getInt("proximity.max-positions", 4194304), 1,
@@ -872,8 +903,12 @@ public final class AntiXrayConfig {
                 clampCeiling(root.getInt("proximity.instant-reveal.radius", 2), 1,
                     PROXIMITY_INSTANT_RADIUS_MAX, "proximity.instant-reveal.radius", floorAdjustments,
                     ceilingAdjustments),
-                Math.max(0, root.getInt("proximity.instant-reveal.max-per-tick", 16))),
-            Math.max(0, root.getInt("proximity.over-reveal-sampling", 20)),
+                clampCeiling(root.getInt("proximity.instant-reveal.max-per-tick", 16), 0,
+                    PROXIMITY_INSTANT_MAX_PER_TICK_MAX, "proximity.instant-reveal.max-per-tick",
+                    floorAdjustments, ceilingAdjustments)),
+            clampCeiling(root.getInt("proximity.over-reveal-sampling", 20), 0,
+                PROXIMITY_OVER_REVEAL_SAMPLING_MAX, "proximity.over-reveal-sampling",
+                floorAdjustments, ceilingAdjustments),
             // 批量合并显形包（默认开启）：把一个周期内的显形用 Paper 原生多方块变更包一次发出。
             // 关掉即逐坐标发单方块变更包（旧行为），供 A/B 对比与线上回退。
             root.getBoolean("proximity.batch-reveal-sends", true)),
@@ -895,14 +930,20 @@ public final class AntiXrayConfig {
             clampCeiling(root.getInt("disk-cache.bucket-cache-size", 8), 1,
                 DISK_CACHE_BUCKET_CACHE_SIZE_MAX, "disk-cache.bucket-cache-size", floorAdjustments,
                 ceilingAdjustments),
-            Math.max(1, root.getInt("disk-cache.idle-close-seconds", 300)),
+            clampCeiling(root.getInt("disk-cache.idle-close-seconds", 300), 1,
+                DISK_CACHE_IDLE_CLOSE_SECONDS_MAX, "disk-cache.idle-close-seconds", floorAdjustments,
+                ceilingAdjustments),
             // 上限见 DISK_CACHE_MAINTENANCE_INTERVAL_MAX_SECONDS：该周期驱动落盘/压缩/关句柄，
             // 配得过大等于让这三件事事实停摆。
             clampCeiling(root.getInt("disk-cache.maintenance-interval-seconds", 30), 1,
                 DISK_CACHE_MAINTENANCE_INTERVAL_MAX_SECONDS,
                 "disk-cache.maintenance-interval-seconds", floorAdjustments, ceilingAdjustments),
-            Math.max(1, root.getInt("disk-cache.compact-per-pass", 4)),
-            Math.max(1, root.getInt("disk-cache.queue-capacity", 256)),
+            clampCeiling(root.getInt("disk-cache.compact-per-pass", 4), 1,
+                DISK_CACHE_COMPACT_PER_PASS_MAX, "disk-cache.compact-per-pass", floorAdjustments,
+                ceilingAdjustments),
+            clampCeiling(root.getInt("disk-cache.queue-capacity", 256), 1,
+                DISK_CACHE_QUEUE_CAPACITY_MAX, "disk-cache.queue-capacity", floorAdjustments,
+                ceilingAdjustments),
             // zstd 前置：服务端自带则直接用；没有则按这几键决定是否自动下载与校验（见 ZstdSupport）
             root.getBoolean("disk-cache.zstd.auto-download", true),
             zstdDownloadUrl(root),
@@ -918,12 +959,15 @@ public final class AntiXrayConfig {
         // 上限见 CACHE_MAXIMUM_SIZE_MAX：每条约 20~25 KB，饱和时内存占用与条目数成正比。
         clampCeiling(root.getInt("cache.maximum-size", 40960), 1,
             CACHE_MAXIMUM_SIZE_MAX, "cache.maximum-size", floorAdjustments, ceilingAdjustments),
-        root.getInt("cache.expire-after-access-seconds", 600),
+        clampCeiling(root.getInt("cache.expire-after-access-seconds", 600), 1,
+            CACHE_EXPIRE_AFTER_ACCESS_SECONDS_MAX, "cache.expire-after-access-seconds",
+            floorAdjustments, ceilingAdjustments),
         // 上限见 ADVANCED_THREADS_MAX：每个 worker 各持一份按线程复用的编解码 scratch，
         // 手滑多打一位数会同时放大线程数与这部分常驻内存。
         clampCeiling(root.getInt("advanced.threads", 0), 0, ADVANCED_THREADS_MAX,
             "advanced.threads", floorAdjustments, ceilingAdjustments),
-        root.getInt("advanced.timeout-millis", 2500),
+        clampCeiling(root.getInt("advanced.timeout-millis", 2500), 100, ADVANCED_TIMEOUT_MILLIS_MAX,
+            "advanced.timeout-millis", floorAdjustments, ceilingAdjustments),
         // 上限见 ADVANCED_QUEUE_CAPACITY_MAX：每个排队项都钉着一个区块封包，
         // 队列容量直接决定积压时钉住多少内存。
         clampCeiling(root.getInt("advanced.queue-capacity", 2048), 1, ADVANCED_QUEUE_CAPACITY_MAX,

@@ -11,6 +11,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -216,9 +217,26 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   };
   /** 退出监听是否已注册（注册/注销必须配对）。 */
   private volatile boolean quitHookRegistered;
-  private final AtomicInteger errorLogs = new AtomicInteger();
+  /**
+   * 各类错误日志的已提示次数，<b>按分类键各自限流</b>。
+   *
+   * <p>用「每类一个计数器」而非单个全局计数器：后者会让前 {@link Constants#MAX_ERROR_LOGS} 条
+   * 任意错误用尽配额，此后所有不同种类的失败一律静默——与日志文案「同类错误最多提示 N 次」不符。
+   * 分类键只有寥寥几个（见 {@link #logThrottled(String, String, Throwable)}），故条目数有界。
+   */
+  private final ConcurrentHashMap<String, AtomicInteger> errorLogCounters = new ConcurrentHashMap<>();
   /** 「首次改写诊断」只打一次（CAS 抢占），避免每区块刷屏。 */
   private final AtomicBoolean firstRewriteDiagnosed = new AtomicBoolean();
+  /**
+   * 停用中标记：{@link #unregisterBukkitHooks()} 首行置位（{@code ProtocolLibHook.unregister} 会在注销
+   * 异步处理器之前先调它）。
+   *
+   * <p><b>闭合的窗口</b>：{@link #scheduleCaptureThenRewrite} 把改写推迟到区域线程的抓取回调里执行，
+   * 该 {@code RewriteTask} 此刻既不在工作池的待处理集合内、其看门狗也会随停用被关闭。停用/热重载时
+   * 区域回调可能不再执行，若不在回调里主动放行，这个区块封包就<b>永远无人 signalOnce</b>——
+   * 玩家会卡在区块加载界面直到重新登录。
+   */
+  private volatile boolean stopping;
 
   /**
    * @param liveConfig       实时配置源（读取「当前」配置，保证热重载后世界黑名单即时生效）；可为 null（回落 config）
@@ -272,6 +290,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 注销本监听器的玩家退出监听（与 {@link #registerQuitHook()} 配对，停用时调用），并清空闸门表。
    */
   public void unregisterBukkitHooks() {
+    // 首行置位：此后任何迟到的抓取回调都必须自行放行（见 stopping 字段说明），
+    // 否则该区块封包会永久无人 signalOnce（停用期工作池与看门狗均已关闭，不会再有兜底）。
+    stopping = true;
     if (quitHookRegistered) {
       quitHookRegistered = false;
       try {
@@ -601,7 +622,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 失败结果不写入任何一级缓存（见 resultCacheable）：瞬时故障若被固化，同指纹区块在缓存有效期内
       // 不再重试改写，等于长期裸露。chunksFailed 计数即「失败且未入缓存」的次数，供诊断回显。
       stats.chunksFailed.increment();
-      logThrottled("区块改写异常（已按原包放行，未写入任何缓存）：" + result.failure(), null);
+      // 该文案会拼接 result.failure()（内容随异常而变）：用固定分类键限流，避免每出现一个新摘要就多计一条
+      logThrottled("区块改写异常", "区块改写异常（已按原包放行，未写入任何缓存）："
+          + result.failure(), null);
     }
     if (result.changed()) {
       stats.chunksRewritten.increment();
@@ -711,6 +734,14 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
 
     Runnable capture = () -> {
+      // 停用中（插件停用 / 热重载）：本回调可能已不再被执行，即便执行也不能再走「先抓取、再入工作池」——
+      // 工作池与看门狗都已随停用关闭，入队只会被丢弃。立刻自行放行原包，避免该区块封包永久无人
+      // signalOnce（玩家卡在区块加载界面直到重登）。
+      if (stopping) {
+        timeout.cancel(false);
+        task.signalOnce();
+        return;
+      }
       try {
         neighborProvider.capture(world, task.chunkX(), task.chunkZ());
       } catch (Throwable throwable) {
@@ -984,7 +1015,19 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   }
 
   private void logThrottled(String message, Throwable throwable) {
-    if (errorLogs.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
+    logThrottled(message, message, throwable);
+  }
+
+  /**
+   * 按 {@code throttleKey} 分别限流：同一分类最多提示 {@link Constants#MAX_ERROR_LOGS} 次，WARN 级别。
+   *
+   * <p>把「分类键」与「日志文案」分开，是为了让文案含可变内容（如异常摘要）时仍能按类别限流：
+   * 若直接拿整条文案当键，每出现一个新摘要都会多占一个计数条目、限流也形同虚设。
+   * 绝大多数调用点的文案本就是字符串字面量，直接以文案为键（见 2 参重载）。
+   */
+  private void logThrottled(String throttleKey, String message, Throwable throwable) {
+    AtomicInteger counter = errorLogCounters.computeIfAbsent(throttleKey, key -> new AtomicInteger());
+    if (counter.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
       getPlugin().getLogger().log(Level.WARNING, message + "（同类错误最多提示 "
           + Constants.MAX_ERROR_LOGS + " 次）", throwable);
     }

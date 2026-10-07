@@ -452,6 +452,25 @@ class ProximityScannerTest {
     assertEquals(all, union, "各片并集必须等于全部候选（分片不丢坐标）");
   }
 
+  /**
+   * 分片轮转的<b>驱动</b>（回归）：连续 4 次巡检必须依次覆盖全部分片。
+   *
+   * <p>此前驱动用的计数器从未自增，分片下标恒为 0，于是 {@code shardOf != 0} 的区块（约 3/4）
+   * 永远不会进入候选窗口——洞穴里裸露的矿只能等玩家挖进去才显形，反矿透的「邻近显形」实际只在
+   * 1/4 的区块上生效。本用例锁死该驱动必须轮转。
+   */
+  @Test
+  void shardRotationCoversEveryShardWithinFourPasses() {
+    Set<Integer> shards = new HashSet<>();
+    for (long round = 1L; round <= 4L; round++) {
+      shards.add(ProximityRevealer.shardFor(round));
+    }
+    assertEquals(Set.of(0, 1, 2, 3), shards,
+        "连续 4 次巡检必须覆盖全部 4 个分片（否则窗口外的区块被永久饿死）");
+    assertEquals(ProximityRevealer.shardFor(1L), ProximityRevealer.shardFor(5L),
+        "分片必须严格每 4 次巡检循环一次");
+  }
+
   /** 分片只由区块坐标决定（同一区块永远属于同一片），否则「几个周期内必轮到」的保证不成立。 */
   @Test
   void shardAssignmentIsStableAndSplitsEvenly() {

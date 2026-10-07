@@ -353,9 +353,8 @@ public final class AntiXrayRuntime {
       return;
     }
     if (obfuscatedChunkIndex == null || revealedSet == null) {
-      // 启动时该功能为关闭（索引从未接入改写链路）：热重载无法凭空补齐，明确提示需重启而非静默失效。
-      logger.info("邻近显形在配置中已启用，但启动时该功能为关闭状态、显形索引未接入改写链路；"
-          + "重启服务器后生效");
+      // 显形索引只能在插件启用时随改写链路一并接入：热重载无法凭空补齐，明确提示需重启而非静默失效。
+      logger.info("邻近显形在配置中已启用，但本功能只能随插件启用时初始化、热重载无法重建；重启服务器后生效");
       return;
     }
     startProximity(antiXray, obfuscatedChunkIndex, revealedSet, proximityStats);

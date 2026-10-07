@@ -683,7 +683,7 @@ public final class Diagnostics {
     // zstd 前置（含新键 zstd-sha256）：回显是否已配置校验，而非打印完整哈希——
     // 哈希本身不是密钥，但整串打进 dump 只是噪声，管理员只需知道「有没有开校验」。
     sb.append("disk-cache.zstd.auto-download=").append(c.diskCache().zstdAutoDownload())
-        .append("，download-url=").append(c.diskCache().zstdDownloadUrl())
+        .append("，download-url=").append(zstdDownloadUrlSummary(c.diskCache().zstdDownloadUrl()))
         .append("，timeout-seconds=").append(c.diskCache().zstdTimeoutSeconds())
         .append("，zstd-sha256=").append(c.diskCache().zstdSha256().isEmpty() ? "未配置（不校验）" : "已配置")
         .append('\n');
@@ -694,6 +694,16 @@ public final class Diagnostics {
         .append("，timeout-millis=").append(c.timeoutMillis())
         .append("，queue-capacity=").append(c.queueCapacity()).append('\n');
     sb.append("config-hash=").append(c.configHash()).append('\n');
+  }
+
+  /**
+   * zstd 下载源只回显「是否已配置」，<b>绝不打印完整 URL</b>：URL 内可能内嵌镜像凭据
+   * （如 {@code https://user:token@mirror}），整串写进 dump 就等同于把凭据落盘。
+   * 与同行 {@code zstd-sha256} 同口径——管理员只需知道「用的是自定义源还是内置默认」。
+   */
+  private static String zstdDownloadUrlSummary(String url) {
+    return url == null || url.isBlank() || AntiXrayConfig.DEFAULT_ZSTD_DOWNLOAD_URL.equals(url)
+        ? "未配置（用内置默认）" : "已配置";
   }
 
   private static void appendBandwidth(StringBuilder sb, BandwidthConfig c) {

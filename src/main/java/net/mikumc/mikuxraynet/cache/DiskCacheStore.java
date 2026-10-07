@@ -526,6 +526,12 @@ public final class DiskCacheStore implements AutoCloseable {
     BufferedLinearV3Format.Entry entry =
         new BufferedLinearV3Format.Entry(0L, writtenAt, configHash, payload);
     int chunkIndex = BufferedLinearV3Format.chunkIndex(chunkX, chunkZ);
+    if (!handle.file.bucketRawLengthFitsAfterPut(chunkIndex, payload.length)) {
+      // 加入本条后该桶的原始长度会超过读取侧上界（BufferedLinearV3Format#MAX_RAW_SIZE）：读取时整桶会被
+      // 判为损坏、整桶当空。写入侧先行拒绝（计入既有大小拒绝计数），避免「写成功却读不回」的不对称。
+      stats.rejectedBySize.increment();
+      return;
+    }
     boolean replaced = handle.file.put(chunkIndex, entry);
     if (!replaced) {
       handle.accountedEntries++;

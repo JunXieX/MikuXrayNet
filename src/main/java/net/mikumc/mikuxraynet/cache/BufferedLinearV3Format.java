@@ -490,7 +490,12 @@ public final class BufferedLinearV3Format {
   // ------------------------------------------------------------------ 条目
 
   /** 单条条目的头部长度：负载长度 4 + 代次 8 + 写入时间 8 + 配置指纹 4 + 校验和 4。 */
-  private static final int ENTRY_HEADER_SIZE = 4 + 8 + 8 + 4 + 4;
+  static final int ENTRY_HEADER_SIZE = 4 + 8 + 8 + 4 + 4;
+
+  /** 单条非空条目的编码长度：长度前缀 {@link Integer#BYTES} + 条目头 {@link #ENTRY_HEADER_SIZE} + 负载。 */
+  static int entryEncodedLength(int payloadLength) {
+    return Integer.BYTES + ENTRY_HEADER_SIZE + payloadLength;
+  }
 
   /** 编码一条条目（含校验和）。 */
   public static byte[] encodeEntry(Entry entry, int hashSeed) {
@@ -602,7 +607,7 @@ public final class BufferedLinearV3Format {
       if (slot == null || slot.payload() == null || slot.payload().length == 0) {
         capacity += Integer.BYTES;
       } else {
-        capacity += Integer.BYTES + ENTRY_HEADER_SIZE + slot.payload().length;
+        capacity += entryEncodedLength(slot.payload().length);
       }
     }
     return capacity;

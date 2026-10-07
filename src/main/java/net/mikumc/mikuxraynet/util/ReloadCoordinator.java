@@ -71,7 +71,14 @@ public final class ReloadCoordinator {
       "区块改写超时与改写缓存容量/过期",
       // 调色板两键在启动期被固化为编码链路的 PaletteOptions（见 AntiXrayRuntime.startAntiXray），
       // reload 只重启显形/带宽任务、不重建编码器，故这两键改了必须重启（含 width-budget / strict-verify）。
-      "调色板压缩 / 位宽预算封顶 / 严格自检（palette.width-budget / strict-verify）");
+      "调色板压缩 / 位宽预算封顶 / 严格自检（palette.width-budget / strict-verify）",
+      // disk-cache 段：除 zstd-sha256（唯一参与指纹的键）外都不进 configHash，且 DiskCacheStore 只在
+      // startAntiXray 里构造一次——reload 既不重建它、指纹也不会变，回显若不说清就会被误认为已生效。
+      "磁盘缓存全部参数（disk-cache.max-entries / max-file-size-mb / expire-seconds / bucket-cache-size / "
+          + "idle-close-seconds / maintenance-interval-seconds / compact-per-pass / queue-capacity / zstd.*）",
+      // occlusion.* 虽参与指纹（改后旧缓存会一次性失效重建），但运行期用于判定的遮挡表由 PacketEventsHook
+      // 在启动期一次性构建，reload 不会重建它——改了只有重启才真正生效。
+      "遮挡规则表（occlusion.extra-occluding / extra-non-occluding / fluid-cover）");
 
   /**
    * 执行一次热重载。

@@ -185,12 +185,15 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       coordinates[i * 3 + 2] = baseZ + (packed >> 4 & 15);
     }
 
+    // 回显判定绑定「本包的接收者」：显形回显只发给了这个玩家，因此也只会在他名下命中
+    RevealEchoCheck echoCheck = instantRevealer == null || player == null
+        ? null : (world, x, y, z) -> isOurRevealEcho(player, world, x, y, z);
     processChanges(worldName, coordinates, positions.length, obfuscatedChunkIndex, revealedSet, stats,
         (changed, changedCount) -> {
           if (instantRevealer != null && changedCount > 0) {
             instantRevealer.onSectionChangeObserved(player, worldName, changed, changedCount);
           }
-        });
+        }, echoCheck);
   }
 
   /**
@@ -202,6 +205,18 @@ public final class BlockChangeRevealListener extends PacketAdapter {
 
     /** 一个 section 的全部变更坐标（已去重，扁平三元组，前 {@code count} 个有效）。 */
     void dispatch(int[] coordinates, int count);
+  }
+
+  /**
+   * 回显判定：该坐标是否为本插件刚为该玩家发出的显形回显（命中即消费该记号）。
+   *
+   * <p>生产实现绑定 {@link ProximityRevealer#consumeOurRevealEcho}；为 {@code null} 时表示「不做区分」，
+   * 一律按真实变更处理（修复前的行为，供单测与未启用事件显形时回落）。
+   */
+  @FunctionalInterface
+  interface RevealEchoCheck {
+
+    boolean isEcho(String worldName, int x, int y, int z);
   }
 
   /** 单个 section 收集到的变更坐标（可增长的扁平三元组缓冲，并按 section 内编码去重）。 */
@@ -284,6 +299,19 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   static void processChanges(String worldName, int[] coordinates, int count,
       ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
       SectionDispatch dispatch) {
+    processChanges(worldName, coordinates, count, obfuscatedChunkIndex, revealedSet, stats, dispatch,
+        null);
+  }
+
+  /**
+   * 同上一重载，追加显形回显判定（{@code null} = 不做区分，保持既有整段批量摘除的快路径）。
+   *
+   * <p>回显坐标必须被排除在摘除之外（见 {@link #unregisterCoordinate}），因此本方法在过滤阶段就地把
+   * 它们从 {@code section} 的有效段里剔除，后续批量摘除只作用于真实变更，既不新增分配也不改变快路径。
+   */
+  static void processChanges(String worldName, int[] coordinates, int count,
+      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
+      SectionDispatch dispatch, RevealEchoCheck echoCheck) {
     if (worldName == null || coordinates == null || count <= 0) {
       return;
     }
@@ -310,14 +338,37 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
 
     for (int s = 0; s < sections.size(); s++) {
-      processSection(worldName, sections.get(s), obfuscatedChunkIndex, revealedSet, stats, dispatch);
+      processSection(worldName, sections.get(s), obfuscatedChunkIndex, revealedSet, stats, dispatch,
+          echoCheck);
     }
   }
 
-  /** 处理单个 section：一次批量摘除 + 一次调度。 */
+  /** 处理单个 section：过滤回显 → 一次批量摘除 → 一次调度。 */
   private static void processSection(String worldName, SectionBuffer section,
       ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
-      SectionDispatch dispatch) {
+      SectionDispatch dispatch, RevealEchoCheck echoCheck) {
+    if (echoCheck != null) {
+      // 就地过滤：把「本插件刚发出的显形回显」从有效段里剔除（回显不改变服务端内容，绝不能摘索引）。
+      // 复用同一数组前段，不新增任何分配；被剔除的坐标也不参与后续摘除与调度。
+      int kept = 0;
+      for (int i = 0; i < section.count; i++) {
+        int x = section.data[i * 3];
+        int y = section.data[i * 3 + 1];
+        int z = section.data[i * 3 + 2];
+        if (echoCheck.isEcho(worldName, x, y, z)) {
+          continue;
+        }
+        section.data[kept * 3] = x;
+        section.data[kept * 3 + 1] = y;
+        section.data[kept * 3 + 2] = z;
+        kept++;
+      }
+      if (kept == 0) {
+        // 整段都是回显：没有任何真实变更，既不摘索引/标记，也不需要触发事件显形
+        return;
+      }
+      section.count = kept;
+    }
     int removed = 0;
     if (obfuscatedChunkIndex != null) {
       removed = obfuscatedChunkIndex.removePositions(worldName, section.data, section.count);
@@ -361,10 +412,10 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       return;
     }
     // 1.1.6 起显形包走 Paper 原生通道（sendMultiBlockChange / sendBlockChange），因此本监听器
-    // 也会看到「我们自己发出的显形回显」。回显不改变服务端内容，因此只摘索引（与真实变更相同），
-    // 不再有任何「磁盘缓存失效」动作——磁盘条目的有效性由负载里的原始区块字节指纹判定
-    // （见 DiskCacheStore 类注释），回显不改变区块字节，天然不需要作废任何缓存条目。
-    unregisterCoordinate(worldName, x, y, z);
+    // 也会看到「我们自己发出的显形回显」。回显不改变服务端内容，必须与真实变更区别对待
+    // （见 unregisterCoordinate）；磁盘缓存方面两者都不需要作废任何条目——条目有效性由负载里的
+    // 原始区块字节指纹判定（见 DiskCacheStore 类注释），回显不改变区块字节。
+    unregisterCoordinate(player, worldName, x, y, z);
     if (instantRevealer != null) {
       instantRevealer.onBlockChangeObserved(player, worldName, x, y, z);
     }
@@ -389,8 +440,14 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * 就未命中，但本玩家刚写入的标记仍在——那是一枚孤儿标记（已显形数虚增会让「整块跳过」提前成立，
    * 真实坐标被长期漏显形）。因此这里无条件摘标记：正常情况无副作用，异常情况恰好清掉孤儿。
    */
-  private void unregisterCoordinate(String worldName, int x, int y, int z) {
+  private void unregisterCoordinate(Player player, String worldName, int x, int y, int z) {
     if (worldName == null || obfuscatedChunkIndex == null) {
+      return;
+    }
+    if (isOurRevealEcho(player, worldName, x, y, z)) {
+      // 回显（本插件自己刚为该玩家发出的显形包）：服务端内容没有变化，因此<b>绝不能</b>摘共享伪装索引
+      // ——索引按区块全服共享，摘掉会让其它玩家对同一坐标再也无法被主动显形（他们的客户端仍持伪装
+      // 区块，只能等区块重载才恢复）。本玩家的已显形标记也保留：它确实已被显形，再发一次毫无意义。
       return;
     }
     boolean removedFromIndex = obfuscatedChunkIndex.removePosition(worldName, x, y, z);
@@ -399,6 +456,26 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
     if (removedFromIndex && stats != null) {
       stats.unregistered.increment();
+    }
+  }
+
+  /**
+   * 该坐标的变更是否为本插件刚为该玩家发出的显形回显（见 {@link RevealEchoCheck}）。
+   *
+   * <p>判定不可用时返回 false（按真实变更处理，退回修复前行为）：宁可多摘一次索引，也绝不因判定
+   * 失败而把真实变更漏掉（那会让索引残留已消失的坐标）。
+   *
+   * <p><b>未启用事件显形时不做区分</b>：此时本类拿不到显形器引用，只能按真实变更处理——这只影响
+   * {@code proximity.instant-reveal.enabled=false} 的配置，默认配置不受影响。
+   */
+  private boolean isOurRevealEcho(Player player, String worldName, int x, int y, int z) {
+    if (instantRevealer == null || player == null) {
+      return false;
+    }
+    try {
+      return instantRevealer.consumeOurRevealEcho(player.getUniqueId(), worldName, x, y, z);
+    } catch (Throwable throwable) {
+      return false;
     }
   }
 

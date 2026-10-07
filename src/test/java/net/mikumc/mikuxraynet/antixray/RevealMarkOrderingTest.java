@@ -56,6 +56,68 @@ class RevealMarkOrderingTest {
   }
 
   /**
+   * 显形回显窗口：成功发出的显形包会留下「刚发过」记号，监听器消费一次即失效。
+   *
+   * <p>这是「回显不摘共享索引」的判定依据：记号缺失或已被消费时必须返回 false，让之后真正的方块变更
+   * 照常摘除索引（否则索引会残留已消失的坐标）。
+   */
+  @Test
+  void sentRevealLeavesAConsumableEchoMarker() {
+    assertFalse(revealer.consumeOurRevealEcho(PLAYER, WORLD, 2, 64, 2), "未发过显形时不得判为回显");
+
+    assertTrue(revealer.markThenSend(PLAYER, WORLD, 2, 64, 2, () -> true), "桩返回 true：视为已发出");
+    assertTrue(revealer.consumeOurRevealEcho(PLAYER, WORLD, 2, 64, 2), "刚发出的坐标必须被判为回显");
+    assertFalse(revealer.consumeOurRevealEcho(PLAYER, WORLD, 2, 64, 2),
+        "记号必须被消费：之后的同坐标变更要按真实变更处理，否则会漏摘索引");
+
+    // 另一个世界/坐标不受影响（键含世界名与坐标）
+    assertFalse(revealer.consumeOurRevealEcho(PLAYER, "other", 2, 64, 2));
+    assertFalse(revealer.consumeOurRevealEcho(UUID.randomUUID(), WORLD, 2, 64, 2));
+  }
+
+  /**
+   * 回显不摘共享索引（本次修复的核心回归）：批量变更里被判为「本插件刚发出的显形回显」的坐标，
+   * 必须保留在<b>按区块全服共享</b>的伪装索引与已显形标记中——否则甲玩家被显形后，乙玩家对同一坐标
+   * 再也无法被主动显形（乙客户端仍持伪装区块，只能等区块重载才恢复）。
+   */
+  @Test
+  void echoCoordinatesAreNotRemovedFromTheSharedIndex() {
+    // 两个坐标同属区块 (0,0)：摘掉其中一个后该区块条目仍存在，便于用 size 断言
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
+    ChunkKey chunk = ChunkKey.ofBlock(WORLD, 1, 1);
+    revealed.mark(PLAYER, chunk, 1, 64, 1);
+    revealed.mark(PLAYER, chunk, 2, 64, 1);
+    assertEquals(2, index.entry(chunk).size(), "前置：两个坐标都在伪装清单里");
+
+    int[] coordinates = {1, 64, 1, 2, 64, 1};
+    // 坐标 (1,64,1) 判为回显（本插件刚发给该玩家的显形），(2,64,1) 是真实变更
+    BlockChangeRevealListener.processChanges(WORLD, coordinates, 2, index, revealed,
+        new ProximityStats(), null, (world, x, y, z) -> x == 1);
+
+    assertEquals(1, index.entry(chunk).size(),
+        "回显坐标必须保留在共享伪装索引里（被摘掉就会让其他玩家永久漏显形）");
+    assertTrue(revealed.contains(PLAYER, chunk, 1, 64, 1), "回显坐标的已显形标记也应保留（确实已显形）");
+    assertFalse(revealed.contains(PLAYER, chunk, 2, 64, 1), "真实变更坐标的已显形标记必须照常摘除");
+  }
+
+  /**
+   * 整段都是回显时不做任何摘除：这类包正是「本插件的显形包被自己回显」的典型形态，
+   * 若照旧整段摘除，等于每次显形都把共享索引里的坐标清掉。
+   */
+  @Test
+  void sectionConsistingEntirelyOfEchoesIsLeftUntouched() {
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(3, 64, 3)});
+    ChunkKey chunk = ChunkKey.ofBlock(WORLD, 3, 3);
+    revealed.mark(PLAYER, chunk, 3, 64, 3);
+
+    BlockChangeRevealListener.processChanges(WORLD, new int[] {3, 64, 3}, 1, index, revealed,
+        new ProximityStats(), null, (world, x, y, z) -> true);
+
+    assertEquals(1, index.entry(chunk).size(), "整段回显不得摘除共享索引");
+    assertTrue(revealed.contains(PLAYER, chunk, 3, 64, 3), "整段回显不得摘除已显形标记");
+  }
+
+  /**
    * 交错顺序：发包桩里先跑出站监听器的摘除（模拟异步线程先于 markRevealed 执行）。
    * 标记先行 → 监听器命中并一并摘掉标记 → <b>无孤儿标记</b>、计数与区块清单自洽。
    */

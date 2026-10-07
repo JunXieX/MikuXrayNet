@@ -532,6 +532,29 @@ final class RegionFile implements AutoCloseable {
   }
 
   /**
+   * 预判：把一条 {@code payloadLength} 字节的条目写入 {@code chunkIndex} 后，该桶编码后的<b>原始</b>字节
+   * 长度是否仍不超过读取侧上界 {@link BufferedLinearV3Format#MAX_RAW_SIZE}。
+   *
+   * <p><b>为什么写入侧要判</b>：读取侧对 {@code rawLength} 超过该上界的桶一律判为损坏、整桶当空；写入侧
+   * 若不先行拦下，一个合法写入（单条负载 ≤ 16 MiB × 单桶 64 条）就可能撑出超限的桶，表现为
+   * 「写成功却读不回」。这里复用与读取侧<b>同一个常量</b>，越界即由调用方按既有拒绝路径丢弃本次写入。
+   */
+  boolean bucketRawLengthFitsAfterPut(int chunkIndex, int payloadLength) {
+    if (lockUnavailable) {
+      return true; // 该文件已停用：调用方本就跳过写入，这里不制造额外拒绝
+    }
+    BufferedLinearV3Format.Entry[] bucketSlots = ensureLoaded(bucketIndex(chunkIndex));
+    int current = BufferedLinearV3Format.encodedBucketLength(bucketSlots);
+    BufferedLinearV3Format.Entry existing = bucketSlots[slotInBucket(chunkIndex)];
+    int existingBytes = existing == null || existing.payload() == null || existing.payload().length == 0
+        ? Integer.BYTES
+        : BufferedLinearV3Format.entryEncodedLength(existing.payload().length);
+    long projected = (long) current - existingBytes
+        + BufferedLinearV3Format.entryEncodedLength(payloadLength);
+    return projected <= BufferedLinearV3Format.MAX_RAW_SIZE;
+  }
+
+  /**
    * 清空一个区块的条目（惰性清理过期/旧代次条目时使用）。
    *
    * <p><b>三种桶状态</b>：

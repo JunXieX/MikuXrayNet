@@ -380,6 +380,14 @@ public final class ObfuscationProcessor {
    * 值不可变（含 {@link #NO_OVERRIDE} 哨兵），多线程安全。
    */
   private final ConcurrentHashMap<String, WorldProfile>[] overrideCache;
+  /**
+   * 单维度「世界名 → 档案」缓存条数上限。
+   *
+   * <p>世界名在实践中是个位数（主世界/下界/末地 + 少量副本世界），但动态建图的服务器可能产生大量
+   * 一次性世界名，若不做上界这张表会随服务器寿命无界增长。超限即整体清空——只是下次重新解析一次
+   * （{@code matchOverride} 是纯字符串匹配），零正确性影响。
+   */
+  private static final int OVERRIDE_CACHE_MAX = 4096;
   /** 「未命中任何覆盖段」的哨兵值（避免用 null 表示「已查询但无覆盖」而反复匹配）。 */
   private static final WorldProfile NO_OVERRIDE = WorldProfile.EMPTY;
 
@@ -861,6 +869,10 @@ public final class ObfuscationProcessor {
     if (matched == null) {
       int index = config.matchOverride(worldName);
       matched = index < 0 ? NO_OVERRIDE : overrideProfiles[index][dimensionIndex];
+      // 上界保护（见 OVERRIDE_CACHE_MAX）：超限整体清空，只让下一次多解析一遍字符串，不影响正确性
+      if (cache.size() >= OVERRIDE_CACHE_MAX) {
+        cache.clear();
+      }
       cache.put(worldName, matched);
     }
     return matched == NO_OVERRIDE ? dimensionProfiles[dimensionIndex] : matched;

@@ -165,7 +165,7 @@ class EntityCullerTest {
     int cycles = 0;
     int maxCycles = (total + budget - 1) / budget;
     while (covered.size() < total && cycles < maxCycles) {
-      List<Entity> batch = rotation.nextBatch(budget, Set.of());
+      List<Entity> batch = rotation.nextBatch(budget);
       assertTrue(batch.size() <= budget, "每周期复检数不得超过预算（实际 " + batch.size() + "）");
       for (Entity entity : batch) {
         covered.add(entity.getEntityId());
@@ -177,19 +177,25 @@ class EntityCullerTest {
         "50 个追踪实体、预算 10 → 必须在 " + maxCycles + " 个周期内全部复检一次（实际 " + cycles + "）");
   }
 
-  /** 已隐藏的实体不占用轮转预算配额：它们由「每周期全量复检」通道负责，不能因此挤掉可见实体的份额。 */
+  /**
+   * 轮转必须推进游标、且<b>不跳过任何实体</b>——已隐藏者同样要排到复检轮次。
+   *
+   * <p>这正是「遮挡物被炸开后恢复可见」在远距离的唯一入口：通道①对远距离条目刻意不打射线，
+   * 若轮转再跳过已隐藏者，被遮挡隐藏的实体就会一直不可见（直到玩家走近强制可见距离或重新追踪）。
+   */
   @Test
-  void rotationSkipsHiddenEntitiesButStillAdvancesTheCursor() {
+  void rotationIncludesHiddenEntitiesSoTheyCanBeReEvaluated() {
     EntityCuller.TrackedRotation rotation = new EntityCuller.TrackedRotation();
     for (int i = 0; i < 6; i++) {
       rotation.add(new EntityStub(2000 + i, new WorldStub()).proxy());
     }
-    Set<Integer> hidden = Set.of(2000, 2001, 2002);
 
-    List<Entity> first = rotation.nextBatch(3, hidden);
-    assertEquals(0, first.size(), "本批位置全是已隐藏实体：不应产出可见复检项");
-    List<Entity> second = rotation.nextBatch(3, hidden);
-    assertEquals(Set.of(2003, 2004, 2005), idsOf(second), "游标必须照常推进到下一批（否则会饿死后面的实体）");
+    assertEquals(Set.of(2000, 2001, 2002), idsOf(rotation.nextBatch(3)),
+        "第一批必须是最早加入的三个（分片按位置推进）");
+    assertEquals(Set.of(2003, 2004, 2005), idsOf(rotation.nextBatch(3)),
+        "游标必须照常推进到下一批（否则会饿死后面的实体）");
+    assertEquals(Set.of(2000, 2001, 2002), idsOf(rotation.nextBatch(3)),
+        "游标必须回绕，保证有限周期内覆盖全部追踪实体");
   }
 
   /**
@@ -243,13 +249,13 @@ class EntityCullerTest {
   }
 
   /**
-   * 通道①成本有界：已隐藏实体即使「视线已通畅」，只要仍在强制可见距离外就不打射线、不被复活。
+   * 通道①的成本上界：已隐藏实体即便「视线已通畅」，只要仍在强制可见距离外，通道①就不打射线。
    *
-   * <p>这正是旧实现提前返回所要保护的场景（远距离账本条目会随会话累积大量长射线）。若有人把通道①
-   * 也改成允许远距离打射线，本用例会因实体被恢复而失败。
+   * <p>本用例的实体只由 {@code evaluate} 直接造出、<b>未进入轮转队列</b>，因此本轮复检只可能来自通道①
+   * （远距离的再评估由通道②轮转负责，见下一个用例），据此钉死「通道①绝不为远距离条目打射线」。
    */
   @Test
-  void farHiddenEntityIsNotRevivedByTheRestoreChannel() {
+  void restoreChannelDoesNotRaycastFarHiddenEntities() {
     ThrottleStats stats = new ThrottleStats();
     PlayerStub player = new PlayerStub();
     WorldStub world = new WorldStub();
@@ -264,8 +270,39 @@ class EntityCullerTest {
 
     occluded.set(false); // 视线变通畅，但实体仍在远距离
     runRecheckCycles(culler, player, 3, 1);
-    assertEquals(1, culler.hiddenCount(), "远距离已隐藏实体不得被通道①打射线复活（成本有界）");
-    assertEquals(0L, stats.recheckShown.sum(), "通道①对远距离实体不产生恢复");
+    assertEquals(0L, stats.recheckShown.sum(),
+        "通道①对远距离实体不产生恢复（它的职责只有强制可见距离内的恢复）");
+  }
+
+  /**
+   * 远距离已隐藏实体的恢复（本次修复的回归）：遮挡物消失后，通道②的轮转复检必须把它恢复可见。
+   *
+   * <p>走真实入口：实体经 {@code onTrack} 进入轮转队列 → 入场即被判定遮挡而隐藏（超距）→ 遮挡消失后
+   * 在有限周期内被轮转通道重新评估并恢复。修复前轮转会跳过已隐藏实体，导致它在远距离永远不可见。
+   */
+  @Test
+  void farTrackedEntityIsRestoredByRotationAfterTheOccluderDisappears() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    AtomicBoolean occluded = new AtomicBoolean(true);
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 3, frustumOff()), stats,
+        entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> occluded.get());
+
+    // 距离约 141 格（远超强制可见距离 2 格）：入场首评判为被遮挡 → 隐藏，并登记进轮转队列
+    EntityStub far = new EntityStub(7301, world);
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), far.proxy()));
+    assertEquals(1, culler.hiddenCount(), "入场即被遮挡且超出强制可见距离 → 应被隐藏");
+
+    // 遮挡物消失（墙被炸开/挖开）：轮转复检必须把它重新评估并恢复
+    occluded.set(false);
+    runRecheckCycles(culler, player, 3, 1);
+
+    assertEquals(0, culler.hiddenCount(),
+        "遮挡物消失后必须经轮转复检恢复可见（否则玩家在远处一直看不到这个实体）");
+    assertEquals(1L, stats.recheckShown.sum(), "恢复应计入「复检致恢复」");
+    assertEquals(1, player.showCalls.get(), "必须真的下发 showEntity");
   }
 
   /**

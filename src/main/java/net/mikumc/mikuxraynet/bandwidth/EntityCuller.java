@@ -7,7 +7,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -68,10 +67,13 @@ import org.bukkit.util.Vector;
  *       可见距离时 {@code showIfHidden}；超出该距离一律不打射线（成本有界，见 {@link RecheckMode}）。
  *       额外只对<b>视锥隐藏</b>的条目做一次纯数学的锥内复判（不打射线）：一旦它回到视野锥内立即恢复，
  *       保证「转头后 ≤ 1 个复检周期重新出现」。</li>
- *   <li><b>通道②·其余追踪实体</b>：按<b>轮转分片</b>每周期只复检 {@code entity-culling.recheck-budget}
- *       个，游标推进，故 {@code ceil(追踪数 / budget)} 个周期内必然覆盖全部追踪实体。该通道允许对超出
- *       强制可见距离的实体<b>打射线并隐藏</b>——这正是「入场时可见、之后才被墙/地形挡住」的实体能被
- *       收敛到隐藏的<b>唯一</b>路径；每条射线的成本已由 {@code recheck-budget} 封顶。</li>
+ *   <li><b>通道②·全部追踪实体（含已隐藏者）</b>：按<b>轮转分片</b>每周期只复检
+ *       {@code entity-culling.recheck-budget} 个，游标推进，故 {@code ceil(追踪数 / budget)} 个周期内
+ *       必然覆盖全部追踪实体。该通道允许对超出强制可见距离的实体<b>打射线</b>，承担两件事：
+ *       <b>①</b> 把「入场时可见、之后才被墙/地形挡住」的实体收敛到隐藏；
+ *       <b>②</b> 把「曾因遮挡被隐藏、之后遮挡物被炸开/挖开」的实体恢复可见——这是远距离已隐藏实体
+ *       唯一的再评估入口（通道①对远距离条目不射线）。每条射线的成本已由 {@code recheck-budget} 封顶，
+ *       故「包含已隐藏者」不会让开销随隐藏数无界增长。</li>
  * </ol>
  * 两条通道都复用同一套评估链路（实体所属线程做原生射线并 hide/show），不另写一套。
  * <b>距离闸门</b>：任何通道内、处于强制可见距离内的实体一律可见（{@code showIfHidden}），绝不隐藏——
@@ -269,7 +271,8 @@ public final class EntityCuller implements Listener {
     RESTORE_ONLY,
     /**
      * 通道②·轮转分片复检：数量已由 {@code entity-culling.recheck-budget} 封顶，故允许对超出强制可见
-     * 距离的实体打射线并隐藏——这是「先可见、之后才被挡住」能被收敛到隐藏的关键；成本上界＝每周期预算次。
+     * 距离的实体打射线——既能隐藏「先可见、之后才被挡住」的实体，也能恢复「遮挡物已消失」的已隐藏实体
+     * （方向由射线结果决定）；成本上界＝每周期预算次射线。
      */
     ROTATION
   }
@@ -489,7 +492,8 @@ public final class EntityCuller implements Listener {
         }
         // 远距离：只有「因视锥剔除而隐藏」的条目才做廉价的锥内复判（纯数学，不打射线）。
         // 一旦实体重新回到视野锥内、或不再满足距离门，立刻恢复显示——这就是「转头后 ≤ 1 个复检周期补发」。
-        // 射线遮挡隐藏的条目（frustumCulled=false）保持既有行为：等实体靠近或被重新追踪，不打射线（成本有界）。
+        // 射线遮挡隐藏的条目（frustumCulled=false）不在本通道打射线（成本有界），改由通道②的轮转
+        // 复检周期性重估（遮挡物消失后即可恢复可见），因此这里不必也不应打射线。
         if (entry.frustumCulled() && !frustumCullable(player, entity)
             && showIfHidden(player, entity)) {
           stats.recheckShown.increment();
@@ -504,15 +508,18 @@ public final class EntityCuller implements Listener {
       }
     }
 
-    // ② 其余追踪实体：轮转分片，每周期只取一小批（已隐藏者由 ① 负责，这里跳过）。
-    //    本通道允许打射线隐藏（ROTATION）：这是「先可见、之后才被挡住」能被收敛到隐藏的唯一路径，
-    //    成本由 recheck-budget 封顶（每周期至多少量射线）。
+    // ② 全部追踪实体（<b>含已隐藏者</b>）：轮转分片，每周期只取 recheck-budget 个。
+    //    本通道允许对远距离实体打射线（ROTATION），承担两件事：
+    //      · 把「先可见、之后才被挡住」的实体收敛到隐藏；
+    //      · 把「曾因遮挡被隐藏、之后遮挡物消失（被炸开/被挖开）」的实体恢复可见。通道①对远距离条目
+    //        刻意不打射线（成本有界），因此这里是远距离已隐藏实体唯一的再评估入口。
+    //    成本仍由 recheck-budget 封顶（每周期至多预算次射线）：ceil(追踪数 / 预算) 个周期覆盖全部追踪
+    //    实体，隐藏实体只是排到属于自己的那一轮，不会让射线次数随隐藏数无界增长。
     TrackedRotation rotation = rotations.get(playerId);
     if (rotation == null) {
       return;
     }
-    Set<Integer> hiddenIds = hiddenMap == null ? Set.of() : hiddenMap.keySet();
-    for (Entity entity : rotation.nextBatch(config.recheckBudget(), hiddenIds)) {
+    for (Entity entity : rotation.nextBatch(config.recheckBudget())) {
       if (!owns(entity)) {
         continue;
       }
@@ -886,8 +893,15 @@ public final class EntityCuller implements Listener {
     if (existing == null || existing.entity() != entity) {
       return false;
     }
+    // 先真正下发 showEntity，成功后再摘账本（对照 LatencyMonitor.restore 的「写入成功才删原值」）：
+    // 若先摘再发而下发失败（show 内部已吞异常并返回 false），账本条目就没了，此后 evaluate 的恢复分支
+    // 再也找不到「同一实例」的记录，该实体将永久不可见——这是最严重的一类可见性故障。
+    // 失败时条目保留，下一轮复检会重试；实体已失效的条目由别处的 isValid 清理分支移除。
+    if (!show(player, entity)) {
+      return false;
+    }
     map.remove(entity.getEntityId(), existing);
-    return show(player, entity);
+    return true;
   }
 
   /** @return 是否真的下发了 showEntity（实体已失效时为 false）。 */
@@ -1082,7 +1096,7 @@ public final class EntityCuller implements Listener {
     /**
      * 当前轮转队列里的追踪实体数。
      *
-     * <p>测试专用豁免：生产路径不读该值（复检只走 {@link #nextBatch(int, Set)}），
+     * <p>测试专用豁免：生产路径不读该值（复检只走 {@link #nextBatch(int)}），
      * 本方法当前仅单测在用，保留以免破坏测试。
      */
     synchronized int size() {
@@ -1090,13 +1104,16 @@ public final class EntityCuller implements Listener {
     }
 
     /**
-     * 取出本轮要复检的一小批追踪实体（跳过已隐藏者——它们由「每周期全量复检」通道负责），
-     * 并把游标推进一批，保证有限周期内覆盖全部追踪实体。
+     * 取出本轮要复检的一小批追踪实体，并把游标推进一批，保证有限周期内覆盖全部追踪实体。
+     *
+     * <p><b>不再跳过已隐藏者</b>：隐藏条目也必须排到复检轮次，否则「遮挡物消失后恢复可见」在远距离
+     * 永远没有入口（通道①对远距离条目不打射线）。覆盖保证（{@code ceil(size / budget)} 个周期内遍历
+     * 全部位置）与射线成本上界（每周期至多 {@code budget} 次）都不受影响。
      *
      * <p>环形数组直接取 {@code step} 个位置：{@code start = cursor % size}，依次取
      * {@code [start, start+step)}（回绕），位置数而非提交数推进，覆盖保证与旧实现一致。
      */
-    synchronized List<Entity> nextBatch(int budget, Set<Integer> hiddenIds) {
+    synchronized List<Entity> nextBatch(int budget) {
       int size = order.size();
       if (size == 0) {
         cursor = 0;
@@ -1106,10 +1123,7 @@ public final class EntityCuller implements Listener {
       int start = Math.floorMod(cursor, size);
       List<Entity> batch = new ArrayList<>(step);
       for (int offset = 0; offset < step; offset++) {
-        Tracked tracked = order.get(Math.floorMod(start + offset, size));
-        if (!hiddenIds.contains(tracked.id())) {
-          batch.add(tracked.entity());
-        }
+        batch.add(order.get(Math.floorMod(start + offset, size)).entity());
       }
       cursor = (start + step) % size;
       return batch;
