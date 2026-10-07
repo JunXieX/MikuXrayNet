@@ -46,12 +46,20 @@ import org.bukkit.plugin.Plugin;
  * 清空并计入安全阀计数（只短期少省一点包，不影响正确性）；玩家退出即释放。
  *
  * <p><b>失败语义 fail-open</b>：字段形态与预期不符（不同服务端版本的包布局差异）或任何异常，一律放行原包，
- * 绝不误删客户端需要的数据。
+ * 绝不误删客户端需要的数据；且<b>一次失败即永久停用本过滤</b>（见 {@link #onPacketSending}）——包形态与
+ * 预期不符通常是结构性的，继续运行只会在封包线程上反复抛异常、刷日志。
  */
 public final class EntityMetadataFilter extends PacketAdapter implements Listener {
 
-  /** 需要拦截的包：元数据本身 + 全部实体生成包（生成意味着客户端实体状态被重置）。 */
-  private static final PacketType[] PACKET_TYPES = {
+  /**
+   * 希望拦截的包：元数据本身 + 全部实体生成包（生成意味着客户端实体状态被重置）。
+   *
+   * <p>其中若干生成包是旧版专属的：现代 MC 已把所有实体生成统一到 {@code SPAWN_ENTITY}，这些类型在本
+   * 服务端并未注册。对未注册的类型注册监听会被 ProtocolLib 打 WARN（并在其内部「报告过滤」里抛
+   * IllegalArgumentException），因此构造期用 {@link PacketType#isSupported()} 只保留本服务端实际存在的
+   * 类型（见 {@link #supportedPacketTypes()}）。本项目只兼容最新版本，不做旧版兼容。
+   */
+  private static final PacketType[] CANDIDATE_TYPES = {
       PacketType.Play.Server.ENTITY_METADATA,
       PacketType.Play.Server.SPAWN_ENTITY,
       PacketType.Play.Server.SPAWN_ENTITY_LIVING,
@@ -64,7 +72,16 @@ public final class EntityMetadataFilter extends PacketAdapter implements Listene
   private final ProtocolManager protocolManager;
   private final BandwidthConfig.EntityMetadata config;
   private final ThrottleStats stats;
+  /** 本服务端实际注册的包类型（构造期过滤，见 {@link #supportedPacketTypes()}）。 */
+  private final PacketType[] packetTypes;
   private final AtomicInteger errorCounter = new AtomicInteger();
+  /**
+   * 本服务端 ProtocolLib 无法解析实体元数据时置位：此后永久跳过处理（fail-open，只记一次日志）。
+   *
+   * <p>判据见 {@link #onPacketSending}：一旦读取元数据条目抛异常，即说明该服务端的包形态与 ProtocolLib
+   * 的预期不符，继续运行只会在封包线程上反复抛异常、刷日志。重载 / 重启会重建本模块，从而重新评估。
+   */
+  private volatile boolean disabled;
 
   /**
    * 玩家 → (实体 id → (元数据索引 → 上次已下发的值))。
@@ -76,15 +93,42 @@ public final class EntityMetadataFilter extends PacketAdapter implements Listene
 
   public EntityMetadataFilter(Plugin plugin, ProtocolManager protocolManager,
       BandwidthConfig.EntityMetadata config, ThrottleStats stats) {
-    super(plugin, ListenerPriority.NORMAL, PACKET_TYPES);
+    this(plugin, protocolManager, config, stats, supportedPacketTypes());
+  }
+
+  private EntityMetadataFilter(Plugin plugin, ProtocolManager protocolManager,
+      BandwidthConfig.EntityMetadata config, ThrottleStats stats, PacketType[] packetTypes) {
+    super(plugin, ListenerPriority.NORMAL, packetTypes);
     this.plugin = plugin;
     this.protocolManager = protocolManager;
     this.config = config;
     this.stats = stats;
+    this.packetTypes = packetTypes;
+  }
+
+  /**
+   * 只保留本服务端实际注册的包类型。
+   *
+   * <p>{@link PacketType#isSupported()}（内部为 {@code PacketRegistry.isSupported}）判定的正是「该类型在
+   * 当前服务端是否有对应封包类」——对未注册类型注册监听即触发 ProtocolLib 的 unknown packet WARN 与其
+   * 报告过滤异常。按当前版本动态筛选，而不是硬编码，可保证换版本后依然干净。
+   */
+  private static PacketType[] supportedPacketTypes() {
+    List<PacketType> supported = new ArrayList<>(CANDIDATE_TYPES.length);
+    for (PacketType type : CANDIDATE_TYPES) {
+      if (type.isSupported()) {
+        supported.add(type);
+      }
+    }
+    return supported.toArray(new PacketType[0]);
   }
 
   /** 注册封包监听与退出清理。 */
   public void start() {
+    if (packetTypes.length == 0) {
+      plugin.getLogger().info("带宽模块已跳过：实体元数据不变值剔除（本服务端未注册所需的包类型）");
+      return;
+    }
     protocolManager.addPacketListener(this);
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     plugin.getLogger().info("带宽模块已启用：实体元数据不变值剔除（每玩家最多缓存 "
@@ -114,7 +158,7 @@ public final class EntityMetadataFilter extends PacketAdapter implements Listene
 
   @Override
   public void onPacketSending(PacketEvent event) {
-    if (event.isCancelled() || event.getPlayer() == null) {
+    if (disabled || event.isCancelled() || event.getPlayer() == null) {
       return;
     }
     // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API
@@ -129,8 +173,17 @@ public final class EntityMetadataFilter extends PacketAdapter implements Listene
         invalidate(event);
       }
     } catch (Throwable throwable) {
-      // fail-open：字段形态与预期不符时放行原包，绝不误删
-      logThrottled(throwable);
+      // fail-open：字段形态与预期不符时放行原包，绝不误删；但一次失败即永久停用本过滤。
+      // 若本服务端的 ProtocolLib 读不出实体元数据形态（实测其数据条目类解析停留在旧名
+      // DataWatcher$Item / SynchedEntityData$DataItem，识别不了本服务端的 SynchedEntityData$DataValue），
+      // 则每个元数据包都会在此抛异常——继续运行只会在封包线程上反复抛异常、刷日志，毫无收益。
+      disabled = true;
+      if (errorCounter.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
+        // 只打一行（不含堆栈）：这是已识别的、可预期的服务端/ProtocolLib 版本不匹配，不是需要排查的崩溃
+        plugin.getLogger().warning(
+            "实体元数据不变值剔除已停用：本服务端的 ProtocolLib 无法解析实体元数据（" + throwable
+                + "）——fail-open，原包照常下发；如需该功能，请更新为与服务端版本匹配的 ProtocolLib");
+      }
     }
   }
 
@@ -204,11 +257,5 @@ public final class EntityMetadataFilter extends PacketAdapter implements Listene
       stats.entityMetadataEvicted.increment();
     }
     return entities.computeIfAbsent(entityId, id -> new ConcurrentHashMap<>());
-  }
-
-  private void logThrottled(Throwable throwable) {
-    if (errorCounter.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
-      plugin.getLogger().log(Level.WARNING, "实体元数据剔除判定失败，已按原包放行", throwable);
-    }
   }
 }
