@@ -57,17 +57,6 @@ public final class ThrottleStats {
   public final LongAdder frustumHidden = new LongAdder();
   public final LongAdder frustumShown = new LongAdder();
 
-  /**
-   * 实体元数据「不变值剔除」：整包取消数 / 被剔除的冗余条目数 / 缓存安全阀清空次数。
-   *
-   * <p>{@code entityMetadataCancelled} 计的是「整包完全冗余、直接不发」的包数；条目数计的是
-   * 「包仍要发、但其中若干条目与上次相同被剔除」的条目数。安全阀清空是内存上界的代价，
-   * 正常运营下应接近 0（非 0 说明单名玩家追踪的实体数超过了配置上限）。
-   */
-  public final LongAdder entityMetadataCancelled = new LongAdder();
-  public final LongAdder entityMetadataEntriesDropped = new LongAdder();
-  public final LongAdder entityMetadataEvicted = new LongAdder();
-
   /** AFK 降级：进入 AFK 次数 / 丢弃的低价值包数。 */
   public final LongAdder afkEntered = new LongAdder();
   public final LongAdder afkPacketsDropped = new LongAdder();

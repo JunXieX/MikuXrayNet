@@ -141,14 +141,6 @@ entity-culling:
     # 调大更保守（如 48/64，几乎察觉不到剔除）；上限 1024（越大越多实体不被剔除、越安全）。
     min-distance: 24.0
 
-entity-metadata:
-  # 模块总开关。false = 本模块完全关闭（零开销）。
-  enabled: true
-
-  # 每名玩家最多缓存的实体数：超出后整体清空（只短期少省一点包，不影响正确性，并计入安全阀计数）。
-  # 上限 4096（越大越省包，内存可控）；默认 256。
-  max-tracked-per-player: 256
-
 afk:
   # 模块总开关。false = 本模块完全关闭（零开销）。
   enabled: true

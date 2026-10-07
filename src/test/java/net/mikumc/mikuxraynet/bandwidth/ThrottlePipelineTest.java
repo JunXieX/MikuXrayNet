@@ -42,7 +42,6 @@ class ThrottlePipelineTest {
     assertTrue(plan.entityPackets(), "默认应注册零位移实体包取消");
     assertTrue(plan.blockChanges(), "默认应注册方块变更合并");
     assertTrue(plan.entityCulling(), "默认应注册实体射线剔除");
-    assertTrue(plan.entityMetadata(), "默认应注册实体元数据不变值剔除");
     assertTrue(plan.afk(), "默认应注册 AFK 降级");
     assertTrue(plan.latency(), "默认应注册高延迟降视距");
   }
@@ -55,16 +54,6 @@ class ThrottlePipelineTest {
     assertFalse(ThrottlePipeline.plan(
         config("entity-culling:\n  raycast: false\n  frustum:\n    enabled: false\n"))
         .entityCulling(), "两个子项全关时本模块必须完全不注册");
-  }
-
-  /** 元数据剔除模块可独立关闭（protocolLib 可用性由 start() 判定，不在 plan 里）。 */
-  @Test
-  void entityMetadataDisabledIsNotRegistered() {
-    assertFalse(ThrottlePipeline.plan(
-        config("entity-metadata:\n  enabled: false\n")).entityMetadata(),
-        "entity-metadata.enabled=false 时必须完全不注册");
-    assertTrue(ThrottlePipeline.plan(config("entity-culling:\n  enabled: false\n")).entityMetadata(),
-        "关闭实体剔除不得影响元数据剔除模块");
   }
 
   @Test
@@ -88,12 +77,11 @@ class ThrottlePipelineTest {
     assertFalse(ThrottlePipeline.plan(config("entity-packets:\n  enabled: false\n")).entityPackets());
     assertFalse(ThrottlePipeline.plan(config("block-changes:\n  enabled: false\n")).blockChanges());
     assertFalse(ThrottlePipeline.plan(config("entity-culling:\n  enabled: false\n")).entityCulling());
-    assertFalse(ThrottlePipeline.plan(config("entity-metadata:\n  enabled: false\n")).entityMetadata());
 
     // 每个用例都只关一个模块，其余仍应注册（互相独立）
     ThrottlePipeline.ModulePlan onlyAfkOff = ThrottlePipeline.plan(config("afk:\n  enabled: false\n"));
     assertTrue(onlyAfkOff.entityPackets() && onlyAfkOff.blockChanges()
-        && onlyAfkOff.entityCulling() && onlyAfkOff.entityMetadata() && onlyAfkOff.latency());
+        && onlyAfkOff.entityCulling() && onlyAfkOff.latency());
   }
 
   @Test
@@ -103,7 +91,6 @@ class ThrottlePipelineTest {
     assertFalse(plan.entityPackets(), "总开关关闭时不注册任何子模块");
     assertFalse(plan.blockChanges());
     assertFalse(plan.entityCulling());
-    assertFalse(plan.entityMetadata());
     assertFalse(plan.afk());
     assertFalse(plan.latency());
   }

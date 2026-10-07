@@ -123,27 +123,23 @@ public final class Diagnostics {
     }
 
     /**
-     * 带宽域：零位移取消、变更合并、实体剔除（含复检与视锥口径）、元数据剔除与 AFK / 降视距计数。
+     * 带宽域：零位移取消、变更合并、实体剔除（含复检与视锥口径）与 AFK / 降视距计数。
      *
      * @param frustumHidden             因「视野锥外 + 超出距离门」被隐藏的实体数（视锥剔除子项）
      * @param frustumShown              转头后经复检恢复的视锥隐藏实体数（视锥剔除子项的恢复侧）
-     * @param entityMetadataCancelled   整包冗余、被直接取消的实体元数据包数
-     * @param entityMetadataDropped     包仍要发、但其中被剔除的冗余条目数
-     * @param entityMetadataEvicted     元数据缓存「每玩家条目数」安全阀清空次数（正常应接近 0）
      */
     public record Throttle(long entityPacketsCancelled, long entityPacketsPassed,
         long blockMergeBatches, long blockChangesMerged, long blockChangesPassed,
         long entitiesHidden, long entitiesShown, int entitiesHiddenNow,
         long recheckSubmitted, long recheckHidden, long recheckShown,
         long frustumHidden, long frustumShown,
-        long entityMetadataCancelled, long entityMetadataDropped, long entityMetadataEvicted,
         int afkPlayers, long afkEntered, long afkPacketsDropped,
         long viewDistanceReduced, long viewDistanceRestored,
         long blockMergeFlushes, long blockMergeFlushNanos) {
 
       /** 带宽优化未启用时的零值兜底。 */
       public static final Throttle EMPTY = new Throttle(
-          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L);
+          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     /** 工作线程池域：线程数、活动数与队列占用。 */
@@ -312,9 +308,6 @@ public final class Diagnostics {
             pipeline.hiddenEntityCount(), throttleStats.recheckSubmitted.sum(),
             throttleStats.recheckHidden.sum(), throttleStats.recheckShown.sum(),
             throttleStats.frustumHidden.sum(), throttleStats.frustumShown.sum(),
-            throttleStats.entityMetadataCancelled.sum(),
-            throttleStats.entityMetadataEntriesDropped.sum(),
-            throttleStats.entityMetadataEvicted.sum(),
             pipeline.afkPlayerCount(), throttleStats.afkEntered.sum(),
             throttleStats.afkPacketsDropped.sum(), throttleStats.viewDistanceReduced.sum(),
             throttleStats.viewDistanceRestored.sum(), throttleStats.blockMergeFlushes.sum(),
@@ -427,9 +420,6 @@ public final class Diagnostics {
         // 视锥剔除单列：它的失效模式是「转头后实体迟一步出现」，与射线剔除（该看见的被藏）完全不同，
         // 分列后管理员据此判断该不该调大 frustum.min-distance 或关掉该子项。
         + "）｜视锥剔除 隐藏 " + s.throttle().frustumHidden() + "/恢复 " + s.throttle().frustumShown());
-    lines.add("带宽：元数据剔除 取消 " + s.throttle().entityMetadataCancelled()
-        + "（剔除冗余条目 " + s.throttle().entityMetadataDropped()
-        + "，安全阀清空 " + s.throttle().entityMetadataEvicted() + "）");
     lines.add("带宽：AFK 玩家 " + s.throttle().afkPlayers() + "（累计进入 " + s.throttle().afkEntered()
         + "），AFK 丢包 " + s.throttle().afkPacketsDropped() + "，降视距 " + s.throttle().viewDistanceReduced()
         + "/还原 " + s.throttle().viewDistanceRestored());
@@ -503,7 +493,6 @@ public final class Diagnostics {
         + "｜变更合并 " + c.blockChanges().enabled()
         + "｜调色板压缩 " + paletteSwitch(c.palette())
         + "｜实体剔除 " + entityCullingSwitch(c.entityCulling())
-        + "｜元数据剔除 " + c.entityMetadata().enabled()
         + "｜AFK 降级 " + afkSwitch(c.afk())
         + "｜高延迟降视距 " + c.latency().enabled();
   }
@@ -745,9 +734,6 @@ public final class Diagnostics {
             ? "无"
             : Math.max(c.entityCulling().frustum().minDistance(),
                 c.entityCulling().forceVisibleDistance()))
-        .append('\n');
-    sb.append("entity-metadata.enabled=").append(c.entityMetadata().enabled())
-        .append("，max-tracked-per-player=").append(c.entityMetadata().maxTrackedPerPlayer())
         .append('\n');
     sb.append("afk.enabled=").append(c.afk().enabled())
         .append("，seconds=").append(c.afk().seconds())

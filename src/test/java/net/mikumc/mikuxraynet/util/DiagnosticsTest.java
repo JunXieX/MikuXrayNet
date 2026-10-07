@@ -40,7 +40,7 @@ class DiagnosticsTest {
         new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 40L, 6L),
         new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L),
         new Diagnostics.Snapshot.Throttle(20L, 30L, 4L, 40L, 12L,
-            6L, 5L, 4, 40L, 7L, 3L, 11L, 2L, 13L, 21L, 0L,
+            6L, 5L, 4, 40L, 7L, 3L, 11L, 2L,
             2, 3L, 8L, 9L, 4L, 5L, 25_000_000L),
         new Diagnostics.Snapshot.Pool(4, 2, 10, 2048),
         new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2, 4L, 5L, 6L, 1L, 0L, 0L),
@@ -178,8 +178,6 @@ class DiagnosticsTest {
         "状态面板必须单列周期复检口径，否则「先可见后被遮挡」是否被收敛到隐藏无法观测：" + text);
     assertTrue(text.contains("视锥剔除 隐藏 11/恢复 2"),
         "视锥剔除必须单列隐藏/恢复计数（其失效模式是「转头后实体迟一步出现」，与射线剔除不同）：" + text);
-    assertTrue(text.contains("元数据剔除 取消 13（剔除冗余条目 21，安全阀清空 0）"),
-        "元数据剔除必须分列整包取消数、被剔除的条目数与安全阀清空次数：" + text);
     assertTrue(text.contains("单线程冲刷 5 次（累计 25.0 ms，平均 5.00 ms/次）"),
         "状态面板必须暴露单线程合并冲刷的次数与耗时（极端配置下的延迟瓶颈观测口径）：" + text);
     assertTrue(text.contains("磁盘缓存"), text);

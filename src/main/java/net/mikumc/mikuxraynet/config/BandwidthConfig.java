@@ -92,8 +92,6 @@ public final class BandwidthConfig {
    * 属明显的观感损伤配置，故设安全下限；低于 30 会被抬到 30 并记入明细（供加载路径一次性 WARN）。
    */
   public static final double MIN_FRUSTUM_FOV = 30.0D;
-  /** 元数据缓存「每玩家实体数」上限：越高越省包（内存可控），故放宽到 4096。 */
-  public static final int MAX_METADATA_TRACKED_PER_PLAYER = 4096;
 
   /**
    * 零位移实体包抑制。
@@ -184,19 +182,6 @@ public final class BandwidthConfig {
     }
   }
 
-  /**
-   * 实体元数据「不变值剔除」。
-   *
-   * <p>{@code ENTITY_METADATA} 包中「与上次已下发给该玩家的值完全相同」的条目不再重发；整包全部冗余
-   * 时直接取消该包。很多插件每 tick 重设实体名 / 血量等元数据，客户端其实早已持有同样的值。
-   *
-   * @param enabled             模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
-   * @param maxTrackedPerPlayer 每名玩家最多缓存的实体数：超出即整体清空（只短期少省一点包，不影响正确性，
-   *                            且计入安全阀计数可供诊断）；上限 {@value #MAX_METADATA_TRACKED_PER_PLAYER}。
-   */
-  public record EntityMetadata(boolean enabled, int maxTrackedPerPlayer) {
-  }
-
   /** AFK 降级。{@code enabled} 为模块总开关，关闭时本模块完全不注册（零开销）。 */
   public record Afk(boolean enabled, int seconds, double distance, boolean dropParticles,
       boolean dropBlockBreakAnimation) {
@@ -216,7 +201,6 @@ public final class BandwidthConfig {
   private final BlockChanges blockChanges;
   private final Palette palette;
   private final EntityCulling entityCulling;
-  private final EntityMetadata entityMetadata;
   private final Afk afk;
   private final Latency latency;
   private final Diagnostics diagnostics;
@@ -226,14 +210,13 @@ public final class BandwidthConfig {
   private final List<String> clampAdjustments;
 
   private BandwidthConfig(boolean enabled, EntityPackets entityPackets, BlockChanges blockChanges, Palette palette,
-      EntityCulling entityCulling, EntityMetadata entityMetadata, Afk afk, Latency latency,
+      EntityCulling entityCulling, Afk afk, Latency latency,
       Diagnostics diagnostics, List<String> clampAdjustments) {
     this.enabled = enabled;
     this.entityPackets = entityPackets;
     this.blockChanges = blockChanges;
     this.palette = palette;
     this.entityCulling = entityCulling;
-    this.entityMetadata = entityMetadata;
     this.afk = afk;
     this.latency = latency;
     this.diagnostics = diagnostics;
@@ -312,11 +295,6 @@ public final class BandwidthConfig {
                 clampUpper(root.getDouble("entity-culling.frustum.min-distance", 24.0D),
                     24.0D, MAX_FRUSTUM_MIN_DISTANCE, "entity-culling.frustum.min-distance",
                     clampAdjustments))),
-        new EntityMetadata(
-            root.getBoolean("entity-metadata.enabled", true),
-            clampUpper(Math.max(1, root.getInt("entity-metadata.max-tracked-per-player", 256)),
-                MAX_METADATA_TRACKED_PER_PLAYER, "entity-metadata.max-tracked-per-player",
-                clampAdjustments)),
         new Afk(
             root.getBoolean("afk.enabled", true),
             clampUpper(Math.max(1, root.getInt("afk.seconds", 300)),
@@ -451,7 +429,7 @@ public final class BandwidthConfig {
    * <p>热重载时用它判断「带宽侧配置是否变化」（见 {@code ReloadCoordinator}）。
    */
   public int configHash() {
-    return Objects.hash(enabled, entityPackets, blockChanges, palette, entityCulling, entityMetadata,
+    return Objects.hash(enabled, entityPackets, blockChanges, palette, entityCulling,
         afk, latency, diagnostics);
   }
 
@@ -473,10 +451,6 @@ public final class BandwidthConfig {
 
   public EntityCulling entityCulling() {
     return entityCulling;
-  }
-
-  public EntityMetadata entityMetadata() {
-    return entityMetadata;
   }
 
   public Afk afk() {
