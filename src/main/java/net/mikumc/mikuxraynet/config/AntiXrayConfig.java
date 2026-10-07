@@ -966,8 +966,12 @@ public final class AntiXrayConfig {
         // 手滑多打一位数会同时放大线程数与这部分常驻内存。
         clampCeiling(root.getInt("advanced.threads", 0), 0, ADVANCED_THREADS_MAX,
             "advanced.threads", floorAdjustments, ceilingAdjustments),
-        clampCeiling(root.getInt("advanced.timeout-millis", 2500), 100, ADVANCED_TIMEOUT_MILLIS_MAX,
-            "advanced.timeout-millis", floorAdjustments, ceilingAdjustments),
+        // advanced.timeout-millis：原实现不带下限（有效下限由构造器的 Math.max(100, ...) 统一兜住），
+        // 此处只补上限（15 项修复回归：不得凭空抬高管理员 <100 的配置值）。
+        // 上限见 ADVANCED_TIMEOUT_MILLIS_MAX：超时上限直接决定单任务能挂住一条工作线程多久。
+        clampCeiling(root.getInt("advanced.timeout-millis", 2500), Integer.MIN_VALUE,
+            ADVANCED_TIMEOUT_MILLIS_MAX, "advanced.timeout-millis",
+            floorAdjustments, ceilingAdjustments),
         // 上限见 ADVANCED_QUEUE_CAPACITY_MAX：每个排队项都钉着一个区块封包，
         // 队列容量直接决定积压时钉住多少内存。
         clampCeiling(root.getInt("advanced.queue-capacity", 2048), 1, ADVANCED_QUEUE_CAPACITY_MAX,

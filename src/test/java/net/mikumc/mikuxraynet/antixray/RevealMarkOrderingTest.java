@@ -184,6 +184,32 @@ class RevealMarkOrderingTest {
   }
 
   /**
+   * 批量路径的回显记号<b>必须后于发包</b>：发包失败时不得留下记号，否则会出现「记号在、包没发成」的窗口，
+   * 其间该坐标的<b>真实</b>方块变更会被误判为回显而漏摘共享索引（其他玩家看到幻影伪装）。
+   */
+  @Test
+  void batchEchoMarkerIsWrittenOnlyAfterSendSucceeds() {
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
+    List<int[]> positions = List.of(new int[] {1, 64, 1});
+
+    int[] fresh = revealer.claimForSend(PLAYER, WORLD, positions);
+    assertEquals(1, fresh.length, "坐标应新登记");
+    assertFalse(revealer.consumeOurRevealEcho(PLAYER, WORLD, 1, 64, 1),
+        "只登记「已显形」时不得留下回显记号（记号必须后于发包）");
+
+    assertFalse(revealer.sendBatchOrRollback(PLAYER, WORLD, positions, fresh, () -> false),
+        "合并包未发出");
+    assertFalse(revealer.consumeOurRevealEcho(PLAYER, WORLD, 1, 64, 1),
+        "发包失败不得留下回显记号，否则真实变更会被误判为回显");
+
+    int[] again = revealer.claimForSend(PLAYER, WORLD, positions);
+    assertTrue(revealer.sendBatchOrRollback(PLAYER, WORLD, positions, again, () -> true),
+        "合并包已发出");
+    assertTrue(revealer.consumeOurRevealEcho(PLAYER, WORLD, 1, 64, 1),
+        "发包成功必须留下可消费的回显记号");
+  }
+
+  /**
    * <b>跨路径「恰好一次」</b>：同一坐标在同一 tick 先由周期批量路径（{@link ProximityRevealer#claimForSend}）
    * 登记，再由事件即时路径（{@link ProximityRevealer#markThenSend}）触发——单包路径的原子复核必须发现
    * 该坐标已显形并跳过发送，绝不重复发包、也不把这次计入「发送」。

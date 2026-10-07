@@ -431,6 +431,31 @@ class EntityCullerTest {
         "已隐藏实体仍须每周期复检（行为不退化）");
   }
 
+  /**
+   * 计数去重：同一实体「既已隐藏、又在轮转队列」时，单周期内的「复检提交」只应计一次。
+   *
+   * <p>通道①（已隐藏全量复检）与通道②（轮转分片）会各自遍历到它，若各计一次会让 {@code /mxnet status}
+   * 的「实体复检」虚增（≤ budget/周期）。去重只影响计数口径，通道②的射线评估照旧执行。
+   */
+  @Test
+  void recheckCountsHiddenAndRotatedEntityOncePerPass() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    // 遮挡恒为「完全遮挡」：入场首评即隐藏，同时经 onTrack 进入轮转队列（两通道交集）
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 4, frustumOff()), stats,
+        entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> true);
+
+    EntityStub entity = new EntityStub(4300, world); // 距玩家约 141 格：远超强制可见距离
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), entity.proxy()));
+    assertEquals(1, culler.hiddenCount(), "前置：该实体已被隐藏且已登记进轮转队列");
+
+    culler.recheck(player.proxy());
+    assertEquals(1L, stats.recheckSubmitted.sum(),
+        "既已隐藏又在轮转队列：单周期只计一次复检提交（通道②必须去重）");
+  }
+
   /** 复检通道的计数归属：由遮挡新隐藏 / 恢复可见都要计入「复检致隐藏 / 复检致恢复」。 */
   @Test
   void recheckEvaluationsAttributeNewHidesAndRestores() {

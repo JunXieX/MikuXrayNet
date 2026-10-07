@@ -824,7 +824,9 @@ public final class ProximityRevealer implements Listener {
     }
     try {
       ConcurrentHashMap<EchoKey, Long> perPlayer = revealEcho.get(playerId);
-      if (perPlayer == null) {
+      if (perPlayer == null || perPlayer.isEmpty()) {
+        // 稳态下记号当 tick 即被消费、内层 map 为空：空即早退，省去 netty 线程上每个变更坐标的
+        // EchoKey 分配（满载多方块变更包最多 4096 个坐标）与 remove 查找。
         return false;
       }
       Long expiry = perPlayer.remove(new EchoKey(worldName, x, y, z));
@@ -865,9 +867,9 @@ public final class ProximityRevealer implements Listener {
         }
       }
       if (fresh) {
-        // 记号：这批坐标即将发包（合并包失败会整批回滚已显形标记，回显记号最多久留 2 秒即失效，
-        // 因此不需要为它单独做回滚）
-        markOurReveal(playerId, worldName, position[0], position[1], position[2]);
+        // 这里只登记「已显形」标记（供跨路径判重）。回显记号必须等真正发包成功后再写
+        // （见 sendBatchOrRollback / flushBatch）：先写会在发包失败时留下「记号在、包没发成」的
+        // ≤2 秒窗口，其间该坐标的真实方块变更会被误判为回显而漏摘共享索引。
         claimed[count++] = i;
       }
     }
@@ -875,15 +877,21 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 合并包的「发包 + 失败整批回滚」步（包级可见，便于离线单测）。
+   * 合并包的「发包 + 成功补记回显记号 / 失败整批回滚」步（包级可见，便于离线单测）。
    *
-   * <p>调用方已在 {@link #claimForSend} 里完成原子复核与标记，这里只负责把 {@code fresh} 这批坐标
-   * 一次发出；发送失败则回滚这些坐标的标记（返回 false，调用方随后退化为逐坐标 {@link #markThenSend}，
+   * <p>调用方已在 {@link #claimForSend} 里完成原子复核与「已显形」标记，这里只负责把 {@code fresh} 这批
+   * 坐标一次发出：<b>发出成功</b>后才为它们补记回显记号（记号必须后于发包，见 {@link #claimForSend}）；
+   * 发送失败则回滚这些坐标的「已显形」标记（返回 false，调用方随后退化为逐坐标 {@link #markThenSend}，
    * 未发出的坐标后续周期仍会重试）。
    */
   boolean sendBatchOrRollback(UUID playerId, String worldName, List<int[]> positions, int[] fresh,
       java.util.function.BooleanSupplier send) {
     if (send.getAsBoolean()) {
+      // 回显记号写在发包成功之后：失败时不留记号，避免「记号在、包没发成」把随后的真实变更误判为回显
+      for (int index : fresh) {
+        int[] position = positions.get(index);
+        markOurReveal(playerId, worldName, position[0], position[1], position[2]);
+      }
       return true;
     }
     if (revealedSet != null) {
@@ -935,8 +943,8 @@ public final class ProximityRevealer implements Listener {
       return;
     }
 
-    // 标记由 claimForSend 写好；合并包失败时 sendBatchOrRollback 会整批回滚，届时逐坐标重新「复核 + 标记」。
-    boolean marksWritten = true;
+    // 「已显形」标记由 claimForSend 写好；合并包失败时 sendBatchOrRollback 会整批回滚，届时逐坐标重新「复核 + 标记」。
+    boolean revealedMarksWritten = true;
     if (fresh.length > 1) {
       Map<Position, BlockData> changes;
       try {
@@ -969,19 +977,22 @@ public final class ProximityRevealer implements Listener {
           }
           return;
         }
-        marksWritten = false; // 合并包未发出 → 本批标记已整批回滚
+        revealedMarksWritten = false; // 合并包未发出 → 本批「已显形」标记已整批回滚
       }
-      // changes 构建失败：标记仍在（marksWritten 保持 true），落到下面的逐坐标单包
+      // changes 构建失败：「已显形」标记仍在（revealedMarksWritten 保持 true），落到下面的逐坐标单包
     }
 
     for (int index : fresh) {
       int[] position = batch.positions.get(index);
       BlockData state = batch.states.get(index);
       boolean sent;
-      if (marksWritten) {
-        // 标记已在 claimForSend 写好：发送成功即保留，失败则回滚（该坐标仍在伪装清单里，后续周期重试）
+      if (revealedMarksWritten) {
+        // 「已显形」标记已在 claimForSend 写好：发送成功即保留并补记回显记号（记号必须后于发包），
+        // 失败则回滚（该坐标仍在伪装清单里，后续周期重试）
         sent = sendSingle(player, world, position[0], position[1], position[2], state);
-        if (!sent && revealedSet != null) {
+        if (sent) {
+          markOurReveal(playerId, worldName, position[0], position[1], position[2]);
+        } else if (revealedSet != null) {
           // 只回滚本玩家的标记（同 markThenSend），避免连带作废其它玩家的有效显形
           revealedSet.removePosition(playerId, worldName, position[0], position[1], position[2]);
         }

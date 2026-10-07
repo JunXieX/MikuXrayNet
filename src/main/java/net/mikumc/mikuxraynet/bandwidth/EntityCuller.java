@@ -4,9 +4,11 @@ import io.papermc.paper.event.player.PlayerTrackEntityEvent;
 import io.papermc.paper.event.player.PlayerUntrackEntityEvent;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -469,6 +471,9 @@ public final class EntityCuller implements Listener {
     //    读它们的任何状态都会触发 Folia 线程校验（先打 ERROR 再抛异常），因此先问能不能碰，不能则整轮跳过。
     //    本通道只做「强制可见距离内的恢复」（RESTORE_ONLY）：远距离不打射线，成本有界。
     Map<Integer, HiddenEntry> hiddenMap = hidden.get(playerId);
+    // 通道①本周期已计入「复检提交」的实体 id（供通道②去重，避免同一实体同周期被计两次）。
+    // 仅当通道①确实计过至少一条时才分配，避免无隐藏实体的常见情形产生无谓分配。
+    Set<Integer> countedByFirstPass = null;
     if (hiddenMap != null && !hiddenMap.isEmpty()) {
       List<Entity> stale = null;
       // hiddenMap 是并发 Map，遍历中 submitRaycast / showIfHidden 可能增删；弱一致迭代不会抛异常。
@@ -486,6 +491,10 @@ public final class EntityCuller implements Listener {
         }
         // 计数口径不变：每条「本区域 + 有效」的已隐藏记录每周期都算一次复检提交
         stats.recheckSubmitted.increment();
+        if (countedByFirstPass == null) {
+          countedByFirstPass = new HashSet<>();
+        }
+        countedByFirstPass.add(entity.getEntityId());
         if (withinForceVisible(player, entity)) {
           submitRaycast(player, entity, RecheckMode.RESTORE_ONLY);
           continue;
@@ -527,7 +536,11 @@ public final class EntityCuller implements Listener {
         rotation.remove(entity.getEntityId());
         continue;
       }
-      stats.recheckSubmitted.increment();
+      // 去重：本周期已被通道①计过的实体（既已隐藏又在轮转队列）不再重复计数，避免「复检提交」虚增。
+      // 射线评估照旧执行（该实体可能因遮挡物消失而恢复可见）。
+      if (countedByFirstPass == null || !countedByFirstPass.contains(entity.getEntityId())) {
+        stats.recheckSubmitted.increment();
+      }
       submitRaycast(player, entity, RecheckMode.ROTATION);
     }
   }
