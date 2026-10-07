@@ -63,9 +63,6 @@ public final class ZstdSupport {
   /** 缺省下载源（Maven Central 根地址）。 */
   public static final String DEFAULT_DOWNLOAD_URL = "https://repo1.maven.org/maven2";
 
-  /** 缺省等待上限（秒）。 */
-  public static final int DEFAULT_TIMEOUT_SECONDS = 10;
-
   /**
    * 自动下载文件的体积上限：16 MiB。
    *

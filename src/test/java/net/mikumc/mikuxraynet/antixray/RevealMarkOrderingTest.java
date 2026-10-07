@@ -34,7 +34,7 @@ class RevealMarkOrderingTest {
       new ObfuscatedChunkIndex(1_000_000, 300 * SECOND_NANOS, () -> clock[0]);
   private final RevealedSet revealed =
       new RevealedSet(1_000_000, 300 * SECOND_NANOS, () -> clock[0]);
-  private final ProximityRevealer revealer = new ProximityRevealer(null, null, config(), index,
+  private final ProximityRevealer revealer = new ProximityRevealer(null, config(), index,
       revealed, new ProximityStats(), null, null);
 
   private static AntiXrayConfig config() {

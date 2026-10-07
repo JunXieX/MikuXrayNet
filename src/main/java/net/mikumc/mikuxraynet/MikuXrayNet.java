@@ -7,7 +7,6 @@ import net.mikumc.mikuxraynet.bandwidth.ThrottlePipeline;
 import net.mikumc.mikuxraynet.bandwidth.ThrottleStats;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.MikuConfig;
-import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Diagnostics;
 import net.mikumc.mikuxraynet.util.ReloadCoordinator;
 import org.bukkit.Bukkit;

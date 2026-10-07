@@ -1,6 +1,5 @@
 package net.mikumc.mikuxraynet.antixray;
 
-import com.comphenix.protocol.ProtocolManager;
 import io.papermc.paper.math.Position;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
@@ -326,11 +325,10 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * @param protocolManager ProtocolLib 协议管理器。<b>保留形参以维持既有装配签名</b>——显形发包已改用
-   *                        Paper 原生 API（见类注释「发包纪律」），封包通道由本插件其它模块继续使用；
-   *                        本类不再读取它。
+   * <p><b>为什么不需要 ProtocolLib 协议管理器</b>：显形发包已改用 Paper 原生 API（见类注释「发包纪律」），
+   * 封包通道由本插件其它模块继续使用，本类不读取它——因此不留无用形参。
    */
-  public ProximityRevealer(Plugin plugin, ProtocolManager protocolManager, AntiXrayConfig config,
+  public ProximityRevealer(Plugin plugin, AntiXrayConfig config,
       ObfuscatedChunkIndex chunkIndex, RevealedSet revealedSet, ProximityStats stats,
       BypassRegistry bypassRegistry, MikuWorkPool workPool) {
     this.plugin = plugin;
@@ -1227,7 +1225,7 @@ public final class ProximityRevealer implements Listener {
       return;
     }
     if (hasDisguisedNearby(chunkIndex, worldName, x, y, z, instant.radius())) {
-      Schedulers.onEntity(plugin, player, () -> revealImmediately(player, worldName, x, y, z));
+      Schedulers.onEntity(plugin, player, () -> revealImmediately(player, x, y, z));
     }
   }
 
@@ -1321,7 +1319,7 @@ public final class ProximityRevealer implements Listener {
     }
     if (hasDisguisedNearSection(chunkIndex, worldName, coordinates, count, instant.radius())) {
       Schedulers.onEntity(plugin, player,
-          () -> revealSectionImmediately(player, worldName, coordinates, count));
+          () -> revealSectionImmediately(player, coordinates, count));
     }
   }
 
@@ -1366,7 +1364,7 @@ public final class ProximityRevealer implements Listener {
    * 取本 tick 剩余额度 → 逐偏移「仍在伪装清单 + 该玩家未显形过」→ 复用 {@link #sendOne}
    * （射线判定、发包、标记、统计全在既有链路里）。失败只记日志，绝不抛出。
    */
-  private void revealImmediately(Player player, String worldName, int cx, int cy, int cz) {
+  private void revealImmediately(Player player, int cx, int cy, int cz) {
     try {
       if (!player.isOnline()
           || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
@@ -1422,7 +1420,7 @@ public final class ProximityRevealer implements Listener {
    * 但只调度一个任务）。对每个变更坐标走同一套判定（身边半径、区块已加载、仍在伪装清单且未显形过），
    * 候选坐标跨变更坐标去重后复用 {@link #sendOne}，因此结果与逐坐标处理逐条一致。
    */
-  private void revealSectionImmediately(Player player, String worldName, int[] coordinates, int count) {
+  private void revealSectionImmediately(Player player, int[] coordinates, int count) {
     try {
       if (!player.isOnline()
           || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {

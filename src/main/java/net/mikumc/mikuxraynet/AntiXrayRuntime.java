@@ -220,8 +220,9 @@ public final class AntiXrayRuntime {
    * 邻近显形装配：索引为 null（配置关闭）或拿不到 ProtocolLib 协议管理器时只跳过该子模块，
    * 反矿透主体照常工作。
    *
-   * <p>方块变更观察监听器在「显形索引或磁盘缓存任一启用」时都会注册：它负责注销已显形的坐标
-   * （服务端自己下发了该坐标的变更 → 索引里那条记录不再可信）。
+   * <p>方块变更观察监听器只在「显形索引已建立」时注册：它的全部动作都以该索引与已显形集合为对象
+   * （磁盘缓存的有效性由负载里的原始字节指纹判定，与本监听器无关），索引为 null 时注册只会让每个
+   * 方块变更包在封包线程上白走一遍解析与空判定。
    */
   private void startProximity(AntiXrayConfig antiXray, ObfuscatedChunkIndex chunkIndex,
       RevealedSet revealed, ProximityStats stats) {
@@ -233,25 +234,18 @@ public final class AntiXrayRuntime {
 
     if (chunkIndex == null || revealed == null) {
       logger.info("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
-    }
-
-    if (diskCacheStore == null && chunkIndex == null) {
       return;
     }
 
     // 先建邻近显形器（持有显形链路），再把它交给方块变更观察监听器做事件驱动即时显形（P1-4）。
-    ProximityRevealer revealer = chunkIndex != null && revealed != null
-        ? new ProximityRevealer(plugin, protocolManager, antiXray, chunkIndex, revealed, stats,
-            bypassRegistry, workPool)
-        : null;
+    ProximityRevealer revealer = new ProximityRevealer(plugin, antiXray, chunkIndex, revealed, stats,
+        bypassRegistry, workPool);
     this.blockChangeRevealListener = new BlockChangeRevealListener(plugin, protocolManager,
         antiXray, chunkIndex, revealed, stats, revealer);
     try {
       blockChangeRevealListener.start();
-      if (revealer != null) {
-        this.proximityRevealer = revealer;
-        revealer.start();
-      }
+      this.proximityRevealer = revealer;
+      revealer.start();
     } catch (Throwable throwable) {
       logger.warning("邻近显形装配失败（不影响反矿透主体）：" + throwable.getMessage());
       stopProximity();

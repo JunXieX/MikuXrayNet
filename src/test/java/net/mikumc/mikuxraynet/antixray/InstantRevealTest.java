@@ -29,7 +29,7 @@ class InstantRevealTest {
 
   /** 默认配置构造显形器（事件显形默认开启）；离线构造只需纯数据依赖，Bukkit 组件传 null。 */
   private ProximityRevealer revealer() {
-    return new ProximityRevealer(null, null, config(), new ObfuscatedChunkIndex(1, 300),
+    return new ProximityRevealer(null, config(), new ObfuscatedChunkIndex(1, 300),
         new RevealedSet(1024, 300), new ProximityStats(), null, null);
   }
 
@@ -127,7 +127,7 @@ class InstantRevealTest {
     index.recordChunk(WORLD, 0, 0, 0, new int[] {64 << 8 | 10 << 4 | 10});
 
     UUID player = UUID.randomUUID();
-    ProximityRevealer revealer = new ProximityRevealer(null, null, config(), index, revealed,
+    ProximityRevealer revealer = new ProximityRevealer(null, config(), index, revealed,
         new ProximityStats(), null, null);
 
     assertTrue(revealer.isInstantCandidate(player, WORLD, 10, 64, 10),

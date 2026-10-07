@@ -78,10 +78,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     /** 累计逐出的闸门数（诊断用；逐出行为本身不变）。 */
     private long evictions;
 
-    BatchTable() {
-      this(MAX_PENDING_BATCHES, null);
-    }
-
     /** 测试用构造：可指定容量上限（不输出日志）。 */
     BatchTable(int maxPending) {
       this(maxPending, null);
