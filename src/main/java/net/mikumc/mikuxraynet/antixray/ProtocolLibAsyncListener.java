@@ -1023,15 +1023,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     logThrottled(message, message, throwable);
   }
 
-  /** 取消定时器：失败无副作用（闸门已置位，兜底触发只会空转），绝不能顶掉放行动作。 */
-  private static void cancelQuietly(ScheduledFuture<?> timeout) {
-    try {
-      timeout.cancel(false);
-    } catch (Throwable ignored) {
-      // 取消失败不影响「恰好一次放行」
-    }
-  }
-
   /**
    * 按 {@code throttleKey} 分别限流：同一分类最多提示 {@link Constants#MAX_ERROR_LOGS} 次，WARN 级别。
    *
