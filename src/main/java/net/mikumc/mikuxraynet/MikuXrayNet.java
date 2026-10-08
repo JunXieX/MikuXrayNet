@@ -36,7 +36,14 @@ import org.bukkit.plugin.java.JavaPlugin;
 public final class MikuXrayNet extends JavaPlugin {
 
   private MikuConfig config;
-  private ThrottlePipeline throttlePipeline;
+  /**
+   * 带宽管线（热重载时整体停旧建新）。
+   *
+   * <p><b>为什么是 volatile</b>：写发生在命令线程（reload 的「停旧建新」），读发生在周期诊断任务所在的
+   * 全局区域线程。首次发布由「任务提交」提供一次 happens-before，但 reload 的重建发生在任务早已运行
+   * 之后，之后两边再无同步点——非 volatile 会让诊断线程读到旧引用（最坏短暂显示旧计数）。
+   */
+  private volatile ThrottlePipeline throttlePipeline;
   /**
    * 带宽统计持有者：<b>插件级唯一</b>，跨热重载复用。
    *
@@ -44,11 +51,16 @@ public final class MikuXrayNet extends JavaPlugin {
    * 累计口径失去连续性。把它提到插件层后，管线重建不影响计数，{@code /mxnet status} 字段语义不变。
    */
   private final ThrottleStats throttleStats = new ThrottleStats();
-  private Diagnostics diagnostics;
+  /** 诊断转储 / status 数据源（热重载时重建；volatile 原因同 {@link #throttlePipeline}）。 */
+  private volatile Diagnostics diagnostics;
   /** 周期运行摘要任务（bandwidth.yml: diagnostics.interval-seconds；0 = 关闭）。 */
   private ScheduledTask diagnosticsTask;
-  /** 反矿透侧运行时（ProtocolLib 接入、工作池、显形结构、磁盘缓存、直通名单）；onEnable 起可用。 */
-  private AntiXrayRuntime runtime;
+  /**
+   * 反矿透侧运行时（ProtocolLib 接入、工作池、显形结构、磁盘缓存、直通名单）；onEnable 起可用。
+   *
+   * <p><b>为什么是 volatile</b>：同 {@link #throttlePipeline}——命令线程停旧建新、诊断任务的全局区域线程读取。
+   */
+  private volatile AntiXrayRuntime runtime;
 
   private final ReloadCoordinator reloadCoordinator = new ReloadCoordinator();
 

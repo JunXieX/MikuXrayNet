@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
@@ -80,5 +81,26 @@ class RewriteTaskTest {
     assertFalse(task.releaseOnTimeout(), "兜底只生效一次");
     assertFalse(task.tryBeginWrite(), "已被兜底放行的任务不得再取得写入权");
     assertEquals(1, deliveries.get());
+  }
+
+  /**
+   * 放行动作自身抛异常时，{@code signalOnce()} 绝不能让异常外抛。
+   *
+   * <p>看门狗路径的异常会被 {@code ScheduledFuture} 静默吞掉、工作线程路径会被 {@code FutureTask}
+   * 静默吞掉——异常一旦外抛就既不可观测，又会顶掉调用方 finally 链里尚未执行的清理；
+   * 而 CAS 已消耗，重启放行没有语义（多为连接已销毁），故只能提示后静默。
+   */
+  @Test
+  void deliveryFailureDoesNotPropagate() {
+    AtomicBoolean attempted = new AtomicBoolean();
+    RewriteTask task = new RewriteTask(0, 0, "world", -64, 24, 10_000L, () -> {
+      attempted.set(true);
+      throw new IllegalStateException("连接已销毁");
+    });
+
+    task.signalOnce();
+
+    assertTrue(attempted.get(), "放行动作必须被调用过");
+    assertFalse(task.releaseOnTimeout(), "CAS 已消耗，迟到的兜底不得再放行一次");
   }
 }

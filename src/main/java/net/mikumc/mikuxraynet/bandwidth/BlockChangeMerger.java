@@ -485,7 +485,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         }
         boolean overflow = false;
         for (Update<WrappedBlockData> update : updates) {
-          overflow |= target.batch.add(update.x(), update.y(), update.z(), update.value());
+          // 直接复用解析阶段已构造的 Update 实例（避免同一坐标再造一个等值 record）
+          overflow |= target.batch.add(update);
           // 本坐标刚被重新缓冲：此刻缓冲条目才是最新的，必须撤销「已被更新下发覆盖」的标记。
           // 否则上一轮「立即放行 / 直通批量包」留下的标记会在 flush 时把这条更新的变更当旧态误删（丢更新）。
           target.passed.remove(new Coord(update.x(), update.y(), update.z()));

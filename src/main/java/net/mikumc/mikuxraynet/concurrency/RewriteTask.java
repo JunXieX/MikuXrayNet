@@ -2,7 +2,10 @@ package net.mikumc.mikuxraynet.concurrency;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
+import net.mikumc.mikuxraynet.util.Constants;
 
 /**
  * 单个区块封包的改写任务：只承载「基本类型 / 不可变标识 + 世界名 + 维度」与放行状态机，
@@ -21,6 +24,10 @@ public final class RewriteTask {
   private static final int GATE_OPEN = 0;
   private static final int GATE_WRITING = 1;
   private static final int GATE_DONE = 2;
+
+  private static final Logger LOGGER = Logger.getLogger("MikuXrayNet");
+  /** 放行动作失败提示计数：同类最多提示 {@link Constants#MAX_ERROR_LOGS} 次后静默。 */
+  private static final AtomicInteger DELIVERY_FAILURE_LOGS = new AtomicInteger();
 
   private final int chunkX;
   private final int chunkZ;
@@ -128,7 +135,18 @@ public final class RewriteTask {
   public void signalOnce() {
     if (signaled.compareAndSet(false, true)) {
       gate.set(GATE_DONE);
-      delivery.run();
+      // 放行动作绝不外抛：它是「恰好一次放行」的唯一执行体。若在此抛出，看门狗路径会被
+      // ScheduledFuture 静默吞掉、工作线程路径会被 FutureTask 静默吞掉——既不可观测，
+      // 又会顶掉调用方 finally 链里尚未执行的清理。CAS 已消耗，没有重试语义（多半是连接已销毁），
+      // 故按同类限流提示后静默。
+      try {
+        delivery.run();
+      } catch (Throwable throwable) {
+        if (DELIVERY_FAILURE_LOGS.incrementAndGet() <= Constants.MAX_ERROR_LOGS) {
+          LOGGER.log(Level.WARNING, "区块封包放行动作失败（该包可能未被放行，多为连接已销毁）"
+              + "（同类错误最多提示 " + Constants.MAX_ERROR_LOGS + " 次）", throwable);
+        }
+      }
     }
   }
 

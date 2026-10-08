@@ -483,8 +483,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 超时实时读「当前」配置（reload 立即生效），与区块路径一致。
       ScheduledFuture<?> timeout = workPool.scheduleTimeout(gate::forceRelease, live().timeoutMillis());
       gate.finish(() -> {
-        timeout.cancel(false);
-        asynchronousManager.signalPacketTransmission(event);
+        // 放行必须最先执行，且绝不外抛：闸门的 CAS 在动作<b>之前</b>就已消耗，动作一旦抛出，
+        // 超时兜底 forceRelease() 会因 CAS 失败而空转——CHUNK_BATCH_FINISHED 从此永久无人放行，
+        // 该玩家异步队列里的所有后续区块包全部滞留（客户端卡在区块加载界面直到重登）。
+        try {
+          asynchronousManager.signalPacketTransmission(event);
+        } catch (Throwable throwable) {
+          logThrottled("CHUNK_BATCH_FINISHED 放行失败（连接可能已销毁），不再重试", throwable);
+        } finally {
+          // 取消看门狗只是收尾：即便取消失败，兜底再触发也只会因闸门已置位而空转，不影响放行语义。
+          cancelQuietly(timeout);
+        }
       });
     } catch (Throwable throwable) {
       // 登记失败（例如插件正在停用）：立即归还这次延迟，绝不把批次结束包卡住
@@ -1012,6 +1021,15 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
   private void logThrottled(String message, Throwable throwable) {
     logThrottled(message, message, throwable);
+  }
+
+  /** 取消定时器：失败无副作用（闸门已置位，兜底触发只会空转），绝不能顶掉放行动作。 */
+  private static void cancelQuietly(ScheduledFuture<?> timeout) {
+    try {
+      timeout.cancel(false);
+    } catch (Throwable ignored) {
+      // 取消失败不影响「恰好一次放行」
+    }
   }
 
   /**

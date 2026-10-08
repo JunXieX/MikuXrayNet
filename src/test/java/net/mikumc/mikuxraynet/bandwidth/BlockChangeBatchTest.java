@@ -14,6 +14,24 @@ import org.junit.jupiter.api.Test;
 /** 方块变更合并逻辑：邻域聚簇、超限冲刷、冲刷后缓冲清空与条目集合正确。 */
 class BlockChangeBatchTest {
 
+  /**
+   * 复用已构造的 {@link Update} 实例（热路径省掉同一坐标的第二次等值分配）必须与四参重载语义一致：
+   * 上限判定与簇分组完全相同。
+   */
+  @Test
+  @DisplayName("add(Update) 重载与四参 add 语义一致")
+  void addUpdateOverloadMatchesFourArgSemantics() {
+    BlockChangeBatch<Integer> batch = new BlockChangeBatch<>(2);
+
+    assertFalse(batch.add(new Update<>(0, 64, 0, 1)), "未达上限应返回 false");
+    assertTrue(batch.add(new Update<>(1, 64, 0, 2)), "达到条目上限应返回 true");
+
+    List<List<Update<Integer>>> clusters = batch.drainClusters(2);
+    assertEquals(1, clusters.size(), "曼哈顿距离 1 内的两条变更应合并为一簇");
+    assertEquals(2, clusters.get(0).size());
+    assertTrue(batch.isEmpty(), "冲刷后缓冲必须清空");
+  }
+
   @Test
   @DisplayName("曼哈顿距离 2 内的邻域更新被合并为一簇")
   void mergesNeighborsWithinManhattanRadius() {

@@ -56,6 +56,16 @@ public final class BlockChangeBatch<V> {
   }
 
   /**
+   * 追加一条<b>已构造好</b>的变更（与 {@link #add(int, int, int, Object)} 语义、上限判定完全一致）。
+   *
+   * <p>供热路径直接复用封包解析阶段已构造的记录，省掉同一坐标的第二次等值分配。
+   */
+  public boolean add(Update<V> update) {
+    pending.add(update);
+    return pending.size() >= maxEntries;
+  }
+
+  /**
    * 按「曼哈顿距离不超过 radius」的邻域把待发变更聚成若干簇，并清空缓冲。
    *
    * <p><b>为什么改成网格分桶 + 并查集</b>：旧实现是「每簇 × while(grew) × 遍历簇内成员」三重循环，

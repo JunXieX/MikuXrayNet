@@ -13,7 +13,8 @@ import io.netty.buffer.ByteBuf;
  *   <li>bitsPerBlock=0 用单值调色板；读取时位宽 1 保留原值（兼容 FAWE 的非标准区块格式）；
  *       位宽 4..8 为间接调色板（{@code max(4, bitsPerBlock)} 仅对 4..8 是无操作）；
  *       位宽 2..3 视为非法编码并拒绝（旧实现静默归一化为 4 位，见 {@link #setBitsPerBlock} 注释）；
- *       位宽 &gt;8 一律按 direct 处理，且位宽取自 {@code registryAccessor.getMaxBitsPerBlockState()}；</li>
+ *       位宽 &gt;8 为 direct（global）格式，声明值必须等于 {@code registryAccessor.getMaxBitsPerBlockState()}
+ *       （位打包按声明值写出，声明值与注册表位宽不符同样拒绝，见 {@link #setBitsPerBlock} 注释）；</li>
  *   <li>{@link #grow(int, int)} 升位时会把旧调色板索引整体重映射到新调色板，因此方块状态语义不变，
  *       但调色板索引顺序可能改变；</li>
  *   <li>元素序号为 {@code y << 8 | z << 4 | x}（共 4096 项）；</li>
@@ -81,7 +82,21 @@ public class ChunkSection {
         this.bitsPerBlock = Math.max(4, bitsPerBlock);
         this.palette = new IndirectPalette(this.bitsPerBlock, this);
       } else {
-        this.bitsPerBlock = registryAccessor.getMaxBitsPerBlockState();
+        int registryBits = registryAccessor.getMaxBitsPerBlockState();
+        if (!grow && bitsPerBlock != registryBits) {
+          // 直接（direct/global）格式：**位打包是按声明的位宽写出的**——客户端按声明值解包
+          // （Configuration.Global(bitsInMemory, bitsInStorage)：存储位宽取声明值，读完再重排到内存位宽）。
+          // 声明 9..14（或 >registryBits）时若按注册表位宽重解释，同一段字节会被按错误位宽读出错值、
+          // 多读/少读若干 long，把后续（群系容器 / 下一个 section）的字节吞进方块数据；1.21.5+ 没有
+          // long 数组长度字段可校验（本项目目标 26.2），错位没有任何内建校验能兜住，
+          // 最坏把整块区块按垃圾字节重编码下发。故与位宽 2/3 同一处置：显式拒绝，交由上层解码 fail-open。
+          //
+          // 只对读取路径生效：升位路径 grow(9)（8 位间接调色板写满、出现第 257 个不同状态）是
+          // 本插件自己产生的合法中间态，必须继续按注册表位宽切到直接调色板。
+          throw new IllegalArgumentException("非法的直接格式位宽 bitsPerBlock=" + bitsPerBlock
+              + "（应为注册表位宽 " + registryBits + "）");
+        }
+        this.bitsPerBlock = registryBits;
         this.palette = new DirectPalette();
       }
 

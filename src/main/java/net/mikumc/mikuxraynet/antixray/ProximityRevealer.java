@@ -705,10 +705,11 @@ public final class ProximityRevealer implements Listener {
       }
     }
 
-    // 真实方块状态必须在玩家所属线程读取（本方法即运行在该线程上）
+    // 真实方块状态必须在玩家所属线程读取（本方法即运行在该线程上）。
+    // 用 World#getBlockData(x,y,z) 直取，避免 getBlockAt(...) 为每次显形多分配一个即用即丢的 Block 包装对象。
     BlockData data;
     try {
-      data = world.getBlockAt(x, y, z).getBlockData();
+      data = world.getBlockData(x, y, z);
     } catch (Throwable throwable) {
       logThrottled(throwable);
       data = null;

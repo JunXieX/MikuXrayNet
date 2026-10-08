@@ -168,6 +168,12 @@ public final class ObfuscatedChunkIndex {
    * 本次记录是否会触发容量安全阀淘汰（{@code 坐标总量 + 本次量 > 上限}）。
    *
    * <p>供调用方在热路径上做「是否需要准备淘汰收集容器」的零分配预判：常态下只读一次原子计数。
+   *
+   * <p><b>已知且刻意接受的竞态</b>：预判为 false（不准备容器）与真正 {@code recordChunkWithRemovals}
+   * 之间，若有并发记录推高总量，本次淘汰会带 null 容器静默发生——调用方拿不到被淘汰区块键，
+   * 无法作废其已显形标记（成为孤儿标记，最坏让「整块跳过」提前成立、个别坐标漏显形一次）。
+   * 触发条件双重稀有：安全阀正常运营恒为 0，且必须恰有并发记录同时触顶；为此在热路径多一次容器
+   * 分配（或让正常记录莫名失败）不划算，故按项目惯例明确接受并在此文档化。
    */
   public boolean mayEvict(int incoming) {
     return totalPositions.get() + incoming > maxPositions;

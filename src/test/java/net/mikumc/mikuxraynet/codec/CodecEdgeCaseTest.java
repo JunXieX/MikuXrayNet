@@ -145,6 +145,29 @@ class CodecEdgeCaseTest {
     }
   }
 
+  /**
+   * 直接（direct/global）格式的声明位宽若不等于注册表位宽，必须显式拒绝（交由上层 fail-open），
+   * 不得按注册表位宽重新解释。
+   *
+   * <p>位打包是按<b>声明的位宽</b>写出的：客户端按声明值解包（{@code Configuration.Global(bitsInMemory,
+   * bitsInStorage)}——存储位宽取声明值，读完再重排到内存位宽）。声明 9..14 或 &gt;15 时若按注册表位宽 15
+   * 重解释，同一段字节会被读出错值、多读/少读若干 long，把后续（群系容器 / 下一个 section）字节吞进
+   * 方块数据——1.21.5+ 没有 long 数组长度字段可校验，错位无内建校验能兜住，最坏整块按垃圾字节重编码。
+   */
+  @Test
+  void directSectionWithWrongBitWidthIsRejected() {
+    int[] blockStates = new int[4096];
+    for (int bits : new int[] {9, 12, 14, 16, 64}) {
+      byte[] raw = new TestChunkBuilder(MODERN)
+          .directSection(bits, 0, 0, blockStates, 0, new int[] {1})
+          .build();
+
+      ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+      assertThrows(IllegalArgumentException.class, () -> codec.decode(raw, 1),
+          "直接格式声明位宽 " + bits + " ≠ 注册表位宽 15，必须显式拒绝而不是按 15 位重解释");
+    }
+  }
+
   /** 调色板里出现重复的方块状态值即为损坏：必须在读取时拒绝（fail-open 由上层解码兜底）。 */
   @Test
   void duplicatePaletteValueIsRejected() {
