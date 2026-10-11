@@ -516,16 +516,22 @@ public final class DiskCacheStore implements AutoCloseable {
       // 必须在这里就返回，否则下面会把「写了但没落盘」的条目计进 approximateEntries，白白耗尽额度。
       return;
     }
-    if (handle.file.sizeBytes() + handle.pendingBytes >= maxFileSizeBytes) {
-      // 单文件上限：既看已落盘字节，也看尚未 append 的待落盘字节
-      // （bucket 是整块追加的，只看已落盘大小会让首次落盘一次性冲破上限）
+    int chunkIndex = BufferedLinearV3Format.chunkIndex(chunkX, chunkZ);
+    int bucket = BufferedLinearV3Format.bucketIndex(chunkIndex);
+    // 单文件上限：既看已落盘字节，也看尚未 append 的待落盘字节，并<b>把本次写入会引起的该桶编码增量
+    // 一并投影进去</b>。bucket 是整块追加的，若只看「写入之前的待落盘字节」（旧实现），本次写入可新增
+    // 整整一个桶的字节，于是上限随时可能被顶破（默认 16 MiB 上限下实测可到数十 MB）。
+    // 投影口径与下方记账用的 encodedBucketSizeEstimate 完全一致，故判定与记账不会漂移。
+    long projectedBucketBytes = handle.file.encodedBucketSizeEstimateAfterPut(chunkIndex, payload.length);
+    long projectedFileBytes = handle.file.sizeBytes() + handle.pendingBytes
+        - handle.pendingBucketBytes[bucket] + projectedBucketBytes;
+    if (projectedFileBytes >= maxFileSizeBytes) {
       stats.rejectedBySize.increment();
       return;
     }
 
     BufferedLinearV3Format.Entry entry =
         new BufferedLinearV3Format.Entry(0L, writtenAt, configHash, payload);
-    int chunkIndex = BufferedLinearV3Format.chunkIndex(chunkX, chunkZ);
     if (!handle.file.bucketRawLengthFitsAfterPut(chunkIndex, payload.length)) {
       // 加入本条后该桶的原始长度会超过读取侧上界（BufferedLinearV3Format#MAX_RAW_SIZE）：读取时整桶会被
       // 判为损坏、整桶当空。写入侧先行拒绝（计入既有大小拒绝计数），避免「写成功却读不回」的不对称。
@@ -540,7 +546,6 @@ public final class DiskCacheStore implements AutoCloseable {
     // 该负载会在 flushDirty 时随所属 bucket <b>整块</b> append：按「该桶整桶编码长度」的增量记账，
     // 而不是只加本次 payload 长度——bucket 是整块追加的，后者会严重低估上限判定所需的数据量。
     // 桶重写产生的旧副本计入垃圾，由压缩回收。
-    int bucket = BufferedLinearV3Format.bucketIndex(chunkIndex);
     long bucketBytes = handle.file.encodedBucketSizeEstimate(bucket);
     handle.pendingBytes += bucketBytes - handle.pendingBucketBytes[bucket];
     handle.pendingBucketBytes[bucket] = bucketBytes;

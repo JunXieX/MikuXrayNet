@@ -554,6 +554,34 @@ final class RegionFile implements AutoCloseable {
   }
 
   /**
+   * 预判：把一条 {@code payloadLength} 字节的条目写入 {@code chunkIndex} 后，该桶落盘追加时的字节估算
+   * （{@code 8} 字节桶头 + 整桶编码长度，口径与 {@link #encodedBucketSizeEstimate(int)} 完全一致）。
+   *
+   * <p><b>为什么需要它</b>：{@code DiskCacheStore} 的单文件大小上限原先「先写后记账」——判定用的是写入
+   * <b>之前</b>的待落盘字节，而本次写入会新增整整一个 bucket 的编码长度（bucket 是整块追加的），
+   * 于是「上限 × 1」随时可能被整整一个桶顶破（默认 16 MiB 上限下实测可到数十 MB）。本方法把该增量
+   * 在写入前投影出来，使上限真正成立。与 {@link #bucketRawLengthFitsAfterPut} 共用同一套投影口径
+   * （同一个 {@code existingBytes} 与 {@code entryEncodedLength} 算法），两处不会漂移。
+   *
+   * @return 投影后的追加字节估算；文件已因跨进程锁被停用时返回 {@code 0}
+   *         （调用方本就跳过写入，不制造额外拒绝）
+   */
+  long encodedBucketSizeEstimateAfterPut(int chunkIndex, int payloadLength) {
+    if (lockUnavailable) {
+      return 0L;
+    }
+    BufferedLinearV3Format.Entry[] bucketSlots = ensureLoaded(bucketIndex(chunkIndex));
+    long current = BufferedLinearV3Format.encodedBucketLength(bucketSlots);
+    BufferedLinearV3Format.Entry existing = bucketSlots[slotInBucket(chunkIndex)];
+    int existingBytes = existing == null || existing.payload() == null || existing.payload().length == 0
+        ? Integer.BYTES
+        : BufferedLinearV3Format.entryEncodedLength(existing.payload().length);
+    long projectedRaw = current - existingBytes
+        + BufferedLinearV3Format.entryEncodedLength(payloadLength);
+    return 8L + projectedRaw;
+  }
+
+  /**
    * 清空一个区块的条目（惰性清理过期/旧代次条目时使用）。
    *
    * <p><b>三种桶状态</b>：

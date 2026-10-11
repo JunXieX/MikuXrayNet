@@ -484,12 +484,18 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
           continue;
         }
         boolean overflow = false;
+        // 「已直通下发的坐标」集合在绝大多数窗口里是空的（本窗口没有近身立即放行、也没有远距离直通批量包）。
+        // isEmpty 与下面的 remove 同处 synchronized(target) 临界区（passed 的写入方 rememberDelivered 也持它），
+        // 因此循环内不可能有并发写入，据此把它提出循环即可省掉「每 update 一个 Coord 分配 + 一次哈希查找」的纯开销。
+        boolean hasPassed = !target.passed.isEmpty();
         for (Update<WrappedBlockData> update : updates) {
           // 直接复用解析阶段已构造的 Update 实例（避免同一坐标再造一个等值 record）
           overflow |= target.batch.add(update);
           // 本坐标刚被重新缓冲：此刻缓冲条目才是最新的，必须撤销「已被更新下发覆盖」的标记。
           // 否则上一轮「立即放行 / 直通批量包」留下的标记会在 flush 时把这条更新的变更当旧态误删（丢更新）。
-          target.passed.remove(new Coord(update.x(), update.y(), update.z()));
+          if (hasPassed) {
+            target.passed.remove(new Coord(update.x(), update.y(), update.z()));
+          }
         }
         // 先入缓冲、再登记延迟：held.add 若在此之后抛异常，登记过的延迟就再也没人放行（永久卡包）。
         // flush() 的兜底只遍历 target.held，所以条目必须先在里面，登记才能生效。
