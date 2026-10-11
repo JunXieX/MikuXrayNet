@@ -63,6 +63,15 @@ jobs:
             0) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
             *) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
           esac
+          # 更新日志：取该 tag 所指提交的正文（%(contents:body)；打轻量 tag 时会回落到提交正文）。
+          # 约定：发版提交（release: 发布正式版 x.y.z / 测试版）的正文就是本次更新日志。
+          # 取不到（例如该提交没有正文）时留空，由下面的 generate_release_notes 兜底——
+          # 绝不因为「缺日志」让发布失败，也绝不阻断构建。
+          {
+            echo 'notes<<MIKUXRAYNET_RELEASE_NOTES_EOF'
+            git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" 2>/dev/null || true
+            echo 'MIKUXRAYNET_RELEASE_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Publish Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -71,4 +80,6 @@ jobs:
           name: ${{ steps.rel.outputs.title }}
           files: target/MikuXrayNet-*.jar
           prerelease: ${{ steps.rel.outputs.prerelease }}
+          # 更新日志在前、GitHub 自动生成的变更清单与 Full Changelog 链接附在其后
+          body: ${{ steps.rel.outputs.notes }}
           generate_release_notes: true
