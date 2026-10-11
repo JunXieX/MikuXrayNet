@@ -27,9 +27,9 @@ import org.junit.jupiter.api.io.TempDir;
  */
 class RegionFileEvictionTest {
 
-  /** bucket 下标 b 的槽位序号（bucketIndex = chunkIndex >>> BUCKET_SHIFT）。 */
+  /** bucket 下标 b 的槽位序号（{@code bucketIndex = chunkIndex >>> BUCKET_SHIFT}，故取该桶的首个槽位）。 */
   private static int chunkIndexForBucket(int bucket) {
-    return bucket << 6;
+    return bucket << BufferedLinearV3Format.BUCKET_SHIFT;
   }
 
   private static BufferedLinearV3Format.Entry entry(int marker) {

@@ -1159,9 +1159,9 @@ final class RegionFile implements AutoCloseable {
             || !rawLengthWithinFileBudget(rawLength)) {
           continue; // 含「声明原始长度远超文件」的伪造头：与 ensureLoaded 同口径，避免按它分配
         }
-        byte[] compressed = readAt(channel, positions[bucket] + 8L, compressedLength);
-        count += BufferedLinearV3Format.countBucketEntries(
-            BufferedLinearV3Format.decompress(compressed, rawLength, compression));
+        // 槽位粒度记录（一条记录至多 1 个槽位）：按声明的原始长度即可判定条目数，<b>无需解压</b>——
+        // 旧实现为了一个（本就是近似的）计数把整份文件全部解压一遍，属纯浪费的精确化。
+        count += BufferedLinearV3Format.declaredEntryCount(rawLength);
       } catch (IOException | RuntimeException exception) {
         // 结构损坏：只少计这一个桶
       }

@@ -316,6 +316,24 @@ public final class BufferedLinearV3Format {
 
   // ------------------------------------------------------------------ 偏移表
 
+  /**
+   * 不解压即可判定的「一条记录承载多少个条目」。
+   *
+   * <p>当前布局每条记录只承载 1 个槽位（{@link #BUCKET_SIZE} == 1），记录内容为
+   * {@code [i32 条目长度][条目字节]}：空槽恰好是 4 字节的零长度前缀，非空则至少
+   * {@code 4 +}{@link #ENTRY_HEADER_SIZE}{@code + 1} 字节。因此只看记录头里声明的 {@code rawLength}
+   * 即可判定，<b>无需解压</b>——供「首次打开区域文件时补计已有条目数」使用（旧实现为此把整份文件
+   * 全部解压一遍，属纯浪费的防御性精确计数）。
+   *
+   * <p>若将来调整 {@link #BUCKET_SHIFT}（须同时升 {@link #VERSION}），本判定必须一并修改。
+   *
+   * @param rawLength 记录头（u32 原始长度）里声明的解压后长度
+   * @return {@code 0} 或 {@code 1}
+   */
+  static int declaredEntryCount(int rawLength) {
+    return rawLength > Integer.BYTES ? 1 : 0;
+  }
+
   /** 编码偏移表（{@link #BUCKET_COUNT} 个 u64）。 */
   public static byte[] encodePosTable(long[] offsets) {
     ByteBuffer buffer = ByteBuffer.allocate(POS_TABLE_SIZE);
@@ -631,8 +649,11 @@ public final class BufferedLinearV3Format {
    * 只数条数、不解码：按「每槽位一个 int 长度前缀」扫一遍，返回长度大于 0 的槽位数。
    *
    * <p>遍历规则与 {@link #decodeBucket(byte[], int)} 一致（长度 ≤ 0 视为空槽、越界即停止），
-   * 但既不复制也不校验、更不分配负载数组——供启动期统计磁盘既有条目数使用（避免为一个计数
-   * 把整份区域文件的桶全部解码进内存）。
+   * 但既不复制也不校验、更不分配负载数组。
+   *
+   * <p><b>测试专用豁免</b>：生产端「统计磁盘既有条目数」已不再解压（改用
+   * {@link #declaredEntryCount(int)}，槽位粒度记录无需解压），本方法当前仅单测在用，
+   * 保留以免破坏测试。
    */
   public static int countBucketEntries(byte[] raw) {
     if (raw == null) {

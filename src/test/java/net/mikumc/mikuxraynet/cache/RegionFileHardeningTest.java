@@ -26,9 +26,9 @@ import org.junit.jupiter.api.io.TempDir;
  */
 class RegionFileHardeningTest {
 
-  /** bucket 下标 b 的槽位序号（bucketIndex = chunkIndex >>> BUCKET_SHIFT）。 */
+  /** bucket 下标 b 的槽位序号（{@code bucketIndex = chunkIndex >>> BUCKET_SHIFT}，故取该桶的首个槽位）。 */
   private static int chunkIndexForBucket(int bucket) {
-    return bucket << 6;
+    return bucket << BufferedLinearV3Format.BUCKET_SHIFT;
   }
 
   private static BufferedLinearV3Format.Entry entry(int marker) {
@@ -191,7 +191,7 @@ class RegionFileHardeningTest {
     RegionFile writer = RegionFile.open(file, 2);
     try {
       writer.put(chunkIndexForBucket(0), entry(5));
-      writer.put(chunkIndexForBucket(0) + 1, entry(9)); // 同桶第 2 个槽位（对照组）
+      writer.put(chunkIndexForBucket(1), entry(9)); // 另一条记录（对照组）
       writer.flushDirty();
     } finally {
       writer.close();
@@ -205,8 +205,8 @@ class RegionFileHardeningTest {
       assertTrue(reader.clear(chunkIndexForBucket(0)),
           "懒桶上的 clear 必须物化后就地清除并返回 true（修复前恒 false → 陈旧条目滞留）");
       assertNull(reader.get(chunkIndexForBucket(0)), "已清除的条目不得再被读出");
-      assertNotNull(reader.get(chunkIndexForBucket(0) + 1),
-          "同桶对照条目必须不受影响（物化不得误伤其它槽位）");
+      assertNotNull(reader.get(chunkIndexForBucket(1)),
+          "对照条目必须不受影响（清理不得误伤别的记录）");
 
       // dirty 置位后落盘：flush + 重开，被清条目必须真的从磁盘消失
       reader.flushDirty();
@@ -218,7 +218,7 @@ class RegionFileHardeningTest {
     try {
       assertNull(reopened.get(chunkIndexForBucket(0)),
           "clear 的脏标记必须落盘：重开后被清条目已从磁盘删除");
-      assertNotNull(reopened.get(chunkIndexForBucket(0) + 1), "同桶对照条目重开后仍在");
+      assertNotNull(reopened.get(chunkIndexForBucket(1)), "对照条目重开后仍在");
     } finally {
       reopened.close();
     }

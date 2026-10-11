@@ -207,48 +207,69 @@ class BufferedLinearV3FormatTest {
     BufferedLinearV3Format.Entry[] slots =
         new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
     slots[0] = new BufferedLinearV3Format.Entry(1L, 100L, 5, payload(300));
-    slots[7] = new BufferedLinearV3Format.Entry(2L, 200L, 6, payload(700));
-    slots[63] = new BufferedLinearV3Format.Entry(3L, 300L, 7, payload(64));
-    byte[] bucket = BufferedLinearV3Format.encodeBucket(slots, SEED);
+    byte[] record = BufferedLinearV3Format.encodeBucket(slots, SEED);
 
-    assertEquals(3, BufferedLinearV3Format.countBucketEntries(bucket),
-        "只数条数的口径必须与解码出的非空槽位一致");
-
+    assertEquals(1, BufferedLinearV3Format.countBucketEntries(record),
+        "一条非空记录必须计 1 条（与解码出的非空槽位数一致）");
+    assertEquals(0, BufferedLinearV3Format.countBucketEntries(
+            BufferedLinearV3Format.encodeBucket(new BufferedLinearV3Format.Entry[
+                BufferedLinearV3Format.BUCKET_SIZE], SEED)),
+        "全空记录计 0 条");
     assertEquals(0, BufferedLinearV3Format.countBucketEntries(null), "空输入计 0 条");
     assertEquals(0, BufferedLinearV3Format.countBucketEntries(new byte[] {1, 2, 3}),
         "连一个长度前缀都读不全时计 0 条");
-    assertEquals(2, BufferedLinearV3Format.countBucketEntries(
-        Arrays.copyOf(bucket, bucket.length - 5)),
-        "尾部截断：数到截断点为止（截断的那一条不计），且绝不抛异常");
+    assertEquals(0, BufferedLinearV3Format.countBucketEntries(
+            Arrays.copyOf(record, record.length - 5)),
+        "尾部截断：截断的那一条不计，且绝不抛异常");
   }
 
   @Test
   void bucketRoundTripKeepsSlotLayout() throws IOException {
+    int first = 0;
+    int last = BufferedLinearV3Format.BUCKET_SIZE - 1;
     BufferedLinearV3Format.Entry[] slots =
         new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
-    slots[1] = new BufferedLinearV3Format.Entry(1L, 100L, 5, payload(300));
-    slots[63] = new BufferedLinearV3Format.Entry(2L, 200L, 6, payload(700));
+    slots[first] = new BufferedLinearV3Format.Entry(1L, 100L, 5, payload(300));
+    if (last != first) {
+      slots[last] = new BufferedLinearV3Format.Entry(2L, 200L, 6, payload(700));
+    }
 
     BufferedLinearV3Format.Entry[] decoded = BufferedLinearV3Format.decodeBucket(
         BufferedLinearV3Format.encodeBucket(slots, SEED), SEED);
 
     assertEquals(BufferedLinearV3Format.BUCKET_SIZE, decoded.length);
-    assertNull(decoded[0], "空槽位必须保持为空（条目缺失即未命中）");
-    assertNull(decoded[62]);
-    assertNotNull(decoded[1]);
-    assertNotNull(decoded[63]);
-    assertEquals(1L, decoded[1].generation());
-    assertEquals(6, decoded[63].configHash());
-    assertArrayEquals(payload(300), decoded[1].payload());
-    assertArrayEquals(payload(700), decoded[63].payload());
+    for (int slot = 0; slot < decoded.length; slot++) {
+      if (slot != first && slot != last) {
+        assertNull(decoded[slot], "空槽位必须保持为空（条目缺失即未命中）");
+      }
+    }
+    assertNotNull(decoded[first]);
+    assertEquals(1L, decoded[first].generation());
+    assertArrayEquals(payload(300), decoded[first].payload());
+    if (last != first) {
+      assertNotNull(decoded[last]);
+      assertEquals(6, decoded[last].configHash());
+      assertArrayEquals(payload(700), decoded[last].payload());
+    }
   }
 
+  /**
+   * 一条记录内损坏的<b>那个槽位</b>必须作废（宁可未命中），其余槽位照常可用。
+   *
+   * <p>当前布局每条记录只有 1 个槽位（{@code BUCKET_SHIFT = 0}），因此本用例在「槽位粒度」上退化为
+   * 「损坏即整条记录作废」——这正是期望的 fail-open 方向：绝不把一个校验失败的数据当成命中返回。
+   * 断言写成对 {@code BUCKET_SIZE} 通用，将来若调整粒度（须同时升格式版本）本用例无需改写。
+   */
   @Test
   void corruptedSlotOnlyLosesThatSlot() throws IOException {
+    int victim = 0;
+    int control = BufferedLinearV3Format.BUCKET_SIZE > 1 ? 1 : -1;
     BufferedLinearV3Format.Entry[] slots =
         new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
-    slots[0] = new BufferedLinearV3Format.Entry(1L, 1L, 1, payload(200));
-    slots[1] = new BufferedLinearV3Format.Entry(2L, 2L, 2, payload(200));
+    slots[victim] = new BufferedLinearV3Format.Entry(1L, 1L, 1, payload(200));
+    if (control >= 0) {
+      slots[control] = new BufferedLinearV3Format.Entry(2L, 2L, 2, payload(200));
+    }
 
     byte[] encoded = BufferedLinearV3Format.encodeBucket(slots, SEED);
     // 篡改第一个槽位的负载（槽位 = 4 字节长度 + 28 字节条目头 + 负载）
@@ -256,9 +277,11 @@ class BufferedLinearV3FormatTest {
 
     BufferedLinearV3Format.Entry[] decoded = BufferedLinearV3Format.decodeBucket(encoded, SEED);
 
-    assertNull(decoded[0], "损坏的槽位必须作废（宁可未命中）");
-    assertNotNull(decoded[1], "其它槽位不受影响：" + decoded[1]);
-    assertArrayEquals(payload(200), decoded[1].payload());
+    assertNull(decoded[victim], "损坏的槽位必须作废（宁可未命中）");
+    if (control >= 0) {
+      assertNotNull(decoded[control], "其它槽位不受影响：" + decoded[control]);
+      assertArrayEquals(payload(200), decoded[control].payload());
+    }
   }
 
   @Test
@@ -274,7 +297,7 @@ class BufferedLinearV3FormatTest {
 
   /**
    * {@code encodeBucket} 按内容精确定容，产出的字节长度必须等于
-   * {@code 64 × 4（每槽位 i32 长度前缀） + Σ(28 条目头 + 负载长度)}：这既是预分配公式的依据，
+   * {@code BUCKET_SIZE × 4（每槽位 i32 长度前缀） + Σ(28 条目头 + 负载长度)}：这既是预分配公式的依据，
    * 也保证没有「空负载按空槽」的口径偏差。
    */
   @Test
@@ -282,15 +305,27 @@ class BufferedLinearV3FormatTest {
     BufferedLinearV3Format.Entry[] slots =
         new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
     slots[0] = new BufferedLinearV3Format.Entry(1L, 100L, 5, payload(300));
-    slots[2] = new BufferedLinearV3Format.Entry(2L, 200L, 6, payload(700));
-    slots[63] = new BufferedLinearV3Format.Entry(3L, 300L, 7, new byte[0]); // 空负载按空槽
+    int second = BufferedLinearV3Format.BUCKET_SIZE - 1;
+    if (second != 0) {
+      slots[second] = new BufferedLinearV3Format.Entry(2L, 200L, 6, payload(700));
+    }
 
     byte[] bucket = BufferedLinearV3Format.encodeBucket(slots, SEED);
 
     int entryHeaderSize = 4 + 8 + 8 + 4 + 4; // 负载长度 + 代次 + 写入时间 + 配置指纹 + 校验和
-    int expected = BufferedLinearV3Format.BUCKET_SIZE * Integer.BYTES + entryHeaderSize + 300
-        + entryHeaderSize + 700;
+    int expected = BufferedLinearV3Format.BUCKET_SIZE * Integer.BYTES + entryHeaderSize + 300;
+    if (second != 0) {
+      expected += entryHeaderSize + 700;
+    }
     assertEquals(expected, bucket.length, "桶字节长度必须等于预分配公式算出的长度");
+
+    // 空负载按空槽计（不写入条目头与负载）
+    BufferedLinearV3Format.Entry[] withEmptyPayload =
+        new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
+    withEmptyPayload[0] = new BufferedLinearV3Format.Entry(3L, 300L, 7, new byte[0]);
+    assertEquals(BufferedLinearV3Format.BUCKET_SIZE * Integer.BYTES,
+        BufferedLinearV3Format.encodeBucket(withEmptyPayload, SEED).length,
+        "空负载必须按空槽计（只占一个 i32 长度前缀）");
   }
 
   @Test
@@ -302,9 +337,14 @@ class BufferedLinearV3FormatTest {
     // 负数坐标同样落在 0..1023（region 内部相对坐标）
     assertEquals(BufferedLinearV3Format.chunkIndex(0, 0) + 32,
         BufferedLinearV3Format.chunkIndex(-32, -31));
+    // 槽位序号 → 记录序号：与 BUCKET_SIZE 相除（当前 BUCKET_SIZE = 1，即一槽一条记录）
     assertEquals(0, BufferedLinearV3Format.bucketIndex(0));
-    assertEquals(15, BufferedLinearV3Format.bucketIndex(1023));
-    assertEquals(1, BufferedLinearV3Format.bucketIndex(64));
+    assertEquals(1023 / BufferedLinearV3Format.BUCKET_SIZE,
+        BufferedLinearV3Format.bucketIndex(1023));
+    assertEquals(64 / BufferedLinearV3Format.BUCKET_SIZE,
+        BufferedLinearV3Format.bucketIndex(64));
+    assertEquals(1024, BufferedLinearV3Format.BUCKET_COUNT * BufferedLinearV3Format.BUCKET_SIZE,
+        "BUCKET_COUNT × BUCKET_SIZE 必须恰好覆盖 1024 个区块");
 
     assertEquals(0, BufferedLinearV3Format.regionCoordinate(0));
     assertEquals(0, BufferedLinearV3Format.regionCoordinate(31));
