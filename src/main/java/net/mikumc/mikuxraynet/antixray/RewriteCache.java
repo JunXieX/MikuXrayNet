@@ -113,7 +113,19 @@ public final class RewriteCache<V> {
       return null;
     }
     if (now - entry.lastAccessNanos > expireAfterAccessNanos) {
-      entries.remove(entry.key, entry);
+      // 复核后再删：put 对同键是「原地刷新同一个 CacheEntry」（lastAccessNanos / value 都可能刚被更新）。
+      // 若在「读取 lastAccessNanos」与「删除」之间恰好被刷新，直接 remove(entry.key, entry) 会把刚刷新
+      // 的条目整条删掉（只多一次重算，非数据错误，但属无谓浪费）。computeIfPresent 在 bin 锁内以
+      // 「当前值」复核，保证只删此刻确实仍过期的条目。
+      CacheEntry<V> live = entries.computeIfPresent(entry.key,
+          (key, current) -> now - current.lastAccessNanos > expireAfterAccessNanos ? null : current);
+      if (live != null) {
+        // 期间被同键 put 刷新（value / 访问时间已更新）：按刷新后的值命中，不计一次虚假未命中
+        live.lastAccessNanos = now;
+        live.referenced = true;
+        hits.increment();
+        return live.value;
+      }
       misses.increment();
       return null;
     }

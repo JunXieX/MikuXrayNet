@@ -451,13 +451,16 @@ public final class RevealedSet {
         return; // 已被并行摘除：无需重复扣减
       }
       for (Map.Entry<UUID, Marker> entry : players.entrySet()) {
-        AtomicInteger total = playerTotals.get(entry.getKey());
-        if (total == null) {
-          continue;
-        }
         Marker marker = entry.getValue();
         synchronized (marker) {
-          subtract(total, marker.size());
+          // 只对「本方法真正摘除」的条目扣减：expire() 并未持 players 监视器，可能已并行摘除同一 entry
+          // 并按其 size 扣减过；无条件扣减会把同一 size 扣两次，使 playerTotals 偏低 → 容量安全阀判据失真。
+          if (players.remove(entry.getKey(), marker)) {
+            AtomicInteger total = playerTotals.get(entry.getKey());
+            if (total != null) {
+              subtract(total, marker.size());
+            }
+          }
         }
       }
     }

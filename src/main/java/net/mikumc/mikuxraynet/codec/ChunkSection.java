@@ -214,16 +214,22 @@ public class ChunkSection {
    */
   public void read(ByteBuf buffer) {
     this.blockCount = buffer.readShort();
-    // blockCount 是有符号 short：合法范围 0..4096（section 体积）。负值只可能来自损坏/非标准数据，
-    // 且会让 isEmpty()/位宽预算等判断落进「非空」这一侧。与其它非法编码（bitsPerBlock 2/3、调色板
+    // blockCount 是有符号 short：合法范围 0..4096（section 体积）。负值或超过体积只可能来自损坏/非标准
+    // 数据，且会被原样 writeShort 回包下发给客户端。与其它非法编码（bitsPerBlock 2/3、调色板
     // 重复值、越界 id）同口径：显式拒绝，交由上层解码 fail-open（放行原包、不改写）。
-    if (this.blockCount < 0) {
+    if (this.blockCount < 0 || this.blockCount > SECTION_VOLUME) {
       throw new IllegalArgumentException(
           "非法的 blockCount=" + this.blockCount + "（section 体积为 0..4096）");
     }
 
     if (this.versionFlags.hasFluidCount()) {
       this.fluidCount = buffer.readShort();
+      // 与 blockCount 同口径：流体计数合法范围同为 0..4096，越界同样只可能来自损坏数据，
+      // 且会被原样写回客户端，故一并显式拒绝。
+      if (this.fluidCount < 0 || this.fluidCount > SECTION_VOLUME) {
+        throw new IllegalArgumentException(
+            "非法的 fluidCount=" + this.fluidCount + "（section 体积为 0..4096）");
+      }
     }
 
     this.setBitsPerBlock(buffer.readUnsignedByte(), false);

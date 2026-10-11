@@ -90,8 +90,12 @@ public final class AfkTracker implements Listener {
   /** 注册事件监听与（可选的）低价值包过滤监听。 */
   public void start() {
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
+    // 热重载时可能已有玩家在线：他们的初始状态必须补登。但 remember() 要读玩家位置——在 Folia 上，
+    // 从命令发送者所在区域线程去读别的区域的玩家状态会触发 TickThread 校验（轻则读到陈旧坐标，
+    // 重则抛异常被上层装配兜底 → 整个 AFK 模块被静默停用）。因此这里不直接读，而是把登记投递到
+    // 各玩家所属线程执行（Paper 上即主线程），与 EntityPacketFilter 对 Folia 的同一条纪律一致。
     for (Player player : plugin.getServer().getOnlinePlayers()) {
-      remember(player);
+      Schedulers.onEntity(plugin, player, () -> remember(player));
     }
 
     List<PacketType> types = new ArrayList<>(2);

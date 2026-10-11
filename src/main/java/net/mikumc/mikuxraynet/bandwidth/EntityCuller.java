@@ -884,13 +884,43 @@ public final class EntityCuller implements Listener {
       return false;
     }
     try {
+      HiddenEntry entry = new HiddenEntry(entity, frustumCulled);
       player.hideEntity(plugin, entity);
-      map.put(entity.getEntityId(), new HiddenEntry(entity, frustumCulled));
+      map.put(entity.getEntityId(), entry);
+      // 停用竞态收口（Folia：stop() 可能在另一条区域线程上并发执行）：<b>入账之后再读一次</b> volatile
+      // stopping。这样保证「本次读到 false ⇒ stop() 尚未置位 ⇒ 其 restoreAll 必然发生在本次入账之后、
+      // 一定看得到本条目」；读到 true 则说明 stop() 已在恢复，必须自行回滚本次隐藏——否则该实体既不在
+      // 新管线账本里、也没被旧管线恢复，将<b>永久不可见</b>（直到玩家重登）。
+      if (stopping) {
+        if (map.remove(entity.getEntityId(), entry)) {
+          // 条目仍在账本里 ⇒ restoreAll 无从看到它（账本已被摘走/清空），必须自行恢复。
+          // 本次隐藏从未计入 entitiesHidden，故这里也不计 entitiesShown（两侧口径保持对称）。
+          undoHide(player, entity);
+        }
+        // 条目已被 drain 摘走 ⇒ restoreAll 会（或已经）恢复它，此处不得重复操作
+        return false;
+      }
       stats.entitiesHidden.increment();
       return true;
     } catch (Throwable throwable) {
       logThrottled(throwable);
       return false;
+    }
+  }
+
+  /**
+   * 回滚一次「刚发生、但已来不及计入账本」的隐藏（停用竞态收口专用）。
+   *
+   * <p>不记统计：该次隐藏从未计入 {@code entitiesHidden}，若这里计 {@code entitiesShown} 会让
+   * 「累计隐藏 = 累计恢复 + 当前隐藏中 + 自然回收」出现无谓偏差。
+   */
+  private void undoHide(Player player, Entity entity) {
+    try {
+      if (entity.isValid()) {
+        player.showEntity(plugin, entity);
+      }
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
     }
   }
 

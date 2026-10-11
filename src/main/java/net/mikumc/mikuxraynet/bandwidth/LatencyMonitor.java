@@ -169,8 +169,24 @@ public final class LatencyMonitor implements Listener {
       if (target >= current || target < floor) {
         return;
       }
-      originalViewDistance.put(player.getUniqueId(), current);
+      int original = current;
+      originalViewDistance.put(player.getUniqueId(), original);
       player.setSendViewDistance(target);
+      // 停用竞态收口（Folia：stop() 可能在另一条区域线程上并发执行）：<b>写入之后再读一次</b> volatile
+      // stopping。这样保证「本次读到 false ⇒ stop() 尚未置位 ⇒ 其 restoreAll 必然发生在本次写入之后、
+      // 一定看得到这条记录」；读到 true 则说明 stop() 已在还原，必须自行回滚——否则这条记录被旧实例
+      // 一起丢弃、新实例又不知道，玩家会<b>永久卡在降级后的视距</b>。
+      if (stopping) {
+        // restoreAll 若已把该记录摘走／随整表 clear() 丢弃，就再也不会替我们还原，因此这里<b>无条件</b>
+        // 回滚：若它已经还原过，重复写回同一个 original 值只是幂等重复，无害。
+        originalViewDistance.remove(player.getUniqueId(), original);
+        try {
+          player.setSendViewDistance(original);
+        } catch (Throwable throwable) {
+          plugin.getLogger().fine("停用竞态回滚视距失败：" + throwable.getMessage());
+        }
+        return;
+      }
       stats.viewDistanceReduced.increment();
     } catch (Throwable throwable) {
       // 视距调整失败不影响其它功能
