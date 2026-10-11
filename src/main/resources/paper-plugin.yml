@@ -138,6 +138,12 @@ permissions:
 #     签名已在本项目编译目标 paper-api 26.2.build.129-stable 上用 javap 核实。
 #   为什么仍保留本段：本项目已删除 plugin.yml，这里是唯一对外可见的「命令 ←→ 权限」元数据，
 #   由 PluginDescriptionConsistencyTest 与 CommandRegistrar 的代码常量逐字对照守门。
+#
+#   【务必看清】下面 commands 段的 permission 只是**元数据**，运行期不生效：
+#   命令注册（CommandRegistrar.PaperCommandBridge#permission）返回 null，判权由 MikuCommand
+#   逐子命令完成（status / dump / reload 各判各的节点）——否则只授予 mikuxraynet.status 的玩家
+#   会被框架级权限 mikuxraynet.admin 直接拒绝，三个子权限就无法单独授予。
+#   mikuxraynet.admin 仍是「总权限」：它的 children 已包含那三个节点，授予它即同时授予三者。
 # ---------------------------------------------------------------------------
 commands:
   mikuxraynet:
@@ -146,6 +152,7 @@ commands:
     aliases:
       - mxnet
       - mxr
+    # 元数据（运行期由代码逐子命令判定，见上方说明）；与 CommandRegistrar.COMMAND_PERMISSION 一致。
     permission: mikuxraynet.admin
     permission-message: 你没有权限使用该命令
 

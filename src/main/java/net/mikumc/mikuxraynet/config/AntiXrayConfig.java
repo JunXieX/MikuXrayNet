@@ -368,10 +368,13 @@ public final class AntiXrayConfig {
   public static final int DISK_CACHE_MAX_FILE_SIZE_MB_MAX = 1024;
 
   /**
-   * {@code disk-cache.bucket-cache-size}（每个区域文件常驻内存的 bucket 数）的安全上限。
+   * {@code disk-cache.bucket-cache-size}（每个区域文件常驻内存的槽位记录数）的安全上限。
    *
-   * <p>一个区域文件只有 {@code BufferedLinearV3Format.BUCKET_COUNT}（16）个 bucket，故该值超过 16
-   * 之后不再有任何收益（LRU 永远装得下全部桶）。上限取 16 的整数倍留出余量，拦住误配大数。
+   * <p>槽位粒度记录（{@code BufferedLinearV3Format.BUCKET_SHIFT = 0}）下「1 条记录 = 1 个区块」，
+   * 故本值即「每个已打开的区域文件最多把多少个已载入的区块数据留在内存里」。文件中最多有
+   * {@code BUCKET_COUNT}（1024）条记录，理论上限是 1024；这里仍取 64，理由是<b>内存</b>而非收益：
+   * 一条记录解压后可达数十~上百 KB（最坏 16 MiB），64 条即约 6 MB/文件，与旧布局默认 8 桶
+   * （8 × 64 槽，量级相当）持平；再往上抬会让「多文件同时打开」时的驻留内存线性放大。
    */
   public static final int DISK_CACHE_BUCKET_CACHE_SIZE_MAX = 64;
 
@@ -1036,6 +1039,11 @@ public final class AntiXrayConfig {
     if (weights.isEmpty()) {
       weights = fallback.replacementWeights();
     }
+    // 分区表：显式配了就优先用它的解析结果（含「解析后为空」——即分段落全部非法被丢弃的情形）。
+    // 【刻意如此，勿当 bug 修】解析为空时不回落默认分区表，而是让该维度「按全局权重伪装」（等价于
+    // 未启用分区）：与 hide-blocks / replacement-weights 的「空表回落默认」不同，这里把管理员显式写出
+    // 的 replacement-bands 视为最终意图——写照了却一个合法分段都没有，说明本意就是不要分区伪装；
+    // 后果仅是伪装分布不再随高度分层（外观问题），不会让任何方块漏伪装（隐藏清单与权重表照旧生效）。
     List<ReplacementBand> bands = section.contains("replacement-bands")
         ? parseBands(section.getMapList("replacement-bands")) : fallback.replacementBands();
     int minY = section.contains("min-y") ? section.getInt("min-y") : fallback.minY();

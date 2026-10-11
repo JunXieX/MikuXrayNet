@@ -17,21 +17,23 @@ import java.util.zip.Inflater;
  * <p><b>文件布局</b>
  * <pre>
  *   偏移 0     : 魔数 u64 = MAGIC
- *   偏移 8     : 版本 u8 = 0x04
+ *   偏移 8     : 版本 u8 = 0x05
  *   偏移 9     : 压缩方案 u8（0x01 = Deflate 历史格式；0x02 = Zstd 当前写入，见下）
  *   偏移 10    : 校验种子 i32（默认 0x0721）
- *   偏移 14    : 16 × u64 bucket 偏移表（每个 bucket 覆盖 64 个区块，共 1024 个区块 = 32×32）
- *   偏移 142   : 数据区，每个 bucket 为 [u32 原始长度][u32 压缩长度][压缩数据]
+ *   偏移 14    : 1024 × u64 槽位偏移表（每个槽位 = 一个区块，共 1024 个区块 = 32×32）
+ *   偏移 8206  : 数据区，每条记录为 [u32 原始长度][u32 压缩长度][压缩数据]
  * </pre>
- * 未写入的 bucket 偏移为 0。bucket 原始内容为 64 个槽位依次排列的 {@code [i32 条目长度][条目字节]}，
- * 长度 {@code <= 0} 表示空槽。条目字节为
+ * 未写入的槽位偏移为 0。一条记录对应<b>一个</b>槽位，原始内容为
+ * {@code [i32 条目长度][条目字节]}（长度 {@code <= 0} 表示空槽）。条目字节为
  * {@code [i32 负载长度][i64 区块代次][i64 写入时间][i32 配置指纹][i32 负载校验和][负载]}，
  * 校验和为 {@link XXHash32}（与格式头种子一致）。
  *
  * <p><b>版本历史</b>：{@code 0x03} 为初版；{@code 0x04} 起明确「负载信封必须携带被伪装坐标清单」
  * （见 {@code DiskPayload}：{@code [i64 指纹][i32 坐标数][i32×N 坐标][区块字节]}），
- * 否则磁盘缓存命中的区块不会进入显形索引。读取 {@code 0x03} 旧文件时明确拒绝并（只提示一次）
- * 由调用方删除重建，避免复用与当前信封约定不一致的历史条目。
+ * 否则磁盘缓存命中的区块不会进入显形索引；{@code 0x05} 把原来的「64 槽位一个桶」改为
+ * <b>「一个槽位一条记录」</b>（见 {@link #BUCKET_SHIFT}），消除「改 1 个区块 = 重压缩整桶 64 槽」
+ * 的写放大。读取任何低于当前版本的旧文件时明确拒绝并（只提示一次）由调用方删除重建，
+ * 避免复用与当前信封/布局约定不一致的历史条目。
  *
  * <p><b>压缩方案（偏移 9 的那个字节）</b>：该字节在文件<b>创建时</b>确定，并决定整个文件里所有 bucket
  * 的压缩算法；此后<b>追加入写必须沿用该字节</b>（调用 {@link #compress(byte[], byte)} 传入它，
@@ -58,14 +60,11 @@ public final class BufferedLinearV3Format {
   /** 仅提示一次的「zstd 回退 Deflater」日志开关（运行期压缩/解压抛异常的路径）。 */
   private static final AtomicBoolean ZSTD_FALLBACK_WARNED = new AtomicBoolean();
 
-  /** 仅提示一次的「旧版（0x03）区域文件已被拒绝、将重建」日志开关。 */
+  /** 仅提示一次的「旧版区域文件已被拒绝、将重建」日志开关。 */
   private static final AtomicBoolean LEGACY_VERSION_WARNED = new AtomicBoolean();
 
   /** 仅提示一次的「文件声明方案在本进程不可用、已整文件迁移」日志开关。 */
   private static final AtomicBoolean SCHEME_DOWNGRADE_WARNED = new AtomicBoolean();
-
-  /** 初版格式版本：其负载信封未约定必须携带被伪装坐标，读取时明确拒绝。 */
-  private static final byte LEGACY_VERSION = 0x03;
 
   /**
    * zstd 压缩等级：<b>3 = 速度优先</b>（用户指定最快档）。
@@ -80,8 +79,8 @@ public final class BufferedLinearV3Format {
   /** 文件魔数。 */
   public static final long MAGIC = 0xFFFFDFF7EDDAFD97L;
 
-  /** 格式版本（bucket 化布局 + 负载信封携带伪装坐标）。 */
-  public static final byte VERSION = 0x04;
+  /** 格式版本（槽位粒度记录 + 负载信封携带伪装坐标）。 */
+  public static final byte VERSION = 0x05;
 
   /** 压缩方案：JDK Deflater（历史格式，仅用于读取旧文件）。 */
   public static final byte COMPRESSION_DEFLATE = 0x01;
@@ -92,19 +91,30 @@ public final class BufferedLinearV3Format {
   /** 文件头长度：魔数 8 + 版本 1 + 压缩方案 1 + 种子 4。 */
   public static final int HEADER_SIZE = 14;
 
-  /** bucket 覆盖的区块数（2 的 6 次方）。 */
-  public static final int BUCKET_SHIFT = 6;
+  /**
+   * 槽位粒度的位移：<b>0 = 每条记录只承载 1 个槽位</b>（即「一个区块一条独立压缩记录」）。
+   *
+   * <p><b>为什么是 0（而不是旧版的 6 = 每桶 64 槽）</b>：旧布局下桶是<b>整块</b>追加写的，
+   * 改 1 个区块就要把整桶 64 槽重新编码 + 重新压缩 + 整块追加——默认 16 MiB 单文件上限下，
+   * 一次改动可产生数 MB 的写放大，垃圾也随之快速堆积、把整文件压缩回收（最长可达数百 ms）
+   * 推成周期性事件。改为「一槽一条记录」后，写放大恒为 1 条记录；读一条也只需解压一条记录
+   * （旧布局要解压整桶）。代价是偏移表从 16×8 字节变 1024×8 字节（8 KiB，仍随每次落盘整体重写，
+   * 无 force，开销可忽略），以及每条记录多 8 字节的桶头——相对被消除的写放大完全不值一提。
+   *
+   * <p>该位移是<b>文件布局的一部分</b>（由 {@link #VERSION} 标识），改动它必须同时升版本号。
+   */
+  public static final int BUCKET_SHIFT = 0;
 
-  /** 单个 bucket 的区块槽位数。 */
+  /** 单条记录的区块槽位数（{@code 1}：一槽一条记录，见 {@link #BUCKET_SHIFT}）。 */
   public static final int BUCKET_SIZE = 1 << BUCKET_SHIFT;
 
-  /** bucket 数量：1024 个区块 / 64。 */
+  /** 记录（槽位）数量：1024 个区块 / 每记录槽位数。 */
   public static final int BUCKET_COUNT = 1024 / BUCKET_SIZE;
 
   /** 偏移表在文件中的位置（紧随头部）。 */
   public static final int POS_TABLE_OFFSET = HEADER_SIZE;
 
-  /** 偏移表长度：16 × u64。 */
+  /** 偏移表长度：{@link #BUCKET_COUNT} × u64。 */
   public static final int POS_TABLE_SIZE = BUCKET_COUNT * Long.BYTES;
 
   /** 数据区起始偏移。 */
@@ -117,18 +127,20 @@ public final class BufferedLinearV3Format {
   public static final int MAX_PAYLOAD_SIZE = 16 * 1024 * 1024;
 
   /**
-   * 单个 bucket 解压后原始数据的上限（防御损坏数据造成超大分配）：128 MiB。
+   * 单条记录解压后原始数据的上限（防御损坏数据造成超大分配）：32 MiB。
    *
-   * <p><b>为什么从 512 MiB 收紧到 128 MiB</b>：桶头里的 {@code rawLength} 直接来自（可能损坏的）文件，
-   * {@link #inflate} 会先 {@code new byte[rawLength]} 再解压——旧上限下「大 rawLength + 极小
-   * compressedLength」的损坏头可以让小堆服务端先发生数百 MiB 的分配、异常才被兜住（分配已经发生）。
-   * 依据：真实区块负载受 {@link #MAX_PAYLOAD_SIZE}（16 MiB）与区块实际编码规模双重约束——Paper/原版
-   * 一个区块的原始网络字节通常几十 KiB、最坏（24 段 × 15 位直接调色板 + 调色板/群系开销，384 高世界）
-   * 也仅约 200 KiB；一个桶最多 64 个区块，实际远小于 13 MiB。128 MiB 对任一现实负载都有 &gt;10 倍余量，
-   * 同时把单次分配的防护上限压到可控范围。理论上限 64 × (4 + 28 + 16 MiB) ≈ 1024 MiB 只在本进程
-   * 主动写入 16 MiB 级负载时才可能触及，而 {@code DiskCacheStore} 的单文件上限与负载上限已先行拦截。
+   * <p>{@code rawLength} 来自（可能损坏的）文件头，解压前会先 {@code new byte[rawLength]}，因此必须有闸。
+   * <b>槽位粒度记录（{@link #BUCKET_SHIFT}=0）下一条记录只承载一个槽位</b>，其原始长度恒为
+   * {@code 4 + 条目头 28 + 负载}，而负载上限由 {@link #MAX_PAYLOAD_SIZE}（16 MiB）双向把住
+   * （写入侧 {@code DiskCacheStore#put} 与读取侧 {@link #decodeEntry} 都拒绝超限负载），
+   * 故合法上界为 {@code 16 MiB + 32} 字节。取 32 MiB 即 2 倍余量。
+   *
+   * <p><b>为什么从 128 MiB 收紧</b>：旧布局一条记录是一个 64 槽位的桶（理论上限远超本值），故当时放宽到
+   * 128 MiB；改为一条记录一个槽位后，128 MiB 对合法数据有 8 倍余量、对损坏头像「白送」96 MiB 的分配额度。
+   * 收紧到 32 MiB 后，单次损坏头最坏只造成一次 32 MiB 分配（还有 {@code MAX_RAW_LENGTH_RATIO} 的
+   * 与文件大小挂钩的钳制、以及压缩比 sanity 两道更早的闸）。
    */
-  public static final int MAX_RAW_SIZE = 128 * 1024 * 1024;
+  public static final int MAX_RAW_SIZE = 32 * 1024 * 1024;
 
   /**
    * 解压前的「压缩比 sanity」上限：声明原始长度超过压缩长度 {@code 8192} 倍即判损坏。
@@ -180,10 +192,12 @@ public final class BufferedLinearV3Format {
     }
   }
 
-  /** 旧版（0x03）文件被拒绝时的唯一一次中文提示（并发安全）；由调用方删除重建。 */
+  /** 旧版（低于 {@link #VERSION}）文件被拒绝时的唯一一次中文提示（并发安全）；由调用方删除重建。 */
   private static void warnLegacyVersionOnce(byte version) {
-    if (version == LEGACY_VERSION && LEGACY_VERSION_WARNED.compareAndSet(false, true)) {
-      LOGGER.warning("检测到旧版磁盘缓存格式（0x03）：新版（0x04）要求负载信封携带被伪装坐标清单，"
+    if (version < VERSION && LEGACY_VERSION_WARNED.compareAndSet(false, true)) {
+      LOGGER.warning("检测到旧版磁盘缓存格式（0x" + Integer.toHexString(version & 0xFF)
+          + "）：当前格式为 0x" + Integer.toHexString(VERSION & 0xFF)
+          + "（槽位粒度记录；0x04 及以前是「64 槽一桶」的整桶追加布局）。"
           + "旧文件将被拒绝并删除重建（缓存只是可选加速，不影响封包链路，也绝不影响反矿透本身）");
     }
   }
@@ -291,7 +305,7 @@ public final class BufferedLinearV3Format {
     if (version != VERSION) {
       warnLegacyVersionOnce(version);
       throw new IOException("不支持的格式版本 " + version + "（当前支持 " + VERSION
-          + (version == LEGACY_VERSION ? "；旧版缓存将被删除重建" : "") + "）");
+          + (version < VERSION ? "；旧版缓存将被删除重建" : "") + "）");
     }
     byte compression = buffer.get();
     if (compression != COMPRESSION_DEFLATE && compression != COMPRESSION_ZSTD) {
@@ -302,7 +316,7 @@ public final class BufferedLinearV3Format {
 
   // ------------------------------------------------------------------ 偏移表
 
-  /** 编码偏移表（16 个 u64）。 */
+  /** 编码偏移表（{@link #BUCKET_COUNT} 个 u64）。 */
   public static byte[] encodePosTable(long[] offsets) {
     ByteBuffer buffer = ByteBuffer.allocate(POS_TABLE_SIZE);
     for (int i = 0; i < BUCKET_COUNT; i++) {
@@ -371,7 +385,7 @@ public final class BufferedLinearV3Format {
    * 按线程复用的 Deflater：避免「每个桶新建一个 Deflater」。
    *
    * <p>Deflater 构造会分配原生内存与内部状态，而 {@link #deflate} 在历史 Deflate 文件写入 / zstd 不可用时
-   * 会被每个桶反复调用（一个区域文件最多 16 个桶，且会被反复重压缩）。复用同一实例并每次 {@code reset()}
+   * 会被每个槽位记录反复调用（一个区域文件最多 {@link #BUCKET_COUNT} 条记录，且会被反复重压缩）。复用同一实例并每次 {@code reset()}
    * 即可消除这部分分配，输出字节与每次新建完全相同（Deflate 是确定性算法）。
    *
    * <p><b>为什么不 {@code end()}</b>：{@code end()} 之后该 Deflater 不可再用；按线程复用的实例刻意不释放，
@@ -529,7 +543,7 @@ public final class BufferedLinearV3Format {
    * 从缓冲区区间 {@code [offset, offset + length)} 解析一条条目（<b>不</b>复制数组）。
    *
    * <p>与 2 参重载语义完全一致，只是把「先 {@code Arrays.copyOfRange} 再解析」合并成原地解析：
-   * 一个 bucket 最多 64 个槽位，原先每次载入桶都要多出最多 64 次数组复制与对应的垃圾。
+   * 一条记录最多只有 1 个槽位（旧布局是 64 槽一桶，那时每次载入要付最多 64 次数组复制与对应垃圾）。
    *
    * @throws IOException 截断、长度非法或校验失败
    */
@@ -560,7 +574,7 @@ public final class BufferedLinearV3Format {
   // ------------------------------------------------------------------ bucket
 
   /**
-   * 编码一个 bucket（64 个槽位；空槽写长度为 0）。
+   * 编码一条记录（{@link #BUCKET_SIZE} 个槽位；空槽写长度为 0）。
    *
    * @param slots    长度应为 {@link #BUCKET_SIZE}，不足部分按空槽处理
    * @param hashSeed 条目校验种子
@@ -568,7 +582,7 @@ public final class BufferedLinearV3Format {
   public static byte[] encodeBucket(Entry[] slots, int hashSeed) {
     // 容量已按内容精确算好（见 encodedBucketLength），直接把每条条目写进结果数组——不再走
     // ByteArrayOutputStream + toByteArray() 的「先写进中间缓冲、再整块复制一份」双重拷贝，也不再为每个
-    // 条目单独分配一个编码临时数组（桶是热路径：一个区域文件最多 16 个桶会被反复重编码）。
+    // 条目单独分配一个编码临时数组（记录是热路径：一个区域文件最多 BUCKET_COUNT 条记录会被反复重编码）。
     // 写出字节与 encodeEntry 完全一致。
     byte[] out = new byte[encodedBucketLength(slots)];
     int offset = 0;

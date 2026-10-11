@@ -16,8 +16,11 @@ import java.util.logging.Logger;
 /**
  * 单个区域缓存文件（{@code r.<regionX>.<regionZ>.b_linear}）的读写句柄，格式见 {@link BufferedLinearV3Format}。
  *
- * <p><b>线程纪律</b>：所有方法都只在 {@link DiskCacheStore} 的磁盘线程上调用（单线程串行），
- * 因此内部只用普通字段与一把逻辑串行化，不做额外的线程安全处理。
+ * <p><b>线程纪律</b>：除 {@link #compact} 外，所有方法都只在 {@link DiskCacheStore} 的<b>磁盘线程</b>上调用
+ * （该线程上单线程串行），因此这些路径之间不做额外的线程安全处理。{@link #compact} 例外——它跑在
+ * {@link DiskCacheStore} 的<b>独立压缩线程</b>上，两个线程靠 {@link #compacting} 标志互斥：
+ * 磁盘线程在把压缩任务交付出去之前调 {@link #beginCompact()} 置位，此后磁盘线程的每个入口都自行避让
+ * （fail-open），压缩线程跑完时清位（volatile，充当 release）。因此同一时刻只有一个线程触碰本对象的状态。
  *
  * <p><b>内存纪律</b>：bucket 按需（懒）加载，并用一个受 {@code bucketCacheSize} 限制的 LRU 持有
  * 已加载槽位；被淘汰的脏 bucket 会先落盘再释放，因此内存占用有界且不会丢写入。
@@ -39,23 +42,23 @@ final class RegionFile implements AutoCloseable {
   /**
    * 桶头声明的 {@code rawLength} 相对<b>整文件大小</b>的许可倍数上限。
    *
-   * <p><b>为什么需要</b>：{@code rawLength} 直接来自（可能损坏/被篡改的）文件，解压会按它先分配原始
-   * 缓冲区。单靠 {@code BufferedLinearV3Format} 的 {@link BufferedLinearV3Format#MAX_RAW_SIZE}（128 MiB）
-   * 与「压缩比」闸门仍留有一个洞：压缩长度约 16 KB 的桶恰好能声明到约 128 MiB raw（8192 × 16 KB）通过
-   * 压缩比检查，16 个桶叠加即约 2 GiB 的分配尖峰。用一个与文件实际大小挂钩的钳制即可堵住它——
-   * 桶占文件字节数很小，却声明出远超文件的原始长度，只可能是伪造头。
+   * <p><b>为什么要这道闸</b>：{@code rawLength} 直接来自（可能损坏/被篡改的）文件，解压会按它先分配原始
+   * 缓冲区。单靠 {@link BufferedLinearV3Format#MAX_RAW_SIZE} 与「压缩比」闸门仍留有一个洞：压缩长度
+   * 约 32 KB 的记录恰好能声明到约 32 MiB raw（受 MAX_RAW_SIZE 封顶）通过压缩比检查，上百条这样的记录
+   * 叠加即在压缩回收/首次计数时形成可观的分配量。用一个与文件实际大小挂钩的钳制即可堵住它——
+   * 记录占文件字节数很小，却声明出远超文件的原始长度，只可能是伪造头。
    *
    * <p><b>为什么取 1024</b>：真实负载里「单桶原始长度 / 整文件字节」远小于 100（区块负载压缩比通常个位数
    * 到几十；即便单个高重复桶，其原始长度也不会超过整文件的千倍），1024 留足 >10 倍余量、绝不误伤合法桶；
-   * 同时它远小于 8192，可把上述「16 KB 声明 128 MiB」的伪造头直接拒之门外（该类伪造需要 8192 倍）。
+   * 同时它远小于 8192，可把上述「32 KB 声明 32 MiB」的伪造头直接拒之门外（该类伪造需要 8192 倍）。
    */
   private static final long MAX_RAW_LENGTH_RATIO = 1024L;
 
   /**
    * 单次 {@link #compact} 允许累计解压的原始字节上限（256 MiB）。
    *
-   * <p>压缩要先把全部 bucket 载入内存（见 {@link #compact} 的内存尖峰说明）。即便每个桶都通过了
-   * {@link #MAX_RAW_LENGTH_RATIO} 钳制，16 个桶叠加仍可能很大；这里对「累计解压字节」再加一道总量闸：
+   * <p>压缩要先把全部槽位记录载入内存（见 {@link #compact} 的内存尖峰说明）。即便每条记录都通过了
+   * {@link #MAX_RAW_LENGTH_RATIO} 钳制，全部记录叠加仍可能很大；这里对「累计解压字节」再加一道总量闸：
    * 超限即中止本次压缩、直接抛异常（此时尚未创建临时文件，原文件毫发无损，交由调用方走既有安全路径）。
    * 取值依据：合法文件的活动数据受 {@code max-file-size-mb}（默认远小于此）与逐条目负载上限共同约束，
    * 整文件解压后极少超过 256 MiB，故它只拦异常/伪造输入。
@@ -133,7 +136,16 @@ final class RegionFile implements AutoCloseable {
   private long fileSize;
   private long liveBytes;
   private long garbageBytes;
-  private boolean compacting;
+  /**
+   * 「本文件正被整文件重写（{@link #compact}）独占」。
+   *
+   * <p><b>为什么是 volatile 且由调用方提前置位</b>：压缩已改为在<b>独立的压缩线程</b>上执行（见
+   * {@code DiskCacheStore} 的双线程模型），而本类的其余状态仍由磁盘线程独占。为了让两个线程<b>互斥</b>
+   * 地访问本对象，磁盘线程在把压缩任务交给压缩线程之前先调 {@link #beginCompact()} 置位，此后磁盘线程的
+   * 所有入口（读 / 写 / 落盘 / 清理 / 计数）一律先看这个标志并<b>直接避让</b>（fail-open：读视为未命中、
+   * 写视为跳过）。volatile 保证「压缩线程的写入」对随后读到 {@code false} 的磁盘线程可见。
+   */
+  private volatile boolean compacting;
   private boolean closed;
 
   private RegionFile(Path path, FileChannel channel, int hashSeed, byte compression,
@@ -372,14 +384,44 @@ final class RegionFile implements AutoCloseable {
       // 该文件归其它进程所有：一律视为未命中，交给上层回退重算（fail-open）
       return null;
     }
+    if (compacting) {
+      // 整文件重写进行中（压缩线程持有本对象）：磁盘线程一律不碰它的任何状态，本次读取按未命中降级。
+      // 压缩窗口是「单文件」粒度且伴随 force+move，用户可见代价只是一次回退重算（fail-open）。
+      return null;
+    }
     return readSlot(bucketIndex(chunkIndex), slotInBucket(chunkIndex));
+  }
+
+  /**
+   * 该文件是否正被整文件重写独占（压缩线程持有）。供 {@code DiskCacheStore} 避免对同一句柄再做落盘、
+   * 关闭或计数——那些操作都会触碰压缩线程正在改写的状态。
+   */
+  boolean isCompacting() {
+    return compacting;
+  }
+
+  /**
+   * 把「本文件归压缩线程独占」<b>在交付压缩任务之前</b>置位（由磁盘线程调用）。
+   *
+   * <p>顺序是关键：置位必须发生在提交任务<b>之前</b>，这样「磁盘线程后续的任何操作都会看到 true 并避让」
+   * 与「压缩线程开始改写状态」之间不存在窗口。执行完 {@link #compact} 后由它自己清除（见其 finally），
+   * 即「压缩线程写状态 → 清标志（volatile 写）」对随后读到 false 的磁盘线程构成 release/acquire，
+   * 磁盘线程因此能看到压缩的全部结果。
+   */
+  void beginCompact() {
+    compacting = true;
+  }
+
+  /** 解除「压缩独占」标志（{@link #compact} 的 finally 调用；交付压缩任务失败时也由调用方调用）。 */
+  void endCompact() {
+    compacting = false;
   }
 
   /**
    * 读取一个槽位：桶已在内存（整桶已解码）时直接返回该槽位；否则走懒加载——只解析槽位表、只解码本次
    * 请求的那一个槽位。
    *
-   * <p><b>为什么要懒解码</b>：旧实现每次读取都 {@link #ensureLoaded} 整桶 64 个槽位（逐槽分配 payload、
+   * <p><b>为什么要懒解码</b>：旧实现每次读取都 {@link #ensureLoaded} 整桶（旧布局一桶 64 个槽位，逐槽分配 payload、
    * 复制、XXHash 校验），单次区块读取要付出最多 64 个区块的工作量；而读取只有 50ms 预算，常常跑不完
    * 而被记未命中，上层于是回退整块重写，磁盘缓存几乎失效。现在只解码被请求的槽位，其余槽位的校验/复制
    * 都推迟到真正需要（写、压缩回收）时。
@@ -478,7 +520,7 @@ final class RegionFile implements AutoCloseable {
   /**
    * 解码懒加载桶中的一个槽位；槽位为空、偏移非法或条目损坏（长度非法、XXHash 校验失败等）都只丢该槽位。
    *
-   * <p>不复用整桶的槽位数组，因此每次读取只分配「被请求的那一条负载」，而不是最多 64 条。
+   * <p>不复用整桶的槽位数组，因此每次读取只分配「被请求的那一条负载」（旧布局一桶 64 槽，最多 64 条）。
    */
   private BufferedLinearV3Format.Entry decodeLazySlot(LazyBucket lazy, int slot) {
     int offset = lazy.offsets[slot];
@@ -522,6 +564,11 @@ final class RegionFile implements AutoCloseable {
     if (lockUnavailable) {
       return false; // 该文件归其它进程所有：跳过写（不落盘、不报错），交给上层
     }
+    if (compacting) {
+      // 整文件重写进行中：绝不写它的内存态（压缩线程正在整体重建槽位与偏移表）。按「写入被跳过」处理：
+      // 上层只损失一条缓存写入（fail-open），绝不产生半个写入或状态错乱。
+      return false;
+    }
     BufferedLinearV3Format.Entry[] bucketSlots = ensureLoaded(bucketIndex(chunkIndex));
     int slot = slotInBucket(chunkIndex);
     boolean replaced = bucketSlots[slot] != null;
@@ -541,6 +588,11 @@ final class RegionFile implements AutoCloseable {
   boolean bucketRawLengthFitsAfterPut(int chunkIndex, int payloadLength) {
     if (lockUnavailable) {
       return true; // 该文件已停用：调用方本就跳过写入，这里不制造额外拒绝
+    }
+    if (compacting) {
+      // 整文件重写进行中：本方法要 ensureLoaded（触碰槽位状态），必须避让。
+      // 返回 true（不制造额外拒绝）——真正的写会被 put 的压缩避让挡下，语义一致。
+      return true;
     }
     BufferedLinearV3Format.Entry[] bucketSlots = ensureLoaded(bucketIndex(chunkIndex));
     int current = BufferedLinearV3Format.encodedBucketLength(bucketSlots);
@@ -568,6 +620,11 @@ final class RegionFile implements AutoCloseable {
    */
   long encodedBucketSizeEstimateAfterPut(int chunkIndex, int payloadLength) {
     if (lockUnavailable) {
+      return 0L;
+    }
+    if (compacting) {
+      // 整文件重写进行中：本方法要 ensureLoaded（触碰槽位状态），必须避让。返回 0 让大小判定退化为
+      // 「本次记账为 0」，随后 put 也会被压缩避让挡下——不会产生错误的接受/拒绝判定。
       return 0L;
     }
     BufferedLinearV3Format.Entry[] bucketSlots = ensureLoaded(bucketIndex(chunkIndex));
@@ -628,6 +685,11 @@ final class RegionFile implements AutoCloseable {
   boolean flushDirty() throws IOException {
     if (lockUnavailable) {
       return false; // 该文件归其它进程所有：跳过落盘（不报错）
+    }
+    if (compacting) {
+      // 整文件重写进行中：落盘要读槽位数组并写偏移表，而压缩线程正在整体重建它们，必须避让。
+      // 返回 false 表示「本次没写」；压缩完成后文件已是内存态的最新快照，无需补写。
+      return false;
     }
     boolean wrote = false;
     // 记录本轮真正追加落盘的桶，等偏移表也写成功后再统一清 dirty（见方法说明）。
@@ -692,9 +754,9 @@ final class RegionFile implements AutoCloseable {
   /**
    * 整文件重写，丢弃 {@code keep} 判定为不需要的条目；返回丢弃的条目数。
    *
-   * <p><b>内存尖峰</b>：本方法先把<b>全部 16 个 bucket（共 1024 个区块槽）</b>的条目一次性
+   * <p><b>内存尖峰</b>：本方法先把<b>全部 {@code BUCKET_COUNT} 条槽位记录（共 1024 个区块）</b>的条目一次性
    * {@link #ensureLoaded} 进内存（{@code all} 数组持引用，加载后即使 LRU 淘汰也不释放），峰值内存约等于「整文件的未压缩负载」——
-   * 满文件（16MB 压缩）时可达数百 MB 级。这是刻意的取舍：压缩必须以「整文件一致」为前提，
+   * 满文件（16MB 压缩）时可达数十~上百 MB 级。这是刻意的取舍：压缩必须以「整文件一致」为前提，
    * 不能边读边写（读着旧文件、写着新文件会踩坏尚未搬完的 bucket）。内存护栏由两层上游限制兜底：
    * {@code max-file-size-mb}（单文件上限）与 {@code compact-per-pass}（每轮最多几个文件）。
    *
@@ -703,6 +765,10 @@ final class RegionFile implements AutoCloseable {
    * 触发后<b>整个文件的活动数据</b>会被重写一遍。因此「写入放大 = 最多约 2 倍」：一条数据最多被
    * 写两次（一次追加 + 一次随压缩重写）。把压缩阈值从「每次落盘」放宽到「垃圾过半」，正是用
    * 可控的放大换掉高频整文件重写。
+   *
+   * <p><b>线程归属</b>：本方法由 {@code DiskCacheStore} 的<b>压缩线程</b>调用（而非磁盘线程）。
+   * 调用方必须在交付之前调 {@link #beginCompact()} 置独占标志，本方法的 finally 会清掉它；
+   * 这段时间内磁盘线程对本对象的任何入口都自行避让（见 {@link #isCompacting()}）。
    */
   int compact(EntryFilter keep) throws IOException {
     if (lockUnavailable) {
@@ -712,7 +778,7 @@ final class RegionFile implements AutoCloseable {
     try {
       BufferedLinearV3Format.Entry[][] all =
           new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_COUNT][];
-      // 累计解压字节的记账数组：即使每个桶都过了 rawLength 钳制，16 个桶叠加仍可能过大，
+      // 累计解压字节的记账数组：即使每条记录都过了 rawLength 钳制，全部记录叠加仍可能过大，
       // 因此再加一道总量闸。超限即在此抛异常——此刻临时文件尚未创建，原文件毫发无损。
       long[] compactRawBudget = {0L};
       for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
@@ -801,8 +867,14 @@ final class RegionFile implements AutoCloseable {
       garbageBytes = 0L;
       return dropped;
     } finally {
-      compacting = false;
-      evictIfNeeded(-1);
+      // 顺序关键：先做压缩后的 LRU 收敛（可能落盘），再解除「压缩独占」标志。若先清标志，磁盘线程会
+      // 立刻恢复对该文件的读写，而此时收敛可能正在 flushBucket / 写偏移表——两个线程同时改同一份状态。
+      // 清标志（volatile 写）同时充当 release：随后读到 false 的磁盘线程能看到压缩与收敛的全部结果。
+      try {
+        evictIfNeededUnchecked(-1);
+      } finally {
+        endCompact();
+      }
     }
   }
 
@@ -838,10 +910,20 @@ final class RegionFile implements AutoCloseable {
     if (lockUnavailable) {
       return 0L;
     }
+    if (compacting) {
+      // 整文件重写进行中：槽位数组正被压缩线程重建，读它没有意义也不安全。返回 0 表示「本次无待落盘增量」
+      // （对应的 put 同样被避让挡下，不会出现「记了 0 却真的写进去了」）。
+      return 0L;
+    }
     return 8L + BufferedLinearV3Format.encodedBucketLength(slots[bucket]);
   }
 
   boolean isDirty() {
+    if (compacting) {
+      // 整文件重写进行中：脏标记数组正被压缩线程重建，磁盘线程不得读它（见 compacting 字段说明）。
+      // 返回 false 表示「本文件此刻无需落盘」——压缩结束时自身已把全部内容按最新状态重写落盘。
+      return false;
+    }
     for (boolean value : dirty) {
       if (value) {
         return true;
@@ -853,6 +935,10 @@ final class RegionFile implements AutoCloseable {
   boolean isEmptyFile() {
     if (lockUnavailable) {
       // 该文件归其它进程所有：绝不能因「看起来空」而被本进程删除（那会毁掉对方的缓存）
+      return false;
+    }
+    if (compacting) {
+      // 整文件重写进行中：绝不能被判定为「空文件」而被关闭/删除（那会毁掉压缩线程正在写的文件）
       return false;
     }
     return liveBytes <= 0L && !isDirty();
@@ -1053,6 +1139,11 @@ final class RegionFile implements AutoCloseable {
     if (lockUnavailable) {
       return 0; // 该文件归其它进程所有：不读它的内容，计为 0（计数偏小只影响上限保守度）
     }
+    if (compacting) {
+      // 整文件重写进行中：偏移表正被重建，读它只会得到半新半旧的结果。返回 0（计数偏小只影响上限
+      // 保守度）；调用方下次打开该句柄时会重新计数。
+      return 0;
+    }
     int count = 0;
     for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
       if (positions[bucket] <= 0L) {
@@ -1089,6 +1180,15 @@ final class RegionFile implements AutoCloseable {
     if (compacting) {
       return;
     }
+    evictIfNeededUnchecked(pinned);
+  }
+
+  /**
+   * 驱逐主体（<b>不做</b>「压缩中则避让」的检查）：只由压缩线程在 {@link #compact} 的 finally 里、
+   * 且<b>在解除 {@link #beginCompact()} 标志之前</b>调用——那时压缩已经完成但独占尚未释放，
+   * 收敛本身必须照常执行（压缩把全部桶载入内存后需要按 LRU 上限收回来）。
+   */
+  private void evictIfNeededUnchecked(int pinned) {
     while (loaded.size() > bucketCacheSize) {
       int victim = selectEvictableVictim(pinned);
       if (victim < 0) {

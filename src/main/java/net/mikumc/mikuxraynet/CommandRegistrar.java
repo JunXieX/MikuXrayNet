@@ -34,6 +34,14 @@ final class CommandRegistrar {
   /** 管理命令名（插件描述与代码注册两处必须一致，由 PluginDescriptionConsistencyTest 守门）。 */
   static final String COMMAND_NAME = "mikuxraynet";
   static final String COMMAND_DESCRIPTION = "MikuXrayNet 管理命令";
+  /**
+   * 命令的「总权限」节点，<b>仅用于插件描述元数据</b>（paper-plugin.yml 的 commands 段）+ 构建期一致性守门。
+   *
+   * <p>它<b>不再</b>是 Brigadier 的 requires 判据——命令注册时 {@code permission()} 返回 {@code null}，
+   * 判权改由 MikuCommand 逐子命令执行（原因见 PaperCommandBridge#permission 的说明：框架级单一权限会
+   * 让 status/dump/reload 三个子权限无法单独授予）。授予本节点的玩家照常可执行全部子命令，
+   * 因为 paper-plugin.yml 里它的 children 已包含那三个节点。
+   */
   static final String COMMAND_PERMISSION = Constants.ADMIN_PERMISSION;
   static final List<String> COMMAND_ALIASES = List.of("mxnet", "mxr");
 
@@ -111,7 +119,17 @@ final class CommandRegistrar {
 
     @Override
     public String permission() {
-      return COMMAND_PERMISSION;
+      // 返回 null = **不在框架层**要求权限：真正的判权在 MikuCommand#onCommand（逐子命令）与
+      // MikuCommand#suggestSubcommands（补全收敛）里完成。
+      //
+      // 为什么不返回 COMMAND_PERMISSION（mikuxraynet.admin）：Brigadier 的 permission() 是单一字符串、
+      // 不支持「或」，一旦在这里要求 admin，只授予 mikuxraynet.status 的玩家会被**框架**直接拒绝，
+      // paper-plugin.yml 里声明的 status/dump/reload 三个子权限就形同虚设（无法单独授予）。
+      // 授予 admin 的玩家照常可用——admin 的 children 已包含这三个节点，逐子命令判定同样通过。
+      //
+      // 副作用（已接受）：命令本身不再被框架隐藏，完全无权限的玩家也能在补全里看到命令名——
+      // 但其补全结果为空，执行时得到 NO_PERMISSION_MESSAGE，不会泄露任何状态/配置信息。
+      return null;
     }
   }
 }

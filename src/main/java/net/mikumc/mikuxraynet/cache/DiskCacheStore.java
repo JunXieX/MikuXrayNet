@@ -12,6 +12,7 @@ import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
@@ -90,10 +91,9 @@ public final class DiskCacheStore implements AutoCloseable {
   /**
    * 两次「单文件压缩」之间的让出时间（毫秒）。
    *
-   * <p>压缩是「整文件重写 + force + move」的长任务，与读取共用同一个磁盘线程。若把一轮的全部候选连续
-   * 做完，这期间提交的读取会在队列里枯等到 50ms 预算耗尽、记未命中，上层于是回退重写——缓存近乎失效。
-   * 因此一次只压缩一个文件，压完隔一小段时间再排下一个：空档里新提交的读取能立刻执行（见
-   * {@link #compactGarbage()}）。
+   * <p>压缩现已改由<b>独立的压缩线程</b>执行（见 {@link #compactionExecutor}），因此它不再阻塞读取；
+   * 这里的间隔只用于把「同一轮压缩会话」的文件之间拉开一点距离，避免压缩线程长时间连轴转、
+   * 也顺便让每一步都重新检查 {@code closed}。
    */
   private static final long COMPACT_YIELD_MILLIS = 20L;
 
@@ -135,7 +135,7 @@ public final class DiskCacheStore implements AutoCloseable {
     /**
      * 每个 bucket 已计入 {@link #pendingBytes} 的整桶编码长度（只有磁盘线程访问）。
      *
-     * <p><b>为什么按桶而非按负载记账</b>：flush 追加的是<b>整块 bucket</b>（最多 64 个槽位），旧实现只把
+     * <p><b>为什么按记录而不是按负载记账</b>：flush 追加的是<b>整条记录</b>（含 8 字节记录头 + 编码后的槽位），
      * 本次 payload 长度累加进 {@link #pendingBytes}，严重低估了实际会写入文件的字节数——文件早已冲破
      * {@code max-file-size-mb}，上限判定却迟迟不触发、压缩回收也被一并推迟。改为：每次写入把「该桶整桶
      * 编码长度」相对上次的增量并入 {@link #pendingBytes}，使上限判定反映真正会被 append 的数据量。
@@ -186,6 +186,21 @@ public final class DiskCacheStore implements AutoCloseable {
   /** flush / 世界失效的等待预算（毫秒）；生产为 {@link #FLUSH_WAIT_MILLIS}，测试可放宽。 */
   private final long flushWaitMillis;
   private final ScheduledExecutorService executor;
+  /**
+   * 压缩（整文件重写）专用线程：<b>读写与压缩分线程</b>。
+   *
+   * <p><b>为什么必须分开</b>：压缩是「解压全部槽位 → 重新编码+zstd → 写临时文件 → {@code force(true)}
+   * → move」的不可切分长任务（单文件可达数百 ms）。与读取共用一条线程时，这段时间内<b>所有</b>文件的
+   * 读取都会在 50ms 预算内跑不完 → 全部记未命中 → 上层回退整块重写（最贵路径），表现为周期性的
+   * 命中率骤降与 CPU 抖动。拆开后，压缩期间磁盘线程照常服务其它文件的读写。
+   *
+   * <p><b>两个线程如何互斥</b>：本类的 {@code open}/{@code stats}/{@code approximateEntries} 等都是
+   * 线程安全的，唯一不能并发的是「同一个 {@code RegionFile} 的状态」。做法是磁盘线程在交付压缩任务
+   * <b>之前</b>调 {@link RegionFile#beginCompact()} 置独占标志，此后磁盘线程对该文件的所有入口
+   * （读/写/落盘/清理/计数）一律避让并 fail-open；压缩线程跑完 {@code compact} 时清标志（volatile 写，
+   * 充当 release）。因此两个线程从不同时触碰同一份 {@code RegionFile} 状态，也不需要任何锁。
+   */
+  private final ExecutorService compactionExecutor;
   /**
    * 压缩会话是否进行中。
    *
@@ -243,6 +258,14 @@ public final class DiskCacheStore implements AutoCloseable {
           DISK_THREAD.remove();
         }
       }, THREAD_NAME);
+      thread.setDaemon(true);
+      return thread;
+    });
+
+    // 压缩专用线程：不写 DISK_THREAD 身份标记（它本就不是磁盘线程，submit() 因此不会把它误判成
+    // 「已在磁盘线程内」而绕过排队；压缩路径也从不提交任务给磁盘线程，不存在自等自）。
+    this.compactionExecutor = Executors.newSingleThreadExecutor(runnable -> {
+      Thread thread = new Thread(runnable, "MikuXrayNet-DiskCache-Compact");
       thread.setDaemon(true);
       return thread;
     });
@@ -416,6 +439,19 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
     closed = true;
+    // 顺序：先让压缩线程收工，再排空磁盘线程。压缩独占某个句柄的 RegionFile，若在它跑的时候关闭通道，
+    // 压缩会以 ClosedChannelException 失败（数据无损，只是该文件本轮未被回收，且会多一条告警）。
+    // 与下面磁盘线程的关闭同口径：只 shutdown（不再收新任务、让已排入的压缩自然跑完），绝不 shutdownNow
+    // ——中断会毁掉正在进行的 FileChannel 写，把「可能未完成」变成「彻底失败」。
+    compactionExecutor.shutdown();
+    try {
+      if (!compactionExecutor.awaitTermination(CLOSE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
+        logger.warning("磁盘缓存压缩线程超过 " + CLOSE_TIMEOUT_MILLIS + "ms 仍未收工；"
+            + "本次关闭不再等待它（该区域文件本轮未被压缩回收，缓存只是可选加速，不影响封包链路）");
+      }
+    } catch (InterruptedException exception) {
+      Thread.currentThread().interrupt();
+    }
     try {
       executor.submit(() -> {
         try {
@@ -514,6 +550,13 @@ public final class DiskCacheStore implements AutoCloseable {
     if (handle.file.lockUnavailable()) {
       // 该文件被其它服务端实例占用：本实例对它停用读写（见 RegionFile#lockUnavailable）。
       // 必须在这里就返回，否则下面会把「写了但没落盘」的条目计进 approximateEntries，白白耗尽额度。
+      return;
+    }
+    if (handle.file.isCompacting()) {
+      // 该文件正被压缩线程独占（整文件重写）：本次写入整体跳过。
+      // 必须在入口就返回，不能只依赖 RegionFile#put 内部的避让——put 返回 false 在本方法里意味着
+      // 「未覆盖已有条目」，会让下面把一条根本没写进去的条目录进 accountedEntries / approximateEntries。
+      // 语义：只是少缓存一条（fail-open），压缩结束后后续写入照常。
       return;
     }
     int chunkIndex = BufferedLinearV3Format.chunkIndex(chunkX, chunkZ);
@@ -643,40 +686,64 @@ public final class DiskCacheStore implements AutoCloseable {
     }
     RegionKey key = candidates.get(index);
     try {
-      executor.schedule(() -> {
-        try {
-          if (!closed) {
-            compactOne(key);
-          }
-        } finally {
-          scheduleCompactStep(candidates, index + 1);
-        }
-      }, COMPACT_YIELD_MILLIS, TimeUnit.MILLISECONDS);
+      executor.schedule(() -> startCompact(candidates, key, index), COMPACT_YIELD_MILLIS,
+          TimeUnit.MILLISECONDS);
     } catch (Throwable throwable) {
       compactionRunning.set(false);
       fail("磁盘缓存压缩回收排程失败（已中止本轮）", throwable);
     }
   }
 
-  /** 压缩单个区域文件（在磁盘线程上执行，与读写天然串行）。 */
-  private void compactOne(RegionKey key) {
-    Handle handle = open.get(key);
-    if (handle == null) {
-      // 句柄可能已被闲置关闭 / 世界卸载关闭：跳过（数据已在之前的落盘中持久化）
+  /**
+   * 【磁盘线程】把第 {@code index} 个文件交给压缩线程：<b>先置独占标志再交付</b>，然后继续排下一个。
+   *
+   * <p>顺序是本设计的全部要害：置标志发生在提交之前，因此「磁盘线程此后对该文件的每次访问都会看到
+   * {@code true} 并避让」与「压缩线程开始改写该文件状态」之间不存在窗口（见 {@link RegionFile#beginCompact()}）。
+   * 压缩完成后由压缩线程在 {@code compact} 的 finally 里清标志，并接着排下一个文件。
+   */
+  private void startCompact(List<RegionKey> candidates, RegionKey key, int index) {
+    Handle handle = !closed ? open.get(key) : null;
+    if (handle == null || handle.file.isCompacting()) {
+      // 句柄已被闲置关闭 / 世界卸载关闭，或在途压缩未收工：跳过本文件，直接排下一个
+      scheduleCompactStep(candidates, index + 1);
       return;
     }
+    // 交付前置位：此后磁盘线程对该文件的一切入口（读/写/落盘/清理/计数）都会自行避让
+    handle.file.beginCompact();
     try {
-      int dropped = handle.file.compact((chunkIndex, entry) -> keepEntry(entry));
-      if (dropped > 0) {
-        handle.accountedEntries = Math.max(0L, handle.accountedEntries - dropped);
-        approximateEntries.updateAndGet(value -> Math.max(0, value - dropped));
-      }
-      // 压缩会把内存里的全部 bucket（含脏的）整文件重写：待落盘记账随之清零
-      handle.clearPending();
+      compactionExecutor.execute(() -> runCompact(candidates, key, handle, index + 1));
     } catch (Throwable throwable) {
-      // 压缩失败：句柄可能已不可用（例如文件被外部删除），直接关闭并让它下次重新打开
-      fail("磁盘缓存压缩回收失败，已关闭该区域文件句柄：" + handle.file.path(), throwable);
-      removeAndClose(key, handle);
+      // 压缩线程已关闭（本实例正在关闭）：必须撤销独占标志，否则该文件永久避让
+      handle.file.endCompact();
+      fail("磁盘缓存压缩任务提交失败（已跳过该文件）", throwable);
+      scheduleCompactStep(candidates, index + 1);
+    }
+  }
+
+  /**
+   * 【压缩线程】整文件重写单个区域文件；收工后在 finally 里排下一个文件（会话是单线程串行的）。
+   *
+   * <p>与旧实现（跑在磁盘线程上）的唯一差别是执行线程：这里能安全地长跑，因为磁盘线程已被
+   * {@link RegionFile#beginCompact()} 挡在该文件之外，且其余文件仍由磁盘线程正常服务。
+   */
+  private void runCompact(List<RegionKey> candidates, RegionKey key, Handle handle, int nextIndex) {
+    try {
+      try {
+        int dropped = handle.file.compact((chunkIndex, entry) -> keepEntry(entry));
+        if (dropped > 0) {
+          handle.accountedEntries = Math.max(0L, handle.accountedEntries - dropped);
+          approximateEntries.updateAndGet(value -> Math.max(0, value - dropped));
+        }
+        // 压缩会把内存里的全部槽位（含脏的）整文件重写：待落盘记账随之清零
+        handle.clearPending();
+      } catch (Throwable throwable) {
+        // 压缩失败：句柄可能已不可用（例如文件被外部删除），直接关闭并让它下次重新打开。
+        // 此刻 compact 的 finally 已解除独占标志，故这里的关闭不与压缩互斥冲突。
+        fail("磁盘缓存压缩回收失败，已关闭该区域文件句柄：" + handle.file.path(), throwable);
+        removeAndClose(key, handle);
+      }
+    } finally {
+      scheduleCompactStep(candidates, nextIndex);
     }
   }
 
@@ -727,6 +794,12 @@ public final class DiskCacheStore implements AutoCloseable {
    * <p>只有磁盘线程调用；{@link ConcurrentHashMap#remove(Object, Object)} 返回 false（句柄已被别处移除）时不做任何事。
    */
   private void removeAndClose(RegionKey key, Handle handle) {
+    if (handle.file.isCompacting()) {
+      // 该文件正被压缩线程独占：绝不能在压缩进行中关闭它的通道（那会让压缩以 ClosedChannelException
+      // 失败）。留给下一次维护重试；压缩线程自身的失败路径也会调本方法，那时标志已由 compact 的
+      // finally 清除，不受此判定影响。
+      return;
+    }
     if (!open.remove(key, handle)) {
       return;
     }

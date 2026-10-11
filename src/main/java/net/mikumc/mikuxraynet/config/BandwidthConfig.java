@@ -53,6 +53,19 @@ public final class BandwidthConfig {
   public static final int MAX_IMMEDIATE_RADIUS = 64;
   /** 强制可见距离上限（格）：越大越多实体不被剔除、越安全，故放宽到 1024。 */
   public static final double MAX_FORCE_VISIBLE_DISTANCE = 1024.0D;
+  /**
+   * 强制可见距离<b>硬下限</b>（格，16）。
+   *
+   * <p><b>为什么必须有下限</b>：{@code force-visible-distance} 是「近身实体一律可见」这条安全策略的唯一
+   * 承载者——射线判定偶有误判（射线起点落在实体内部、薄方块/浮空方块的边界情况），该距离内的实体
+   * <b>绝不</b>走射线剔除，也就绝不会出现「眼前的实体忽然消失」。旧实现只钳上限（负值按 0 生效），
+   * 配成 0 或负数会<b>静默关掉</b>这层兜底（玩家身边 1 格处的实体隔着一层薄墙就会被隐藏），
+   * 而配置里看不出任何异常。
+   *
+   * <p>取 16 与项目既有约定一致（{@code proximity.frustum.min-distance} 的安全下限同为 16 格，
+   * README 的安全区间一节也以「16 格」表述近身豁免距离）；默认值 32 仍在区间内，故默认行为不变。
+   */
+  public static final double MIN_FORCE_VISIBLE_DISTANCE = 16.0D;
   /** 遮挡复检周期上限（tick）：40 tick（2 秒）再长会让「误藏」持续过久，可被玩家感知。 */
   public static final int MAX_UPDATE_INTERVAL_TICKS = 40;
   /** 每周期复检预算上限：预算即每周期主线程射线次数，越大收敛越快、越安全，故放宽到 2048。 */
@@ -269,8 +282,11 @@ public final class BandwidthConfig {
             root.getBoolean("entity-culling.raycast", true),
             // 默认 32（性能优先，回落到设计兜底值）：剔除更多远处实体以省包；近身/视野中心的实体
             // 仍在强制可见范围内放行，玩家不易察觉剔除在发生。
-            clampUpper(root.getDouble("entity-culling.force-visible-distance", 32.0D),
-                32.0D, MAX_FORCE_VISIBLE_DISTANCE, "entity-culling.force-visible-distance", clampAdjustments),
+            // 两端都钳（单趟 clampRange，保证每键至多一条明细）：上限防手滑多打 0，下限
+            // MIN_FORCE_VISIBLE_DISTANCE 保证「近身实体一律可见」这层兜底绝不被配没（见其常量说明）。
+            clampRange(root.getDouble("entity-culling.force-visible-distance", 32.0D),
+                32.0D, MIN_FORCE_VISIBLE_DISTANCE, MAX_FORCE_VISIBLE_DISTANCE,
+                "entity-culling.force-visible-distance", clampAdjustments),
             // 默认 10（性能优先）：复检更省 CPU；遮挡/可见切换的延迟由「已隐藏实体每周期全量复检」
             // 兜底，玩家几乎察觉不到。
             clampUpper(Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),

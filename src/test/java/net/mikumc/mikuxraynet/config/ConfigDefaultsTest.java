@@ -157,6 +157,10 @@ class ConfigDefaultsTest {
 
   /**
    * 任务3：bandwidth 侧浮点钳制的<b>有限负值</b>不得再静默归 0（旧实现 {@code Math.max(0, v)} 无记录）。
+   *
+   * <p>同时覆盖 {@code entity-culling.force-visible-distance} 的<b>硬下限</b>：该键承载「近身实体一律
+   * 可见」这条安全策略，配 0 或负数必须被抬到 {@link BandwidthConfig#MIN_FORCE_VISIBLE_DISTANCE}
+   * （而不是静默关掉兜底），并进入钳制明细。
    */
   @Test
   void negativeFiniteFloatClampInBandwidthIsReported() {
@@ -164,10 +168,23 @@ class ConfigDefaultsTest {
         entity-culling:
           force-visible-distance: -3.0
         """));
-    assertEquals(0.0D, config.entityCulling().forceVisibleDistance(), 1.0E-9D, "负值必须钳到 0");
+    assertEquals(BandwidthConfig.MIN_FORCE_VISIBLE_DISTANCE,
+        config.entityCulling().forceVisibleDistance(), 1.0E-9D,
+        "负值必须被抬到硬下限（不得静默关掉近身可见兜底）");
     assertTrue(String.join("、", config.clampAdjustments())
             .contains("entity-culling.force-visible-distance=-3.0"),
         "有限负值必须进入钳制明细（不再静默归 0）：" + config.clampAdjustments());
+
+    // 低于下限（0 与下限以下的正值）同样被抬到硬下限，且各只有一条明细
+    BandwidthConfig zero = BandwidthConfig.from(yaml("""
+        entity-culling:
+          force-visible-distance: 0.0
+        """));
+    assertEquals(BandwidthConfig.MIN_FORCE_VISIBLE_DISTANCE,
+        zero.entityCulling().forceVisibleDistance(), 1.0E-9D,
+        "0 会关掉近身可见兜底，必须被抬到硬下限");
+    assertEquals(1, zero.clampAdjustments().size(),
+        "单趟钳制必须保证每个键至多一条明细：" + zero.clampAdjustments());
   }
 
   /**
@@ -802,6 +819,7 @@ class ConfigDefaultsTest {
     assertEquals(8192, BandwidthConfig.MAX_PENDING_ENTRIES_LIMIT);
     assertEquals(64, BandwidthConfig.MAX_IMMEDIATE_RADIUS);
     assertEquals(1024.0D, BandwidthConfig.MAX_FORCE_VISIBLE_DISTANCE, 1.0E-9D);
+    assertEquals(16.0D, BandwidthConfig.MIN_FORCE_VISIBLE_DISTANCE, 1.0E-9D);
     assertEquals(40, BandwidthConfig.MAX_UPDATE_INTERVAL_TICKS);
     assertEquals(2048, BandwidthConfig.MAX_RECHECK_BUDGET);
     assertEquals(86400, BandwidthConfig.MAX_AFK_SECONDS);
@@ -820,6 +838,8 @@ class ConfigDefaultsTest {
     assertTrue(defaults.blockChanges().mergeWindowMillis() <= BandwidthConfig.MAX_MERGE_WINDOW_MILLIS);
     assertTrue(defaults.blockChanges().immediateRadius() <= BandwidthConfig.MAX_IMMEDIATE_RADIUS);
     assertTrue(defaults.entityCulling().forceVisibleDistance() <= BandwidthConfig.MAX_FORCE_VISIBLE_DISTANCE);
+    assertTrue(defaults.entityCulling().forceVisibleDistance() >= BandwidthConfig.MIN_FORCE_VISIBLE_DISTANCE,
+        "默认值必须不低于硬下限，否则默认配置自身会被抬升并打出误导性 WARN");
     assertTrue(defaults.entityCulling().updateIntervalTicks() <= BandwidthConfig.MAX_UPDATE_INTERVAL_TICKS);
     assertTrue(defaults.entityCulling().recheckBudget() <= BandwidthConfig.MAX_RECHECK_BUDGET);
     assertTrue(defaults.afk().distance() <= BandwidthConfig.MAX_AFK_DISTANCE);

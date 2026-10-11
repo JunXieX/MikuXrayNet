@@ -76,12 +76,12 @@ class BufferedLinearV3FormatTest {
         () -> BufferedLinearV3Format.decodeHeader(new byte[] {1, 2, 3}), "长度不足必须拒绝");
   }
 
-  /** 版本字节：新写入必须是 0x04；初版 0x03 必须被明确拒绝（交由调用方删除重建）。 */
+  /** 版本字节：新写入必须是 0x05；更旧的版本（0x03/0x04）必须被明确拒绝（交由调用方删除重建）。 */
   @Test
   void headerCarriesCurrentVersionAndRejectsLegacy() {
     byte[] header = BufferedLinearV3Format.encodeHeader(SEED);
-    assertEquals(BufferedLinearV3Format.VERSION, header[8], "新文件版本字节必须是 0x04");
-    assertEquals(0x04, BufferedLinearV3Format.VERSION, "版本常量必须是 0x04");
+    assertEquals(BufferedLinearV3Format.VERSION, header[8], "新文件版本字节必须是 0x05");
+    assertEquals(0x05, BufferedLinearV3Format.VERSION, "版本常量必须是 0x05（槽位粒度记录布局）");
 
     byte[] legacy = BufferedLinearV3Format.encodeHeader(SEED);
     legacy[8] = 0x03;

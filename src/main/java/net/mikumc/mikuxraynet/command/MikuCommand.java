@@ -33,6 +33,8 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
   private static final String PERMISSION_DUMP = Constants.DUMP_PERMISSION;
   private static final String PERMISSION_RELOAD = Constants.RELOAD_PERMISSION;
   private static final List<String> SUBCOMMANDS = List.of("status", "dump", "reload");
+  /** 无任何子命令权限时的统一回显（等价于命令描述里声明的 permission-message）。 */
+  private static final String NO_PERMISSION_MESSAGE = "你没有权限使用该命令";
 
   private final MikuXrayNet plugin;
   private final Diagnostics diagnostics;
@@ -47,6 +49,14 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
     // 整段包在 try 内：usage 提示此前在任何保护之外，一旦回显失败（例如在不支持 Adventure 的核心上）
     // 会从命令分发器二次抛出。现在任何异常都只记日志并尽力回显一句中文提示，绝不外抛。
     try {
+      // 权限闸门在这里（而不是 Brigadier 的 permission()）：根命令若在框架层要求 mikuxraynet.admin，
+      // 则只授予 mikuxraynet.status 的玩家会被**框架**直接拒绝，三个子权限形同虚设。
+      // 改为「命令本身不设框架级权限、逐子命令判权」，子权限才可单独授予；admin 仍可用是因为
+      // paper-plugin.yml 里 admin 的 children 已包含这三个节点（授予 admin 即同时授予三者）。
+      if (!hasAnySubPermission(sender)) {
+        message(sender, NO_PERMISSION_MESSAGE);
+        return true;
+      }
       if (args.length == 0) {
         usage(sender, label);
         return true;
@@ -65,8 +75,42 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
     }
   }
 
+  /**
+   * 子命令 → 权限节点的<b>唯一映射</b>。
+   *
+   * <p>执行侧（{@link #onCommand}）与补全侧（{@link #suggestSubcommands(CommandSender, String[])}）
+   * 共用它，避免「补全能看到、执行说没权限」这类两处判据漂移；未知子命令返回 {@code null}。
+   */
+  private static String permissionOf(String subcommand) {
+    if (subcommand == null) {
+      return null;
+    }
+    return switch (subcommand) {
+      case "status" -> PERMISSION_STATUS;
+      case "dump" -> PERMISSION_DUMP;
+      case "reload" -> PERMISSION_RELOAD;
+      default -> null;
+    };
+  }
+
+  /** 发送者是否可执行/可见该子命令。 */
+  static boolean allowed(CommandSender sender, String subcommand) {
+    String permission = permissionOf(subcommand);
+    return permission != null && sender != null && sender.hasPermission(permission);
+  }
+
+  /** 发送者是否至少拥有一个子命令权限（用于「完全无权限」时的统一拒绝）。 */
+  private static boolean hasAnySubPermission(CommandSender sender) {
+    for (String sub : SUBCOMMANDS) {
+      if (allowed(sender, sub)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private void status(CommandSender sender) {
-    if (!sender.hasPermission(PERMISSION_STATUS)) {
+    if (!allowed(sender, "status")) {
       message(sender, "你没有权限查看运行状态");
       return;
     }
@@ -81,7 +125,7 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
   }
 
   private void dump(CommandSender sender) {
-    if (!sender.hasPermission(PERMISSION_DUMP)) {
+    if (!allowed(sender, "dump")) {
       message(sender, "你没有权限导出诊断");
       return;
     }
@@ -95,7 +139,7 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
   }
 
   private void reload(CommandSender sender) {
-    if (!sender.hasPermission(PERMISSION_RELOAD)) {
+    if (!allowed(sender, "reload")) {
       message(sender, "你没有权限热重载配置");
       return;
     }
@@ -138,7 +182,27 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
 
   @Override
   public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
-    return suggestSubcommands(args);
+    return suggestSubcommands(sender, args);
+  }
+
+  /**
+   * 按发送者权限过滤后的子命令补全。
+   *
+   * <p>与执行侧共用 {@link #permissionOf(String)} 的同一份映射：只补出「确实有权限执行」的子命令，
+   * 既避免误导（补出来却执行不了），也避免把管理命令的存在与否暴露给完全无权限的玩家。
+   */
+  static List<String> suggestSubcommands(CommandSender sender, String[] args) {
+    List<String> all = suggestSubcommands(args);
+    if (all.isEmpty() || sender == null) {
+      return all;
+    }
+    List<String> visible = new ArrayList<>(all.size());
+    for (String sub : all) {
+      if (allowed(sender, sub)) {
+        visible.add(sub);
+      }
+    }
+    return visible;
   }
 
   /**
@@ -157,8 +221,9 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
    * 真机反馈的「TAB 补全不能用」正是前者：旧实现在长度不为 1 时直接返回空列表，
    * 于是 Paper/Folia 上 {@code /mxnet <TAB>} 一个候选都出不来（输入了首字母反而有）。
    *
-   * <p>权限不在这里过滤：命令本身要求 {@code mikuxraynet.admin}，各子命令的权限在真正执行时判定，
-   * 补全只做「有哪些子命令」这一件事（与旧行为一致）。
+   * <p>本重载只做「有哪些子命令」这一件事（纯函数，便于离线单测）；<b>权限过滤</b>由
+   * {@link #suggestSubcommands(CommandSender, String[])} 承担——根命令已不在框架层要求
+   * {@code mikuxraynet.admin}（否则子权限无法单独授予），故补全必须自行按发送者权限收敛。
    */
   static List<String> suggestSubcommands(String[] args) {
     if (args != null && args.length > 1) {
