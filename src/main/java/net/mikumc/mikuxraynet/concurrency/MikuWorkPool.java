@@ -62,21 +62,6 @@ public final class MikuWorkPool implements AutoCloseable {
    */
   private final Set<RewriteTask> pending = ConcurrentHashMap.newKeySet();
 
-  /**
-   * 「关闭」与「登记 + 入队」的互斥锁。
-   *
-   * <p><b>为什么必须有它</b>：{@link #close()} 放行兜底依赖「快照 ⊇ 所有已登记任务」这一不变式。
-   * 若 {@link #execute(RewriteTask, Runnable)} 不做互斥，就存在这样的窗口——本线程的
-   * {@code pending.add(task)} 发生在 {@code close()} 的 {@code Set.copyOf(pending)} <b>之后</b>、
-   * 而入队成功发生在 {@code shutdownNow()} <b>之前</b>：该任务既不在快照里（不会被兜底放行），
-   * 又被 {@code shutdownNow()} 从队列丢弃（永不执行）→ 对应封包既未改写也永远无人放行
-   * （客户端卡在加载界面）。把「判关闭 + 登记 + 入队」与「置关闭 + 取快照 + shutdownNow」放进同一把锁，
-   * 使两者只能整体先于对方发生：要么任务已在快照内，要么提交被拒（调用方 fail-open）。
-   *
-   * <p>锁内只有内存操作与一次 {@code executor.execute}（自身不再回调本池），无死锁风险。
-   */
-  private final Object lifecycleLock = new Object();
-
   public MikuWorkPool(int threads, int queueCapacity) {
     int workerCount = threads > 0 ? threads : Math.min(4, Runtime.getRuntime().availableProcessors());
     AtomicInteger workerIndex = new AtomicInteger();
@@ -172,30 +157,37 @@ public final class MikuWorkPool implements AutoCloseable {
    * {@link RewriteTask#signalOnce()} 放行——放行权一旦拿到就不会再有人替你放行。
    */
   public void execute(RewriteTask task, Runnable payload) {
-    synchronized (this.lifecycleLock) {
-      if (this.closed) {
-        // 已关闭：此刻「登记 + 入队」会掉进 close() 快照与 shutdownNow 之间的缝隙而无人放行（见
-        // lifecycleLock 说明）。直接抛拒绝，调用方（区块改写链路）随即按 fail-open 放行原包。
-        throw new RejectedExecutionException("工作池已关闭，拒绝提交区块改写任务");
-      }
-      pending.add(task);
-      this.queuedTasks.incrementAndGet();
-      try {
-        this.executor.execute(() -> {
-          // 一开始执行就撤销占用：本计数只近似「排队中」的任务数（见 queuedTasks 说明）
-          this.queuedTasks.decrementAndGet();
-          try {
-            payload.run();
-          } finally {
-            pending.remove(task);
-          }
-        });
-      } catch (Throwable throwable) {
-        pending.remove(task);
-        // 提交被拒：撤销 +1，避免计数漂高导致 hasCapacity 永远返回 false
+    // 本方法是「每个区块封包」的热路径，绝不能加锁：下面的无锁协议用两次 volatile 读闭合竞态。
+    if (this.closed) {
+      throw new RejectedExecutionException("工作池已关闭，拒绝提交区块改写任务");
+    }
+    pending.add(task);
+    // 登记之后再读一次 closed（第一道同名检查不够：close() 可能在本次登记之前就取走了快照）。
+    // 读到 false ⇒ close() 尚未置位 ⇒ 其「取快照」一定晚于本次登记 ⇒ 本任务必在快照内，由 close() 兜底；
+    // 读到 true ⇒ 本次登记可能落在快照之后（close 看不到它），此时由本线程自行放行——releaseOnTimeout 的
+    // CAS 保证与 close() 的兜底「恰好一个生效」，故不会漏放行也不会重复放行。放行后按「拒绝」抛给调用方，
+    // 其 fail-open 分支里的 signalOnce 幂等，重复调用无害。
+    if (this.closed) {
+      pending.remove(task);
+      task.releaseOnTimeout();
+      throw new RejectedExecutionException("工作池已关闭，拒绝提交区块改写任务");
+    }
+    this.queuedTasks.incrementAndGet();
+    try {
+      this.executor.execute(() -> {
+        // 一开始执行就撤销占用：本计数只近似「排队中」的任务数（见 queuedTasks 说明）
         this.queuedTasks.decrementAndGet();
-        throw throwable;
-      }
+        try {
+          payload.run();
+        } finally {
+          pending.remove(task);
+        }
+      });
+    } catch (Throwable throwable) {
+      pending.remove(task);
+      // 提交被拒：撤销 +1，避免计数漂高导致 hasCapacity 永远返回 false
+      this.queuedTasks.decrementAndGet();
+      throw throwable;
     }
   }
 
@@ -226,17 +218,20 @@ public final class MikuWorkPool implements AutoCloseable {
    */
   @Override
   public void close() {
-    Set<RewriteTask> snapshot;
-    synchronized (this.lifecycleLock) {
-      // 先置关闭标志：关闭后 hasCapacity 一律 false，且 execute(task,payload) 直接拒绝（见 lifecycleLock）。
-      this.closed = true;
-      // 置关闭、取快照、shutdownNow 必须在同一临界区内完成：否则「取快照」与 execute 的「登记 + 入队」
-      // 之间存在缝隙，会让某个任务既不在快照里、又被 shutdownNow 丢弃（无人放行，见 lifecycleLock）。
-      snapshot = Set.copyOf(pending);
-      this.executor.shutdownNow();
-    }
-    // 先取登记表快照、再 shutdownNow 的理由见上方临界区注释与 lifecycleLock 说明；
-    // CAS 仍保证「恰好一次」：若工作线程已抢到写入权，兜底会因 CAS 失败而不放行，改由工作线程自行放行。
+    // 先置关闭标志：关闭后 hasCapacity 一律 false，且 execute(task,payload) 会拒绝或自行放行（见其无锁协议）。
+    this.closed = true;
+    // 先取登记表快照、再 shutdownNow。
+    // 为什么不能先 shutdownNow：它会立刻中断工作线程，而被中断的 payload 可能在自己的 finally 里
+    // 先行注销（pending.remove），于是 close 随后遍历登记表时已经看不到这个任务 ——
+    // 该任务「已出队但尚未开始写」，既没被兜底放行、也没人改写（CI 上稳定复现「放行 0 次」）。
+    // 快照在中断前取出，保证这类任务一定被兜底覆盖；CAS 仍保证「恰好一次」：
+    // 若工作线程已抢到写入权、或 execute 侧已按 closed 分支自行放行，兜底会因 CAS 失败而不放行。
+    //
+    // 与 execute 侧的配合：凡「登记」早于本快照的任务必在快照内（execute 读到 closed==false ⇒ 本次登记
+    // 早于上面的置位 ⇒ 早于快照）；凡登记晚于快照的任务，execute 的第二次 closed 读必然为 true，
+    // 由它自行 releaseOnTimeout 放行。两侧合起来即「恰好放行一次」。
+    Set<RewriteTask> snapshot = Set.copyOf(pending);
+    this.executor.shutdownNow();
     for (RewriteTask task : snapshot) {
       try {
         task.releaseOnTimeout();
