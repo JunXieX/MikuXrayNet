@@ -140,33 +140,45 @@ public final class OcclusionPatchListener extends PacketAdapter {
       try {
         MethodHandle accessor = idAccessor;
         if (accessor == null) {
-          accessor = resolve(nmsHandle.getClass());
-          if (accessor == null) {
+          Method method = findGetIdMethod(nmsHandle.getClass());
+          if (method == null) {
             warnOnce(null);
             return -1;
           }
+          // Lookup#unreflect 声明<b>受检异常</b> IllegalAccessException；这里与 invokeExact（声明 throws
+          // Throwable）一样必须落在 try 内自吞，绝不上抛——失败语义见 warnOnce（只打一次 WARN、此后永久
+          // 返回 -1 = 回落 Material 级）。
+          accessor = MethodHandles.publicLookup().unreflect(method)
+              .asType(MethodType.methodType(int.class, Object.class));
           idAccessor = accessor;
         }
         return (int) accessor.invokeExact(nmsHandle);
       } catch (Throwable throwable) {
+        // 覆盖：unreflect 的 IllegalAccessException、invokeExact 的 Throwable、以及 NMS 类查找的运行时异常
         warnOnce(throwable);
         return -1;
       }
     }
 
-    /** 在 NMS {@code Block} 类上找静态 {@code getId(state)} 并适配为 {@code (Object)int}。 */
-    private static MethodHandle resolve(Class<?> stateClass) {
+    /**
+     * 在 NMS {@code Block} 类上找静态 {@code getId(state)} 方法对象。
+     *
+     * <p><b>刻意只做「查找」不碰反射调用</b>：{@code Class#getMethods()} / {@code Method#getName} 等
+     * <b>不声明受检异常</b>，因此本方法无受检异常；真正会抛 {@code IllegalAccessException} 的
+     * {@code Lookup#unreflect} 留在调用方的 try 内（见 {@link #resolveStateId}）。
+     *
+     * @return 找到的方法对象；找不到返回 {@code null}
+     */
+    private static Method findGetIdMethod(Class<?> stateClass) {
       Class<?> blockClass = MinecraftReflection.getBlockClass();
       for (Method method : blockClass.getMethods()) {
-        if (!method.getName().equals("getId")
-            || !Modifier.isStatic(method.getModifiers())
-            || method.getReturnType() != int.class
-            || method.getParameterCount() != 1
-            || !method.getParameterTypes()[0].isAssignableFrom(stateClass)) {
-          continue;
+        if (method.getName().equals("getId")
+            && Modifier.isStatic(method.getModifiers())
+            && method.getReturnType() == int.class
+            && method.getParameterCount() == 1
+            && method.getParameterTypes()[0].isAssignableFrom(stateClass)) {
+          return method;
         }
-        return MethodHandles.publicLookup().unreflect(method)
-            .asType(MethodType.methodType(int.class, Object.class));
       }
       return null;
     }
