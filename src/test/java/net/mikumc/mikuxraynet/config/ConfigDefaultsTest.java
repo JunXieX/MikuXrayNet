@@ -256,8 +256,9 @@ class ConfigDefaultsTest {
 
     // 2026-09 更新①：新增 disk-cache.zstd-sha256 参与指纹（按任务要求）。
     // 2026-09 更新②：新增 obfuscation.remove-block-entities 参与指纹（它直接改变写进缓存的区块负载字节）。
-    // 两次改动都会使期望值变化、现存磁盘缓存一次性失效重建（属正常）。
-    assertEquals(-1049098715, config.configHash(),
+    // 更新③：移除 occlusion.fluid-cover（岩浆改为恒判视觉遮挡，不再是开关）→ 指纹随之变化。
+    // 以上改动都会使期望值变化、现存磁盘缓存一次性失效重建（属正常）。
+    assertEquals(1073391632, config.configHash(),
         "配置指纹必须是跨进程稳定的固定值（不得混入枚举 identity hash / 随机值）");
     // 同一份内容重复解析必须得到同一个值（同一进程内的自洽性）
     assertEquals(config.configHash(), AntiXrayConfig.from(yaml("""
