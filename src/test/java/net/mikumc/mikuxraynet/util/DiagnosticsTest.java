@@ -304,8 +304,17 @@ class DiagnosticsTest {
   void entityCullingSwitchNamesBothSubSwitches() {
     String defaultOn = String.join("\n",
         Diagnostics.formatStatus(fixed(bandwidth("enabled: true\n"))));
-    assertTrue(defaultOn.contains("实体剔除 启用（射线遮挡 + 视锥剔除（距离门 24.0 格，FOV 110.0°））"),
-        "默认必须写明两个子项都开启：" + defaultOn);
+    // 距离门显示的是「有效值」= max(frustum.min-distance 24, force-visible-distance 32) = 32：
+    // 只印配置原值 24 会与启动日志的有效值不一致、并让人误读成「配 24 却从 32 格才生效」。
+    assertTrue(defaultOn.contains("实体剔除 启用（射线遮挡 + 视锥剔除（距离门 32.0 格，FOV 110.0°））"),
+        "默认必须写明两个子项都开启，且距离门按有效值（32）回显：" + defaultOn);
+
+    // 配置的门比强制可见距离大时，有效值取配置值（此处 48 > 32）
+    String widerGate = String.join("\n",
+        Diagnostics.formatStatus(fixed(bandwidth(
+            "entity-culling:\n  frustum:\n    min-distance: 48.0\n"))));
+    assertTrue(widerGate.contains("距离门 48.0 格"),
+        "距离门大于强制可见距离时必须回显配置值本身：" + widerGate);
 
     String raycastOff = String.join("\n",
         Diagnostics.formatStatus(fixed(bandwidth("entity-culling:\n  raycast: false\n"))));

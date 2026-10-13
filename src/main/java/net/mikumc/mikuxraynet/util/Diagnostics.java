@@ -652,12 +652,29 @@ public final class Diagnostics {
     sb.append(raycast ? "射线遮挡" : "不做射线遮挡");
     sb.append(" + 视锥剔除");
     if (frustumOn) {
-      sb.append("（距离门 ").append(frustum.minDistance()).append(" 格，FOV ")
+      // 显示「有效距离门」而非配置原值：实际门槛是 max(min-distance, force-visible-distance)。
+      // 只印配置值会出现「配了 24 却从 32 格才生效」的误读（与启动日志的有效值不一致），
+      // 这里与 dump 的 frustum.有效距离 保持同一口径。
+      sb.append("（距离门 ").append(frustumEffectiveDistance(culling)).append(" 格，FOV ")
           .append(frustum.fov()).append("°）");
     } else {
       sb.append("关");
     }
     return sb.append("）").toString();
+  }
+
+  /**
+   * 视锥剔除的<b>有效距离门</b>（格）= {@code max(frustum.min-distance, force-visible-distance)}。
+   *
+   * <p>强制可见距离内一律不剔除是既有的安全策略，因此距离门不可能小于它；配置值比它小时不产生
+   * 额外效果。status 与 dump 都按此有效值回显，避免「读到的配置值」与「真正生效的门槛」不一致。
+   */
+  private static double frustumEffectiveDistance(BandwidthConfig.EntityCulling culling) {
+    BandwidthConfig.EntityCulling.Frustum frustum = culling.frustum();
+    if (frustum == null) {
+      return culling.forceVisibleDistance();
+    }
+    return Math.max(frustum.minDistance(), culling.forceVisibleDistance());
   }
 
   /**
@@ -865,9 +882,7 @@ public final class Diagnostics {
         .append("，frustum.min-distance=").append(c.entityCulling().frustum() == null
             ? "无" : c.entityCulling().frustum().minDistance())
         .append("，frustum.有效距离=").append(c.entityCulling().frustum() == null
-            ? "无"
-            : Math.max(c.entityCulling().frustum().minDistance(),
-                c.entityCulling().forceVisibleDistance()))
+            ? "无" : frustumEffectiveDistance(c.entityCulling()))
         .append('\n');
     sb.append("afk.enabled=").append(c.afk().enabled())
         .append("，seconds=").append(c.afk().seconds())
