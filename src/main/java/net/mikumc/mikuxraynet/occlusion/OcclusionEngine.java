@@ -219,7 +219,18 @@ public final class OcclusionEngine implements AutoCloseable {
       }
 
       long start = System.nanoTime();
-      boolean fullyOccluded = compute(ray, lookup, request);
+      boolean fullyOccluded;
+      try {
+        fullyOccluded = compute(ray, lookup, request);
+      } catch (Throwable computeFailure) {
+        // 单条判定抛异常（例如越界坐标被 SectionKey.packSection 拒绝，或查询/步进里未来新增的
+        // 运行时异常）绝不能拖垮工作线程：本类线程是 daemon 且无 UncaughtExceptionHandler，
+        // 一旦异常逃逸出 workerLoop，该线程会永久退出、队列再无人消费——默认 threads=1 时整个
+        // 异步遮挡子系统将静默失效（实体不再随遮挡变化隐藏/恢复），直到热重载。按「保持实体当前
+        // 显示状态」处理（不调用 sink），与超时丢弃 / 拒收的语义一致（见类注释的 fail-open 说明）。
+        stats.computeFailures.increment();
+        continue;
+      }
       long spent = System.nanoTime() - start;
       stats.computed.increment();
       stats.nanosTotal.add(spent);

@@ -20,6 +20,14 @@ public final class OcclusionStats {
   /** 因队列满被直接拒收（按「可见」处理，fail-open）的次数。 */
   public final LongAdder rejectedQueueFull = new LongAdder();
   /**
+   * 单条判定在工作线程内抛异常被就地吞掉的次数（不改变实体显示状态，见 {@code OcclusionEngine}）。
+   *
+   * <p><b>为什么必须可见</b>：该计数持续非 0 说明射线判定链路存在会抛异常的输入（例如坐标越界被
+   * {@code SectionKey.packSection} 拒绝）；它本身不改变显示状态（方向安全），但若放任异常逃逸出工作
+   * 循环会直接杀死工作线程、令队列永久无人消费，故就地捕获并计数，使这类输入可被观测定位。
+   */
+  public final LongAdder computeFailures = new LongAdder();
+  /**
    * 射线路经的 section <b>查不到遮挡条目</b>的次数（= 遮挡数据缺失）。
    *
    * <p>「已知全不遮挡」（{@link EmptyOcclusion}）不计入——它是有数据且判定为不遮挡。
