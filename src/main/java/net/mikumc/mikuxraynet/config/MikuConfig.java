@@ -182,13 +182,26 @@ public final class MikuConfig {
     }
   }
 
-  /** 配置解析失败的一次性中文提示（每个文件只打印一次，说明保留策略与后果）。 */
+  /**
+   * 配置解析失败的一次性中文提示（每个文件只打印一次，说明保留策略与后果）。
+   *
+   * <p><b>为什么对 {@code StackOverflowError} 只打一行、不倾倒堆栈</b>：YAML 锚点/别名形成自引用循环时，
+   * {@code YamlConfiguration.fromNodeTree} 会递归到把栈打穿（数千层同帧），这份堆栈对定位毫无帮助，
+   * 却会淹没控制台（CI 的 -Strict 日志达 4000+ 行）。这类失败给出「文件 + 递归结构」即可定位；其它异常
+   * 仍带完整堆栈（可用）。注意：这**不改变**任何回退语义（仍保留上一份 / 回落内置默认），只改日志形态。
+   */
   private void warnFallbackOnce(AtomicBoolean gate, String fileName, String detail, Throwable cause) {
     if (!gate.compareAndSet(false, true)) {
       return;
     }
-    logger.log(Level.WARNING, "配置文件 " + fileName + " 解析失败，" + detail
-        + "（本次按该策略继续运行，不会因此禁用插件）。请检查该文件内容后重载。", cause);
+    String message = "配置文件 " + fileName + " 解析失败，" + detail
+        + "（本次按该策略继续运行，不会因此禁用插件）。请检查该文件内容后重载。";
+    if (cause instanceof StackOverflowError) {
+      // 自引用别名（&x / *x）造成的栈溢出：堆栈数千层且无定位价值，只给结论
+      logger.warning(message + "（原因：文件里的 YAML 锚点/别名形成自引用循环，解析递归过深导致栈溢出）");
+      return;
+    }
+    logger.log(Level.WARNING, message, cause);
   }
 
   /**

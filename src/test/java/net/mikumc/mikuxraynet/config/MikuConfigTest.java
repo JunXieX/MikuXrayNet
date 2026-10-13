@@ -18,10 +18,16 @@ import org.junit.jupiter.api.io.TempDir;
  * {@link MikuConfig#load()} 的异常安全回归：解析失败绝不能让异常冒泡到 {@code onLoad}
  * （否则服务端会把插件整体禁用），且必须保留上一份有效配置。
  *
- * <p><b>为什么用「递归别名」构造畸形 yml</b>：普通语法错误会被
- * {@code YamlConfiguration.loadConfiguration} 吞掉并降级成空配置（随后 {@code from(空)} 返回默认值），
- * 不会抛异常；只有当解析阶段抛出非 {@code IOException/InvalidConfigurationException} 的 Throwable
- * （递归结构触发的 {@code StackOverflowError}）时才真正走到 {@code from(...)} 外层的新兜底分支。
+ * <p><b>为什么用「递归别名」构造畸形 yml</b>：{@code MikuConfig#read} 走 {@code loadFromString}，普通语法
+ * 错误会抛 {@code InvalidConfigurationException}（属 {@code Exception}）并到达 {@code catch (Throwable)}；
+ * 而本用例要覆盖更强的「{@code Error}（如 {@code StackOverflowError}，非 {@code Exception}）也会被兜住」
+ * 这条分支——自引用别名 {@code a: &x / b: *x} 会让 {@code YamlConfiguration.fromNodeTree} 无限递归、
+ * 抛 {@code StackOverflowError}，正合此意。
+ *
+ * <p><b>控制台/CI 日志里出现的那条「解析失败」WARN 是本用例的预期产物，并非配置文件坏了</b>：
+ * {@link MikuConfig#warnFallbackOnce} 对 {@code StackOverflowError} 只打一行结论（不再倾倒数千层堆栈，
+ * 否则会淹没日志/CI）；真实资源文件 {@code src/main/resources/antixray.yml} 与 {@code bandwidth.yml}
+ * 不含任何锚点/别名，可被正常解析（由 {@code ConfigDefaultsTest} 用真实解析器逐键守门）。
  *
  * <p>用动态代理桩 {@link Plugin}（不引入新依赖），数据目录指向 {@link TempDir}，
  * 两处配置文件均预先写好，因此不会触发 {@code saveResource}。

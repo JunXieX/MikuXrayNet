@@ -199,11 +199,16 @@ class PeRealDataOcclusionTest {
    *
    * <p>离线环境真实 {@code Bukkit.createBlockData(...).isOccluding()} 不可用（{@code No RegistryAccess}），
    * 因此「真值生效 / 解析失败 / 覆盖优先」这些路径必须用可注入的桩来覆盖。
+   *
+   * <p><b>桩谓词按「PE 状态串的真实格式」匹配</b>：{@link com.github.retrooper.packetevents.protocol.world.states.WrappedBlockState#toString()}
+   * 产出的是 vanilla 状态串但<b>不带</b> {@code minecraft:} 命名空间前缀（依据：PE 的
+   * {@code getByString} 先 {@code replace("minecraft:", "")} 再查内部表，即内部键无前缀），
+   * 形如 {@code chest[facing=north,type=single,waterlogged=false]}。故先剥可选前缀、再取 {@code [} 前的方块名。
    */
   @Test
   void stubOracleCoversTruthFallbackAndOverridePaths() {
-    StateOcclusionOracle mixed =
-        stateString -> stateString.startsWith("minecraft:chest") ? null : Boolean.TRUE;
+    StateOcclusionOracle mixed = stateString -> "chest".equals(bareBlockName(stateString))
+        ? null : Boolean.TRUE;
     BlockStateRegistry stub = BlockStateRegistry.build(Set.of(), Set.of("stone"), null, mixed);
 
     // ① 真值生效 + ② 解析失败回落：每个有效状态要么取真值、要么回落，二者之和应等于状态总数
@@ -505,6 +510,19 @@ class PeRealDataOcclusionTest {
     int stateId = BlockStateRegistry.resolveStateId(version, name);
     assertTrue(stateId >= 0, "PE 真实映射里必须能解析出状态 id：" + name);
     return stateId;
+  }
+
+  /**
+   * 从 PE 的方块状态串取<b>纯净方块名</b>（无命名空间前缀、无属性段）。
+   *
+   * <p>PE 的 {@code WrappedBlockState#toString()} 形如 {@code chest[facing=north,type=single]}——不带
+   * {@code minecraft:} 前缀（见用例注释中的依据）；这里同时兼容「带前缀」的情形，避免测试再次踩格式假设。
+   */
+  private static String bareBlockName(String stateString) {
+    String bare = stateString.startsWith("minecraft:")
+        ? stateString.substring("minecraft:".length()) : stateString;
+    int bracket = bare.indexOf('[');
+    return bracket >= 0 ? bare.substring(0, bracket) : bare;
   }
 
   private static int index(int x, int y, int z) {

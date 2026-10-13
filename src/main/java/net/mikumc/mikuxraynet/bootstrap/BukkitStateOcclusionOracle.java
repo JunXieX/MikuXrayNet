@@ -10,11 +10,17 @@ import org.bukkit.block.data.BlockData;
  * 解析成 {@link BlockData}，直接取 {@link BlockData#isOccluding()}——这正是 vanilla 的<b>逐状态</b>
  * {@code isOccluding} 语义（javadoc：该状态是否会遮挡其它方块/是否透光），也就是「玩家视觉能否看穿」。
  *
- * <p><b>为什么不手工拼属性名</b>：PacketEvents 的 {@code WrappedBlockState#toString()} 已经是与
- * {@code Bukkit.createBlockData} 完全对齐的 vanilla 状态字符串（PE 自带的 {@code SpigotConversionUtil}
+ * <p><b>为什么不手工拼属性名</b>：PacketEvents 的 {@code WrappedBlockState#toString()} 已经是
+ * {@code Bukkit.createBlockData} 可直接解析的 vanilla 状态字符串（PE 自带的 {@code SpigotConversionUtil}
  * 也是直接 {@code Bukkit.createBlockData(state.toString())}）。手工把 PE 的枚举名映射成 vanilla 属性名
  * （如 {@code Type.DOUBLE → "double"}、{@code BlockFace.NORTH → "north"}）既脆弱又无必要——解析失败时
  * 我们本来就要回落启发式，交给 PE 维护这份映射反而更可靠。
+ *
+ * <p><b>格式事实（已核实）</b>：{@code WrappedBlockState#toString()} 产出<b>不带</b> {@code minecraft:}
+ * 命名空间前缀（PE 的 {@code getByString} 先 {@code replace("minecraft:", "")} 再查内部表，
+ * 说明其内部键无前缀），形如 {@code chest[facing=north,type=single,waterlogged=false]}。
+ * 本类在缺前缀时补上 {@code minecraft:}，使交给 Bukkit 的串严格落在其文档格式
+ * （{@code minecraft:chest[waterlogged=true]}）内——这样无论 PE 版本是否带前缀都能解析。
  *
  * <p><b>解析失败</b>：字符串不合法、Bukkit 不认识该方块、属性名/值对不上时，{@code Bukkit.createBlockData}
  * 会抛 {@link IllegalArgumentException}（以及个别 {@code NPE}）。这里一律返回 {@code null}，由调用方
@@ -35,7 +41,7 @@ public final class BukkitStateOcclusionOracle implements StateOcclusionOracle {
   @Override
   public Boolean resolve(String blockDataString) {
     try {
-      BlockData data = Bukkit.createBlockData(blockDataString);
+      BlockData data = Bukkit.createBlockData(namespaced(blockDataString));
       if (data.getMaterial() == INVISIBLE_BUT_OCCLUDING) {
         return Boolean.FALSE;
       }
@@ -44,5 +50,20 @@ public final class BukkitStateOcclusionOracle implements StateOcclusionOracle {
       // 单状态解析失败：返回 null 交调用方回落启发式并计数（不影响其它状态）
       return null;
     }
+  }
+
+  /**
+   * 缺 {@code minecraft:} 命名空间前缀时补上（PE 的状态串不带前缀；Bukkit 文档格式带前缀）。
+   *
+   * <p>判据：取 {@code '['}（属性段起点）之前的部分，若其中没有 {@code ':'}（即无命名空间）则补前缀。
+   * vanilla 的属性名/值里不含 {@code ':'}，故该判据不会误伤带前缀的串。
+   */
+  private static String namespaced(String blockDataString) {
+    int bracket = blockDataString.indexOf('[');
+    String head = bracket >= 0 ? blockDataString.substring(0, bracket) : blockDataString;
+    if (head.indexOf(':') >= 0) {
+      return blockDataString;
+    }
+    return "minecraft:" + blockDataString;
   }
 }

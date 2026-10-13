@@ -13,8 +13,9 @@ package net.mikumc.mikuxraynet.registry;
  * 调用方（{@link BlockStateRegistry}）对 {@code null} 的回落与失败计数都以此为准。
  *
  * <p>状态字符串由 {@link BlockStateRegistry} 从 PacketEvents 的 {@code WrappedBlockState#toString()}
- * 摊平而来（vanilla 形式，如 {@code minecraft:oak_slab[type=double,waterlogged=false]}），
- * 即 {@code Bukkit.createBlockData} 直接可解析的格式。
+ * 摊平而来。格式事实（已核实）：它是 vanilla 状态串但<b>不带</b> {@code minecraft:} 命名空间前缀
+ * （PE 的 {@code getByString} 会先 {@code replace("minecraft:", "")} 再查内部表，说明内部键无前缀），
+ * 形如 {@code oak_slab[type=double,waterlogged=false]}；具体实现可自行按需补前缀后交给 Bukkit 解析。
  */
 @FunctionalInterface
 public interface StateOcclusionOracle {
@@ -22,7 +23,8 @@ public interface StateOcclusionOracle {
   /**
    * 解析某个方块状态的逐状态遮挡真值。
    *
-   * @param blockDataString vanilla 方块状态字符串（形如 {@code minecraft:oak_slab[type=double]}）
+   * @param blockDataString 方块状态字符串（vanilla 形式，如 {@code oak_slab[type=double]}；
+   *                        PE 产出时不带 {@code minecraft:} 前缀）
    * @return {@code TRUE}/{@code FALSE} = 服务端逐状态真值；{@code null} = 无法解析（调用方回落启发式）
    */
   Boolean resolve(String blockDataString);
