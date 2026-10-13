@@ -24,7 +24,6 @@ import net.mikumc.mikuxraynet.occlusion.OcclusionEngine;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import org.bukkit.Location;
-import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
@@ -1241,8 +1240,10 @@ class EntityCullerTest {
   }
 
   /**
-   * 世界替身：{@code rayTraceBlocks} 由 {@code occluding} 开关决定「命中遮挡方块 / 通畅」
-   * （命中时返回带 {@link Material#STONE} 的 {@link RayTraceResult}，未命中返回 null）。
+   * 世界替身：{@code rayTraceBlocks} 由 {@code occluding} 开关决定「命中方块 / 通畅」
+   * （命中时返回一个方块替身，未命中返回 null）。命中方块的遮挡判定已改走
+   * {@code BlockData#isOccluding}（逐状态），而离线无法构造真实 {@code BlockData}，故命中分支只覆盖
+   * 「不抛异常」那半条路径（见 {@code getBlockData} 分支的说明）。
    */
   private static final class WorldStub implements InvocationHandler {
 
@@ -1280,8 +1281,10 @@ class EntityCullerTest {
           }
           yield occluding ? new RayTraceResult(new Vector(0, 0, 0), block, BlockFace.UP) : null;
         }
-        // 命中方块的材质：stone 为遮挡方块、glass 为非遮挡方块（可透见其后实体）
-        case "getType" -> occluding ? Material.STONE : Material.GLASS;
+        // 命中方块的逐状态遮挡由 BlockData#isOccluding 决定（经统一入口）。离线无法构造真实 BlockData
+        // （依赖服务端注册表），故返回 null —— 统一入口对 null 按「不遮挡」处理，命中分支因此只覆盖
+        // 「不抛异常」的那半条路径；「判定失败必须保持可见」的红线由 failBlockRead 用例覆盖。
+        case "getBlockData" -> null;
         default -> defaultValue(method.getReturnType());
       };
     }

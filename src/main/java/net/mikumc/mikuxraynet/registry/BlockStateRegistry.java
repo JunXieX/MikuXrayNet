@@ -29,6 +29,8 @@ import net.mikumc.mikuxraynet.codec.RegistryAccessor;
  * {@code WrappedBlockState#toString()} 交给注入的 {@link StateOcclusionOracle} 解析成
  * {@code BlockData#isOccluding()}（服务端权威、逐状态，即「玩家视觉能否看穿」）。单个状态解析失败时
  * 回落到 {@link OcclusionRules} 的启发式，并计入回落数；<b>绝不让单个状态失败影响整体</b>。
+ * 唯一的例外是 barrier：它在服务端真值里算遮挡，但视觉不可见，由 {@link OcclusionRules} 判为非遮挡
+ * （该例外只定义一处，见 {@code OcclusionRules#visuallyInvisibleOccluder}）。
  *
  * <p>启发式回落后，本类把 PE 的状态语义摊平成 {@link OcclusionRules.Facts}：
  * <ul>

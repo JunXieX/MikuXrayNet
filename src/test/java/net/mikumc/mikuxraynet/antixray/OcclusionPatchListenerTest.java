@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
+import net.mikumc.mikuxraynet.registry.OcclusionRules;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -143,5 +144,23 @@ class OcclusionPatchListenerTest {
     assertEquals(48, coords[6]);
     assertEquals(-17, coords[7], "y 取低 4 位（此处 15）");
     assertEquals(95, coords[8]);
+  }
+
+  /**
+   * 如实断言补丁路径的口径<b>限制</b>：ProtocolLib 的 {@code WrappedBlockData} 只暴露 Material（方块级），
+   * 拿不到具体状态（其 {@code handle} 是 NMS 状态对象，不提供 Bukkit {@code BlockData}/全局 id），
+   * 因此「同方块不同状态」（单台阶 vs 双台阶）在补丁路径只能取默认状态近似
+   * （见 {@link OcclusionPatchListener} 类注释的「已知残余差异」）。
+   *
+   * <p>该限制无法离线构造 {@code WrappedBlockData} 或真实注册表来直接驱动（ProtocolLib 的方块数据包装
+   * 依赖服务端注册表），故这里以规则层的等价断言如实记录：Material 级近似（OAK_SLAB 默认单台阶）判
+   * 非遮挡，而同一名字的真实状态为双台阶时应判遮挡——补丁路径取不到后者。
+   */
+  @Test
+  void patchPathCannotDistinguishStateDependentBlocks() {
+    assertFalse(OcclusionRules.visualVerdict("oak_slab", false),
+        "Material 级近似取默认状态（单台阶）：非遮挡");
+    assertTrue(OcclusionRules.visualVerdict("oak_slab", true),
+        "同一名字的真实状态为双台阶时判遮挡——补丁路径拿不到该状态，只能退回上面那条近似");
   }
 }

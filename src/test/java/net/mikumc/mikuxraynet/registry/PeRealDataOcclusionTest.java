@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 import com.github.retrooper.packetevents.PacketEvents;
 import com.github.retrooper.packetevents.PacketEventsAPI;
@@ -14,6 +15,8 @@ import com.github.retrooper.packetevents.manager.server.ServerManager;
 import com.github.retrooper.packetevents.manager.server.ServerVersion;
 import com.github.retrooper.packetevents.netty.NettyManager;
 import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.world.states.WrappedBlockState;
+import com.github.retrooper.packetevents.protocol.world.states.enums.Type;
 import com.github.retrooper.packetevents.protocol.world.states.type.StateType;
 import com.github.retrooper.packetevents.protocol.world.states.type.StateTypes;
 import java.io.BufferedReader;
@@ -170,6 +173,88 @@ class PeRealDataOcclusionTest {
       assertFalse(registry.isOccluding(requireStateId(name)),
           name + " 必须判为不遮挡（真机 PE 2.13.0 / V_26_2）");
     }
+  }
+
+  /**
+   * <b>核心验收点</b>：同一批状态 id 在<b>异步</b>与<b>同步</b>两条射线路径下结论一致（真值用可注入桩）。
+   *
+   * <p>两路各代表什么：
+   * <ul>
+   *   <li><b>异步</b>：{@link BlockStateRegistry#isEntityOccluding}——实体口径位图，异步实体剔除与位图显形的
+   *       数据源（{@code entity-culling.async-occlusion=true} 时走它）；</li>
+   *   <li><b>同步</b>：{@link OcclusionRules#visualVerdict}——同步原生射线命中 {@code BlockData} 时走的
+   *       逐状态视觉规则（{@code entity-culling.async-occlusion=false} 时走它）。</li>
+   * </ul>
+   * 把同一批状态同时喂给两路并断言逐条一致，即钉死「异步开 / 关在同一方块上结论一致」。
+   *
+   * <p><b>为什么真值要用桩</b>：离线环境 {@code Bukkit.createBlockData(...).isOccluding()} 不可用
+   * （{@code No RegistryAccess implementation found}），故注入 {@link StateOcclusionOracle} 桩模拟
+   * 「服务端逐状态真值」。用例特意选入三类有代表性的状态：普通实心方块、状态相关方块（单/双台阶）、
+   * barrier 例外。
+   */
+  @Test
+  void asyncAndSyncRayPathsAgreeOnTheSameStates() {
+    // 桩真值：按「状态串」给出服务端逐状态 isOccluding（含状态相关与 barrier 两类特例）
+    StateOcclusionOracle serverTruth = stateString -> {
+      String name = bareBlockName(stateString);
+      if ("air".equals(name) || "glass".equals(name) || "water".equals(name)) {
+        return Boolean.FALSE;
+      }
+      if ("oak_slab".equals(name)) {
+        return stateString.contains("type=double"); // 双台阶遮挡、单台阶不遮挡（同方块不同状态）
+      }
+      return Boolean.TRUE; // 其余一律判遮挡（含 barrier —— 服务端原始真值把 barrier 标为遮挡）
+    };
+    BlockStateRegistry stub = BlockStateRegistry.build(Set.of(), Set.of(), null, serverTruth);
+
+    int[] ids = {
+        requireStateId("stone"), requireStateId("glass"), requireStateId("air"),
+        requireStateId("barrier"), requireStateId("oak_slab"), findDoubleSlabStateId()};
+    for (int id : ids) {
+      WrappedBlockState state = WrappedBlockState.getByGlobalId(version, id, false);
+      assertNotNull(state, "状态 id 必须可解出状态对象：" + id);
+      String stateString = state.toString();
+      boolean server = Boolean.TRUE.equals(serverTruth.resolve(stateString));
+
+      boolean async = stub.isEntityOccluding(id); // 异步位图口径
+      boolean sync = OcclusionRules.visualVerdict(bareBlockName(stateString), server); // 同步射线规则
+      assertEquals(async, sync, "同一状态在异步/同步两条路径下必须结论一致：" + stateString);
+    }
+
+    // 状态相关方块：同一名字（oak_slab）的单 / 双台阶在两条路径上都取到「状态级」结论
+    assertFalse(stub.isEntityOccluding(requireStateId("oak_slab")), "单台阶不遮挡（异步位图口径）");
+    assertTrue(stub.isEntityOccluding(findDoubleSlabStateId()), "双台阶遮挡（异步位图口径）");
+
+    // barrier：桩真值把它标为遮挡，但两条路径都必须判非遮挡（唯一例外在规则里只定义一处）
+    assertTrue(Boolean.TRUE.equals(serverTruth.resolve(
+            WrappedBlockState.getByGlobalId(version, requireStateId("barrier")).toString())),
+        "前置：桩真值把 barrier 标为遮挡（服务端原始语义）");
+    assertFalse(stub.isEntityOccluding(requireStateId("barrier")), "异步位图口径：barrier 判非遮挡");
+    assertFalse(OcclusionRules.visualVerdict("barrier", true), "同步规则：barrier 判非遮挡");
+  }
+
+  /**
+   * 扫出 {@code oak_slab[type=double]} 的全局状态 id（PE 真实映射里存在；离线可算，无需 Bukkit）。
+   *
+   * <p>单/双台阶是「同方块不同状态」的代表：名字相同、状态不同结论相反——正是逐状态真值才能区分的那类。
+   */
+  private static int findDoubleSlabStateId() {
+    for (int id = 0; id < registry.getUniqueBlockStateCount(); id++) {
+      WrappedBlockState state = WrappedBlockState.getByGlobalId(version, id, false);
+      // 与 BlockStateRegistry 的探测口径一致：跳过空洞（返回状态的 globalId 必须等于 id）
+      if (state == null || state.getGlobalId() != id || !"oak_slab".equals(state.getType().getName())) {
+        continue;
+      }
+      try {
+        if (state.getTypeData() == Type.DOUBLE) {
+          return id;
+        }
+      } catch (RuntimeException exception) {
+        // 该映射项的 type 属性缺失：跳过
+      }
+    }
+    fail("PE 真实映射（V_26_2）里必须存在 oak_slab[type=double] 状态");
+    return -1;
   }
 
   /**

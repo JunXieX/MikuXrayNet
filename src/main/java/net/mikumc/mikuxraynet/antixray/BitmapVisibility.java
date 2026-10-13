@@ -21,10 +21,15 @@ import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
  * 真实方块，等于把矿直接亮给透视端（本功能最严重的失效模式）。缺数据时「不显形」只是延迟到区块建表之后：
  * 该坐标仍留在伪装清单里，后续周期会重试。
  *
- * <p><b>口径</b>：位图由 {@code entityOcclusionTable}（服务端逐状态真值 {@code BlockData#isOccluding()}）构建，
- * 与旧的精确判定里 {@code BlockData#isOccluding()} 同一口径。但步进射线只统计「遮挡方块」，因此玻璃、蜡烛等
+ * <p><b>口径</b>：位图由 {@code entityOcclusionTable}（服务端逐状态真值 {@code BlockData#isOccluding()}
+ * + 唯一的 barrier 例外）构建。步进射线只统计「遮挡方块」，因此玻璃、蜡烛等
  * 非遮挡方块不再阻断射线（旧实现是「命中任何别的方块即不通畅」）——这一语义变化与用户既定的
  * 「尽可能保证玩家可见性」方向一致。
+ *
+ * <p><b>与降级路径（{@code ProximityRevealer} 的原生射线）在 barrier 上的差异</b>：本类读的是实体口径位图
+ * （barrier 例外生效 → barrier 不阻断射线）；降级路径刻意保持「服务端原始逐状态真值」（barrier 仍算遮挡
+ * → 更保守）。两者对 barrier 的结论不同属<b>既有的、方向更保守</b>的差异：降级路径只在异步遮挡不可用时
+ * 才被走到（{@code async-occlusion=false}），且它的选择是「不放松显形」。
  *
  * <p><b>分工</b>：位图分不出的「目标上方是流体」规则（需读世界方块）不在本类判，由发布侧
  * （{@code ProximityRevealer} 的玩家线程）补判。

@@ -32,8 +32,16 @@ import java.util.Set;
  *
  * <p><b>关于 waterlogged</b>：PE 的 {@code isFluid()} 已把含水状态算作流体，含水与否不改变方块本体的
  * 形状语义（含水的台阶仍是台阶），因此判定里不额外使用该属性，规则保持一致。
+ *
+ * <p><b>唯一的「barrier 例外」</b>：{@code barrier} 在服务端 {@code isOccluding} 标记里算「遮挡」，
+ * 但它对玩家<b>完全不可见</b>（本插件判据是「玩家视觉能否看穿」）。因此这里把 {@code barrier} 显式判为
+ * <b>不遮挡</b>——这是全仓库唯一一处 barrier 例外的定义（见 {@link #visuallyInvisibleOccluder}）。
+ * 用户覆盖表仍可压过它（{@code occlusion.extra-occluding} 里写 {@code barrier} 可改回遮挡）。
  */
 public final class OcclusionRules {
+
+  /** 视觉不可见、但服务端标记为「遮挡」的方块名：对玩家而言「看不见 = 可以看穿」（barrier 例外）。 */
+  private static final Set<String> VISUALLY_INVISIBLE_OCCLUDERS = Set.of("barrier");
 
   /** 判定输入：全部为纯值，不含任何 PacketEvents 类型。 */
   public record Facts(boolean air, boolean solid, boolean exceedsCube, boolean materialOccluding,
@@ -90,14 +98,8 @@ public final class OcclusionRules {
       return false;
     }
     String name = normalize(facts.name());
-
-    if (extraNonOccluding != null && extraNonOccluding.contains(name)) {
-      return false;
-    }
-    if (extraOccluding != null && extraOccluding.contains(name)) {
-      return true;
-    }
-    return baseVerdict(facts, perStateTruth);
+    return camouflageVerdict(name, serverVerdict(facts, name, perStateTruth),
+        extraOccluding, extraNonOccluding);
   }
 
   /**
@@ -112,10 +114,65 @@ public final class OcclusionRules {
     if (facts == null) {
       return false;
     }
-    if (perStateTruth != null) {
-      return perStateTruth;
+    String name = normalize(facts.name());
+    return visualVerdict(name, serverVerdict(facts, name, perStateTruth));
+  }
+
+  /**
+   * 服务端原始逐状态判定（<b>不含</b> barrier 例外）：真值可用时取真值，否则走启发式回落。
+   *
+   * <p>只有本方法内部用到「真值 or 启发式」这一层选择；上层（{@link #baseVerdict} /
+   * {@link #isOccluding} / 各 Bukkit 入口）一律再经 {@link #visualVerdict} 套用唯一那处 barrier 例外。
+   */
+  private static boolean serverVerdict(Facts facts, String normalizedName, Boolean perStateTruth) {
+    return perStateTruth != null ? perStateTruth : heuristic(facts, normalizedName);
+  }
+
+  /**
+   * <b>视觉口径</b>：把「服务端原始逐状态判定」套上唯一的 barrier 例外，得到「玩家视觉能否看穿」的结论。
+   *
+   * <p>这是全仓库「何为遮挡」的<b>唯一规则入口</b>：实体剔除的同步射线、异步位图、反矿透伪装边界邻块、
+   * 显形可见性判定在拿不到逐状态真值时都收敛到这里（拿得到真值的走覆盖表变体
+   * {@link #camouflageVerdict}）。
+   *
+   * @param blockName      方块名（可带命名空间/大小写，内部归一化）
+   * @param serverOccluding 服务端对该状态的原始 isOccluding 判定（含 barrier 为遮挡）
+   */
+  public static boolean visualVerdict(String blockName, boolean serverOccluding) {
+    return !visuallyInvisibleOccluder(blockName) && serverOccluding;
+  }
+
+  /**
+   * <b>伪装口径</b>：在视觉口径之上再套 {@code occlusion.extra-*} 用户覆盖（优先级最高）。
+   *
+   * <p>供只能拿到「方块名 + 服务端原始判定」（而不是摊平后的 {@link Facts}）的调用方使用
+   * ——例如反矿透边界邻块的 {@code BlockData} 路径，它必须与 {@code ObfuscationProcessor} 内部
+   * 经 {@link BlockStateRegistry#isOccluding} 的伪装判定保持同源。
+   *
+   * @param blockName         方块名（可带命名空间/大小写，内部归一化）
+   * @param serverOccluding   服务端对该状态的原始 isOccluding 判定
+   * @param extraOccluding    用户额外声明为「遮挡」的方块名（已归一化；可为 {@code null}）
+   * @param extraNonOccluding 用户额外声明为「不遮挡」的方块名（已归一化；可为 {@code null}）
+   */
+  public static boolean camouflageVerdict(String blockName, boolean serverOccluding,
+      Set<String> extraOccluding, Set<String> extraNonOccluding) {
+    String name = normalize(blockName);
+    if (extraNonOccluding != null && extraNonOccluding.contains(name)) {
+      return false;
     }
-    return heuristic(facts, normalize(facts.name()));
+    if (extraOccluding != null && extraOccluding.contains(name)) {
+      return true;
+    }
+    return visualVerdict(name, serverOccluding);
+  }
+
+  /**
+   * 该方块名是否属于「视觉不可见、但服务端标记为遮挡」的少数方块（当前只有 {@code barrier}）。
+   *
+   * <p>这是全仓库 barrier 例外的<b>唯一定义处</b>；各处不得再各写一份。
+   */
+  public static boolean visuallyInvisibleOccluder(String blockName) {
+    return VISUALLY_INVISIBLE_OCCLUDERS.contains(normalize(blockName));
   }
 
   /** 启发式回落（旧口径）：只在逐状态真值不可用时使用。 */
@@ -141,8 +198,8 @@ public final class OcclusionRules {
   /**
    * 该方块名是否为「薄片族」（仅按名称后缀近似，内部判定用）。
    *
-   * <p>入参必须是<b>已归一化</b>的名称：调用方 {@link #isOccluding} 已对名称归一化过一次，
-   * 这里再归一化一遍是多余计算。{@link #normalize} 幂等，去掉这次重复调用结果逐位不变。
+   * <p>入参必须是<b>已归一化</b>的名称：调用方（{@link #isOccluding} / {@link #baseVerdict} 经
+   * {@link #serverVerdict}）已对名称归一化过一次，这里不再重复归一化。
    */
   private static boolean hasThinSuffix(String normalized) {
     for (String suffix : THIN_NAME_SUFFIXES) {

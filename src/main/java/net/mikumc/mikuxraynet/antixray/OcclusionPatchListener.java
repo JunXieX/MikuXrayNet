@@ -11,6 +11,7 @@ import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
+import net.mikumc.mikuxraynet.bootstrap.BukkitOcclusion;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
@@ -50,11 +51,14 @@ import org.bukkit.plugin.Plugin;
  * 单格置零在<b>两个方向上都更保守</b>：若该格真实是遮挡方块，最坏只少算一格遮挡。
  * 失败格数计入 {@link OcclusionStats#patchFailures}，持续偏高即说明补丁链路读不出发送方方块数据。
  *
- * <p><b>口径</b>：本类只能用 ProtocolLib 包装后的 {@code Material} 判遮挡（{@code Material#isOccluding()}，
- * 方块级）；位图建表用的<b>实体遮挡口径表</b>则是<b>逐状态真值</b>（服务端 {@code BlockData#isOccluding()}，
- * 见 {@code EntityOcclusionTable}）。二者对绝大多数方块一致，仅对「同方块不同状态的结论不同」的少数方块
- * （如单台阶 vs 双台阶）可能不同——本类拿不到逐状态信息，属近似口径；且本类拿不到口径时一律降级为
- * 「不遮挡」（fail-open），不会造成误藏。
+ * <p><b>口径</b>：本类经统一入口 {@link BukkitOcclusion#entityOccludingByMaterial}（<b>实体口径</b>，
+ * 含唯一的 barrier 例外）判遮挡。位图建表用的<b>实体遮挡口径表</b>是<b>逐状态真值</b>（服务端
+ * {@code BlockData#isOccluding()}，见 {@code EntityOcclusionTable}）。<b>已知残余差异</b>：本类只能拿到
+ * ProtocolLib 包装后的 {@link org.bukkit.Material}（方块级），拿不到具体状态——{@link WrappedBlockData}
+ * 只暴露 {@code getType()}（Material）与旧版 {@code getData()}（legacy 数据字节），其内部 {@code handle}
+ * 是 NMS 状态对象、不提供 Bukkit {@code BlockData}/全局 id。因此「同方块不同状态结论不同」的少数方块
+ * （如单台阶 vs 双台阶）在补丁路径只能取默认状态近似，无法与逐状态位图完全一致；但 barrier 例外在
+ * Material 级是精确的，已与之对齐。且本类拿不到口径时一律降级为「不遮挡」（fail-open），不会造成误藏。
  * 反矿透伪装那条链路与实体位图同源（同一逐状态真值），二者互不影响。
  */
 public final class OcclusionPatchListener extends PacketAdapter {
@@ -187,10 +191,17 @@ public final class OcclusionPatchListener extends PacketAdapter {
   /**
    * 把一条出站方块变更解析为「是否遮挡」三态：
    * {@link #OCCLUDING} / {@link #CLEAR}，读不到方块数据时 {@link #UNRESOLVED}（调用方把该格置为不遮挡）。
+   *
+   * <p><b>口径（实体口径，经统一入口 {@link BukkitOcclusion#entityOccludingByMaterial}）</b>：位图建表用的是
+   * <b>逐状态真值</b>（服务端 {@code BlockData#isOccluding()} + 唯一的 barrier 例外，见
+   * {@code EntityOcclusionTable}）。本类只能拿到 ProtocolLib 包装后的 {@link org.bukkit.Material}
+   * （{@code WrappedBlockData#getType()}——它不暴露具体状态，详见类注释），因此这里走 Material 级判定：
+   * barrier 例外在 Material 级是精确的（barrier 只有一个状态），故能与之对齐；
+   * 但「同方块不同状态」（如单台阶 vs 双台阶）无法区分，属<b>已知残余差异</b>。
    */
   private static byte resolve(WrappedBlockData data) {
     try {
-      return data.getType().isOccluding() ? OCCLUDING : CLEAR;
+      return BukkitOcclusion.entityOccludingByMaterial(data.getType()) ? OCCLUDING : CLEAR;
     } catch (Throwable throwable) {
       return UNRESOLVED;
     }

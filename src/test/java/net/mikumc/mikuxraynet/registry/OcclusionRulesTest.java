@@ -171,4 +171,50 @@ class OcclusionRulesTest {
     assertFalse(OcclusionRules.isOccluding(null, NO_OVERRIDE, NO_OVERRIDE),
         "未知/缺失的方块语义一律按「不遮挡」处理（保守方向）");
   }
+
+  /**
+   * barrier 例外（全仓库唯一定义处）：服务端逐状态真值把 barrier 标为「遮挡」，但视觉口径必须判非遮挡；
+   * 用户覆盖表仍可压过它。
+   *
+   * <p>本用例同时钉死「例外只写一处、且各口径共用它」——实体口径（{@link OcclusionRules#baseVerdict}）、
+   * 伪装口径（{@link OcclusionRules#isOccluding}）、纯视觉规则（{@link OcclusionRules#visualVerdict}）
+   * 与边界邻块用的 {@link OcclusionRules#camouflageVerdict} 结论必须一致。
+   */
+  @Test
+  void barrierExceptionIsDefinedHereAndIsOverridable() {
+    assertTrue(OcclusionRules.visuallyInvisibleOccluder("barrier"));
+    assertTrue(OcclusionRules.visuallyInvisibleOccluder("minecraft:BARRIER"), "归一化后同样命中");
+    assertFalse(OcclusionRules.visuallyInvisibleOccluder("glass"));
+
+    // 服务端真值说遮挡，但 barrier 对玩家不可见 → 视觉口径判非遮挡
+    assertFalse(OcclusionRules.visualVerdict("barrier", true));
+    assertFalse(OcclusionRules.baseVerdict(solid("barrier"), Boolean.TRUE), "实体口径（基线）同样套用该例外");
+    assertFalse(OcclusionRules.isOccluding(solid("barrier"), NO_OVERRIDE, NO_OVERRIDE, Boolean.TRUE));
+    assertFalse(OcclusionRules.camouflageVerdict("barrier", true, NO_OVERRIDE, NO_OVERRIDE),
+        "边界邻块用的伪装口径同样套用该例外");
+
+    // 覆盖表优先级最高：把 barrier 写进 extra-occluding 可改回「遮挡」
+    Set<String> extraOccluding = OcclusionRules.normalizeAll(Set.of("barrier"));
+    assertTrue(OcclusionRules.isOccluding(solid("barrier"), extraOccluding, NO_OVERRIDE, Boolean.TRUE),
+        "显式覆盖可压过 barrier 例外");
+    assertTrue(OcclusionRules.camouflageVerdict("barrier", true, extraOccluding, NO_OVERRIDE));
+  }
+
+  /** 无逐状态真值（走启发式）时 barrier 也判非遮挡——同一方块在任何路径下结论一致。 */
+  @Test
+  void barrierIsNotOccludingOnEveryPath() {
+    assertFalse(OcclusionRules.visualVerdict("barrier", false));
+    assertFalse(OcclusionRules.baseVerdict(solid("barrier"), null), "启发式路径也必须判非遮挡");
+    assertFalse(OcclusionRules.isOccluding(solid("barrier"), NO_OVERRIDE, NO_OVERRIDE, null));
+  }
+
+  /**
+   * 状态相关方块：结论必须来自<b>逐状态真值</b>，而不是方块名——同一名字（{@code oak_slab}）的单台阶与
+   * 双台阶结论相反。这正是「Material 级近似」（补丁路径）无法做到的一点。
+   */
+  @Test
+  void stateDependentVerdictsComeFromTruthNotFromTheBlockName() {
+    assertFalse(OcclusionRules.visualVerdict("oak_slab", false), "单台阶：真值非遮挡");
+    assertTrue(OcclusionRules.visualVerdict("oak_slab", true), "双台阶：同一名字、真值遮挡");
+  }
 }

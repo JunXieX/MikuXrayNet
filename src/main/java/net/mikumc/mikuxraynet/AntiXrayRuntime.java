@@ -154,7 +154,8 @@ public final class AntiXrayRuntime {
     }
 
     NeighborChunkProvider neighborProvider = antiXray.neighbors().enabled()
-        ? new NeighborChunkProvider(antiXray.neighbors().cacheMaximumSize())
+        ? new NeighborChunkProvider(antiXray.neighbors().cacheMaximumSize(),
+            antiXray.occlusion().extraOccluding(), antiXray.occlusion().extraNonOccluding())
         : null;
 
     // 邻近显形索引：拆成「按区块共享的伪装清单」+「按玩家的已显形集合」两个结构。

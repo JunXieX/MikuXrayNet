@@ -13,8 +13,9 @@ import java.util.BitSet;
  * （启动期自证差异恒为 0）——这正是消除「异步与同步漂移」的关键。
  *
  * <p><b>历史</b>：旧实现按 {@code Material#isOccluding()}（方块级、无状态）逐方块名查表，与同步射线
- * 同源；但它无法区分同一方块的不同状态（如单台阶 vs 双台阶），而同步射线其实走的是
- * {@code BlockData#isOccluding()}（逐状态）。改为逐状态真值后反而与同步路径<b>更</b>对齐。
+ * 同源；但它无法区分同一方块的不同状态（如单台阶 vs 双台阶）。改为逐状态真值后，同步射线
+ * （{@code EntityCuller.isClear}）也一并改走 {@code BlockData#isOccluding()}（逐状态）——两者自此
+ * 真正同源，同一方块在异步位图与同步射线下结论一致。
  *
  * <p><b>平台无关、可离线单测</b>：本类只依赖 {@code java.util} 的位图；真正的「逐状态解析」在
  * {@link StateOcclusionOracle} 里完成，构建时由 {@link BlockStateRegistry} 把结果位图传进来。

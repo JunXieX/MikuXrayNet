@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.Schedulers;
+import net.mikumc.mikuxraynet.bootstrap.BukkitOcclusion;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
@@ -1180,7 +1181,10 @@ public final class ProximityRevealer implements Listener {
         @Override
         public boolean isOccluding(int blockX, int blockY, int blockZ) {
           BlockData data = world.getBlockData(blockX, blockY, blockZ);
-          return data != null && data.isOccluding();
+          // 显形可见性判定必须保持<b>保守</b>方向（显形判错 = 泄露）：故这里用「服务端原始逐状态真值」
+          // （经统一入口取，但仍用 BlockData#isOccluding），<b>刻意不套</b>唯一的 barrier 例外——
+          // barrier 仍算遮挡 → 射线更难通畅 → 更少显形，方向与原有行为一致（绝不放松）。
+          return BukkitOcclusion.serverOccluding(data);
         }
 
         @Override

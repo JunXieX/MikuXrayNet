@@ -1,8 +1,12 @@
 package net.mikumc.mikuxraynet.antixray;
 
 import java.util.ArrayDeque;
+import java.util.Collection;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
+import net.mikumc.mikuxraynet.bootstrap.BukkitOcclusion;
+import net.mikumc.mikuxraynet.registry.OcclusionRules;
 import org.bukkit.ChunkSnapshot;
 import org.bukkit.World;
 
@@ -19,7 +23,8 @@ import org.bukkit.World;
  *
  * <p><b>一次抓取、稳定读取</b>：生产路径先用 {@code Chunk#getChunkSnapshot(true,false,false)} 把每个邻块
  * 抓成一份快照（一次复制该区块的方块数据与高度图），随后所有逐格读取都走快照的区块内数组查询——
- * 不再经世界→区块解析（遮挡判定仍用 {@code BlockData#isOccluding()}，与旧实现逐格等价）。快照只在本
+ * 不再经世界→区块解析（遮挡判定经统一入口 {@code BukkitOcclusion#camouflageOccluding}，取逐状态真值并套用
+ * {@code occlusion.extra-*} 覆盖）。快照只在本
  * 方法内短暂存活，不进入缓存，抓取逻辑仍可离线构造桩验证（见 {@link SideSnapshot}）。
  *
  * <p><b>按列高度上界裁剪扫描</b>：每列先问一次该列的「最高非空气方块」Y（生产实现直接读快照自带
@@ -103,6 +108,15 @@ public final class NeighborChunkProvider {
   private final int cacheMaximumSize;
   private final long cacheTtlNanos;
   private final LongSupplier nanoClock;
+  /**
+   * 伪装口径的用户覆盖表（{@code occlusion.extra-occluding} / {@code extra-non-occluding}，已归一化）。
+   *
+   * <p><b>为什么边界邻块也要用它</b>：邻块贴边位的遮挡判定必须与 {@code ObfuscationProcessor} 内部经
+   * {@link net.mikumc.mikuxraynet.registry.BlockStateRegistry#isOccluding} 的伪装判定<b>同源</b>——否则
+   * 覆盖表（如把某个方块名声明为遮挡）只作用于区块内部，边界那一圈会得出相反结论而泄漏。
+   */
+  private final Set<String> extraOccluding;
+  private final Set<String> extraNonOccluding;
 
   /** 主存储：读取完全无锁。 */
   private final ConcurrentHashMap<ChunkKey, CacheEntry> entries = new ConcurrentHashMap<>();
@@ -144,19 +158,38 @@ public final class NeighborChunkProvider {
   }
 
   public NeighborChunkProvider(int cacheMaximumSize) {
-    this(cacheMaximumSize, DEFAULT_CACHE_TTL_MILLIS, System::nanoTime);
+    this(cacheMaximumSize, DEFAULT_CACHE_TTL_MILLIS, System::nanoTime, Set.of(), Set.of());
   }
 
   /** 带 TTL 的构造（毫秒，{@code <= 0} 表示不过期）；供装配方按需传入更短/更长的过期时间。 */
   public NeighborChunkProvider(int cacheMaximumSize, long cacheTtlMillis) {
-    this(cacheMaximumSize, cacheTtlMillis, System::nanoTime);
+    this(cacheMaximumSize, cacheTtlMillis, System::nanoTime, Set.of(), Set.of());
+  }
+
+  /**
+   * 生产构造：额外带上伪装口径的用户覆盖表（{@code occlusion.extra-*}），使边界邻块与区块内部判定同源。
+   *
+   * @param extraOccluding    额外视为「遮挡」的方块名（可为 {@code null}/空）
+   * @param extraNonOccluding 额外视为「不遮挡」的方块名（可为 {@code null}/空）
+   */
+  public NeighborChunkProvider(int cacheMaximumSize, Collection<String> extraOccluding,
+      Collection<String> extraNonOccluding) {
+    this(cacheMaximumSize, DEFAULT_CACHE_TTL_MILLIS, System::nanoTime,
+        OcclusionRules.normalizeAll(extraOccluding), OcclusionRules.normalizeAll(extraNonOccluding));
   }
 
   /** 测试专用：额外注入时间源，便于离线验证过期语义（无需真实等待）。 */
   NeighborChunkProvider(int cacheMaximumSize, long cacheTtlMillis, LongSupplier nanoClock) {
+    this(cacheMaximumSize, cacheTtlMillis, nanoClock, Set.of(), Set.of());
+  }
+
+  private NeighborChunkProvider(int cacheMaximumSize, long cacheTtlMillis, LongSupplier nanoClock,
+      Set<String> extraOccluding, Set<String> extraNonOccluding) {
     this.cacheMaximumSize = Math.max(1, cacheMaximumSize);
     this.cacheTtlNanos = cacheTtlMillis <= 0 ? 0L : cacheTtlMillis * 1_000_000L;
     this.nanoClock = nanoClock;
+    this.extraOccluding = extraOccluding;
+    this.extraNonOccluding = extraNonOccluding;
   }
 
   /**
@@ -227,9 +260,11 @@ public final class NeighborChunkProvider {
    * 「同时最多一个 BlockData」相比更高，但换取的是读取次数的显著下降（抓取仅在 {@code mode=enclosed}
    * 世界发生，且有 30 秒 TTL 缓存兜底）。
    *
-   * <p><b>遮挡判定仍走 {@code BlockData#isOccluding()}</b>（与旧实现逐格等价）。刻意不用
-   * {@code Material#isOccluding()}：新版 Paper 上它会经注册表解析出 BlockType，既依赖服务端运行时，
-   * 也不保证与方块状态级判定完全一致——语义等价优先。
+   * <p><b>遮挡判定经统一入口 {@link BukkitOcclusion#camouflageOccluding}（伪装口径）</b>：取贴边方块的
+   * <b>逐状态真值</b>（{@code BlockData#isOccluding()} + 唯一的 barrier 例外），并套上
+   * {@code occlusion.extra-*} 覆盖表，与 {@code ObfuscationProcessor} 内部经
+   * {@code BlockStateRegistry#isOccluding} 的伪装判定<b>同源</b>。刻意不用 {@code Material#isOccluding()}：
+   * 它只是方块级默认状态的近似，无法区分同方块的不同状态（双台阶 vs 单台阶），会导致边界圈漏判。
    */
   private long[] captureSideFromWorld(World world, int baseY, int height, int chunkX, int chunkZ,
       NeighborEdges.Side side) {
@@ -245,7 +280,8 @@ public final class NeighborChunkProvider {
           new SideSnapshot() {
             @Override
             public boolean isOccluding(int localX, int localY, int localZ) {
-              return snapshot.getBlockData(localX, localY, localZ).isOccluding();
+              return BukkitOcclusion.camouflageOccluding(snapshot.getBlockData(localX, localY, localZ),
+                  extraOccluding, extraNonOccluding);
             }
 
             @Override

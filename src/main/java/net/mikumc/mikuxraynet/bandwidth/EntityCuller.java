@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.antixray.ProximitySelector;
+import net.mikumc.mikuxraynet.bootstrap.BukkitOcclusion;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.occlusion.OcclusionEngine;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
@@ -1070,7 +1071,12 @@ public final class EntityCuller implements Listener {
    * （玻璃/台阶/植物等，玩家仍能看见其后的实体）算通畅。
    *
    * <p>{@code FluidCollisionMode.NEVER}：流体不参与射线（水里的实体照常可见）。
-   * 命中方块的遮挡判定用 {@code Material#isOccluding()}，不新建 BlockData 对象。
+   *
+   * <p><b>遮挡判定经统一入口 {@link BukkitOcclusion#visualOccluding}（实体口径）</b>：直接取命中方块的
+   * <b>逐状态真值</b>（{@code BlockData#isOccluding()} + 唯一的 barrier 例外），而非
+   * {@code Material#isOccluding()} 的方块级近似。这样本同步射线与异步位图（{@code EntityOcclusionTable}，
+   * 同源真值）在<b>状态相关方块</b>（双台阶 vs 单台阶）与 barrier 上结论一致——即
+   * {@code entity-culling.async-occlusion} 开 / 关都不会改变同一方块的判定。
    */
   private static boolean isClear(World world, Location eye, double x, double y, double z,
       Vector direction) {
@@ -1094,7 +1100,7 @@ public final class EntityCuller implements Listener {
       return true;
     }
     Block block = hit.getHitBlock();
-    return !block.getType().isOccluding();
+    return !BukkitOcclusion.visualOccluding(block.getBlockData());
   }
 
   /**

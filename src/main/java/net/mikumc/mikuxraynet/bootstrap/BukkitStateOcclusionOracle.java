@@ -1,8 +1,8 @@
 package net.mikumc.mikuxraynet.bootstrap;
 
+import net.mikumc.mikuxraynet.registry.OcclusionRules;
 import net.mikumc.mikuxraynet.registry.StateOcclusionOracle;
 import org.bukkit.Bukkit;
-import org.bukkit.Material;
 import org.bukkit.block.data.BlockData;
 
 /**
@@ -26,8 +26,11 @@ import org.bukkit.block.data.BlockData;
  * 会抛 {@link IllegalArgumentException}（以及个别 {@code NPE}）。这里一律返回 {@code null}，由调用方
  * 回落既有启发式并计数——<b>绝不</b>让单个状态失败影响整体构建。
  *
- * <p><b>为什么把 barrier 排除</b>：{@code barrier} 在服务端 {@code isOccluding} 标记里算「遮挡」，
- * 但它对玩家<b>完全不可见</b>。本判据是「玩家视觉能否看穿」，故显式判为非遮挡（与既有启发式口径一致）。
+ * <p><b>为什么不再在这里排除 barrier</b>：{@code barrier} 在服务端 {@code isOccluding} 标记里算「遮挡」，
+ * 但它对玩家<b>完全不可见</b>。本判据是「玩家视觉能否看穿」，故需要把 barrier 显式判为非遮挡——
+ * 该例外如今<b>只定义一处</b>：{@link OcclusionRules#visuallyInvisibleOccluder}（由
+ * {@link OcclusionRules#visualVerdict} 统一套用）。本实现只负责给出<b>服务端原始真值</b>，
+ * 由 {@code BlockStateRegistry} 的判定路径套用那处例外（伪装口径与实体口径都如此）。
  *
  * <p><b>为何只能在真机用</b>：{@code Bukkit.createBlockData} 依赖服务端的 {@code RegistryAccess}，
  * 离线环境会抛 {@code IllegalStateException: No RegistryAccess implementation found}——因此本类不进单测，
@@ -35,16 +38,10 @@ import org.bukkit.block.data.BlockData;
  */
 public final class BukkitStateOcclusionOracle implements StateOcclusionOracle {
 
-  /** 视觉不可见、但服务端标记为「遮挡」的方块：对玩家而言「看不见 = 可以看穿」。 */
-  private static final Material INVISIBLE_BUT_OCCLUDING = Material.BARRIER;
-
   @Override
   public Boolean resolve(String blockDataString) {
     try {
       BlockData data = Bukkit.createBlockData(namespaced(blockDataString));
-      if (data.getMaterial() == INVISIBLE_BUT_OCCLUDING) {
-        return Boolean.FALSE;
-      }
       return data.isOccluding();
     } catch (Throwable throwable) {
       // 单状态解析失败：返回 null 交调用方回落启发式并计数（不影响其它状态）
