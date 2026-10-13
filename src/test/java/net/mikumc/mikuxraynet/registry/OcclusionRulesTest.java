@@ -210,6 +210,42 @@ class OcclusionRulesTest {
   }
 
   /**
+   * 岩浆例外（全仓库唯一定义处，与 barrier 互为反向）：服务端逐状态真值把岩浆标为「非遮挡」
+   * （非满方块、光会穿过），但视觉上<b>不透明</b>，视觉口径必须判遮挡；水/水柱透明，仍判非遮挡。
+   *
+   * <p>岩浆走名称判定（{@code visuallyOpaqueFluid}），因此即便真值不可用（走启发式、且启发式里岩浆的
+   * {@code solid} 为 false）也照样判遮挡——离线/回落口径与在线一致。
+   */
+  @Test
+  void lavaExceptionIsDefinedHereAndIsOverridable() {
+    assertTrue(OcclusionRules.visuallyOpaqueFluid("lava"));
+    assertTrue(OcclusionRules.visuallyOpaqueFluid("minecraft:LAVA"), "归一化后同样命中");
+    assertTrue(OcclusionRules.visuallyOpaqueFluid("  Lava  "), "含空白/大小写同样命中");
+    assertFalse(OcclusionRules.visuallyOpaqueFluid("water"), "水透明，不算视觉遮挡流体");
+    assertFalse(OcclusionRules.visuallyOpaqueFluid("bubble_column"), "水柱透明，不算视觉遮挡流体");
+    assertFalse(OcclusionRules.visuallyOpaqueFluid("stone"));
+
+    // 服务端真值说非遮挡，但岩浆视觉上不透明 → 视觉口径判遮挡
+    assertTrue(OcclusionRules.visualVerdict("lava", false));
+    // 真值不可用（走启发式）：岩浆的 solid 为 false，但视觉口径仍判遮挡（名称补判）
+    assertTrue(OcclusionRules.baseVerdict(new OcclusionRules.Facts(false, false, false, false, false,
+        "lava"), null), "启发式路径也必须判岩浆为遮挡");
+    assertTrue(OcclusionRules.isOccluding(new OcclusionRules.Facts(false, false, false, false, false,
+        "lava"), NO_OVERRIDE, NO_OVERRIDE, null));
+
+    // 覆盖表优先级最高：把岩浆写进 extra-non-occluding 可改回「非遮挡」
+    Set<String> extraNonOccluding = OcclusionRules.normalizeAll(Set.of("lava"));
+    assertFalse(OcclusionRules.isOccluding(new OcclusionRules.Facts(false, false, false, false, false,
+        "lava"), NO_OVERRIDE, extraNonOccluding, Boolean.FALSE), "显式覆盖可压过岩浆例外");
+    assertFalse(OcclusionRules.camouflageVerdict("lava", false, NO_OVERRIDE, extraNonOccluding));
+
+    // 水在任何路径下都不因「流体」身份被判遮挡
+    assertFalse(OcclusionRules.visualVerdict("water", false));
+    assertFalse(OcclusionRules.isOccluding(new OcclusionRules.Facts(false, false, false, true, false,
+        "water"), NO_OVERRIDE, NO_OVERRIDE, Boolean.FALSE));
+  }
+
+  /**
    * 状态相关方块：结论必须来自<b>逐状态真值</b>，而不是方块名——同一名字（{@code oak_slab}）的单台阶与
    * 双台阶结论相反。这正是「Material 级近似」做不到的一点；该近似现在只剩<b>补丁路径拿不到状态 id 时的
    * 回落</b>（补丁默认已按全局 id 逐状态判定，见 {@code OcclusionPatchListener}）。
@@ -221,11 +257,11 @@ class OcclusionRulesTest {
   }
 
   /**
-   * 「视觉口径」与「服务端原始逐状态真值」的差异<b>只应来自 barrier 例外</b>。
+   * 「视觉口径」与「服务端原始逐状态真值」的差异<b>只应来自两个反向例外：barrier 与岩浆</b>。
    *
-   * <p>这是显形路径改造的安全前提：把显形从「原始真值」（barrier 算遮挡 → 更少显形）改为「视觉口径」
-   * 后，唯一的结论变化就是 barrier（对玩家不可见 → 其后方方块得以显形，属正确体验而非泄露）。
-   * 其余任何方块、任何状态都不得出现分歧。
+   * <p>这是显形路径改造的安全前提：把显形从「原始真值」改为「视觉口径」后，结论变化只应来自
+   * barrier（对玩家不可见 → 其后方方块得以显形）与岩浆（视觉不透明 → 其后方/下方方块不显形）这两处。
+   * 其余任何方块、任何状态都不得出现分歧。本用例的语料刻意不含 lava，逐条验证「非例外方块无分歧」。
    */
   @Test
   void visualVerdictDiffersFromRawServerVerdictOnlyOnBarrier() {

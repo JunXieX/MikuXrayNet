@@ -448,7 +448,7 @@ public final class BandwidthConfig {
             clampUpper(Math.max(1, root.getInt("latency.check-interval-seconds", 5)),
                 MAX_CHECK_INTERVAL_SECONDS, "latency.check-interval-seconds", clampAdjustments)),
         new Diagnostics(
-            clampUpper(Math.max(0, root.getInt("diagnostics.interval-seconds", 60)),
+            clampUpper(Math.max(0, root.getInt("diagnostics.interval-seconds", 0)),
                 MAX_DIAGNOSTICS_INTERVAL_SECONDS, "diagnostics.interval-seconds", clampAdjustments)),
         clampAdjustments);
   }

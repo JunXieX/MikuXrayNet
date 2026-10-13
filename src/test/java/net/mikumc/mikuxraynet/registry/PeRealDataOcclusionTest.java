@@ -164,8 +164,10 @@ class PeRealDataOcclusionTest {
           name + " 必须判为遮挡（真机 PE 2.13.0 / V_26_2）");
     }
 
+    // 注意：岩浆不在此列——它服务端 isOccluding()=false，但视觉不透明，由视觉口径补判为遮挡
+    //（见 lavaIsOccludingInBothCamouflageAndEntityVerdictsWhileWaterIsNot）。
     String[] mustNotOcclude = {
-        "air", "cave_air", "water", "lava", "glass", "oak_leaves", "oak_stairs", "oak_fence",
+        "air", "cave_air", "water", "glass", "oak_leaves", "oak_stairs", "oak_fence",
         "torch", "chest",
         // P1-5：箱子族为「实心但形状小于整方块」，白名单判非遮挡（1.0.x 既有行为，保持）
         "trapped_chest", "ender_chest", "shulker_box"};
@@ -416,54 +418,27 @@ class PeRealDataOcclusionTest {
   }
 
   /**
-   * 流体覆盖掩码必须与真机 PE 材质语义一致：只认水/岩浆（含流动变体）与水柱，
-   * <b>排除含水方块</b>（真机 PE 的 {@code isFluid()} 把 11728 个含水状态也算作流体，二者不可混用）。
+   * 岩浆已并入共享遮挡表：真机 PE 映射下，岩浆（视觉不透明）必须在<b>伪装口径与实体口径</b>下都判遮挡，
+   * 而水/水柱（透明）两者都判非遮挡。
    *
-   * <p><b>改造后</b>：反矿透流体规则只认岩浆（水/水柱透明、不参与遮挡），因此新增的
-   * {@link BlockStateRegistry#isLavaCover} 必须<b>只</b>含岩浆而<b>不含</b>水/水柱；旧的 {@code isFluidCover}
-   * 语义不变（水/岩浆/水柱），仅为兼容保留。
+   * <p><b>为什么必须实测</b>：服务端 {@code BlockData#isOccluding()} 对岩浆返回 {@code false}（非满方块、光会
+   * 穿过），「岩浆算遮挡」全靠 {@code OcclusionRules} 的视觉口径按名称补判。本用例直接驱动真实 PE 数据，
+   * 钉住「岩浆 id 确实落在遮挡位图里、水/水柱确实不在」——四条路径（实体剔除位图 / 显形位图 / 显形降级射线 /
+   * 方块补丁）读的都是这张表，因此这里成立即四路径一致。
    */
   @Test
-  void fluidCoverMaskExcludesWaterloggedStates() {
-    assertTrue(registry.isFluidCover(requireStateId("water")), "水必须是流体覆盖");
-    assertTrue(registry.isFluidCover(requireStateId("lava")), "岩浆必须是流体覆盖");
-    // 这些方块本体不是流体（即便某些状态下 can be waterlogged）→ 不算流体覆盖
-    for (String name : new String[] {"oak_fence", "oak_stairs", "oak_slab", "chest", "stone",
-        "netherrack", "end_stone"}) {
-      assertFalse(registry.isFluidCover(requireStateId(name)), name + " 本体不是流体，不算流体覆盖");
-    }
-    // 岩浆覆盖掩码（反矿透新口径）：只认岩浆，水/水柱都不算
-    assertTrue(registry.isLavaCover(requireStateId("lava")), "岩浆必须是岩浆覆盖");
-    assertFalse(registry.isLavaCover(requireStateId("water")), "水是透明的，不得算岩浆覆盖");
-    assertFalse(registry.isLavaCover(requireStateId("bubble_column")), "水柱是透明的，不得算岩浆覆盖");
-    assertFalse(registry.isLavaCover(requireStateId("stone")), "石头不是岩浆，不得算岩浆覆盖");
+  void lavaIsOccludingInBothCamouflageAndEntityVerdictsWhileWaterIsNot() {
+    int lavaId = requireStateId("lava");
+    assertTrue(registry.isOccluding(lavaId),
+        "岩浆在伪装口径下必须判遮挡（视觉不透明，OcclusionRules 按名称补判）");
+    assertTrue(registry.isEntityOccluding(lavaId),
+        "岩浆在实体口径下必须判遮挡（与伪装口径同源，供实体剔除位图使用）");
 
-    int fluidTotal = 0;
-    int coverTotal = 0;
-    int lavaCoverTotal = 0;
-    int waterloggedOnly = 0;
-    for (int id = 0; id < registry.getUniqueBlockStateCount(); id++) {
-      if (registry.isFluid(id)) {
-        fluidTotal++;
-      }
-      if (registry.isFluidCover(id)) {
-        coverTotal++;
-      }
-      if (registry.isLavaCover(id)) {
-        lavaCoverTotal++;
-      }
-      if (registry.isFluid(id) && !registry.isFluidCover(id)) {
-        waterloggedOnly++;
-      }
+    for (String name : new String[] {"water", "bubble_column"}) {
+      int id = requireStateId(name);
+      assertFalse(registry.isOccluding(id), name + " 透明，不得判遮挡（伪装口径）");
+      assertFalse(registry.isEntityOccluding(id), name + " 透明，不得判遮挡（实体口径）");
     }
-    System.out.println("[流体掩码] isFluid=" + fluidTotal + "，isFluidCover=" + coverTotal
-        + "，isLavaCover=" + lavaCoverTotal + "，仅 isFluid（含水状态）=" + waterloggedOnly);
-    assertTrue(waterloggedOnly > 0,
-        "真机 PE 的 isFluid 把含水状态也算作流体，必须被流体覆盖掩码排除（否则上方是含水台阶也会保持伪装）");
-    assertTrue(coverTotal > 0 && coverTotal <= 64,
-        "流体覆盖掩码只应包含水/岩浆/水柱这类「本体即流体」的少数状态：" + coverTotal);
-    assertTrue(lavaCoverTotal > 0 && lavaCoverTotal < coverTotal,
-        "岩浆覆盖掩码应只含岩浆状态，是流体覆盖掩码的真子集：" + lavaCoverTotal + " < " + coverTotal);
   }
 
   /** 读取打包 antixray.yml 里各维度的 hide-blocks（不依赖 Bukkit YAML）。 */

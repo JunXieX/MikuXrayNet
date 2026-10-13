@@ -27,10 +27,12 @@ import net.mikumc.mikuxraynet.codec.RegistryAccessor;
  *
  * <p><b>遮挡（occluding）判定</b>：优先采用<b>逐状态真值</b>——启动期把每个状态的
  * {@code WrappedBlockState#toString()} 交给注入的 {@link StateOcclusionOracle} 解析成
- * {@code BlockData#isOccluding()}（服务端权威、逐状态，即「玩家视觉能否看穿」）。单个状态解析失败时
+ * {@code BlockData#isOccluding()}（服务端权威、逐状态，即「是否挡光」）。单个状态解析失败时
  * 回落到 {@link OcclusionRules} 的启发式，并计入回落数；<b>绝不让单个状态失败影响整体</b>。
- * 唯一的例外是 barrier：它在服务端真值里算遮挡，但视觉不可见，由 {@link OcclusionRules} 判为非遮挡
- * （该例外只定义一处，见 {@code OcclusionRules#visuallyInvisibleOccluder}）。
+ * 服务端真值与「玩家视觉能否看穿」在两个方向上各有一处偏差，均由 {@link OcclusionRules} 归一到
+ * 「视觉口径」这唯一入口：{@code barrier}（服务端说遮挡、视觉不可见 → 判非遮挡）与
+ * 岩浆（服务端说不遮挡、视觉不透明 → 判遮挡）；两处例外都只定义一处
+ * （见 {@code OcclusionRules#visuallyInvisibleOccluder} / {@code #visuallyOpaqueFluid}）。
  *
  * <p>启发式回落后，本类把 PE 的状态语义摊平成 {@link OcclusionRules.Facts}：
  * <ul>
@@ -68,16 +70,6 @@ public final class BlockStateRegistry implements RegistryAccessor {
   private final int maxBitsPerBlockState;
   private final BitSet airStates;
   private final BitSet fluidStates;
-  /** 「流体覆盖」掩码：只有水/岩浆（含流动变体）与水柱，**不含含水方块**（见 {@link #isFluidCover}）。 */
-  private final BitSet fluidCoverStates;
-  /**
-   * 「岩浆覆盖」掩码：只有岩浆（含流动变体）——反矿透流体规则改造后的判据来源（见 {@link #isLavaCover}）。
-   *
-   * <p><b>为什么单独一张掩码</b>：新口径下只有<b>岩浆</b>参与遮挡（视觉不透明），水/水柱透明、不再触发任何
-   * 保持伪装或抑制显形的规则。这里保留 {@link #fluidCoverStates} 以免破坏其它调用方与测试，但生产路径
-   * （三处局部判据）一律改用本掩码。
-   */
-  private final BitSet lavaCoverStates;
   private final BitSet occludingStates;
   /**
    * 实体遮挡口径表：只供实体剔除的异步位图使用，内容与伪装口径<b>同源</b>（同一逐状态真值），
@@ -98,15 +90,13 @@ public final class BlockStateRegistry implements RegistryAccessor {
   private final List<String> heuristicFallbackNames;
 
   private BlockStateRegistry(int uniqueBlockStateCount, int maxBitsPerBlockState, BitSet airStates,
-      BitSet fluidStates, BitSet fluidCoverStates, BitSet lavaCoverStates, BitSet occludingStates,
+      BitSet fluidStates, BitSet occludingStates,
       EntityOcclusionTable entityOcclusionTable, int truthStateCount, int heuristicFallbackStateCount,
       int overrideHitStateCount, int occlusionDriftStateCount, List<String> heuristicFallbackNames) {
     this.uniqueBlockStateCount = uniqueBlockStateCount;
     this.maxBitsPerBlockState = maxBitsPerBlockState;
     this.airStates = airStates;
     this.fluidStates = fluidStates;
-    this.fluidCoverStates = fluidCoverStates;
-    this.lavaCoverStates = lavaCoverStates;
     this.occludingStates = occludingStates;
     this.entityOcclusionTable = entityOcclusionTable;
     this.truthStateCount = truthStateCount;
@@ -170,8 +160,6 @@ public final class BlockStateRegistry implements RegistryAccessor {
 
     BitSet airStates = new BitSet(count);
     BitSet fluidStates = new BitSet(count);
-    BitSet fluidCoverStates = new BitSet(count);
-    BitSet lavaCoverStates = new BitSet(count);
     BitSet occludingStates = new BitSet(count);
     // 实体口径 = 逐状态真值（不含 extra-* 覆盖）；与伪装口径同源，仅差覆盖表。
     BitSet entityOccludingStates = new BitSet(count);
@@ -195,18 +183,6 @@ public final class BlockStateRegistry implements RegistryAccessor {
       }
       if (state.isFluid() || type.getMaterialType() == MaterialType.BUBBLE_COLUMN) {
         fluidStates.set(id);
-      }
-      // 流体覆盖掩码：只认「本体就是流体」的材质（WATER / LAVA / 水柱）。
-      // 真机 PE 实测：isFluid() 把含水状态也算作流体（32366 个状态里 11760 个 isFluid=true，
-      // 其中 11728 个是含水的台阶/栅栏/告示牌等，二者不可混用）——含水方块本体不是流体，
-      // 上方放一块含水台阶不应让下方矿「保持伪装」。
-      if (isFluidMaterial(type.getMaterialType())) {
-        fluidCoverStates.set(id);
-      }
-      // 岩浆覆盖掩码：只认岩浆（含流动变体）。新口径下岩浆是唯一参与遮挡的流体——它视觉不透明，
-      // 而水/水柱透明（见类注释与 isLavaCover）。
-      if (isLavaMaterial(type.getMaterialType())) {
-        lavaCoverStates.set(id);
       }
 
       OcclusionRules.Facts facts = facts(type, name, state);
@@ -241,8 +217,8 @@ public final class BlockStateRegistry implements RegistryAccessor {
 
     List<String> fallbackNameList = new ArrayList<>(fallbackNames);
     fallbackNameList.sort(String::compareTo);
-    return new BlockStateRegistry(count, width, airStates, fluidStates, fluidCoverStates,
-        lavaCoverStates, occludingStates, EntityOcclusionTable.build(entityOccludingStates),
+    return new BlockStateRegistry(count, width, airStates, fluidStates, occludingStates,
+        EntityOcclusionTable.build(entityOccludingStates),
         truthCount, fallbackCount, overrideHitCount, driftCount, List.copyOf(fallbackNameList));
   }
 
@@ -261,18 +237,6 @@ public final class BlockStateRegistry implements RegistryAccessor {
       // 单个状态取字符串/解析失败：不中断整个构建，按「真值不可用」回落
       return null;
     }
-  }
-
-  /** 本体即流体的材质：水（含流动变体与水柱）与岩浆。 */
-  private static boolean isFluidMaterial(MaterialType material) {
-    return material == MaterialType.WATER
-        || material == MaterialType.LAVA
-        || material == MaterialType.BUBBLE_COLUMN;
-  }
-
-  /** 本体即岩浆的材质（含静止与流动变体）：反矿透流体规则改造后唯一的「遮挡型流体」。 */
-  private static boolean isLavaMaterial(MaterialType material) {
-    return material == MaterialType.LAVA;
   }
 
   /** 方块名称 → 默认状态的全局 id；未知名称返回 -1。仅启动期用于解析配置。 */
@@ -319,37 +283,11 @@ public final class BlockStateRegistry implements RegistryAccessor {
   }
 
   /**
-   * 流体覆盖掩码查询（水/岩浆/水柱；<b>不含含水方块</b>）：供反矿透「目标方块上方是流体则按遮挡处理、
-   * 且显形侧不显形」的<b>旧口径</b>规则使用。与 {@link #isFluid}（方块计数口径，含含水方块）刻意分开——
-   * 见 {@link #build} 中的实测说明。
-   *
-   * <p><b>改造说明</b>：新口径下流体规则已改为<b>只认岩浆</b>（水/水柱透明，不参与遮挡），生产路径请用
-   * {@link #isLavaCover}；本方法保留以免破坏其它调用方与既有测试。
-   */
-  @Override
-  public boolean isFluidCover(int blockId) {
-    return blockId >= 0 && blockId < uniqueBlockStateCount && fluidCoverStates.get(blockId);
-  }
-
-  /**
-   * 岩浆覆盖掩码查询（只含岩浆，含流动变体；<b>不含水/水柱/含水方块</b>）：这是反矿透流体规则改造后
-   * 唯一的判据来源。
-   *
-   * <p><b>为什么只有岩浆</b>：水是<b>透明</b>的——玩家在矿洞里应当能看见被水盖住的矿物，因此水（含流动
-   * 变体、水柱 {@code BUBBLE_COLUMN}）不再触发任何「保持伪装 / 不显形」规则；而岩浆视觉上<b>不透明</b>，
-   * 玩家看不到岩浆池里的残骸属正常现象，本规则正是要防止「生成在岩浆里的残骸被透视端看见」。三处局部判据
-   * （{@code ProximityRevealer.fluidAllowsReveal}、{@code ProximitySelector} 的岩浆面/射线，以及
-   * {@code ObfuscationProcessor.isLavaCoverAt}）一律改用本掩码。
-   */
-  public boolean isLavaCover(int blockId) {
-    return blockId >= 0 && blockId < uniqueBlockStateCount && lavaCoverStates.get(blockId);
-  }
-
-  /**
    * 该状态是否为「整块不透明」（可作为遮挡面）——<b>反矿透伪装口径</b>。
    *
    * <p>优先取逐状态真值（服务端 {@code BlockData#isOccluding()}），真值不可用的状态才回落 PE 状态语义启发式；
-   * 两者都可被 {@code occlusion.extra-*} 覆盖表改写（覆盖优先级最高）。
+   * 两者都要经 {@link OcclusionRules} 的视觉口径校正（barrier 判非遮挡、岩浆判遮挡），并可被
+   * {@code occlusion.extra-*} 覆盖表改写（覆盖优先级最高）。
    */
   public boolean isOccluding(int blockId) {
     return blockId >= 0 && blockId < uniqueBlockStateCount && occludingStates.get(blockId);

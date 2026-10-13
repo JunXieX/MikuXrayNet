@@ -24,7 +24,6 @@ import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.FluidCollisionMode;
 import org.bukkit.Location;
-import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.data.BlockData;
@@ -69,10 +68,10 @@ import org.bukkit.util.Vector;
    *       因此可整段在工作线程上跑（不再需要 Bukkit API）；位图整体不可用（反矿透未启用
    *       {@code entity-culling.async-occlusion}）时回落旧的原生射线路径（{@code World#rayTraceBlocks}）
    *       ——那是<b>降级路径</b>，不是开关。</li>
-   *   <li><b>流体覆盖</b>（默认开启，{@code occlusion.fluid-cover}）：目标方块紧邻<b>岩浆</b>（含上方 y+1）
-   *       时按视觉遮挡处理、不显形——刷在岩浆里的下界残骸本就被伪装，显形侧若还原就等于把它亮给玩家。
-   *       <b>水不参与</b>（透明，玩家应当能看见水下的矿物）。位图分不出岩浆（vanilla {@code isOccluding()}
-   *       对岩浆返回 false），因此这一条由发布侧（玩家线程）补判。</li>
+   *   <li><b>岩浆遮挡</b>（统一入口）：岩浆视觉不透明（服务端 {@code isOccluding()} 却返回 false），
+   *       现由 {@code OcclusionRules} 的视觉口径并入遮挡，因此位图与降级射线都天然把岩浆当遮挡——
+   *       刷在岩浆里的下界残骸在显形侧不会被还原，不必再单独补判。<b>水不参与</b>（透明，玩家应当能看见
+   *       水下的矿物）。</li>
    * </ul>
  *
  * <p><b>缺数据的方向（与实体遮挡路径刻意相反）</b>：位图查不到 section、或该世界尚无位图时一律按「遮挡」
@@ -83,7 +82,7 @@ import org.bukkit.util.Vector;
  *
  * <p><b>线程纪律</b>：位置读取、方块读取与发包都在主线程 / Folia 区域线程（非 Folia 为统一主线程任务，
  * Folia 为各玩家的区域任务）；纯计算（视锥角度 + 遮挡位图可见性）交给 {@link MikuWorkPool} 的工作线程，
- * 算完再回到玩家所属线程，只做「区块加载检查 + 上方流体规则 + 读真实方块 + 发包」。旧的原生射线可见性判定
+ * 算完再回到玩家所属线程，只做「区块加载检查 + 读真实方块 + 发包」。旧的原生射线可见性判定
  * （{@code World#rayTraceBlocks} + 6 邻块读）是 Bukkit API，只能在玩家线程做；位图判定
  * （{@link BitmapVisibility}）不需要，因而被搬到了工作线程。工作队列已满时退化为「玩家线程直接做同一套
  * 纯计算」，功能不降级、绝不阻塞。
@@ -269,8 +268,6 @@ public final class ProximityRevealer implements Listener {
   private final AntiXrayConfig config;
   private final AntiXrayConfig.Proximity proximity;
   private final AntiXrayConfig.InstantReveal instant;
-  /** 流体覆盖开关（{@code occlusion.fluid-cover}）：上方是岩浆时不显形（保持伪装）；水不参与。 */
-  private final boolean fluidCover;
   /** 是否把同一周期的显形合并成一个 Paper 原生多方块变更包发出（{@code proximity.batch-reveal-sends}）。 */
   private final boolean batchRevealSends;
   private final ObfuscatedChunkIndex chunkIndex;
@@ -365,7 +362,6 @@ public final class ProximityRevealer implements Listener {
     this.config = config;
     this.proximity = config.proximity();
     this.instant = proximity.instantReveal();
-    this.fluidCover = config.occlusion().fluidCover();
     this.batchRevealSends = proximity.batchRevealSends();
     this.overRevealSampler = new OverRevealSampler(Math.max(0, proximity.overRevealSampling()));
     this.chunkIndex = chunkIndex;
@@ -667,8 +663,8 @@ public final class ProximityRevealer implements Listener {
    * 留在伪装清单里等下一个周期——「无数据 ≠ 通畅」，否则整片未建表的区域会被一次性还原成真实方块。
    *
    * @param worldName         候选所属世界名（位图按世界分域，须与写入侧口径一致）
-   * @param bitmapVisibility  本轮的可见性判定是否走遮挡位图（由 {@link #reveal} 判定并传入，保证
-   *                          「筛选用哪条路径」与「发布侧是否补判」在整轮里是同一个取值）
+   * @param bitmapVisibility  本轮的可见性判定是否走遮挡位图（由 {@link #reveal} 判定并传入，保证整轮
+   *                          「位图判定 or 原生射线判定」是同一个取值）
    */
   private Plan computePlan(ProximitySelector.Eye eye, int[] coordinates, String worldName,
       boolean bitmapVisibility) {
@@ -722,8 +718,8 @@ public final class ProximityRevealer implements Listener {
   /**
    * 逐个候选做可见性判定 → 发包 → 标记已显形；{@code eye} 为 {@code null} 时不启用可见性判定。
    *
-   * @param visibilityInPlan 可见性是否已在 {@link #computePlan} 里按遮挡位图判完（true 时本方法只补判
-   *                         「上方是岩浆」这一条位图分不出的规则；false 时按原生射线在玩家线程判定）
+   * @param visibilityInPlan 可见性是否已在 {@link #computePlan} 里按遮挡位图判完（true 时 sendOne 不再
+   *                         重复判定；false 时按原生射线在玩家线程判定）
    */
   private void sendCandidates(Player player, World world,
       List<ObfuscatedChunkIndex.Position> candidates, Plan plan, ProximitySelector.Eye eye,
@@ -778,7 +774,7 @@ public final class ProximityRevealer implements Listener {
    * 单个坐标：区块未加载则跳过、不可见则跳过，否则读真实方块；批量模式累积、否则立即发包并标记。
    *
    * @param visibilityInPlan 可见性是否已在工作线程按遮挡位图判完（见 {@link #sendCandidates}）；
-   *                         为 true 时这里只补判「目标上方是岩浆」这一条位图分不出的规则
+   *                         为 true 时此处不再重复判定（位图已含岩浆与 barrier 的视觉口径）
    */
   private void sendOne(Player player, World world, int x, int y, int z, ProximitySelector.Eye eye,
       Budget budget, PassTally tally, RevealBatch batch, boolean visibilityInPlan) {
@@ -788,20 +784,13 @@ public final class ProximityRevealer implements Listener {
       return;
     }
 
-    if (eye != null && proximity.raycastEnabled()) {
-      if (visibilityInPlan) {
-        // 可见性已在工作线程按位图判完；这里只补位图分不出的一条——「上方是岩浆则保持伪装」。
-        if (!fluidAllowsReveal(world, x, y, z)) {
-          stats.revealsRayCulled.increment();
-          tally.rayCulled++;
-          return;
-        }
-      } else if (!isVisible(world, eye, x, y, z)) {
-        // 降级路径：位图整体不可用，仍用 Paper 原生射线在玩家线程判定（含上方流体规则，见 isVisible）。
-        stats.revealsRayCulled.increment();
-        tally.rayCulled++;
-        return;
-      }
+    // 可见性判定：位图路径已在工作线程判完（visibilityInPlan=true，此处跳过）；降级路径在位图不可用时
+    // 才在玩家线程用 Paper 原生射线判定。两条路径都经统一视觉口径（OcclusionRules），含岩浆与 barrier 例外。
+    if (eye != null && proximity.raycastEnabled() && !visibilityInPlan
+        && !isVisible(world, eye, x, y, z)) {
+      stats.revealsRayCulled.increment();
+      tally.rayCulled++;
+      return;
     }
 
     // 过度显形量化（P2-6b，只计数不改行为）：发包前按 1/N 抽样，若 RevealedSet 已含该坐标，
@@ -1158,19 +1147,22 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * <b>降级路径</b>（位图整体不可用时）的可见性判定：在玩家所属线程上先判「上方是否岩浆」
-   * （流体覆盖开启时，是则不显形），再读 6 个邻块判暴露面，然后对暴露面上的至多
-   * {@code proximity.raycast.samples} 个候选点用 Paper 原生射线（{@code World#rayTraceBlocks}）
+   * <b>降级路径</b>（位图整体不可用时）的可见性判定：在玩家所属线程上读 6 个邻块判暴露面，然后对暴露面上的
+   * 至多 {@code proximity.raycast.samples} 个候选点用 Paper 原生射线（{@code World#rayTraceBlocks}）
    * 逐一检测，任一条通畅即可见。
    *
    * <p><b>为什么保留</b>：位图由反矿透改写链路建立（见 {@code OcclusionStores}）；若该功能未启用
    * （{@code entity-culling.async-occlusion=false}）或未装配，便没有位图可用——此时必须仍能判可见性，
    * 只是代价回到「在玩家线程上做 Bukkit 读 + 原生射线」。这是<b>降级路径</b>，不是用户开关。
    *
+   * <p><b>与位图路径同源</b>：这里的遮挡查询走统一入口 {@link BukkitOcclusion#visualOccluding}
+   * （服务端逐状态真值 + barrier 判非遮挡 + 岩浆判遮挡），因此与位图显形路径、实体剔除位图完全一致——
+   * 岩浆（视觉不透明）在两条路径下都判遮挡，其后方/下方方块不显形。
+   *
    * <p><b>判定失败的方向</b>：读世界/射线出现<b>异常</b>（无法判定）时按「可见」处理，即<b>显形</b>
    * ——方向由用户指定「尽可能保证玩家可见性」：宁可多还原一块，也不让玩家对着假石头挖矿。
-   * 确定性的结论不受影响：上方是岩浆、六面全掩埋、射线命中别的方块这三条仍然判「不显形」
-   * （前两条本就看不到，第三条是「绝不隔墙还原」，都不属于「无法判定」）。
+   * 确定性的结论不受影响：六面全掩埋（含六面全岩浆）、射线命中别的方块这两条仍然判「不显形」
+   * （前者本就看不到，后者是「绝不隔墙还原」，都不属于「无法判定」）。
    */
   private boolean isVisible(World world, ProximitySelector.Eye eye, int x, int y, int z) {
     try {
@@ -1183,8 +1175,8 @@ public final class ProximityRevealer implements Listener {
         public boolean isOccluding(int blockX, int blockY, int blockZ) {
           BlockData data = world.getBlockData(blockX, blockY, blockZ);
           // 显形与隐藏回答的是同一个问题——「玩家视觉能否看穿」——只是方向相反。因此这里与实体口径同源，
-          // 走统一入口 {@link BukkitOcclusion#visualOccluding}（服务端逐状态真值 + 唯一的 barrier 例外），
-          // 与位图显形路径（{@code BitmapVisibility}，读实体口径位图）完全一致。
+          // 走统一入口 {@link BukkitOcclusion#visualOccluding}（服务端逐状态真值 + barrier 判非遮挡 +
+          // 岩浆判遮挡），与位图显形路径（{@code BitmapVisibility}，读实体口径位图）完全一致。
           //
           // <b>纠正一处旧论证</b>：旧实现以「显形必须更保守 → barrier 仍算遮挡 → 更少显形」为由走服务端
           // 原始真值；但 barrier 的 isOccluding=true 是<b>服务端材质级怪值</b>，而 barrier 对玩家
@@ -1192,47 +1184,11 @@ public final class ProximityRevealer implements Listener {
           // 「更少显形 = 更安全」只对石头/深板岩这类<b>真实</b>遮挡方块成立，不应套到 barrier 上。
           return BukkitOcclusion.visualOccluding(data);
         }
-
-        @Override
-        public boolean isLava(int blockX, int blockY, int blockZ) {
-          // 只认「本体就是岩浆」的材质：水（含流动变体、水柱）是透明的，不参与遮挡；
-          // 含水的台阶/栅栏等更不算（与注册表的岩浆覆盖掩码同义）。
-          return world.getBlockData(blockX, blockY, blockZ).getMaterial() == Material.LAVA;
-        }
       };
-      return ProximitySelector.isVisible(eye, x, y, z, query, maxPoints, fluidCover,
+      return ProximitySelector.isVisible(eye, x, y, z, query, maxPoints,
           (pointX, pointY, pointZ) -> rayClear(world, eyeLocation, x, y, z, pointX, pointY, pointZ));
     } catch (Throwable throwable) {
       // 无法判定 → 按「可见」处理（偏显形；方向由用户指定，理由见方法注释）
-      logVisibilityFailure(throwable);
-      return true;
-    }
-  }
-
-  /**
-   * 位图模式下的发布侧补判：目标方块<b>上方（y+1）</b>紧邻方块是<b>岩浆</b>时不得显形。
-   *
-   * <p><b>为什么只认岩浆</b>：水是<b>透明</b>的（含流动变体、水柱 {@code BUBBLE_COLUMN}）——玩家在矿洞里
-   * 应当能看见被水盖住的矿物，因此水不参与遮挡、一律放行显形；岩浆视觉上<b>不透明</b>，玩家看不到岩浆池里的
-   * 残骸属正常现象，本规则正是要防止「生成在岩浆里的残骸被透视端看见」。水/水柱从规则中彻底移除是本功能
-   * 的核心诉求之一。
-   *
-   * <p><b>为什么在玩家线程单独判</b>：遮挡位图只记录「是否遮挡」，位图里看不出岩浆（岩浆在 vanilla 的
-   * {@code isOccluding()} 里返回 false——它不是满方块、光会穿过，但视觉上不透明；见 {@code ProximitySelector}
-   * 的「视觉口径 = isOccluding 或 是岩浆」说明）；而这条规则需要读世界方块，只能在玩家所属线程做
-   * （见类注释「流体覆盖」）。
-   *
-   * @return true = 可以显形（上方不是岩浆，或流体覆盖开关关闭）；false = 保持伪装
-   */
-  private boolean fluidAllowsReveal(World world, int x, int y, int z) {
-    if (!fluidCover) {
-      return true;
-    }
-    try {
-      // 只认本体就是岩浆的材质：水/水柱透明、放行显形；含水的台阶/栅栏等更不算（与注册表岩浆覆盖掩码同义）。
-      return world.getBlockData(x, y + 1, z).getMaterial() != Material.LAVA;
-    } catch (Throwable throwable) {
-      // 无法判定（如越界读取）→ 不阻断显形（偏显形，与旧路径的异常方向一致）
       logVisibilityFailure(throwable);
       return true;
     }

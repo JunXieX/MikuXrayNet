@@ -33,15 +33,34 @@ import java.util.Set;
  * <p><b>关于 waterlogged</b>：PE 的 {@code isFluid()} 已把含水状态算作流体，含水与否不改变方块本体的
  * 形状语义（含水的台阶仍是台阶），因此判定里不额外使用该属性，规则保持一致。
  *
- * <p><b>唯一的「barrier 例外」</b>：{@code barrier} 在服务端 {@code isOccluding} 标记里算「遮挡」，
- * 但它对玩家<b>完全不可见</b>（本插件判据是「玩家视觉能否看穿」）。因此这里把 {@code barrier} 显式判为
- * <b>不遮挡</b>——这是全仓库唯一一处 barrier 例外的定义（见 {@link #visuallyInvisibleOccluder}）。
- * 用户覆盖表仍可压过它（{@code occlusion.extra-occluding} 里写 {@code barrier} 可改回遮挡）。
+ * <p><b>两个「反向例外」都收敛到「视觉口径」这一个概念</b>：本插件的判据自始至终是
+ * 「玩家视觉能否看穿」，而服务端 {@code isOccluding} 是「是否挡光」——两者在两个方向上各有一处偏差，
+ * 这里把它们一并归到 {@link #visualVerdict} 这唯一入口（见其说明）：
+ * <ul>
+ *   <li><b>barrier 例外</b>（服务端说遮挡、视觉不遮挡）：{@code barrier} 在服务端 {@code isOccluding}
+ *       标记里算「遮挡」，但它对玩家<b>完全不可见</b>，因此显式判为<b>不遮挡</b>——定义见
+ *       {@link #visuallyInvisibleOccluder}。</li>
+ *   <li><b>岩浆例外</b>（服务端说不遮挡、视觉遮挡）：岩浆在服务端 {@code isOccluding} 里返回
+ *       {@code false}（非满方块、光会穿过），但它视觉上<b>不透明</b>——玩家其实看不穿岩浆，因此显式补判为
+ *       <b>遮挡</b>——定义见 {@link #visuallyOpaqueFluid}。二者互为反向，正好把「是否挡光」校正回
+ *       「视觉能否看穿」。</li>
+ * </ul>
+ * 用户覆盖表仍可压过它（如 {@code occlusion.extra-occluding} 里写 {@code barrier} 可改回遮挡）。
  */
 public final class OcclusionRules {
 
   /** 视觉不可见、但服务端标记为「遮挡」的方块名：对玩家而言「看不见 = 可以看穿」（barrier 例外）。 */
   private static final Set<String> VISUALLY_INVISIBLE_OCCLUDERS = Set.of("barrier");
+
+  /**
+   * 视觉<b>不透明</b>、但服务端 {@code isOccluding} 返回 {@code false} 的流体名：对玩家而言「看不穿 = 遮挡」
+   * （岩浆例外）。
+   *
+   * <p><b>为什么只列 {@code lava}</b>：水（含流动变体与水柱）是<b>透明</b>的——玩家在矿洞里应当能看见被水
+   * 盖住的矿物，故不在此列。只有岩浆视觉上不透明。归一化后比对，故流动变体（同属 {@code lava} 名下）一并命中，
+   * 无需另列。
+   */
+  private static final Set<String> VISUALLY_OPAQUE_FLUIDS = Set.of("lava");
 
   /** 判定输入：全部为纯值，不含任何 PacketEvents 类型。 */
   public record Facts(boolean air, boolean solid, boolean exceedsCube, boolean materialOccluding,
@@ -119,27 +138,35 @@ public final class OcclusionRules {
   }
 
   /**
-   * 服务端原始逐状态判定（<b>不含</b> barrier 例外）：真值可用时取真值，否则走启发式回落。
+   * 服务端原始逐状态判定（<b>不含</b>视觉口径的两处反向例外）：真值可用时取真值，否则走启发式回落。
    *
    * <p>只有本方法内部用到「真值 or 启发式」这一层选择；上层（{@link #baseVerdict} /
-   * {@link #isOccluding} / 各 Bukkit 入口）一律再经 {@link #visualVerdict} 套用唯一那处 barrier 例外。
+   * {@link #isOccluding} / 各 Bukkit 入口）一律再经 {@link #visualVerdict} 套用两处反向例外
+   * （barrier 判非遮挡、岩浆判遮挡）。
    */
   private static boolean serverVerdict(Facts facts, String normalizedName, Boolean perStateTruth) {
     return perStateTruth != null ? perStateTruth : heuristic(facts, normalizedName);
   }
 
   /**
-   * <b>视觉口径</b>：把「服务端原始逐状态判定」套上唯一的 barrier 例外，得到「玩家视觉能否看穿」的结论。
+   * <b>视觉口径</b>：把「服务端原始逐状态判定」校正为「玩家视觉能否看穿」的结论。
    *
    * <p>这是全仓库「何为遮挡」的<b>唯一规则入口</b>：实体剔除的同步射线、异步位图、反矿透伪装边界邻块、
    * 显形可见性判定在拿不到逐状态真值时都收敛到这里（拿得到真值的走覆盖表变体
-   * {@link #camouflageVerdict}）。
+   * {@link #camouflageVerdict}）。岩浆进入共享遮挡位图后，四条路径（实体剔除位图 / 显形位图 /
+   * 显形降级射线 / 方块变更补丁）读的都是本口径，因此自动一致。
+   *
+   * <p>两处反向例外在此并存（这正是「视觉口径」比「服务端挡光口径」多的全部内容）：
+   * <ul>
+   *   <li>{@link #visuallyInvisibleOccluder}（barrier）：服务端说遮挡、视觉不遮挡 → 取反为非遮挡；</li>
+   *   <li>{@link #visuallyOpaqueFluid}（岩浆）：服务端说不遮挡、视觉不透明 → 补判为遮挡。</li>
+   * </ul>
    *
    * @param blockName      方块名（可带命名空间/大小写，内部归一化）
-   * @param serverOccluding 服务端对该状态的原始 isOccluding 判定（含 barrier 为遮挡）
+   * @param serverOccluding 服务端对该状态的原始 isOccluding 判定（barrier 为遮挡、岩浆为非遮挡）
    */
   public static boolean visualVerdict(String blockName, boolean serverOccluding) {
-    return !visuallyInvisibleOccluder(blockName) && serverOccluding;
+    return !visuallyInvisibleOccluder(blockName) && (serverOccluding || visuallyOpaqueFluid(blockName));
   }
 
   /**
@@ -175,7 +202,23 @@ public final class OcclusionRules {
     return VISUALLY_INVISIBLE_OCCLUDERS.contains(normalize(blockName));
   }
 
-  /** 启发式回落（旧口径）：只在逐状态真值不可用时使用。 */
+  /**
+   * 该方块名是否为「视觉不透明、但服务端 {@code isOccluding} 返回 {@code false}」的流体（当前只有岩浆）。
+   *
+   * <p>这是全仓库岩浆例外的<b>唯一定义处</b>；各处不得再各写一份（如显形侧、实体剔除、方块补丁）。
+   */
+  public static boolean visuallyOpaqueFluid(String blockName) {
+    return VISUALLY_OPAQUE_FLUIDS.contains(normalize(blockName));
+  }
+
+  /**
+   * 启发式回落（旧口径）：只在逐状态真值不可用时使用。
+   *
+   * <p><b>岩浆为何不在此处理</b>：启发式里岩浆的 {@code solid} 可能为 {@code false}（PE 映射把岩浆算作非固体），
+   * 在 {@code facts.air() || !facts.solid()} 处就会被判为非遮挡，若在此补判反而要重复名称判断。更稳妥的落点是
+   * 统一入口 {@link #visualVerdict}——它按<b>名称</b>补判岩浆，位于真值/启发式选择<b>之后、之上</b>，
+   * 因此无论走真值还是走本启发式，「岩浆算遮挡」都成立，离线/回落口径与在线口径一致。
+   */
   private static boolean heuristic(Facts facts, String normalizedName) {
     if (facts.air() || !facts.solid()) {
       return false;

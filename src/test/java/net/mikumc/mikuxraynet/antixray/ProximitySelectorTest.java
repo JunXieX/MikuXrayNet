@@ -292,8 +292,8 @@ class ProximitySelectorTest {
   /**
    * 给定内存遮挡表，路径是否被挡（对应改造前的 isRayOccluded）；空路径/null 查询恒判「未挡住」。
    *
-   * <p>视觉口径：{@code isOccluding 或 isLava}（与生产 {@code ProximitySelector#visuallyOccluding} 一致）
-   * ——射线同样不能穿过岩浆。lazy 默认 {@code isLava=false}，故既有 lambda 用例行为不变。
+   * <p>视觉口径：{@link ProximitySelector.RayQuery#isOccluding} 本身即「视觉遮挡」（含岩浆，由
+   * {@code OcclusionRules} 统一并入），因此这里只查 {@code isOccluding}——不再单独叠加岩浆判断。
    */
   private static boolean occluded(int[] path, ProximitySelector.RayQuery table) {
     if (path == null || path.length < 3 || table == null) {
@@ -303,7 +303,7 @@ class ProximitySelectorTest {
       int x = path[index];
       int y = path[index + 1];
       int z = path[index + 2];
-      if (table.isOccluding(x, y, z) || table.isLava(x, y, z)) {
+      if (table.isOccluding(x, y, z)) {
         return true;
       }
     }
@@ -572,118 +572,41 @@ class ProximitySelectorTest {
         "配置 samples=8 时，实际尝试的候选点数仍受有效上限 5 约束（不会超过候选点数）");
   }
 
-  // ---------------------------------------------------------------- 流体覆盖（显形侧，改造后只认岩浆）
+  // ---------------------------------------------------------------- 视觉遮挡（岩浆已并入共享遮挡表）
 
   /**
-   * 岩浆覆盖（显形侧）回归：目标方块<b>上方是岩浆</b>时不显形（保持伪装）；关闭该规则时恢复显形。
+   * 目标六面全是<b>水</b> → 可见（可显形）。
    *
-   * <p>场景与隐藏侧对称：刷在岩浆里的下界残骸本就被伪装，显形侧若把它还原，就等于把它亮给玩家。
-   * 岩浆被移除后（服务端下发变更）重查，应恢复显形。注意这里用的是 {@code isLava}（改造后的判据），
-   * 不再是旧的 {@code isFluid}。
-   */
-  @Test
-  void lavaAboveKeepsTargetDisguisedOnlyWhenFluidCoverEnabled() {
-    ProximitySelector.Eye eye = standingEye();
-    // 目标 (0,64,5) 四周空气（视线通畅），其上方 (0,65,5) 是岩浆
-    ProximitySelector.RayQuery lavaAbove = new ProximitySelector.RayQuery() {
-      @Override
-      public boolean isOccluding(int x, int y, int z) {
-        return false;
-      }
-
-      @Override
-      public boolean isLava(int x, int y, int z) {
-        return x == 0 && y == 65 && z == 5;
-      }
-    };
-
-    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 5, lavaAbove, SAMPLES, true,
-        probe(eye, lavaAbove)),
-        "上方是岩浆且流体覆盖开启 → 保持伪装，不显形");
-    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, lavaAbove, SAMPLES, false,
-        probe(eye, lavaAbove)),
-        "流体覆盖关闭 → 规则不生效，视线通畅即显形（行为回到原状）");
-
-    // 上方不是岩浆：两种设置都正常显形
-    ProximitySelector.RayQuery open = (x, y, z) -> false;
-    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, open, SAMPLES, true, probe(eye, open)),
-        "上方非岩浆 → 正常显形");
-
-    // 岩浆被移除（变更事件后的重查）→ 恢复显形
-    ProximitySelector.RayQuery lavaRemoved = new ProximitySelector.RayQuery() {
-      @Override
-      public boolean isOccluding(int x, int y, int z) {
-        return false;
-      }
-
-      @Override
-      public boolean isLava(int x, int y, int z) {
-        return false;
-      }
-    };
-    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, lavaRemoved, SAMPLES, true,
-        probe(eye, lavaRemoved)),
-        "岩浆被移除 → 恢复显形（由方块变更事件触发正常显形流程）");
-
-    // 兼容：不传 fluidCover 的重载默认 fluidCover=false（既有调用方行为不变）
-    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, lavaAbove, SAMPLES, probe(eye, lavaAbove)),
-        "不带 fluidCover 的重载默认 false，行为不变");
-  }
-
-  /**
-   * <b>行为变更（本改造核心）</b>：目标六面全是<b>水</b> → 可见（可显形）。
-   *
-   * <p>水是透明的——玩家在矿洞里应当能看见被水盖住的矿物，因此水不参与遮挡。用一个 {@code isFluid=true}
-   * 但 {@code isOccluding=false}、{@code isLava=false} 的查询模拟「邻块全是水」，无论流体覆盖开关如何，
-   * 判定都必须显形（旧的 {@code isFluid} 早退规则已彻底移除）。
+   * <p>水是透明的——玩家在矿洞里应当能看见被水盖住的矿物，因此水不参与遮挡。用一个
+   * {@code isOccluding=false} 的查询模拟「邻块全是水」（视觉口径里水不算遮挡），判定必须显形。
    */
   @Test
   void sixWaterFacesAreVisible() {
     ProximitySelector.Eye eye = standingEye();
-    ProximitySelector.RayQuery water = new ProximitySelector.RayQuery() {
-      @Override
-      public boolean isOccluding(int x, int y, int z) {
-        return false;
-      }
-
-      @Override
-      public boolean isFluid(int x, int y, int z) {
-        return true;
-      }
-    };
+    // 邻块全是水：视觉口径下不遮挡（透明）
+    ProximitySelector.RayQuery water = (x, y, z) -> false;
 
     assertEquals(ProximitySelector.ALL_FACES,
         ProximitySelector.exposedFaces(0, 64, 5, water), "水不是视觉遮挡 → 六面全暴露");
-    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, water, SAMPLES, true, probe(eye, water)),
-        "六面全是水（透明）→ 有暴露面 → 正常显形（即便流体覆盖开启）");
-    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, water, SAMPLES, false, probe(eye, water)),
-        "六面全是水 → 关闭流体覆盖同样显形");
+    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, water, SAMPLES, probe(eye, water)),
+        "六面全是水（透明）→ 有暴露面 → 正常显形");
   }
 
   /**
    * <b>逐面（方案 A）</b>：目标六面全是<b>岩浆</b> → 完全不可见（保持伪装、不显形）。
    *
-   * <p>视觉遮挡 = {@code isOccluding 或 isLava}，六面紧邻岩浆时一个暴露面都取不到，从任何方向都看不到。
+   * <p>岩浆视觉不透明，已由 {@code OcclusionRules} 并入遮挡，因此 {@link ProximitySelector.RayQuery}
+   * 对岩浆返回 {@code isOccluding=true}；六面紧邻岩浆时一个暴露面都取不到，从任何方向都看不到。
    */
   @Test
   void sixLavaFacesMakeTargetInvisible() {
     ProximitySelector.Eye eye = standingEye();
-    ProximitySelector.RayQuery allLava = new ProximitySelector.RayQuery() {
-      @Override
-      public boolean isOccluding(int x, int y, int z) {
-        return false;
-      }
-
-      @Override
-      public boolean isLava(int x, int y, int z) {
-        return true;
-      }
-    };
+    // 邻块全是岩浆：视觉口径下视为遮挡（isOccluding=true）
+    ProximitySelector.RayQuery allLava = (x, y, z) -> true;
 
     assertEquals(0, ProximitySelector.exposedFaces(0, 64, 5, allLava),
-        "六面紧邻岩浆 = 无暴露面（视觉遮挡 = isOccluding 或 isLava）");
-    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 5, allLava, SAMPLES, true,
-        probe(eye, allLava)),
+        "六面紧邻岩浆 = 无暴露面（岩浆是视觉遮挡）");
+    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 5, allLava, SAMPLES, probe(eye, allLava)),
         "六面全是岩浆 → 完全不可见（保持伪装，不显形）");
   }
 
@@ -691,30 +614,20 @@ class ProximitySelectorTest {
    * <b>逐面（方案 A）语义</b>：只有<b>部分面</b>紧邻岩浆时仍可见——只有被岩浆覆盖的那些面不可见，
    * 其余面照常暴露（比「六面全是岩浆才判」更精确）。
    *
-   * <p>这里仅 -X 面是岩浆、其余五面空气（+Y 也是空气，故不受「上方岩浆」规则影响）：暴露面应为
-   * 「除 -X 外的五面」，视线通畅即可见——即便 {@code fluidCover=true}。
+   * <p>这里仅 -X 面是岩浆、其余五面空气：暴露面应为「除 -X 外的五面」，视线通畅即可见。
    */
   @Test
   void partialLavaFacesStillReveal() {
     ProximitySelector.Eye eye = standingEye();
-    ProximitySelector.RayQuery lavaNegXOnly = new ProximitySelector.RayQuery() {
-      @Override
-      public boolean isOccluding(int x, int y, int z) {
-        return false;
-      }
-
-      @Override
-      public boolean isLava(int x, int y, int z) {
-        return x == -1 && y == 64 && z == 5;
-      }
-    };
+    // 只有 (x=-1,y=64,z=5) 是岩浆：视觉口径下该面遮挡
+    ProximitySelector.RayQuery lavaNegXOnly = (x, y, z) -> x == -1 && y == 64 && z == 5;
 
     int expected = ProximitySelector.ALL_FACES & ~ProximitySelector.FACE_NEG_X;
     assertEquals(expected, ProximitySelector.exposedFaces(0, 64, 5, lavaNegXOnly),
         "只有 -X 面紧邻岩浆 → 只有该面不可见，其余五面仍暴露");
-    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, lavaNegXOnly, SAMPLES, true,
+    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, lavaNegXOnly, SAMPLES,
         probe(eye, lavaNegXOnly)),
-        "只有部分面是岩浆 → 仍有暴露面 → 可见（逐面语义，即便流体覆盖开启）");
+        "只有部分面是岩浆 → 仍有暴露面 → 可见（逐面语义）");
   }
 
   // ---------------------------------------------------------------- 视锥「先粗后细」等价性（③）

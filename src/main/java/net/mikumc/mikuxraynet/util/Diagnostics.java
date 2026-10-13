@@ -781,8 +781,7 @@ public final class Diagnostics {
     sb.append("layer-obfuscation=").append(c.layerObfuscation())
         .append("，remove-block-entities=").append(c.removeBlockEntities()).append('\n');
     sb.append("occlusion.extra-occluding=").append(c.occlusion().extraOccluding())
-        .append("，extra-non-occluding=").append(c.occlusion().extraNonOccluding())
-        .append("，fluid-cover=").append(c.occlusion().fluidCover()).append('\n');
+        .append("，extra-non-occluding=").append(c.occlusion().extraNonOccluding()).append('\n');
     sb.append("neighbors.enabled=").append(c.neighbors().enabled())
         .append("，missing-policy=").append(c.neighbors().missingPolicy())
         .append("，cache-maximum-size=").append(c.neighbors().cacheMaximumSize()).append('\n');

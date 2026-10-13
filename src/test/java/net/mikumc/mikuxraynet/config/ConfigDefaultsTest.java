@@ -347,14 +347,12 @@ class ConfigDefaultsTest {
         "主世界默认带 2 段按 Y 分区伪装表（深层深板岩系 / 浅层石头系）");
   }
 
-  /** 新增配置键的默认值：use-block-below 关（行为不变）、事件显形开且限额保守、抽样 1/20、流体覆盖开。 */
+  /** 新增配置键的默认值：use-block-below 关（行为不变）、事件显形开且限额保守、抽样 1/20。 */
   @Test
   void newFeatureDefaultsAreConservative() {
     AntiXrayConfig config = AntiXrayConfig.from(yaml("enabled: true\n"));
     assertFalse(config.dimensionEffective(AntiXrayConfig.Dimension.NORMAL).useBlockBelow(),
         "use-block-below 默认关闭（行为不变）");
-    assertTrue(config.occlusion().fluidCover(),
-        "流体覆盖默认开启（刷在岩浆里的下界残骸若不按遮挡处理会裸露在矿洞里被透视看到）");
     assertTrue(config.proximity().instantReveal().enabled(), "事件驱动即时显形默认开启");
     assertEquals(4, config.proximity().instantReveal().radius(), "事件显形曼哈顿半径默认 4（= 半个区块）");
     assertEquals(16, config.proximity().instantReveal().maxPerTick(), "事件显形每玩家每 tick 限额默认 16");
@@ -363,7 +361,7 @@ class ConfigDefaultsTest {
         && config.proximity().instantReveal().maxPerTick() <= 0, "开启时限额必须为正");
   }
 
-  /** use-block-below / 事件显形 / 流体覆盖等配置可显式解析，非法/极端值被钳制。 */
+  /** use-block-below / 事件显形等配置可显式解析，非法/极端值被钳制。 */
   @Test
   void newFeatureKeysParseAndClamp() {
     AntiXrayConfig on = AntiXrayConfig.from(yaml(
@@ -390,9 +388,6 @@ class ConfigDefaultsTest {
         + "  over-reveal-sampling: -3\n"));
     assertEquals(1, negative.proximity().instantReveal().radius(), "radius 负值钳制到 1");
     assertEquals(0, negative.proximity().overRevealSampling(), "抽样负值归 0（关闭）");
-
-    AntiXrayConfig fluidOff = AntiXrayConfig.from(yaml("occlusion:\n  fluid-cover: false\n"));
-    assertFalse(fluidOff.occlusion().fluidCover(), "流体覆盖可显式关闭（两处规则都不生效）");
   }
 
   /** 配置指纹：影响改写结果的 use-block-below 切换必须使指纹变化（缓存不得复用）。 */
@@ -582,10 +577,9 @@ class ConfigDefaultsTest {
     assertFalse(config.layerObfuscation(), "层状伪装默认关闭（逐方块独立随机，更不易被模式识别）");
     assertTrue(config.removeBlockEntities(), "方块实体剔除默认开启（防幽灵刷怪笼/箱子）");
 
-    // occlusion 三键：覆盖表默认为空（内置规则兜底，由用户按需填写），流体覆盖默认开
+    // occlusion 两键：覆盖表默认为空（内置规则兜底，由用户按需填写）
     assertTrue(config.occlusion().extraOccluding().isEmpty(), "extra-occluding 默认为空");
     assertTrue(config.occlusion().extraNonOccluding().isEmpty(), "extra-non-occluding 默认为空");
-    assertTrue(config.occlusion().fluidCover(), "fluid-cover 默认开启");
 
     // neighbors 三键
     assertTrue(config.neighbors().enabled(), "邻块贴边快照默认开启");
@@ -768,7 +762,7 @@ class ConfigDefaultsTest {
     assertEquals(5, config.latency().checkIntervalSeconds(), "延迟采样周期默认 5 秒");
 
     // diagnostics
-    assertEquals(60, config.diagnostics().intervalSeconds(), "周期运行摘要默认 60 秒（0 = 关闭）");
+    assertEquals(0, config.diagnostics().intervalSeconds(), "周期运行摘要默认关闭（0 = 不输出）");
   }
 
   /**

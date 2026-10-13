@@ -218,10 +218,10 @@ class WorldOverrideConfigTest {
         "其它维度的 mode 变化也必须改变指纹（维度选择与各维度生效值都纳入指纹）");
     assertNotEquals(plain.configHash(), withEndEnabled.configHash(),
         "维度启用开关必须参与指纹（否则开关末地后旧缓存会被复用）");
-    // 流体覆盖影响改写结果与显形行为，必须参与指纹
+    // 遮挡覆盖表影响改写结果，必须参与指纹
     assertNotEquals(plain.configHash(),
-        config(base + "occlusion:\n  fluid-cover: false\n").configHash(),
-        "occlusion.fluid-cover 必须参与指纹");
+        config(base + "occlusion:\n  extra-non-occluding:\n    - stone\n").configHash(),
+        "occlusion.extra-non-occluding 必须参与指纹");
     // 同一份配置重复解析：指纹必须稳定
     assertEquals(withOverride.configHash(), config(base + """
         world-overrides:

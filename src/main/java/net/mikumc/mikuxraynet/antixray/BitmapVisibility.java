@@ -21,20 +21,17 @@ import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
  * 真实方块，等于把矿直接亮给透视端（本功能最严重的失效模式）。缺数据时「不显形」只是延迟到区块建表之后：
  * 该坐标仍留在伪装清单里，后续周期会重试。
  *
- * <p><b>口径</b>：位图由 {@code entityOcclusionTable}（服务端逐状态真值 {@code BlockData#isOccluding()}
- * + 唯一的 barrier 例外）构建。步进射线只统计「遮挡方块」，因此玻璃、蜡烛等
- * 非遮挡方块不再阻断射线（旧实现是「命中任何别的方块即不通畅」）——这一语义变化与用户既定的
- * 「尽可能保证玩家可见性」方向一致。
+ * <p><b>口径</b>：位图由 {@code entityOcclusionTable}（{@code OcclusionRules} 的视觉口径：服务端逐状态真值
+ * {@code BlockData#isOccluding()} + barrier 判非遮挡 + 岩浆判遮挡）构建。步进射线只统计「遮挡方块」，
+ * 因此玻璃、蜡烛等非遮挡方块不再阻断射线（旧实现是「命中任何别的方块即不通畅」）——这一语义变化与用户
+ * 既定的「尽可能保证玩家可见性」方向一致。
  *
- * <p><b>与降级路径（{@code ProximityRevealer} 的原生射线）在 barrier 上已统一</b>：本类读的是视觉口径位图
- * （barrier 例外生效 → barrier 不阻断射线）；降级路径的可见性查询也已改走 {@code visualOccluding}（同一
- * barrier 例外）。两条路径对 barrier 的结论因此一致：barrier 后方的方块可见即显形——barrier 对玩家
- * <b>完全不可见</b>，「矿石只被 barrier 挡住」时玩家本就能看穿，显形是正确体验而非泄露。
+ * <p><b>与降级路径（{@code ProximityRevealer} 的原生射线）在 barrier 与岩浆上均已统一</b>：本类读的是视觉
+ * 口径位图（barrier 不阻断射线、岩浆阻断射线）；降级路径的可见性查询也已改走同一入口
+ * {@code BukkitOcclusion.visualOccluding}（同一 barrier 例外与岩浆例外）。两条路径因此完全一致。
  *
- * <p><b>分工</b>：位图分不出的「目标紧邻岩浆」规则（需读世界方块，且岩浆在 vanilla {@code isOccluding()}
- * 里返回 false、位图里看不出）不在本类判，由发布侧（{@code ProximityRevealer} 的玩家线程）补判。
- * 注意本类读的遮挡位图是<b>共享口径</b>（实体剔除同源），刻意不把岩浆并入——岩浆只在显形侧
- * （{@code ProximitySelector}）叠加为视觉遮挡。
+ * <p><b>岩浆已并入共享位图</b>：岩浆现由唯一规则入口 {@code OcclusionRules.visualVerdict} 判为遮挡，因此
+ * 本类的位图天然包含岩浆——暴露面识别与步进射线都能正确对待岩浆，无需在发布侧再补判。
  *
  * <p><b>线程与分配</b>：{@link OcclusionRay} 的游标是实例字段，实例不可跨线程共享；因此本类以
  * {@link ThreadLocal} 每线程一份复用（工作线程与玩家线程各持一份）。一次判定只用可变字段承载上下文，
@@ -84,8 +81,6 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
   /**
    * 判定坐标 {@code (x, y, z)} 对 {@code eye} 是否可见（多候选点、任一通畅即可见）。
    *
-   * <p>不使用「上方岩浆」规则（{@code fluidCover=false}）——它需要读世界方块，只能在玩家线程补判。
-   *
    * @param stores    遮挡位图注册表；{@code null} 时全部按遮挡处理（严格）
    * @param worldName 该坐标所属世界名（位图按世界分域，见 {@link OcclusionStores}）
    * @param maxPoints 每方块最多尝试的候选点数（有效上限见 {@link ProximitySelector#MAX_SAMPLE_POINTS}）
@@ -102,7 +97,7 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
     this.eyeX = eye.x();
     this.eyeY = eye.y();
     this.eyeZ = eye.z();
-    return ProximitySelector.isVisible(eye, x, y, z, this, maxPoints, false, this);
+    return ProximitySelector.isVisible(eye, x, y, z, this, maxPoints, this);
   }
 
   /** 本次判定是否触碰过「无数据」的 section（仅在 {@link #isVisible} 之后读取才有效，见字段说明）。 */

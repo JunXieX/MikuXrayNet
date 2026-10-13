@@ -118,9 +118,7 @@ public final class AntiXrayRuntime {
       return;
     }
 
-    // 传入数据目录：让启动期自检把「逐状态真值解析成功 / 回落启发式 / 覆盖表命中 / 构建耗时 / 两套口径一致性」
-    // 导出到与 Diagnostics.writeDump() 同一处（occlusion-diff.txt）
-    PacketEventsHook packetEventsHook = new PacketEventsHook(logger, plugin.getDataFolder());
+    PacketEventsHook packetEventsHook = new PacketEventsHook(logger);
     if (!packetEventsHook.initialize(antiXray.occlusion().extraOccluding(),
         antiXray.occlusion().extraNonOccluding())) {
       return;

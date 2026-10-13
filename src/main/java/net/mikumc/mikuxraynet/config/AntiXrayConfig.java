@@ -241,21 +241,20 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 遮挡判定的用户覆盖表（用户自行纠正判定的出口）与流体覆盖开关。
+   * 遮挡判定的用户覆盖表（用户自行纠正判定的出口）。
    *
    * <p>{@code extraNonOccluding} 优先级最高（显式声明不遮挡），{@code extraOccluding} 次之
    * （可覆盖逐状态真值 {@code BlockData#isOccluding()} 与全部启发式回落规则）。名称用方块注册名
    * （无需 {@code minecraft:} 前缀）。
    *
-   * <p>{@code fluidCover}（默认开）：目标方块紧邻<b>岩浆</b>（含上方 y+1）时按视觉遮挡处理（隐藏侧），
-   * 且显形侧不显形——让刷在岩浆里的下界残骸保持伪装，透视端看不到。<b>水不参与</b>：水是透明的，玩家应当
-   * 能看见被水盖住的矿物，因此水/水柱不触发任何规则。它只作用于目标方块的判定，**不改动全局遮挡表**
-   * （避免影响非目标方块），也<b>不会</b>把岩浆写进实体剔除共用的遮挡位图。
+   * <p>「岩浆算遮挡」不再是一个可关的开关，而是<b>唯一规则入口</b> {@code OcclusionRules} 的视觉口径
+   * 的一部分（岩浆视觉不透明）：它已并入共享遮挡位图，因此实体剔除、显形（位图/降级射线）、方块补丁四条
+   * 路径自动一致。水是透明的，不参与遮挡。
    *
-   * <p>本表影响启动期构建的遮挡位图与流体规则，因此<b>只在启动时生效</b>（修改后需重启服务端），
+   * <p>本表影响启动期构建的遮挡位图，因此<b>只在启动时生效</b>（修改后需重启服务端），
    * 且参与配置指纹——重启后磁盘缓存也会随之失效。
    */
-  public record Occlusion(Set<String> extraOccluding, Set<String> extraNonOccluding, boolean fluidCover) {
+  public record Occlusion(Set<String> extraOccluding, Set<String> extraNonOccluding) {
   }
 
   /**
@@ -742,7 +741,7 @@ public final class AntiXrayConfig {
       }
     }
     this.overrideEffectives = merged;
-    // 影响改写结果的全部配置项都参与哈希（含遮挡/流体覆盖表与各维度生效值）；顺序敏感，故用有序列表。
+    // 影响改写结果的全部配置项都参与哈希（含遮挡覆盖表与各维度生效值）；顺序敏感，故用有序列表。
     // 伪装模式必须参与：否则「enclosed 写出的缓存」会在切换到 all 后被复用，导致裸露矿泄漏。
     // use-block-below / 高度范围 / 分区表 / 维度启用 都影响改写结果，一并纳入指纹。
     // ⚠ 所有分量都必须是「哈希有规范定义」的稳定表示（字符串/数字/列表/映射/枚举名），
@@ -764,7 +763,7 @@ public final class AntiXrayConfig {
     this.configHash = Objects.hash(dimensionFingerprints, overrideFingerprints, layerObfuscation,
         neighbors.enabled(), neighbors.missingPolicy().name(),
         OcclusionRules.sortedList(this.occlusion.extraOccluding()),
-        OcclusionRules.sortedList(this.occlusion.extraNonOccluding()), this.occlusion.fluidCover(),
+        OcclusionRules.sortedList(this.occlusion.extraNonOccluding()),
         // 黑名单决定「哪些世界完全不改写」，参与指纹：切换黑名单后旧缓存（该世界已改写结果）不再复用。
         this.worldBlacklist,
         // remove-block-entities 直接改变「写进缓存的区块负载字节」（是否从区块封包剔除方块实体数据），
@@ -888,10 +887,7 @@ public final class AntiXrayConfig {
                 ceilingAdjustments)),
         new Occlusion(
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-occluding")),
-            OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding")),
-            // 流体覆盖默认开启：只认岩浆——刷在岩浆里的下界残骸若不按遮挡处理，会裸露在矿洞里被透视看到；
-            // 水透明、不参与，玩家应当能看见水下的矿物。
-            root.getBoolean("occlusion.fluid-cover", true)),
+            OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding"))),
         new Proximity(
             root.getBoolean("proximity.enabled", true),
             // 默认 96（原 64）：真机反馈「64 格仍然偏近」。显形只在射线通畅时才还原，
@@ -1551,7 +1547,7 @@ public final class AntiXrayConfig {
     return neighbors;
   }
 
-  /** 遮挡判定覆盖表 + 流体覆盖开关（启动期构建位图时消费，修改需重启）。 */
+  /** 遮挡判定覆盖表（启动期构建位图时消费，修改需重启）。 */
   public Occlusion occlusion() {
     return occlusion;
   }

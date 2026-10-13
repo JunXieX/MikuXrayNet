@@ -213,6 +213,6 @@ class OcclusionCaptureTest {
     return new ObfuscationProcessor(new ChunkCodec(REGISTRY, ChunkVersionFlags.PAPER_26_2),
         OCCLUDING, false, true, new ObfuscationProcessor.PaletteOptions(false, false), null,
         profile, new ObfuscationProcessor.WorldProfile[] {profile, profile, profile},
-        new ObfuscationProcessor.WorldProfile[0][3], null, false, null, occlusionStores, null);
+        new ObfuscationProcessor.WorldProfile[0][3], null, occlusionStores, null);
   }
 }
