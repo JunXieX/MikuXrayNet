@@ -247,9 +247,10 @@ public final class AntiXrayConfig {
    * （可覆盖逐状态真值 {@code BlockData#isOccluding()} 与全部启发式回落规则）。名称用方块注册名
    * （无需 {@code minecraft:} 前缀）。
    *
-   * <p>{@code fluidCover}（默认开）：目标方块「上方紧邻方块是流体」时按遮挡处理（隐藏侧），
-   * 且显形侧不显形——让刷在岩浆里的下界残骸保持伪装，透视端看不到。它只作用于目标方块的判定，
-   * **不改动全局遮挡表**（避免影响非目标方块）。
+   * <p>{@code fluidCover}（默认开）：目标方块紧邻<b>岩浆</b>（含上方 y+1）时按视觉遮挡处理（隐藏侧），
+   * 且显形侧不显形——让刷在岩浆里的下界残骸保持伪装，透视端看不到。<b>水不参与</b>：水是透明的，玩家应当
+   * 能看见被水盖住的矿物，因此水/水柱不触发任何规则。它只作用于目标方块的判定，**不改动全局遮挡表**
+   * （避免影响非目标方块），也<b>不会</b>把岩浆写进实体剔除共用的遮挡位图。
    *
    * <p>本表影响启动期构建的遮挡位图与流体规则，因此<b>只在启动时生效</b>（修改后需重启服务端），
    * 且参与配置指纹——重启后磁盘缓存也会随之失效。
@@ -888,7 +889,8 @@ public final class AntiXrayConfig {
         new Occlusion(
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-occluding")),
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding")),
-            // 流体覆盖默认开启：刷在岩浆里的下界残骸若不按遮挡处理，会裸露在矿洞里被透视看到。
+            // 流体覆盖默认开启：只认岩浆——刷在岩浆里的下界残骸若不按遮挡处理，会裸露在矿洞里被透视看到；
+            // 水透明、不参与，玩家应当能看见水下的矿物。
             root.getBoolean("occlusion.fluid-cover", true)),
         new Proximity(
             root.getBoolean("proximity.enabled", true),

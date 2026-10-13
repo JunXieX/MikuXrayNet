@@ -368,12 +368,18 @@ public final class ObfuscationProcessor {
    */
   private final IntPredicate belowUsable;
   /**
-   * 流体覆盖开关（{@code occlusion.fluid-cover}，默认开）：enclosed 模式下目标方块<b>上方是流体</b>
-   * 时按遮挡处理（刷在岩浆里的残骸由此被伪装）。只作用于目标方块的判定，不改动全局遮挡表。
+   * 流体覆盖开关（{@code occlusion.fluid-cover}，默认开）：enclosed 模式下目标方块<b>上方是岩浆</b>
+   * 时按视觉遮挡处理（刷在岩浆里的残骸由此被伪装）。只作用于目标方块的判定，不改动全局遮挡表。
+   *
+   * <p><b>改造说明</b>：新口径下只认<b>岩浆</b>——水是透明的（玩家应当能看见水下的矿物），
+   * 水/水柱不再触发本规则。
    */
   private final boolean fluidCover;
-  /** 流体覆盖掩码（水/岩浆/水柱；不含含水方块）；{@code null} = 不可用（流体规则整体不生效）。 */
-  private final IntPredicate fluidTable;
+  /**
+   * 岩浆覆盖掩码（只含岩浆，含流动变体；不含水/水柱/含水方块）；
+   * {@code null} = 不可用（本规则整体不生效）。
+   */
+  private final IntPredicate lavaTable;
   /**
    * 遮挡数据仓库（异步实体遮挡判定用，按世界分域）；{@code null} = 该功能关闭，改写路径不做任何建表（零开销）。
    *
@@ -517,7 +523,7 @@ public final class ObfuscationProcessor {
    * @param dimensionProfiles 各维度档案（下标 = {@code Dimension#ordinal()}）
    * @param overrideProfiles  各覆盖段档案：{@code [覆盖段下标][维度下标]}
    * @param fluidCover        流体覆盖开关（{@code occlusion.fluid-cover}）
-   * @param fluidTable        流体覆盖掩码；null 表示不可用（流体规则不生效）
+   * @param lavaTable         岩浆覆盖掩码；null 表示不可用（本规则不生效）
    * @param entityOcclusionTable 实体遮挡口径表（仅建位图用）；null 表示与 {@code occlusionTable} 相同
    */
   @SuppressWarnings("unchecked")
@@ -525,7 +531,7 @@ public final class ObfuscationProcessor {
       boolean missingPolicyHide, PaletteOptions paletteOptions, IntPredicate belowUsable,
       WorldProfile defaultProfile, WorldProfile[] dimensionProfiles,
       WorldProfile[][] overrideProfiles, AntiXrayConfig config, boolean fluidCover,
-      IntPredicate fluidTable, OcclusionStores occlusionStores, IntPredicate entityOcclusionTable) {
+      IntPredicate lavaTable, OcclusionStores occlusionStores, IntPredicate entityOcclusionTable) {
     this.codec = codec;
     this.occlusionTable = occlusionTable;
     this.entityOcclusionTable = entityOcclusionTable == null ? occlusionTable : entityOcclusionTable;
@@ -534,7 +540,7 @@ public final class ObfuscationProcessor {
     this.paletteOptions = paletteOptions;
     this.belowUsable = belowUsable;
     this.fluidCover = fluidCover;
-    this.fluidTable = fluidTable;
+    this.lavaTable = lavaTable;
     this.occlusionStores = occlusionStores;
     this.defaultProfile = defaultProfile;
     this.dimensionProfiles = dimensionProfiles;
@@ -599,7 +605,7 @@ public final class ObfuscationProcessor {
     return new ObfuscationProcessor(codec, registry::isOccluding, config.layerObfuscation(),
         missingPolicyHide, paletteOptions, belowUsable,
         dimensionProfiles[AntiXrayConfig.Dimension.NORMAL.ordinal()], dimensionProfiles,
-        overrideProfiles, config, config.occlusion().fluidCover(), registry::isFluidCover,
+        overrideProfiles, config, config.occlusion().fluidCover(), registry::isLavaCover,
         occlusionStores, registry::isEntityOccluding);
   }
 
@@ -1253,11 +1259,16 @@ public final class ObfuscationProcessor {
   /**
    * 6 面正交遮挡判定（enclosed 模式）。
    *
-   * <p><b>流体覆盖规则</b>：目标方块的<b>上方（y+1）</b>紧邻方块是流体（水/岩浆）时，该方向按「遮挡」
+   * <p><b>岩浆覆盖规则（只认岩浆）</b>：目标方块的<b>上方（y+1）</b>紧邻方块是<b>岩浆</b>时，该方向按「视觉遮挡」
    * 处理——下界残骸常刷在岩浆里，若把上方岩浆当作「暴露面」，残骸就不会被伪装，透视端会看到它。
-   * 只加在「上方」这一面（用户要求只判上方）：流体几乎总是从上方覆盖目标（残骸/矿脉被岩浆淹没），
-   * 而侧面的流体要么极罕见、要么本身就在裸露矿洞里——若把侧面也当作遮挡反而会隐藏「本应显形」的矿。
+   * <b>水不参与</b>：水是透明的，玩家应当能看见被水盖住的矿物，因此水/水柱不再触发本规则。
+   * 只加在「上方」这一面（用户要求只判上方）：岩浆几乎总是从上方覆盖目标（残骸/矿脉被岩浆淹没），
+   * 而侧面的岩浆要么极罕见、要么本身就在裸露矿洞里——若把侧面也当作遮挡反而会隐藏「本应显形」的矿。
    * 该规则只在目标方块的判定里生效，**不改动全局遮挡表**（避免影响非目标方块）。
+   *
+   * <p><b>为什么不能靠 {@code isOccluding} 表达</b>：vanilla 的 {@code isOccluding()} 对岩浆返回 {@code false}
+   * （岩浆不是满方块，光会穿过），但视觉上不透明。这里因此显式叠加一条「是岩浆」的判断
+   * （{@link #isLavaCoverAt}），与显形侧 {@code ProximitySelector} 的「视觉口径 = isOccluding 或 isLava」同义。
    *
    * @param baseY 该 section 的起始 Y（区块内相对坐标）
    * @param index 该 section 内的元素序号（{@code y << 8 | z << 4 | x}）
@@ -1268,7 +1279,7 @@ public final class ObfuscationProcessor {
     int y = baseY | (index >> 8 & 15);
 
     boolean above = isOccluding(chunk, y + 1, x, z, neighbors)
-        || isFluidCoverAt(chunk, y + 1, x, z);
+        || isLavaCoverAt(chunk, y + 1, x, z);
     return above
         && isOccluding(chunk, y - 1, x, z, neighbors)
         && isOccluding(chunk, y, x + 1, z, neighbors)
@@ -1278,17 +1289,17 @@ public final class ObfuscationProcessor {
   }
 
   /**
-   * 「上方紧邻方块是否是流体」（流体覆盖规则用）。
+   * 「上方紧邻方块是否是岩浆」（岩浆覆盖规则用；只认岩浆，水/水柱不算）。
    *
    * <p><b>跨 section</b>：{@code y} 可能落在相邻 section（当前方块处于 section 顶部 localY=15 时），
    * 也可能越出区块上边界（最顶 section 的顶部方块）——前者在 {@link Chunk} 内纯数据读取
-   * （section 顺序与索引计算与 {@link #isOccluding} 完全一致），后者按「越界非流体」处理
-   * （世界上下界之外不可能是流体，与 {@link #isOccluding} 的越界语义一致）。
+   * （section 顺序与索引计算与 {@link #isOccluding} 完全一致），后者按「越界非岩浆」处理
+   * （世界上下界之外不可能是岩浆，与 {@link #isOccluding} 的越界语义一致）。
    *
    * <p>x/z 恒在 {@code [0,15]}（只判 y+1 不改横向坐标），因此无需查邻块快照。
    */
-  private boolean isFluidCoverAt(Chunk chunk, int y, int x, int z) {
-    if (!fluidCover || fluidTable == null || y < 0) {
+  private boolean isLavaCoverAt(Chunk chunk, int y, int x, int z) {
+    if (!fluidCover || lavaTable == null || y < 0) {
       return false;
     }
     int sectionIndex = y >> 4;
@@ -1299,7 +1310,7 @@ public final class ObfuscationProcessor {
     if (section == null) {
       return false;
     }
-    return fluidTable.test(section.getBlockState((y & 15) << 8 | z << 4 | x));
+    return lavaTable.test(section.getBlockState((y & 15) << 8 | z << 4 | x));
   }
 
   /** 区块内相对坐标处的方块是否遮挡；越出世界上下界视为未遮挡，越出本区块改查邻块贴边快照。 */

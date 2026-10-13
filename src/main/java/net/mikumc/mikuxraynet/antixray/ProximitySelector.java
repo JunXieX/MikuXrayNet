@@ -35,7 +35,9 @@ import java.util.List;
  * 旧实现只打「包围盒最近点」一条射线：矿嵌在角落时该点往往正好压在相邻方块那一侧，射线被旁边方块挡住，
  * 于是「明明露着面，却要贴到跟前才显形」。现在：
  * <ol>
- *   <li>先用遮挡表（{@link #exposedFaces}）判出该方块<b>哪些面朝向非遮挡方块</b>；</li>
+ *   <li>先用遮挡表（{@link #exposedFaces}）判出该方块<b>哪些面朝向非遮挡方块</b>。此处的「遮挡」是<b>视觉口径</b>
+ *       ——{@code isOccluding 或 是岩浆}（见 {@link #visuallyOccluding}）：岩浆在 vanilla {@code isOccluding()}
+ *       里返回 false，但视觉上不透明，故单独叠加；水是透明的，不参与。</li>
  *   <li>只在<b>暴露面</b>上取至多 {@link #MAX_SAMPLE_POINTS} 个候选点：
  *       ① 正对玩家（按视线方向选面）的那个暴露面的中心 → ② 包围盒最近点（仅当它确实落在暴露面上）
  *       → ③ 该暴露面四角中离眼睛最近的至多 3 个；</li>
@@ -53,7 +55,7 @@ public final class ProximitySelector {
   public record Eye(double x, double y, double z, double dirX, double dirY, double dirZ) {
   }
 
-  /** 世界坐标遮挡/流体查询（显形流程用主线程读世界方块，单测可注入纯内存实现）。 */
+  /** 世界坐标遮挡/岩浆查询（显形流程用主线程读世界方块，单测可注入纯内存实现）。 */
   @FunctionalInterface
   public interface RayQuery {
 
@@ -61,12 +63,26 @@ public final class ProximitySelector {
     boolean isOccluding(int x, int y, int z);
 
     /**
-     * 该坐标是否为流体（水/岩浆；含水的台阶/栅栏等不算）。
+     * 该坐标是否为流体（水/岩浆；含水的台阶/栅栏等不算）。<b>保留的历史接口</b>：流体规则改造后不再使用
+     * （见 {@link #isLava}），仅为向后兼容既有实现与单测而保留默认实现。
      *
-     * <p>默认实现返回 {@code false}（= 不启用流体规则），因此既有单测的 lambda 无需改动；
-     * 生产路径由 {@code ProximityRevealer} 注入真实的方块材质判定。
+     * <p>默认实现返回 {@code false}（= 不启用旧流体规则），因此既有单测的 lambda 无需改动。
      */
     default boolean isFluid(int x, int y, int z) {
+      return false;
+    }
+
+    /**
+     * 该坐标是否为<b>岩浆</b>（含流动变体；水/水柱/含水的台阶栅栏等都不算）。
+     *
+     * <p><b>为什么单独有这个查询</b>：岩浆在 vanilla 的 {@code isOccluding()} 里返回 {@code false}——它不是
+     * 满方块、光会穿过，但视觉上<b>不透明</b>。因此「视觉遮挡」不能靠 {@link #isOccluding} 表达，必须叠一层
+     * 岩浆判断（见 {@code ProximitySelector#visuallyOccluding}）。而水是透明的，不参与遮挡。
+     *
+     * <p>默认实现返回 {@code false}（= 不启用岩浆规则），因此既有单测的 lambda 与匿名实现无需改动；
+     * 生产路径由 {@code ProximityRevealer} 注入真实的方块材质判定。
+     */
+    default boolean isLava(int x, int y, int z) {
       return false;
     }
   }
@@ -276,35 +292,60 @@ public final class ProximitySelector {
   }
 
   /**
-   * 识别方块的<b>暴露面</b>：某个面朝向的方向上「不是遮挡方块」（空气/玻璃/植物等都算暴露）即为暴露面。
+   * 识别方块的<b>暴露面</b>：某个面朝向的方向上「不是视觉遮挡方块」（空气/玻璃/植物/水等都算暴露）即为暴露面。
+   *
+   * <p><b>逐面语义（方案 A）</b>：视觉遮挡 = {@code isOccluding} 或「是岩浆」（见 {@link #visuallyOccluding}）。
+   * 因此：
+   * <ul>
+   *   <li>某面紧邻<b>岩浆</b> → 该面不可见（不计入暴露面，射线也不能穿过它）；</li>
+   *   <li>某面紧邻<b>水</b> → 该面仍是暴露面（水透明，玩家应当能看见水下的矿物）；</li>
+   *   <li>只有<b>部分面</b>是岩浆 → 只有那些面不可见，其余面照常暴露（比「六面全是岩浆才算」更精确）。</li>
+   * </ul>
    *
    * @param query 遮挡查询；为 {@code null} 时保守认为六面全暴露（由后续射线判定兜底）
-   * @return 暴露面位掩码；0 表示六面全被遮挡（完全掩埋，从任何方向都看不见）
+   * @return 暴露面位掩码；0 表示六面全被视觉遮挡（完全掩埋，从任何方向都看不见）
    */
   public static int exposedFaces(int blockX, int blockY, int blockZ, RayQuery query) {
     if (query == null) {
       return ALL_FACES;
     }
     int mask = 0;
-    if (!query.isOccluding(blockX + 1, blockY, blockZ)) {
+    if (!visuallyOccluding(query, blockX + 1, blockY, blockZ)) {
       mask |= FACE_POS_X;
     }
-    if (!query.isOccluding(blockX - 1, blockY, blockZ)) {
+    if (!visuallyOccluding(query, blockX - 1, blockY, blockZ)) {
       mask |= FACE_NEG_X;
     }
-    if (!query.isOccluding(blockX, blockY + 1, blockZ)) {
+    if (!visuallyOccluding(query, blockX, blockY + 1, blockZ)) {
       mask |= FACE_POS_Y;
     }
-    if (!query.isOccluding(blockX, blockY - 1, blockZ)) {
+    if (!visuallyOccluding(query, blockX, blockY - 1, blockZ)) {
       mask |= FACE_NEG_Y;
     }
-    if (!query.isOccluding(blockX, blockY, blockZ + 1)) {
+    if (!visuallyOccluding(query, blockX, blockY, blockZ + 1)) {
       mask |= FACE_POS_Z;
     }
-    if (!query.isOccluding(blockX, blockY, blockZ - 1)) {
+    if (!visuallyOccluding(query, blockX, blockY, blockZ - 1)) {
       mask |= FACE_NEG_Z;
     }
     return mask;
+  }
+
+  /**
+   * 「<b>视觉口径</b>的遮挡」：{@code isOccluding 或 是岩浆}。这是显形侧判定「某个面是否不可见 / 射线能否
+   * 穿过」的唯一入口——暴露面识别与射线判定两处都走它。
+   *
+   * <p><b>为什么不改 {@code RayQuery.isOccluding} 的语义</b>：{@code isOccluding} 是<b>共享位图口径</b>
+   * （{@link BitmapVisibility} 读实体剔除同源的遮挡位图），把岩浆并进去会连带改变实体剔除行为、并让位图内存
+   * 翻倍。因此岩浆只在这一层叠加：共享位图的读法完全不变，只是显形侧多叠一条岩浆判断。
+   *
+   * <p><b>为什么需要这一层</b>：vanilla 的 {@code isOccluding()} 对岩浆返回 {@code false}（岩浆不是满方块，
+   * 光会穿过），但它视觉上不透明。既有 barrier 例外是<b>反向</b>的（视觉不可见却服务端判遮挡），二者互为反向
+   * 例外，都收敛到「视觉口径」这一概念上——barrier 例外由 {@code OcclusionRules.visualVerdict} 在
+   * {@code isOccluding} 内部处理，岩浆例外则在这里叠加。
+   */
+  private static boolean visuallyOccluding(RayQuery query, int x, int y, int z) {
+    return query.isOccluding(x, y, z) || query.isLava(x, y, z);
   }
 
   /**
@@ -334,23 +375,29 @@ public final class ProximitySelector {
   }
 
   /**
-   * 方块是否对玩家可见（追加「上方是流体则保持伪装」的显形侧规则）。
+   * 方块是否对玩家可见（追加「上方是岩浆则保持伪装」的显形侧规则 + 逐面岩浆遮挡）。
    *
-   * <p><b>流体规则（显形侧）</b>：目标方块<b>上方（y+1）</b>紧邻方块是流体（水/岩浆）时，
-   * 本次<b>不显形</b>（保持伪装）——与隐藏侧的规则对称：刷在岩浆里的下界残骸本就被伪装，
-   * 显形侧若把它还原，玩家一眼就能看到岩浆里的残骸，透视端同样能看到。
-   * 流体被挖开/流走后，服务端会下发方块变更，{@code ProximityRevealer} 的周期巡检或事件显形
-   * 随后按正常流程还原（该坐标仍在伪装清单里）。
+   * <p><b>流体规则（显形侧，只认岩浆）</b>：目标方块<b>上方（y+1）</b>紧邻方块是<b>岩浆</b>时，本次<b>不显形</b>
+   * （保持伪装）——与隐藏侧的规则对称：刷在岩浆里的下界残骸本就被伪装，显形侧若把它还原，玩家一眼就能看到
+   * 岩浆里的残骸，透视端同样能看到。<b>水不参与</b>：水是透明的，玩家应当能看见被水盖住的矿物，因此水/水柱
+   * 一律放行显形（从规则中彻底移除）。
    *
-   * @param fluidCover true = 启用「上方是流体则不显形」；false = 完全保持既有行为（两处规则都不生效）
+   * <p><b>逐面（方案 A）</b>：此外 {@link #exposedFaces} 会把「紧邻岩浆」的面也当作不可见（视觉遮挡 = isOccluding
+   * 或 isLava）。于是侧面紧邻岩浆、其余面暴露的方块仍可显形——只有被岩浆覆盖的那些面不可见，比「六面全岩浆
+   * 才判」更精确。
+   *
+   * <p>岩浆被挖开/流走后，服务端会下发方块变更，{@code ProximityRevealer} 的周期巡检或事件显形随后按正常
+   * 流程还原（该坐标仍在伪装清单里）。
+   *
+   * @param fluidCover true = 启用「上方是岩浆则不显形」；false = 完全保持既有行为（该规则不生效）
    */
   public static boolean isVisible(Eye eye, int blockX, int blockY, int blockZ, RayQuery query,
       int maxPoints, boolean fluidCover, RayProbe probe) {
     if (eye == null || query == null || probe == null) {
       return true;
     }
-    if (fluidCover && query.isFluid(blockX, blockY + 1, blockZ)) {
-      // 上方是流体：保持伪装，不显形（等流体被移除后由变更事件触发正常显形流程）
+    if (fluidCover && query.isLava(blockX, blockY + 1, blockZ)) {
+      // 上方是岩浆：保持伪装，不显形（等岩浆被移除后由变更事件触发正常显形流程）
       return false;
     }
     int faces = exposedFaces(blockX, blockY, blockZ, query);

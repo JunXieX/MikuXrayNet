@@ -418,6 +418,10 @@ class PeRealDataOcclusionTest {
   /**
    * 流体覆盖掩码必须与真机 PE 材质语义一致：只认水/岩浆（含流动变体）与水柱，
    * <b>排除含水方块</b>（真机 PE 的 {@code isFluid()} 把 11728 个含水状态也算作流体，二者不可混用）。
+   *
+   * <p><b>改造后</b>：反矿透流体规则只认岩浆（水/水柱透明、不参与遮挡），因此新增的
+   * {@link BlockStateRegistry#isLavaCover} 必须<b>只</b>含岩浆而<b>不含</b>水/水柱；旧的 {@code isFluidCover}
+   * 语义不变（水/岩浆/水柱），仅为兼容保留。
    */
   @Test
   void fluidCoverMaskExcludesWaterloggedStates() {
@@ -428,9 +432,15 @@ class PeRealDataOcclusionTest {
         "netherrack", "end_stone"}) {
       assertFalse(registry.isFluidCover(requireStateId(name)), name + " 本体不是流体，不算流体覆盖");
     }
+    // 岩浆覆盖掩码（反矿透新口径）：只认岩浆，水/水柱都不算
+    assertTrue(registry.isLavaCover(requireStateId("lava")), "岩浆必须是岩浆覆盖");
+    assertFalse(registry.isLavaCover(requireStateId("water")), "水是透明的，不得算岩浆覆盖");
+    assertFalse(registry.isLavaCover(requireStateId("bubble_column")), "水柱是透明的，不得算岩浆覆盖");
+    assertFalse(registry.isLavaCover(requireStateId("stone")), "石头不是岩浆，不得算岩浆覆盖");
 
     int fluidTotal = 0;
     int coverTotal = 0;
+    int lavaCoverTotal = 0;
     int waterloggedOnly = 0;
     for (int id = 0; id < registry.getUniqueBlockStateCount(); id++) {
       if (registry.isFluid(id)) {
@@ -439,16 +449,21 @@ class PeRealDataOcclusionTest {
       if (registry.isFluidCover(id)) {
         coverTotal++;
       }
+      if (registry.isLavaCover(id)) {
+        lavaCoverTotal++;
+      }
       if (registry.isFluid(id) && !registry.isFluidCover(id)) {
         waterloggedOnly++;
       }
     }
     System.out.println("[流体掩码] isFluid=" + fluidTotal + "，isFluidCover=" + coverTotal
-        + "，仅 isFluid（含水状态）=" + waterloggedOnly);
+        + "，isLavaCover=" + lavaCoverTotal + "，仅 isFluid（含水状态）=" + waterloggedOnly);
     assertTrue(waterloggedOnly > 0,
         "真机 PE 的 isFluid 把含水状态也算作流体，必须被流体覆盖掩码排除（否则上方是含水台阶也会保持伪装）");
     assertTrue(coverTotal > 0 && coverTotal <= 64,
         "流体覆盖掩码只应包含水/岩浆/水柱这类「本体即流体」的少数状态：" + coverTotal);
+    assertTrue(lavaCoverTotal > 0 && lavaCoverTotal < coverTotal,
+        "岩浆覆盖掩码应只含岩浆状态，是流体覆盖掩码的真子集：" + lavaCoverTotal + " < " + coverTotal);
   }
 
   /** 读取打包 antixray.yml 里各维度的 hide-blocks（不依赖 Bukkit YAML）。 */

@@ -25,8 +25,12 @@ public interface RegistryAccessor {
   /**
    * 「流体覆盖」判定用的流体掩码（水/岩浆，含静止与流动变体；含水的台阶/栅栏等<b>不算</b>）。
    *
-   * <p>只用于反矿透的「目标方块上方是流体则按遮挡处理 / 不显形」规则，与 {@link #isFluid} 的
+   * <p>只用于反矿透的「目标方块上方是流体则按遮挡处理 / 不显形」规则的<b>旧口径</b>，与 {@link #isFluid} 的
    * 方块计数口径解耦。默认回落 {@link #isFluid}，使测试桩（只实现了 isFluid）行为与既有语义一致。
+   *
+   * <p><b>改造说明</b>：流体规则已改为<b>只认岩浆</b>（水/水柱透明，不参与遮挡）；生产路径改用
+   * {@code BlockStateRegistry#isLavaCover}（不在本最小视图里，注册表实现直接暴露给 {@code ObfuscationProcessor}）。
+   * 本方法保留以免破坏其它调用方与既有测试。
    */
   default boolean isFluidCover(int blockId) {
     return isFluid(blockId);

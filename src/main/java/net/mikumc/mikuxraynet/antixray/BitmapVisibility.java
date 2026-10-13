@@ -31,8 +31,10 @@ import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
  * barrier 例外）。两条路径对 barrier 的结论因此一致：barrier 后方的方块可见即显形——barrier 对玩家
  * <b>完全不可见</b>，「矿石只被 barrier 挡住」时玩家本就能看穿，显形是正确体验而非泄露。
  *
- * <p><b>分工</b>：位图分不出的「目标上方是流体」规则（需读世界方块）不在本类判，由发布侧
- * （{@code ProximityRevealer} 的玩家线程）补判。
+ * <p><b>分工</b>：位图分不出的「目标紧邻岩浆」规则（需读世界方块，且岩浆在 vanilla {@code isOccluding()}
+ * 里返回 false、位图里看不出）不在本类判，由发布侧（{@code ProximityRevealer} 的玩家线程）补判。
+ * 注意本类读的遮挡位图是<b>共享口径</b>（实体剔除同源），刻意不把岩浆并入——岩浆只在显形侧
+ * （{@code ProximitySelector}）叠加为视觉遮挡。
  *
  * <p><b>线程与分配</b>：{@link OcclusionRay} 的游标是实例字段，实例不可跨线程共享；因此本类以
  * {@link ThreadLocal} 每线程一份复用（工作线程与玩家线程各持一份）。一次判定只用可变字段承载上下文，
@@ -82,7 +84,7 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
   /**
    * 判定坐标 {@code (x, y, z)} 对 {@code eye} 是否可见（多候选点、任一通畅即可见）。
    *
-   * <p>不使用「上方流体」规则（{@code fluidCover=false}）——它需要读世界方块，只能在玩家线程补判。
+   * <p>不使用「上方岩浆」规则（{@code fluidCover=false}）——它需要读世界方块，只能在玩家线程补判。
    *
    * @param stores    遮挡位图注册表；{@code null} 时全部按遮挡处理（严格）
    * @param worldName 该坐标所属世界名（位图按世界分域，见 {@link OcclusionStores}）
