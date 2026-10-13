@@ -127,8 +127,11 @@ class DiskCacheChannelFailureTest {
    */
   @Test
   void readTimeoutDoesNotInterruptTheDiskThread(@TempDir Path dir) throws Exception {
-    // 读取预算 1ms：写入队列压满时必然超时
-    try (DiskCacheStore store = new DiskCacheStore(dir, config(600), LOGGER, 1L)) {
+    // 读取预算 1ms：写入队列压满时必然超时。
+    // 但 flush 预算必须给足——本用例要先确认「句柄已建立」，而 put 与 flush 共用同一条磁盘线程队列：
+    // 若 flush 也只等 1ms，它会在 32 个 put 尚未执行时就超时返回，于是下面取不到任何已打开句柄而偶发失败
+    // （CI 上曾复现：断言 open 非空失败）。给足 flush 预算后，flush 会等到全部 put 跑完，断言才有确定性。
+    try (DiskCacheStore store = new DiskCacheStore(dir, config(600), LOGGER, 1L, 10_000L)) {
       for (int chunkX = 0; chunkX < 32; chunkX++) {
         store.put(WORLD, chunkX, 0, 1, payload(64 * 1024, chunkX));
       }
