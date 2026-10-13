@@ -13,6 +13,12 @@ import net.mikumc.mikuxraynet.codec.Chunk;
 import net.mikumc.mikuxraynet.codec.ChunkCodec;
 import net.mikumc.mikuxraynet.codec.ChunkSection;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
+import net.mikumc.mikuxraynet.occlusion.BitmapOcclusion;
+import net.mikumc.mikuxraynet.occlusion.EmptyOcclusion;
+import net.mikumc.mikuxraynet.occlusion.OcclusionPayload;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
+import net.mikumc.mikuxraynet.occlusion.SectionOcclusion;
+import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
 import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
 
 /**
@@ -81,8 +87,12 @@ public final class ObfuscationProcessor {
    *                            （此时已 fail-open 放行原包，调用方应计数并告警，勿与「无目标方块」混淆）
    * @param sectionBits         各 section 改写后的每方块位宽（未改写的 section 为 -1；无任何改写为 null）。
    *                            供「位宽直方图」诊断观察封顶/降位效果
+   * @param occlusion           本区块整列的遮挡数据负载（见 {@code OcclusionPayload}）；仅在启用
+   *                            异步实体遮挡时为非 null。调用方把它随改写结果一并缓存，使缓存命中的区块
+   *                            也能恢复遮挡数据（否则命中路径不解码、拿不到位图）。
    */
-  public record Result(byte[] data, int[] obfuscatedPositions, String failure, int[] sectionBits) {
+  public record Result(byte[] data, int[] obfuscatedPositions, String failure, int[] sectionBits,
+      byte[] occlusion) {
 
     /** 是否真的改动了字节。 */
     public boolean changed() {
@@ -364,6 +374,28 @@ public final class ObfuscationProcessor {
   private final boolean fluidCover;
   /** 流体覆盖掩码（水/岩浆/水柱；不含含水方块）；{@code null} = 不可用（流体规则整体不生效）。 */
   private final IntPredicate fluidTable;
+  /**
+   * 遮挡数据仓库（异步实体遮挡判定用，按世界分域）；{@code null} = 该功能关闭，改写路径不做任何建表（零开销）。
+   *
+   * <p>建表在<b>解码之后、改写之前</b>进行：位图必须反映<b>真实世界几何</b>，而反矿透改写
+   * （矿石→石头）恰好不改变遮挡性，故取改写前的状态即可（也避免依赖「改写是否保遮挡」这一隐含前提）。
+   *
+   * <p><b>为什么是「按世界分域的注册表」而不是单张表</b>：改写工作线程同时服务多个世界，而位图键
+   * 只有区块坐标（见 {@link OcclusionStores}）——不分域会让主世界与下界的同名区块互相覆盖，
+   * 进而把可见实体隐藏（安全方向错误）。世界名由工作线程现成持有（{@code RewriteTask#worldName}）。
+   */
+  private final OcclusionStores occlusionStores;
+  /**
+   * <b>实体遮挡口径</b>的判定表：只供 {@link #captureOcclusion} 建位图使用。
+   *
+   * <p><b>为什么不与 {@link #occlusionTable} 共用</b>：反矿透伪装口径（PE 状态语义启发式）刻意偏多判
+   * （宁可多伪装，漏伪装是安全事故），而实体剔除的方向相反——多判会把本可见的实体藏起来。既有同步射线
+   * 用的是 {@code Material#isOccluding()}，真机实测两者对 125/1196 种方块相反，故实体位图必须用同一口径，
+   * 否则异步/同步两种模式会漂移。详见 {@code EntityOcclusionTable}。
+   *
+   * <p>{@code null} = 与 {@link #occlusionTable} 相同（离线单测与不提供 Bukkit 表时的回落）。
+   */
+  private final IntPredicate entityOcclusionTable;
   /** 无覆盖世界（或世界名为 null）时使用的档案（= 主世界档案，供解码侧诊断用）。 */
   private final WorldProfile defaultProfile;
   /** 各维度档案（下标 = {@link AntiXrayConfig.Dimension#ordinal()}）。 */
@@ -463,7 +495,7 @@ public final class ObfuscationProcessor {
         new WorldProfile[] {defaultProfile.withUseBlockBelow(useBlockBelow),
             defaultProfile.withUseBlockBelow(useBlockBelow),
             defaultProfile.withUseBlockBelow(useBlockBelow)},
-        expandOverrides(overrideProfiles, useBlockBelow), config, false, null);
+        expandOverrides(overrideProfiles, useBlockBelow), config, false, null, null, null);
   }
 
   /** 逐世界覆盖档案展开为「各覆盖段 × 各维度」（兼容构造用：同一档案施加到全部维度）。 */
@@ -486,21 +518,24 @@ public final class ObfuscationProcessor {
    * @param overrideProfiles  各覆盖段档案：{@code [覆盖段下标][维度下标]}
    * @param fluidCover        流体覆盖开关（{@code occlusion.fluid-cover}）
    * @param fluidTable        流体覆盖掩码；null 表示不可用（流体规则不生效）
+   * @param entityOcclusionTable 实体遮挡口径表（仅建位图用）；null 表示与 {@code occlusionTable} 相同
    */
   @SuppressWarnings("unchecked")
   ObfuscationProcessor(ChunkCodec codec, IntPredicate occlusionTable, boolean layerObfuscation,
       boolean missingPolicyHide, PaletteOptions paletteOptions, IntPredicate belowUsable,
       WorldProfile defaultProfile, WorldProfile[] dimensionProfiles,
       WorldProfile[][] overrideProfiles, AntiXrayConfig config, boolean fluidCover,
-      IntPredicate fluidTable) {
+      IntPredicate fluidTable, OcclusionStores occlusionStores, IntPredicate entityOcclusionTable) {
     this.codec = codec;
     this.occlusionTable = occlusionTable;
+    this.entityOcclusionTable = entityOcclusionTable == null ? occlusionTable : entityOcclusionTable;
     this.layerObfuscation = layerObfuscation;
     this.missingPolicyHide = missingPolicyHide;
     this.paletteOptions = paletteOptions;
     this.belowUsable = belowUsable;
     this.fluidCover = fluidCover;
     this.fluidTable = fluidTable;
+    this.occlusionStores = occlusionStores;
     this.defaultProfile = defaultProfile;
     this.dimensionProfiles = dimensionProfiles;
     this.overrideProfiles = overrideProfiles;
@@ -532,7 +567,8 @@ public final class ObfuscationProcessor {
    * @return 已装配的处理器；若未解析到任何有效目标或伪装方块，{@link #isActive()} 为 false
    */
   public static ObfuscationProcessor create(ChunkCodec codec, BlockStateRegistry registry,
-      AntiXrayConfig config, Logger logger, PaletteOptions paletteOptions) {
+      AntiXrayConfig config, Logger logger, PaletteOptions paletteOptions,
+      OcclusionStores occlusionStores) {
     AntiXrayConfig.Dimension[] dimensions = AntiXrayConfig.Dimension.values();
     WorldProfile[] dimensionProfiles = new WorldProfile[dimensions.length];
     for (AntiXrayConfig.Dimension dimension : dimensions) {
@@ -558,10 +594,13 @@ public final class ObfuscationProcessor {
     // 是否是目标方块的检查在改写循环里做（targets 位图），这里只提供空气/流体过滤器。
     IntPredicate belowUsable = state -> !(registry.isAir(state) || registry.isFluid(state));
 
+    // 两套遮挡口径刻意分开：反矿透伪装用 PE 语义表（偏多判，宁多伪装不漏伪装）；
+    // 实体遮挡位图用实体口径表（与既有同步射线同源，偏少判才安全）。见 EntityOcclusionTable。
     return new ObfuscationProcessor(codec, registry::isOccluding, config.layerObfuscation(),
         missingPolicyHide, paletteOptions, belowUsable,
         dimensionProfiles[AntiXrayConfig.Dimension.NORMAL.ordinal()], dimensionProfiles,
-        overrideProfiles, config, config.occlusion().fluidCover(), registry::isFluidCover);
+        overrideProfiles, config, config.occlusion().fluidCover(), registry::isFluidCover,
+        occlusionStores, registry::isEntityOccluding);
   }
 
   /**
@@ -636,6 +675,16 @@ public final class ObfuscationProcessor {
   }
 
   /**
+   * 7 参重载（不传区块坐标）：区块坐标仅在启用异步遮挡建表时被用到，未启用时传 0 无副作用。
+   *
+   * <p>测试专用豁免：既有单测走本重载；生产路径走 9 参完整入口（带区块坐标）。
+   */
+  public Result rewrite(byte[] source, int sectionCount, long seed, NeighborEdges neighbors,
+      String worldName, AntiXrayConfig.Dimension dimension, int worldMinY) {
+    return rewrite(source, sectionCount, seed, neighbors, worldName, dimension, worldMinY, 0, 0);
+  }
+
+  /**
    * 改写一个区块（完整入口：按「世界名 + 维度」取配置）。
    *
    * <p>解析优先级：{@code world-overrides}（按世界名）&gt; {@code dimensions.<维度>}。
@@ -644,16 +693,18 @@ public final class ObfuscationProcessor {
    * @param dimension 该世界所属维度（由 {@code World#getEnvironment()} 判定，见
    *                  {@link AntiXrayConfig.Dimension#of(org.bukkit.World.Environment)}）
    * @param worldMinY 该世界最低方块 Y（世界坐标系），用于把 section 内相对 Y 换算成绝对 Y
+   * @param chunkX    区块 X（仅在启用异步遮挡建表时使用；未启用时可为任意值）
+   * @param chunkZ    区块 Z（同上）
    */
   public Result rewrite(byte[] source, int sectionCount, long seed, NeighborEdges neighbors,
-      String worldName, AntiXrayConfig.Dimension dimension, int worldMinY) {
+      String worldName, AntiXrayConfig.Dimension dimension, int worldMinY, int chunkX, int chunkZ) {
     if (!isActive() || sectionCount <= 0 || source.length == 0) {
-      return new Result(source, NO_POSITIONS, null, null);
+      return new Result(source, NO_POSITIONS, null, null, null);
     }
     WorldProfile profile = profileFor(worldName, dimension == null
         ? AntiXrayConfig.Dimension.NORMAL : dimension);
     if (!profile.active()) {
-      return new Result(source, NO_POSITIONS, null, null);
+      return new Result(source, NO_POSITIONS, null, null, null);
     }
 
     Random random = new Random(seed);
@@ -663,15 +714,19 @@ public final class ObfuscationProcessor {
     // 改写 section 的最终位宽（位宽直方图诊断用；null = 无任何改写，不分配）
     int[] sectionBits = null;
 
+    // 本区块整列的遮挡数据负载（启用异步实体遮挡时非 null，见 captureOcclusion）
+    byte[] occlusion = null;
     Chunk chunk;
     try {
       chunk = codec.decode(source, sectionCount);
     } catch (RuntimeException exception) {
       // 解码失败：多半是区块二进制布局与预期不符（版本/第三方改写），必须可观测，不能静默当作「无改动」
-      return new Result(source, NO_POSITIONS, describe(exception), null);
+      return new Result(source, NO_POSITIONS, describe(exception), null, null);
     }
 
     try {
+      // 异步实体遮挡建表（在改写之前，位图反映真实世界几何）：未启用该功能时 occlusionStore 为 null，零开销。
+      occlusion = captureOcclusion(chunk, worldName, chunkX, chunkZ, worldMinY);
       boolean rangeLimited = profile.minY != Integer.MIN_VALUE || profile.maxY != Integer.MAX_VALUE;
       boolean bandDriven = profile.bandMinY.length > 0;
       // section 级预筛（封包侧判空）：全空气（封包头 blockCount==0）与本段调色板里没有目标方块的
@@ -802,14 +857,96 @@ public final class ObfuscationProcessor {
       }
 
       if (!changed) {
-        // 无改动：直接复用原字节，跳过整次重编码
-        return new Result(source, NO_POSITIONS, null, null);
+        // 无改动：直接复用原字节，跳过整次重编码（遮挡数据仍然照常返回：它独立于是否改写过）
+        return new Result(source, NO_POSITIONS, null, null, occlusion);
       }
-      return new Result(chunk.finalizeOutput(), Arrays.copyOf(positions, count), null, sectionBits);
+      return new Result(chunk.finalizeOutput(), Arrays.copyOf(positions, count), null, sectionBits,
+          occlusion);
     } catch (RuntimeException exception) {
-      return new Result(source, NO_POSITIONS, describe(exception), null);
+      return new Result(source, NO_POSITIONS, describe(exception), null, null);
     } finally {
       chunk.close();
+    }
+  }
+
+  /**
+   * 异步实体遮挡建表：把本区块各 section 的遮挡位图写入 {@link OcclusionStores}（该世界那一张表）。
+   *
+   * <p><b>为什么放在这里</b>：本方法运行在反矿透解码工作线程上，且此刻已拿到解码后的 {@link Chunk}
+   * （逐格 stateId 可直接读）——旁路生成位图，零额外解析、零 Bukkit 访问。位图在改写<b>之前</b>采集，
+   * 因此反映的是传输中的<b>真实世界几何</b>（反矿透改写矿石→石头本身也不改变遮挡性，取改写前更无歧义）。
+   *
+   * <p><b>覆盖性</b>：只为「会被发送给玩家的区块」建表，而这些正是玩家周围、遮挡判定有意义的区块。
+   * 未被解码的区块（如内存/磁盘缓存命中的区块）查不到位图 → 射线按「不遮挡」处理
+   * （fail-open：少藏不多藏）。覆盖度须由真机指标观测，属方案已明确接受的权衡。
+   *
+   * <p><b>快路径</b>：全空气 section 直接写 {@code null}（同时清掉该段旧条目）；单值调色板段只判一次。
+   *
+   * <p><b>失败语义</b>：任何异常都被吞掉——建表失败只意味着少一份遮挡数据（安全方向），
+   * 绝不允许影响反矿透改写本身。
+   */
+  private byte[] captureOcclusion(Chunk chunk, String worldName, int chunkX, int chunkZ,
+      int worldMinY) {
+    OcclusionStores stores = this.occlusionStores;
+    if (stores == null) {
+      return null;
+    }
+    try {
+      int minSectionY = worldMinY >> 4;
+      int sectionCount = chunk.getSectionCount();
+      SectionOcclusion[] column = new SectionOcclusion[sectionCount];
+      for (int sectionIndex = 0; sectionIndex < sectionCount; sectionIndex++) {
+        ChunkSection section = chunk.getSection(sectionIndex);
+        if (section == null || section.isEmpty()) {
+          // 「已知全不遮挡」而非 null：区分开「该段确实没遮挡方块」与「没有该段的数据」
+          column[sectionIndex] = EmptyOcclusion.INSTANCE;
+        } else if (section.bitsPerBlock() == 0) {
+          // 单值调色板：整段同一种方块，只需判一次是「全遮挡」还是「全不遮挡」
+          column[sectionIndex] = entityOcclusionTable.test(section.getBlockState(0))
+              ? SolidOcclusion.INSTANCE : EmptyOcclusion.INSTANCE;
+        } else {
+          column[sectionIndex] =
+              BitmapOcclusion.fromStateLookup(section::getBlockState, entityOcclusionTable);
+        }
+      }
+      stores.of(worldName).restoreColumn(chunkX, minSectionY, chunkZ, column);
+      // 同时返回编码后的负载：调用方把它随改写结果一并缓存，使缓存命中路径也能恢复遮挡数据
+      return OcclusionPayload.encode(column);
+    } catch (Throwable ignored) {
+      // 建表失败不影响反矿透改写（fail-open）
+      return null;
+    }
+  }
+
+  /**
+   * 从缓存负载恢复整列遮挡数据（<b>缓存命中路径</b>调用）。
+   *
+   * <p>方案 b 的关键：遮挡位图只在解码时生成，而内存/磁盘缓存命中不会解码 → 若不随负载持久化，
+   * 命中区块就永远没有遮挡数据（实体不再被隐藏）。这里把负载解回整列并写进 {@link OcclusionStores}
+   * 中该世界那一张表。
+   *
+   * <p>任何异常 / 畸形负载 / 未启用该功能都静默跳过（fail-open：拿不到位图 = 不遮挡 = 少藏不多藏）。
+   *
+   * @param occlusion  {@code Result#occlusion()} 或磁盘负载里的遮挡字节；{@code null} 表示无
+   * @param worldName  该区块所属世界名（两侧口径一致的关键，见 {@link OcclusionStores}）
+   * @param chunkX     区块 X
+   * @param minSectionY 该世界最低 section 序号（= 世界最低方块 Y &gt;&gt; 4）
+   * @param chunkZ     区块 Z
+   */
+  public void restoreOcclusion(byte[] occlusion, String worldName, int chunkX, int minSectionY,
+      int chunkZ) {
+    OcclusionStores stores = this.occlusionStores;
+    if (stores == null || occlusion == null) {
+      return;
+    }
+    try {
+      SectionOcclusion[] column = OcclusionPayload.decode(occlusion);
+      if (column == null) {
+        return;
+      }
+      stores.of(worldName).restoreColumn(chunkX, minSectionY, chunkZ, column);
+    } catch (Throwable ignored) {
+      // fail-open：恢复失败只意味着少一份遮挡数据
     }
   }
 

@@ -45,6 +45,13 @@ import java.util.logging.Logger;
  * </ol>
  * 由于构造器不参与，本类天然免疫构造器签名变化。
  *
+ * <p><b>为什么绝不触碰构造器</b>：字段级路径的唯一前提是「拿到区块数据对象本身」，而该对象由
+ * {@code packet.getSpecificModifier(...)} 从封包中取出，<b>不走任何构造器</b>。本类<b>绝不</b>
+ * {@code new} 该 NMS 类、也<b>绝不</b>用 {@code FuzzyReflection.getConstructor} 之类去解析
+ * {@code (FriendlyByteBuf, int, int)} 构造器——正是那条硬查构造器的路径在 26.3 上 clinit 抛异常、
+ * 令反矿透完全失效。字段名/类型一旦变化，字段定位失败只会让调用方 fail-open（放行原包、留下可见状态），
+ * 而不会像构造器路径那样拖垮整个类。因此本类天然免疫构造器签名变化。
+ *
  * <p><b>失败语义</b>：字段定位不到 → 构造器抛异常，调用方 fail-open（放行原包、不改写）并给出
  * 一次性中文提示；方块实体剔除所需的字段定位不到 → 降级为「不剔除方块实体」（启动期提示可见），
  * 运行期剔除本身抛异常 → 计数 + 一次性中文提示（见 {@link #recordBlockEntityFilterFailure}），
@@ -53,8 +60,37 @@ import java.util.logging.Logger;
  */
 public final class ChunkPacketAccessor {
 
+  /**
+   * 字段定位状态（只读、可打印中文一行）：让「字段级取数是否可用」这一 fail-open 口径可见。
+   *
+   * <p><b>为什么要它</b>：MC 26.3 移除区块数据构造器后，若字段定位失败，反矿透会静默 fail-open
+   * （放行原包、矿物以真实状态下发）——「改写计数看起来正常但玩家仍能透视」无法归因。把定位结果
+   * 汇总进启动日志与 {@code /mikuxraynet status}，即可一眼区分「全命中 / 降级 / 完全不可用」。
+   */
+  public enum AccessorState {
+    /** 尚未解析（反矿透未启用，或启动期未触发解析）。 */
+    UNRESOLVED("未解析（反矿透未启用）"),
+    /** 连区块字节字段都定位不到：构造器会抛，调用方 fail-open 放行原包。 */
+    UNAVAILABLE("字段级取数不可用(放行原包)"),
+    /** 区块字节可用，但方块实体剔除所需字段不全：降级为「不剔除方块实体」（字节改写照常）。 */
+    DEGRADED("字段级取数(降级：方块实体剔除不可用)"),
+    /** 区块字节 + 方块实体列表 + 坐标字段全部命中：完整的字段级改写 + 方块实体剔除。 */
+    READY("字段级取数(全命中)");
+
+    private final String label;
+
+    AccessorState(String label) {
+      this.label = label;
+    }
+
+    /** 可直接打印的中文一行。 */
+    public String label() {
+      return label;
+    }
+  }
+
   /** 区块数据类（{@code ClientboundLevelChunkPacketData}）的字段访问计划；启动期解析一次后缓存。 */
-  private record FieldPlan(FieldAccessor buffer, FieldAccessor blockEntities,
+  record FieldPlan(FieldAccessor buffer, FieldAccessor blockEntities,
       FieldAccessor blockEntityPackedXz, FieldAccessor blockEntityY) {
 
     /** 方块实体剔除是否可用（三者齐全才剔除；缺任意一项即降级为不剔除以保护 buffer 改写）。 */
@@ -278,10 +314,31 @@ public final class ChunkPacketAccessor {
     return describe(resolved);
   }
 
-  /** 字段定位结果的中文描述（启动日志用）。 */
-  private static String describe(FieldPlan resolved) {
+  /**
+   * 当前字段定位状态（只读，线程安全；<b>不触发</b>惰性解析）。
+   *
+   * <p>只读已缓存的结果：解析在启动期由 {@link #resolveAndDescribe()} 完成，未解析时返回
+   * {@link AccessorState#UNRESOLVED}。它是「字段级取数悄悄 fail-open」的可见出口——诊断面板据此
+   * 回显「区块取数=…」，避免服务端 NMS 结构变更后被静默放行而无人察觉。
+   */
+  public static AccessorState accessorState() {
+    return planResolved ? stateOf(plan) : AccessorState.UNRESOLVED;
+  }
+
+  /** 由字段计划映射到（可打印的）定位状态；纯函数，离线可测。 */
+  static AccessorState stateOf(FieldPlan resolved) {
     if (resolved == null) {
-      return "区块数据字段：buffer=byte[] ✗｜blockEntitiesData=List ✗"
+      return AccessorState.UNAVAILABLE;
+    }
+    return resolved.blockEntityFilterReady() ? AccessorState.READY : AccessorState.DEGRADED;
+  }
+
+  /** 字段定位结果的中文描述（启动日志用）：先给状态词，再逐项列出命中情况。 */
+  private static String describe(FieldPlan resolved) {
+    String state = stateOf(resolved).label();
+    if (resolved == null) {
+      return "区块取数=" + state
+          + "：区块数据字段 buffer=byte[] ✗｜blockEntitiesData=List ✗"
           + "（服务端 NMS 结构可能已变更 → 本次反矿透改写将按原包放行）";
     }
     String blockEntities = resolved.blockEntities() == null
@@ -292,7 +349,7 @@ public final class ChunkPacketAccessor {
         : "｜方块实体坐标字段 packedXZ " + (resolved.blockEntityPackedXz() == null ? "✗" : "✓")
             + " y " + (resolved.blockEntityY() == null ? "✗" : "✓")
             + "（降级：不剔除方块实体）";
-    return "区块数据字段：buffer=byte[] ✓｜" + blockEntities + coordinates;
+    return "区块取数=" + state + "：区块数据字段 buffer=byte[] ✓｜" + blockEntities + coordinates;
   }
 
   /** 当前字段计划；启动期未显式解析时惰性解析一次（失败也会缓存，避免热路径反复反射）。 */
@@ -313,32 +370,40 @@ public final class ChunkPacketAccessor {
   private static FieldPlan locate() {
     try {
       Class<?> chunkDataClass = MinecraftReflection.getLevelChunkPacketDataClass();
-      if (chunkDataClass == null) {
-        return null;
-      }
-
-      Field bufferField = selectField(chunkDataClass, byte[].class, "buffer");
-      // buffer 是硬需求：定位不到就不要改写（由调用方 fail-open 放行原包）
-      FieldAccessor buffer = accessorOf(bufferField);
-      if (buffer == null) {
-        return null;
-      }
-
-      Field entitiesField = selectField(chunkDataClass, List.class,
-          "blockEntitiesData", "blockEntities", "blockEntityData");
-      FieldAccessor blockEntities = accessorOf(entitiesField);
-
-      FieldAccessor packedXz = null;
-      FieldAccessor y = null;
-      Class<?> entryClass = listElementType(entitiesField);
-      if (entryClass != null) {
-        packedXz = accessorOf(selectFieldByName(entryClass, "packedXZ", byte.class, int.class, short.class));
-        y = accessorOf(selectFieldByName(entryClass, "y", short.class, int.class, byte.class));
-      }
-      return new FieldPlan(buffer, blockEntities, packedXz, y);
+      return chunkDataClass == null ? null : locate(chunkDataClass);
     } catch (Throwable throwable) {
       return null;
     }
+  }
+
+  /**
+   * 对指定区块数据类解析字段访问计划（<b>绝不触碰任何构造器</b>）。
+   *
+   * <p>包级可见：离线单测用合成类直接驱动「字段全命中 / 缺 buffer 放行 / 缺方块实体字段降级 /
+   * 坐标字段形态不符降级」四条路径——真实 NMS 类离线不可得，故把「目标类」抽成参数留出这条测试缝。
+   *
+   * @return 字段计划；区块字节字段定位不到（改写无法进行）时返回 {@code null}（调用方 fail-open 放行原包）
+   */
+  static FieldPlan locate(Class<?> chunkDataClass) {
+    Field bufferField = selectField(chunkDataClass, byte[].class, "buffer");
+    // buffer 是硬需求：定位不到就不要改写（由调用方 fail-open 放行原包）
+    FieldAccessor buffer = accessorOf(bufferField);
+    if (buffer == null) {
+      return null;
+    }
+
+    Field entitiesField = selectField(chunkDataClass, List.class,
+        "blockEntitiesData", "blockEntities", "blockEntityData");
+    FieldAccessor blockEntities = accessorOf(entitiesField);
+
+    FieldAccessor packedXz = null;
+    FieldAccessor y = null;
+    Class<?> entryClass = listElementType(entitiesField);
+    if (entryClass != null) {
+      packedXz = accessorOf(selectFieldByName(entryClass, "packedXZ", byte.class, int.class, short.class));
+      y = accessorOf(selectFieldByName(entryClass, "y", short.class, int.class, byte.class));
+    }
+    return new FieldPlan(buffer, blockEntities, packedXz, y);
   }
 
   /**

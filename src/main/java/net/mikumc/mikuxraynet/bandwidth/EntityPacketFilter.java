@@ -6,7 +6,6 @@ import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
-import com.comphenix.protocol.reflect.StructureModifier;
 import com.destroystokyo.paper.event.entity.EntityAddToWorldEvent;
 import com.destroystokyo.paper.event.entity.EntityRemoveFromWorldEvent;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
@@ -18,6 +17,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
@@ -98,6 +98,8 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
    */
   private final Set<String> unresolvedWhitelist;
   private final AtomicInteger errorCounter = new AtomicInteger();
+  /** 「位移字段形态不符」只告警一次（CAS 抢占）：它是「服务端/ProtocolLib 改了包布局」的信号，必须可见但不刷屏。 */
+  private final AtomicBoolean shapeWarned = new AtomicBoolean();
 
   /**
    * 实体 id → 归一化类型键。
@@ -239,6 +241,15 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
       PacketContainer packet = event.getPacket();
       PacketType type = event.getPacketType();
 
+      // 到达口径（三分）：取消 0 的三种成因只能靠「哪一类包真的到了」来区分，见 ThrottleStats 说明。
+      if (type == PacketType.Play.Server.REL_ENTITY_MOVE) {
+        stats.entityMovePackets.increment();
+      } else if (type == PacketType.Play.Server.REL_ENTITY_MOVE_LOOK) {
+        stats.entityMoveRotPackets.increment();
+      } else {
+        stats.entityLookPackets.increment();
+      }
+
       // 只有纯位移包（REL_ENTITY_MOVE）才可能被判为冗余取消；朝向包（REL_ENTITY_MOVE_LOOK / ENTITY_LOOK）
       // 里的 yaw/pitch 是绝对量化角（0 表示朝正南 / 平视），按全 0 取消会让客户端保留旧朝向（持久朝向错误，
       // 依据见 MovementDelta 类注释），因此一律放行。提前在这里返回还顺带省下为朝向包构造 short 位移
@@ -248,9 +259,19 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
         return;
       }
 
-      // 纯位移包：读取 dx/dy/dz。字段形态不符（不同服务端版本的字段布局差异）时 fail-open 放行，绝不误判取消。
-      StructureModifier<Short> deltas = packet.getSpecificModifier(short.class);
-      if (deltas.size() < 3) {
+      // 纯位移包：读取 dx/dy/dz 与实体 id。
+      //
+      // 为什么不用 ProtocolLib 的类型化访问器（getSpecificModifier / getIntegers）：它们的字段表只含
+      // 「具体类的声明字段」，而 MC 1.21.2 起该包把 xa/ya/za 与 entityId 都放进了基类
+      // ClientboundMoveEntityPacket（子类不再声明任何实例字段）→ 两个访问器都取不到东西，
+      // 本模块会静默退化为永远放行。故改走「沿继承链定位」的 MovePacketFields（详见其类注释）。
+      Object handle = packet.getHandle();
+      MovePacketFields.Access access = MovePacketFields.of(handle);
+      if (access == null) {
+        // 字段定位不到（服务端/映射变更）：fail-open 放行。这一分支此前是纯静默放行，面板只剩「取消 0」，
+        // 与「本来就没包可取消」无法区分、极易被误判成功能失效，因此计数 + 首次告警一次。
+        stats.entityMoveShapeMismatch.increment();
+        warnShapeMismatchOnce(handle);
         pass();
         return;
       }
@@ -262,12 +283,9 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
       // 都会被取消）。即便改用「容量封顶 + 清空」换取有界，也要在每个相对移动包（本项正是要削减开销的热路径）
       // 上多读一次布尔、多一次映射操作，得不偿失。权衡后此处保持不变：onGround 偶发滞后属低风险观感问题，
       // 无界状态 / 热路径加负的风险更高。
-      boolean redundant = MovementDelta.isRedundantEntityUpdate(false,
-          deltas.read(0), deltas.read(1), deltas.read(2));
+      boolean redundant = MovePacketFields.isZeroMove(access, handle);
 
-      // getIntegers() 仅在确认冗余后才调用：该访问器同样每次都 new 一个 StructureModifier，放到条件分支里
-      // 可避免在热路径（每个实体每 tick 的相对移动）上为「非冗余」包白白分配一次。
-      if (!redundant || isWhitelisted(packet.getIntegers().read(0))) {
+      if (!redundant || isWhitelisted((int) access.entityId().get(handle))) {
         pass();
         return;
       }
@@ -414,6 +432,23 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     String lower = value.toLowerCase(Locale.ROOT).trim();
     int colon = lower.indexOf(':');
     return colon >= 0 ? lower.substring(colon + 1) : lower;
+  }
+
+  /**
+   * 「纯位移包的位移字段定位不到」只告警一次。
+   *
+   * <p>该分支意味着服务端或映射改了该包的字段布局，零位移取消会全部退化为放行——面板上表现为「取消 0」，
+   * 与「本来就没有可取消的包」无法区分，故必须把这条第一次出现的信号打出来（只一次，不刷屏）。
+   * 告警带上包对象的实际类名，便于直接判断是「字段上移到基类」（本类已按继承链兼容）还是别的结构变更。
+   */
+  private void warnShapeMismatchOnce(Object handle) {
+    if (shapeWarned.compareAndSet(false, true)) {
+      plugin.getLogger().warning("纯位移包（REL_ENTITY_MOVE）的位移字段定位失败：包对象类 "
+          + (handle == null ? "未知" : handle.getClass().getName())
+          + " 上找不到「entityId + 位移」字段（已按 ≤26.2 的三个 short 与 26.3 的单个 VecDelta 两种形态尝试）；"
+          + "零位移取消已按放行处理。原因：" + MovePacketFields.describeLastFailure()
+          + "。请连同 /mxnet dump 一并反馈。");
+    }
   }
 
   private void logThrottled(Throwable throwable) {

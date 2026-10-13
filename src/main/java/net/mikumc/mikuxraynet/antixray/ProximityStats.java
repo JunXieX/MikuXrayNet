@@ -28,6 +28,19 @@ public final class ProximityStats {
   public final LongAdder revealsRayCulled = new LongAdder();
 
   /**
+   * 上述「射线剔除」中，判定期间曾触碰过<b>无位图数据</b>的 section 的候选数（上界式归因）。
+   *
+   * <p><b>为什么必须单列</b>：位图判定的缺数据规则是「无数据 = 遮挡」（见 {@code BitmapVisibility}），
+   * 它与「真的被墙挡住」在 {@link #revealsRayCulled} 里混在一起——只看总数无法判断严格规则是否在伤人。
+   * 这个数持续偏高才说明「区块没建过表 / 位图 section 被降级」正在憋住本应显形的方块；
+   * 若它 ≈ 0 而射线剔除很大，则剔除确实来自真实遮挡，无需处理。
+   *
+   * <p>属上界式归因：只统计「最终判不可见且期间触到缺数据」的候选，因此不会把纯真实遮挡混进来，
+   * 但极少数「既触到缺数据、也确实被墙挡住」的候选会被多算一次。
+   */
+  public final LongAdder revealsRayCulledMissingData = new LongAdder();
+
+  /**
    * 过度显形抽样中被复核的显形包数（按 1/N 抽样；默认 N=20，只计数不改行为）。
    *
    * <p><b>口径</b>：发包前若 {@link RevealedSet} 已含该坐标，说明客户端应已可见（或刚被其它路径显形过），
@@ -52,6 +65,7 @@ public final class ProximityStats {
     map.put("变更注销", unregistered.sum());
     map.put("视锥剔除", revealsFrustumCulled.sum());
     map.put("射线剔除", revealsRayCulled.sum());
+    map.put("射线剔除（缺数据）", revealsRayCulledMissingData.sum());
     map.put("过度显形（抽样）", overRevealWasted.sum());
     map.put("过度显形抽样数", overRevealSampled.sum());
     return map;

@@ -37,13 +37,16 @@ class DiagnosticsTest {
         new Diagnostics.Snapshot.Env(true, true, false, true, 1, "Paper 1.20.4", "25", "1.2.5"),
         new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
             0L, 0L, 0L, "无采样"),
-        new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 40L, 6L),
+        new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 1L, 40L, 6L),
         new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L),
-        new Diagnostics.Snapshot.Throttle(20L, 30L, 4L, 40L, 12L,
+        new Diagnostics.Snapshot.Occlusion(true, 4096, 3, 200L, 190L, 2L, 1L, 55L, 4_200_000L, 88L, 4L),
+        new Diagnostics.Snapshot.Throttle(20L, 30L, 11L, 4L, 39L, 0L,
+            4L, 40L, 12L,
             6L, 5L, 4, 40L, 7L, 3L, 11L, 2L,
             2, 3L, 8L, 9L, 4L, 5L, 25_000_000L),
         new Diagnostics.Snapshot.Pool(4, 2, 10, 2048),
         new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2, 4L, 5L, 6L, 1L, 0L, 0L),
+        Diagnostics.Snapshot.ChunkAccessor.EMPTY,
         null, bandwidth);
   }
 
@@ -73,9 +76,11 @@ class DiagnosticsTest {
         Diagnostics.Snapshot.Rewrite.EMPTY,
         Diagnostics.Snapshot.Proximity.EMPTY,
         Diagnostics.Snapshot.Index.EMPTY,
+        Diagnostics.Snapshot.Occlusion.EMPTY,
         Diagnostics.Snapshot.Throttle.EMPTY,
         Diagnostics.Snapshot.Pool.EMPTY,
         Diagnostics.Snapshot.DiskCache.EMPTY,
+        Diagnostics.Snapshot.ChunkAccessor.EMPTY,
         antiXray, null);
   }
 
@@ -166,7 +171,8 @@ class DiagnosticsTest {
     assertTrue(text.contains("邻近显形：发送 7，坐标跳过 3"),
         "「跳过」必须写明是「坐标跳过」，否则会被误读成「整块跳过 = 0 → 整块跳过没生效」：" + text);
     assertTrue(text.contains("视锥剔除 3"), text);
-    assertTrue(text.contains("射线剔除 2"), text);
+    assertTrue(text.contains("射线剔除 2（其中缺数据 1）"),
+        "位图判定的「缺数据 = 遮挡」子集必须单列，否则「射线剔除很大」无法区分是缺数据还是真实遮挡：" + text);
     assertTrue(text.contains("过度显形（抽样） 6 / 抽样 40"),
         "过度显形量化必须显示「浪费数 / 抽样数」，否则无法评估显形策略是否需要收紧：" + text);
     assertTrue(text.contains("显形索引：伪装区块 7（坐标 41）｜已显形 坐标 12（当前在线）｜累计登记 108｜安全阀触发 3/2"),
@@ -187,7 +193,17 @@ class DiagnosticsTest {
         "磁盘缓存必须分列过期清理、负载被拒、写入被拒、积压被拒与异常，否则「命中率异常」无法自证：" + text);
     assertTrue(text.contains("==== MikuXrayNet 运行状态（v1.2.5） ===="),
         "状态面板首行必须回显插件版本（区分不同构建的日志靠它）：" + text);
+    assertTrue(text.contains("异步遮挡：已接线｜位图 section 4096，队列 3"),
+        "状态面板必须单列异步遮挡的接线状态、位图驻留量与专用池队列深度"
+            + "（否则「开了开关但没接线 / 引擎跟不上」无法从日志判断）：" + text);
+    assertTrue(text.contains("提交 200，完成 190，超时丢弃 2，队列满拒收 1，缺遮挡数据 55 次"),
+        "异步遮挡的判定计数必须齐全（「缺遮挡数据」持续偏高 = 区块没被建表）：" + text);
+    assertTrue(text.contains("方块补丁 88 格（失败 4 格）"),
+        "方块变更补丁的格数与其失败数必须可见（补丁长期为 0 = 位图不会被方块变更刷新）：" + text);
     assertTrue(text.contains("带宽"), text);
+    assertTrue(text.contains("零位移取消 20（放行 30；到达 纯位移 11／位移+朝向 4／朝向 39，字段形态不符 0）"),
+        "零位移必须分列「三种包的到达数」与「字段形态不符」：只给「取消/放行」时，"
+            + "「取消 0」无法区分「没有纯位移包」「位移从不为 0」「包没到达」「布局变了」：" + text);
     assertTrue(text.contains("AFK 玩家 2"), text);
     assertTrue(text.contains("线程池"), text);
     assertTrue(text.contains("队列 10/2048"), text);
@@ -214,6 +230,7 @@ class DiagnosticsTest {
     assertTrue(line.contains("区块改写 100（异常 2，超时放行 2）"), line);
     assertTrue(line.contains("显形发送 7"), line);
     assertTrue(line.contains("实体隐藏 6/恢复 5（当前隐藏中 4）"), line);
+    assertTrue(line.contains("异步遮挡 已接线（位图 4096，队列 3，缺数据 55）"), line);
     assertTrue(line.contains("磁盘缓存命中 30"), line);
     assertTrue(line.contains("队列 10/2048"), line);
     // 精简版不得把整面板的内容都塞进来（如依赖状态、AFK、带宽开关段）
@@ -243,9 +260,11 @@ class DiagnosticsTest {
         Diagnostics.Snapshot.Rewrite.EMPTY,
         Diagnostics.Snapshot.Proximity.EMPTY,
         Diagnostics.Snapshot.Index.EMPTY,
+        Diagnostics.Snapshot.Occlusion.EMPTY,
         Diagnostics.Snapshot.Throttle.EMPTY,
         Diagnostics.Snapshot.Pool.EMPTY,
         Diagnostics.Snapshot.DiskCache.EMPTY,
+        Diagnostics.Snapshot.ChunkAccessor.EMPTY,
         null, null);
     String text = String.join("\n", Diagnostics.formatStatus(empty));
     assertTrue(text.contains("命中率 0.0%"), text);
@@ -293,6 +312,24 @@ class DiagnosticsTest {
     String frustumOff = String.join("\n",
         Diagnostics.formatStatus(fixed(bandwidth("entity-culling:\n  frustum:\n    enabled: false\n"))));
     assertTrue(frustumOff.contains("实体剔除 启用（射线遮挡 + 视锥剔除关）"), frustumOff);
+  }
+
+  /**
+   * 零位移取消的开关回显必须同时给出<b>行为开关</b> {@code skip-zero-movement}：
+   * 只回显模块总开关时，把它配成 false 会显示「零位移取消 true」，而实际一个包都不会取消
+   * （提前返回连「放行」也不计数），是典型的「看起来在生效却毫无效果」。
+   */
+  @Test
+  void zeroMoveSwitchEchoesBehaviorFlag() {
+    String defaultOn = String.join("\n",
+        Diagnostics.formatStatus(fixed(bandwidth("enabled: true\n"))));
+    assertTrue(defaultOn.contains("零位移取消 true（skip-zero-movement true）"),
+        "默认必须回显行为开关为 true：" + defaultOn);
+
+    String behaviorOff = String.join("\n",
+        Diagnostics.formatStatus(fixed(bandwidth("entity-packets:\n  skip-zero-movement: false\n"))));
+    assertTrue(behaviorOff.contains("零位移取消 true（skip-zero-movement false）"),
+        "行为开关关掉时必须可见，否则会被读成「在生效」：" + behaviorOff);
   }
 
   /**

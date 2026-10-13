@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Locale;
 import net.mikumc.mikuxraynet.AntiXrayRuntime;
 import net.mikumc.mikuxraynet.MikuXrayNet;
+import net.mikumc.mikuxraynet.antixray.ChunkPacketAccessor;
 import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ProximityStats;
 import net.mikumc.mikuxraynet.antixray.RevealedSet;
@@ -27,6 +28,7 @@ import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.config.MikuConfig;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import org.bukkit.Bukkit;
 
 /**
@@ -71,15 +73,35 @@ public final class Diagnostics {
       Rewrite rewrite,
       Proximity proximity,
       Index index,
+      // 异步遮挡域（entity-culling.async-occlusion）：位图驻留量、专用池队列深度与判定计数
+      Occlusion occlusion,
       Throttle throttle,
       Pool pool,
       DiskCache diskCache,
+      // 区块取数域：反矿透区块封包字段定位状态（fail-open 口径可见）
+      ChunkAccessor chunkAccessor,
       AntiXrayConfig antiXray,
       BandwidthConfig bandwidth) {
 
     /** 配置指纹（取自反矿透配置；无配置时为 0）。 */
     public int configFingerprint() {
       return antiXray == null ? 0 : antiXray.configHash();
+    }
+
+    /**
+     * 区块取数域：反矿透区块封包字段定位状态（可见的 fail-open 口径）。
+     *
+     * <p><b>为什么要它</b>：MC 26.3 移除区块数据构造器后，若字段定位失败，反矿透会<b>静默</b>
+     * fail-open（放行原包、矿物以真实状态下发）——「改写计数看起来正常但玩家仍能透视」无法归因。
+     * 把字段定位结果汇总进状态面板，即可一眼区分「字段级全命中 / 降级不剔方块实体 / 完全不可用」。
+     *
+     * @param state 可打印的中文状态（取自 {@link ChunkPacketAccessor.AccessorState#label()}）
+     */
+    public record ChunkAccessor(String state) {
+
+      /** 反矿透未启用（未解析）时的零值兜底。 */
+      public static final ChunkAccessor EMPTY =
+          new ChunkAccessor(ChunkPacketAccessor.AccessorState.UNRESOLVED.label());
     }
 
     /** 依赖与运行环境（依赖就绪性、平台、直通玩家数、版本标识）。 */
@@ -105,12 +127,20 @@ public final class Diagnostics {
           new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, "无采样");
     }
 
-    /** 邻近显形域：显形发包与视锥/射线剔除计数，以及过度显形的抽样统计。 */
+    /**
+     * 邻近显形域：显形发包与视锥/射线剔除计数，以及过度显形的抽样统计。
+     *
+     * <p>{@code rayCulledMissingData} 是 {@code rayCulled} 的<b>子集</b>（上界式归因）：剔除时判定期间
+     * 曾触碰过「无位图数据」的 section。位图判定的缺数据规则是「无数据 = 遮挡」，只有这个子集持续
+     * 偏高才说明是缺数据在憋住显形；≈0 则表示剔除来自真实遮挡。
+     */
     public record Proximity(long revealsSent, long revealsSkipped, long revealsUnregistered,
-        long frustumCulled, long rayCulled, long overRevealSampled, long overRevealWasted) {
+        long frustumCulled, long rayCulled, long rayCulledMissingData, long overRevealSampled,
+        long overRevealWasted) {
 
       /** 邻近显形未启用时的零值兜底。 */
-      public static final Proximity EMPTY = new Proximity(0L, 0L, 0L, 0L, 0L, 0L, 0L);
+      public static final Proximity EMPTY =
+          new Proximity(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     /** 显形索引域：伪装区块索引（按区块共享）与按玩家的已显形集合的持有量与安全阀计数。 */
@@ -123,12 +153,39 @@ public final class Diagnostics {
     }
 
     /**
+     * 异步遮挡域：位图驻留量与专用池队列深度，以及判定计数（提交 / 完成 / 超时丢弃 / 队列满拒收 /
+     * 遮挡数据缺失）与射线累计耗时。
+     *
+     * <p><b>为什么「缺遮挡数据」必须单列</b>：它是「区块没被建过表」的覆盖率观测点——只要它持续偏高，
+     * 就说明大量区块查不到位图（射线一律按不遮挡放行，实体只是少藏、不会误藏）。真机调优时它比
+     * 「隐藏数」更能说明异步路径是否真的覆盖到了玩家周围的区块。
+     *
+     * @param active          异步遮挡是否已真正接线（引擎已起 + 位图仓库可用）；与配置开关不是一回事
+     * @param sectionsResident 当前驻留的遮挡 section 条目总数（跨世界求和）
+     * @param queueDepth      专用池当前排队的判定数（持续接近队列上限说明引擎线程跟不上）
+     * @param patched         方块变更补丁已改写的格数（长时间为 0 而场上确有方块变更 = 补丁没生效）
+     * @param patchFailures   补丁失败（拿不到新方块口径）的格数（这些 section 已降级为未知，属「少藏」方向）
+     */
+    public record Occlusion(boolean active, int sectionsResident, int queueDepth, long submitted,
+        long computed, long timeoutDiscarded, long rejectedQueueFull, long unknownSection,
+        long nanosTotal, long patched, long patchFailures) {
+
+      /** 异步遮挡未接线时的零值兜底。 */
+      public static final Occlusion EMPTY =
+          new Occlusion(false, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+    }
+
+    /**
      * 带宽域：零位移取消、变更合并、实体剔除（含复检与视锥口径）与 AFK / 降视距计数。
      *
+     * @param entityMovePackets       三种实体更新包各自的到达次数（纯位移 / 位移+朝向 / 朝向）
+     * @param entityMoveShapeMismatch 纯位移包因位移字段数不足 3 被放行的次数（布局与预期不符的信号）
      * @param frustumHidden             因「视野锥外 + 超出距离门」被隐藏的实体数（视锥剔除子项）
      * @param frustumShown              转头后经复检恢复的视锥隐藏实体数（视锥剔除子项的恢复侧）
      */
     public record Throttle(long entityPacketsCancelled, long entityPacketsPassed,
+        long entityMovePackets, long entityMoveRotPackets, long entityLookPackets,
+        long entityMoveShapeMismatch,
         long blockMergeBatches, long blockChangesMerged, long blockChangesPassed,
         long entitiesHidden, long entitiesShown, int entitiesHiddenNow,
         long recheckSubmitted, long recheckHidden, long recheckShown,
@@ -139,7 +196,7 @@ public final class Diagnostics {
 
       /** 带宽优化未启用时的零值兜底。 */
       public static final Throttle EMPTY = new Throttle(
-          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L);
+          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     /** 工作线程池域：线程数、活动数与队列占用。 */
@@ -197,7 +254,11 @@ public final class Diagnostics {
         + "（合并 " + s.throttle().blockChangesMerged() + " 个原包）"
         + "｜实体隐藏 " + s.throttle().entitiesHidden() + "/恢复 " + s.throttle().entitiesShown()
         + "（当前隐藏中 " + s.throttle().entitiesHiddenNow() + "）"
+        // 异步遮挡只带最关键的三个量（是否接线 / 队列积压 / 缺数据），避免单行摘要被塞满
         + "｜磁盘缓存命中 " + s.diskCache().hits() + "，条目约 " + s.diskCache().entries()
+        + "｜异步遮挡 " + (s.occlusion().active() ? "已接线" : "未接线")
+        + "（位图 " + s.occlusion().sectionsResident() + "，队列 " + s.occlusion().queueDepth()
+        + "，缺数据 " + s.occlusion().unknownSection() + "）"
         + "｜队列 " + s.pool().queueSize() + "/" + s.pool().queueCapacity();
   }
 
@@ -276,6 +337,7 @@ public final class Diagnostics {
     RevealedSet revealedSet = runtime == null ? null : runtime.revealedSet();
     MikuConfig config = plugin.mikuConfig();
     ThrottleStats throttleStats = pipeline == null ? null : pipeline.stats();
+    OcclusionStats occlusionStats = pipeline == null ? null : pipeline.occlusionStats();
 
     // 各域来源未启用时直接复用空对象，快照构造里不再出现逐字段的「? null : 0」
     RewriteStats rewriteStats = hook == null ? null : hook.stats();
@@ -290,8 +352,8 @@ public final class Diagnostics {
     Snapshot.Proximity proximity = proximityStats == null ? Snapshot.Proximity.EMPTY
         : new Snapshot.Proximity(proximityStats.revealsSent.sum(), proximityStats.revealsSkipped.sum(),
             proximityStats.unregistered.sum(), proximityStats.revealsFrustumCulled.sum(),
-            proximityStats.revealsRayCulled.sum(), proximityStats.overRevealSampled.sum(),
-            proximityStats.overRevealWasted.sum());
+            proximityStats.revealsRayCulled.sum(), proximityStats.revealsRayCulledMissingData.sum(),
+            proximityStats.overRevealSampled.sum(), proximityStats.overRevealWasted.sum());
     Snapshot.Index index = chunkIndex == null && revealedSet == null ? Snapshot.Index.EMPTY
         : new Snapshot.Index(
             chunkIndex == null ? 0 : chunkIndex.chunkCount(),
@@ -302,7 +364,10 @@ public final class Diagnostics {
             revealedSet == null ? 0L : revealedSet.droppedByCapacity());
     Snapshot.Throttle throttle = pipeline == null ? Snapshot.Throttle.EMPTY
         : new Snapshot.Throttle(throttleStats.entityPacketsCancelled.sum(),
-            throttleStats.entityPacketsPassed.sum(), throttleStats.blockMergeBatches.sum(),
+            throttleStats.entityPacketsPassed.sum(),
+            throttleStats.entityMovePackets.sum(), throttleStats.entityMoveRotPackets.sum(),
+            throttleStats.entityLookPackets.sum(), throttleStats.entityMoveShapeMismatch.sum(),
+            throttleStats.blockMergeBatches.sum(),
             throttleStats.blockChangesMerged.sum(), throttleStats.blockChangesPassed.sum(),
             throttleStats.entitiesHidden.sum(), throttleStats.entitiesShown.sum(),
             pipeline.hiddenEntityCount(), throttleStats.recheckSubmitted.sum(),
@@ -335,11 +400,45 @@ public final class Diagnostics {
         rewrite,
         proximity,
         index,
+        occlusionSnapshot(pipeline, occlusionStats),
         throttle,
         poolSnapshot,
         diskCacheSnapshot,
+        chunkAccessorSnapshot(runtime),
         config == null ? null : config.antiXray(),
         config == null ? null : config.bandwidth());
+  }
+
+  /**
+   * 组装区块取数域快照：反矿透未生效时直接复用零值组。
+   *
+   * <p>取真实字段定位状态（{@link ChunkPacketAccessor#accessorState()}）：字段级取数失败会静默
+   * fail-open（放行原包、矿物真实下发），这一状态是「计数正常却仍能透视」的决定性判据，必须如实回显。
+   * 反矿透未生效时即便启动期解析过也不代表当前在用，故按「未解析」兜底。
+   */
+  private static Snapshot.ChunkAccessor chunkAccessorSnapshot(AntiXrayRuntime runtime) {
+    if (runtime == null || !runtime.antiXrayActive()) {
+      return Snapshot.ChunkAccessor.EMPTY;
+    }
+    return new Snapshot.ChunkAccessor(ChunkPacketAccessor.accessorState().label());
+  }
+
+  /**
+   * 组装异步遮挡域快照：未接线（管线未建 / 引擎未起）时直接复用零值组。
+   *
+   * <p>{@code active} 取自「引擎已起 + 位图仓库可用」这一真实接线状态，而非配置开关——两者在
+   * 「反矿透未启用 / 引擎启动失败」时会不一致，回显必须如实反映实际生效情况。
+   */
+  private static Snapshot.Occlusion occlusionSnapshot(ThrottlePipeline pipeline,
+      OcclusionStats stats) {
+    if (pipeline == null || stats == null) {
+      return Snapshot.Occlusion.EMPTY;
+    }
+    return new Snapshot.Occlusion(pipeline.asyncOcclusionActive(),
+        pipeline.occlusionSectionsResident(), pipeline.occlusionQueueDepth(), stats.submitted.sum(),
+        stats.computed.sum(), stats.timeoutDiscarded.sum(), stats.rejectedQueueFull.sum(),
+        stats.unknownSection.sum(), stats.nanosTotal.sum(), stats.patched.sum(),
+        stats.patchFailures.sum());
   }
 
   /** 状态面板格式化（纯函数）。 */
@@ -351,7 +450,10 @@ public final class Diagnostics {
         + "｜ProtocolLib " + (s.env().protocolLibReady() ? "就绪" : "缺失")
         + "｜平台 " + (s.env().folia() ? "Folia" : "Paper/Spigot"));
     lines.add("反矿透：" + (s.env().antiXrayActive() ? "已生效" : "未生效")
-        + "｜直通玩家 " + s.env().bypassPlayers() + " 名");
+        + "｜直通玩家 " + s.env().bypassPlayers() + " 名"
+        // 区块取数字段定位状态必须可见：字段级取数失败会静默 fail-open（放行原包、矿物真实下发），
+        // 只凭「改写计数正常」无法区分「算了但没生效」，此行给出决定性判据（见 Snapshot.ChunkAccessor）。
+        + "｜区块取数=" + s.chunkAccessor().state());
     lines.add("反矿透世界黑名单：" + worldBlacklistSummary(s.antiXray()));
     lines.add("改写缓存：命中 " + s.rewrite().cacheHits() + "，未命中 " + s.rewrite().cacheMisses()
         + "，命中率 " + hitRate(s.rewrite().cacheHits(), s.rewrite().cacheMisses())
@@ -371,7 +473,10 @@ public final class Diagnostics {
     // 只写「跳过」会被误读成「整块跳过为 0 → 整块跳过没生效」，故此处写明「坐标跳过」。
     lines.add("邻近显形：发送 " + s.proximity().revealsSent() + "，坐标跳过 " + s.proximity().revealsSkipped()
         + "，变更注销 " + s.proximity().revealsUnregistered() + "，视锥剔除 " + s.proximity().frustumCulled()
-        + "，射线剔除 " + s.proximity().rayCulled()
+        // 射线剔除后的括号是它的子集口径：位图判定「缺数据 = 遮挡」，只有这里偏高才说明是「没建过表 /
+        // 位图被降级」在憋住显形；≈0 则剔除确实来自真实遮挡（否则「射线剔除很大」无法区分成因）。
+        + "，射线剔除 " + s.proximity().rayCulled() + "（其中缺数据 "
+        + s.proximity().rayCulledMissingData() + "）"
         + "，过度显形（抽样） " + s.proximity().overRevealWasted() + " / 抽样 "
         + s.proximity().overRevealSampled());
     // 口径说明：这里刻意分列「实时坐标数」与「累计登记数」——前者随登出 / 过期 / 区块失效归零，
@@ -399,7 +504,14 @@ public final class Diagnostics {
         + "，积压被拒 " + s.diskCache().rejectedByBacklog()
         + "，异常 " + s.diskCache().errors());
     lines.add("带宽：零位移取消 " + s.throttle().entityPacketsCancelled()
-        + "（放行 " + s.throttle().entityPacketsPassed() + "），合并批次 "
+        // 括号内先给「放行」总数（与旧口径兼容），再给到达口径三分 + 字段形态口径：
+        // 「取消 0」必须能区分「没有纯位移包」「位移从不为 0」「包没到达」「字段布局变了」四种成因，
+        // 否则该功能看起来永远无效而无法定位（见 ThrottleStats 说明）。
+        + "（放行 " + s.throttle().entityPacketsPassed()
+        + "；到达 纯位移 " + s.throttle().entityMovePackets()
+        + "／位移+朝向 " + s.throttle().entityMoveRotPackets()
+        + "／朝向 " + s.throttle().entityLookPackets()
+        + "，字段形态不符 " + s.throttle().entityMoveShapeMismatch() + "），合并批次 "
         + s.throttle().blockMergeBatches()
         // 「个原包」而非「条」：blockChangesMerged 计的是被合并掉的<b>原始封包数</b>（add(held.size())），
         // 与「合并后发出的包数」（= 合并批次）不是一回事，写「条」极易被读成合并结果的条数。
@@ -420,6 +532,18 @@ public final class Diagnostics {
         // 视锥剔除单列：它的失效模式是「转头后实体迟一步出现」，与射线剔除（该看见的被藏）完全不同，
         // 分列后管理员据此判断该不该调大 frustum.min-distance 或关掉该子项。
         + "）｜视锥剔除 隐藏 " + s.throttle().frustumHidden() + "/恢复 " + s.throttle().frustumShown());
+    // 异步遮挡单列：它取代了实体线程上的原生射线，其「是否接线 / 位图覆盖 / 是否积压」与同步路径
+    // 下的口径完全不同，必须独立观测；「缺遮挡数据」持续偏高说明区块没被建表（射线一律放行）。
+    lines.add("异步遮挡：" + (s.occlusion().active() ? "已接线" : "未接线（走同步原生射线）")
+        + "｜位图 section " + s.occlusion().sectionsResident()
+        + "，队列 " + s.occlusion().queueDepth()
+        + "｜判定 提交 " + s.occlusion().submitted() + "，完成 " + s.occlusion().computed()
+        + "，超时丢弃 " + s.occlusion().timeoutDiscarded()
+        + "，队列满拒收 " + s.occlusion().rejectedQueueFull()
+        + "，缺遮挡数据 " + s.occlusion().unknownSection()
+        + " 次，方块补丁 " + s.occlusion().patched() + " 格（失败 " + s.occlusion().patchFailures()
+        + " 格）"
+        + "，射线耗时 " + formatMillis(s.occlusion().nanosTotal()) + " ms");
     lines.add("带宽：AFK 玩家 " + s.throttle().afkPlayers() + "（累计进入 " + s.throttle().afkEntered()
         + "），AFK 丢包 " + s.throttle().afkPacketsDropped() + "，降视距 " + s.throttle().viewDistanceReduced()
         + "/还原 " + s.throttle().viewDistanceRestored());
@@ -489,7 +613,12 @@ public final class Diagnostics {
       return "带宽开关：配置未加载";
     }
     return "带宽开关：总开关 " + c.enabled()
+        // 零位移取消必须同时回显「行为开关」：只打模块总开关时，把 skip-zero-movement 配成 false
+        // 会显示成「零位移取消 true」，而实际一个包都不会取消（且「放行」计数也不再增长，
+        // 因为提前返回不做计数）——正是「看起来在生效但毫无效果」的经典误读场景。
         + "｜零位移取消 " + c.entityPackets().enabled()
+        + (c.entityPackets().enabled()
+            ? "（skip-zero-movement " + c.entityPackets().skipZeroMovement() + "）" : "")
         + "｜变更合并 " + c.blockChanges().enabled()
         + "｜调色板压缩 " + paletteSwitch(c.palette())
         + "｜实体剔除 " + entityCullingSwitch(c.entityCulling())

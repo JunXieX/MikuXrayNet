@@ -6,6 +6,8 @@ import com.comphenix.protocol.ProtocolManager;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import org.bukkit.plugin.Plugin;
 
 /**
@@ -69,6 +71,15 @@ public final class ThrottlePipeline {
   private final Plugin plugin;
   private final BandwidthConfig config;
   private final ThrottleStats stats;
+  /**
+   * 异步遮挡数据仓库注册表（由反矿透侧持有、随反矿透启用而建）；未启用时为 {@code null}。
+   *
+   * <p>管线只做一次「转交」：实体剔除模块据它创建专用池引擎。两个构造默认给 {@code null}
+   * （离线单测与「未接线」场景），因此不会有任何半接线状态。
+   */
+  private final OcclusionStores occlusionStores;
+  /** 异步遮挡计数（插件级唯一，跨热重载复用；未接线时不影响任何行为）。 */
+  private final OcclusionStats occlusionStats;
 
   private EntityPacketFilter entityPacketFilter;
   private BlockChangeMerger blockChangeMerger;
@@ -82,19 +93,32 @@ public final class ThrottlePipeline {
     this(plugin, config, new ThrottleStats());
   }
 
-  /**
-   * 装配方注入统计持有者的构造。
-   *
-   * <p><b>为什么要把 {@link ThrottleStats} 与管线解耦</b>：热重载会 {@code stop()} 旧管线、再以新配置
-   * 重建一个新管线。若统计仍由管线自己 new，则每次 reload 计数都归零，「累计取消／合并／隐藏」等
-   * 计数失去连续性（管理员会误以为功能刚上线或计数丢失）。因此由插件持有唯一的统计实例、传入管线，
-   * 管线重建后统计照常累计，{@code /mxnet status} 字段语义不变。
-   */
+  /** 未接线异步遮挡的构造（离线单测 / 反矿透未启用）：实体剔除走同步原生射线。 */
   public ThrottlePipeline(Plugin plugin, BandwidthConfig config, ThrottleStats stats) {
+    this(plugin, config, stats, null, null);
+  }
+
+  /**
+   * 生产装配构造：追加「异步遮挡数据仓库 + 计数」。
+   *
+   * @param occlusionStores 反矿透侧按世界分域的遮挡位图仓库；{@code null} = 未启用（回落同步射线）
+   * @param occlusionStats  异步遮挡计数（插件级唯一实例，跨热重载复用）
+   */
+  public ThrottlePipeline(Plugin plugin, BandwidthConfig config, ThrottleStats stats,
+      OcclusionStores occlusionStores, OcclusionStats occlusionStats) {
     this.plugin = plugin;
     this.config = config;
     this.stats = stats == null ? new ThrottleStats() : stats;
+    this.occlusionStores = occlusionStores;
+    this.occlusionStats = occlusionStats == null ? new OcclusionStats() : occlusionStats;
   }
+
+  /**
+   * <b>为什么要把 {@link ThrottleStats} 与管线解耦</b>（上面 3 参构造的由来）：热重载会 {@code stop()}
+   * 旧管线、再以新配置重建一个新管线。若统计仍由管线自己 new，则每次 reload 计数都归零，「累计取消／
+   * 合并／隐藏」等计数失去连续性（管理员会误以为功能刚上线或计数丢失）。因此由插件持有唯一的统计实例、
+   * 传入管线，管线重建后统计照常累计，{@code /mxnet status} 字段语义不变。异步遮挡计数同理由插件持有。
+   */
 
   /** 装配全部子模块；总开关关闭时不做任何事。 */
   public void start() {
@@ -147,8 +171,15 @@ public final class ThrottlePipeline {
           ? "block-changes.merge" : "block-changes.enabled");
     }
     if (plan.entityCulling()) {
+      BandwidthConfig.EntityCulling.AsyncOcclusion async = config.entityCulling().asyncOcclusion();
+      if (async != null && async.enabled() && occlusionStores == null) {
+        // 明确告知「开关开了但没生效」：异步遮挡的数据源来自反矿透解码旁路，
+        // 反矿透未启用（或未启用该子项）时没有位图，本模块只能回退同步原生射线。
+        plugin.getLogger().warning("异步遮挡已在配置中开启，但反矿透未建遮挡位图（antixray 未启用或"
+            + "未开启该建表）：实体剔除已回退为同步原生射线（行为与未开启异步时一致）");
+      }
       entityCuller = register(
-          () -> new EntityCuller(plugin, config.entityCulling(), stats),
+          () -> new EntityCuller(plugin, config.entityCulling(), stats, occlusionStores, occlusionStats),
           EntityCuller::start, EntityCuller::stop);
     } else {
       logDisabled("实体剔除（射线遮挡 / 视锥剔除）", config.entityCulling().enabled()
@@ -206,6 +237,37 @@ public final class ThrottlePipeline {
   public int hiddenEntityCount() {
     EntityCuller culler = entityCuller;
     return culler == null ? 0 : culler.hiddenCount();
+  }
+
+  /**
+   * 异步遮挡是否已真正接线（引擎已起 + 位图仓库可用）；未接线时为 {@code false}。
+   *
+   * <p>与「配置里开了」不是一回事：反矿透未启用、或引擎启动失败时本值为 false，诊断据此如实回显。
+   */
+  public boolean asyncOcclusionActive() {
+    EntityCuller culler = entityCuller;
+    return culler != null && culler.asyncOcclusionActive();
+  }
+
+  /** 异步遮挡专用池当前排队的判定数（诊断用）；未接线时为 0。 */
+  public int occlusionQueueDepth() {
+    EntityCuller culler = entityCuller;
+    return culler == null ? 0 : culler.occlusionQueueDepth();
+  }
+
+  /** 当前驻留的遮挡 section 条目总数（诊断用；跨世界求和，未接线时为 0）。 */
+  public int occlusionSectionsResident() {
+    OcclusionStores stores = occlusionStores;
+    return stores == null ? 0 : stores.residentSections();
+  }
+
+  /**
+   * 异步遮挡计数容器（供诊断读取；未接线时也返回实例，其计数保持为 0）。
+   *
+   * <p>与 {@link #stats()} 一样是插件级唯一实例，跨热重载复用。
+   */
+  public OcclusionStats occlusionStats() {
+    return occlusionStats;
   }
 
   /**

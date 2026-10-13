@@ -53,8 +53,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** 未配对的批次闸门数量上限（异常情况下防止无界增长）。 */
   private static final int MAX_PENDING_BATCHES = 256;
 
-  /** 缓存值：源字节指纹 + 改写结果（不含任何封包或世界引用）。 */
-  private record CachedChunk(long sourceHash, byte[] data, int[] positions) {
+  /**
+   * 缓存值：源字节指纹 + 改写结果（不含任何封包或世界引用）。
+   *
+   * <p>{@code occlusion} 为<b>整列遮挡数据负载</b>（见 {@code occlusion.OcclusionPayload}；未启用异步实体
+   * 遮挡时为 {@code null}）。随缓存一起保存，使<b>缓存命中路径</b>（不经解码）也能恢复遮挡数据。
+   */
+  private record CachedChunk(long sourceHash, byte[] data, int[] positions, byte[] occlusion) {
   }
 
   /**
@@ -557,6 +562,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         }
 
         if (cached != null) {
+          // 缓存命中路径不解码，遮挡位图只能来自随负载一起缓存的副本（方案 b）：
+          // 未启用该功能时 occlusion 为 null、restoreOcclusion 为 no-op，零开销。
+          processor.restoreOcclusion(cached.occlusion(), task.worldName(), task.chunkX(),
+              task.minHeight() >> 4, task.chunkZ());
           writeBack(accessor, task, cached.data(), cached.positions(), current, playerId);
         } else {
           rewrite(task, accessor, source, sourceHash, neighbors, fingerprint, current, playerId);
@@ -599,7 +608,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         stats.diskPayloadRejected.increment();
         return null;
       }
-      CachedChunk fromDisk = new CachedChunk(decoded.sourceHash(), decoded.data(), decoded.positions());
+      CachedChunk fromDisk = new CachedChunk(decoded.sourceHash(), decoded.data(),
+          decoded.positions(), decoded.occlusion());
       cache.put(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint, fromDisk);
       return fromDisk;
     } catch (Throwable throwable) {
@@ -620,7 +630,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // min-y/max-y 过滤与分区伪装表需要把 section 内相对 Y 换算成绝对 Y。
     ObfuscationProcessor.Result result = processor.rewrite(source, task.sectionCount(),
         seed(task.worldName(), task.chunkX(), task.chunkZ()), neighbors,
-        task.worldName(), task.dimension(), task.minHeight());
+        task.worldName(), task.dimension(), task.minHeight(), task.chunkX(), task.chunkZ());
 
     if (result.failed()) {
       // 解码/重编码异常：必须可观测——否则「本该伪装却失败」会被并进「跳过」里，看起来一切正常。
@@ -656,16 +666,18 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     logFirstRewriteDiagnostic(task, source, result);
 
     if (resultCacheable(result)) {
-      CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions());
+      CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions(),
+          result.occlusion());
       cache.put(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint, value);
       if (diskCache != null) {
         // 写入是「提交即返回」的异步操作（自有磁盘线程），不阻塞本工作线程。
         // 用惰性负载重载：先按编码后的长度判定容量，通过后才真正编码——编码要分配并整块拷贝
         // 改写后的区块字节（几十~几百 KB），被拒时（条目达上限 / 磁盘线程积压）这次拷贝纯属浪费。
-        // 负载里带上被伪装坐标，磁盘缓存命中时才能重新写入显形索引（见 DiskPayload）。
+        // 负载里带上被伪装坐标（命中时重新写入显形索引）与整列遮挡数据（命中时恢复遮挡仓库）。
         diskCache.put(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint,
-            DiskPayload.encodedLength(result.obfuscatedPositions(), result.data()),
-            () -> DiskPayload.encode(sourceHash, result.obfuscatedPositions(), result.data()));
+            DiskPayload.encodedLength(result.obfuscatedPositions(), result.occlusion(), result.data()),
+            () -> DiskPayload.encode(sourceHash, result.obfuscatedPositions(), result.occlusion(),
+                result.data()));
       }
     }
     // 失败结果：data == source 且伪装位置为空 → writeBack 直接返回，原包照常下发（fail-open 语义不变）。

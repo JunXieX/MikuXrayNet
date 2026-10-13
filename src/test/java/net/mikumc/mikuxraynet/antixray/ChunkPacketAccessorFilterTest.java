@@ -2,13 +2,20 @@ package net.mikumc.mikuxraynet.antixray;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.ArrayList;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link ChunkPacketAccessor} 纯判定函数测试：remove-block-entities 开关的汇合点与
- * 方块实体剔除的坐标匹配规则（离线无法构造真实区块封包，故只测纯函数缝）。
+ * {@link ChunkPacketAccessor} 纯判定函数测试：remove-block-entities 开关的汇合点、方块实体剔除的坐标匹配规则，
+ * 以及字段定位 {@link ChunkPacketAccessor#locate(Class)} 的三类失效语义（fail-open / 降级 / 跳过）。
+ *
+ * <p>真实区块封包与 NMS 类离线不可得，故用与 NMS 同构的合成类驱动字段定位（{@code locate(Class)} 这条测试缝），
+ * 其余只测纯函数。
  */
 class ChunkPacketAccessorFilterTest {
 
@@ -165,5 +172,89 @@ class ChunkPacketAccessorFilterTest {
     assertFalse(ChunkPacketAccessor.isObfuscated(2, 0, 0, sorted), "y 不在清单不得命中");
     assertFalse(ChunkPacketAccessor.isObfuscated(9, 15, 14, sorted), "x 不同不得命中");
     assertFalse(ChunkPacketAccessor.isObfuscated(-1, 0, 0, sorted), "相对 Y 为负必须短路返回 false");
+  }
+
+  // ---- 字段定位（locate(Class)）：三类失效必须「可见且安全」——fail-open / 降级 / 跳过，绝不猜着应用 ----
+
+  /** 与 NMS 区块数据类同构的合成类：{@code byte[] buffer} + {@code List<块实体>}(packedXZ/y)。 */
+  private static final class FullChunkData {
+    private final byte[] buffer = new byte[0];
+    private final List<Entry> blockEntitiesData = new ArrayList<>();
+
+    static final class Entry {
+      private byte packedXZ;
+      private short y;
+    }
+  }
+
+  /** 只有 {@code byte[]}、没有方块实体列表字段：应降级为「不剔除方块实体」。 */
+  private static final class BufferOnlyChunkData {
+    private final byte[] buffer = new byte[0];
+  }
+
+  /** 方块实体条目的坐标字段「名字命中但类型不符」：必须放弃定位，绝不猜着应用。 */
+  private static final class WrongCoordTypesChunkData {
+    private final byte[] buffer = new byte[0];
+    private final List<WrongEntry> blockEntitiesData = new ArrayList<>();
+
+    static final class WrongEntry {
+      private String packedXZ;
+      private String y;
+    }
+  }
+
+  /** 连 {@code byte[]} 字段都没有：定位不到区块字节 → 返回 null，调用方 fail-open 放行原包。 */
+  private static final class NoBufferChunkData {
+    private final List<Object> blockEntitiesData = new ArrayList<>();
+  }
+
+  /** 字段齐全时必须构建出字段计划（buffer + 列表 + packedXZ + y 全命中），映射为 READY。 */
+  @Test
+  void fieldPlanResolvesFullyWhenAllFieldsPresent() {
+    ChunkPacketAccessor.FieldPlan plan = ChunkPacketAccessor.locate(FullChunkData.class);
+
+    assertNotNull(plan, "字段齐全时必须构建出字段计划");
+    assertNotNull(plan.buffer(), "区块字节字段必须命中");
+    assertTrue(plan.blockEntityFilterReady(), "方块实体列表 + packedXZ + y 必须齐全");
+    assertEquals(ChunkPacketAccessor.AccessorState.READY, ChunkPacketAccessor.stateOf(plan),
+        "全命中必须映射为「字段级取数(全命中)」");
+  }
+
+  /**
+   * 区块字节字段定位不到时 {@code locate} 必须返回 {@code null}（调用方 fail-open 放行原包）：
+   * 绝不抛异常，也绝不退回「解析 (FriendlyByteBuf,int,int) 构造器」那条会在 26.3 上 clinit 崩溃的路径。
+   */
+  @Test
+  void missingBufferFieldYieldsNullPlanForFailOpen() {
+    assertNull(ChunkPacketAccessor.locate(NoBufferChunkData.class),
+        "定位不到区块字节字段必须返回 null（调用方据此 fail-open 放行原包）");
+    assertEquals(ChunkPacketAccessor.AccessorState.UNAVAILABLE,
+        ChunkPacketAccessor.stateOf(null), "无字段计划必须映射为「不可用(放行原包)」");
+  }
+
+  /** 缺方块实体列表字段 → 降级为「不剔除方块实体」（而不是抛异常，也不影响字节改写）。 */
+  @Test
+  void missingBlockEntityFieldDegradesInsteadOfThrowing() {
+    ChunkPacketAccessor.FieldPlan plan = ChunkPacketAccessor.locate(BufferOnlyChunkData.class);
+
+    assertNotNull(plan, "buffer 可用时必须构建计划，不因缺方块实体字段而抛异常");
+    assertNull(plan.blockEntities(), "缺方块实体列表字段时该访问器为 null");
+    assertFalse(plan.blockEntityFilterReady(), "缺方块实体字段必须降级（不剔除方块实体）");
+    assertEquals(ChunkPacketAccessor.AccessorState.DEGRADED, ChunkPacketAccessor.stateOf(plan));
+    assertFalse(ChunkPacketAccessor.shouldRemoveBlockEntities(true, true, new int[] {1}, false),
+        "降级后即便写回已确认、开关开启、有坐标，也绝不剔除方块实体");
+  }
+
+  /** 坐标字段「名字命中但类型不符」→ 放弃定位、整体跳过剔除，绝不猜着应用。 */
+  @Test
+  void mismatchedCoordinateFieldTypesDegradeInsteadOfGuessing() {
+    ChunkPacketAccessor.FieldPlan plan =
+        ChunkPacketAccessor.locate(WrongCoordTypesChunkData.class);
+
+    assertNotNull(plan, "buffer 与列表可用时仍应构建计划");
+    assertNull(plan.blockEntityPackedXz(), "packedXZ 名称命中但类型不符必须放弃定位");
+    assertNull(plan.blockEntityY(), "y 名称命中但类型不符同样放弃");
+    assertFalse(plan.blockEntityFilterReady(), "坐标字段形态不符必须整体跳过剔除（不猜着应用）");
+    assertEquals(ChunkPacketAccessor.AccessorState.DEGRADED, ChunkPacketAccessor.stateOf(plan));
   }
 }

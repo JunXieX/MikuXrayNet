@@ -35,7 +35,7 @@ class RevealMarkOrderingTest {
   private final RevealedSet revealed =
       new RevealedSet(1_000_000, 300 * SECOND_NANOS, () -> clock[0]);
   private final ProximityRevealer revealer = new ProximityRevealer(null, config(), index,
-      revealed, new ProximityStats(), null, null);
+      revealed, new ProximityStats(), null, null, null);
 
   private static AntiXrayConfig config() {
     return AntiXrayConfig.from(yaml("enabled: true\n"));

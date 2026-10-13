@@ -3,7 +3,6 @@ package net.mikumc.mikuxraynet.cache;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 import java.util.zip.DataFormatException;
@@ -17,7 +16,7 @@ import java.util.zip.Inflater;
  * <p><b>文件布局</b>
  * <pre>
  *   偏移 0     : 魔数 u64 = MAGIC
- *   偏移 8     : 版本 u8 = 0x05
+ *   偏移 8     : 版本 u8 = 0x06（见 {@link #VERSION}；低于它的旧版本一律拒绝）
  *   偏移 9     : 压缩方案 u8（0x01 = Deflate 历史格式；0x02 = Zstd 当前写入，见下）
  *   偏移 10    : 校验种子 i32（默认 0x0721）
  *   偏移 14    : 1024 × u64 槽位偏移表（每个槽位 = 一个区块，共 1024 个区块 = 32×32）
@@ -29,10 +28,12 @@ import java.util.zip.Inflater;
  * 校验和为 {@link XXHash32}（与格式头种子一致）。
  *
  * <p><b>版本历史</b>：{@code 0x03} 为初版；{@code 0x04} 起明确「负载信封必须携带被伪装坐标清单」
- * （见 {@code DiskPayload}：{@code [i64 指纹][i32 坐标数][i32×N 坐标][区块字节]}），
- * 否则磁盘缓存命中的区块不会进入显形索引；{@code 0x05} 把原来的「64 槽位一个桶」改为
- * <b>「一个槽位一条记录」</b>（见 {@link #BUCKET_SHIFT}），消除「改 1 个区块 = 重压缩整桶 64 槽」
- * 的写放大。读取任何低于当前版本的旧文件时明确拒绝并（只提示一次）由调用方删除重建，
+ * （见 {@code DiskPayload}），否则磁盘缓存命中的区块不会进入显形索引；{@code 0x05} 把原来的
+ * 「64 槽位一个桶」改为<b>「一个槽位一条记录」</b>（见 {@link #BUCKET_SHIFT}），消除「改 1 个区块 =
+ * 重压缩整桶 64 槽」的写放大；{@code 0x06} 在负载信封里追加「整列遮挡数据负载」
+ * （见 {@code occlusion.OcclusionPayload}），使<b>缓存命中的区块</b>也能恢复异步实体遮挡所需的位图
+ * （位图只在解码时生成，命中路径不解码——不带它则命中区块永无遮挡数据）。
+ * 读取任何低于当前版本的旧文件时明确拒绝并（只提示一次）由调用方删除重建，
  * 避免复用与当前信封/布局约定不一致的历史条目。
  *
  * <p><b>压缩方案（偏移 9 的那个字节）</b>：该字节在文件<b>创建时</b>确定，并决定整个文件里所有 bucket
@@ -79,8 +80,8 @@ public final class BufferedLinearV3Format {
   /** 文件魔数。 */
   public static final long MAGIC = 0xFFFFDFF7EDDAFD97L;
 
-  /** 格式版本（槽位粒度记录 + 负载信封携带伪装坐标）。 */
-  public static final byte VERSION = 0x05;
+  /** 格式版本（槽位粒度记录 + 负载信封携带伪装坐标与整列遮挡数据）。 */
+  public static final byte VERSION = 0x06;
 
   /** 压缩方案：JDK Deflater（历史格式，仅用于读取旧文件）。 */
   public static final byte COMPRESSION_DEFLATE = 0x01;
@@ -197,7 +198,8 @@ public final class BufferedLinearV3Format {
     if (version < VERSION && LEGACY_VERSION_WARNED.compareAndSet(false, true)) {
       LOGGER.warning("检测到旧版磁盘缓存格式（0x" + Integer.toHexString(version & 0xFF)
           + "）：当前格式为 0x" + Integer.toHexString(VERSION & 0xFF)
-          + "（槽位粒度记录；0x04 及以前是「64 槽一桶」的整桶追加布局）。"
+          + "（槽位粒度记录，负载信封携带伪装坐标与整列遮挡数据；0x04 及以前是「64 槽一桶」的整桶追加布局，"
+          + "0x05 的负载信封不带遮挡数据）。"
           + "旧文件将被拒绝并删除重建（缓存只是可选加速，不影响封包链路，也绝不影响反矿透本身）");
     }
   }

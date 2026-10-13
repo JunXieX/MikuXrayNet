@@ -108,16 +108,16 @@ class ProximitySelectorTest {
 
   // ---------------------------------------------------------------- 打包默认值的安全保证（真机回归）
 
-  /** 打包 antixray.yml 的视锥默认值：竖直全角 110°、16 格内豁免。 */
-  private static final double PACKED_FOV = AntiXrayConfig.FRUSTUM_FOV_FLOOR;
-  private static final double PACKED_MIN_DISTANCE = AntiXrayConfig.FRUSTUM_MIN_DISTANCE_FLOOR;
+  /** 打包 antixray.yml 的视锥默认值：竖直全角 120°、24 格内豁免。 */
+  private static final double PACKED_FOV = AntiXrayConfig.FRUSTUM_FOV_DEFAULT;
+  private static final double PACKED_MIN_DISTANCE = AntiXrayConfig.FRUSTUM_MIN_DISTANCE_DEFAULT;
 
   /**
    * 真机回归：站在黑曜石门正前方时，「门的上半部分」在 3 格距离上就有 40° 以上的仰角。
    *
    * <p>旧默认（fov=80 / min-distance=4）会把它们判为视锥外 → 不发包也不记已显形 → 玩家看到的
    * 一直是伪装方块，直到点一下/挖一下（事件显形不做视锥判定）才变回来。
-   * 打包默认值下，16 格内的任何方向都必须保留，因此这类「看得见却是假的」不再发生。
+   * 打包默认值下，24 格内的任何方向都必须保留，因此这类「看得见却是假的」不再发生。
    */
   @Test
   void packedDefaultsKeepBlocksInFrontOfThePlayer() {
@@ -125,17 +125,17 @@ class ProximitySelectorTest {
 
     // 门顶部：前方 3 格、比眼睛高 3 格（仰角约 45°）——旧配置在这里被剔除
     assertTrue(ProximitySelector.withinFrustum(eye, 0, 69, 3, PACKED_MIN_DISTANCE, PACKED_FOV),
-        "眼前 3 格、仰角约 45° 的门顶必须保留（16 格内一律豁免视锥）");
+        "眼前 3 格、仰角约 45° 的门顶必须保留（24 格内一律豁免视锥）");
     assertTrue(ProximitySelector.withinFrustum(eye, -4, 68, 2, PACKED_MIN_DISTANCE, PACKED_FOV),
         "近处侧上方同样保留");
     assertTrue(ProximitySelector.withinFrustum(eye, 0, 66, -8, PACKED_MIN_DISTANCE, PACKED_FOV),
-        "16 格内的背后/脚下也豁免（贴脸不管朝向都必须显形）");
+        "24 格内的背后/脚下也豁免（贴脸不管朝向都必须显形）");
     assertTrue(ProximitySelector.withinFrustum(eye, 3, 64, 14, PACKED_MIN_DISTANCE, PACKED_FOV),
         "水平偏 12° 左右、14 格远仍在锥内");
   }
 
   /**
-   * 默认 110° 覆盖「客户端 FOV 上限 110 + 16:9」的整个可视区：竖直 55°、水平约 68°。
+   * 默认 120° 覆盖「客户端 FOV 上限 110 + 16:9」的整个可视区：竖直 60°、水平约 72°。
    *
    * <p>即：客户端的 FOV 无论怎么调，玩家屏幕上的方块都不会被误剔；更宽的屏幕见 yml 注释。
    */
@@ -143,15 +143,15 @@ class ProximitySelectorTest {
   void packedFovCoversClientMaximumFieldOfView() {
     ProximitySelector.Eye eye = facingPositiveZ();
 
-    // 仰角约 50°（与视线俯仰之差 50° > 旧默认的竖直半角 40°，但在新的 55° 内）→ 必须在锥内
+    // 仰角约 50°（与视线俯仰之差 50° > 旧默认的竖直半角 40°，但在新的 60° 内）→ 必须在锥内
     assertTrue(ProximitySelector.withinFrustum(eye, 0, 90, 22, PACKED_MIN_DISTANCE, PACKED_FOV),
-        "仰角约 50° 在 55° 半角内（客户端 FOV=100 时屏幕顶部可见）");
+        "仰角约 50° 在 60° 半角内（客户端 FOV=100 时屏幕顶部可见）");
     // 水平约 65°（16:9 客户端 FOV=110 时屏幕侧边；旧默认的水平半角是 56°）→ 必须在锥内
     assertTrue(ProximitySelector.withinFrustum(eye, 43, 64, 20, PACKED_MIN_DISTANCE, PACKED_FOV),
-        "水平约 65° 在 68° 半角内（16:9、FOV=110 的屏幕边缘）");
-    // 远超客户端可视范围（水平约 84°）→ 仍然剔除（视锥的省流作用保留）
-    assertFalse(ProximitySelector.withinFrustum(eye, 20, 64, 2, PACKED_MIN_DISTANCE, PACKED_FOV),
-        "水平约 84° 超出 68° 半角，仍应剔除（侧后方继续省流）");
+        "水平约 65° 在 72° 半角内（16:9、FOV=110 的屏幕边缘）");
+    // 远超客户端可视范围（水平约 85°、且已超出 24 格豁免）→ 仍然剔除（视锥的省流作用保留）
+    assertFalse(ProximitySelector.withinFrustum(eye, 60, 64, 6, PACKED_MIN_DISTANCE, PACKED_FOV),
+        "水平约 85° 超出 72° 半角，仍应剔除（侧后方继续省流）");
   }
 
   @Test
@@ -444,6 +444,29 @@ class ProximitySelectorTest {
     assertEquals(0, ProximitySelector.exposedFaces(0, 64, 5, allSolid), "六面全遮挡 = 无暴露面");
     assertFalse(ProximitySelector.isVisible(eye, 0, 64, 5, allSolid, SAMPLES, probe(eye, allSolid)),
         "完全掩埋的方块必须判为不可见（绝不能隔着墙还原）");
+  }
+
+  /**
+   * <b>判定失败的方向</b>（用户明确要求「尽可能保证玩家可见性」）：射线探针抛异常时按「通畅」处理，
+   * 即<b>显形</b>。
+   *
+   * <p>取舍：漏显形会让玩家对着假石头挖矿（体验直接受损），多还原一块只是少一个伪装方块。
+   * 注意这与「六面全掩埋 → 不显形」不冲突——后者是<b>确定性结论</b>（掩埋方块从任何方向都看不到），
+   * 不是「无法判定」，因此与探针是否异常无关。
+   */
+  @Test
+  void probeExceptionIsTreatedAsClearSoTheOreIsRevealed() {
+    ProximitySelector.Eye eye = standingEye();
+    ProximitySelector.RayProbe throwing = (x, y, z) -> {
+      throw new IllegalStateException("模拟射线探针失败");
+    };
+
+    assertTrue(ProximitySelector.isVisible(eye, 1, 64, 20, LONG_TUNNEL, SAMPLES, throwing),
+        "探针异常时必须按「通畅」处理（偏显形）：绝不因偶发异常让玩家对着假石头挖矿");
+
+    ProximitySelector.RayQuery allSolid = (x, y, z) -> true;
+    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 5, allSolid, SAMPLES, throwing),
+        "「六面全掩埋」是确定性结论、无暴露面可用，与探针是否异常无关，仍必须判不可见");
   }
 
   /** <b>红线</b>：完全被 2 格厚石墙挡住的矿石仍必须判为不可见。 */

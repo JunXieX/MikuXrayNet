@@ -59,7 +59,13 @@ public final class ReloadCoordinator {
       "AFK 降级（判定时长/丢弃距离/包类型）",
       "高延迟降视距（阈值/幅度/下限/巡检周期）",
       "带宽全部子模块（零位移/变更合并/实体剔除）",
+      // 异步遮挡的调优键随「停旧管线、建新管线」即时生效（新管线会按新配置重建引擎与线程池）。
+      // 注意「开关本身」不在此列，见 RESTART_REQUIRED。
+      "实体剔除异步遮挡调优（occlusion-time-budget-ms / occlusion-threads / max-occluding-blocks / "
+          + "occlusion-timeout-cycles / occlusion-hysteresis-cycles）",
       "平台判定（advanced.platform，会重新判定并按新分支重建周期任务）",
+      // diagnostics.interval-seconds 参与带宽侧指纹，且 restartPeriodicTasks 会重建摘要任务（0 = 关闭）。
+      "周期诊断摘要间隔（diagnostics.interval-seconds，0 = 关闭）",
       "两份配置文件的读取值");
 
   /** 需要重启服务端才生效的配置项（在启动期已固化的部分）。 */
@@ -78,7 +84,10 @@ public final class ReloadCoordinator {
           + "idle-close-seconds / maintenance-interval-seconds / compact-per-pass / queue-capacity / zstd.*）",
       // occlusion.* 虽参与指纹（改后旧缓存会一次性失效重建），但运行期用于判定的遮挡表由 PacketEventsHook
       // 在启动期一次性构建，reload 不会重建它——改了只有重启才真正生效。
-      "遮挡规则表（occlusion.extra-occluding / extra-non-occluding / fluid-cover）");
+      "遮挡规则表（occlusion.extra-occluding / extra-non-occluding / fluid-cover）",
+      // 异步遮挡「开关本身」必须重启：遮挡位图仓库（OcclusionStores）在 startAntiXray 时按该键一次性创建，
+      // reload 只重建带宽管线、拿不到反矿透侧那座仓库——开了也只会打一次中文 WARN 后回落同步原生射线。
+      "实体剔除异步遮挡开关（entity-culling.async-occlusion）");
 
   /**
    * 执行一次热重载。

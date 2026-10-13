@@ -248,17 +248,17 @@ class ProtocolLibAsyncListenerBatchTest {
   @Test
   void failedResultIsNeverCacheable() {
     ObfuscationProcessor.Result failed =
-        new ObfuscationProcessor.Result(new byte[] {1}, new int[0], "boom", null);
+        new ObfuscationProcessor.Result(new byte[] {1}, new int[0], "boom", null, null);
     assertTrue(failed.failed());
     assertFalse(ProtocolLibAsyncListener.resultCacheable(failed),
         "失败结果不得写入任何一级缓存（否则瞬时故障被固化，同指纹区块不再重试改写）");
 
     ObfuscationProcessor.Result unchanged =
-        new ObfuscationProcessor.Result(new byte[] {1}, new int[0], null, null);
+        new ObfuscationProcessor.Result(new byte[] {1}, new int[0], null, null, null);
     assertTrue(ProtocolLibAsyncListener.resultCacheable(unchanged), "未改动结果照常可缓存");
 
     ObfuscationProcessor.Result changed =
-        new ObfuscationProcessor.Result(new byte[] {2}, new int[] {1}, null, null);
+        new ObfuscationProcessor.Result(new byte[] {2}, new int[] {1}, null, null, null);
     assertTrue(ProtocolLibAsyncListener.resultCacheable(changed), "改写结果照常可缓存");
   }
 }

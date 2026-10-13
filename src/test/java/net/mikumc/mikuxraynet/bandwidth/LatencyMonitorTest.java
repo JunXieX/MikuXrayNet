@@ -147,6 +147,31 @@ class LatencyMonitorTest {
     assertEquals(12, state.view, "整轮降级+还原后 view-distance 仍为 12");
   }
 
+  /**
+   * send 视距从未单独设置过（{@code getSendViewDistance()} 返回 -1）时：
+   * 降级基线必须取生效视距 {@code getViewDistance()}，否则 {@code -1 <= floor} 会直接 return、
+   * 模块对绝大多数玩家形同虚设；同时记录/还原仍写回原始 raw（-1），保持「还原回服务端默认」语义。
+   */
+  @Test
+  void unsetSendViewDistanceUsesEffectiveBaselineAndRestoresRaw() throws Exception {
+    LatencyMonitor monitor = new LatencyMonitor(stubPlugin(), config(2, 4), new ThrottleStats());
+    PlayerState state = new PlayerState();
+    state.send = -1; // 从未单独设置过 send 视距
+    state.view = 12; // 生效视距
+    Player player = stubPlayer(state);
+
+    invoke(monitor, "reduce", player);
+    assertEquals(List.of("10"), state.sendSets,
+        "send 未设置(-1)时必须以生效视距 12 为基线并确实降级到 10（不得因 -1 而跳过）");
+    assertTrue(state.viewSets.isEmpty(),
+        "降级绝不能调用 setViewDistance（该类只触碰 send 视距）");
+
+    invoke(monitor, "restore", player);
+    assertEquals(List.of("10", "-1"), state.sendSets,
+        "还原必须写回原始 raw(-1 = 回到服务端默认)，而不是生效视距 12");
+    assertTrue(state.viewSets.isEmpty(), "还原也绝不能触碰 view-distance");
+  }
+
   /** 目标超过 view-distance 时钳到合法范围（不能让它抛异常），仍只写 send 视距。 */
   @Test
   void targetIsClampedToViewDistance() throws Exception {

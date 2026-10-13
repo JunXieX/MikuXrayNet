@@ -8,6 +8,7 @@ import net.mikumc.mikuxraynet.antixray.BlockChangeRevealListener;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
+import net.mikumc.mikuxraynet.antixray.OcclusionPatchListener;
 import net.mikumc.mikuxraynet.antixray.ProximityRevealer;
 import net.mikumc.mikuxraynet.antixray.ProximityStats;
 import net.mikumc.mikuxraynet.antixray.RevealedSet;
@@ -22,6 +23,9 @@ import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.config.MikuConfig;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import org.bukkit.Bukkit;
@@ -57,12 +61,34 @@ public final class AntiXrayRuntime {
   private volatile RevealedSet revealedSet;
   private ProximityStats proximityStats;
   private DiskCacheStore diskCacheStore;
+  /**
+   * 异步实体遮挡的遮挡数据仓库（按世界分域）；{@code entity-culling.async-occlusion=false} 时为
+   * {@code null}（零开销）。
+   *
+   * <p>由反矿透解码工作线程持续写入（见 {@code ObfuscationProcessor#captureOcclusion}），
+   * 由带宽侧的异步遮挡引擎只读消费（见 {@code bandwidth.ThrottlePipeline}）。
+   *
+   * <p><b>为什么按世界分域</b>：位图键只有区块坐标，而本插件全服单例、同时服务多个世界；
+   * 不分域会让主世界与下界的同名区块互相覆盖，进而隐藏<b>本可见</b>的实体（安全方向错误）。
+   * 世界卸载时整体摘除该世界的表（见 {@link #invalidateWorld}）。
+   */
+  private OcclusionStores occlusionStores;
+  /**
+   * 出站方块变更 → 遮挡位图单格补丁监听器；未启用异步遮挡时为 {@code null}。
+   *
+   * <p>它让「玩家挖开遮挡物」这类变更即时反映到遮挡位图，避免陈旧「遮挡」位把<b>本已可见</b>的实体
+   * 继续隐藏（属正确性要求，见 {@link OcclusionPatchListener}）。
+   */
+  private OcclusionPatchListener occlusionPatchListener;
+  /** 异步遮挡计数（插件级唯一实例，与带宽侧共用；补丁计数也写在这里）。 */
+  private final OcclusionStats occlusionStats;
   private BypassRegistry bypassRegistry;
   private boolean antiXrayActive;
 
-  AntiXrayRuntime(MikuXrayNet plugin) {
+  AntiXrayRuntime(MikuXrayNet plugin, OcclusionStats occlusionStats) {
     this.plugin = plugin;
     this.logger = plugin.getLogger();
+    this.occlusionStats = occlusionStats == null ? new OcclusionStats() : occlusionStats;
   }
 
   /** 直通名单装配：登录/退出即时维护，并在启用时对「当时已在线」玩家做一次快照；不做周期巡检。 */
@@ -92,7 +118,8 @@ public final class AntiXrayRuntime {
       return;
     }
 
-    PacketEventsHook packetEventsHook = new PacketEventsHook(logger);
+    // 传入数据目录：让口径对照能把全量差异导出到与 Diagnostics.writeDump() 同一处（occlusion-diff.txt）
+    PacketEventsHook packetEventsHook = new PacketEventsHook(logger, plugin.getDataFolder());
     if (!packetEventsHook.initialize(antiXray.occlusion().extraOccluding(),
         antiXray.occlusion().extraNonOccluding())) {
       return;
@@ -104,10 +131,17 @@ public final class AntiXrayRuntime {
     // palette.enabled=false（或带宽总开关关闭）时 widthBudget=false，即完全不收缩、不降级，零开销。
     BandwidthConfig.Palette palette = config.bandwidth().palette();
     boolean paletteUsable = config.bandwidth().enabled() && palette.enabled();
+    // 异步实体遮挡建表：仅当 bandwidth.yml 的 entity-culling.async-occlusion 开启时才建（关闭即零开销）。
+    // 数据仓库在此创建并交给改写链路写入（ObfuscationProcessor#captureOcclusion）；
+    // 带宽侧的异步遮挡引擎只读消费（见 ThrottlePipeline）。
+    OcclusionStores occlusionStores = config.bandwidth().entityCulling().asyncOcclusion().enabled()
+        ? new OcclusionStores()
+        : null;
     ObfuscationProcessor processor = ObfuscationProcessor.create(codec, registry, antiXray, logger,
         new ObfuscationProcessor.PaletteOptions(paletteUsable && palette.strictVerify(),
             // P0-1 位宽预算封顶（默认开）：修包体膨胀 + 拿降位宽/单值降级收益
-            paletteUsable && palette.widthBudget()));
+            paletteUsable && palette.widthBudget()),
+        occlusionStores);
     if (!processor.isActive()) {
       logger.warning("未解析到有效的隐藏方块或伪装方块，反矿透模块停用（请检查 antixray.yml）");
       return;
@@ -167,12 +201,14 @@ public final class AntiXrayRuntime {
     this.workPool = pool;
     this.protocolLibHook = hook;
     this.diskCacheStore = diskCache;
+    this.occlusionStores = occlusionStores;
     this.proximityStats = new ProximityStats();
     this.antiXrayActive = true;
     // world-unload 监听仍由主类持有（监听器生命周期与插件一致），这里只触发注册；
     // 注册时机（反矿透装配成功后、邻近显形装配前）与拆分前一致。
     plugin.registerWorldUnloadInvalidation();
     startProximity(antiXray, chunkIndex, revealed, proximityStats);
+    startOcclusionPatch();
     logger.info("反矿透已启用（按维度分段）：" + dimensionSummary(antiXray)
         + "；区块边界邻块快照 " + neighborState(neighborProvider, processor) + "；磁盘缓存 "
         + (diskCache != null ? "已启用（" + new File(plugin.getDataFolder(), "cache").getPath() + "）"
@@ -238,8 +274,9 @@ public final class AntiXrayRuntime {
     }
 
     // 先建邻近显形器（持有显形链路），再把它交给方块变更观察监听器做事件驱动即时显形（P1-4）。
+    // 遮挡位图仓库一并传入：非 null 时可见性判定改走位图（可搬离玩家线程），null 时回落原生射线路径。
     ProximityRevealer revealer = new ProximityRevealer(plugin, antiXray, chunkIndex, revealed, stats,
-        bypassRegistry, workPool);
+        bypassRegistry, workPool, occlusionStores);
     this.blockChangeRevealListener = new BlockChangeRevealListener(plugin, protocolManager,
         antiXray, chunkIndex, revealed, stats, revealer);
     try {
@@ -249,6 +286,42 @@ public final class AntiXrayRuntime {
     } catch (Throwable throwable) {
       logger.warning("邻近显形装配失败（不影响反矿透主体）：" + throwable.getMessage());
       stopProximity();
+    }
+  }
+
+  /**
+   * 装配「出站方块变更 → 遮挡位图单格补丁」监听器（仅在启用异步遮挡时）。
+   *
+   * <p>失败只打一次中文 WARN：位图会因此只在区块重载时自愈，而不会即时反映方块变更——属「少藏」
+   * 方向（射线仍按位图判定，陈旧「遮挡」位可能多藏，故必须把失败显式告知，不能静默）。
+   */
+  private void startOcclusionPatch() {
+    if (occlusionStores == null) {
+      return;
+    }
+    ProtocolManager protocolManager =
+        protocolLibHook == null ? null : protocolLibHook.protocolManager();
+    if (protocolManager == null) {
+      logger.warning("未取得 ProtocolLib 协议管理器，遮挡位图方块补丁停用"
+          + "（位图只在区块重载时重建，方块变更不会即时反映）");
+      return;
+    }
+    OcclusionPatchListener listener =
+        new OcclusionPatchListener(plugin, protocolManager, occlusionStores, occlusionStats);
+    try {
+      listener.start();
+      this.occlusionPatchListener = listener;
+    } catch (Throwable throwable) {
+      logger.log(Level.WARNING, "遮挡位图方块补丁装配失败（位图只在区块重载时重建）", throwable);
+    }
+  }
+
+  /** 停用补丁监听器（可重复调用）。 */
+  private void stopOcclusionPatch() {
+    OcclusionPatchListener listener = occlusionPatchListener;
+    occlusionPatchListener = null;
+    if (listener != null) {
+      listener.stop();
     }
   }
 
@@ -308,6 +381,8 @@ public final class AntiXrayRuntime {
     }
     // 最后停邻近显形：撤销巡检任务、注销变更注销监听并清空索引，不留副作用
     stopProximity();
+    // 方块补丁监听同样先注销：之后不再有位图写入（此时遮挡位图仍会被下面的 clear 清空）
+    stopOcclusionPatch();
     // 磁盘缓存最后关闭：先落盘再关句柄（此时已不会再有新的写入与代次变更）
     closeDiskCache();
     if (workPool != null) {
@@ -317,6 +392,11 @@ public final class AntiXrayRuntime {
     if (bypassRegistry != null) {
       bypassRegistry.stop();
       bypassRegistry = null;
+    }
+    // 遮挡数据仓库最后清空并置空（此时改写链路已注销、异步引擎已先停，不会再有读写）
+    if (occlusionStores != null) {
+      occlusionStores.clear();
+      occlusionStores = null;
     }
     antiXrayActive = false;
   }
@@ -377,6 +457,35 @@ public final class AntiXrayRuntime {
     if (store != null) {
       store.invalidateWorld(worldName);
     }
+    // 遮挡位图同样按世界整体摘除：键里没有世界维度，留着它就会在下一次卸载/重载后污染同名区块。
+    OcclusionStores stores = occlusionStores;
+    if (stores != null) {
+      stores.removeWorld(worldName);
+    }
+  }
+
+  /**
+   * 区块卸载：摘除该区块整列的遮挡位图，使内存驻留量有界。
+   *
+   * <p><b>为什么按卸载驱逐是安全的</b>：区块卸载意味着附近已无玩家，而射线只服务于「玩家周围的
+   * 被追踪实体」，因此这份几何数据此刻无人使用；区块下次被重新发送（解码或缓存命中）时会整列重建。
+   *
+   * <p>由主类持有的 {@code ChunkUnloadEvent} 监听触发，在主线程 / Folia 区域线程执行，只做一次
+   * 内存表的整列摘除，不读世界内容、不做任何计算。
+   */
+  void invalidateChunk(String worldName, int chunkX, int chunkZ) {
+    OcclusionStores stores = occlusionStores;
+    if (stores == null) {
+      return;
+    }
+    try {
+      OcclusionStore store = stores.lookup(worldName);
+      if (store != null) {
+        store.removeColumn(chunkX, chunkZ);
+      }
+    } catch (Throwable throwable) {
+      logger.log(Level.WARNING, "摘除区块遮挡位图时出现异常（已忽略）", throwable);
+    }
   }
 
   public ProtocolLibHook protocolLibHook() {
@@ -391,6 +500,14 @@ public final class AntiXrayRuntime {
   /** 磁盘缓存（供命令与诊断读取持有量与命中率）；未启用时为 null。 */
   public DiskCacheStore diskCacheStore() {
     return diskCacheStore;
+  }
+
+  /**
+   * 异步遮挡数据仓库注册表（供带宽侧的异步遮挡引擎只读消费，见 {@code ThrottlePipeline}）；
+   * 未启用 {@code entity-culling.async-occlusion} 时为 {@code null}。
+   */
+  public OcclusionStores occlusionStores() {
+    return occlusionStores;
   }
 
   /** 伪装区块索引（供诊断读取区块数 / 坐标数与安全阀计数）；未启用邻近显形时为 null。 */

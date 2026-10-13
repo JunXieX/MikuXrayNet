@@ -28,6 +28,12 @@ import org.bukkit.plugin.Plugin;
  * {@code setSendViewDistance()}）—— Paper 上 {@code view-distance} 与 {@code send-view-distance}
  * 是两个独立配置。旧实现「读 send、写 view」会在一次降级+还原后把玩家的 {@code view-distance}
  * 永久改成原 send 值（服主把 send 配得低于 view 时尤其明显），故读写与还原统一到 send 这一对。
+ *
+ * <p><b>读值的基线口径</b>：{@code getSendViewDistance()} 在玩家<b>从未单独设置过</b> send 视距时返回
+ * {@code -1}（API 明确定义 -1 为「回到服务端默认」）。因此降级判定的<b>基线</b>必须取「生效视距」
+ * {@code getViewDistance()}——否则未设置过的玩家（占绝大多数）会命中 {@code -1 <= floor} 而永不降级，
+ * 模块形同虚设。但记录与还原仍写回<b>原始 raw</b>（可能为 -1）：只有把 -1 原样回写，
+ * API 才会把该玩家的 send 视距真正「还原为服务端默认」，还原语义不变。
  */
 public final class LatencyMonitor implements Listener {
 
@@ -150,9 +156,10 @@ public final class LatencyMonitor implements Listener {
       return;
     }
     try {
-      // 读的必须是 send 视距：与下面写入、以及 restore 的还原严格配对，
-      // 否则一次降级+还原会把 view-distance 永久改成原 send 值（见类注释）
-      int current = player.getSendViewDistance();
+      // 读 send 视距并保留原始值 raw：未单独设置过的玩家返回 -1（= 服端默认），此时必须以「生效视距」
+      // getViewDistance() 作降级基线，否则 -1 会命中下面的 floor 比较而永不降级（见类注释）。
+      int raw = player.getSendViewDistance();
+      int current = raw < 0 ? player.getViewDistance() : raw;
       // 生效下限 = max(API 硬下限 2, 配置的 min-view-distance)：配置下限是弱网玩家的体验兜底，
       // 必须与 API 硬下限取并集，绝不能因为某次钳制被击穿。
       int floor = Math.max(2, config.minViewDistance());
@@ -169,8 +176,8 @@ public final class LatencyMonitor implements Listener {
       if (target >= current || target < floor) {
         return;
       }
-      int original = current;
-      originalViewDistance.put(player.getUniqueId(), original);
+      // 记录原始 raw（可能为 -1）：还原时原样回写，API 才会把 send 视距还原为服端默认（见类注释）。
+      originalViewDistance.put(player.getUniqueId(), raw);
       player.setSendViewDistance(target);
       // 停用竞态收口（Folia：stop() 可能在另一条区域线程上并发执行）：<b>写入之后再读一次</b> volatile
       // stopping。这样保证「本次读到 false ⇒ stop() 尚未置位 ⇒ 其 restoreAll 必然发生在本次写入之后、
@@ -178,10 +185,11 @@ public final class LatencyMonitor implements Listener {
       // 一起丢弃、新实例又不知道，玩家会<b>永久卡在降级后的视距</b>。
       if (stopping) {
         // restoreAll 若已把该记录摘走／随整表 clear() 丢弃，就再也不会替我们还原，因此这里<b>无条件</b>
-        // 回滚：若它已经还原过，重复写回同一个 original 值只是幂等重复，无害。
-        originalViewDistance.remove(player.getUniqueId(), original);
+        // 回滚：若它已经还原过，重复写回同一个 raw 值只是幂等重复，无害。回滚必须写回 raw（可能为 -1），
+        // 与记录值同源，才能保证还原语义一致。
+        originalViewDistance.remove(player.getUniqueId(), raw);
         try {
-          player.setSendViewDistance(original);
+          player.setSendViewDistance(raw);
         } catch (Throwable throwable) {
           plugin.getLogger().fine("停用竞态回滚视距失败：" + throwable.getMessage());
         }
@@ -202,7 +210,8 @@ public final class LatencyMonitor implements Listener {
       return;
     }
     try {
-      // 与 reduce 配对：还原也写 send 视距（originalViewDistance 记录的正是原 send 值）
+      // 与 reduce 配对：还原也写 send 视距（originalViewDistance 记录的正是原始 raw，含未设置时的 -1
+      // = 服端默认；-1 由 API 明确定义为「回到服务端默认」，故还原语义不变）
       player.setSendViewDistance(original);
     } catch (Throwable throwable) {
       plugin.getLogger().fine("还原视距失败（保留原值，下次检查重试）：" + throwable.getMessage());

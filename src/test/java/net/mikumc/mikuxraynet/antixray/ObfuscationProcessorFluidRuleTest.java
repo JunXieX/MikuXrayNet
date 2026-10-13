@@ -92,7 +92,7 @@ class ObfuscationProcessorFluidRuleTest {
         new ObfuscationProcessor.PaletteOptions(false, false), state -> state != AIR, profile,
         new ObfuscationProcessor.WorldProfile[] {profile, profile, profile},
         new ObfuscationProcessor.WorldProfile[0][3], null, fluidCover,
-        blockId -> blockId == LAVA);
+        blockId -> blockId == LAVA, null, null);
   }
 
   private static int decodedState(byte[] data, int sectionCount, int sectionIndex, int index) {

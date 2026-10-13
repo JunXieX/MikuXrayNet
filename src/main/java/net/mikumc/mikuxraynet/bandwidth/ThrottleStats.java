@@ -14,6 +14,28 @@ public final class ThrottleStats {
   public final LongAdder entityPacketsCancelled = new LongAdder();
   public final LongAdder entityPacketsPassed = new LongAdder();
 
+  /**
+   * 零位移抑制的<b>到达口径</b>：三种实体更新包各自到达监听器的次数
+   * （纯位移 {@code REL_ENTITY_MOVE} / 位移+朝向 / 朝向）。
+   *
+   * <p><b>为什么必须单列</b>：面板上「取消 0」有三种完全不同的成因——① 服务端根本没有下发纯位移包
+   * （它只在「位置变了、朝向没变」时才发 {@code Pos}，被方块围死的静止实体通常一个都不发 → 本功能
+   * 天然无包可取消）；② 纯位移包的位移从不为 0（确实没有冗余包）；③ 纯位移包根本没到达本监听器
+   * （包类型映射与预期不符）。只看「取消 / 放行」两格无法区分这三者，而「取消恒为 0」看起来
+   * 与「功能完全失效」一模一样——真机正是据此误判过。
+   */
+  public final LongAdder entityMovePackets = new LongAdder();
+  public final LongAdder entityMoveRotPackets = new LongAdder();
+  public final LongAdder entityLookPackets = new LongAdder();
+
+  /**
+   * 纯位移包因「short 字段数不足 3」被放行的次数（位移字段布局与预期不符）。
+   *
+   * <p>这一分支此前是<b>静默放行</b>：一旦字段布局变了，面板只剩「取消 0」，看不出是布局问题。
+   * 现改为计数 + 首次告警一次（见 {@code EntityPacketFilter}）。持续为 0 才是正常态。
+   */
+  public final LongAdder entityMoveShapeMismatch = new LongAdder();
+
   /** 方块变更：合并批次 / 被合并掉的「原始封包个数」/ 原样放行数。
    * 注意 {@link #blockChangesMerged} 计的是<b>原包数</b>（每条 add 传入的是被合并的原包个数），
    * 不是「合并后发出的包数」（那才是 {@link #blockMergeBatches}），面板文案须写「个原包」。 */

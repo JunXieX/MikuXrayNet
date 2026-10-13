@@ -3,8 +3,12 @@ package net.mikumc.mikuxraynet.config;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import org.bukkit.configuration.InvalidConfigurationException;
@@ -15,6 +19,8 @@ import org.junit.jupiter.api.Test;
  * 配置默认值回归：锁住本轮「真机反馈」驱动的默认值变更，避免被无意改回。
  *
  * <p>断言的都是「配置项缺失时的回落值」，即内置默认；因此用最小 YAML 触发回落路径。
+ * 另外有一条用例把<b>打包的 antixray.yml</b> 与这套回落值逐个对照——yml 文本与代码回落是两处独立
+ * 维护的默认值，只测回落路径的话，yml 里的数字漏改不会被任何用例发现（玩家拿到的却是另一套默认）。
  */
 class ConfigDefaultsTest {
 
@@ -37,15 +43,15 @@ class ConfigDefaultsTest {
     assertEquals(AntiXrayConfig.ObfuscationMode.ALL,
         config.dimensionEffective(AntiXrayConfig.Dimension.NORMAL).mode(),
         "默认模式必须是 all（透视不得直接看到裸露在矿洞中的矿）");
-    assertEquals(64.0D, config.proximity().distance(), 1.0E-9D,
-        "显形距离默认 64 格（48 仍偏近；显形只在视线通畅且方块有暴露面时还原，放大距离不会隔墙泄露；"
-            + "扫描半径 ceil(64/16)=4 即 9×9 区块）");
-    assertEquals(256, config.proximity().maxRevealsPerTick(),
-        "单次显形额度默认 256（原 128；配合 64 格距离，候选更多，额度需相应放大）");
+    assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_DEFAULT, config.proximity().distance(), 1.0E-9D,
+        "显形距离默认 96 格（64 仍偏近；显形只在视线通畅且方块有暴露面时还原，放大距离不会隔墙泄露；"
+            + "扫描半径 ceil(96/16)=6 即 13×13 区块）");
+    assertEquals(512, config.proximity().maxRevealsPerTick(),
+        "单次显形额度默认 512（原 256；配合 96 格距离与放宽的视锥，候选更多，额度需相应放大）");
     assertEquals(4, config.proximity().intervalTicks(), "巡检周期收紧为 4 tick（0.2 秒一次，显形更及时）");
     assertTrue(config.proximity().raycastEnabled(), "可见性判定默认开启（隔着墙不显形）");
-    assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_FLOOR, config.proximity().frustumMinDistance(),
-        1.0E-9D, "min-distance 默认为安全下限 16 格（原 4 格盖不住眼前方块：门的顶部在 3 格距离就有 40°+ 仰角）");
+    assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_DEFAULT, config.proximity().frustumMinDistance(),
+        1.0E-9D, "min-distance 默认 24 格（下限 16 之上；原 4 格盖不住眼前方块：门的顶部在 3 格距离就有 40°+ 仰角）");
     assertEquals(524288, config.proximity().maxPositionsPerPlayer(),
         "单玩家坐标上限默认 524288（262144 在真机仍被顶到、淘汰 1400 个坐标）");
     assertEquals(4194304, config.proximity().maxPositions(),
@@ -108,8 +114,8 @@ class ConfigDefaultsTest {
             fov: 0.0
             min-distance: -5.0
         """));
-    assertEquals(AntiXrayConfig.FRUSTUM_FOV_FLOOR, invalid.proximity().frustumFov(), 1.0E-9D,
-        "fov 非法值回落默认（即下限）");
+    assertEquals(AntiXrayConfig.FRUSTUM_FOV_DEFAULT, invalid.proximity().frustumFov(), 1.0E-9D,
+        "fov 非法值回落默认（120°）");
     assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_FLOOR,
         invalid.proximity().frustumMinDistance(), 1.0E-9D, "min-distance 负数按下限处理");
   }
@@ -120,19 +126,60 @@ class ConfigDefaultsTest {
   }
 
   /**
+   * 打包 antixray.yml 的邻近显形默认值必须与「缺键时的代码回落」<b>逐个一致</b>。
+   *
+   * <p><b>为什么必须钉死</b>：yml 文本与代码回落是两处独立维护的默认值——yml 里的数字写错或漏改时，
+   * 只测回落路径的用例（本类其余用例）全部照绿，而玩家实际拿到的是另一套默认值。这条用例用真实解析器
+   * 读打包资源，一次钉住这两处的一致性。
+   */
+  @Test
+  void packagedAntiXrayYmlDefaultsMatchCodeFallbacks() {
+    AntiXrayConfig fallback = AntiXrayConfig.from(yaml("enabled: true\n"));
+    AntiXrayConfig packed = AntiXrayConfig.from(loadPackedAntiXrayYml());
+
+    assertEquals(fallback.proximity().distance(), packed.proximity().distance(), 1.0E-9D,
+        "打包 yml 的 proximity.distance 必须等于代码回落值");
+    assertEquals(fallback.proximity().maxRevealsPerTick(), packed.proximity().maxRevealsPerTick(),
+        "打包 yml 的 proximity.max-reveals-per-tick 必须等于代码回落值");
+    assertEquals(fallback.proximity().frustumFov(), packed.proximity().frustumFov(), 1.0E-9D,
+        "打包 yml 的 proximity.frustum.fov 必须等于代码回落值");
+    assertEquals(fallback.proximity().frustumMinDistance(), packed.proximity().frustumMinDistance(),
+        1.0E-9D, "打包 yml 的 proximity.frustum.min-distance 必须等于代码回落值");
+    assertEquals(fallback.proximity().raycastSamples(), packed.proximity().raycastSamples(),
+        "打包 yml 的 proximity.raycast.samples 必须等于代码回落值");
+    assertEquals(fallback.proximity().instantReveal(), packed.proximity().instantReveal(),
+        "打包 yml 的 instant-reveal 三键必须等于代码回落值");
+    assertTrue(packed.floorAdjustments().isEmpty(),
+        "打包默认值不得触发安全下限抬升（否则每个服主开服都会看到一条误导性 WARN）："
+            + packed.floorAdjustments());
+  }
+
+  /** 用真实解析器读随插件打包的 {@code antixray.yml}（断言默认值文本与代码回落一致）。 */
+  private static YamlConfiguration loadPackedAntiXrayYml() {
+    YamlConfiguration configuration = new YamlConfiguration();
+    try (InputStream input = ConfigDefaultsTest.class.getResourceAsStream("/antixray.yml")) {
+      assertNotNull(input, "classpath 里必须有打包的 antixray.yml（应位于 src/main/resources 下）");
+      configuration.load(new InputStreamReader(input, StandardCharsets.UTF_8));
+    } catch (Exception exception) {
+      throw new AssertionError("解析打包 antixray.yml 失败", exception);
+    }
+    return configuration;
+  }
+
+  /**
    * 非法 fov（&gt;360° / 非正）不再静默回落：必须与「低于下限」一样进入一次性 WARN 明细，
    * 否则管理员写了无效角度会以为它已生效（与其它钳制项口径一致）。
    */
   @Test
   void invalidFrustumFovIsReportedInFloorDetails() {
     AntiXrayConfig tooWide = AntiXrayConfig.from(yaml("proximity:\n  frustum:\n    fov: 400.0\n"));
-    assertEquals(AntiXrayConfig.FRUSTUM_FOV_FLOOR, tooWide.proximity().frustumFov(), 1.0E-9D,
-        "fov>360 属非法值，回落默认（即下限）");
+    assertEquals(AntiXrayConfig.FRUSTUM_FOV_DEFAULT, tooWide.proximity().frustumFov(), 1.0E-9D,
+        "fov>360 属非法值，回落默认（120°）");
     assertTrue(joinedFloors(tooWide).contains("proximity.frustum.fov=400.0"),
         "fov 非法值必须纳入一次性 WARN 明细（不再静默回落）：" + tooWide.floorAdjustments());
 
     AntiXrayConfig nonPositive = AntiXrayConfig.from(yaml("proximity:\n  frustum:\n    fov: -10.0\n"));
-    assertEquals(AntiXrayConfig.FRUSTUM_FOV_FLOOR, nonPositive.proximity().frustumFov(), 1.0E-9D);
+    assertEquals(AntiXrayConfig.FRUSTUM_FOV_DEFAULT, nonPositive.proximity().frustumFov(), 1.0E-9D);
     assertTrue(joinedFloors(nonPositive).contains("proximity.frustum.fov=-10.0"),
         "负角度同样必须留痕：" + nonPositive.floorAdjustments());
   }
@@ -144,8 +191,8 @@ class ConfigDefaultsTest {
   @Test
   void nanMinDistanceAndNegativeProximityDistanceAreReported() {
     AntiXrayConfig nan = AntiXrayConfig.from(yaml("proximity:\n  frustum:\n    min-distance: .nan\n"));
-    assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_FLOOR, nan.proximity().frustumMinDistance(),
-        1.0E-9D, "NaN 的 min-distance 必须回落默认（= 下限）");
+    assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_DEFAULT, nan.proximity().frustumMinDistance(),
+        1.0E-9D, "NaN 的 min-distance 必须回落默认（24 格）");
     assertTrue(joinedFloors(nan).contains("proximity.frustum.min-distance=NaN"),
         "NaN 的 min-distance 必须纳入一次性 WARN 明细（不再静默）：" + nan.floorAdjustments());
 
@@ -309,7 +356,7 @@ class ConfigDefaultsTest {
     assertTrue(config.occlusion().fluidCover(),
         "流体覆盖默认开启（刷在岩浆里的下界残骸若不按遮挡处理会裸露在矿洞里被透视看到）");
     assertTrue(config.proximity().instantReveal().enabled(), "事件驱动即时显形默认开启");
-    assertEquals(2, config.proximity().instantReveal().radius(), "事件显形曼哈顿半径默认 2");
+    assertEquals(4, config.proximity().instantReveal().radius(), "事件显形曼哈顿半径默认 4（= 半个区块）");
     assertEquals(16, config.proximity().instantReveal().maxPerTick(), "事件显形每玩家每 tick 限额默认 16");
     assertEquals(20, config.proximity().overRevealSampling(), "过度显形抽样默认 1/20");
     assertFalse(config.proximity().instantReveal().enabled()
@@ -550,11 +597,11 @@ class ConfigDefaultsTest {
     // proximity 其余键
     assertTrue(config.proximity().enabled(), "邻近显形默认开启");
     assertTrue(config.proximity().frustumEnabled(), "视锥剔除默认开启");
-    assertEquals(AntiXrayConfig.FRUSTUM_FOV_FLOOR, config.proximity().frustumFov(), 1.0E-9D,
-        "视锥竖直全角默认为安全下限 110°（客户端 FOV 上限；配窄会让玩家看得见的方块保持伪装）");
+    assertEquals(AntiXrayConfig.FRUSTUM_FOV_DEFAULT, config.proximity().frustumFov(), 1.0E-9D,
+        "视锥竖直全角默认 120°（下限 110° 之上；配窄会让玩家看得见的方块保持伪装）");
     assertTrue(config.floorAdjustments().isEmpty(), "默认值不触发安全下限抬升（不产生误导性 WARN）");
-    assertEquals(4, config.proximity().raycastSamples(),
-        "候选点数默认 4（原生射线改造后语义为「每方块最多尝试的候选点数」，钳制 1..5）");
+    assertEquals(5, config.proximity().raycastSamples(),
+        "候选点数默认 5（= 上限；原生射线改造后语义为「每方块最多尝试的候选点数」，钳制 1..5）");
     assertTrue(config.proximity().batchRevealSends(),
         "显形包批量合并默认开启（Paper 原生多方块变更包，关掉即回退为逐坐标单包）");
 
@@ -655,20 +702,21 @@ class ConfigDefaultsTest {
   }
 
   /**
-   * {@code proximity.distance} 的非有限值（NaN / ±Inf）必须回落默认 64，不得原样穿过钳制。
+   * {@code proximity.distance} 的非有限值（NaN / ±Inf）必须回落默认 96，不得原样穿过钳制。
    *
    * <p>NaN 会污染距离比较（所有比较恒 false）并进入配置指纹，导致磁盘缓存整体失效。
    */
   @Test
   void proximityDistanceNonFiniteFallsBackToDefault() {
     AntiXrayConfig nan = AntiXrayConfig.from(yaml("proximity:\n  distance: .nan\n"));
-    assertEquals(64.0D, nan.proximity().distance(), 1.0E-9D, "NaN 必须回落默认 64");
+    assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_DEFAULT, nan.proximity().distance(), 1.0E-9D,
+        "NaN 必须回落默认 96");
     assertTrue(String.join("、", nan.ceilingAdjustments()).contains("proximity.distance=NaN"),
         "非有限值回落必须留痕：" + nan.ceilingAdjustments());
 
     AntiXrayConfig inf = AntiXrayConfig.from(yaml("proximity:\n  distance: .inf\n"));
-    assertEquals(64.0D, inf.proximity().distance(), 1.0E-9D,
-        "+Inf 属于非有限值，同样回落默认 64（而不是被当成超大值）");
+    assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_DEFAULT, inf.proximity().distance(), 1.0E-9D,
+        "+Inf 属于非有限值，同样回落默认 96（而不是被当成超大值）");
     assertTrue(String.join("、", inf.ceilingAdjustments()).contains("proximity.distance=Infinity"),
         "非有限值回落必须留痕：" + inf.ceilingAdjustments());
   }

@@ -11,6 +11,7 @@ import java.util.BitSet;
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
@@ -60,15 +61,23 @@ public final class BlockStateRegistry implements RegistryAccessor {
   /** 「流体覆盖」掩码：只有水/岩浆（含流动变体）与水柱，**不含含水方块**（见 {@link #isFluidCover}）。 */
   private final BitSet fluidCoverStates;
   private final BitSet occludingStates;
+  /**
+   * 实体遮挡口径表（Bukkit {@code Material#isOccluding()} 对面）：只供实体剔除的异步位图使用。
+   * {@code null} = 未构建（离线场景 / 未提供 Bukkit 表），此时 {@link #isEntityOccluding} 回落
+   * {@link #occludingStates}（见 {@link EntityOcclusionTable} 的「为什么需要第二张表」）。
+   */
+  private final EntityOcclusionTable entityOcclusionTable;
 
   private BlockStateRegistry(int uniqueBlockStateCount, int maxBitsPerBlockState, BitSet airStates,
-      BitSet fluidStates, BitSet fluidCoverStates, BitSet occludingStates) {
+      BitSet fluidStates, BitSet fluidCoverStates, BitSet occludingStates,
+      EntityOcclusionTable entityOcclusionTable) {
     this.uniqueBlockStateCount = uniqueBlockStateCount;
     this.maxBitsPerBlockState = maxBitsPerBlockState;
     this.airStates = airStates;
     this.fluidStates = fluidStates;
     this.fluidCoverStates = fluidCoverStates;
     this.occludingStates = occludingStates;
+    this.entityOcclusionTable = entityOcclusionTable;
   }
 
   /**
@@ -99,6 +108,18 @@ public final class BlockStateRegistry implements RegistryAccessor {
    */
   public static BlockStateRegistry build(Collection<String> extraOccluding,
       Collection<String> extraNonOccluding, Logger logger) {
+    return build(extraOccluding, extraNonOccluding, logger, null);
+  }
+
+  /**
+   * 完整构建：追加「实体遮挡口径」的 Bukkit 判定表。
+   *
+   * @param bukkitOccludingByBlockName Bukkit 口径（方块名 → {@code Material#isOccluding()}）；
+   *                                   {@code null} = 不构建实体口径表（{@link #isEntityOccluding} 回落本表）
+   */
+  public static BlockStateRegistry build(Collection<String> extraOccluding,
+      Collection<String> extraNonOccluding, Logger logger,
+      Map<String, Boolean> bukkitOccludingByBlockName) {
     Set<String> occludingOverrides = OcclusionRules.normalizeAll(extraOccluding);
     Set<String> nonOccludingOverrides = OcclusionRules.normalizeAll(extraNonOccluding);
 
@@ -116,6 +137,8 @@ public final class BlockStateRegistry implements RegistryAccessor {
     BitSet fluidStates = new BitSet(count);
     BitSet fluidCoverStates = new BitSet(count);
     BitSet occludingStates = new BitSet(count);
+    // 状态 id → 方块名（下标即 id，空洞处留 null）：仅当需要实体口径表时才分配（否则省下 3 万个引用槽）
+    String[] blockNames = bukkitOccludingByBlockName == null ? null : new String[count];
 
     for (int id = 0; id < count; id++) {
       // 空洞 id（映射异常）本身不是有效状态：直接跳过，不参与任何位图
@@ -125,6 +148,9 @@ public final class BlockStateRegistry implements RegistryAccessor {
       }
       StateType type = state.getType();
       String name = type.getName();
+      if (blockNames != null) {
+        blockNames[id] = name;
+      }
 
       if (type.isAir()) {
         airStates.set(id);
@@ -146,7 +172,8 @@ public final class BlockStateRegistry implements RegistryAccessor {
     }
 
     return new BlockStateRegistry(count, width, airStates, fluidStates, fluidCoverStates,
-        occludingStates);
+        occludingStates,
+        EntityOcclusionTable.build(blockNames, occludingStates, bukkitOccludingByBlockName));
   }
 
   /** 本体即流体的材质：水（含流动变体与水柱）与岩浆。 */
@@ -209,14 +236,40 @@ public final class BlockStateRegistry implements RegistryAccessor {
     return blockId >= 0 && blockId < uniqueBlockStateCount && fluidCoverStates.get(blockId);
   }
 
-  /** 该状态是否为「整块不透明」（可作为遮挡面）。 */
+  /**
+   * 该状态是否为「整块不透明」（可作为遮挡面）——<b>反矿透伪装口径</b>（PE 状态语义启发式，刻意偏多判）。
+   * 见 {@link EntityOcclusionTable} 关于两条链路为何必须分口径的说明。
+   */
   public boolean isOccluding(int blockId) {
     return blockId >= 0 && blockId < uniqueBlockStateCount && occludingStates.get(blockId);
+  }
+
+  /**
+   * 该状态在<b>实体遮挡口径</b>下是否遮挡（Bukkit {@code Material#isOccluding()}，与既有同步射线同源）。
+   *
+   * <p>供实体剔除的异步位图使用；未构建实体口径表时回落 {@link #isOccluding}（离线场景与单测）。
+   */
+  public boolean isEntityOccluding(int blockId) {
+    if (entityOcclusionTable == null) {
+      return isOccluding(blockId);
+    }
+    return blockId >= 0 && blockId < uniqueBlockStateCount
+        && entityOcclusionTable.isOccluding(blockId);
   }
 
   /** 被判定为「遮挡」的状态数（启动自检日志用，便于一眼看出遮挡表是否全空）。 */
   public int occludingStateCount() {
     return occludingStates.cardinality();
+  }
+
+  /** 实体遮挡口径下的遮挡状态数；未构建该表时为 -1。 */
+  public int entityOccludingStateCount() {
+    return entityOcclusionTable == null ? -1 : entityOcclusionTable.occludingStateCount();
+  }
+
+  /** 实体遮挡口径下「名称未命中 Bukkit 表、回落注册表口径」的状态数；未构建该表时为 -1。 */
+  public int entityOcclusionFallbackCount() {
+    return entityOcclusionTable == null ? -1 : entityOcclusionTable.fallbackCount();
   }
 
   /** 把 PE 状态摊平为纯判定输入（不保留任何 PE 引用）。 */

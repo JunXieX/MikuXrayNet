@@ -16,6 +16,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.antixray.ProximitySelector;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.occlusion.OcclusionEngine;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
@@ -39,17 +42,37 @@ import org.bukkit.util.Vector;
 /**
  * 实体射线剔除：被不透明方块完全遮挡的实体对玩家隐藏，节省下行的实体跟踪带宽。
  *
- * <p>线程模型（严格「Bukkit API 只在自己线程调用」）：
- * <ol>
- *   <li>主线程/区域线程：从 {@link PlayerTrackEntityEvent} 或周期任务里抓取「眼睛坐标 + 包围盒顶点」；</li>
- *   <li>同一线程：用 Paper 原生射线（{@code World#rayTraceBlocks}）逐顶点判定是否被遮挡；</li>
- *   <li>同一线程：执行 {@link Player#hideEntity} / {@link Player#showEntity}。</li>
- * </ol>
- * 原生射线是 Bukkit API，必须在实体所属线程调用，因此不再把体素路径交给工作线程预计算
- * （旧实现：worker 算路径 → 回主线程读方块），也没有了 {@code int[]} 路径分配与 worker 往返。
+ * <p><b>两种判定模式</b>（由 {@code entity-culling.async-occlusion} 选择，安全语义完全一致）：
+ * <ul>
+ *   <li><b>同步模式（默认）</b>——线程模型（严格「Bukkit API 只在自己线程调用」）：
+ *       <ol>
+ *         <li>主线程/区域线程：从 {@link PlayerTrackEntityEvent} 或周期任务里抓取「眼睛坐标 + 包围盒顶点」；</li>
+ *         <li>同一线程：用 Paper 原生射线（{@code World#rayTraceBlocks}）逐顶点判定是否被遮挡；</li>
+ *         <li>同一线程：执行 {@link Player#hideEntity} / {@link Player#showEntity}。</li>
+ *       </ol>
+ *       原生射线是 Bukkit API，必须在实体所属线程调用，因此不再把体素路径交给工作线程预计算
+ *       （旧实现：worker 算路径 → 回主线程读方块），也没有了 {@code int[]} 路径分配与 worker 往返。
+ *       受线程归属约束，此模式只能用 {@code recheck-budget} 限流 → 收敛延迟随追踪实体数线性增长。</li>
+ *   <li><b>异步模式（{@code async-occlusion=true}，默认开启）</b>——数据源换成「反矿透解码时旁路
+ *       生成的区块遮挡位图」（{@link OcclusionStores}），射线由 {@link OcclusionEngine} 的<b>专用池</b>
+ *       执行（纯内存步进，零 Bukkit 访问）：
+ *       <ol>
+ *         <li>实体所属线程：只抓几何快照（眼睛 + 包围盒候选顶点），组成本质为纯数值的
+ *             {@link OcclusionEngine.Request} 入队（{@link #submitAsync}）；</li>
+ *         <li>专用池线程：按世界取该区块的遮挡位图逐顶点步进判定（{@link OcclusionEngine}）；</li>
+ *         <li>回投：经 {@code Schedulers.onEntity} 跳回实体所属线程，逐条校验
+ *             （在线 / 归属 / 世界未变 / 实体有效）后再 hide/show（{@link #publishAsync}）。</li>
+ *       </ol>
+ *       因此本模式<b>不在实体线程读任何方块</b>，也就<b>取消了 {@code recheck-budget} 的条数封顶</b>
+ *       （每周期提交全部追踪实体，收敛延迟不再随实体数线性增长）；射线 CPU 改由专用池的<b>时间预算</b>
+ *       封顶（超预算者顺延到下一周期，不丢判定）。代价是引入「结果陈旧窗口」，由截止时间丢弃 +
+ *       世界作废守卫 + 可选防抖（{@code occlusion-hysteresis-cycles}）压制。</li>
+ * </ul>
  *
  * <p>安全策略：强制可见距离内的实体一律可见；只有当包围盒的所有可见顶点射线都被遮挡时才隐藏
  * （宁可少隐藏，也不隐藏可见实体）；玩家自身、其它玩家与烟花不做剔除。
+ * 「强制可见距离内的恢复」在两种模式下都是<b>实体线程上的同步 {@code show}</b>，绝不经过异步链路，
+ * 因此近身安全下限不受异步延迟影响。
  *
  * <p><b>视锥剔除（{@code entity-culling.frustum}）</b>：在「被墙完全挡住」之外，再剔除
  * 「位于视野锥之外、且在距离门之外」的实体（玩家背后 / 侧后根本看不到的实体），连射线都省下。
@@ -103,6 +126,28 @@ public final class EntityCuller implements Listener {
   private final BypassLookup bypass;
   /** 遮挡判定（生产实现为本类的 Paper 原生射线；离线单测可注入确定性结果，见 {@link Occlusion}）。 */
   private final Occlusion occlusion;
+  /**
+   * 异步遮挡数据仓库注册表（按世界分域）；{@code null} = 未接线（同步原生射线路径）。
+   *
+   * <p>仅在 {@code entity-culling.async-occlusion=true} 且反矿透已建表时非 null（由装配方传入）。
+   */
+  private final OcclusionStores occlusionStores;
+  /** 异步遮挡计数（引擎与诊断共用；未接线时为 {@code null}）。 */
+  private final OcclusionStats occlusionStats;
+  /**
+   * 异步遮挡引擎；{@link #start()} 时按配置创建、{@link #stop()} 时关闭，{@code null} = 走同步路径。
+   *
+   * <p><b>为什么是 volatile</b>：工作线程的 {@code ResultSink} 会读它；停用/热重载会在命令线程把它置空
+   * 并关闭。读侧只需判断「引擎是否还在」，读到一个过期引用也不会出错（引擎自身在 {@code close()} 后
+   * 拒收任务、且回投前会再校验 epoch/状态）。
+   */
+  private volatile OcclusionEngine engine;
+  /** 防抖：同一实体的判定需连续该周期数一致才允许切换显示状态（0/1 = 立即，见配置说明）。 */
+  private final int hysteresisCycles;
+  /** 结果超时丢弃窗口（纳秒）= {@code occlusion-timeout-cycles × 提交周期}。 */
+  private final long timeoutNanos;
+  /** 本周期引擎的时间预算（纳秒）= {@code occlusion-time-budget-ms × 1e6}；{@code 0} = 引擎未接线。 */
+  private final long budgetNanos;
   private final double forceVisibleSquared;
   /** 视锥剔除子项是否启用。 */
   private final boolean frustumCulling;
@@ -126,6 +171,36 @@ public final class EntityCuller implements Listener {
   private final ConcurrentHashMap<UUID, Map<Integer, HiddenEntry>> hidden = new ConcurrentHashMap<>();
   /** 玩家 → 该玩家当前追踪的实体轮转队列（周期复检切分片用，见 {@link TrackedRotation}）。 */
   private final ConcurrentHashMap<UUID, TrackedRotation> rotations = new ConcurrentHashMap<>();
+  /**
+   * 玩家 → (实体 id → 最近判定与连续次数)，异步路径的防抖账本（仅 {@code hysteresisCycles ≥ 2} 时使用）。
+   *
+   * <p><b>为什么需要它</b>：异步判定天然可能「刚好被挡 / 刚好可见」反复摇摆，直接按每条结果切换
+   * hide/show 会出现闪烁。要求同一结论连续 N 个周期才允许切换即可压住抖动。
+   * {@code hysteresisCycles ≤ 1}（默认）时本表<b>完全不使用</b>（零开销，见 {@link #publishAsync}）。
+   *
+   * <p>条目随 {@code onUntrack} / {@code onQuit} / 实体失效 / 停用清理，不会无界增长。
+   */
+  private final ConcurrentHashMap<UUID, ConcurrentHashMap<Integer, VerdictStreak>> streaks =
+      new ConcurrentHashMap<>();
+
+  /** 防抖账本条目：最近一次判定结论与已连续一致的周期数（只在玩家/实体所属线程上读写）。 */
+  private static final class VerdictStreak {
+    private boolean verdict;
+    private int count;
+
+    /** 记入一次新判定，返回「是否已达到可切换所需的连续次数」。 */
+    boolean record(boolean next, int required) {
+      if (next == verdict) {
+        if (count < required) {
+          count++;
+        }
+      } else {
+        verdict = next;
+        count = 1;
+      }
+      return count >= required;
+    }
+  }
 
   /** 每个在线玩家的周期复检任务（Paper 与 Folia 同一套实体调度器；玩家退出即随实体退役失效）。 */
   private final ConcurrentHashMap<UUID, ScheduledTask> recheckTasks = new ConcurrentHashMap<>();
@@ -174,6 +249,26 @@ public final class EntityCuller implements Listener {
    */
   EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
       EntityOwnership ownership, BypassLookup bypass, Occlusion occlusion) {
+    this(plugin, config, stats, ownership, bypass, occlusion, null, null);
+  }
+
+  /** 生产装配入口（追加异步遮挡仓库与计数）；离线单测可注入 {@code null} 走同步路径。 */
+  EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
+      OcclusionStores occlusionStores, OcclusionStats occlusionStats) {
+    this(plugin, config, stats, EntityCuller::ownedByCurrentRegion, BypassRegistry::isBypassedNow, null,
+        occlusionStores, occlusionStats);
+  }
+
+  /**
+   * 完整构造（追加异步遮挡仓库与计数；离线单测可对归属 / 直通 / 遮挡 / 异步四者全部注入假实现）。
+   *
+   * <p>{@code occlusionStores}/{@code occlusionStats} 两者要么同时给出（且 {@code async-occlusion=true}），
+   * 要么同时为 {@code null}：任一缺失都回落同步原生射线路径，绝不半接线（否则会出现「引擎起来了却没有
+   * 数据源」这类难查的静默失效）。
+   */
+  EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
+      EntityOwnership ownership, BypassLookup bypass, Occlusion occlusion,
+      OcclusionStores occlusionStores, OcclusionStats occlusionStats) {
     this.plugin = plugin;
     this.config = config;
     this.stats = stats;
@@ -190,7 +285,30 @@ public final class EntityCuller implements Listener {
         ? config.forceVisibleDistance()
         : Math.max(frustum.minDistance(), config.forceVisibleDistance());
     this.frustumGateSquared = gate * gate;
+    // 异步遮挡接线：仓库与计数齐备、开关打开、且确实要做射线判定时才算「已接线」（见字段说明）。
+    BandwidthConfig.EntityCulling.AsyncOcclusion async = config.asyncOcclusion();
+    boolean wired = async != null && async.enabled() && config.raycast()
+        && occlusionStores != null && occlusionStats != null;
+    this.occlusionStores = wired ? occlusionStores : null;
+    this.occlusionStats = wired ? occlusionStats : null;
+    this.hysteresisCycles = wired ? Math.max(0, async.hysteresisCycles()) : 0;
+    long intervalNanos = Math.max(1, config.updateIntervalTicks()) * NANOS_PER_TICK;
+    this.timeoutNanos = wired ? Math.max(1, async.timeoutCycles()) * intervalNanos : 0L;
+    this.budgetNanos = wired ? Math.max(0L, (long) (async.timeBudgetMillis() * 1_000_000.0D)) : 0L;
   }
+
+  /** 一 tick 的纳秒数（超时窗口与提交周期都以 tick 计，这里统一换算）。 */
+  private static final long NANOS_PER_TICK = 50_000_000L;
+
+  /**
+   * 异步遮挡专用池的任务队列容量。
+   *
+   * <p><b>为什么给这么大</b>：异步路径每周期提交「该玩家全部追踪实体」（没有条数封顶），队列容量必须
+   * 明显大于「在线玩家 × 追踪实体数」的常见规模，否则会频繁拒收（拒收 = 保留原显示状态，属安全方向，
+   * 但会拖慢收敛）。容量本身只是内存上界（每条任务不到 100 字节），4096 条已足以吸收数秒的尖峰。
+   * 真机上若观测到 {@code rejectedQueueFull} 持续增长，说明引擎线程跟不上（应调大预算/线程数）。
+   */
+  private static final int OCCLUSION_QUEUE_CAPACITY = 4096;
 
   /**
    * 本模块是否需要运行（射线剔除与视锥剔除任一开启）。
@@ -281,6 +399,9 @@ public final class EntityCuller implements Listener {
 
   /** 注册事件监听与周期复检任务。 */
   public void start() {
+    // 异步引擎必须先于周期任务创建：首个复检周期就会向它提交（见 submitAsync）。
+    // 任一环节失败都只回落同步射线（剔除模块本身是可选优化），绝不影响监听注册。
+    startEngine();
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     long interval = Math.max(1, config.updateIntervalTicks());
     // 与 onJoin 保持一致：两个行为开关（raycast / frustum）全关时不登记任何周期复检任务——
@@ -293,13 +414,23 @@ public final class EntityCuller implements Listener {
     }
     plugin.getLogger().info("带宽模块已启用：实体剔除（强制可见距离 " + config.forceVisibleDistance()
         + " 格；射线遮挡 " + (config.raycast()
-            ? "开（Paper 原生射线，每实体至多 " + config.raySamples() + " 个包围盒顶点）" : "关")
+            ? asyncRaycast()
+                ? "开（异步遮挡：专用池 " + engineWorkerCount() + " 线程，每周期时间预算 "
+                    + formatBudgetMillis() + " ms/玩家，条数封顶已取消）"
+                : "开（Paper 原生射线，每实体至多 " + config.raySamples() + " 个包围盒顶点）"
+            : "关")
         + "；视锥剔除 " + (frustumCulling
             ? "开（距离门 " + Math.sqrt(frustumGateSquared) + " 格，FOV " + frustumFov + "°）" : "关")
         + "）");
   }
 
-  /** 注销监听、恢复全部被隐藏实体。 */
+  /**
+   * 注销监听、恢复全部被隐藏实体，并关闭异步引擎。
+   *
+   * <p><b>顺序不可调</b>：先置 {@code stopping} 闭合并发 → 取消在途任务 → 注销监听 → 同步恢复 →
+   * 最后才关引擎。引擎放在最后关，保证「取消任务之后、引擎结束之前」不会有新任务被投进来
+   * （{@code stopping} 已拒绝一切新隐藏，且在途回投会先被 {@link #publishAsync} 的状态校验挡掉）。
+   */
   public void stop() {
     // 先取消在途任务、再同步恢复：Bukkit 的 setEnabled(false) 先置 isEnabled=false 再调 onDisable，
     // 因此停用链路里的 EntityScheduler 一律抛 IllegalPluginAccessException（旧实现被 Schedulers 静默吞掉，
@@ -309,6 +440,66 @@ public final class EntityCuller implements Listener {
     HandlerList.unregisterAll(this);
     restoreAll();
     rotations.clear();
+    streaks.clear();
+    closeEngine();
+  }
+
+  /**
+   * 创建异步遮挡引擎（仅当装配方给出了仓库与计数、且配置要求走异步射线时）。
+   *
+   * <p>引擎自带专用线程池（线程名 {@code MikuXrayNet-Occlusion-N}）：<b>刻意与反矿透改写池隔离</b>——
+   * 改写有 50 ms 级预算，共享池会造成互相饿死。创建失败只回落同步射线并打一次中文 WARN。
+   *
+   * <p>包可见：供离线单测直接起引擎（{@link #start} 依赖 Bukkit 的事件注册，离线不可用）。
+   */
+  void startEngine() {
+    OcclusionStores stores = this.occlusionStores;
+    OcclusionStats counters = this.occlusionStats;
+    if (stores == null || counters == null) {
+      return;
+    }
+    try {
+      BandwidthConfig.EntityCulling.AsyncOcclusion async = config.asyncOcclusion();
+      engine = new OcclusionEngine(stores, counters, async.threads(), async.maxOccludingBlocks(),
+          MAX_RAY_LENGTH, OCCLUSION_QUEUE_CAPACITY);
+    } catch (Throwable throwable) {
+      engine = null;
+      plugin.getLogger().log(Level.WARNING,
+          "异步遮挡引擎启动失败，已回退同步原生射线（不影响实体剔除的其它行为）", throwable);
+    }
+  }
+
+  /**
+   * 关闭异步引擎（可重复调用）；引擎停机后其工作线程不再回投，因此必须排在恢复之后（见 {@link #stop()}）。
+   *
+   * <p>包可见：供离线单测在不起完整停用链路的前提下回收引擎线程。
+   */
+  void closeEngine() {
+    OcclusionEngine current = engine;
+    engine = null;
+    if (current != null) {
+      try {
+        current.close();
+      } catch (Throwable throwable) {
+        plugin.getLogger().log(Level.WARNING, "关闭异步遮挡引擎时出现异常（已强制结束）", throwable);
+      }
+    }
+  }
+
+  /** 启动摘要里的引擎线程数（未接线时为 0，仅用于日志文案）。 */
+  private int engineWorkerCount() {
+    OcclusionEngine current = engine;
+    return current == null ? 0 : current.workerCount();
+  }
+
+  /** 启动摘要里的时间预算文案（毫秒，最多一位小数）。 */
+  private String formatBudgetMillis() {
+    return String.format(java.util.Locale.ROOT, "%.1f", budgetNanos / 1_000_000.0D);
+  }
+
+  /** 异步射线路径是否可用（引擎已起 + 仓库已接线；{@link #stop()} 后恒为 false）。 */
+  private boolean asyncRaycast() {
+    return engine != null && occlusionStores != null;
   }
 
   @EventHandler(ignoreCancelled = true)
@@ -328,6 +519,8 @@ public final class EntityCuller implements Listener {
     // 判定只清账本、不产生恢复计数」一致（见 evaluate 的失效/离线分支）。
     hidden.remove(player.getUniqueId());
     rotations.remove(player.getUniqueId());
+    // 防抖账本随退出整体丢弃（玩家已离线，任何判定结果都不可能再用于切换显示状态）
+    streaks.remove(player.getUniqueId());
   }
 
   /**
@@ -359,6 +552,21 @@ public final class EntityCuller implements Listener {
       total += map.size();
     }
     return total;
+  }
+
+  /**
+   * 异步遮挡是否已真正接线（引擎已起 + 位图仓库可用）——诊断用；未接线时为 {@code false}。
+   *
+   * <p>注意与「配置里开了」不是一回事：反矿透未启用、或引擎启动失败时本值仍为 false。
+   */
+  public boolean asyncOcclusionActive() {
+    return asyncRaycast();
+  }
+
+  /** 异步遮挡专用池当前排队的判定数（诊断用）；未接线时为 0。 */
+  public int occlusionQueueDepth() {
+    OcclusionEngine current = engine;
+    return current == null ? 0 : current.queueDepth();
   }
 
   /** 取出并从登记表移除某玩家的全部隐藏实体（玩家退出 / 插件停用时的全量恢复入口）；无记录返回空表。 */
@@ -433,10 +641,15 @@ public final class EntityCuller implements Listener {
     if (!active()) {
       return;
     }
-    TrackedRotation rotation = rotations.get(event.getPlayer().getUniqueId());
+    UUID playerId = event.getPlayer().getUniqueId();
+    TrackedRotation rotation = rotations.get(playerId);
     if (rotation != null) {
-      // 按实例摘除：实体此时可能已经离开本区域，读它的 entityId 会触发 Folia 线程校验并刷 ERROR
-      rotation.remove(event.getEntity());
+      // 按实例摘除：实体此时可能已经离开本区域，读它的 entityId 会触发 Folia 线程校验并刷 ERROR。
+      // 摘除动作顺带返回「加入时捕获的 entityId」，供防抖账本清除对应条目——同样无需触碰实体本身。
+      int removedId = rotation.remove(event.getEntity());
+      if (removedId >= 0) {
+        removeStreak(playerId, removedId);
+      }
     }
   }
 
@@ -456,6 +669,12 @@ public final class EntityCuller implements Listener {
       return;
     }
     UUID playerId = player.getUniqueId();
+
+    // 异步路径：先把本周期的时间预算交给引擎（工作线程据此决定处理多少条，超预算者顺延到下一周期）。
+    // 每玩家每周期各调一次，因此有效总预算 ≈ 每玩家预算 × 在线玩家数（正是配置项「每周期每玩家」的语义）。
+    // 刻意放在直通判定<b>之前</b>：直通玩家虽然不再提交新任务，但引擎队列里可能仍有早先提交的判定，
+    // 若因「本玩家直通」就不开周期，这些任务会一直顺延（直到有别的玩家开周期），白白积压。
+    beginEngineCycle();
 
     // 直通玩家恢复其全部已隐藏实体，且不再提交任何射线复检。判定只读登录期快照（纯内存、线程安全），
     // 不再调用任何 Bukkit 权限 API —— 因此本类周期路径上不存在任何权限查询。
@@ -524,16 +743,21 @@ public final class EntityCuller implements Listener {
     //        刻意不打射线（成本有界），因此这里是远距离已隐藏实体唯一的再评估入口。
     //    成本仍由 recheck-budget 封顶（每周期至多预算次射线）：ceil(追踪数 / 预算) 个周期覆盖全部追踪
     //    实体，隐藏实体只是排到属于自己的那一轮，不会让射线次数随隐藏数无界增长。
+    //    <b>异步路径下本通道取消条数封顶</b>：提交只做「实体线程抓快照 + 入队」，射线本身在专用池里跑，
+    //    因此每周期提交<b>全部</b>追踪实体——收敛延迟不再随在线实体数线性增长（这正是本子项的目的）。
+    //    射线 CPU 由引擎的时间预算封顶（超预算者顺延到下一周期、不丢判定），故「提交全部」不会让开销无界。
     TrackedRotation rotation = rotations.get(playerId);
     if (rotation == null) {
       return;
     }
-    for (Entity entity : rotation.nextBatch(config.recheckBudget())) {
+    int slice = asyncRaycast() ? Integer.MAX_VALUE : config.recheckBudget();
+    for (Entity entity : rotation.nextBatch(slice)) {
       if (!owns(entity)) {
         continue;
       }
       if (!entity.isValid()) {
         rotation.remove(entity.getEntityId());
+        removeStreak(playerId, entity.getEntityId());
         continue;
       }
       // 去重：本周期已被通道①计过的实体（既已隐藏又在轮转队列）不再重复计数，避免「复检提交」虚增。
@@ -590,12 +814,140 @@ public final class EntityCuller implements Listener {
         evaluate(player, entity, true, mode != RecheckMode.INITIAL, true);
         return;
       }
-      // 射线遮挡判定：raycast=false（只开视锥剔除）时按「不遮挡」处理，实体保持可见。
+      // 射线遮挡判定（异步路径）：实体线程只抓快照并提交，判定与发布在专用池 / 回投里完成
+      // （见 submitAsync / publishAsync）。这一支取代了下面的原生射线，且<b>不再读方块</b>。
+      if (asyncRaycast()) {
+        submitAsync(player, entity, mode != RecheckMode.INITIAL);
+        return;
+      }
+      // 射线遮挡判定（同步路径）：raycast=false（只开视锥剔除）时按「不遮挡」处理，实体保持可见。
       evaluate(player, entity, config.raycast() && occlusion.isFullyOccluded(player, entity),
           mode != RecheckMode.INITIAL);
     } catch (Throwable throwable) {
       // 任意失败都按「保持可见」处理（fail-open：绝不误藏实体）
       logThrottled(throwable);
+    }
+  }
+
+  /** 给异步引擎开一个新周期并给出本玩家的时间预算（未接线时空操作）。 */
+  private void beginEngineCycle() {
+    OcclusionEngine current = engine;
+    if (current != null) {
+      current.beginCycle(budgetNanos);
+    }
+  }
+
+  /**
+   * 异步射线路径的<b>提交侧</b>（运行在实体所属线程）：抓几何快照 → 组纯值任务 → 入队。
+   *
+   * <p><b>为什么只抓快照</b>：{@code getEyeLocation} / {@code getBoundingBox} 都是 Bukkit API，必须在实体
+   * 所属线程读取；读出的坐标是纯数值，交给专用池后工作线程<b>绝不触碰任何 Bukkit API</b>（Folia 上跨区域
+   * 读会先打 ERROR 再抛异常）。与同步路径相比，只是把「射线本身」从实体线程搬到了专用池。
+   *
+   * <p><b>失败与拒收都不改变显示状态</b>：抓几何失败、或任务因队列满被拒收时，一律<b>保持实体当前
+   * 显示状态</b>（与引擎「超时丢弃同样不改变显示状态」一致）：当前状态由此前一次成功判定决定，
+   * 而「该恢复却仍隐藏」由通道①的每周期全量复检兜底。绝不因一次取不到判定就把已隐藏实体强行显示——
+   * 那会与通道②的隐藏判定反复争夺，表现为闪烁。
+   *
+   * <p>包可见：供离线单测验证「提交全部追踪实体 / 组请求 / 拒收不影响状态」这段链路。
+   */
+  void submitAsync(Player player, Entity entity, boolean fromRecheck) {
+    OcclusionEngine current = engine;
+    if (current == null || stopping) {
+      return;
+    }
+    try {
+      Location eye = player.getEyeLocation();
+      String worldName = entity.getWorld().getName();
+      BoundingBox box = entity.getBoundingBox();
+      double[][] visible = visibleVertices(eye.getX(), eye.getY(), eye.getZ(),
+          box.getMinX(), box.getMinY(), box.getMinZ(), box.getMaxX(), box.getMaxY(), box.getMaxZ());
+      int limit = Math.min(Math.max(1, config.raySamples()), visible.length);
+      // 展平成连续数组（纯基本类型，跨线程传递零装箱；工作线程只按 (x,y,z) 三元组读取）
+      double[] vertices = new double[limit * 3];
+      for (int i = 0; i < limit; i++) {
+        vertices[i * 3] = visible[i][0];
+        vertices[i * 3 + 1] = visible[i][1];
+        vertices[i * 3 + 2] = visible[i][2];
+      }
+      // 截止时刻：超过 timeoutCycles 个提交周期仍未回投的判定由引擎丢弃（不改变显示状态），
+      // 避免用陈旧几何去隐藏实体（见 OcclusionEngine 的截止时间说明）。
+      long deadline = System.nanoTime() + timeoutNanos;
+      OcclusionEngine.Request request = new OcclusionEngine.Request(player.getUniqueId(),
+          entity.getEntityId(), worldName, deadline, eye.getX(), eye.getY(), eye.getZ(), vertices,
+          (result, occluded) ->
+              // 回投发生在专用池线程：先跳回玩家/实体所属线程，再触碰任何 Bukkit API
+              Schedulers.onEntity(plugin, player,
+                  () -> publishAsync(player, entity, worldName, result, occluded, fromRecheck)));
+      // 拒收（队列满）不改变显示状态，由引擎计入 rejectedQueueFull 供真机观测（见诊断面板）。
+      current.submit(request);
+    } catch (Throwable throwable) {
+      // 抓快照失败 = 本次拿不到判定：不改变显示状态（fail-open 的安全方向）
+      logThrottled(throwable);
+    }
+  }
+
+  /**
+   * 异步射线路径的<b>发布侧</b>（已跳回玩家/实体所属线程）：逐条状态校验 → 防抖 → hide/show。
+   *
+   * <p><b>每一步校验都不能省</b>：结果从提交到回投之间可能已过若干周期——期间玩家可能退出、实体可能
+   * 失效 / 被卸载 / 离开本区域，甚至被传送到<b>另一个世界</b>（按旧世界几何算出的遮挡结论毫无意义，
+   * 必须作废）。任何一条校验不通过都<b>不改变显示状态</b>（fail-open 的安全方向）。
+   *
+   * <p>包可见：真实回投要经 {@code Schedulers.onEntity}（离线不可用），单测直接调用本方法模拟
+   * 「已跳回实体线程」这一步，从而覆盖全部状态校验与防抖判定。
+   */
+  void publishAsync(Player player, Entity entity, String worldName,
+      OcclusionEngine.Request request, boolean occluded, boolean fromRecheck) {
+    if (stopping || !active()) {
+      return;
+    }
+    if (!player.isOnline()) {
+      return; // 退出已清账本；玩家已看不到该实体，无需（也不该）再动可见性
+    }
+    if (!owns(entity)) {
+      return; // 跨区域（Folia）：读它的状态会先打 ERROR 再抛，直接放弃本轮结果
+    }
+    // 世界作废守卫：迟到结果只对「提交时所属世界」成立；实体换世界后必须丢弃。
+    // 读侧用提交时捕获的世界名做精确比较（世界名由服务端保证唯一），无需任何额外世代编号。
+    if (!worldName.equals(entity.getWorld().getName())) {
+      return;
+    }
+    if (!entity.isValid()) {
+      removeLedgerEntry(player.getUniqueId(), entity);
+      removeStreak(player.getUniqueId(), request.entityId());
+      return;
+    }
+    if (!passesHysteresis(player.getUniqueId(), request.entityId(), occluded)) {
+      return; // 判据尚未连续够次数：维持现状，压住「刚好被挡 / 刚好可见」的抖动
+    }
+    evaluate(player, entity, occluded, fromRecheck);
+  }
+
+  /**
+   * 防抖闸门：同一实体的判定需连续 {@code hysteresisCycles} 个周期一致才允许切换显示状态。
+   *
+   * <p>{@code hysteresisCycles ≤ 1}（默认）时直接放行，<b>既不分配也不访问</b>防抖账本（零开销）。
+   * 达到要求前一律维持现状——注意这也会推迟「恢复可见」，但延迟有硬上界
+   * （{@code hysteresisCycles × update-interval-ticks}），且强制可见距离内的恢复完全不走本路径
+   * （{@link #submitRaycast} 在近处即同步 {@code showIfHidden}），故安全下限不受影响。
+   */
+  private boolean passesHysteresis(UUID playerId, int entityId, boolean verdict) {
+    int required = hysteresisCycles;
+    if (required <= 1) {
+      return true;
+    }
+    ConcurrentHashMap<Integer, VerdictStreak> map =
+        streaks.computeIfAbsent(playerId, uuid -> new ConcurrentHashMap<>());
+    VerdictStreak streak = map.computeIfAbsent(entityId, id -> new VerdictStreak());
+    return streak.record(verdict, required);
+  }
+
+  /** 摘除某实体在防抖账本里的条目（失效 / 解除追踪时调用；无该条目则 no-op）。 */
+  private void removeStreak(UUID playerId, int entityId) {
+    ConcurrentHashMap<Integer, VerdictStreak> map = streaks.get(playerId);
+    if (map != null) {
+      map.remove(entityId);
     }
   }
 
@@ -812,6 +1164,7 @@ public final class EntityCuller implements Listener {
       boolean frustumCulled) {
     if (!entity.isValid() || !player.isOnline()) {
       removeLedgerEntry(player.getUniqueId(), entity);
+      removeStreak(player.getUniqueId(), entity.getEntityId());
       return;
     }
 
@@ -1110,17 +1463,24 @@ public final class EntityCuller implements Listener {
       order.add(new Tracked(id, entity));
     }
 
-    /** 按实例摘除（不读实体状态，供可能已跨区域的 untrack 事件使用）。 */
-    synchronized void remove(Entity entity) {
+    /**
+     * 按实例摘除（不读实体状态，供可能已跨区域的 untrack 事件使用）。
+     *
+     * @return 被摘除条目的 entityId（加入时捕获）；未找到返回 {@code -1}。
+     *         调用方据此清除该实体的辅助状态（防抖账本），无需再去读可能已跨区域的实体本身。
+     */
+    synchronized int remove(Entity entity) {
       for (int index = 0; index < order.size(); index++) {
         if (order.get(index).entity() == entity) {
+          int id = order.get(index).id();
           order.remove(index);
           if (cursor > index) {
             cursor--;
           }
-          return;
+          return id;
         }
       }
+      return -1;
     }
 
     /** 按 id 摘除一个不再被追踪的实体，并修正游标使「下一页」不被跳过。 */

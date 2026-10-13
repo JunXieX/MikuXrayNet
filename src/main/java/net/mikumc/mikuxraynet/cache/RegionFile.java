@@ -247,7 +247,7 @@ final class RegionFile implements AutoCloseable {
           throw new IOException("区域文件过小（" + size + " 字节）");
         }
         // 读取种子与压缩方案：文件头里「格式版本」与「压缩方案」是两个独立字段——
-        // 格式版本当前为 0x04（0x03 等旧版本由 decodeHeaderInfo 明确拒绝）；
+        // 格式版本由 BufferedLinearV3Format.VERSION 标识（当前 0x06；低于它的旧版本由 decodeHeaderInfo 明确拒绝）；
         // 压缩方案 0x02(zstd) 为当前写入值，0x01(Deflate) 是历史格式，两者都要能读。
         BufferedLinearV3Format.Header header = BufferedLinearV3Format.decodeHeaderInfo(
             readAt(channel, 0, BufferedLinearV3Format.HEADER_SIZE));

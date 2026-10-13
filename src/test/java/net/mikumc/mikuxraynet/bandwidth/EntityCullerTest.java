@@ -20,6 +20,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 import net.kyori.adventure.text.Component;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.occlusion.OcclusionEngine;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
@@ -599,6 +602,270 @@ class EntityCullerTest {
     field.setBoolean(culler, true);
   }
 
+  // ------------------------------------------------- 异步遮挡（entity-culling.async-occlusion）
+
+  /** 全部用例统一使用的世界名（与 {@link WorldStub} 默认名一致）。 */
+  private static final String WORLD_NAME = "world";
+
+  /**
+   * 构造「已接线异步遮挡」的剔除器（不调 {@code start()}：它依赖 Bukkit 的事件注册，离线不可用）。
+   *
+   * @param hysteresisCycles 防抖连续次数（0/1 = 立即）
+   * @param raySamples       每实体最多尝试的候选顶点数
+   */
+  private static EntityCuller newAsyncCuller(ThrottleStats stats, OcclusionStores stores,
+      OcclusionStats counters, int hysteresisCycles, int raySamples) {
+    BandwidthConfig.EntityCulling config = new BandwidthConfig.EntityCulling(true, true, 2.0D, 10,
+        raySamples, 12, frustumOff(),
+        new BandwidthConfig.EntityCulling.AsyncOcclusion(true, 2.0D, 1, 0, 3, hysteresisCycles));
+    return new EntityCuller(new PluginStub().proxy(), config, stats, entity -> true,
+        playerId -> false, (ignoredPlayer, ignoredEntity) -> false, stores, counters);
+  }
+
+  /** 造一条异步回投（内容无关紧要：发布侧只读 {@code entityId}，世界名由参数单独传入）。 */
+  private static OcclusionEngine.Request asyncResult(int entityId, PlayerStub player) {
+    return new OcclusionEngine.Request(player.id(), entityId, WORLD_NAME, 0L, 0.0D, 0.0D, 0.0D,
+        new double[] {1.0D, 1.0D, 1.0D}, (request, occluded) -> {
+        });
+  }
+
+  /**
+   * 异步路径<b>取消条数封顶</b>：每周期提交「全部追踪实体」（而非 {@code recheck-budget} 条切片）。
+   *
+   * <p>这是本子项存在的理由——收敛延迟不再随在线实体数线性增长。提交数是确定性的（提交在实体线程上
+   * 同步发生），故断言与引擎线程处理进度无关。
+   */
+  @Test
+  void asyncSubmitsEveryTrackedEntityWithoutCountCap() {
+    ThrottleStats stats = new ThrottleStats();
+    OcclusionStats counters = new OcclusionStats();
+    OcclusionStores stores = new OcclusionStores();
+    EntityCuller culler = newAsyncCuller(stats, stores, counters, 1, 8);
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    try {
+      culler.startEngine();
+      assertTrue(culler.asyncOcclusionActive(), "给出仓库与计数后必须真正接线（否则本用例无意义）");
+
+      int tracked = 30;
+      for (int i = 0; i < tracked; i++) {
+        // 位置距玩家约 141 格（远超强制可见距离 2 格）→ 走射线判定通道
+        culler.onTrack(new PlayerTrackEntityEvent(player.proxy(),
+            new EntityStub(31_000 + i, world).proxy()));
+      }
+      assertEquals(tracked, counters.submitted.sum(),
+          "入场首评即全部提交（异步路径不受条数封顶）");
+
+      culler.recheck(player.proxy());
+      assertEquals(2L * tracked, counters.submitted.sum(),
+          "每个复检周期提交全部追踪实体，而不是 recheck-budget(=12) 条的切片");
+    } finally {
+      culler.closeEngine();
+    }
+  }
+
+  /** 异步发布：判定为「完全遮挡」即隐藏，判定为「通畅」即恢复，且恢复/隐藏都计入复检口径。 */
+  @Test
+  void asyncPublishHidesAndRestoresThroughTheLedger() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler =
+        newAsyncCuller(stats, new OcclusionStores(), new OcclusionStats(), 1, 8);
+    PlayerStub player = new PlayerStub();
+    EntityStub entity = new EntityStub(32_001, new WorldStub());
+
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), true, true);
+    assertEquals(1, culler.hiddenCount(), "异步判定为完全遮挡时必须隐藏");
+    assertEquals(1L, stats.recheckHidden.sum(), "异步复检致隐藏必须计入复检口径");
+
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), false, true);
+    assertEquals(0, culler.hiddenCount(), "异步判定为通畅时必须恢复并摘除账本");
+    assertEquals(1, player.showCalls.get(), "恢复必须真的下发 showEntity");
+    assertEquals(1L, stats.recheckShown.sum());
+  }
+
+  /**
+   * 异步发布的世界作废守卫：实体已换到另一个世界时，按旧世界几何算出的迟到结果必须丢弃
+   * （否则会出现「用 A 世界的墙挡住 B 世界的实体」这类错误隐藏）。
+   */
+  @Test
+  void asyncPublishDiscardsResultFromAnotherWorld() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler =
+        newAsyncCuller(stats, new OcclusionStores(), new OcclusionStats(), 1, 8);
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub entity = new EntityStub(33_001, world);
+
+    // 前置：实体已被隐藏（模拟「上一周期判定为遮挡」）
+    culler.evaluate(player.proxy(), entity.proxy(), true);
+    assertEquals(1, culler.hiddenCount());
+    long hiddenBefore = stats.entitiesHidden.sum();
+
+    // 结果来自旧世界，但实体已传送到世界 "world_nether" → 必须作废
+    world.rename("world_nether");
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), false, true);
+
+    assertEquals(1, culler.hiddenCount(), "跨世界的迟到结果必须作废：不得恢复，也不得再隐藏");
+    assertEquals(0, player.showCalls.get(), "作废的结果不得下发任何可见性操作");
+    assertEquals(hiddenBefore, stats.entitiesHidden.sum());
+  }
+
+  /** 异步发布：实体已失效 → 只清账本，不发 showEntity（服务端已自然回收）。 */
+  @Test
+  void asyncPublishDropsInvalidEntityFromLedger() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler =
+        newAsyncCuller(stats, new OcclusionStores(), new OcclusionStats(), 1, 8);
+    PlayerStub player = new PlayerStub();
+    EntityStub entity = new EntityStub(34_001, new WorldStub());
+
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), true, true);
+    assertEquals(1, culler.hiddenCount());
+
+    entity.valid = false;
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), false, true);
+
+    assertEquals(0, culler.hiddenCount(), "失效实体的隐藏记录必须清理");
+    assertEquals(0, player.showCalls.get(), "已被服务端回收的实体不该收到 showEntity");
+  }
+
+  /** 异步发布：玩家已离线 → 不改变任何显示状态（玩家已看不到该实体，恢复无意义）。 */
+  @Test
+  void asyncPublishIsSkippedForOfflinePlayer() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler =
+        newAsyncCuller(stats, new OcclusionStores(), new OcclusionStats(), 1, 8);
+    PlayerStub player = new PlayerStub();
+    EntityStub entity = new EntityStub(35_001, new WorldStub());
+
+    player.online = false;
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), true, true);
+
+    assertEquals(0, culler.hiddenCount(), "离线玩家不得新增隐藏记录");
+    assertEquals(0L, stats.entitiesHidden.sum());
+  }
+
+  /**
+   * 异步发布：Folia 跨区域实体的迟到结果必须整条丢弃——读它的任何状态都会先打 ERROR 再抛异常。
+   *
+   * <p>归属判定在此注入为「只有 35_101 属于本区域」，并要求该实体一旦被读状态就抛（见
+   * {@link EntityStub#foreign}），因此实现里只要还有一次越界读取，本用例即失败。
+   */
+  @Test
+  void asyncPublishSkipsForeignRegionEntityWithoutTouchingIt() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub foreign = new EntityStub(36_001, world);
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12, frustumOff(),
+            new BandwidthConfig.EntityCulling.AsyncOcclusion(true, 2.0D, 1, 0, 3, 1)),
+        stats, entity -> entity != foreign.proxy(), playerId -> false,
+        (ignoredPlayer, ignoredEntity) -> false, new OcclusionStores(), new OcclusionStats());
+
+    // 先在「同区域」时把它藏起来（此时读状态合法）
+    culler.evaluate(player.proxy(), foreign.proxy(), true);
+    assertEquals(1, culler.hiddenCount());
+    int readsBefore = foreign.stateReads();
+    foreign.foreign = true;
+
+    culler.publishAsync(player.proxy(), foreign.proxy(), WORLD_NAME,
+        asyncResult(foreign.id(), player), true, true);
+
+    assertEquals(readsBefore, foreign.stateReads(),
+        "跨区域实体的状态读取会在 Folia 上刷 ERROR，发布侧必须完全跳过它");
+    assertEquals(1, culler.hiddenCount(), "跨区域实体本轮既不清理也不报错");
+  }
+
+  /** 异步发布：停用已开始 → 迟到的隐藏结果必须被拒（否则会把刚刚恢复的实体重新藏回）。 */
+  @Test
+  void asyncPublishIsRejectedAfterStopBegins() throws Exception {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler =
+        newAsyncCuller(stats, new OcclusionStores(), new OcclusionStats(), 1, 8);
+    PlayerStub player = new PlayerStub();
+    EntityStub entity = new EntityStub(37_001, new WorldStub());
+
+    setStopping(culler);
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), true, true);
+
+    assertEquals(0, culler.hiddenCount(), "停用开始后不得再隐藏实体");
+    assertEquals(0L, stats.entitiesHidden.sum());
+  }
+
+  /**
+   * 防抖（{@code occlusion-hysteresis-cycles}）：同一实体的判定需连续 N 个周期一致才允许切换显示状态。
+   *
+   * <p>这条判据压制「刚好被挡 / 刚好可见」的边界抖动；延迟有硬上界（N × 复检周期），且强制可见距离内的
+   * 恢复完全不走本路径，故安全下限不受影响。
+   */
+  @Test
+  void asyncHysteresisRequiresConsecutiveAgreement() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler = newAsyncCuller(stats, new OcclusionStores(), new OcclusionStats(), 2, 8);
+    PlayerStub player = new PlayerStub();
+    EntityStub entity = new EntityStub(38_001, new WorldStub());
+
+    // 第 1 次「遮挡」：连续次数 1 < 2 → 维持现状（仍可见）
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), true, true);
+    assertEquals(0, culler.hiddenCount(), "防抖未达次数前不得切换（避免边界抖动导致闪烁）");
+
+    // 第 2 次「遮挡」：连续次数 2 → 允许切换
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), true, true);
+    assertEquals(1, culler.hiddenCount(), "连续两次一致后必须隐藏");
+
+    // 第 1 次「通畅」：连续次数重新计为 1 → 仍保持隐藏
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), false, true);
+    assertEquals(1, culler.hiddenCount(), "恢复同样要连续一致才生效");
+
+    // 第 2 次「通畅」→ 恢复
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), false, true);
+    assertEquals(0, culler.hiddenCount(), "连续两次通畅后必须恢复");
+    assertEquals(1, player.showCalls.get());
+  }
+
+  /**
+   * 异步「视锥优先」不变：锥外 + 超距的实体在异步路径下仍由<b>纯数学</b>视锥判定隐藏，
+   * 不占用异步引擎（拿不到位图也照样剔除）。这是「视锥分支不退化」的守门用例。
+   */
+  @Test
+  void asyncPathKeepsFrustumCullingSynchronous() {
+    ThrottleStats stats = new ThrottleStats();
+    OcclusionStats counters = new OcclusionStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, 12,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 2.0D),
+            new BandwidthConfig.EntityCulling.AsyncOcclusion(true, 2.0D, 1, 0, 3, 1)),
+        stats, entity -> true, playerId -> false, (ignoredPlayer, ignoredEntity) -> false,
+        new OcclusionStores(), counters);
+    try {
+      culler.startEngine();
+      // 玩家朝 +Z；实体在其斜后方且距约 141 格（远超距离门 2 格）→ 应被视锥剔除
+      EntityStub behind = new EntityStub(39_001, world, 100.0D, 65.0D, -100.0D);
+      culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), behind.proxy()));
+
+      assertEquals(1L, stats.frustumHidden.sum(), "锥外 + 超距的实体必须被视锥剔除");
+      assertEquals(1, culler.hiddenCount());
+      assertEquals(0L, counters.submitted.sum(),
+          "视锥剔除不打射线，绝不应提交任何异步任务（它本来就拿不到位图也能判定）");
+    } finally {
+      culler.closeEngine();
+    }
+  }
+
   // ------------------------------------------------- 视锥剔除（entity-culling.frustum）
 
   /**
@@ -987,9 +1254,16 @@ class EntityCullerTest {
     private volatile boolean occluding = true;
     /** 为 true 时 rayTraceBlocks 抛异常，模拟「射线 / 世界读取失败」（红线：此时不得隐藏）。 */
     private volatile boolean failBlockRead;
+    /** 世界名（异步路径用它选取该世界的遮挡表、并作废跨世界迟到结果）。 */
+    private String name = WORLD_NAME;
 
     World proxy() {
       return proxy;
+    }
+
+    /** 换名（模拟「实体已传送到另一个世界」）。 */
+    void rename(String newName) {
+      this.name = newName;
     }
 
     @Override
@@ -999,6 +1273,7 @@ class EntityCullerTest {
             : ("equals".equals(method.getName()) ? proxy == args[0] : "WorldStub");
       }
       return switch (method.getName()) {
+        case "getName" -> name;
         case "rayTraceBlocks" -> {
           if (failBlockRead) {
             throw new IllegalStateException("模拟射线 / 世界读取失败");

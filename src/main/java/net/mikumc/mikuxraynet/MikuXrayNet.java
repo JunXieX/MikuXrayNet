@@ -7,11 +7,14 @@ import net.mikumc.mikuxraynet.bandwidth.ThrottlePipeline;
 import net.mikumc.mikuxraynet.bandwidth.ThrottleStats;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.MikuConfig;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.util.Diagnostics;
 import net.mikumc.mikuxraynet.util.ReloadCoordinator;
 import org.bukkit.Bukkit;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.world.ChunkUnloadEvent;
 import org.bukkit.event.world.WorldUnloadEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -51,6 +54,13 @@ public final class MikuXrayNet extends JavaPlugin {
    * 累计口径失去连续性。把它提到插件层后，管线重建不影响计数，{@code /mxnet status} 字段语义不变。
    */
   private final ThrottleStats throttleStats = new ThrottleStats();
+  /**
+   * 异步遮挡计数：同样<b>插件级唯一</b>、跨热重载复用（理由同 {@link #throttleStats}）。
+   *
+   * <p>即使未启用异步遮挡也保留该实例（计数恒为 0）：它只是几个 {@code LongAdder}，
+   * 让诊断侧无需分支即可取值。
+   */
+  private final OcclusionStats occlusionStats = new OcclusionStats();
   /** 诊断转储 / status 数据源（热重载时重建；volatile 原因同 {@link #throttlePipeline}）。 */
   private volatile Diagnostics diagnostics;
   /** 周期运行摘要任务（bandwidth.yml: diagnostics.interval-seconds；0 = 关闭）。 */
@@ -82,7 +92,7 @@ public final class MikuXrayNet extends JavaPlugin {
     // （io.papermc.paper.threadedregions.RegionizedServer：Folia 核心独有，Leaf/Paper 都没有）。
     PlatformSupport.configure(config.antiXray().platform());
     getLogger().info("运行平台：" + PlatformSupport.platformDescription());
-    this.runtime = new AntiXrayRuntime(this);
+    this.runtime = new AntiXrayRuntime(this, occlusionStats);
     runtime.startBypassRegistry();
     runtime.startAntiXray();
     startBandwidth();
@@ -109,8 +119,11 @@ public final class MikuXrayNet extends JavaPlugin {
 
   /** 带宽优化装配：各子模块独立注册，注册失败只停用该子模块，不影响其它功能。 */
   private void startBandwidth() {
-    // 统计持有者跨 reload 复用（throttleStats 为插件级唯一实例）
-    ThrottlePipeline pipeline = new ThrottlePipeline(this, config.bandwidth(), throttleStats);
+    // 统计持有者跨 reload 复用（throttleStats / occlusionStats 均为插件级唯一实例）
+    AntiXrayRuntime current = runtime;
+    OcclusionStores occlusionStores = current == null ? null : current.occlusionStores();
+    ThrottlePipeline pipeline =
+        new ThrottlePipeline(this, config.bandwidth(), throttleStats, occlusionStores, occlusionStats);
     try {
       pipeline.start();
     } catch (Throwable throwable) {
@@ -252,13 +265,35 @@ public final class MikuXrayNet extends JavaPlugin {
     startBandwidth();
   }
 
-  /** 世界卸载时整体失效该世界的改写缓存与磁盘缓存句柄（落盘 + 关闭，避免把已卸载世界的资源留在堆上）。 */
+  /**
+   * 注册「区块 / 世界卸载 → 失效缓存与遮挡位图」监听器（落盘 + 关闭 + 摘除内存表，避免把已卸载的
+   * 资源留在堆上）。
+   *
+   * <p><b>为什么区块卸载也要管</b>：遮挡位图按「区块 + section」驻留，只在解码 / 缓存命中时写入；
+   * 若不随卸载驱逐，其内存会随「本局游戏曾解码过的区块总数」无界增长（跨世界、跨会话）。
+   * 摘除是安全的：区块卸载意味着附近已无玩家，这份几何数据此刻无人使用；区块下次被发送时会整列重建。
+   */
   void registerWorldUnloadInvalidation() {
     getServer().getPluginManager().registerEvents(new Listener() {
       @EventHandler
       public void onWorldUnload(WorldUnloadEvent event) {
         if (runtime != null) {
           runtime.invalidateWorld(event.getWorld().getName());
+        }
+      }
+
+      @EventHandler
+      public void onChunkUnload(ChunkUnloadEvent event) {
+        AntiXrayRuntime current = runtime;
+        if (current == null) {
+          return;
+        }
+        try {
+          current.invalidateChunk(event.getWorld().getName(), event.getChunk().getX(),
+              event.getChunk().getZ());
+        } catch (Throwable throwable) {
+          // 卸载事件里的坐标读取失败只影响本次驱逐（该区块的位图留到下次世界卸载再清），不阻断卸载
+          getLogger().log(Level.WARNING, "区块卸载时摘除遮挡位图失败（已忽略）", throwable);
         }
       }
     }, this);

@@ -30,7 +30,7 @@ class InstantRevealTest {
   /** 默认配置构造显形器（事件显形默认开启）；离线构造只需纯数据依赖，Bukkit 组件传 null。 */
   private ProximityRevealer revealer() {
     return new ProximityRevealer(null, config(), new ObfuscatedChunkIndex(1, 300),
-        new RevealedSet(1024, 300), new ProximityStats(), null, null);
+        new RevealedSet(1024, 300), new ProximityStats(), null, null, null);
   }
 
   private static AntiXrayConfig config() {
@@ -128,7 +128,7 @@ class InstantRevealTest {
 
     UUID player = UUID.randomUUID();
     ProximityRevealer revealer = new ProximityRevealer(null, config(), index, revealed,
-        new ProximityStats(), null, null);
+        new ProximityStats(), null, null, null);
 
     assertTrue(revealer.isInstantCandidate(player, WORLD, 10, 64, 10),
         "已伪装且未显形：是即时显形候选");

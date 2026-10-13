@@ -257,6 +257,16 @@ public final class AntiXrayConfig {
   }
 
   /**
+   * 视锥竖直全角的<b>默认值</b>（度）：120。
+   *
+   * <p>取在安全下限（{@link #FRUSTUM_FOV_FLOOR}）之上：下限保证「按 16:9 屏幕计算的合法可视区不会被剔除」，
+   * 而默认值再宽一些，是为了覆盖更宽的屏幕（21:9 等）与「转头瞬间视锥边界还没更新」的迟滞窗口——
+   * 越宽越不会出现「看得见却还是伪装方块」，代价只是多评估一些侧后方向的候选（判定本身很廉价）。
+   * 要省带宽请关掉整个视锥剔除，而不是把角度配窄。
+   */
+  public static final double FRUSTUM_FOV_DEFAULT = 120.0D;
+
+  /**
    * 视锥竖直全角的<b>安全下限</b>（度）：等于 Minecraft 客户端 FOV 设置的上限 110。
    *
    * <p><b>为什么设下限而不是只写默认值</b>：客户端的 FOV 是纯本地设置、服务端拿不到，而视锥剔除
@@ -264,10 +274,18 @@ public final class AntiXrayConfig {
    * 的方块一直保持伪装（真机反馈：「站在黑曜石门正前方，一半方块始终是石头/泥土，点一下才变回来」
    * ——周期性显形走视锥判定、点击走的事件显形不走，两者只差这一道闸门）。
    * 取 110° 时，16:9 屏幕下竖直半角 55°、水平半角 68.4°，恰好覆盖「客户端 FOV 开到上限 + 16:9」
-   * 的整个可视区，因此<b>任何合法客户端能看到的方向都不会被剔除</b>（更宽的屏幕见 yml 注释）。
+   * 的整个可视区，因此<b>任何合法客户端能看到的方向都不会被剔除</b>（更宽的屏幕见 {@link #FRUSTUM_FOV_DEFAULT}）。
    * 想省带宽应当关掉整个视锥剔除（{@code proximity.frustum.enabled=false}），而不是把角度配窄。
    */
   public static final double FRUSTUM_FOV_FLOOR = 110.0D;
+
+  /**
+   * 视锥「最小豁免距离」的<b>默认值</b>（格）：24（安全下限的 1.5 倍，约 1.5 个区块）。
+   *
+   * <p>该距离内的候选完全不参与视锥判定。取在下限之上，是让「刚进视锥边界、角度还偏」的近处方块
+   * 也一并还原——玩家对「脚边/门后那一块还是假的」最敏感。
+   */
+  public static final double FRUSTUM_MIN_DISTANCE_DEFAULT = 24.0D;
 
   /**
    * 视锥「最小豁免距离」的<b>安全下限</b>（格）：该距离内的候选完全不参与视锥判定。
@@ -293,6 +311,15 @@ public final class AntiXrayConfig {
   public static final int DISK_CACHE_EXPIRE_FLOOR_SECONDS = 86400;
 
   /**
+   * 邻近显形触发距离的<b>默认值</b>（格）：96（= 6 个区块半径，扫描 13×13 = 169 个区块）。
+   *
+   * <p>取在旧默认 64 之上：显形只在射线通畅且方块有暴露面时还原，因此放大距离不会隔着墙泄露，
+   * 只是把「本来就看得到的矿」更早、更远地还给玩家。代价是单周期候选扫描量随半径平方增长
+   * （64 → 96 约 3.5 倍），故仍有安全上限（见 {@link #PROXIMITY_DISTANCE_MAX}）。
+   */
+  public static final double PROXIMITY_DISTANCE_DEFAULT = 96.0D;
+
+  /**
    * 邻近显形触发距离的<b>安全上限</b>（格）。
    *
    * <p><b>为什么设上限</b>：每个巡检周期要对玩家周围该半径内的区块做候选扫描，扫描量随半径<b>平方增长</b>
@@ -306,7 +333,7 @@ public final class AntiXrayConfig {
    *
    * <p>候选点只取在方块<b>暴露面</b>上、按命中概率排序：面中心 + 最近点 + 至多 3 个面角，<b>至多 5 个</b>
    * （见 {@code ProximitySelector#MAX_SAMPLE_POINTS}）。配 6~8 不会多试出第 6 个点，属静默失效，
-   * 因此钳制到 5；默认 4 落在区间内，不改变既有行为。
+   * 因此钳制到 5；默认即取上限 5（多试一个面角，减少「只露一角的矿」漏显形）。
    */
   public static final int PROXIMITY_RAY_SAMPLES_MAX = 5;
 
@@ -314,7 +341,7 @@ public final class AntiXrayConfig {
    * {@code proximity.instant-reveal.radius}（事件驱动即时显形的邻域半径）的有效上限。
    *
    * <p>该半径决定「一个方块变更要连带检查周围多少格」——判定量随半径的三次方增长
-   * （半径 8 时每个变更坐标要查 17³ 量级的邻域）。默认 2，钳制区间 1..8（与立即放行半径同量级）。
+   * （半径 8 时每个变更坐标要查 17³ 量级的邻域）。默认 4，钳制区间 1..8（与立即放行半径同量级）。
    */
   public static final int PROXIMITY_INSTANT_RADIUS_MAX = 8;
 
@@ -441,7 +468,8 @@ public final class AntiXrayConfig {
   /**
    * 邻近显形：玩家靠近曾被伪装的坐标时，主动把该坐标的真实方块发回客户端。
    *
-   * @param distance              触发显形的距离（格，三维欧氏距离，等于阈值也算命中）；
+   * @param distance              触发显形的距离（格，三维欧氏距离，等于阈值也算命中）；默认
+   *                              {@link #PROXIMITY_DISTANCE_DEFAULT}；
    *                              <b>不高于 {@link #PROXIMITY_DISTANCE_MAX}</b>（超过上限会被钳制并 WARN，
    *                              因为扫描量随半径平方增长）
    * @param intervalTicks         巡检周期（tick）
@@ -453,13 +481,14 @@ public final class AntiXrayConfig {
    * @param frustumFov            视野锥<b>竖直全张开角</b>（度）——与 Minecraft 客户端 FOV 设置同义；
    *                              水平方向按 16:9 宽高比换算后更宽（约 1.4 倍），
    *                              详见 {@code ProximitySelector#withinFrustum}；
+   *                              默认 {@link #FRUSTUM_FOV_DEFAULT}，
    *                              <b>不低于 {@link #FRUSTUM_FOV_FLOOR}</b>（低于下限会被抬升并 WARN）
-   * @param frustumMinDistance    该距离内的候选豁免视锥判定；
+   * @param frustumMinDistance    该距离内的候选豁免视锥判定；默认 {@link #FRUSTUM_MIN_DISTANCE_DEFAULT}，
    *                              <b>不低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR}</b>（低于下限会被抬升并 WARN）
    * @param raycastEnabled        是否做射线可见性判定（被墙挡住的不显形；<b>默认开启</b>）
    * @param raycastSamples        <b>每方块最多尝试的候选点数</b>（射线改用 Paper 原生
    *                              {@code World#rayTraceBlocks} 后不再表示采样数）；
-   *                              钳制 1..{@link #PROXIMITY_RAY_SAMPLES_MAX}（默认 4）
+   *                              钳制 1..{@link #PROXIMITY_RAY_SAMPLES_MAX}（默认即上限 5）
    * @param instantReveal         事件驱动即时显形（周期巡检的补充，见 {@link InstantReveal}）
    * @param overRevealSampling    过度显形抽样统计的抽样率分母 N（1/N 抽样，只计数不改行为；
    *                              0 表示关闭）
@@ -479,7 +508,7 @@ public final class AntiXrayConfig {
    * <b>当 tick</b>（不经周期巡检）把变更邻域内「已伪装且视线可见」的坐标显形。
    *
    * @param enabled    总开关（默认开启）
-   * @param radius     曼哈顿半径（格），变更必须落在玩家身边该半径内才触发（默认 2）
+   * @param radius     曼哈顿半径（格），变更必须落在玩家身边该半径内才触发（默认 4）
    * @param maxPerTick 每玩家每 tick 事件显形限额（防爆刷；默认 16，0 表示关闭事件显形）
    */
   public record InstantReveal(boolean enabled, int radius, int maxPerTick) {
@@ -862,16 +891,17 @@ public final class AntiXrayConfig {
             root.getBoolean("occlusion.fluid-cover", true)),
         new Proximity(
             root.getBoolean("proximity.enabled", true),
-            // 默认 64：真机反馈「48 格仍然偏近，走到跟前才变回来」。显形只在射线通畅时才还原，
+            // 默认 96（原 64）：真机反馈「64 格仍然偏近」。显形只在射线通畅时才还原，
             // 因此放大距离不会隔着墙泄露——它只是把「本来就看得到的矿」更早、更远地还给玩家。
             // 但扫描量随半径平方增长，故设有安全上限（见 PROXIMITY_DISTANCE_MAX）。
-            proximityDistance(root.getDouble("proximity.distance", 64.0D), floorAdjustments,
-                ceilingAdjustments),
+            proximityDistance(root.getDouble("proximity.distance", PROXIMITY_DISTANCE_DEFAULT),
+                floorAdjustments, ceilingAdjustments),
             // 默认 4（原为 5）：显形周期越短，「石头还没变回来」的窗口越小。
             clampCeiling(root.getInt("proximity.interval-ticks", 4), 1, PROXIMITY_INTERVAL_TICKS_MAX,
                 "proximity.interval-ticks", floorAdjustments, ceilingAdjustments),
-            // 默认 256（原为 128）：配合扩大到 64 格的距离，候选数量随之上升，单次额度也要相应放大。
-            clampCeiling(root.getInt("proximity.max-reveals-per-tick", 256), 1,
+            // 默认 512（原 256）：配合扩大到 96 格的距离与放宽的视锥，单周期通过筛选的坐标更多，
+            // 单次额度也要相应放大，避免「近处的矿排队等到下一周期才还原」。
+            clampCeiling(root.getInt("proximity.max-reveals-per-tick", 512), 1,
                 PROXIMITY_MAX_REVEALS_PER_TICK_MAX, "proximity.max-reveals-per-tick",
                 floorAdjustments, ceilingAdjustments),
             // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处。
@@ -889,21 +919,22 @@ public final class AntiXrayConfig {
             // 视锥两键都有安全下限（见 FRUSTUM_FOV_FLOOR / FRUSTUM_MIN_DISTANCE_FLOOR）：
             // 配得比客户端可视范围更窄会让「玩家看得见的方块」保持伪装，因此低于下限时按下限生效，
             // 并把被抬升的键记进 floorAdjustments，由加载时一次性 WARN 显式告知（绝不静默改配置）。
-            frustumFov(root.getDouble("proximity.frustum.fov", FRUSTUM_FOV_FLOOR), floorAdjustments),
+            // 键缺失/非法值时回落的是「默认值」（不是下限）——默认值本身就在下限之上（120 / 24）。
+            frustumFov(root.getDouble("proximity.frustum.fov", FRUSTUM_FOV_DEFAULT), floorAdjustments),
             frustumMinDistance(
-                root.getDouble("proximity.frustum.min-distance", FRUSTUM_MIN_DISTANCE_FLOOR),
+                root.getDouble("proximity.frustum.min-distance", FRUSTUM_MIN_DISTANCE_DEFAULT),
                 floorAdjustments),
             root.getBoolean("proximity.raycast.enabled", true),
             // 语义已变：原生射线改造后本键表示「每方块最多尝试的候选点数」（不再表示采样数）。
-            // 钳制 1..PROXIMITY_RAY_SAMPLES_MAX（有效上限 = 暴露面上的候选点数），默认 4。
+            // 钳制 1..PROXIMITY_RAY_SAMPLES_MAX（有效上限 = 暴露面上的候选点数），默认即上限 5。
             // 用 clampCeiling 而非裸 Math.min/max：两端钳制都留痕，管理员能看到配置已被改写。
-            clampCeiling(root.getInt("proximity.raycast.samples", 4), 1, PROXIMITY_RAY_SAMPLES_MAX,
+            clampCeiling(root.getInt("proximity.raycast.samples", 5), 1, PROXIMITY_RAY_SAMPLES_MAX,
                 "proximity.raycast.samples", floorAdjustments, ceilingAdjustments),
             new InstantReveal(
                 root.getBoolean("proximity.instant-reveal.enabled", true),
                 // 半径同时受「下限 1」与「上限 8」约束（见 PROXIMITY_INSTANT_RADIUS_MAX）：
                 // 旧实现用裸 Math.min/Math.max 静默钳制，管理员看不出配置已被改写，故改为两端留痕。
-                clampCeiling(root.getInt("proximity.instant-reveal.radius", 2), 1,
+                clampCeiling(root.getInt("proximity.instant-reveal.radius", 4), 1,
                     PROXIMITY_INSTANT_RADIUS_MAX, "proximity.instant-reveal.radius", floorAdjustments,
                     ceilingAdjustments),
                 clampCeiling(root.getInt("proximity.instant-reveal.max-per-tick", 16), 0,
@@ -1215,20 +1246,21 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 视锥竖直全角的生效值：非法值（NaN / {@code <=0} / {@code >360}）回落默认；低于
-   * {@link #FRUSTUM_FOV_FLOOR} 时抬升到下限——两种情况都记入 {@code floorAdjustments}，
-   * 由加载路径一次性 WARN（绝不静默改用户配置）。
+   * 视锥竖直全角的生效值：非法值（NaN / {@code <=0} / {@code >360}）回落<b>默认值</b>
+   * （{@link #FRUSTUM_FOV_DEFAULT}）；低于 {@link #FRUSTUM_FOV_FLOOR} 时抬升到下限——两种情况都记入
+   * {@code floorAdjustments}，由加载路径一次性 WARN（绝不静默改用户配置）。
    *
-   * <p>升到下限而不是照配置生效的原因见 {@link #FRUSTUM_FOV_FLOOR}：配窄了会让玩家看得见的方块
-   * 一直保持伪装（显形判定里只有这一道闸门会「看得见却不发」）。要省带宽请关掉整个视锥剔除。
+   * <p><b>为什么非法值回落默认值、合法但过窄的值才抬到下限</b>：前者是「这个数根本不能用」，
+   * 应回到插件默认；后者是「能用但会让玩家看得见的方块保持伪装」，下限 110° 恰好是「不伤可见性」的
+   * 最低值，故按最低值生效（详见 {@link #FRUSTUM_FOV_FLOOR}）。要省带宽请关掉整个视锥剔除。
    */
   private static double frustumFov(double configured, List<String> floorAdjustments) {
     if (Double.isNaN(configured) || configured <= 0.0D || configured > 360.0D) {
       // 非法值（NaN / 非正 / 超过 360°）与低于下限一样不会照配置生效：纳入统一的一次性 WARN 明细，
       // 避免出现「管理员写了无效角度、却以为它已生效」的静默落差（与其它钳制项口径一致）。
       floorAdjustments.add("proximity.frustum.fov=" + configured + "（非法值，回落默认 "
-          + FRUSTUM_FOV_FLOOR + "°）");
-      return FRUSTUM_FOV_FLOOR;
+          + FRUSTUM_FOV_DEFAULT + "°）");
+      return FRUSTUM_FOV_DEFAULT;
     }
     if (configured >= FRUSTUM_FOV_FLOOR) {
       return configured;
@@ -1237,14 +1269,17 @@ public final class AntiXrayConfig {
     return FRUSTUM_FOV_FLOOR;
   }
 
-  /** 最小豁免距离的生效值：非法值（NaN）回落默认，低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR} 时抬升到下限——
-   * 两种情况都记入 {@code floorAdjustments}（与 {@link #frustumFov} 口径一致，绝不静默改用户配置）。 */
+  /**
+   * 最小豁免距离的生效值：非法值（NaN）回落<b>默认值</b>（{@link #FRUSTUM_MIN_DISTANCE_DEFAULT}），
+   * 低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR} 时抬升到下限——两种情况都记入 {@code floorAdjustments}
+   * （与 {@link #frustumFov} 口径一致，绝不静默改用户配置）。
+   */
   private static double frustumMinDistance(double configured, List<String> floorAdjustments) {
     if (Double.isNaN(configured)) {
       // 与 frustumFov 对齐：NaN 不再静默回落，纳入统一的一次性 WARN 明细
       floorAdjustments.add("proximity.frustum.min-distance=" + configured + "（非法值，回落默认 "
-          + FRUSTUM_MIN_DISTANCE_FLOOR + " 格）");
-      return FRUSTUM_MIN_DISTANCE_FLOOR;
+          + FRUSTUM_MIN_DISTANCE_DEFAULT + " 格）");
+      return FRUSTUM_MIN_DISTANCE_DEFAULT;
     }
     double value = Math.max(0.0D, configured);
     if (value >= FRUSTUM_MIN_DISTANCE_FLOOR) {
@@ -1293,7 +1328,8 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 邻近显形触发距离的生效值：非有限值（NaN / ±Inf）回落默认 64，负数钳到 0（= 关闭邻近显形触发），
+   * 邻近显形触发距离的生效值：非有限值（NaN / ±Inf）回落默认
+   * （{@link #PROXIMITY_DISTANCE_DEFAULT}），负数钳到 0（= 关闭邻近显形触发），
    * 超过 {@link #PROXIMITY_DISTANCE_MAX} 时按上限生效。
    *
    * <p>三种情况都记入明细、由加载路径一次性 WARN（绝不静默改用户配置）：负数是「低于下限（0）」，
@@ -1305,8 +1341,9 @@ public final class AntiXrayConfig {
   private static double proximityDistance(double configured, List<String> floorAdjustments,
       List<String> ceilingAdjustments) {
     if (!Double.isFinite(configured)) {
-      ceilingAdjustments.add("proximity.distance=" + configured + "（非有限值，回落默认 64 格）");
-      return 64.0D;
+      ceilingAdjustments.add("proximity.distance=" + configured + "（非有限值，回落默认 "
+          + PROXIMITY_DISTANCE_DEFAULT + " 格）");
+      return PROXIMITY_DISTANCE_DEFAULT;
     }
     if (configured < 0.0D) {
       // 负数钳到 0：旧实现直接 Math.max(0, value) 静默归 0、不留痕，管理员会以为负数已生效

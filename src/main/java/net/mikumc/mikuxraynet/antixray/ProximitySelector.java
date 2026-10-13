@@ -9,9 +9,13 @@ import java.util.List;
  *
  * <p><b>为什么拆出来</b>：「读方块」与「射线求交」都需要 Bukkit 世界对象，无法离线单测。因此这里只保留
  * 可离线验证的纯函数：视锥角度计算、方块暴露面识别、候选采样点生成，以及「哪些候选点值得一试」。
- * 生产代码把「读世界方块」注入为 {@link RayQuery}、把「原生射线求交」注入为 {@link RayProbe}
- * （{@code ProximityRevealer} 用 Paper 的 {@code World#rayTraceBlocks} 实现），单测注入内存表/内存探针
- * 即可覆盖全部判定分支——不再自造体素步进。
+ * 生产代码把「读世界方块」注入为 {@link RayQuery}、把「射线求交」注入为 {@link RayProbe}，
+ * 单测注入内存表/内存探针即可覆盖全部判定分支——不再自造体素步进。
+ *
+ * <p><b>生产注入的两种实现</b>：① {@code ProximityRevealer} 的<b>位图路径</b>——由
+ * {@link BitmapVisibility} 注入「遮挡位图查询 + 位图步进射线」，可整段在工作线程执行（无 Bukkit API）；
+ * ② <b>降级路径</b>——位图不可用时由 {@code ProximityRevealer} 注入「读世界方块 + 原生射线
+ * {@code World#rayTraceBlocks}」，只在玩家线程执行。
  *
  * <p><b>视锥</b>（{@link #withinFrustum}）：{@code fovDegrees} 是<b>竖直方向的张开全角</b>（与 Minecraft
  * 客户端 FOV 设置同义），按客户端的矩形投影分解成两轴判定——竖直半角 = {@code fov/2}，
@@ -81,7 +85,7 @@ public final class ProximitySelector {
     /**
      * 从眼睛射向该点，途中是否未被遮挡方块截住。
      *
-     * @return true 表示通畅（射线抵达该点前没有可遮挡的方块）；异常由调用方按「不通畅」保守处理
+     * @return true 表示通畅（射线抵达该点前没有可遮挡的方块）；异常由调用方按「通畅」处理（偏显形）
      */
     boolean isClear(double x, double y, double z);
   }
@@ -311,8 +315,10 @@ public final class ProximitySelector {
    * 六面全被遮挡（完全掩埋）时直接判不可见——这是「不得隔着墙还原」的红线，
    * 因为掩埋方块从任何方向都不可能被看到。
    *
-   * <p>射线检测由 {@link RayProbe} 注入（生产为 {@code World#rayTraceBlocks}）。探针抛异常时按
-   * 「不通畅」保守处理：无法判定就不显形，绝不隔着墙还原。
+   * <p><b>判定失败的方向（用户明确要求「尽可能保证玩家可见性」）</b>：探针抛异常时按<b>「通畅」</b>处理，
+   * 即无法判定就显形。取舍是「该显形却因偶发异常漏显形」比「多还原一块」更伤玩家体验——
+   * 前者让玩家对着假石头挖矿，后者只是少一个伪装方块（代价见 {@code ProximityRevealer} 的说明）。
+   * 注意这只作用于<b>异常/歧义</b>，不改变任何确定性的判定结论（见下）。
    *
    * @param query     遮挡查询；为 {@code null} 时视为可见（fail-open）
    * @param maxPoints 每方块最多尝试的候选点数（由配置 {@code proximity.raycast.samples} 提供）；
@@ -361,8 +367,9 @@ public final class ProximitySelector {
       try {
         clear = probe.isClear(point[0], point[1], point[2]);
       } catch (Throwable throwable) {
-        // 探针异常：无法判定 → 按「不通畅」保守处理（绝不隔着墙还原）
-        clear = false;
+        // 探针异常：无法判定 → 按「通畅」处理（偏显形，方向由用户指定：宁可多还原一块，
+        // 也不让玩家对着假石头挖矿）。确定性判定不受影响：命中了别的方块仍算「不通畅」（见 rayClear）。
+        clear = true;
       }
       if (clear) {
         return true;
