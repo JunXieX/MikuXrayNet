@@ -13,18 +13,22 @@ import org.bukkit.block.data.BlockData;
  * 本类只是它的 Bukkit 适配层。凡在运行期拿到 {@link BlockData} 的调用点都应经本类，不要直接调
  * {@code isOccluding()}。
  *
- * <p><b>三种口径，按用途选对</b>：
+ * <p><b>两种口径，按用途选对</b>：
  * <ul>
- *   <li>{@link #visualOccluding(BlockData)}——<b>实体口径</b>（服务端逐状态真值 + barrier 例外，
- *       不含 {@code occlusion.extra-*} 覆盖）：实体剔除的同步射线（{@code EntityCuller.isClear}）用它，
- *       与异步位图（{@code EntityOcclusionTable}）同源，从而「异步开 / 关」在同一方块上结论一致。</li>
+ *   <li>{@link #visualOccluding(BlockData)}——<b>视觉口径</b>（服务端逐状态真值 + 唯一的 barrier 例外，
+ *       不含 {@code occlusion.extra-*} 覆盖）：实体剔除的同步射线（{@code EntityCuller.isClear}）与邻近显形的
+ *       可见性判定（{@code ProximityRevealer}）都用它——「隐藏」与「显形」都回答同一个问题
+ *       「玩家视觉能否看穿」，只是方向相反。它与异步遮挡位图（{@code EntityOcclusionTable}）同源，
+ *       因此同一方块在「同步 / 异步」「隐藏 / 显形」四条路径上结论一致。</li>
  *   <li>{@link #camouflageOccluding(BlockData, java.util.Set, java.util.Set)}——<b>伪装口径</b>
  *       （视觉口径 + {@code occlusion.extra-*} 名称覆盖）：反矿透边界邻块（{@code NeighborChunkProvider}）
  *       用它，与 {@code ObfuscationProcessor} 内部的伪装判定保持同源。</li>
- *   <li>{@link #serverOccluding(BlockData)}——<b>服务端原始逐状态真值</b>（<b>不含</b> barrier 例外）：
- *       只给「显形可见性判定」这类方向相反的路径用——它必须保持保守（barrier 仍算遮挡 → 更少显形），
- *       套用 barrier 例外会把显形变激进（属放松，不可接受）。见 {@code ProximityRevealer}。</li>
  * </ul>
+ *
+ * <p><b>覆盖表的作用域（既定语义）</b>：{@code occlusion.extra-occluding} / {@code extra-non-occluding}
+ * <b>只</b>作用于「伪装」判定，<b>不</b>进入显形与实体剔除（两者走视觉口径）。因此当管理员配置了覆盖项时，
+ * 同一方块在「伪装」与「显形/实体剔除」上<b>可能得出不同结论</b>——这是有意的：覆盖表是校正「哪些方块该被
+ * 伪装」的出口，不应放松显形（显形放松 = 泄露）或改变实体剔除。
  *
  * <p><b>为什么在这里用 {@code Material#name()} 而不是 {@code getAsString()}</b>：名字级归一化是规则需要的
  * 最小信息，且 {@code getMaterial()} 不产生额外分配（{@code getAsString()} 会拼一个状态串）。
@@ -35,22 +39,16 @@ public final class BukkitOcclusion {
   }
 
   /**
-   * 实体口径：逐状态真值（{@code BlockData#isOccluding()}）套用唯一那处 barrier 例外。
+   * 视觉口径：逐状态真值（{@code BlockData#isOccluding()}）套用唯一那处 barrier 例外。
+   *
+   * <p>「玩家视觉能否看穿」是同一个问题，「隐藏」与「显形」只是方向相反：实体剔除的同步射线
+   * （{@code EntityCuller.isClear}）与邻近显形的可见性判定（{@code ProximityRevealer} 的原生射线降级路径）
+   * 都走本方法，与异步位图（{@code EntityOcclusionTable}）同源。
    *
    * @param data 命中/查询到的方块状态；{@code null} 按「不遮挡」处理（未知即不遮挡，少算一个遮挡面）
    */
   public static boolean visualOccluding(BlockData data) {
     return data != null && OcclusionRules.visualVerdict(name(data), data.isOccluding());
-  }
-
-  /**
-   * 服务端原始逐状态真值（<b>不含</b> barrier 例外）：供显形射线等「只许更保守」的路径使用。
-   *
-   * <p>与 {@link #visualOccluding(BlockData)} 的差别只在 barrier：这里 barrier 仍算遮挡（保持既有显形方向，
-   * 更少显形）。
-   */
-  public static boolean serverOccluding(BlockData data) {
-    return data != null && data.isOccluding();
   }
 
   /**
@@ -67,13 +65,15 @@ public final class BukkitOcclusion {
   }
 
   /**
-   * 实体口径的 <b>Material 级</b>判定：供只能拿到方块级信息、拿不到具体状态的调用方使用
-   * （{@code OcclusionPatchListener} 的 {@code WrappedBlockData} 路径）。
+   * 视觉口径的 <b>Material 级</b>近似：供只能拿到方块级信息、拿不到具体状态的调用方使用。
+   *
+   * <p><b>用途已收窄为「回落」</b>：{@code OcclusionPatchListener} 现在优先从封包状态取全局 id 查实体口径表
+   * （逐状态，与位图一致）；只有 id 解析不可用时才回落到本方法。
    *
    * <p><b>已知限制</b>：{@code Material#isOccluding()} 取的是<b>默认状态</b>的判定，无法区分「同方块不同
-   * 状态」（如 {@code oak_slab} 的单台阶 vs 双台阶）——这就是补丁路径<b>无法</b>与逐状态位图完全统一的
-   * 残余差异。barrier 例外在 Material 级是精确的（barrier 只有一个状态），故这里仍经统一规则套用该例外，
-   * 至少把 barrier 与逐状态位图对齐。
+   * 状态」（如 {@code oak_slab} 的单台阶 vs 双台阶）——这就是回落路径<b>无法</b>与逐状态位图完全统一的
+   * 残余差异（已由 {@code OcclusionStats#stateIdFallbacks} 计数）。barrier 例外在 Material 级是精确的
+   * （barrier 只有一个状态），故这里仍经统一规则套用该例外，至少把 barrier 与逐状态位图对齐。
    */
   public static boolean entityOccludingByMaterial(Material material) {
     return material != null && OcclusionRules.visualVerdict(material.name(), material.isOccluding());

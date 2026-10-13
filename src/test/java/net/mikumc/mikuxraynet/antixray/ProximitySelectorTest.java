@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.util.HashSet;
 import java.util.Set;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
+import net.mikumc.mikuxraynet.registry.OcclusionRules;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -719,5 +720,41 @@ class ProximitySelectorTest {
         {5, 64, 5}, {6, 64, 5}, {7, 64, 4}, {7, 64, 5}, {7, 64, 6}}) {
       assertFrustumEquivalent(axis, block[0], block[1], block[2], 4.0D, 80.0D);
     }
+  }
+
+  // ---------------------------------------------------------------- 显形可见性的视觉口径（barrier 例外）
+
+  /**
+   * barrier 后方的矿石<b>必须能显形</b>：barrier 的 {@code isOccluding=true} 是服务端材质级怪值，但
+   * barrier <b>对玩家完全不可见</b>——「矿石只被 barrier 挡住」时玩家本就能看穿它，显形才是正确体验。
+   * 显形路径因此改用视觉口径（{@link OcclusionRules#visualVerdict}，barrier 例外生效），与位图显形路径
+   * （{@code BitmapVisibility}）同源。
+   *
+   * <p>本用例用「服务端原始真值」作对照：旧口径把 barrier 算遮挡 → 后面的矿不显形（错误体验）。
+   */
+  @Test
+  void barrierBehindOreIsRevealedBecauseBarrierIsInvisible() {
+    ProximitySelector.Eye eye = standingEye();
+    // z=3 整层是 barrier；服务端原始真值：barrier 的 isOccluding()=true
+    ProximitySelector.RayQuery raw = (x, y, z) -> z == 3;
+    // 显形路径实际使用的视觉口径：barrier 例外 → 不是遮挡
+    ProximitySelector.RayQuery visual = (x, y, z) -> OcclusionRules.visualVerdict("barrier", z == 3);
+
+    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 5, raw, SAMPLES, probe(eye, raw)),
+        "对照：旧口径（服务端原始真值）把 barrier 当遮挡 → 后方矿石不显形");
+    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 5, visual, SAMPLES, probe(eye, visual)),
+        "视觉口径：barrier 后方矿石能显形（barrier 对玩家不可见，显形才是正确体验）");
+  }
+
+  /** 真实遮挡方块（石头）后方的矿石仍不得显形——隔离墙必须依旧有效，绝不泄露。 */
+  @Test
+  void realOccluderBehindOreStillBlocksReveal() {
+    ProximitySelector.Eye eye = standingEye();
+    ProximitySelector.RayQuery stone = (x, y, z) -> OcclusionRules.visualVerdict("stone", z == 3);
+
+    assertFalse(ProximitySelector.isVisible(eye, 0, 64, 5, stone, SAMPLES, probe(eye, stone)),
+        "石头后方的矿不得显形（隔离墙仍有效，不泄露）");
+    assertTrue(ProximitySelector.isVisible(eye, 0, 64, 2, stone, SAMPLES, probe(eye, stone)),
+        "墙前面的矿照常显形");
   }
 }

@@ -210,7 +210,7 @@ public final class AntiXrayRuntime {
     // 注册时机（反矿透装配成功后、邻近显形装配前）与拆分前一致。
     plugin.registerWorldUnloadInvalidation();
     startProximity(antiXray, chunkIndex, revealed, proximityStats);
-    startOcclusionPatch();
+    startOcclusionPatch(registry);
     logger.info("反矿透已启用（按维度分段）：" + dimensionSummary(antiXray)
         + "；区块边界邻块快照 " + neighborState(neighborProvider, processor) + "；磁盘缓存 "
         + (diskCache != null ? "已启用（" + new File(plugin.getDataFolder(), "cache").getPath() + "）"
@@ -294,10 +294,13 @@ public final class AntiXrayRuntime {
   /**
    * 装配「出站方块变更 → 遮挡位图单格补丁」监听器（仅在启用异步遮挡时）。
    *
+   * <p>补丁的遮挡判定走<b>状态级</b>路径：把 {@code registry::isEntityOccluding} 注入监听器，即用
+   * 封包状态的全局 id 查<b>与遮挡位图同一张表</b>（逐状态一致，见 {@code OcclusionPatchListener}）。
+   *
    * <p>失败只打一次中文 WARN：位图会因此只在区块重载时自愈，而不会即时反映方块变更——属「少藏」
    * 方向（射线仍按位图判定，陈旧「遮挡」位可能多藏，故必须把失败显式告知，不能静默）。
    */
-  private void startOcclusionPatch() {
+  private void startOcclusionPatch(BlockStateRegistry registry) {
     if (occlusionStores == null) {
       return;
     }
@@ -308,8 +311,8 @@ public final class AntiXrayRuntime {
           + "（位图只在区块重载时重建，方块变更不会即时反映）");
       return;
     }
-    OcclusionPatchListener listener =
-        new OcclusionPatchListener(plugin, protocolManager, occlusionStores, occlusionStats);
+    OcclusionPatchListener listener = new OcclusionPatchListener(plugin, protocolManager,
+        occlusionStores, occlusionStats, registry::isEntityOccluding);
     try {
       listener.start();
       this.occlusionPatchListener = listener;

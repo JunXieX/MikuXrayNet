@@ -45,7 +45,7 @@ import org.bukkit.util.Vector;
  *
  * <p><b>两种判定模式</b>（由 {@code entity-culling.async-occlusion} 选择，安全语义完全一致）：
  * <ul>
- *   <li><b>同步模式（默认）</b>——线程模型（严格「Bukkit API 只在自己线程调用」）：
+ *   <li><b>回落模式（仅在未接线 / 开关关闭时启用）</b>——线程模型（严格「Bukkit API 只在自己线程调用」）：
  *       <ol>
  *         <li>主线程/区域线程：从 {@link PlayerTrackEntityEvent} 或周期任务里抓取「眼睛坐标 + 包围盒顶点」；</li>
  *         <li>同一线程：用 Paper 原生射线（{@code World#rayTraceBlocks}）逐顶点判定是否被遮挡；</li>

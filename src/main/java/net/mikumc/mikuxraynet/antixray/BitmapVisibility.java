@@ -26,10 +26,10 @@ import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
  * 非遮挡方块不再阻断射线（旧实现是「命中任何别的方块即不通畅」）——这一语义变化与用户既定的
  * 「尽可能保证玩家可见性」方向一致。
  *
- * <p><b>与降级路径（{@code ProximityRevealer} 的原生射线）在 barrier 上的差异</b>：本类读的是实体口径位图
- * （barrier 例外生效 → barrier 不阻断射线）；降级路径刻意保持「服务端原始逐状态真值」（barrier 仍算遮挡
- * → 更保守）。两者对 barrier 的结论不同属<b>既有的、方向更保守</b>的差异：降级路径只在异步遮挡不可用时
- * 才被走到（{@code async-occlusion=false}），且它的选择是「不放松显形」。
+ * <p><b>与降级路径（{@code ProximityRevealer} 的原生射线）在 barrier 上已统一</b>：本类读的是视觉口径位图
+ * （barrier 例外生效 → barrier 不阻断射线）；降级路径的可见性查询也已改走 {@code visualOccluding}（同一
+ * barrier 例外）。两条路径对 barrier 的结论因此一致：barrier 后方的方块可见即显形——barrier 对玩家
+ * <b>完全不可见</b>，「矿石只被 barrier 挡住」时玩家本就能看穿，显形是正确体验而非泄露。
  *
  * <p><b>分工</b>：位图分不出的「目标上方是流体」规则（需读世界方块）不在本类判，由发布侧
  * （{@code ProximityRevealer} 的玩家线程）补判。

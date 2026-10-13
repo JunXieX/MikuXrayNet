@@ -47,13 +47,23 @@ public final class OcclusionStats {
    * <p>持续偏高说明补丁链路拿不到方块数据（此时功能只是「少藏」，不会「误藏」），需查日志。
    */
   public final LongAdder patchFailures = new LongAdder();
+  /**
+   * 方块变更补丁中「拿不到逐状态全局 id、回落 Material 级近似」的<b>格数</b>。
+   *
+   * <p><b>为什么单列</b>：补丁现在优先取封包内状态的全局 id 查实体口径表（与遮挡位图逐状态一致）；
+   * 只有在 id 解析不可用（如 NMS 桥接初始化失败）时才回落到旧的 Material 级近似——那种近似无法区分
+   * 「同方块不同状态」（单/双台阶等），是<b>已知残余差异</b>。该计数持续非 0 就说明仍走在近似路径上，
+   * 必须可见而不能静默（否则「补丁为什么和位图不一致」无从判断）。
+   */
+  public final LongAdder stateIdFallbacks = new LongAdder();
 
   /** 中文单行摘要（供 {@code /mxnet status} 与周期摘要复用）。 */
   public String summaryLine() {
     return "遮挡判定：提交 " + submitted.sum() + "，完成 " + computed.sum()
         + "，超时丢弃 " + timeoutDiscarded.sum() + "，队列满拒收 " + rejectedQueueFull.sum()
         + "，缺遮挡数据 " + unknownSection.sum() + " 次"
-        + "，方块补丁 " + patched.sum() + " 格（失败 " + patchFailures.sum() + " 格）"
+        + "，方块补丁 " + patched.sum() + " 格（失败 " + patchFailures.sum() + " 格，状态id回落 "
+        + stateIdFallbacks.sum() + " 格）"
         + "，射线耗时 " + (nanosTotal.sum() / 1_000_000L) + " ms";
   }
 }

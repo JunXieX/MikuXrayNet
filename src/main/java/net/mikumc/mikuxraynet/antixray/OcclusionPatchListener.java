@@ -7,10 +7,19 @@ import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.utility.MinecraftReflection;
 import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntPredicate;
 import java.util.logging.Level;
+import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.bootstrap.BukkitOcclusion;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
@@ -51,15 +60,20 @@ import org.bukkit.plugin.Plugin;
  * 单格置零在<b>两个方向上都更保守</b>：若该格真实是遮挡方块，最坏只少算一格遮挡。
  * 失败格数计入 {@link OcclusionStats#patchFailures}，持续偏高即说明补丁链路读不出发送方方块数据。
  *
- * <p><b>口径</b>：本类经统一入口 {@link BukkitOcclusion#entityOccludingByMaterial}（<b>实体口径</b>，
- * 含唯一的 barrier 例外）判遮挡。位图建表用的<b>实体遮挡口径表</b>是<b>逐状态真值</b>（服务端
- * {@code BlockData#isOccluding()}，见 {@code EntityOcclusionTable}）。<b>已知残余差异</b>：本类只能拿到
- * ProtocolLib 包装后的 {@link org.bukkit.Material}（方块级），拿不到具体状态——{@link WrappedBlockData}
- * 只暴露 {@code getType()}（Material）与旧版 {@code getData()}（legacy 数据字节），其内部 {@code handle}
- * 是 NMS 状态对象、不提供 Bukkit {@code BlockData}/全局 id。因此「同方块不同状态结论不同」的少数方块
- * （如单台阶 vs 双台阶）在补丁路径只能取默认状态近似，无法与逐状态位图完全一致；但 barrier 例外在
- * Material 级是精确的，已与之对齐。且本类拿不到口径时一律降级为「不遮挡」（fail-open），不会造成误藏。
- * 反矿透伪装那条链路与实体位图同源（同一逐状态真值），二者互不影响。
+ * <p><b>口径（逐状态，与位图一致）</b>：本类优先走<b>状态级</b>判定——从 {@link WrappedBlockData} 公开的
+ * NMS 句柄（{@code getHandle()}，即 NMS 方块状态对象）反射 NMS {@code Block.getId(BlockState)} 得到
+ * <b>全局方块状态 id</b>，再用该 id 查<b>实体遮挡口径表</b>（{@code BlockStateRegistry#isEntityOccluding}
+ * → {@code EntityOcclusionTable}，下标即状态 id）。该全局 id 与 PacketEvents 全局 stateId 是<b>同一 id
+ * 空间</b>：服务端正是用 {@code Block.getId} 把状态写进方块变更包，而本插件解码出的网络状态 id 也直接喂给
+ * 同一张表（逐条证据见 {@link NmsStateIdResolver}）。因此位图与补丁对同一状态结论逐状态一致，barrier 例外
+ * 同样生效。
+ *
+ * <p><b>回落（fail-open，且必计数）</b>：id 解析不可用（NMS 桥接初始化失败等）时回落到旧的
+ * {@link BukkitOcclusion#entityOccludingByMaterial}（<b>Material 级近似</b>，取默认状态，无法区分
+ * 「同方块不同状态」如单/双台阶），该回落逐格计入 {@code OcclusionStats#stateIdFallbacks} 并在
+ * {@code /mxnet status} 可见（见 {@code Diagnostics}），绝不静默。确实拿不到任何口径时该格降级为
+ * 「不遮挡」（{@link #UNRESOLVED}），不会留下陈旧「遮挡」位误藏。反矿透伪装那条链路与实体位图同源
+ * （同一逐状态真值），二者互不影响。
  */
 public final class OcclusionPatchListener extends PacketAdapter {
 
@@ -68,22 +82,126 @@ public final class OcclusionPatchListener extends PacketAdapter {
   static final byte OCCLUDING = 1;
   static final byte UNRESOLVED = -1;
 
+  /**
+   * 状态 id 解析：把 ProtocolLib 的 NMS 方块状态句柄映射为<b>全局方块状态 id</b>。
+   *
+   * <p>生产实现见 {@link NmsStateIdResolver}；离线单测可注入桩（见
+   * {@link OcclusionPatchListener#resolveStateLevel}）。
+   *
+   * @return 全局状态 id；{@code < 0} = 无法解析（调用方回落 Material 级）
+   */
+  @FunctionalInterface
+  interface StateIdResolver {
+    int resolveStateId(Object nmsHandle);
+  }
+
+  /**
+   * 生产用状态 id 解析器：反射 NMS {@code Block.getId(BlockState)}（= 服务端写入网络包所用的全局方块
+   * 状态 id）得到全局 id。
+   *
+   * <p><b>为什么取 {@code Block.getId}</b>：ProtocolLib 的 {@link WrappedBlockData#getHandle()} 是 NMS 方块
+   * 状态对象（{@code AbstractWrapper.handle}，其类型由 ProtocolLib 内部的 {@code MinecraftReflection
+   * #getIBlockDataClass()} 给出）。已用 {@code javap} 核实（Paper 26.3 服务端 jar）：
+   * <ul>
+   *   <li>{@code net.minecraft.world.level.block.Block} 有 {@code public static int getId(BlockState)}，
+   *       其实现体就是 {@code Block.BLOCK_STATE_REGISTRY.getId(state)}（{@code BLOCK_STATE_REGISTRY} 为
+   *       {@code public static final IdMapper<BlockState>}）；</li>
+   *   <li>服务端正是用它把状态写进包：{@code ClientboundSectionBlocksUpdatePacket}（MULTI_BLOCK_CHANGE）
+   *       写 {@code Block.getId(BlockState)}；{@code ClientboundBlockUpdatePacket}（BLOCK_CHANGE）经
+   *       {@code ByteBufCodecs.idMapper(Block.BLOCK_STATE_REGISTRY)} 序列化；
+   *       {@code GlobalPalette.idFor} 亦用 {@code IdMap.getId}。</li>
+   * </ul>
+   * 因此 {@code Block.getId(state)} 与「网络包里的方块状态 id」逐位一致。而 PacketEvents 的全局 stateId
+   * （{@code WrappedBlockState#getGlobalId()}，即本插件 {@code BlockStateRegistry} / {@code EntityOcclusionTable}
+   * 的下标）同样是网络状态 id——本插件的区块编解码（{@code ChunkSection}）从网络缓冲读出的状态 id 直接喂给
+   * {@code isEntityOccluding}/{@code captureOcclusion}，这是<b>已投产的既有不变式</b>。三者同属一个 id 空间。
+   *
+   * <p><b>只在首次使用时解析一次</b>：用 {@link MethodHandles#publicLookup()} 在 NMS {@code Block} 上找
+   * 稳定的 mojang 映射方法 {@code getId}（静态、返回 int、单参数、参数类型可接受句柄的运行时类型），
+   * 并适配成 {@code (Object)int} 的 {@link MethodHandle}（{@code invokeExact} 零装箱）。解析失败（版本不匹配 /
+   * 方法名变化）只记一次中文 WARN 并永久返回 -1 → 调用方回落 Material 级，绝不误藏/误改位图。
+   */
+  private static final class NmsStateIdResolver implements StateIdResolver {
+
+    private final Logger logger;
+    private final AtomicBoolean warned = new AtomicBoolean();
+    /** 懒解析并缓存下来的 {@code (Object)int} 句柄；未解析成功前为 {@code null}。 */
+    private volatile MethodHandle idAccessor;
+
+    NmsStateIdResolver(Logger logger) {
+      this.logger = logger;
+    }
+
+    @Override
+    public int resolveStateId(Object nmsHandle) {
+      if (nmsHandle == null) {
+        return -1;
+      }
+      try {
+        MethodHandle accessor = idAccessor;
+        if (accessor == null) {
+          accessor = resolve(nmsHandle.getClass());
+          if (accessor == null) {
+            warnOnce(null);
+            return -1;
+          }
+          idAccessor = accessor;
+        }
+        return (int) accessor.invokeExact(nmsHandle);
+      } catch (Throwable throwable) {
+        warnOnce(throwable);
+        return -1;
+      }
+    }
+
+    /** 在 NMS {@code Block} 类上找静态 {@code getId(state)} 并适配为 {@code (Object)int}。 */
+    private static MethodHandle resolve(Class<?> stateClass) {
+      Class<?> blockClass = MinecraftReflection.getBlockClass();
+      for (Method method : blockClass.getMethods()) {
+        if (!method.getName().equals("getId")
+            || !Modifier.isStatic(method.getModifiers())
+            || method.getReturnType() != int.class
+            || method.getParameterCount() != 1
+            || !method.getParameterTypes()[0].isAssignableFrom(stateClass)) {
+          continue;
+        }
+        return MethodHandles.publicLookup().unreflect(method)
+            .asType(MethodType.methodType(int.class, Object.class));
+      }
+      return null;
+    }
+
+    private void warnOnce(Throwable throwable) {
+      if (warned.compareAndSet(false, true)) {
+        Logger target = logger != null ? logger : Logger.getLogger("MikuXrayNet");
+        target.log(Level.WARNING, "方块变更补丁无法解析方块状态的全局 id（已回落 Material 级近似；"
+            + "该近似无法区分同方块不同状态，见 /mxnet status 的『状态id回落』计数）", throwable);
+      }
+    }
+  }
+
   private final Plugin plugin;
   private final ProtocolManager protocolManager;
   private final OcclusionStores stores;
   private final OcclusionStats stats;
+  /** 状态 id 查询（生产为 {@code BlockStateRegistry#isEntityOccluding}，与位图同一张表）；{@code null} = 未接线，一律回落。 */
+  private final IntPredicate stateLookup;
+  /** 状态 id 解析器；见 {@link NmsStateIdResolver}。 */
+  private final StateIdResolver idResolver;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
   private AsyncListenerHandler handler;
 
   public OcclusionPatchListener(Plugin plugin, ProtocolManager protocolManager, OcclusionStores stores,
-      OcclusionStats stats) {
+      OcclusionStats stats, IntPredicate stateLookup) {
     super(plugin, ListenerPriority.NORMAL, PacketType.Play.Server.BLOCK_CHANGE,
         PacketType.Play.Server.MULTI_BLOCK_CHANGE);
     this.plugin = plugin;
     this.protocolManager = protocolManager;
     this.stores = stores;
     this.stats = stats == null ? new OcclusionStats() : stats;
+    this.stateLookup = stateLookup;
+    this.idResolver = new NmsStateIdResolver(plugin.getLogger());
   }
 
   /** 注册异步监听器（真异步扣包）。 */
@@ -190,18 +308,50 @@ public final class OcclusionPatchListener extends PacketAdapter {
 
   /**
    * 把一条出站方块变更解析为「是否遮挡」三态：
-   * {@link #OCCLUDING} / {@link #CLEAR}，读不到方块数据时 {@link #UNRESOLVED}（调用方把该格置为不遮挡）。
+   * {@link #OCCLUDING} / {@link #CLEAR}，读不到任何口径时 {@link #UNRESOLVED}（调用方把该格置为不遮挡）。
    *
-   * <p><b>口径（实体口径，经统一入口 {@link BukkitOcclusion#entityOccludingByMaterial}）</b>：位图建表用的是
-   * <b>逐状态真值</b>（服务端 {@code BlockData#isOccluding()} + 唯一的 barrier 例外，见
-   * {@code EntityOcclusionTable}）。本类只能拿到 ProtocolLib 包装后的 {@link org.bukkit.Material}
-   * （{@code WrappedBlockData#getType()}——它不暴露具体状态，详见类注释），因此这里走 Material 级判定：
-   * barrier 例外在 Material 级是精确的（barrier 只有一个状态），故能与之对齐；
-   * 但「同方块不同状态」（如单台阶 vs 双台阶）无法区分，属<b>已知残余差异</b>。
+   * <p><b>优先状态级</b>：id 可解析时查实体口径表（见类注释），与遮挡位图逐状态一致；否则回落
+   * {@link BukkitOcclusion#entityOccludingByMaterial}（Material 级近似）并计数——两种情况都不改包、
+   * 只写内存位图。
    */
-  private static byte resolve(WrappedBlockData data) {
+  private byte resolve(WrappedBlockData data) {
+    byte byState = stateLookup == null
+        ? UNRESOLVED
+        : resolveStateLevel(data.getHandle(), idResolver, stateLookup);
+    if (byState != UNRESOLVED) {
+      return byState;
+    }
+    // 状态级不可得（id 解析不可用 / 查表异常 / 未接线）→ 回落 Material 级近似（旧口径），并计数使其可见。
     try {
-      return BukkitOcclusion.entityOccludingByMaterial(data.getType()) ? OCCLUDING : CLEAR;
+      byte fallback = BukkitOcclusion.entityOccludingByMaterial(data.getType()) ? OCCLUDING : CLEAR;
+      stats.stateIdFallbacks.increment();
+      return fallback;
+    } catch (Throwable throwable) {
+      return UNRESOLVED;
+    }
+  }
+
+  /**
+   * 状态级三态判定（纯函数，供离线单测注入「id 解析桩 + 查表桩」）：id 解析成功即查实体口径表，
+   * 与遮挡位图逐状态一致；解析失败 / 查表异常一律 {@link #UNRESOLVED}（由调用方再回落 Material 级）。
+   *
+   * @param nmsHandle ProtocolLib {@code WrappedBlockData#getHandle()} 给出的 NMS 方块状态句柄
+   * @param idResolver 状态 id 解析器（生产为 {@link NmsStateIdResolver}；单测注入桩）
+   * @param lookup     状态 id → 实体口径是否遮挡（生产为 {@code BlockStateRegistry#isEntityOccluding}）
+   */
+  static byte resolveStateLevel(Object nmsHandle, StateIdResolver idResolver,
+      IntPredicate lookup) {
+    int stateId;
+    try {
+      stateId = idResolver.resolveStateId(nmsHandle);
+    } catch (Throwable throwable) {
+      return UNRESOLVED;
+    }
+    if (stateId < 0) {
+      return UNRESOLVED;
+    }
+    try {
+      return lookup.test(stateId) ? OCCLUDING : CLEAR;
     } catch (Throwable throwable) {
       return UNRESOLVED;
     }

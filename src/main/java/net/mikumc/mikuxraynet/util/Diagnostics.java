@@ -165,14 +165,16 @@ public final class Diagnostics {
      * @param queueDepth      专用池当前排队的判定数（持续接近队列上限说明引擎线程跟不上）
      * @param patched         方块变更补丁已改写的格数（长时间为 0 而场上确有方块变更 = 补丁没生效）
      * @param patchFailures   补丁失败（拿不到新方块口径）的格数（这些 section 已降级为未知，属「少藏」方向）
+     * @param stateIdFallbacks 补丁「拿不到状态 id、回落 Material 级近似」的格数（&gt;0 说明补丁暂时无法与
+     *                        位图逐状态一致，只能按方块级近似）
      */
     public record Occlusion(boolean active, int sectionsResident, int queueDepth, long submitted,
         long computed, long timeoutDiscarded, long rejectedQueueFull, long unknownSection,
-        long nanosTotal, long patched, long patchFailures) {
+        long nanosTotal, long patched, long patchFailures, long stateIdFallbacks) {
 
       /** 异步遮挡未接线时的零值兜底。 */
       public static final Occlusion EMPTY =
-          new Occlusion(false, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+          new Occlusion(false, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     /**
@@ -438,7 +440,7 @@ public final class Diagnostics {
         pipeline.occlusionSectionsResident(), pipeline.occlusionQueueDepth(), stats.submitted.sum(),
         stats.computed.sum(), stats.timeoutDiscarded.sum(), stats.rejectedQueueFull.sum(),
         stats.unknownSection.sum(), stats.nanosTotal.sum(), stats.patched.sum(),
-        stats.patchFailures.sum());
+        stats.patchFailures.sum(), stats.stateIdFallbacks.sum());
   }
 
   /** 状态面板格式化（纯函数）。 */
@@ -542,6 +544,9 @@ public final class Diagnostics {
         + "，队列满拒收 " + s.occlusion().rejectedQueueFull()
         + "，缺遮挡数据 " + s.occlusion().unknownSection()
         + " 次，方块补丁 " + s.occlusion().patched() + " 格（失败 " + s.occlusion().patchFailures()
+        // 补丁的「状态id回落」单列：>0 说明补丁暂时拿不到逐状态 id、退回了 Material 级近似，此时
+        // 补丁与位图可能对「同方块不同状态」结论不同——必须可见，否则该残余差异无从察觉。
+        + " 格，状态id回落 " + s.occlusion().stateIdFallbacks()
         + " 格）"
         + "，射线耗时 " + formatMillis(s.occlusion().nanosTotal()) + " ms");
     lines.add("带宽：AFK 玩家 " + s.throttle().afkPlayers() + "（累计进入 " + s.throttle().afkEntered()

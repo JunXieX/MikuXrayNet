@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.BitSet;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
@@ -210,11 +211,68 @@ class OcclusionRulesTest {
 
   /**
    * 状态相关方块：结论必须来自<b>逐状态真值</b>，而不是方块名——同一名字（{@code oak_slab}）的单台阶与
-   * 双台阶结论相反。这正是「Material 级近似」（补丁路径）无法做到的一点。
+   * 双台阶结论相反。这正是「Material 级近似」做不到的一点；该近似现在只剩<b>补丁路径拿不到状态 id 时的
+   * 回落</b>（补丁默认已按全局 id 逐状态判定，见 {@code OcclusionPatchListener}）。
    */
   @Test
   void stateDependentVerdictsComeFromTruthNotFromTheBlockName() {
     assertFalse(OcclusionRules.visualVerdict("oak_slab", false), "单台阶：真值非遮挡");
     assertTrue(OcclusionRules.visualVerdict("oak_slab", true), "双台阶：同一名字、真值遮挡");
+  }
+
+  /**
+   * 「视觉口径」与「服务端原始逐状态真值」的差异<b>只应来自 barrier 例外</b>。
+   *
+   * <p>这是显形路径改造的安全前提：把显形从「原始真值」（barrier 算遮挡 → 更少显形）改为「视觉口径」
+   * 后，唯一的结论变化就是 barrier（对玩家不可见 → 其后方方块得以显形，属正确体验而非泄露）。
+   * 其余任何方块、任何状态都不得出现分歧。
+   */
+  @Test
+  void visualVerdictDiffersFromRawServerVerdictOnlyOnBarrier() {
+    String[] names = {"barrier", "stone", "deepslate", "glass", "oak_slab", "oak_fence", "air", "water"};
+    for (String name : names) {
+      for (boolean raw : new boolean[] {true, false}) {
+        boolean visual = OcclusionRules.visualVerdict(name, raw);
+        if (OcclusionRules.visuallyInvisibleOccluder(name) && raw) {
+          assertFalse(visual, name + "：服务端真值标为遮挡，但视觉口径必须判非遮挡（唯一差异点）");
+        } else {
+          assertEquals(raw, visual,
+              name + "（真值 " + raw + "）：非 barrier 情形下视觉口径必须等于服务端原始真值");
+        }
+      }
+    }
+  }
+
+  /**
+   * <b>同步射线 / 异步位图 / 显形</b>三条路径对同一批状态结论一致（都回答同一个视觉问题）。
+   *
+   * <p>离线建模：位图口径用真实的 {@link EntityOcclusionTable}（下标即状态 id，按 {@code baseVerdict}
+   * 建位——与 {@code BlockStateRegistry} 对实体口径的建法一致）；同步射线与显形口径用
+   * {@link OcclusionRules#visualVerdict}（生产分别为 {@code BukkitOcclusion#visualOccluding} 的
+   * {@code EntityCuller} / {@code ProximityRevealer} 调用点）。三者在每个状态上必须相等；
+   * barrier 在三者下都判非遮挡（其后方方块可见 → 显形）。
+   */
+  @Test
+  void syncAsyncAndRevealAgreeOnEveryState() {
+    String[] names = {"stone", "deepslate", "glass", "barrier", "oak_slab"};
+    boolean[] truths = {true, true, false, true, true}; // 逐状态真值（oak_slab 这里代表双台阶）
+
+    BitSet entityOccluding = new BitSet();
+    for (int id = 0; id < names.length; id++) {
+      if (OcclusionRules.baseVerdict(solid(names[id]), truths[id])) {
+        entityOccluding.set(id);
+      }
+    }
+    EntityOcclusionTable table = EntityOcclusionTable.build(entityOccluding);
+
+    for (int id = 0; id < names.length; id++) {
+      boolean bitmap = table.isOccluding(id);                               // 异步位图口径
+      boolean syncOrReveal = OcclusionRules.visualVerdict(names[id], truths[id]); // 同步射线 = 显形口径
+      assertEquals(syncOrReveal, bitmap,
+          names[id] + "：同步射线 / 显形 与 异步位图 的口径必须一致");
+    }
+    assertFalse(table.isOccluding(3), "位图：barrier（真值遮挡）在实体口径下必须判非遮挡");
+    assertFalse(OcclusionRules.visualVerdict("barrier", true),
+        "同步射线 / 显形：barrier 同样判非遮挡 → 其后方矿石能显形（体验正确，不泄露）");
   }
 }

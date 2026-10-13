@@ -6,10 +6,11 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.BitSet;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
-import net.mikumc.mikuxraynet.registry.OcclusionRules;
+import net.mikumc.mikuxraynet.registry.EntityOcclusionTable;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -147,20 +148,39 @@ class OcclusionPatchListenerTest {
   }
 
   /**
-   * 如实断言补丁路径的口径<b>限制</b>：ProtocolLib 的 {@code WrappedBlockData} 只暴露 Material（方块级），
-   * 拿不到具体状态（其 {@code handle} 是 NMS 状态对象，不提供 Bukkit {@code BlockData}/全局 id），
-   * 因此「同方块不同状态」（单台阶 vs 双台阶）在补丁路径只能取默认状态近似
-   * （见 {@link OcclusionPatchListener} 类注释的「已知残余差异」）。
+   * 补丁路径的<b>状态级</b>判定：给定全局状态 id，直接查与遮挡位图同源的表，因而能区分「同方块不同状态」
+   * （如 {@code oak_slab[type=double]} 判遮挡、{@code oak_slab[type=bottom]} 判不遮挡）。
    *
-   * <p>该限制无法离线构造 {@code WrappedBlockData} 或真实注册表来直接驱动（ProtocolLib 的方块数据包装
-   * 依赖服务端注册表），故这里以规则层的等价断言如实记录：Material 级近似（OAK_SLAB 默认单台阶）判
-   * 非遮挡，而同一名字的真实状态为双台阶时应判遮挡——补丁路径取不到后者。
+   * <p>离线拿不到真实注册表 / 真实 NMS 句柄（ProtocolLib 的 {@code WrappedBlockData} 依赖服务端注册表），
+   * 故按 {@link OcclusionPatchListener#resolveStateLevel} 的注入点给出「id 解析桩 + 查表桩」：句柄只作占位
+   * 字符串，id 与遮挡结论都由桩给定——<b>不依赖真实 Bukkit 注册表</b>。查表桩用真实的
+   * {@link EntityOcclusionTable}（下标即状态 id），以确保测的就是补丁实际接入的那张表。
    */
   @Test
-  void patchPathCannotDistinguishStateDependentBlocks() {
-    assertFalse(OcclusionRules.visualVerdict("oak_slab", false),
-        "Material 级近似取默认状态（单台阶）：非遮挡");
-    assertTrue(OcclusionRules.visualVerdict("oak_slab", true),
-        "同一名字的真实状态为双台阶时判遮挡——补丁路径拿不到该状态，只能退回上面那条近似");
+  void patchPathResolvesStateDependentBlocksPerState() {
+    // 与遮挡位图同一张表的离线替身：只把「双台阶」那个状态 id 标为遮挡。
+    BitSet occluding = new BitSet();
+    occluding.set(DOUBLE_SLAB_ID);
+    EntityOcclusionTable table = EntityOcclusionTable.build(occluding);
+    // id 解析桩：把两个状态句柄映射到不同的全局状态 id（离线无真实 NMS 句柄，句柄仅作占位）。
+    OcclusionPatchListener.StateIdResolver idResolver = handle -> switch ((String) handle) {
+      case "double" -> DOUBLE_SLAB_ID;
+      case "bottom" -> BOTTOM_SLAB_ID;
+      default -> -1;
+    };
+
+    assertEquals(OcclusionPatchListener.OCCLUDING,
+        OcclusionPatchListener.resolveStateLevel("double", idResolver, table::isOccluding),
+        "双台阶状态（oak_slab[type=double]）查实体口径表判遮挡");
+    assertEquals(OcclusionPatchListener.CLEAR,
+        OcclusionPatchListener.resolveStateLevel("bottom", idResolver, table::isOccluding),
+        "单台阶状态（oak_slab[type=bottom]）查表判不遮挡——同一方块名的不同状态必须能区分开");
+    assertEquals(OcclusionPatchListener.UNRESOLVED,
+        OcclusionPatchListener.resolveStateLevel("unknown", idResolver, table::isOccluding),
+        "状态 id 拿不到时交回 UNRESOLVED，由调用方回落 Material 级（并计入「状态id回落」计数）");
   }
+
+  /** 桩用的两个状态 id（取值无关紧要，只要不同且能命中/未命中上表）。 */
+  private static final int DOUBLE_SLAB_ID = 31;
+  private static final int BOTTOM_SLAB_ID = 8;
 }

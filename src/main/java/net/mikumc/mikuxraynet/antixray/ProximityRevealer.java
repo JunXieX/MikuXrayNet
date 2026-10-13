@@ -1181,10 +1181,15 @@ public final class ProximityRevealer implements Listener {
         @Override
         public boolean isOccluding(int blockX, int blockY, int blockZ) {
           BlockData data = world.getBlockData(blockX, blockY, blockZ);
-          // 显形可见性判定必须保持<b>保守</b>方向（显形判错 = 泄露）：故这里用「服务端原始逐状态真值」
-          // （经统一入口取，但仍用 BlockData#isOccluding），<b>刻意不套</b>唯一的 barrier 例外——
-          // barrier 仍算遮挡 → 射线更难通畅 → 更少显形，方向与原有行为一致（绝不放松）。
-          return BukkitOcclusion.serverOccluding(data);
+          // 显形与隐藏回答的是同一个问题——「玩家视觉能否看穿」——只是方向相反。因此这里与实体口径同源，
+          // 走统一入口 {@link BukkitOcclusion#visualOccluding}（服务端逐状态真值 + 唯一的 barrier 例外），
+          // 与位图显形路径（{@code BitmapVisibility}，读实体口径位图）完全一致。
+          //
+          // <b>纠正一处旧论证</b>：旧实现以「显形必须更保守 → barrier 仍算遮挡 → 更少显形」为由走服务端
+          // 原始真值；但 barrier 的 isOccluding=true 是<b>服务端材质级怪值</b>，而 barrier 对玩家
+          // <b>完全不可见</b>——「矿石只被 barrier 挡住」时玩家本就能看穿它，显形才是正确体验，不是泄露。
+          // 「更少显形 = 更安全」只对石头/深板岩这类<b>真实</b>遮挡方块成立，不应套到 barrier 上。
+          return BukkitOcclusion.visualOccluding(data);
         }
 
         @Override
