@@ -17,11 +17,14 @@ import java.util.Set;
  * <p><b>判定顺序（后者不会覆盖前者）</b>：
  * <ol>
  *   <li>{@code occlusion.extra-non-occluding}：用户显式声明「不算遮挡」——优先级最高；</li>
- *   <li>{@code occlusion.extra-occluding}：用户显式声明「算遮挡」——可覆盖下面全部内置规则；</li>
+ *   <li>{@code occlusion.extra-occluding}：用户显式声明「算遮挡」——可覆盖真值与全部启发式规则；</li>
+ *   <li><b>逐状态真值</b>（{@code perStateTruth}，服务端 {@code BlockData#isOccluding()} 的逐状态结果）——
+ *       只要可用就以此为准，<b>不再走</b>下面的启发式；</li>
+ *   <li>逐状态真值不可用（该状态解析失败）时，回落下面这套启发式（旧口径）：</li>
  *   <li>空气 / 非固体（{@code isSolid()==false}）→ 不遮挡；</li>
  *   <li>形状超出整方块（{@code exceedsCube()}，如栅栏/墙/竹子/脚手架）→ 不遮挡；</li>
- *   <li>双层台阶（{@code type=double}）→ 遮挡（这是唯一需要看「状态属性」而非只看方块类型的修正）；</li>
- *   <li>名称属于「形状小于整方块」白名单（箱子族等，PE 无对应标志位，见 {@link #NON_OCCLUDING_NAMES}）→ 不遮挡；</li>
+ *   <li>双层台阶（{@code type=double}）→ 遮挡；</li>
+ *   <li>名称属于「形状小于整方块」白名单（箱子族等，见 {@link #NON_OCCLUDING_NAMES}）→ 不遮挡；</li>
  *   <li>材质属于植物/玻璃/树叶/液体等装饰性类别 → 不遮挡；</li>
  *   <li>名称以薄片族后缀结尾（台阶/楼梯/板/门/告示牌等）→ 不遮挡；</li>
  *   <li>其余 → 遮挡。</li>
@@ -59,7 +62,7 @@ public final class OcclusionRules {
   }
 
   /**
-   * 判定一个方块状态是否遮挡。
+   * 判定一个方块状态是否遮挡（不带逐状态真值，等价于 {@code perStateTruth = null}）。
    *
    * @param facts           摊平后的判定输入
    * @param extraOccluding  用户额外声明为「遮挡」的方块名（已归一化）
@@ -67,6 +70,22 @@ public final class OcclusionRules {
    */
   public static boolean isOccluding(Facts facts, Set<String> extraOccluding,
       Set<String> extraNonOccluding) {
+    return isOccluding(facts, extraOccluding, extraNonOccluding, null);
+  }
+
+  /**
+   * 判定一个方块状态是否遮挡（优先采用逐状态真值）。
+   *
+   * <p>优先级：{@code extra-non-occluding} → {@code extra-occluding} → 逐状态真值（非 {@code null} 时）
+   * → 启发式回落。真值可用时<b>不再</b>触碰启发式，因此「材质级判错」（如单/双台阶、箱子族）不会发生。
+   *
+   * @param facts           摊平后的判定输入
+   * @param extraOccluding  用户额外声明为「遮挡」的方块名（已归一化）
+   * @param extraNonOccluding 用户额外声明为「不遮挡」的方块名（已归一化）
+   * @param perStateTruth   逐状态真值：{@code TRUE}/{@code FALSE}=服务端判定，{@code null}=解析失败（走启发式）
+   */
+  public static boolean isOccluding(Facts facts, Set<String> extraOccluding,
+      Set<String> extraNonOccluding, Boolean perStateTruth) {
     if (facts == null) {
       return false;
     }
@@ -78,6 +97,29 @@ public final class OcclusionRules {
     if (extraOccluding != null && extraOccluding.contains(name)) {
       return true;
     }
+    return baseVerdict(facts, perStateTruth);
+  }
+
+  /**
+   * 遮挡的<b>基线</b>判定（不含任何用户覆盖）：逐状态真值可用时以真值为准，否则走启发式。
+   *
+   * <p>实体遮挡口径与「同源一致性」自证都用本方法——它与 {@link #isOccluding} 的差别只在覆盖表。
+   *
+   * @param facts         摊平后的判定输入
+   * @param perStateTruth 逐状态真值；{@code null}=解析失败（走启发式）
+   */
+  public static boolean baseVerdict(Facts facts, Boolean perStateTruth) {
+    if (facts == null) {
+      return false;
+    }
+    if (perStateTruth != null) {
+      return perStateTruth;
+    }
+    return heuristic(facts, normalize(facts.name()));
+  }
+
+  /** 启发式回落（旧口径）：只在逐状态真值不可用时使用。 */
+  private static boolean heuristic(Facts facts, String normalizedName) {
     if (facts.air() || !facts.solid()) {
       return false;
     }
@@ -87,13 +129,13 @@ public final class OcclusionRules {
     if (facts.doubleSlab()) {
       return true;
     }
-    if (NON_OCCLUDING_NAMES.contains(name)) {
+    if (NON_OCCLUDING_NAMES.contains(normalizedName)) {
       return false;
     }
     if (!facts.materialOccluding()) {
       return false;
     }
-    return !hasThinSuffix(name);
+    return !hasThinSuffix(normalizedName);
   }
 
   /**

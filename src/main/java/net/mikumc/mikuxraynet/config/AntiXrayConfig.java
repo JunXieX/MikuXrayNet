@@ -244,7 +244,8 @@ public final class AntiXrayConfig {
    * 遮挡判定的用户覆盖表（用户自行纠正判定的出口）与流体覆盖开关。
    *
    * <p>{@code extraNonOccluding} 优先级最高（显式声明不遮挡），{@code extraOccluding} 次之
-   * （可覆盖内置的空气/形状/材质/薄片规则）。名称用方块注册名（无需 {@code minecraft:} 前缀）。
+   * （可覆盖逐状态真值 {@code BlockData#isOccluding()} 与全部启发式回落规则）。名称用方块注册名
+   * （无需 {@code minecraft:} 前缀）。
    *
    * <p>{@code fluidCover}（默认开）：目标方块「上方紧邻方块是流体」时按遮挡处理（隐藏侧），
    * 且显形侧不显形——让刷在岩浆里的下界残骸保持伪装，透视端看不到。它只作用于目标方块的判定，

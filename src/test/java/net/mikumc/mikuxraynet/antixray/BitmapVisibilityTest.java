@@ -17,7 +17,8 @@ import org.junit.jupiter.api.Test;
  * <ul>
  *   <li><b>缺数据 = 不可见</b>：与实体遮挡路径的 fail-open 相反——显形侧「无数据 ≠ 通畅」，
  *       否则整片尚未建表的区域会被一次性还原成真实方块（见 {@code ProximityRevealer} 类注释）；</li>
- *   <li><b>只统计遮挡方块</b>：玻璃等非遮挡方块不阻断步进射线（口径由 Bukkit {@code isOccluding} 决定）。</li>
+ *   <li><b>只统计遮挡方块</b>：玻璃等非遮挡方块不阻断步进射线（口径 = 服务端逐状态真值
+ *       {@code BlockData#isOccluding()}）。</li>
  * </ul>
  */
 class BitmapVisibilityTest {
@@ -62,7 +63,7 @@ class BitmapVisibilityTest {
     fillEmpty(stores);
     stores.of(WORLD).replaceSection(0, 0, 0, layerSection(3, GLASS));
 
-    assertTrue(visible(stores, 8, 0, 20), "玻璃层不阻断步进射线（口径 = Bukkit isOccluding）");
+    assertTrue(visible(stores, 8, 0, 20), "玻璃层不阻断步进射线（口径 = 逐状态真值 isOccluding）");
   }
 
   @Test

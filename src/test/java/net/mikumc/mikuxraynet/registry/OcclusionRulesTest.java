@@ -125,6 +125,47 @@ class OcclusionRulesTest {
         "未覆盖时按内置规则判为遮挡");
   }
 
+  /** 逐状态真值可用时以其为准，两个方向都能压过启发式（这是「材质级判错」的修正点）。 */
+  @Test
+  void perStateTruthOverridesHeuristicInBothDirections() {
+    // 铁砧：启发式判遮挡；逐状态真值说非遮挡 → 以真值为准
+    OcclusionRules.Facts anvil = new OcclusionRules.Facts(false, true, false, true, false, "anvil");
+    assertTrue(OcclusionRules.isOccluding(anvil, NO_OVERRIDE, NO_OVERRIDE), "无真值时启发式判遮挡");
+    assertFalse(OcclusionRules.isOccluding(anvil, NO_OVERRIDE, NO_OVERRIDE, Boolean.FALSE),
+        "有真值时以真值为准（非遮挡）");
+
+    // 箱子：启发式判非遮挡；逐状态真值说遮挡 → 以真值为准
+    OcclusionRules.Facts chest = new OcclusionRules.Facts(false, true, false, true, false, "chest");
+    assertFalse(OcclusionRules.isOccluding(chest, NO_OVERRIDE, NO_OVERRIDE), "无真值时启发式判非遮挡");
+    assertTrue(OcclusionRules.isOccluding(chest, NO_OVERRIDE, NO_OVERRIDE, Boolean.TRUE),
+        "有真值时以真值为准（遮挡）");
+  }
+
+  /** 真值缺失（{@code null}）时回落启发式——单状态解析失败不得改变整体行为。 */
+  @Test
+  void nullTruthFallsBackToHeuristic() {
+    OcclusionRules.Facts anvil = new OcclusionRules.Facts(false, true, false, true, false, "anvil");
+
+    assertTrue(OcclusionRules.isOccluding(anvil, NO_OVERRIDE, NO_OVERRIDE, null),
+        "真值不可用时回落启发式（此处判遮挡）");
+    assertTrue(OcclusionRules.baseVerdict(anvil, null));
+    assertFalse(OcclusionRules.baseVerdict(anvil, Boolean.FALSE), "真值可用时基线取真值");
+  }
+
+  /** 用户覆盖表优先级仍最高：既压过真值，也压过启发式。 */
+  @Test
+  void userOverridesStillWinOverPerStateTruth() {
+    Set<String> extraOccluding = OcclusionRules.normalizeAll(Set.of("anvil"));
+    Set<String> extraNonOccluding = OcclusionRules.normalizeAll(Set.of("stone"));
+    OcclusionRules.Facts anvil = new OcclusionRules.Facts(false, true, false, true, false, "anvil");
+    OcclusionRules.Facts stone = new OcclusionRules.Facts(false, true, false, true, false, "stone");
+
+    assertTrue(OcclusionRules.isOccluding(anvil, extraOccluding, extraNonOccluding, Boolean.FALSE),
+        "真值说非遮挡、extra-occluding 说遮挡 → 覆盖表胜");
+    assertFalse(OcclusionRules.isOccluding(stone, extraOccluding, extraNonOccluding, Boolean.TRUE),
+        "真值说遮挡、extra-non-occluding 说非遮挡 → 覆盖表胜");
+  }
+
   @Test
   void nullFactsAreNotOccluding() {
     assertFalse(OcclusionRules.isOccluding(null, NO_OVERRIDE, NO_OVERRIDE),

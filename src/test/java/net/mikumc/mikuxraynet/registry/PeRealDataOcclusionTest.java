@@ -137,6 +137,10 @@ class PeRealDataOcclusionTest {
   /**
    * 遮挡分类必须与真实 PE 语义一致。
    *
+   * <p>本用例未注入逐状态真值 oracle，走的是<b>启发式回落</b>路径（与未接入真值时完全一致），
+   * 因此断言的是「回落规则」在真实 PE 数据下的结果；「真值生效」的接线由
+   * {@link #perStateOracleDrivesBothVerdictsAndOverridesWin()} 覆盖。
+   *
    * <p>这是抗矿透的地基：若 stone / deepslate 被判成「不遮挡」，{@code shouldObfuscate} 恒为 false，
    * 所有矿物都会原样下发（真机表现为「仍能透视看到矿物」）。
    */
@@ -166,6 +170,66 @@ class PeRealDataOcclusionTest {
       assertFalse(registry.isOccluding(requireStateId(name)),
           name + " 必须判为不遮挡（真机 PE 2.13.0 / V_26_2）");
     }
+  }
+
+  /**
+   * 未注入 oracle（离线场景）→ 全部状态回落启发式，回落数如实可观测；两套口径同源、差异 0。
+   *
+   * <p>这钉死「真值缺省时仍然可用」这一兜底：绝不能让「真值没接上」变成静默的口径分叉。
+   */
+  @Test
+  void withoutOracleEveryStateFallsBackToHeuristic() {
+    assertEquals(0, registry.truthStateCount(), "未注入 oracle 时不应有真值生效");
+    assertEquals(registry.getUniqueBlockStateCount(), registry.heuristicFallbackStateCount(),
+        "未注入 oracle 时每个有效状态都应回落启发式");
+    assertEquals(0, registry.overrideHitStateCount(), "默认覆盖表为空，不应有命中");
+    assertEquals(0, registry.occlusionDriftStateCount(),
+        "无覆盖表时伪装口径与实体口径必须完全一致（同源）");
+    assertEquals(registry.occludingStateCount(), registry.entityOccludingStateCount(),
+        "两套口径的遮挡状态数也应一致");
+  }
+
+  /**
+   * 注入桩 oracle，一次构建覆盖三条路径：
+   * <ol>
+   *   <li><b>真值生效</b>：非 chest 状态返回 {@code TRUE} → 以其为准，不再走启发式；</li>
+   *   <li><b>解析失败 → 回落</b>：chest 状态返回 {@code null} → 回落启发式（chest 判非遮挡）并计入回落数；</li>
+   *   <li><b>覆盖表优先</b>：extra-non-occluding={stone} 压过真值；实体口径不含覆盖 → 出现分歧（仅此来源）。</li>
+   * </ol>
+   *
+   * <p>离线环境真实 {@code Bukkit.createBlockData(...).isOccluding()} 不可用（{@code No RegistryAccess}），
+   * 因此「真值生效 / 解析失败 / 覆盖优先」这些路径必须用可注入的桩来覆盖。
+   */
+  @Test
+  void stubOracleCoversTruthFallbackAndOverridePaths() {
+    StateOcclusionOracle mixed =
+        stateString -> stateString.startsWith("minecraft:chest") ? null : Boolean.TRUE;
+    BlockStateRegistry stub = BlockStateRegistry.build(Set.of(), Set.of("stone"), null, mixed);
+
+    // ① 真值生效 + ② 解析失败回落：每个有效状态要么取真值、要么回落，二者之和应等于状态总数
+    assertTrue(stub.truthStateCount() > 0, "非 chest 状态应拿到桩真值");
+    assertTrue(stub.heuristicFallbackStateCount() > 0, "chest 状态解析失败 → 应回落启发式并计数");
+    assertEquals(stub.getUniqueBlockStateCount(),
+        stub.truthStateCount() + stub.heuristicFallbackStateCount(),
+        "每个有效状态要么取真值、要么回落（没有第三种）");
+    assertTrue(stub.heuristicFallbackNames().contains("chest"),
+        "回落串里应能看出是哪个方块无法解析：" + stub.heuristicFallbackNames());
+
+    // ③ 覆盖表优先于真值
+    assertFalse(stub.isOccluding(requireStateId("stone")), "extra-non-occluding 应压过逐状态真值");
+    assertTrue(stub.isOccluding(requireStateId("anvil")), "未被覆盖的方块以真值为准（遮挡）");
+    assertFalse(stub.isOccluding(requireStateId("chest")), "chest 回落启发式 → 判非遮挡");
+
+    // 两套口径同源：实体口径不含覆盖
+    assertTrue(stub.isEntityOccluding(requireStateId("stone")), "实体口径不含覆盖，stone 仍按真值判遮挡");
+    assertTrue(stub.overrideHitStateCount() > 0, "覆盖表命中数应可观测");
+    assertTrue(stub.occlusionDriftStateCount() > 0, "覆盖表造成了两套口径的分歧（仅此来源）");
+
+    System.out.println("[逐状态真值/回落] 成功=" + stub.truthStateCount()
+        + "，回落=" + stub.heuristicFallbackStateCount()
+        + "，覆盖命中=" + stub.overrideHitStateCount()
+        + "，两套口径差异=" + stub.occlusionDriftStateCount()
+        + "，回落名抽样=" + stub.heuristicFallbackNames());
   }
 
   /** PE 真实数据里各抽样方块的语义摊平结果（打印到测试输出，便于人工核对判定依据）。 */

@@ -7,11 +7,13 @@ import com.github.retrooper.packetevents.protocol.world.states.WrappedBlockState
 import com.github.retrooper.packetevents.protocol.world.states.enums.Type;
 import com.github.retrooper.packetevents.protocol.world.states.type.StateType;
 import com.github.retrooper.packetevents.protocol.world.states.type.StateTypes;
+import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collection;
 import java.util.EnumSet;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
@@ -23,23 +25,29 @@ import net.mikumc.mikuxraynet.codec.RegistryAccessor;
  * <p><b>只在启动期构建一次</b>（{@link #build} 需要 PacketEvents 已就绪），构建完成后实例内部
  * 只保留 {@code int + BitSet}，热路径不再触碰任何 PacketEvents 类型。
  *
- * <p><b>遮挡（occluding）判定</b>：规则见 {@link OcclusionRules}（纯逻辑、可单测）；本类只负责把
- * PE 的状态语义摊平成 {@link OcclusionRules.Facts}：
+ * <p><b>遮挡（occluding）判定</b>：优先采用<b>逐状态真值</b>——启动期把每个状态的
+ * {@code WrappedBlockState#toString()} 交给注入的 {@link StateOcclusionOracle} 解析成
+ * {@code BlockData#isOccluding()}（服务端权威、逐状态，即「玩家视觉能否看穿」）。单个状态解析失败时
+ * 回落到 {@link OcclusionRules} 的启发式，并计入回落数；<b>绝不让单个状态失败影响整体</b>。
+ *
+ * <p>启发式回落后，本类把 PE 的状态语义摊平成 {@link OcclusionRules.Facts}：
  * <ul>
  *   <li>{@code air} ← {@code StateType#isAir()}；</li>
  *   <li>{@code solid} ← {@code StateType#isSolid()}；</li>
  *   <li>{@code exceedsCube} ← {@code StateType#exceedsCube()}（形状超出整方块的栅栏/墙/竹子/脚手架等）；</li>
  *   <li>{@code materialOccluding} ← 材质类别是否不属于装饰性类别；</li>
- *   <li>{@code doubleSlab} ← 名称以 {@code _slab} 结尾且状态属性 {@code type == DOUBLE}（双台阶填满整方块，
- *       只看方块名会误判为「不遮挡」）。</li>
+ *   <li>{@code doubleSlab} ← 名称以 {@code _slab} 结尾且状态属性 {@code type == DOUBLE}。</li>
  * </ul>
  * 判定结果可被 {@code antixray.yml} 的 {@code occlusion.extra-occluding} /
- * {@code occlusion.extra-non-occluding} 覆盖（用户自行纠正判定的出口）。
+ * {@code occlusion.extra-non-occluding} 覆盖（用户自行纠正判定的出口，优先级最高）。
  */
 public final class BlockStateRegistry implements RegistryAccessor {
 
   /** 探测状态 id 的安全扫描上限（防御映射异常时无限循环）；远大于任何真实映射规模（实测约 3.2 万）。 */
   private static final int MAX_STATE_SCAN = 1 << 18;
+
+  /** 回落启发式的「代表性方块名」采样上限（仅用于日志/导出的 triage，避免整表失败时打印爆屏）。 */
+  private static final int MAX_FALLBACK_NAME_SAMPLE = 64;
 
   /** 「探测结果不确定需保守放大位宽」的一次性 WARN 闸门。 */
   private static final AtomicBoolean UNCERTAIN_PROBE_WARNED = new AtomicBoolean();
@@ -62,15 +70,27 @@ public final class BlockStateRegistry implements RegistryAccessor {
   private final BitSet fluidCoverStates;
   private final BitSet occludingStates;
   /**
-   * 实体遮挡口径表（Bukkit {@code Material#isOccluding()} 对面）：只供实体剔除的异步位图使用。
-   * {@code null} = 未构建（离线场景 / 未提供 Bukkit 表），此时 {@link #isEntityOccluding} 回落
-   * {@link #occludingStates}（见 {@link EntityOcclusionTable} 的「为什么需要第二张表」）。
+   * 实体遮挡口径表：只供实体剔除的异步位图使用，内容与伪装口径<b>同源</b>（同一逐状态真值），
+   * 仅少了 {@code occlusion.extra-*} 用户覆盖。
+   * {@code null} = 未构建，此时 {@link #isEntityOccluding} 回落 {@link #occludingStates}。
    */
   private final EntityOcclusionTable entityOcclusionTable;
 
+  /** 逐状态真值解析成功（并生效）的状态数。 */
+  private final int truthStateCount;
+  /** 逐状态真值解析失败、回落启发式的状态数。 */
+  private final int heuristicFallbackStateCount;
+  /** 命中 {@code occlusion.extra-*} 覆盖表的状态数（覆盖优先于真值）。 */
+  private final int overrideHitStateCount;
+  /** 伪装口径与实体口径判定不同的状态数（由覆盖表造成；无覆盖时应为 0）。 */
+  private final int occlusionDriftStateCount;
+  /** 回落启发式涉及的代表性方块名（去重、按名排序、上限内截断），供启动日志与导出 triage。 */
+  private final List<String> heuristicFallbackNames;
+
   private BlockStateRegistry(int uniqueBlockStateCount, int maxBitsPerBlockState, BitSet airStates,
       BitSet fluidStates, BitSet fluidCoverStates, BitSet occludingStates,
-      EntityOcclusionTable entityOcclusionTable) {
+      EntityOcclusionTable entityOcclusionTable, int truthStateCount, int heuristicFallbackStateCount,
+      int overrideHitStateCount, int occlusionDriftStateCount, List<String> heuristicFallbackNames) {
     this.uniqueBlockStateCount = uniqueBlockStateCount;
     this.maxBitsPerBlockState = maxBitsPerBlockState;
     this.airStates = airStates;
@@ -78,6 +98,11 @@ public final class BlockStateRegistry implements RegistryAccessor {
     this.fluidCoverStates = fluidCoverStates;
     this.occludingStates = occludingStates;
     this.entityOcclusionTable = entityOcclusionTable;
+    this.truthStateCount = truthStateCount;
+    this.heuristicFallbackStateCount = heuristicFallbackStateCount;
+    this.overrideHitStateCount = overrideHitStateCount;
+    this.occlusionDriftStateCount = occlusionDriftStateCount;
+    this.heuristicFallbackNames = heuristicFallbackNames;
   }
 
   /**
@@ -112,14 +137,13 @@ public final class BlockStateRegistry implements RegistryAccessor {
   }
 
   /**
-   * 完整构建：追加「实体遮挡口径」的 Bukkit 判定表。
+   * 完整构建：追加「逐状态真值」来源，并由它同时驱动伪装口径与实体口径（两套同源）。
    *
-   * @param bukkitOccludingByBlockName Bukkit 口径（方块名 → {@code Material#isOccluding()}）；
-   *                                   {@code null} = 不构建实体口径表（{@link #isEntityOccluding} 回落本表）
+   * @param oracle 逐状态遮挡真值来源（服务端 {@code BlockData#isOccluding()}）；{@code null} = 不提供，
+   *               全部状态回落启发式（离线单测场景）
    */
   public static BlockStateRegistry build(Collection<String> extraOccluding,
-      Collection<String> extraNonOccluding, Logger logger,
-      Map<String, Boolean> bukkitOccludingByBlockName) {
+      Collection<String> extraNonOccluding, Logger logger, StateOcclusionOracle oracle) {
     Set<String> occludingOverrides = OcclusionRules.normalizeAll(extraOccluding);
     Set<String> nonOccludingOverrides = OcclusionRules.normalizeAll(extraNonOccluding);
 
@@ -137,8 +161,13 @@ public final class BlockStateRegistry implements RegistryAccessor {
     BitSet fluidStates = new BitSet(count);
     BitSet fluidCoverStates = new BitSet(count);
     BitSet occludingStates = new BitSet(count);
-    // 状态 id → 方块名（下标即 id，空洞处留 null）：仅当需要实体口径表时才分配（否则省下 3 万个引用槽）
-    String[] blockNames = bukkitOccludingByBlockName == null ? null : new String[count];
+    // 实体口径 = 逐状态真值（不含 extra-* 覆盖）；与伪装口径同源，仅差覆盖表。
+    BitSet entityOccludingStates = new BitSet(count);
+    int truthCount = 0;
+    int fallbackCount = 0;
+    int overrideHitCount = 0;
+    int driftCount = 0;
+    Set<String> fallbackNames = new LinkedHashSet<>();
 
     for (int id = 0; id < count; id++) {
       // 空洞 id（映射异常）本身不是有效状态：直接跳过，不参与任何位图
@@ -148,9 +177,6 @@ public final class BlockStateRegistry implements RegistryAccessor {
       }
       StateType type = state.getType();
       String name = type.getName();
-      if (blockNames != null) {
-        blockNames[id] = name;
-      }
 
       if (type.isAir()) {
         airStates.set(id);
@@ -165,15 +191,59 @@ public final class BlockStateRegistry implements RegistryAccessor {
       if (isFluidMaterial(type.getMaterialType())) {
         fluidCoverStates.set(id);
       }
-      if (OcclusionRules.isOccluding(facts(type, name, state), occludingOverrides,
-          nonOccludingOverrides)) {
+
+      OcclusionRules.Facts facts = facts(type, name, state);
+      // 逐状态真值：单个状态解析失败返回 null（异常已被 oracle 吞掉），据此计数并回落启发式。
+      Boolean truth = resolveTruth(oracle, state);
+      if (truth != null) {
+        truthCount++;
+      } else {
+        fallbackCount++;
+        if (fallbackNames.size() < MAX_FALLBACK_NAME_SAMPLE) {
+          fallbackNames.add(name);
+        }
+      }
+      // 基线（不含覆盖）= 实体口径：真值优先，失败才走启发式。
+      boolean baseline = OcclusionRules.baseVerdict(facts, truth);
+      if (baseline) {
+        entityOccludingStates.set(id);
+      }
+      boolean camouflage = OcclusionRules.isOccluding(facts, occludingOverrides,
+          nonOccludingOverrides, truth);
+      if (camouflage) {
         occludingStates.set(id);
+      }
+      if (camouflage != baseline) {
+        driftCount++; // 只有覆盖表能造成伪装/实体口径分歧
+      }
+      String key = OcclusionRules.normalize(name);
+      if (occludingOverrides.contains(key) || nonOccludingOverrides.contains(key)) {
+        overrideHitCount++; // 该状态命中用户覆盖表（判定以覆盖表为准）
       }
     }
 
+    List<String> fallbackNameList = new ArrayList<>(fallbackNames);
+    fallbackNameList.sort(String::compareTo);
     return new BlockStateRegistry(count, width, airStates, fluidStates, fluidCoverStates,
-        occludingStates,
-        EntityOcclusionTable.build(blockNames, occludingStates, bukkitOccludingByBlockName));
+        occludingStates, EntityOcclusionTable.build(entityOccludingStates), truthCount,
+        fallbackCount, overrideHitCount, driftCount, List.copyOf(fallbackNameList));
+  }
+
+  /** 逐状态真值来源：无 oracle（离线）返回 {@code null}；状态字符串不可得也返回 {@code null}（回落）。 */
+  private static Boolean resolveTruth(StateOcclusionOracle oracle, WrappedBlockState state) {
+    if (oracle == null) {
+      return null;
+    }
+    try {
+      String stateString = state.toString();
+      if (stateString == null) {
+        return null;
+      }
+      return oracle.resolve(stateString);
+    } catch (Throwable throwable) {
+      // 单个状态取字符串/解析失败：不中断整个构建，按「真值不可用」回落
+      return null;
+    }
   }
 
   /** 本体即流体的材质：水（含流动变体与水柱）与岩浆。 */
@@ -237,17 +307,19 @@ public final class BlockStateRegistry implements RegistryAccessor {
   }
 
   /**
-   * 该状态是否为「整块不透明」（可作为遮挡面）——<b>反矿透伪装口径</b>（PE 状态语义启发式，刻意偏多判）。
-   * 见 {@link EntityOcclusionTable} 关于两条链路为何必须分口径的说明。
+   * 该状态是否为「整块不透明」（可作为遮挡面）——<b>反矿透伪装口径</b>。
+   *
+   * <p>优先取逐状态真值（服务端 {@code BlockData#isOccluding()}），真值不可用的状态才回落 PE 状态语义启发式；
+   * 两者都可被 {@code occlusion.extra-*} 覆盖表改写（覆盖优先级最高）。
    */
   public boolean isOccluding(int blockId) {
     return blockId >= 0 && blockId < uniqueBlockStateCount && occludingStates.get(blockId);
   }
 
   /**
-   * 该状态在<b>实体遮挡口径</b>下是否遮挡（Bukkit {@code Material#isOccluding()}，与既有同步射线同源）。
+   * 该状态在<b>实体遮挡口径</b>下是否遮挡（与伪装口径<b>同源</b>：同一逐状态真值，仅不含 {@code extra-*} 覆盖）。
    *
-   * <p>供实体剔除的异步位图使用；未构建实体口径表时回落 {@link #isOccluding}（离线场景与单测）。
+   * <p>供实体剔除的异步位图使用；未构建实体口径表时回落 {@link #isOccluding}。
    */
   public boolean isEntityOccluding(int blockId) {
     if (entityOcclusionTable == null) {
@@ -267,9 +339,34 @@ public final class BlockStateRegistry implements RegistryAccessor {
     return entityOcclusionTable == null ? -1 : entityOcclusionTable.occludingStateCount();
   }
 
-  /** 实体遮挡口径下「名称未命中 Bukkit 表、回落注册表口径」的状态数；未构建该表时为 -1。 */
+  /** 实体口径里「逐状态真值不可用、回落启发式」的状态数；未构建实体口径表时为 -1。 */
   public int entityOcclusionFallbackCount() {
-    return entityOcclusionTable == null ? -1 : entityOcclusionTable.fallbackCount();
+    return entityOcclusionTable == null ? -1 : heuristicFallbackStateCount;
+  }
+
+  /** 逐状态真值解析成功（并生效）的状态数。 */
+  public int truthStateCount() {
+    return truthStateCount;
+  }
+
+  /** 逐状态真值解析失败、回落启发式的状态数。 */
+  public int heuristicFallbackStateCount() {
+    return heuristicFallbackStateCount;
+  }
+
+  /** 命中 {@code occlusion.extra-*} 覆盖表、判定以覆盖表为准的状态数。 */
+  public int overrideHitStateCount() {
+    return overrideHitStateCount;
+  }
+
+  /** 伪装口径与实体口径判定不同的状态数（由覆盖表造成；无覆盖时应为 0，即两套口径完全一致）。 */
+  public int occlusionDriftStateCount() {
+    return occlusionDriftStateCount;
+  }
+
+  /** 回落启发式涉及的代表性方块名（去重、按名排序、上限内截断），供启动日志与导出 triage。 */
+  public List<String> heuristicFallbackNames() {
+    return heuristicFallbackNames;
   }
 
   /** 把 PE 状态摊平为纯判定输入（不保留任何 PE 引用）。 */

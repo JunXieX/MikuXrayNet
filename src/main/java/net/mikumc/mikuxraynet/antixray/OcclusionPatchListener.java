@@ -50,11 +50,12 @@ import org.bukkit.plugin.Plugin;
  * 单格置零在<b>两个方向上都更保守</b>：若该格真实是遮挡方块，最坏只少算一格遮挡。
  * 失败格数计入 {@link OcclusionStats#patchFailures}，持续偏高即说明补丁链路读不出发送方方块数据。
  *
- * <p><b>口径与建表路径完全一致</b>：本类只能用 ProtocolLib 包装后的 {@code Material} 判遮挡
- * （{@code Material#isOccluding()}），而位图建表用的<b>实体遮挡口径表</b>正是同一来源
- * （见 {@code EntityOcclusionTable}），同步回退路径的 {@code World#rayTraceBlocks} 亦然——
- * 建表 / 补丁 / 同步回退三者同口径，不会出现「同一格三种结论」。
- * 反矿透伪装那条链路用的是另一套（PE 状态语义、刻意偏多判），二者互不影响。
+ * <p><b>口径</b>：本类只能用 ProtocolLib 包装后的 {@code Material} 判遮挡（{@code Material#isOccluding()}，
+ * 方块级）；位图建表用的<b>实体遮挡口径表</b>则是<b>逐状态真值</b>（服务端 {@code BlockData#isOccluding()}，
+ * 见 {@code EntityOcclusionTable}）。二者对绝大多数方块一致，仅对「同方块不同状态的结论不同」的少数方块
+ * （如单台阶 vs 双台阶）可能不同——本类拿不到逐状态信息，属近似口径；且本类拿不到口径时一律降级为
+ * 「不遮挡」（fail-open），不会造成误藏。
+ * 反矿透伪装那条链路与实体位图同源（同一逐状态真值），二者互不影响。
  */
 public final class OcclusionPatchListener extends PacketAdapter {
 

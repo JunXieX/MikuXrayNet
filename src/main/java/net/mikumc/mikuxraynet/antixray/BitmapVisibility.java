@@ -21,8 +21,8 @@ import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
  * 真实方块，等于把矿直接亮给透视端（本功能最严重的失效模式）。缺数据时「不显形」只是延迟到区块建表之后：
  * 该坐标仍留在伪装清单里，后续周期会重试。
  *
- * <p><b>口径</b>：位图由 {@code entityOcclusionTable}（Bukkit {@code Material#isOccluding()}）构建，与旧的
- * 精确判定里 {@code BlockData#isOccluding()} 同一口径。但步进射线只统计「遮挡方块」，因此玻璃、蜡烛等
+ * <p><b>口径</b>：位图由 {@code entityOcclusionTable}（服务端逐状态真值 {@code BlockData#isOccluding()}）构建，
+ * 与旧的精确判定里 {@code BlockData#isOccluding()} 同一口径。但步进射线只统计「遮挡方块」，因此玻璃、蜡烛等
  * 非遮挡方块不再阻断射线（旧实现是「命中任何别的方块即不通畅」）——这一语义变化与用户既定的
  * 「尽可能保证玩家可见性」方向一致。
  *

@@ -388,10 +388,10 @@ public final class ObfuscationProcessor {
   /**
    * <b>实体遮挡口径</b>的判定表：只供 {@link #captureOcclusion} 建位图使用。
    *
-   * <p><b>为什么不与 {@link #occlusionTable} 共用</b>：反矿透伪装口径（PE 状态语义启发式）刻意偏多判
-   * （宁可多伪装，漏伪装是安全事故），而实体剔除的方向相反——多判会把本可见的实体藏起来。既有同步射线
-   * 用的是 {@code Material#isOccluding()}，真机实测两者对 125/1196 种方块相反，故实体位图必须用同一口径，
-   * 否则异步/同步两种模式会漂移。详见 {@code EntityOcclusionTable}。
+   * <p><b>为什么与 {@link #occlusionTable} 分开保存</b>：两者现在<b>同源</b>——同一逐状态真值
+   * （服务端 {@code BlockData#isOccluding()}）。分开只是因为伪装口径额外套用 {@code occlusion.extra-*}
+   * 用户覆盖，而实体剔除不受覆盖影响；无覆盖表时两者逐状态判定完全一致，不存在异步/同步漂移。
+   * 详见 {@code EntityOcclusionTable}。
    *
    * <p>{@code null} = 与 {@link #occlusionTable} 相同（离线单测与不提供 Bukkit 表时的回落）。
    */
@@ -594,8 +594,8 @@ public final class ObfuscationProcessor {
     // 是否是目标方块的检查在改写循环里做（targets 位图），这里只提供空气/流体过滤器。
     IntPredicate belowUsable = state -> !(registry.isAir(state) || registry.isFluid(state));
 
-    // 两套遮挡口径刻意分开：反矿透伪装用 PE 语义表（偏多判，宁多伪装不漏伪装）；
-    // 实体遮挡位图用实体口径表（与既有同步射线同源，偏少判才安全）。见 EntityOcclusionTable。
+    // 两套遮挡口径同源（同一逐状态真值：服务端 BlockData#isOccluding()）；伪装口径额外套用
+    // occlusion.extra-* 覆盖，实体口径不套用。见 EntityOcclusionTable。
     return new ObfuscationProcessor(codec, registry::isOccluding, config.layerObfuscation(),
         missingPolicyHide, paletteOptions, belowUsable,
         dimensionProfiles[AntiXrayConfig.Dimension.NORMAL.ordinal()], dimensionProfiles,
