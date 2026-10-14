@@ -39,7 +39,7 @@ class DiagnosticsTest {
             0L, 0L, 0L, "无采样"),
         new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 1L, 40L, 6L),
         new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L),
-        new Diagnostics.Snapshot.Occlusion(true, 4096, 3, 200L, 190L, 2L, 1L, 55L, 4_200_000L, 88L, 4L,
+        new Diagnostics.Snapshot.Occlusion(true, 4096, 3, 200L, 190L, 2L, 1L, 9L, 55L, 4_200_000L, 88L, 4L,
             6L),
         new Diagnostics.Snapshot.Throttle(20L, 30L, 11L, 4L, 39L, 0L,
             4L, 40L, 12L,
@@ -197,8 +197,8 @@ class DiagnosticsTest {
     assertTrue(text.contains("异步遮挡：已接线｜位图 section 4096，队列 3"),
         "状态面板必须单列异步遮挡的接线状态、位图驻留量与专用池队列深度"
             + "（否则「开了开关但没接线 / 引擎跟不上」无法从日志判断）：" + text);
-    assertTrue(text.contains("提交 200，完成 190，超时丢弃 2，队列满拒收 1，缺遮挡数据 55 次"),
-        "异步遮挡的判定计数必须齐全（「缺遮挡数据」持续偏高 = 区块没被建表）：" + text);
+    assertTrue(text.contains("提交 200，完成 190，超时丢弃 2，队列满拒收 1，判定异常 9，缺遮挡数据 55 次"),
+        "异步遮挡的判定计数必须齐全（「判定异常」持续非 0 = 存在异常输入；「缺遮挡数据」持续偏高 = 区块没被建表）：" + text);
     assertTrue(text.contains("方块补丁 88 格（失败 4 格，状态id回落 6 格）"),
         "方块变更补丁的格数、失败数与「状态id回落」数必须可见"
             + "（补丁长期为 0 = 位图不会被方块变更刷新；状态id回落 >0 = 补丁退回了 Material 级近似、"

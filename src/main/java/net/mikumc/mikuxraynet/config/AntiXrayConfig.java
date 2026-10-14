@@ -1269,14 +1269,18 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 最小豁免距离的生效值：非法值（NaN）回落<b>默认值</b>（{@link #FRUSTUM_MIN_DISTANCE_DEFAULT}），
-   * 低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR} 时抬升到下限——两种情况都记入 {@code floorAdjustments}
-   * （与 {@link #frustumFov} 口径一致，绝不静默改用户配置）。
+   * 最小豁免距离的生效值：非有限值（NaN / ±Inf）回落<b>默认值</b>
+   * （{@link #FRUSTUM_MIN_DISTANCE_DEFAULT}），低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR} 时抬升到下限——
+   * 两种情况都记入 {@code floorAdjustments}（与 {@link #frustumFov} 口径一致，绝不静默改用户配置）。
+   *
+   * <p><b>为什么用 {@code !isFinite} 而不是只拦 NaN</b>：{@code Math.max(0.0, +Inf)} 仍是 {@code +Inf}，
+   * 会让 {@code +Inf} 原样穿过钳制进入生效值——视锥判定的豁免半径变成无穷大，<b>所有候选都豁免</b>，
+   * 等于静默把「视锥剔除」关掉（与 {@link #proximityDistance} 的 NaN 缺陷同源）。非有限值一律回落默认。
    */
   private static double frustumMinDistance(double configured, List<String> floorAdjustments) {
-    if (Double.isNaN(configured)) {
-      // 与 frustumFov 对齐：NaN 不再静默回落，纳入统一的一次性 WARN 明细
-      floorAdjustments.add("proximity.frustum.min-distance=" + configured + "（非法值，回落默认 "
+    if (!Double.isFinite(configured)) {
+      // 与 frustumFov / proximityDistance 对齐：非有限值不再静默回落，纳入统一的一次性 WARN 明细
+      floorAdjustments.add("proximity.frustum.min-distance=" + configured + "（非有限值，回落默认 "
           + FRUSTUM_MIN_DISTANCE_DEFAULT + " 格）");
       return FRUSTUM_MIN_DISTANCE_DEFAULT;
     }

@@ -154,27 +154,32 @@ public final class Diagnostics {
 
     /**
      * 异步遮挡域：位图驻留量与专用池队列深度，以及判定计数（提交 / 完成 / 超时丢弃 / 队列满拒收 /
-     * 遮挡数据缺失）与射线累计耗时。
+     * 判定异常 / 遮挡数据缺失）与射线累计耗时。
      *
      * <p><b>为什么「缺遮挡数据」必须单列</b>：它是「区块没被建过表」的覆盖率观测点——只要它持续偏高，
      * 就说明大量区块查不到位图（射线一律按不遮挡放行，实体只是少藏、不会误藏）。真机调优时它比
      * 「隐藏数」更能说明异步路径是否真的覆盖到了玩家周围的区块。
      *
+     * <p><b>为什么「判定异常」必须单列</b>：单条判定在工作线程内抛异常会被就地吞掉（不改变显示状态，
+     * 方向安全），但若这类输入持续出现，说明射线链路存在越界/畸形坐标等异常输入；这一计数不落盘、
+     * 不进日志，若此处不回显便完全不可观测（故障会表现为「部分判定静默丢失」而无人知晓）。
+     *
      * @param active          异步遮挡是否已真正接线（引擎已起 + 位图仓库可用）；与配置开关不是一回事
      * @param sectionsResident 当前驻留的遮挡 section 条目总数（跨世界求和）
      * @param queueDepth      专用池当前排队的判定数（持续接近队列上限说明引擎线程跟不上）
-     * @param patched         方块变更补丁已改写的格数（长时间为 0 而场上确有方块变更 = 补丁没生效）
      * @param patchFailures   补丁失败（拿不到新方块口径）的格数（这些 section 已降级为未知，属「少藏」方向）
+     * @param computeFailures 单条判定在工作线程内抛异常被就地吞掉的次数（持续非 0 = 存在异常输入，需定位）
      * @param stateIdFallbacks 补丁「拿不到状态 id、回落 Material 级近似」的格数（&gt;0 说明补丁暂时无法与
      *                        位图逐状态一致，只能按方块级近似）
      */
     public record Occlusion(boolean active, int sectionsResident, int queueDepth, long submitted,
-        long computed, long timeoutDiscarded, long rejectedQueueFull, long unknownSection,
-        long nanosTotal, long patched, long patchFailures, long stateIdFallbacks) {
+        long computed, long timeoutDiscarded, long rejectedQueueFull, long computeFailures,
+        long unknownSection, long nanosTotal, long patched, long patchFailures,
+        long stateIdFallbacks) {
 
       /** 异步遮挡未接线时的零值兜底。 */
       public static final Occlusion EMPTY =
-          new Occlusion(false, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+          new Occlusion(false, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     /**
@@ -439,8 +444,8 @@ public final class Diagnostics {
     return new Snapshot.Occlusion(pipeline.asyncOcclusionActive(),
         pipeline.occlusionSectionsResident(), pipeline.occlusionQueueDepth(), stats.submitted.sum(),
         stats.computed.sum(), stats.timeoutDiscarded.sum(), stats.rejectedQueueFull.sum(),
-        stats.unknownSection.sum(), stats.nanosTotal.sum(), stats.patched.sum(),
-        stats.patchFailures.sum(), stats.stateIdFallbacks.sum());
+        stats.computeFailures.sum(), stats.unknownSection.sum(), stats.nanosTotal.sum(),
+        stats.patched.sum(), stats.patchFailures.sum(), stats.stateIdFallbacks.sum());
   }
 
   /** 状态面板格式化（纯函数）。 */
@@ -542,6 +547,9 @@ public final class Diagnostics {
         + "｜判定 提交 " + s.occlusion().submitted() + "，完成 " + s.occlusion().computed()
         + "，超时丢弃 " + s.occlusion().timeoutDiscarded()
         + "，队列满拒收 " + s.occlusion().rejectedQueueFull()
+        // 判定异常单列：单条判定抛异常被就地吞掉（不改变显示状态，方向安全），但持续非 0 说明射线链路
+        // 收到越界/畸形坐标等异常输入，会导致部分判定静默丢失——必须可见才能定位。
+        + "，判定异常 " + s.occlusion().computeFailures()
         + "，缺遮挡数据 " + s.occlusion().unknownSection()
         + " 次，方块补丁 " + s.occlusion().patched() + " 格（失败 " + s.occlusion().patchFailures()
         // 补丁的「状态id回落」单列：>0 说明补丁暂时拿不到逐状态 id、退回了 Material 级近似，此时
