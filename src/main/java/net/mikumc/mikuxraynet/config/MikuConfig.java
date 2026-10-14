@@ -4,6 +4,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -22,6 +23,7 @@ public final class MikuConfig {
 
   public static final String ANTI_XRAY_FILE = "antixray.yml";
   public static final String BANDWIDTH_FILE = "bandwidth.yml";
+  public static final String BLACKLIST_FILE = "blacklist.yml";
 
   private final Plugin plugin;
   private final Logger logger;
@@ -33,22 +35,25 @@ public final class MikuConfig {
   private final AtomicBoolean antiXrayFallbackWarned = new AtomicBoolean();
   /** 「带宽配置解析失败已保留上一份/改用默认」WARN 的进程级一次性闸门。 */
   private final AtomicBoolean bandwidthFallbackWarned = new AtomicBoolean();
+  /** 「世界黑名单配置解析失败已保留上一份/改用默认」WARN 的进程级一次性闸门。 */
+  private final AtomicBoolean blacklistFallbackWarned = new AtomicBoolean();
   /** 「带宽配置项超过安全上限被钳制」WARN 的进程级一次性闸门。 */
   private final AtomicBoolean bandwidthClampWarned = new AtomicBoolean();
 
   /**
-   * 同一代的两份配置（反矿透 + 带宽）的不可变持有者。
+   * 同一代的配置的不可变持有者（反矿透 + 带宽 + 世界黑名单）。
    *
-   * <p><b>为什么要成对发布</b>：这两份配置由同一次 {@link #load()} 一起生成。若各自用一个 volatile
+   * <p><b>为什么要成对发布</b>：这些配置由同一次 {@link #load()} 一起生成。若各自用一个 volatile
    * 字段分别写入，reload 瞬间读者可能读到「新一代反矿透 + 旧一代带宽」的混合对（或反之）——一次请求
-   * 里两个模块会按不同代的口径行事，难以复现与排查。改为把这一对不可变对象放进同一个 holder、<b>一次
-   * volatile 写替换</b>，读者从单一 volatile 读取出 holder 后看到的必然是同代的一对配置。
+   * 里两个模块会按不同代的口径行事，难以复现与排查。改为把这些不可变对象放进同一个 holder、<b>一次
+   * volatile 写替换</b>，读者从单一 volatile 读取出 holder 后看到的必然是同一代的一整组配置。
    */
-  private record Loaded(AntiXrayConfig antiXray, BandwidthConfig bandwidth) {
+  private record Loaded(AntiXrayConfig antiXray, BandwidthConfig bandwidth,
+      WorldBlacklistConfig blacklist) {
   }
 
-  /** 当前生效的配置对；首次 {@link #load()} 之前为 {@code (null, null)}。整体一次替换，保证同代可见。 */
-  private volatile Loaded loaded = new Loaded(null, null);
+  /** 当前生效的配置组；首次 {@link #load()} 之前为 {@code (null, null, 空名单)}。整体一次替换。 */
+  private volatile Loaded loaded = new Loaded(null, null, WorldBlacklistConfig.fromPatterns(List.of()));
 
   /**
    * 最近一次加载的回退说明（{@code null} = 正常）：解析失败时用于在重载回显里如实告知管理员
@@ -74,9 +79,13 @@ public final class MikuConfig {
     this.fallbackNote = null;
     AntiXrayConfig loadedAntiXray = loadAntiXray();
     BandwidthConfig loadedBandwidth = loadBandwidth();
+    WorldBlacklistConfig loadedBlacklist = loadBlacklist();
 
-    // 成对发布：一次 volatile 写替换整个 holder，读者永远看到同一代的两份配置
-    this.loaded = new Loaded(loadedAntiXray, loadedBandwidth);
+    // 成对发布：一次 volatile 写替换整个 holder，读者永远看到同一代的一组配置
+    this.loaded = new Loaded(loadedAntiXray, loadedBandwidth, loadedBlacklist);
+    // 世界黑名单另有「封包线程无锁读取」的静态入口（带宽模块与反矿透监听器都在封包热路径上查它）。
+    // 必须在发布 holder 之后立即刷新，保证封包线程读到的名单与本代配置一致。
+    WorldBlacklistConfig.publish(loadedBlacklist);
 
     if (loadedAntiXray.enabled()) {
       logger.info("反矿透配置已加载（按维度分段）：" + dimensionSummary(loadedAntiXray));
@@ -84,12 +93,11 @@ public final class MikuConfig {
       logger.info("反矿透配置已加载：功能处于关闭状态");
     }
     // 世界黑名单（优先级最高）：启动/重载时打印一次数量与具体列表（空则明确写「未配置」），不逐区块刷屏
-    if (loadedAntiXray.worldBlacklist().isEmpty()) {
-      logger.info("反矿透世界黑名单：未配置（所有世界都启用反矿透）");
+    if (loadedBlacklist.isEmpty()) {
+      logger.info("世界黑名单：未配置（所有世界都启用反矿透与带宽优化）");
     } else {
-      logger.info("反矿透世界黑名单：" + loadedAntiXray.worldBlacklist().size() + " 项 "
-          + loadedAntiXray.worldBlacklist()
-          + "（名单内世界不使用任何反矿透功能；带宽模块不受影响）");
+      logger.info("世界黑名单：" + loadedBlacklist.patterns().size() + " 项 "
+          + loadedBlacklist.patterns() + "（名单内世界同时不使用反矿透与带宽优化）");
     }
     // 缺 dimensions 段（旧版 worlds / 顶层 obfuscation 结构）时用内置默认运行并一次性提示
     loadedAntiXray.warnIfDimensionsMissing(logger, dimensionsWarned);
@@ -133,14 +141,40 @@ public final class MikuConfig {
     return loaded.bandwidth();
   }
 
+  /** 世界黑名单（独立配置 {@code blacklist.yml}）：对反矿透与带宽优化同时生效。 */
+  public WorldBlacklistConfig blacklist() {
+    return loaded.blacklist();
+  }
+
   /**
-   * 最近一次 {@link #load()} 中发生的「解析失败后回退」说明（{@code null} = 两份文件都正常解析）。
+   * 最近一次 {@link #load()} 中发生的「解析失败后回退」说明（{@code null} = 所有文件都正常解析）。
    *
    * <p>供重载回显使用：解析失败时会保留上一份配置（见 {@link #loadAntiXray()}），此时若仍只打
    * 「指纹未变化 + 已热生效」，管理员会误以为刚修改的文件已生效，实际改动被整份忽略。
    */
   public String fallbackNote() {
     return fallbackNote;
+  }
+
+  /**
+   * 读取并解析世界黑名单配置；失败语义同 {@link #loadAntiXray()}（保留上一份 / 回落空名单）。
+   *
+   * <p>空名单 = 所有世界都启用——这是默认行为，因此首次加载即失败时回落空名单是安全的。
+   */
+  private WorldBlacklistConfig loadBlacklist() {
+    try {
+      return WorldBlacklistConfig.from(read(BLACKLIST_FILE));
+    } catch (Throwable throwable) {
+      WorldBlacklistConfig previous = this.loaded.blacklist();
+      if (previous != null) {
+        warnFallbackOnce(blacklistFallbackWarned, BLACKLIST_FILE, "已保留上一份配置", throwable);
+        this.fallbackNote = BLACKLIST_FILE + " 解析失败，已保留上一份配置";
+        return previous;
+      }
+      warnFallbackOnce(blacklistFallbackWarned, BLACKLIST_FILE, "已改用空白名单", throwable);
+      this.fallbackNote = BLACKLIST_FILE + " 解析失败，已改用空白名单（所有世界都启用）";
+      return WorldBlacklistConfig.fromPatterns(List.of());
+    }
   }
 
   /**

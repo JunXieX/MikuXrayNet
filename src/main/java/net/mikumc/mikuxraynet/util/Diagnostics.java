@@ -28,6 +28,7 @@ import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.config.MikuConfig;
+import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import org.bukkit.Bukkit;
 
@@ -461,7 +462,7 @@ public final class Diagnostics {
         // 区块取数字段定位状态必须可见：字段级取数失败会静默 fail-open（放行原包、矿物真实下发），
         // 只凭「改写计数正常」无法区分「算了但没生效」，此行给出决定性判据（见 Snapshot.ChunkAccessor）。
         + "｜区块取数=" + s.chunkAccessor().state());
-    lines.add("反矿透世界黑名单：" + worldBlacklistSummary(s.antiXray()));
+    lines.add("世界黑名单：" + worldBlacklistSummary());
     lines.add("改写缓存：命中 " + s.rewrite().cacheHits() + "，未命中 " + s.rewrite().cacheMisses()
         + "，命中率 " + hitRate(s.rewrite().cacheHits(), s.rewrite().cacheMisses())
         + "，条目 " + s.rewrite().cacheEntries());
@@ -589,15 +590,16 @@ public final class Diagnostics {
   }
 
   /** 世界黑名单回显（中文，纯函数；status 与 dump 共用）。空列表明确写「未配置」。 */
-  private static String worldBlacklistSummary(AntiXrayConfig c) {
-    if (c == null) {
+  private static String worldBlacklistSummary() {
+    WorldBlacklistConfig current = WorldBlacklistConfig.current();
+    if (current == null) {
       return "配置未加载";
     }
-    if (c.worldBlacklist().isEmpty()) {
-      return "未配置（所有世界都启用反矿透）";
+    if (current.isEmpty()) {
+      return "未配置（所有世界都启用反矿透与带宽优化）";
     }
-    return c.worldBlacklist().size() + " 项：" + String.join(", ", c.worldBlacklist())
-        + "（名单内世界不使用任何反矿透功能）";
+    return current.patterns().size() + " 项：" + String.join(", ", current.patterns())
+        + "（名单内世界同时不使用反矿透与带宽优化）";
   }
 
   /**
@@ -754,7 +756,8 @@ public final class Diagnostics {
       return;
     }
     sb.append("enabled=").append(c.enabled()).append('\n');
-    sb.append("world-blacklist=").append(worldBlacklistSummary(c)).append('\n');
+    sb.append("world-blacklist（独立文件 blacklist.yml）=").append(worldBlacklistSummary())
+        .append('\n');
     if (c.dimensionsMissing()) {
       sb.append("dimensions=缺少该段（已使用内置默认运行，请重新生成配置）\n");
     }

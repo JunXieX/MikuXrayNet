@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.util.List;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.junit.jupiter.api.Test;
@@ -88,20 +89,28 @@ class DiagnosticsTest {
   /**
    * 世界黑名单必须出现在 status（人类可读行）与 dump（配置有效值）两处回显中；
    * 空列表也要明确写「未配置」，否则管理员无法确认「是没配」还是「解析丢了」。
+   *
+   * <p>黑名单已迁出为独立配置 {@code blacklist.yml}，回显取自静态活动实例
+   * （{@code WorldBlacklistConfig.current()}），因此这里直接发布活动实例后断言。
    */
   @Test
   void statusAndDumpEchoWorldBlacklist() {
-    Diagnostics.Snapshot configured = withAntiXray(antiXray("world-blacklist: [spawn, dungeon_*]\n"));
-    String status = String.join("\n", Diagnostics.formatStatus(configured));
-    assertTrue(status.contains("反矿透世界黑名单：2 项：spawn, dungeon_*"),
-        "status 必须回显黑名单数量与列表：" + status);
-    String dump = Diagnostics.formatDump(configured, "20260925-000000");
-    assertTrue(dump.contains("world-blacklist=2 项：spawn, dungeon_*"),
-        "dump 的配置有效值必须回显黑名单：" + dump);
+    WorldBlacklistConfig.publish(WorldBlacklistConfig.fromPatterns(List.of("spawn", "dungeon_*")));
+    try {
+      Diagnostics.Snapshot configured = withAntiXray(antiXray("enabled: true\n"));
+      String status = String.join("\n", Diagnostics.formatStatus(configured));
+      assertTrue(status.contains("世界黑名单：2 项：spawn, dungeon_*"),
+          "status 必须回显黑名单数量与列表：" + status);
+      String dump = Diagnostics.formatDump(configured, "20260925-000000");
+      assertTrue(dump.contains("world-blacklist（独立文件 blacklist.yml）=2 项：spawn, dungeon_*"),
+          "dump 的配置有效值必须回显黑名单：" + dump);
+    } finally {
+      WorldBlacklistConfig.publish(WorldBlacklistConfig.fromPatterns(List.of()));
+    }
 
     Diagnostics.Snapshot empty = withAntiXray(antiXray("enabled: true\n"));
     String emptyStatus = String.join("\n", Diagnostics.formatStatus(empty));
-    assertTrue(emptyStatus.contains("反矿透世界黑名单：未配置"),
+    assertTrue(emptyStatus.contains("世界黑名单：未配置"),
         "空黑名单必须明确写「未配置」：" + emptyStatus);
   }
 

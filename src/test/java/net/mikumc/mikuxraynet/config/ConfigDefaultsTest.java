@@ -257,6 +257,7 @@ class ConfigDefaultsTest {
     // 2026-09 更新①：新增 disk-cache.zstd-sha256 参与指纹（按任务要求）。
     // 2026-09 更新②：新增 obfuscation.remove-block-entities 参与指纹（它直接改变写进缓存的区块负载字节）。
     // 更新③：移除 occlusion.fluid-cover（岩浆改为恒判视觉遮挡，不再是开关）→ 指纹随之变化。
+    // 更新④：world-blacklist 迁出为独立配置 blacklist.yml（不再参与 AntiXrayConfig 指纹）→ 指纹随之变化。
     // 以上改动都会使期望值变化、现存磁盘缓存一次性失效重建（属正常）。
     assertEquals(1073391632, config.configHash(),
         "配置指纹必须是跨进程稳定的固定值（不得混入枚举 identity hash / 随机值）");
@@ -551,10 +552,10 @@ class ConfigDefaultsTest {
     AntiXrayConfig config = AntiXrayConfig.from(yaml(""));
 
     assertTrue(config.enabled(), "反矿透总开关默认开启");
-    assertTrue(config.antiXrayAppliesTo("any_world"), "总开关开启且未命中黑名单时对任意世界生效（世界白名单已随按维度分段重构移除）");
-    assertTrue(config.worldBlacklist().isEmpty(), "反矿透世界黑名单默认空列表（现有用户行为不变）");
-    assertFalse(config.isBlacklisted("spawn"), "空黑名单下任何世界都不豁免");
-    assertTrue(config.antiXrayAppliesTo("spawn"), "空黑名单下所有世界照常反矿透");
+    assertTrue(config.antiXrayAppliesTo("any_world"),
+        "总开关开启且世界黑名单为空时对任意世界生效（世界白名单已随按维度分段重构移除）");
+    // 世界黑名单已迁出为独立配置 blacklist.yml（见 WorldBlacklistTest）；此处只验证默认空名单下不豁免
+    assertTrue(config.antiXrayAppliesTo("spawn"), "默认空黑名单下所有世界照常反矿透");
     // 维度启用：主世界/地狱默认启用，末地默认关闭（末地无矿物）
     assertTrue(config.dimensionEnabled(AntiXrayConfig.Dimension.NORMAL), "主世界默认启用");
     assertTrue(config.dimensionEnabled(AntiXrayConfig.Dimension.NETHER), "地狱默认启用");

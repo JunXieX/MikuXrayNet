@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.entity.Player;
@@ -435,6 +436,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     Player player = event.getPlayer();
     // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API（名单仅由登录/退出与启用快照维护，无周期刷新）
     if (player == null || BypassRegistry.isBypassedNow(player.getUniqueId())) {
+      return;
+    }
+    // 世界黑名单：命中世界不做任何带宽优化（变更合并一并跳过，原包照常放行）。
+    // 名单为空（默认）时 isBlacklistedNow 直接早退，热路径近乎零开销。
+    if (WorldBlacklistConfig.isBlacklistedNow(player.getWorld().getName())) {
       return;
     }
 

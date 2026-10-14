@@ -30,7 +30,7 @@ import org.junit.jupiter.api.io.TempDir;
  * 不含任何锚点/别名，可被正常解析（由 {@code ConfigDefaultsTest} 用真实解析器逐键守门）。
  *
  * <p>用动态代理桩 {@link Plugin}（不引入新依赖），数据目录指向 {@link TempDir}，
- * 两处配置文件均预先写好，因此不会触发 {@code saveResource}。
+ * 三份配置文件均预先写好，因此不会触发 {@code saveResource}。
  */
 class MikuConfigTest {
 
@@ -44,21 +44,26 @@ class MikuConfigTest {
   void malformedConfigKeepsPreviousValidValues(@TempDir Path dir) throws Exception {
     write(dir, MikuConfig.ANTI_XRAY_FILE, "enabled: false\n");
     write(dir, MikuConfig.BANDWIDTH_FILE, "enabled: false\n");
+    write(dir, MikuConfig.BLACKLIST_FILE, "world-blacklist: []\n");
 
     MikuConfig config = new MikuConfig(plugin(dir));
     assertDoesNotThrow(config::load);
     AntiXrayConfig firstAntiXray = config.antiXray();
     BandwidthConfig firstBandwidth = config.bandwidth();
+    WorldBlacklistConfig firstBlacklist = config.blacklist();
     assertNotNull(firstAntiXray);
     assertNotNull(firstBandwidth);
+    assertNotNull(firstBlacklist);
 
     write(dir, MikuConfig.ANTI_XRAY_FILE, MALFORMED);
     write(dir, MikuConfig.BANDWIDTH_FILE, MALFORMED);
+    write(dir, MikuConfig.BLACKLIST_FILE, MALFORMED);
 
     assertDoesNotThrow(config::load,
         "配置解析抛异常时 load() 不得冒泡：onLoad 抛出会让插件被整体禁用");
     assertSame(firstAntiXray, config.antiXray(), "反矿透解析失败必须保留上一份有效配置");
     assertSame(firstBandwidth, config.bandwidth(), "带宽解析失败必须保留上一份有效配置");
+    assertSame(firstBlacklist, config.blacklist(), "黑名单解析失败必须保留上一份有效配置");
   }
 
   /** 首次加载即失败：回落到内置默认，绝不为 null（否则后续按 loadedAntiXray 打摘要会 NPE）。 */
@@ -66,11 +71,13 @@ class MikuConfigTest {
   void firstLoadFailureFallsBackToBuiltinDefaults(@TempDir Path dir) throws Exception {
     write(dir, MikuConfig.ANTI_XRAY_FILE, MALFORMED);
     write(dir, MikuConfig.BANDWIDTH_FILE, MALFORMED);
+    write(dir, MikuConfig.BLACKLIST_FILE, MALFORMED);
 
     MikuConfig config = new MikuConfig(plugin(dir));
     assertDoesNotThrow(config::load);
     assertNotNull(config.antiXray(), "首次加载失败必须回落到内置默认（不能为 null）");
     assertNotNull(config.bandwidth(), "首次加载失败必须回落到内置默认（不能为 null）");
+    assertNotNull(config.blacklist(), "首次加载失败必须回落到空白名单（不能为 null）");
   }
 
   private static void write(Path dir, String name, String content) throws Exception {

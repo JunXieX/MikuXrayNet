@@ -16,6 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Location;
@@ -247,6 +248,10 @@ public final class AfkTracker implements Listener {
       return;
     }
     Player player = event.getPlayer();
+    // 世界黑名单：命中世界不做任何带宽优化（AFK 丢包一并跳过）。
+    if (WorldBlacklistConfig.isBlacklistedNow(player.getWorld().getName())) {
+      return;
+    }
     // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API
     if (BypassRegistry.isBypassedNow(player.getUniqueId())) {
       return;

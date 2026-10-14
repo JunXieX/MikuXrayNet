@@ -275,7 +275,7 @@ public final class AntiXrayRuntime {
     ProximityRevealer revealer = new ProximityRevealer(plugin, antiXray, chunkIndex, revealed, stats,
         bypassRegistry, workPool, occlusionStores);
     this.blockChangeRevealListener = new BlockChangeRevealListener(plugin, protocolManager,
-        antiXray, chunkIndex, revealed, stats, revealer);
+        chunkIndex, revealed, stats, revealer);
     try {
       blockChangeRevealListener.start();
       this.proximityRevealer = revealer;

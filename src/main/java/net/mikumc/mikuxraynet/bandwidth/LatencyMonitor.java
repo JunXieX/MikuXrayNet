@@ -6,6 +6,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -132,6 +133,12 @@ public final class LatencyMonitor implements Listener {
   /** 单个玩家的采样与降级/还原（必须在玩家所属线程执行）。 */
   private void tick(Player player) {
     if (stopping || !player.isOnline()) {
+      return;
+    }
+    // 世界黑名单：命中世界不做任何带宽优化。若该玩家此前已被降过视距（例如从普通世界走进黑名单
+    // 世界），此处立即还原，避免黑名单世界仍处于降级状态；否则直接跳过采样。
+    if (WorldBlacklistConfig.isBlacklistedNow(player.getWorld().getName())) {
+      restore(player);
       return;
     }
     PingState state = watches.computeIfAbsent(player.getUniqueId(), uuid -> new PingState());

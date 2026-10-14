@@ -16,6 +16,7 @@ import net.mikumc.mikuxraynet.bandwidth.Schedulers;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
+import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
@@ -1222,7 +1223,7 @@ public final class ProximityRevealer implements Listener {
       return;
     }
     // 黑名单世界不做事件即时显形（在调度前就返回，避免产生任何任务）：纯判定，不触碰 Bukkit。
-    if (config.isBlacklisted(worldName)) {
+    if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       return;
     }
     if (chunkIndex == null || revealedSet == null) {
@@ -1315,7 +1316,7 @@ public final class ProximityRevealer implements Listener {
       return;
     }
     // 黑名单世界不做事件即时显形（在调度前就返回，避免产生任何任务）：纯判定，不触碰 Bukkit。
-    if (config.isBlacklisted(worldName)) {
+    if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       return;
     }
     if (chunkIndex == null || revealedSet == null) {

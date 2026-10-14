@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
@@ -30,6 +31,7 @@ import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
+import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
@@ -232,8 +234,14 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     if (!config.skipZeroMovement() || event.isCancelled() || event.getPlayer() == null) {
       return;
     }
+    Player packetPlayer = event.getPlayer();
+    // 世界黑名单：命中世界的玩家不做任何带宽优化（零位移取消一并跳过）。
+    // 名单为空（默认）时 isBlacklistedNow 直接早退，热路径近乎零开销。
+    if (WorldBlacklistConfig.isBlacklistedNow(packetPlayer.getWorld().getName())) {
+      return;
+    }
     // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API
-    if (BypassRegistry.isBypassedNow(event.getPlayer().getUniqueId())) {
+    if (BypassRegistry.isBypassedNow(packetPlayer.getUniqueId())) {
       return;
     }
 

@@ -970,10 +970,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   }
 
   /**
-   * 世界是否允许反矿透（统一入口判定，可离线单测）：总开关开启 <b>且</b> 世界不在黑名单。
+   * 世界是否允许反矿透（统一入口判定，可离线单测）：总开关开启 <b>且</b> 世界不在世界黑名单。
    *
    * <p>黑名单世界一律拒绝——改写路径的入口判定即在此处最早返回，不登记延迟、不建任务、
-   * 不抓邻块快照、不读写磁盘缓存。带宽模块不走本判定，故不受影响。
+   * 不抓邻块快照、不读写磁盘缓存。黑名单现在是独立配置（{@code blacklist.yml}），对反矿透与
+   * 带宽优化<b>同时</b>生效（带宽侧在各自封包热路径上另做同一判定）。
    */
   static boolean worldAllowed(AntiXrayConfig config, String worldName) {
     return config != null && config.antiXrayAppliesTo(worldName);

@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.antixray.ProximitySelector;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.occlusion.OcclusionEngine;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
@@ -581,6 +582,10 @@ public final class EntityCuller implements Listener {
     if (entity instanceof Player || entity instanceof Firework) {
       return;
     }
+    // 世界黑名单：命中世界不做任何带宽优化（不登记、不提交判定）。
+    if (WorldBlacklistConfig.isBlacklistedNow(entity.getWorld().getName())) {
+      return;
+    }
     // 跨区域实体不登记也不评估：读它们的任何状态都会触发 Folia 线程校验（先打 ERROR 再抛异常）
     if (!owns(entity)) {
       return;
@@ -626,6 +631,13 @@ public final class EntityCuller implements Listener {
       return;
     }
     UUID playerId = player.getUniqueId();
+
+    // 世界黑名单：命中世界不做任何带宽优化。玩家此刻就在黑名单世界时，恢复其全部已隐藏实体
+    // （避免从普通世界走进来时残留隐藏），直接返回；不再开周期预算、不再提交任何判定。
+    if (WorldBlacklistConfig.isBlacklistedNow(player.getWorld().getName())) {
+      restorePlayer(player);
+      return;
+    }
 
     // 异步路径：先把本周期的时间预算交给引擎（工作线程据此决定处理多少条，超预算者顺延到下一周期）。
     // 每玩家每周期各调一次，因此有效总预算 ≈ 每玩家预算 × 在线玩家数（正是配置项「每周期每玩家」的语义）。
