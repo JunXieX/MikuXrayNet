@@ -583,7 +583,9 @@ public final class EntityCuller implements Listener {
       return;
     }
     // 世界黑名单：命中世界不做任何带宽优化（不登记、不提交判定）。
-    if (WorldBlacklistConfig.isBlacklistedNow(entity.getWorld().getName())) {
+    // 读玩家自己的世界（追踪事件里玩家与实体必然同世界），避免在 owns(entity) 之前触碰实体状态——
+    // 跨区域实体读 getWorld() 同样会触发 Folia 线程校验（先打 ERROR 再抛异常）。
+    if (WorldBlacklistConfig.isBlacklistedNow(player.getWorld().getName())) {
       return;
     }
     // 跨区域实体不登记也不评估：读它们的任何状态都会触发 Folia 线程校验（先打 ERROR 再抛异常）
