@@ -94,7 +94,13 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
       int localZ = z & SectionOcclusion.LOCAL_MASK;
 
       SectionOcclusion current = sections.get(key);
-      if (current == null) {
+      // 「无该段数据」（null）与「已知该段全不遮挡」（{@link EmptyOcclusion} 共享快路径）在语义上都等价于
+      // 「零个遮挡位」——空段既可能是「从未建表」，也可能是「建表时判为全不遮挡」或「位图被清空后回落」。
+      // 两者必须同路径处理：否则对 EmptyOcclusion 走到下面的 (BitmapOcclusion) 强转会抛 ClassCastException，
+      // 被 applyPatches 当成「补丁失败」吞掉——于是「在空气段里新放置的遮挡方块」永远进不了位图。
+      // 方向性：该格漏记为遮挡 = 实体射线少算一格遮挡（少藏，安全侧），但显形侧会据此把该方块后方
+      // 本不可见的坐标误判为可见而还原（偏漏防）。故按「零遮挡位」统一处理，保证位图与真实世界一致。
+      if (current == null || current.isEmpty()) {
         if (!occluding) {
           return;
         }

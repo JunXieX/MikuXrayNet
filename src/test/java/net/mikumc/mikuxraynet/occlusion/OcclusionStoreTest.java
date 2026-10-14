@@ -95,6 +95,30 @@ class OcclusionStoreTest {
     assertEquals(1, store.loadedSectionCount());
   }
 
+  /**
+   * 回归：对<b>已存在且为「已知全不遮挡」</b>（{@link EmptyOcclusion} 共享快路径）的 section 打「遮挡」
+   * 补丁，必须能新建位图并置位——不得因把 EmptyOcclusion 强转 BitmapOcclusion 而抛异常、被当成补丁失败
+   * 静默吞掉。
+   *
+   * <p>触发路径：区块建表时该段全不遮挡 → 记为 EmptyOcclusion；随后玩家在该段放置一块石头（出站方块变更
+   * → {@code OcclusionPatchListener}）→ 该格必须进位图。
+   */
+  @Test
+  void patchOnKnownEmptySectionCreatesBitmap() {
+    OcclusionStore store = new OcclusionStore();
+    // 位图清空后回落到「已知全不遮挡」快路径（与「从未建表」的 null 不同）
+    store.setBlockOccluding(5, 5, 5, true);
+    store.setBlockOccluding(5, 5, 5, false);
+    assertSame(EmptyOcclusion.INSTANCE, store.section(0, 0, 0), "前置：该段已是「已知全不遮挡」快路径");
+
+    // 在该空段上放置一块遮挡方块：必须能置位（旧实现在此强转抛 CCE → 补丁失败、位图不更新）
+    store.setBlockOccluding(9, 9, 9, true);
+    SectionOcclusion section = store.section(0, 0, 0);
+    assertNotNull(section);
+    assertTrue(section.isOccludingLocal(9, 9, 9), "空段上新放置的遮挡方块必须进位图");
+    assertFalse(section.isOccludingLocal(9, 9, 10), "其余格保持不遮挡");
+  }
+
   @Test
   void patchDowngradesSolidSectionToBitmap() {
     OcclusionStore store = new OcclusionStore();
