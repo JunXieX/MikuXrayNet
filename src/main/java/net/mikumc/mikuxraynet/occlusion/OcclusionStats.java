@@ -64,14 +64,4 @@ public final class OcclusionStats {
    * 必须可见而不能静默（否则「补丁为什么和位图不一致」无从判断）。
    */
   public final LongAdder stateIdFallbacks = new LongAdder();
-
-  /** 中文单行摘要（供 {@code /mxnet status} 与周期摘要复用）。 */
-  public String summaryLine() {
-    return "遮挡判定：提交 " + submitted.sum() + "，完成 " + computed.sum()
-        + "，超时丢弃 " + timeoutDiscarded.sum() + "，队列满拒收 " + rejectedQueueFull.sum()
-        + "，缺遮挡数据 " + unknownSection.sum() + " 次"
-        + "，方块补丁 " + patched.sum() + " 格（失败 " + patchFailures.sum() + " 格，状态id回落 "
-        + stateIdFallbacks.sum() + " 格）"
-        + "，射线耗时 " + (nanosTotal.sum() / 1_000_000L) + " ms";
-  }
 }

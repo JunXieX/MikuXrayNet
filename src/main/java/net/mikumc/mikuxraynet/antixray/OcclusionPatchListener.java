@@ -77,7 +77,7 @@ import org.bukkit.plugin.Plugin;
  */
 public final class OcclusionPatchListener extends PacketAdapter {
 
-  /** 补丁判定的三态：不遮挡 / 遮挡 / 拿不到口径（→ 降级该 section 为未知）。 */
+  /** 补丁判定的三态：不遮挡 / 遮挡 / 拿不到口径（→ 该格置为不遮挡，只动这一格）。 */
   static final byte CLEAR = 0;
   static final byte OCCLUDING = 1;
   static final byte UNRESOLVED = -1;

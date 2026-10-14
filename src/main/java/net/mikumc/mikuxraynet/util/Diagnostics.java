@@ -167,7 +167,7 @@ public final class Diagnostics {
      * @param active          异步遮挡是否已真正接线（引擎已起 + 位图仓库可用）；与配置开关不是一回事
      * @param sectionsResident 当前驻留的遮挡 section 条目总数（跨世界求和）
      * @param queueDepth      专用池当前排队的判定数（持续接近队列上限说明引擎线程跟不上）
-     * @param patchFailures   补丁失败（拿不到新方块口径）的格数（这些 section 已降级为未知，属「少藏」方向）
+     * @param patchFailures   补丁失败（拿不到新方块口径）的格数（这些格已被置为「不遮挡」，属「少藏」方向）
      * @param computeFailures 单条判定在工作线程内抛异常被就地吞掉的次数（持续非 0 = 存在异常输入，需定位）
      * @param stateIdFallbacks 补丁「拿不到状态 id、回落 Material 级近似」的格数（&gt;0 说明补丁暂时无法与
      *                        位图逐状态一致，只能按方块级近似）
