@@ -59,6 +59,16 @@ public final class RewriteStats {
   public final LongAdder indexSkippedOnWriteBackFailure = new LongAdder();
 
   /**
+   * 内存改写缓存「命中了条目、但原始字节指纹已变」的次数（命中计数 +1 却用不上）。
+   *
+   * <p><b>为什么必须有这个计数器</b>：{@code RewriteCache#hitCount()} 只统计「键命中且未过期」，
+   * 而调用方随后还要比对负载里的原始字节指纹——不符就意味着该区块内容真的变了，本次必须重新改写
+   * （并继续查磁盘）。这类「命中但作废」被算进命中数会让命中率虚高，而它恰恰是磁盘查询的一部分来源：
+   * {@code 磁盘查询数 = 内存未命中 + 本计数}，缺了这一项，两边数字对不上时无从归因。
+   */
+  public final LongAdder cacheContentRejected = new LongAdder();
+
+  /**
    * 磁盘缓存「读到了负载但被拒」的次数：负载里的原始区块字节指纹与本次要改写的字节不符（或信封损坏）。
    *
    * <p><b>为什么必须有这个计数器</b>：这是磁盘缓存唯一「命中计数 +1 但实际用不上」的出口——

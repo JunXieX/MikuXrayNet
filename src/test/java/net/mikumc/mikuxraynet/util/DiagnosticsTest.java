@@ -36,7 +36,7 @@ class DiagnosticsTest {
   private static Diagnostics.Snapshot fixed(BandwidthConfig bandwidth) {
     return new Diagnostics.Snapshot(
         new Diagnostics.Snapshot.Env(true, true, false, true, 1, "Paper 1.20.4", "25", "1.2.5"),
-        new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
+        new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 30L, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
             0L, 0L, 0L, "无采样"),
         new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 1L, 40L, 6L),
         new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L),
@@ -47,7 +47,7 @@ class DiagnosticsTest {
             6L, 5L, 4, 40L, 7L, 3L, 11L, 2L,
             2, 3L, 8L, 9L, 4L, 5L, 25_000_000L),
         new Diagnostics.Snapshot.Pool(4, 2, 10, 2048),
-        new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2, 4L, 5L, 6L, 1L, 0L, 0L),
+        new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2, 4L, 3L, 5L, 6L, 1L, 0L, 0L),
         Diagnostics.Snapshot.ChunkAccessor.EMPTY,
         null, bandwidth);
   }
@@ -172,6 +172,14 @@ class DiagnosticsTest {
     assertTrue(text.contains("直通玩家 1 名"), text);
     assertTrue(text.contains("改写缓存"), text);
     assertTrue(text.contains("命中率 90.0%"), text);
+    // 内存缓存分列：命中但内容指纹已变的那些其实等于未命中，必须单列并与磁盘查询数对账
+    // （夹具自洽：磁盘查询 40 = 内存未命中 10 + 内容已变 30 = 磁盘 命中 30 + 未命中 10）
+    assertTrue(text.contains("命中 90（有效 60，内容已变 30）"),
+        "改写缓存必须分列「键命中」与「有效命中」（内容指纹一致），否则命中率虚高：", text);
+    assertTrue(text.contains("有效命中率 60.0%"),
+        "有效命中率 = 有效命中 / (有效命中 + 未命中 + 内容已变)：" + text);
+    assertTrue(text.contains("磁盘查询 40"),
+        "「磁盘查询」= 内存未命中 + 内容已变，必须与磁盘缓存一行的分母相等，用于对账统计缺口：" + text);
     assertTrue(text.contains("区块改写"), text);
     assertTrue(text.contains("替换方块 331"), "状态面板必须显示累计替换方块数（区分『没匹配到目标』与『写回没生效』）");
     assertTrue(text.contains("异常 2"), text);
@@ -198,9 +206,16 @@ class DiagnosticsTest {
         "状态面板必须暴露单线程合并冲刷的次数与耗时（极端配置下的延迟瓶颈观测口径）：" + text);
     assertTrue(text.contains("磁盘缓存"), text);
     assertTrue(text.contains("命中率 75.0%"), text);
-    // 「命中率为什么异常」的自证口径：过期清理 / 负载被拒 / 写入被拒 / 积压被拒 / 异常必须可见
-    assertTrue(text.contains("过期清理 4，负载被拒 5，写入被拒 7，积压被拒 0，异常 0"),
-        "磁盘缓存必须分列过期清理、负载被拒、写入被拒、积压被拒与异常，否则「命中率异常」无法自证：" + text);
+    // 「命中」是「读到条目」，与「有效命中」分列：被负载被拒掉的那些等于未命中
+    // （否则「读到 37 条、全部作废」会被显示成 1.5% 而非 0%，被误判为缓存正常）
+    assertTrue(text.contains("命中 30（有效 25）"),
+        "磁盘缓存必须分列「读到条目」与「有效命中」（hits − 负载被拒），否则全废的缓存会被显示成有一定命中率：" + text);
+    assertTrue(text.contains("有效命中率 62.5%"),
+        "有效命中率 = (hits − 负载被拒) / (hits − 负载被拒 + misses + 负载被拒) =" + text);
+    // 「命中率为什么异常」的自证口径：过期清理 / 配置指纹清理 / 负载被拒 / 写入被拒 / 积压被拒 / 异常必须可见
+    assertTrue(text.contains("过期清理 4，配置指纹不符清理 3，负载被拒 5，写入被拒 7，积压被拒 0，异常 0"),
+        "磁盘缓存必须分列过期清理、配置指纹不符清理、负载被拒、写入被拒、积压被拒与异常，"
+            + "否则「命中率异常」无法自证（尤其配置指纹清理：升级后命中率骤降的头号成因，此前完全不可见）：" + text);
     assertTrue(text.contains("==== MikuXrayNet 运行状态（v1.2.5） ===="),
         "状态面板首行必须回显插件版本（区分不同构建的日志靠它）：" + text);
     assertTrue(text.contains("遮挡判定：已接线｜位图 section 4096，队列 3"),

@@ -20,6 +20,16 @@ public final class DiskCacheStats {
   /** 因过期而被惰性清理的条目数。 */
   public final LongAdder expiredRemoved = new LongAdder();
 
+  /**
+   * 因<b>配置指纹不符</b>而被惰性清理的条目数（读取时发现条目是旧配置改写的，删除并当未命中）。
+   *
+   * <p><b>为什么必须单列</b>：升级插件或调整任何影响改写结果的配置后，配置指纹变化会让<b>全部</b>
+   * 现存条目在首次读取时被逐条删除——这正是「刚升级完命中率骤降为 0」的头号原因。此前该分支不递增
+   * 任何计数（只表现为普通未命中），而 {@code 过期清理} 又恒为 0，管理员无法区分
+   * 「条目没过期、缓存却没命中」到底是配置指纹在拦还是磁盘真的没有数据。
+   */
+  public final LongAdder configMismatchRemoved = new LongAdder();
+
   /** 因总条目上限或负载过大被拒绝的写入数。 */
   public final LongAdder rejectedByCapacity = new LongAdder();
 

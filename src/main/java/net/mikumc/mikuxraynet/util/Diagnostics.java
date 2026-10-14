@@ -117,15 +117,27 @@ public final class Diagnostics {
      * <p>字节口径只统计真正改写的区块：{@code bytesSaved = bytesOriginal − bytesOutput}，
      * 可能为负（升位/扩容时输出更大）。{@code paletteBitsSummary} 为改写 section 的
      * bitsPerBlock 直方图摘要（dump 展示封顶/裁剪/降位效果；无采样为「无采样」）。
+     *
+     * <p><b>{@code cacheHits} 是「键命中且未过期」，不等于「用上了」</b>：其中被
+     * {@code cacheContentRejected}（内容指纹已变）作废的实际等同未命中。要看内存缓存真正起了多少作用，
+     * 应看有效命中率 {@code (cacheHits - cacheContentRejected) / (cacheHits + cacheMisses)}
+     * （分母即全部查询次数，因为作废的命中是 {@code cacheHits} 的子集）。
+     * 另外 {@code cacheMisses + cacheContentRejected = 磁盘查询次数}，可用来和磁盘缓存一行的分母对账。
      */
     public record Rewrite(long cacheHits, long cacheMisses, int cacheEntries,
+        long cacheContentRejected,
         long chunksRewritten, long blocksReplaced, long chunksSkipped, long chunksFailed,
         long writeBackFailures, long chunksTimedOut, long chunksSkippedQueueFull,
         long bytesOriginal, long bytesOutput, long bytesSaved, String paletteBitsSummary) {
 
       /** 反矿透未启用时的零值兜底。 */
       public static final Rewrite EMPTY =
-          new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, "无采样");
+          new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, "无采样");
+
+      /** 真正用上的命中数（键命中且内容指纹一致）；被 {@code cacheContentRejected} 作废的不计入。 */
+      public long effectiveCacheHits() {
+        return Math.max(0L, cacheHits - cacheContentRejected);
+      }
     }
 
     /**
@@ -217,18 +229,31 @@ public final class Diagnostics {
     /**
      * 磁盘缓存域：命中、持有量、打开的区域文件数与「为什么没命中 / 命中了却没用上」的拆解计数。
      *
-     * <p>{@code expiredRemoved} / {@code payloadRejected} / {@code rejectedBy*} 是排查「命中率异常」的关键：
+     * <p>{@code expiredRemoved} / {@code configMismatchRemoved} / {@code payloadRejected} / {@code rejectedBy*}
+     * 是排查「命中率异常」的关键：
      * 过期清理说明条目活不过配置的 expire-seconds（配短了等于关掉缓存），
+     * <b>配置指纹清理</b>说明条目是旧配置改写的（升级 / 改过会影响改写结果的配置后必然出现一大批，
+     * 属正常的「缓存整体重建」），
      * 写入被拒说明容量/文件大小上限在拦，{@code payloadRejected} 说明读到的负载与本次要改写的字节不符
      * （内容真变了，或信封损坏）。
+     *
+     * <p><b>注意 {@code hits} 是「读到了条目」，不等于「用上了」</b>：其中被 {@code payloadRejected}
+     * 拒掉的（内容指纹不符）实际等同于未命中（会回退整块重写）。要判断磁盘缓存真正起了多少作用，
+     * 应看有效命中率 {@code (hits - payloadRejected) / (hits + misses)}
+     * （分母即全部查询次数，因为被拒的命中是 {@code hits} 的子集）。
      */
     public record DiskCache(long hits, long misses, int entries, int openFiles,
-        long expiredRemoved, long payloadRejected, long rejectedByCapacity, long rejectedBySize,
-        long rejectedByBacklog, long errors) {
+        long expiredRemoved, long configMismatchRemoved, long payloadRejected,
+        long rejectedByCapacity, long rejectedBySize, long rejectedByBacklog, long errors) {
 
       /** 磁盘缓存未启用时的零值兜底。 */
       public static final DiskCache EMPTY =
-          new DiskCache(0L, 0L, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L);
+          new DiskCache(0L, 0L, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+
+      /** 真正用上的命中数（读到条目且负载可用）；被 {@code payloadRejected} 拒掉的不计入。 */
+      public long effectiveHits() {
+        return Math.max(0L, hits - payloadRejected);
+      }
     }
   }
 
@@ -351,6 +376,7 @@ public final class Diagnostics {
     RewriteStats rewriteStats = hook == null ? null : hook.stats();
     Snapshot.Rewrite rewrite = rewriteStats == null ? Snapshot.Rewrite.EMPTY
         : new Snapshot.Rewrite(hook.cacheHits(), hook.cacheMisses(), hook.cacheSize(),
+            rewriteStats.cacheContentRejected.sum(),
             rewriteStats.chunksRewritten.sum(), rewriteStats.blocksReplaced.sum(),
             rewriteStats.chunksSkipped.sum(), rewriteStats.chunksFailed.sum(),
             rewriteStats.writeBackFailures.sum(), rewriteStats.chunksTimedOut.sum(),
@@ -392,6 +418,7 @@ public final class Diagnostics {
         : new Snapshot.DiskCache(diskCache.stats().hits.sum(), diskCache.stats().misses.sum(),
             diskCache.entries(), diskCache.openRegionFiles(),
             diskCache.stats().expiredRemoved.sum(),
+            diskCache.stats().configMismatchRemoved.sum(),
             // 「读到但被拒」由改写侧统计（负载解封与字节指纹比对在那里做）：此处借用同一次快照的数值
             rewriteStats == null ? 0L : rewriteStats.diskPayloadRejected.sum(),
             diskCache.stats().rejectedByCapacity.sum(), diskCache.stats().rejectedBySize.sum(),
@@ -463,9 +490,20 @@ public final class Diagnostics {
         // 只凭「改写计数正常」无法区分「算了但没生效」，此行给出决定性判据（见 Snapshot.ChunkAccessor）。
         + "｜区块取数=" + s.chunkAccessor().state());
     lines.add("世界黑名单：" + worldBlacklistSummary());
-    lines.add("改写缓存：命中 " + s.rewrite().cacheHits() + "，未命中 " + s.rewrite().cacheMisses()
+    // 「命中」是「键命中且未过期」，与「有效命中」分列：内容指纹已变的那些其实等于未命中（必须重新改写）。
+    // 另给出「磁盘查询」= 内存未命中 + 内容不符 —— 它与磁盘缓存一行的分母（命中 + 未命中）必然相等，
+    // 两行互相对账即可发现「某类查询没有计数」这类统计缺口。
+    lines.add("改写缓存：命中 " + s.rewrite().cacheHits()
+        + "（有效 " + s.rewrite().effectiveCacheHits() + "，内容已变 "
+        + s.rewrite().cacheContentRejected() + "）"
+        + "，未命中 " + s.rewrite().cacheMisses()
         + "，命中率 " + hitRate(s.rewrite().cacheHits(), s.rewrite().cacheMisses())
-        + "，条目 " + s.rewrite().cacheEntries());
+        // 有效命中率的分母仍是「全部查询次数」= 有效命中 + 未命中 + 内容已变（三者互斥、恰好划分全体员工），
+        // 只把分子里的作废命中剔除；等价于 hitRate(有效, hits + misses − 有效)。
+        + "，有效命中率 " + hitRate(s.rewrite().effectiveCacheHits(),
+            s.rewrite().cacheMisses() + s.rewrite().cacheContentRejected())
+        + "，条目 " + s.rewrite().cacheEntries()
+        + "，磁盘查询 " + (s.rewrite().cacheMisses() + s.rewrite().cacheContentRejected()));
     lines.add("区块改写：改写 " + s.rewrite().chunksRewritten() + "，替换方块 " + s.rewrite().blocksReplaced()
         + "，跳过 " + s.rewrite().chunksSkipped()
         + "，异常 " + s.rewrite().chunksFailed() + "，写回失败 " + s.rewrite().writeBackFailures()
@@ -496,15 +534,24 @@ public final class Diagnostics {
         + s.index().revealedRegisteredTotal()
         + "｜安全阀触发 " + s.index().indexEvictedByCapacity() + "/" + s.index().revealedDroppedByCapacity()
         + "（正常运营下应为 0，触发即说明有 bug）");
-    // 「过期清理 / 负载被拒 / 写入被拒 / 异常」是「命中率为什么异常」的自证口径：
-    // 过期清理 > 0 说明文件的 expire-seconds 比两次启动的间隔还短（条目全死），
+    // 「过期清理 / 配置指纹清理 / 负载被拒 / 写入被拒 / 异常」是「命中率为什么异常」的自证口径：
+    // 过期清理 > 0 说明文件的 expire-seconds 比两次启动的间隔还短（条目全死）；
+    // 配置指纹清理 > 0 说明条目是旧配置改写的（升级 / 改过会影响改写结果的配置后必然出现一大批，
+    //   属正常的「缓存整体重建」）——没这一项时，管理员只看到命中率骤降而「过期清理 0」，无从归因；
     // 负载被拒 > 0 说明读到的负载与本次要改写的字节不符（内容真变了或信封损坏），
     // 写入被拒 > 0 说明容量/单文件上限在拦（新区块没进缓存），异常 > 0 见日志。
+    // 「命中」写的是「读到条目」，与「有效命中」分列：被负载被拒掉的那些其实等于未命中（会回退重写），
+    // 只报命中率会把「读到但全废」的磁盘缓存显示成 1.5% 而非 0%，从而被误判为「缓存基本正常」。
     lines.add("磁盘缓存：" + (s.diskCache().openFiles() > 0 || s.diskCache().entries() > 0 ? "已启用" : "无数据")
-        + "｜命中 " + s.diskCache().hits() + "，未命中 " + s.diskCache().misses()
+        + "｜命中 " + s.diskCache().hits() + "（有效 " + s.diskCache().effectiveHits() + "）"
+        + "，未命中 " + s.diskCache().misses()
         + "，命中率 " + hitRate(s.diskCache().hits(), s.diskCache().misses())
+        // 分母仍是全部查询次数（= 有效命中 + 未命中 + 负载被拒），只把分子里的作废命中剔除。
+        + "，有效命中率 " + hitRate(s.diskCache().effectiveHits(),
+            s.diskCache().misses() + s.diskCache().payloadRejected())
         + "，条目约 " + s.diskCache().entries() + "，打开区域文件 " + s.diskCache().openFiles()
         + "｜过期清理 " + s.diskCache().expiredRemoved()
+        + "，配置指纹不符清理 " + s.diskCache().configMismatchRemoved()
         + "，负载被拒 " + s.diskCache().payloadRejected()
         + "，写入被拒 " + (s.diskCache().rejectedByCapacity() + s.diskCache().rejectedBySize())
         // 积压被拒单列：它不代表配置上限在拦，而是磁盘线程跟不上（压缩/落盘成瓶颈），

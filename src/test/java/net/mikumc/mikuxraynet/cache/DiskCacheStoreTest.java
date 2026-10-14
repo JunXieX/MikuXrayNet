@@ -165,6 +165,10 @@ class DiskCacheStoreTest {
       assertEquals(2L, reader.stats().hits.sum());
       assertEquals(0L, reader.stats().misses.sum(), "旧条目不允许多余的一次未命中");
       assertNull(reader.get(WORLD, 8, 9, 6), "配置指纹不同仍然必须未命中");
+      // 配置指纹不符必须单列计数：升级/改配置后命中率骤降的头号成因，此前该清理完全不可见
+      assertEquals(1L, reader.stats().configMismatchRemoved.sum(),
+          "配置指纹不符的条目应被惰性清理并计入 configMismatchRemoved");
+      assertEquals(0L, reader.stats().expiredRemoved.sum(), "这不是过期，不得混入过期清理口径");
     }
   }
 

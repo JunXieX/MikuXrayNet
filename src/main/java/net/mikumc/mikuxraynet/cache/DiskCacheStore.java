@@ -517,7 +517,10 @@ public final class DiskCacheStore implements AutoCloseable {
       return null;
     }
     if (entry.configHash() != configHash) {
-      // 配置变了：惰性清理，绝不返回旧配置改写的负载
+      // 配置变了：惰性清理，绝不返回旧配置改写的负载。
+      // 必须计数：这是「升级/改配置后命中率骤降」的唯一成因出口，否则该清理完全不可见
+      //（过期清理恒为 0，管理员会误以为条目有效却读不到）。
+      stats.configMismatchRemoved.increment();
       removeEntry(handle, chunkIndex);
       return null;
     }

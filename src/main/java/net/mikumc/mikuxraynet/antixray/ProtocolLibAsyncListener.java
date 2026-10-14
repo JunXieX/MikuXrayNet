@@ -558,6 +558,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         CachedChunk cached = cache.get(task.worldName(), task.chunkX(), task.chunkZ(),
             fingerprint);
         if (cached == null || cached.sourceHash() != sourceHash) {
+          if (cached != null) {
+            // 键命中但内容已变：命中计数 +1 却用不上，必须单列，否则命中率虚高且磁盘查询数对不上
+            stats.cacheContentRejected.increment();
+          }
           cached = loadFromDisk(task, sourceHash, fingerprint);
         }
 
