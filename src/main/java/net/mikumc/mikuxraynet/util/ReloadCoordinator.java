@@ -31,7 +31,7 @@ public final class ReloadCoordinator {
      */
     int bandwidthFingerprint();
 
-    /** 重新读取两份配置文件。 */
+    /** 重新读取全部配置文件（antixray.yml / bandwidth.yml / blacklist.yml）。 */
     void reloadConfiguration();
 
     /** 使改写缓存、邻块快照与显形索引立即失效。 */
@@ -41,7 +41,7 @@ public final class ReloadCoordinator {
     void restartPeriodicTasks();
 
     /**
-     * 最近一次「重新读取配置」中发生的解析失败说明（{@code null} = 两份文件都正常解析）。
+     * 最近一次「重新读取配置」中发生的解析失败说明（{@code null} = 全部配置文件都正常解析）。
      *
      * <p><b>为什么必须上报</b>：配置文件解析失败时 {@code MikuConfig} 会<b>保留上一份有效配置</b>并只在
      * 控制台 WARN——于是游戏内的重载回显会打出「指纹未变化 + 已热生效」，管理员根本不知道新文件被拒绝、
@@ -66,7 +66,7 @@ public final class ReloadCoordinator {
       "平台判定（advanced.platform，会重新判定并按新分支重建周期任务）",
       // diagnostics.interval-seconds 参与带宽侧指纹，且 restartPeriodicTasks 会重建摘要任务（0 = 关闭）。
       "周期诊断摘要间隔（diagnostics.interval-seconds，0 = 关闭）",
-      "两份配置文件的读取值");
+      "全部配置文件的读取值");
 
   /** 需要重启服务端才生效的配置项（在启动期已固化的部分）。 */
   public static final List<String> RESTART_REQUIRED = List.of(

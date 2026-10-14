@@ -138,7 +138,7 @@
                     <include>paper-plugin.yml</include>
                 </includes>
             </resource>
-            <!-- 其余资源（含两份带中文注释的配置文件）必须原样打包，不做占位符替换 -->
+            <!-- 其余资源（含三份带中文注释的配置文件）必须原样打包，不做占位符替换 -->
             <resource>
                 <directory>src/main/resources</directory>
                 <filtering>false</filtering>

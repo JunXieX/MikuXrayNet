@@ -13,8 +13,8 @@ import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.plugin.Plugin;
 
 /**
- * 统一配置加载入口：负责把两份默认配置从插件资源复制到数据目录，再解析为 {@link AntiXrayConfig}
- * 与 {@link BandwidthConfig}。
+ * 统一配置加载入口：负责把三份默认配置从插件资源复制到数据目录，再解析为 {@link AntiXrayConfig}、
+ * {@link BandwidthConfig} 与 {@link WorldBlacklistConfig}。
  *
  * <p>关键约束：默认配置以「资源文件」形式提供，首次运行只做复制（{@code saveResource}），
  * 绝不用 {@link YamlConfiguration} 回写，以免中文注释被覆盖丢失。
@@ -67,10 +67,10 @@ public final class MikuConfig {
   }
 
   /**
-   * 加载（或重新加载）两份配置。加载失败时保留上一份有效值，不抛异常。
+   * 加载（或重新加载）三份配置。加载失败时保留上一份有效值，不抛异常。
    *
    * <p><b>为什么解析必须包 try/catch(Throwable)</b>：本方法由 {@code MikuXrayNet.onLoad()} 调用，
-   * 一旦解析抛异常冒泡上去，服务端会把插件整体禁用（连带宽/反矿透都一起停）。因此两份配置各自
+   * 一旦解析抛异常冒泡上去，服务端会把插件整体禁用（连带宽/反矿透都一起停）。因此三份配置各自
    * 兜底：解析成功则替换，失败则保留上一份有效值（首次加载即失败则回落到内置默认），
    * 保证 {@link #antiXray()} / {@link #bandwidth()} 永远非 {@code null}。
    */

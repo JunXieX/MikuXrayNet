@@ -197,7 +197,7 @@ public final class MikuXrayNet extends JavaPlugin {
   }
 
   /**
-   * 热重载两份配置：重读配置 → 失效改写缓存/邻块快照/显形索引 → 按新配置重启周期任务。
+   * 热重载全部配置（antixray.yml / bandwidth.yml / blacklist.yml）：重读配置 → 失效改写缓存/邻块快照/显形索引 → 按新配置重启周期任务。
    *
    * <p>可重复执行、异常安全（fail-open）；返回给管理员看的中文结果行。启动期已固化的部分
    * （隐藏方块表、线程数、缓存容量等）不在本次生效范围内，结果中会显式列出。
