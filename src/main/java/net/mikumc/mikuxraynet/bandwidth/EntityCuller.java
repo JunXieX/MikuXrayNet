@@ -369,7 +369,13 @@ public final class EntityCuller implements Listener {
         scheduleRecheck(player, interval);
       }
     }
-    plugin.getLogger().info("带宽模块已启用：实体剔除（强制可见距离 " + config.forceVisibleDistance()
+    // 位图仓库未接线（反矿透未启用 → 没有遮挡位图）时射线遮挡判定整体跳过：这是「实体不再被墙后剔除」
+    // 的功能受损，必须 WARNING 点名。引擎自身创建失败的情况由 startEngine() 另行 WARN（此处不重复报）。
+    if (config.raycast() && occlusionStores == null) {
+      plugin.getLogger().warning("实体剔除：遮挡位图不可用（反矿透未启用），"
+          + "射线遮挡判定已跳过，仅做视锥剔除——墙后的实体不会被剔除（少藏而非误藏）");
+    }
+    plugin.getLogger().fine("带宽模块已启用：实体剔除（强制可见距离 " + config.forceVisibleDistance()
         + " 格；射线遮挡 " + (config.raycast()
             ? raycastReady()
                 ? "开（遮挡位图：专用池 " + engineWorkerCount() + " 线程，每周期时间预算 "

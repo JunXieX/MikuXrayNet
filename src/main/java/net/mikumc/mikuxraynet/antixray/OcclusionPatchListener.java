@@ -220,7 +220,7 @@ public final class OcclusionPatchListener extends PacketAdapter {
   public void start() {
     handler = protocolManager.getAsynchronousManager().registerAsyncHandler(this);
     handler.start();
-    plugin.getLogger().info("遮挡位图方块补丁已启用：出站方块变更即时同步进遮挡位图");
+    plugin.getLogger().fine("遮挡位图方块补丁已启用：出站方块变更即时同步进遮挡位图");
   }
 
   /** 注销监听器；可重复调用，异常安全。 */

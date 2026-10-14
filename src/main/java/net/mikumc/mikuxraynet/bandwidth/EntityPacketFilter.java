@@ -175,7 +175,7 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
             INDEX_REBUILD_TICKS);
       }
     }
-    plugin.getLogger().info("带宽模块已启用：零位移实体包取消（白名单 " + whitelist.size() + " 项）");
+    plugin.getLogger().fine("带宽模块已启用：零位移实体包取消（白名单 " + whitelist.size() + " 项）");
   }
 
   /** 注销监听器与索引任务。 */

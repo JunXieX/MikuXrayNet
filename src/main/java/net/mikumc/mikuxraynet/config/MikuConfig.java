@@ -87,16 +87,16 @@ public final class MikuConfig {
     // 必须在发布 holder 之后立即刷新，保证封包线程读到的名单与本代配置一致。
     WorldBlacklistConfig.publish(loadedBlacklist);
 
+    // 常规加载结果一律 FINE（默认不可见）：开服日志只保留插件的「已启用」一行。
+    // 需要核对各项生效值时看 /mikuxraynet status 或 dump；解析失败仍会打 WARNING（下方 warnFallbackOnce）。
     if (loadedAntiXray.enabled()) {
-      logger.info("反矿透配置已加载（按维度分段）：" + dimensionSummary(loadedAntiXray));
+      logger.fine("反矿透配置已加载（按维度分段）：" + dimensionSummary(loadedAntiXray));
     } else {
-      logger.info("反矿透配置已加载：功能处于关闭状态");
+      logger.fine("反矿透配置已加载：功能处于关闭状态");
     }
-    // 世界黑名单（优先级最高）：启动/重载时打印一次数量与具体列表（空则明确写「未配置」），不逐区块刷屏
-    if (loadedBlacklist.isEmpty()) {
-      logger.info("世界黑名单：未配置（所有世界都启用反矿透与带宽优化）");
-    } else {
-      logger.info("世界黑名单：" + loadedBlacklist.patterns().size() + " 项 "
+    // 世界黑名单（优先级最高）：只在配置了名单时打一行 FINE（空名单是默认状态，无需刷屏）
+    if (!loadedBlacklist.isEmpty()) {
+      logger.fine("世界黑名单：" + loadedBlacklist.patterns().size() + " 项 "
           + loadedBlacklist.patterns() + "（名单内世界同时不使用反矿透与带宽优化）");
     }
     // 缺 dimensions 段（旧版 worlds / 顶层 obfuscation 结构）时用内置默认运行并一次性提示
@@ -111,7 +111,7 @@ public final class MikuConfig {
     }
     // 配置项超过安全上限（失控值）时按上限生效并一次性提示，绝不静默改用户配置
     loadedBandwidth.warnIfClampApplied(logger, bandwidthClampWarned);
-    logger.info("带宽配置已加载：总开关 " + (loadedBandwidth.enabled() ? "开启" : "关闭"));
+    logger.fine("带宽配置已加载：总开关 " + (loadedBandwidth.enabled() ? "开启" : "关闭"));
   }
 
   /** 各维度一句话摘要（主/地狱/末地的启用状态、隐藏项数与伪装方块数）。 */

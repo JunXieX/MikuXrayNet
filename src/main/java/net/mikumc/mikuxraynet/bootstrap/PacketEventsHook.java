@@ -61,12 +61,12 @@ public final class PacketEventsHook {
       this.registry = BlockStateRegistry.build(extraOccluding, extraNonOccluding, logger, oracle);
       long buildMillis = Math.max(0L, (System.nanoTime() - startNanos) / 1_000_000L);
 
-      logger.info("方块状态映射构建完成：服务端版本 " + releaseName
+      // 常规就绪信息降为 FINE（开服日志只保留「已启用」一行）；两处自检只在「发现问题」时打 WARNING。
+      logger.fine("方块状态映射构建完成：服务端版本 " + releaseName
           + "，状态数 " + registry.getUniqueBlockStateCount()
           + "，直接格式位宽 " + registry.getMaxBitsPerBlockState()
           + "，构建耗时 " + buildMillis + " ms");
-      logger.info(occlusionSelfCheck(registry, buildMillis));
-      logger.info(occlusionConsistencyCheck(registry));
+      logOcclusionWarnings(registry);
       return true;
     } catch (Throwable throwable) {
       logger.log(Level.SEVERE, "构建方块状态映射失败，反矿透模块停用", throwable);
@@ -76,51 +76,52 @@ public final class PacketEventsHook {
   }
 
   /**
-   * 遮挡表自检：输出「逐状态真值解析成功数 / 回落启发式数 / 覆盖表命中数 / 构建耗时」与典型方块抽样。
+   * 遮挡表自检的<b>异常侧</b>输出：正常就绪不打日志，只有出现「会让反矿透或实体剔除静默失效」的
+   * 问题时才 WARNING，并明确点名受影响的功能。
+   *
+   * <p>逐状态真值回落启发式会让若干方块的遮挡结论偏离服务端判定（进而影响实体剔除的「藏 / 不藏」）；
+   * 两套口径出现差异则是「同一功能两种结论」的口径漂移（伪装与实体判定不一致）。
+   * 完整就绪明细（各计数与典型方块抽样）仍可在调试日志（FINE）中查看。
+   */
+  private void logOcclusionWarnings(BlockStateRegistry registry) {
+    logger.fine(occlusionSelfCheck(registry));
+    int fallback = registry.heuristicFallbackStateCount();
+    if (fallback > 0) {
+      logger.warning("遮挡判定：有 " + fallback + " 个方块状态未能取到逐状态真值、已回落启发式判定，"
+          + "这些方块的「是否遮挡」可能与服务端不一致（影响实体剔除的隐藏/恢复与矿物伪装判定的边界）；"
+          + "回落方块名抽样：" + preview(registry.heuristicFallbackNames()));
+    }
+    int drift = registry.occlusionDriftStateCount();
+    if (registry.entityOccludingStateCount() < 0) {
+      logger.warning("遮挡判定：实体遮挡口径未能构建（离线场景），已回落伪装口径——实体剔除的隐藏判定"
+          + "与矿物伪装判定此时可能不一致，请带 /mikuxraynet dump 反馈");
+    } else if (drift > 0) {
+      logger.warning("遮挡判定：伪装口径与实体口径出现 " + drift + " 个状态的判定差异"
+          + "（仅可能由 occlusion.extra-* 覆盖表造成，覆盖表命中 "
+          + registry.overrideHitStateCount() + " 个状态）——实体剔除与矿物伪装对同一方块的结论不一致");
+    }
+  }
+
+  /**
+   * 遮挡表自检明细：输出「逐状态真值解析成功数 / 回落启发式数 / 覆盖表命中数」与典型方块抽样。
    *
    * <p>这是「反矿透是否真的会隐藏」的地基自证：若这里的 stone / deepslate 不是「遮挡」，
    * 那么 {@code shouldObfuscate} 恒为 false、所有矿物都会原样下发（不伪装）。
+   * 正常就绪时降为 FINE；异常侧见 {@link #logOcclusionWarnings(BlockStateRegistry)}。
    */
-  private static String occlusionSelfCheck(BlockStateRegistry registry, long buildMillis) {
+  private static String occlusionSelfCheck(BlockStateRegistry registry) {
     StringBuilder message = new StringBuilder("遮挡表就绪：遮挡 ")
         .append(registry.occludingStateCount()).append('/')
         .append(registry.getUniqueBlockStateCount())
         .append("；逐状态真值解析成功 ").append(registry.truthStateCount())
         .append("；回落启发式 ").append(registry.heuristicFallbackStateCount())
-        .append("；覆盖表命中 ").append(registry.overrideHitStateCount())
-        .append("；构建耗时 ").append(buildMillis).append(" ms");
-    if (registry.heuristicFallbackStateCount() > 0) {
-      message.append("（回落项方块名抽样：").append(preview(registry.heuristicFallbackNames())).append('）');
-    }
+        .append("；覆盖表命中 ").append(registry.overrideHitStateCount());
     for (String name : new String[] {"stone", "deepslate", "air", "water", "anvil"}) {
       int stateId = BlockStateRegistry.resolveStateId(name);
       message.append("；抽样 ").append(name).append('=')
           .append(stateId < 0 ? "未识别" : (registry.isOccluding(stateId) ? "遮挡" : "非遮挡"));
     }
     return message.toString();
-  }
-
-  /**
-   * 两套口径一致性检查：伪装口径与实体口径现在<b>同源</b>（同一逐状态真值），差异只可能来自
-   * {@code occlusion.extra-*} 覆盖表；因此在没有配置覆盖表时差异应恒为 0。
-   *
-   * <p>出现差异即为「同一功能两种结论」的口径漂移，会让异步与同步模式表现不一致，必须核对覆盖表。
-   */
-  private static String occlusionConsistencyCheck(BlockStateRegistry registry) {
-    int drift = registry.occlusionDriftStateCount();
-    if (registry.entityOccludingStateCount() < 0) {
-      return "实体遮挡口径：未构建（离线场景），已回落伪装口径——实体位图此时与伪装口径不同，请反馈";
-    }
-    if (drift == 0) {
-      return "两套口径一致性：伪装口径与实体口径同源（逐状态真值），逐状态判定差异 0"
-          + "；遮挡状态 实体 " + registry.entityOccludingStateCount()
-          + " / 伪装 " + registry.occludingStateCount()
-          + (registry.overrideHitStateCount() > 0
-              ? "（覆盖表命中 " + registry.overrideHitStateCount() + " 个状态，但未改变任何逐状态判定）"
-              : "");
-    }
-    return "两套口径一致性：发现 " + drift + " 个状态的判定不同（仅可能由 occlusion.extra-* 覆盖表造成，"
-        + "覆盖表命中 " + registry.overrideHitStateCount() + " 个状态）。";
   }
 
   /** 取前若干个名字拼成一行（避免日志爆屏）。 */

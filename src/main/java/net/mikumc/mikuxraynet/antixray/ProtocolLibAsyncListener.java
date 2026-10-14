@@ -729,7 +729,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
           ? String.valueOf(task.sectionCount()) : String.valueOf(diagnostic.sectionCount());
       String kinds = diagnostic == null ? "解码失败" : String.valueOf(diagnostic.stateKinds());
       String matches = diagnostic == null ? "解码失败" : String.valueOf(diagnostic.targetMatches());
-      getPlugin().getLogger().info("首次改写诊断：区块 (" + task.chunkX() + "," + task.chunkZ()
+      // 一次性就绪诊断（正常运营信息，降为 FINE）：开服/运行日志只保留必要内容与异常提示。
+      getPlugin().getLogger().fine("首次改写诊断：区块 (" + task.chunkX() + "," + task.chunkZ()
           + ") section 数 " + sections
           + "；解码状态种类 " + kinds
           + "；命中目标方块 " + matches + " 个"

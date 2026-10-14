@@ -99,7 +99,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   public void start() {
     handler = protocolManager.getAsynchronousManager().registerAsyncHandler(this);
     handler.start();
-    plugin.getLogger().info("方块变更观察已启用：命中已伪装坐标即从显形索引移除");
+    plugin.getLogger().fine("方块变更观察已启用：命中已伪装坐标即从显形索引移除");
   }
 
   /** 注销监听器；可重复调用，异常安全。 */

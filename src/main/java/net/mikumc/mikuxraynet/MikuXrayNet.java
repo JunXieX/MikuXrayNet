@@ -91,14 +91,25 @@ public final class MikuXrayNet extends JavaPlugin {
     // 判定顺序：advanced.platform 手动覆盖 → 品牌/版本标识（含 folia）→ 判别类探测
     // （io.papermc.paper.threadedregions.RegionizedServer：Folia 核心独有，Leaf/Paper 都没有）。
     PlatformSupport.configure(config.antiXray().platform());
-    getLogger().info("运行平台：" + PlatformSupport.platformDescription());
+    // 开服日志只保留一行「加载成功」：常规启动的全部细节（平台、各模块参数、自检结果）一律降为 FINE
+    // （默认不可见，需要排查时打开调试日志即可）；任何功能不可用 / 降级 / 失败都会由各自模块打 WARNING。
+    getLogger().fine("运行平台：" + PlatformSupport.platformDescription());
     this.runtime = new AntiXrayRuntime(this, occlusionStats);
     runtime.startBypassRegistry();
     runtime.startAntiXray();
     startBandwidth();
     new CommandRegistrar(this).register();
     startDiagnosticsTask();
-    getLogger().info("MikuXrayNet 已启用");
+    getLogger().info("MikuXrayNet " + pluginVersion() + " 已启用（" + PlatformSupport.platformDescription() + "）");
+  }
+
+  /** 插件版本号（读取失败时为空串，绝不因此影响启用流程）。 */
+  private String pluginVersion() {
+    try {
+      return getPluginMeta().getVersion();
+    } catch (Throwable ignored) {
+      return "";
+    }
   }
 
   @Override
@@ -114,7 +125,7 @@ public final class MikuXrayNet extends JavaPlugin {
       runtime.stopForDisable();
       runtime = null;
     }
-    getLogger().info("MikuXrayNet 已停用");
+    getLogger().fine("MikuXrayNet 已停用");
   }
 
   /** 带宽优化装配：各子模块独立注册，注册失败只停用该子模块，不影响其它功能。 */

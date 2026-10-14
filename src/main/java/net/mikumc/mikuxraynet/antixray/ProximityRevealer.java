@@ -384,7 +384,7 @@ public final class ProximityRevealer implements Listener {
       globalTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, scheduled -> passAll(),
           interval, interval);
     }
-    plugin.getLogger().info("邻近显形已启用：距离 " + proximity.distance() + " 格，周期 " + interval
+    plugin.getLogger().fine("邻近显形已启用：距离 " + proximity.distance() + " 格，周期 " + interval
         + " tick，单次上限 " + proximity.maxRevealsPerTick() + " 个；视锥 "
         + (proximity.frustumEnabled() ? proximity.frustumFov() + "°（最小距离 "
             + proximity.frustumMinDistance() + " 格内豁免）" : "已关闭")
@@ -1120,7 +1120,8 @@ public final class ProximityRevealer implements Listener {
     if (!firstRevealDiagnosed.compareAndSet(false, true)) {
       return;
     }
-    plugin.getLogger().info("首次显形诊断：扫描区块 " + tally.chunksScanned + " 个（整块跳过 "
+    // 一次性就绪诊断（正常运营信息，降为 FINE）：开服/运行日志只保留必要内容与异常提示。
+    plugin.getLogger().fine("首次显形诊断：扫描区块 " + tally.chunksScanned + " 个（整块跳过 "
         + tally.chunksSkipped + "，分片推迟 " + tally.chunksDeferred + "／共 " + SCAN_SHARDS
         + " 片），坐标评估 " + tally.positionsEvaluated + " 个，候选 " + candidateCount
         + " 个，视锥剔除 " + frustumCulled + "，射线剔除 " + tally.rayCulled

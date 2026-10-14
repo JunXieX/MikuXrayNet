@@ -112,7 +112,7 @@ public final class AfkTracker implements Listener {
     }
     // 回显「实际会丢弃哪些包」而非只报「AFK 降级已启用」：drop-particles / drop-block-break-animation
     // 全为 false 时本模块只统计 AFK 状态、不丢任何包，若仍写「已启用」会让管理员以为降级在生效。
-    plugin.getLogger().info("带宽模块已启用：AFK 降级（" + config.seconds() + " 秒，距离 "
+    plugin.getLogger().fine("带宽模块已启用：AFK 降级（" + config.seconds() + " 秒，距离 "
         + config.distance() + " 格；" + droppedTypesText(types) + "）");
   }
 

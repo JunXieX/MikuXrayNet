@@ -312,7 +312,7 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
     if (removed > 0) {
-      logger.info("已清理 " + removed + " 个上次崩溃残留的磁盘缓存临时文件（*.tmp）");
+      logger.fine("已清理 " + removed + " 个上次崩溃残留的磁盘缓存临时文件（*.tmp）");
     }
   }
 

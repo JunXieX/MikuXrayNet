@@ -60,8 +60,14 @@ public final class ProtocolLibHook {
       Supplier<RevealedSet> revealedSet, BypassRegistry bypassRegistry, DiskCacheStore diskCache,
       Supplier<AntiXrayConfig> liveConfig) {
     // 启动期解析并缓存区块数据字段（字段直读，不依赖 ProtocolLib 自带的区块数据包装类）。
-    // 打一行判定结果便于用户核对：任一 ✗ 都意味着该功能 fail-open（放行原包），一眼可定位环境问题。
-    logger.info(ChunkPacketAccessor.resolveAndDescribe());
+    // 取数全命中属正常启动（降为 FINE）；降级（方块实体剔除不可用）或不可用（fail-open 放行原包、
+    // 矿物以真实状态下发）都是「功能受损」，必须打 WARNING 点名——绝不静默。
+    String accessorState = ChunkPacketAccessor.resolveAndDescribe();
+    if (ChunkPacketAccessor.accessorState() == ChunkPacketAccessor.AccessorState.READY) {
+      logger.fine(accessorState);
+    } else {
+      logger.warning(accessorState);
+    }
 
     Throwable batchFailure = tryRegister(config, processor, workPool, neighborProvider,
         obfuscatedChunkIndex, revealedSet, bypassRegistry, diskCache, liveConfig, true);
@@ -97,7 +103,7 @@ public final class ProtocolLibHook {
       // 必须显式 start()，否则异步监听器不会真正开始分发封包
       this.asyncListenerHandler.start();
 
-      logger.info("反矿透封包拦截已启用（ProtocolLib 异步通道，监听 "
+      logger.fine("反矿透封包拦截已启用（ProtocolLib 异步通道，监听 "
           + (handleChunkBatch ? "MAP_CHUNK + CHUNK_BATCH_START/FINISHED" : "MAP_CHUNK") + "）");
       return null;
     } catch (Throwable throwable) {

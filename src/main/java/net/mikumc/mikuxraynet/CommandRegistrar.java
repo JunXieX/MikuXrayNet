@@ -56,7 +56,7 @@ final class CommandRegistrar {
     try {
       MikuCommand executor = new MikuCommand(plugin);
       if (registerLifecycleCommand(executor)) {
-        plugin.getLogger().info("管理命令 /" + COMMAND_NAME + " 已按 paper-plugin.yml 现代方式注册");
+        plugin.getLogger().fine("管理命令 /" + COMMAND_NAME + " 已按 paper-plugin.yml 现代方式注册");
         return;
       }
       // 非 Paper 核心（无 getLifecycleManager）：本项目不做 Spigot 兼容，故不存在回退路径

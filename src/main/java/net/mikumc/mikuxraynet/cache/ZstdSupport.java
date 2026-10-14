@@ -412,7 +412,9 @@ public final class ZstdSupport {
 
     codec(); // ① 运行期已有（服务端自带）
     if (codec != null) {
-      logger.info(detectionLine() + "；来源=" + source.label());
+      // 正常就绪（成功路径）降为 FINE：开服日志只保留插件「已启用」一行；
+      // 下方所有「未启用自动下载 / 校验未通过 / 下载失败」等异常路径仍为 WARNING。
+      logger.fine(detectionLine() + "；来源=" + source.label());
       return;
     }
 
@@ -427,7 +429,7 @@ public final class ZstdSupport {
           install(local, Source.LOCAL);
           // 候选顺序固定为「平台包 → 全平台包」，故首个候选只在分类器可识别时才是平台包
           String used = i == 0 && classifier != null ? classifier : null;
-          logger.info(detectionLine() + "；来源=" + source.label() + "（"
+          logger.fine(detectionLine() + "；来源=" + source.label() + "（"
               + artifactDetail(used, sizeOf(candidate)) + "）");
           return;
         }
@@ -444,13 +446,13 @@ public final class ZstdSupport {
       }
       Codec downloaded = downloadCodec(libraryDir, downloadUrl, expectedSha256, timeoutSeconds);
       if (downloaded != null) {
-        logger.info(detectionLine() + "；来源=" + source.label() + "（"
+        logger.fine(detectionLine() + "；来源=" + source.label() + "（"
             + artifactDetail(downloadedClassifier, downloadedBytes) + "）");
         if (verify) {
-          logger.info("ZSTD 前置：下载文件已通过 SHA-256 校验（" + lastDownloadedSha256 + "）");
+          logger.fine("ZSTD 前置：下载文件已通过 SHA-256 校验（" + lastDownloadedSha256 + "）");
         } else if (!lastDownloadedSha256.isEmpty()) {
           // 未配置期望哈希：把实际值一次性打印出来，供服主复制填入 disk-cache.zstd-sha256（幂等，不会重复）
-          logger.info("ZSTD 前置：已计算实际 SHA-256：" + lastDownloadedSha256
+          logger.fine("ZSTD 前置：已计算实际 SHA-256：" + lastDownloadedSha256
               + "，可填入 disk-cache.zstd-sha256 以启用校验");
         }
         return;

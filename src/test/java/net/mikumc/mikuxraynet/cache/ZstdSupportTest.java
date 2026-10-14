@@ -355,10 +355,13 @@ class ZstdSupportTest {
 
     assertTrue(ZstdSupport.available(), "本进程类路径有 zstd-jni，必须探测成功");
     assertEquals(ZstdSupport.Source.SERVER, ZstdSupport.source(), "来源必须是「服务端自带」");
-    // 启动日志必须一次性说清三件事：检测到的平台、推导出的分类器、最终来源
+    // 正常就绪的探测结果降为 FINE（开服日志只保留插件「已启用」一行）：这里必须仍能一次性说清
+    // 三件事——检测到的平台、推导出的分类器、最终来源（RecordingLogger 记 ALL 级，故 FINE 也可见）
     assertTrue(logger.contains("ZSTD 前置：平台 "), "必须打印检测到的平台：" + logger.lines);
     assertTrue(logger.contains("分类器 "), "必须打印推导出的分类器：" + logger.lines);
     assertTrue(logger.contains("；来源=服务端自带"), "必须打印最终来源：" + logger.lines);
+    assertFalse(logger.contains("INFO ZSTD 前置"),
+        "正常就绪不得打 INFO（开服日志只保留插件「已启用」一行）：" + logger.lines);
     assertFalse(Files.exists(libDir.resolve(
         ZstdSupport.jarFileName(ZstdSupport.ARTIFACT, ZstdSupport.VERSION))),
         "①命中后不得发起下载（lib 目录必须为空）");

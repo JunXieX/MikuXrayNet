@@ -72,7 +72,7 @@ public final class LatencyMonitor implements Listener {
       watches.put(player.getUniqueId(), new PingState());
       scheduleCheck(player, period);
     }
-    plugin.getLogger().info("带宽模块已启用：高延迟降视距（阈值 " + config.thresholdMillis() + "ms，持续 "
+    plugin.getLogger().fine("带宽模块已启用：高延迟降视距（阈值 " + config.thresholdMillis() + "ms，持续 "
         + config.sustainSeconds() + " 秒，降 " + config.reduceViewDistance() + " 区块）");
   }
 

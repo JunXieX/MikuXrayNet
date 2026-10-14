@@ -193,8 +193,8 @@ public final class ObfuscationProcessor {
           resolvedTargets.add(name);
         }
       }
-      // 启动自检：把「实际匹配到的目标方块清单」打出来，便于一眼看出是否漏了深层矿变体
-      logger.info(label + "目标方块解析完成：" + resolvedTargets.size() + '/' + effective.hideBlocks().size()
+      // 启动自检：把「实际匹配到的目标方块清单」打出来，便于一眼看出是否漏了深层矿变体（降为 FINE）
+      logger.fine(label + "目标方块解析完成：" + resolvedTargets.size() + '/' + effective.hideBlocks().size()
           + " 种 → " + resolvedTargets);
 
       int[][] fallback = weightedTable(effective.replacementWeights(), logger, label);

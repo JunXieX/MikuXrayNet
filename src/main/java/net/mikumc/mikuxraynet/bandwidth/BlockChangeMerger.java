@@ -237,7 +237,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     for (Player player : plugin.getServer().getOnlinePlayers()) {
       schedulePositionRefresh(player);
     }
-    plugin.getLogger().info("带宽模块已启用：方块变更合并（时间窗 " + config.mergeWindowMillis()
+    plugin.getLogger().fine("带宽模块已启用：方块变更合并（时间窗 " + config.mergeWindowMillis()
         + "ms，邻域半径 " + config.mergeRadius() + "，立即放行半径 " + config.immediateRadius()
         + " 格，缓冲上限 " + config.maxPendingEntries() + "）");
   }

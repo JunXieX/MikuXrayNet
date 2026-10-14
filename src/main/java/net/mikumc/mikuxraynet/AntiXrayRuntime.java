@@ -108,7 +108,8 @@ public final class AntiXrayRuntime {
     MikuConfig config = plugin.mikuConfig();
     AntiXrayConfig antiXray = config.antiXray();
     if (!antiXray.enabled()) {
-      logger.info("反矿透已在配置中关闭（antixray.yml: enabled=false）");
+      // 配置主动关闭：不是异常，降为 FINE（需要确认时看 /mikuxraynet status）
+      logger.fine("反矿透已在配置中关闭（antixray.yml: enabled=false）");
       return;
     }
 
@@ -206,7 +207,7 @@ public final class AntiXrayRuntime {
     plugin.registerWorldUnloadInvalidation();
     startProximity(antiXray, chunkIndex, revealed, proximityStats);
     startOcclusionPatch(registry);
-    logger.info("反矿透已启用（按维度分段）：" + dimensionSummary(antiXray)
+    logger.fine("反矿透已启用（按维度分段）：" + dimensionSummary(antiXray)
         + "；区块边界邻块快照 " + neighborState(neighborProvider, processor) + "；磁盘缓存 "
         + (diskCache != null ? "已启用（" + new File(plugin.getDataFolder(), "cache").getPath() + "）"
             : "已关闭"));
@@ -266,7 +267,8 @@ public final class AntiXrayRuntime {
     }
 
     if (chunkIndex == null || revealed == null) {
-      logger.info("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
+      // 配置主动关闭：不是异常，降为 FINE
+      logger.fine("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
       return;
     }
 
@@ -414,7 +416,7 @@ public final class AntiXrayRuntime {
     if (!antiXrayActive || proximityStats == null) {
       // 反矿透整体未启用（或尚未装配完成）时邻近显形无从接入改写链路，重启项静默无效。
       // 必须显式告知管理员「为什么没生效」，否则「重启邻近显形」这类操作会被误读为已生效。
-      logger.info("反矿透未启用，proximity 重启项已跳过");
+      logger.fine("反矿透未启用，proximity 重启项已跳过");
       return;
     }
     AntiXrayConfig antiXray = plugin.mikuConfig().antiXray();
@@ -423,12 +425,12 @@ public final class AntiXrayRuntime {
       // 之后不再登记/发送任何显形——与启动路径「关闭即不建索引、零开销」保持一致。
       obfuscatedChunkIndex = null;
       revealedSet = null;
-      logger.info("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
+      logger.fine("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
       return;
     }
     if (obfuscatedChunkIndex == null || revealedSet == null) {
       // 显形索引只能在插件启用时随改写链路一并接入：热重载无法凭空补齐，明确提示需重启而非静默失效。
-      logger.info("邻近显形在配置中已启用，但本功能只能随插件启用时初始化、热重载无法重建；重启服务器后生效");
+      logger.fine("邻近显形在配置中已启用，但本功能只能随插件启用时初始化、热重载无法重建；重启服务器后生效");
       return;
     }
     startProximity(antiXray, obfuscatedChunkIndex, revealedSet, proximityStats);

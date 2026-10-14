@@ -123,7 +123,7 @@ public final class ThrottlePipeline {
   /** 装配全部子模块；总开关关闭时不做任何事。 */
   public void start() {
     if (!config.enabled()) {
-      plugin.getLogger().info("带宽优化已在配置中关闭（bandwidth.yml: enabled=false）");
+      plugin.getLogger().fine("带宽优化已在配置中关闭（bandwidth.yml: enabled=false）");
       return;
     }
 
@@ -171,12 +171,8 @@ public final class ThrottlePipeline {
           ? "block-changes.merge" : "block-changes.enabled");
     }
     if (plan.entityCulling()) {
-      if (occlusionStores == null) {
-        // 明确告知「位图不可用」：遮挡位图来自反矿透解码旁路，反矿透未启用时没有位图，
-        // 此时射线遮挡判定整体跳过、仅做视锥剔除（fail-open：不误藏）。
-        plugin.getLogger().warning("反矿透未建遮挡位图（antixray 未启用）：实体剔除的射线遮挡判定已跳过，"
-            + "仅做视锥剔除（行为属安全方向：少藏而不误藏）");
-      }
+      // 「遮挡位图不可用 → 跳过射线遮挡判定」的提示不在这里打：EntityCuller.start() 会依据
+      // raycastReady() 给出更准确的一行 WARNING（它同时覆盖「反矿透未启用」与「引擎启动失败」两种成因）。
       entityCuller = register(
           () -> new EntityCuller(plugin, config.entityCulling(), stats, occlusionStores, occlusionStats),
           EntityCuller::start, EntityCuller::stop);
@@ -298,9 +294,9 @@ public final class ThrottlePipeline {
     }
   }
 
-  /** 模块被配置关闭时的一次性中文提示（不会打印任何「已启用」行，因为该模块根本没注册）。 */
+  /** 模块被配置关闭时的一次性中文提示（正常启动的常规信息，降为 FINE；不会打印任何「已启用」行）。 */
   private void logDisabled(String name, String reasonKey) {
-    plugin.getLogger().info("带宽模块已关闭（配置）：" + name + "（bandwidth.yml: " + reasonKey + "=false）");
+    plugin.getLogger().fine("带宽模块已关闭（配置）：" + name + "（bandwidth.yml: " + reasonKey + "=false）");
   }
 
   private <T> void close(String name, T module, ModuleStopper<T> stopper) {
