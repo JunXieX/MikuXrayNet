@@ -259,7 +259,7 @@ class ConfigDefaultsTest {
     // 更新③：移除 occlusion.fluid-cover（岩浆改为恒判视觉遮挡，不再是开关）→ 指纹随之变化。
     // 更新④：world-blacklist 迁出为独立配置 blacklist.yml（不再参与 AntiXrayConfig 指纹）→ 指纹随之变化。
     // 以上改动都会使期望值变化、现存磁盘缓存一次性失效重建（属正常）。
-    assertEquals(1073391632, config.configHash(),
+    assertEquals(-519526893, config.configHash(),
         "配置指纹必须是跨进程稳定的固定值（不得混入枚举 identity hash / 随机值）");
     // 同一份内容重复解析必须得到同一个值（同一进程内的自洽性）
     assertEquals(config.configHash(), AntiXrayConfig.from(yaml("""

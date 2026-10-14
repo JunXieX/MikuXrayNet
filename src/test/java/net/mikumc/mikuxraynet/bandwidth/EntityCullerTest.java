@@ -1088,6 +1088,8 @@ class EntityCullerTest {
         Player.class.getClassLoader(), new Class<?>[] {Player.class}, this);
     /** 位置与 {@link EntityStub} 的默认位置不同，但坐标本身不重要（只用于距离比较）。 */
     private final Location location = new Location(null, 0.5D, 65.0D, 0.5D);
+    /** 世界替身：带宽侧世界黑名单判定会读 {@code getWorld().getName()}，默认名 "world"（不在任何黑名单）。 */
+    private final WorldStub world = new WorldStub();
     private volatile boolean online = true;
 
     Player proxy() {
@@ -1117,6 +1119,7 @@ class EntityCullerTest {
         case "hasPermission" -> throw new UnsupportedOperationException(
             "EntityCuller 不得查询 Bukkit 权限，直通判定只读 BypassRegistry 登录期快照");
         case "getLocation", "getEyeLocation" -> location;
+        case "getWorld" -> world.proxy();
         // 强制可见距离闸门改用零分配坐标 getter（不再 new Location）读取玩家位置
         case "getX" -> location.getX();
         case "getY" -> location.getY();
