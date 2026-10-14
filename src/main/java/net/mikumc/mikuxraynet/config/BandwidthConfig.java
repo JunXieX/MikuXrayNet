@@ -68,8 +68,6 @@ public final class BandwidthConfig {
   public static final double MIN_FORCE_VISIBLE_DISTANCE = 16.0D;
   /** 遮挡复检周期上限（tick）：40 tick（2 秒）再长会让「误藏」持续过久，可被玩家感知。 */
   public static final int MAX_UPDATE_INTERVAL_TICKS = 40;
-  /** 每周期复检预算上限：预算即每周期主线程射线次数，越大收敛越快、越安全，故放宽到 2048。 */
-  public static final int MAX_RECHECK_BUDGET = 2048;
   /** AFK 判定时长上限（秒，1 天）：超过一天的判定几乎不可能触发，只是白占状态。 */
   public static final int MAX_AFK_SECONDS = 86400;
   /** AFK 丢包距离上限（格）：越大越少误丢玩家看得见的远处包，故放宽到 1024。 */
@@ -107,9 +105,9 @@ public final class BandwidthConfig {
   public static final double MIN_FRUSTUM_FOV = 30.0D;
 
   /*
-   * 异步实体遮挡判定（entity-culling.async-occlusion.*）的安全边界。
-   * 本组功能默认<b>开启</b>（位图/补丁/同步回退已统一为同一遮挡口径并完成真机验证），因此这些边界在
-   * 默认配置下不改变任何行为——默认值全部落在 [下限, 上限] 内，只在管理员写出失控值时触发。
+   * 遮挡判定（entity-culling.occlusion-*）的安全边界。
+   * 遮挡判定恒走异步位图（原生命中射线已移除），因此这些边界在默认配置下不改变任何行为——默认值全部
+   * 落在 [下限, 上限] 内，只在管理员写出失控值时触发。
    */
 
   /** 每周期每玩家射线时间预算下限（毫秒，0.1）：低于它几乎必然一个实体都算不完，等于功能失效。 */
@@ -186,27 +184,17 @@ public final class BandwidthConfig {
    *
    * @param enabled  模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
    * @param raycast  行为开关：依据视线射线剔除被遮挡实体；仅在 {@code enabled=true} 时生效。
-   * @param recheckBudget 周期复检预算：除「已隐藏实体每周期全部复检」外，每周期额外按轮转分片
-   *                      复检的「可见追踪实体」条数上限（默认 12——性能优先档，兼顾收敛速度与每周期
-   *                      主线程射线次数；建议区间 8~24）。
-   *                      <p>为什么需要它：实体进入追踪范围那一刻（{@code PlayerTrackEntityEvent}）只评估一次，
-   *                      若实体是「先可见、之后才被墙/地形挡住」，只复检已隐藏集合永远发现不了它。
-   *                      轮转分片让复检在 {@code ceil(追踪数 / recheckBudget)} 个周期内覆盖全部追踪实体
-   *                      （如 50 个实体、预算 10 → 5 个周期内全部复检一次），因此新出现的遮挡也能被隐藏。
-   *                      <p>CPU 取舍：本项把「每周期射线判定」的调用数摊平为固定上限——越大越早发现新遮挡，
-   *                      但每周期主线程射线次数同比上升；越小越省 CPU，但收敛更慢。
-   * @param raySamples <b>每个实体最多尝试的候选顶点数</b>（射线改用 Paper 原生
-   *                   {@code World#rayTraceBlocks} 后不再表示采样数）；钳制 1..{@value #MAX_RAY_SAMPLES}，
+   * @param raySamples <b>每个实体最多尝试的候选顶点数</b>；钳制 1..{@value #MAX_RAY_SAMPLES}，
    *                   默认 {@value #MAX_RAY_SAMPLES}——包围盒「朝向玩家一侧」的可见顶点最多
    *                   {@value #MAX_RAY_SAMPLES} 个，取到上限即「全部顶点都试」。
    * @param frustum    视锥剔除子项（见 {@link Frustum}）：在「被墙完全挡住」之外，再剔除
    *                   「位于视野锥之外、且在距离门之外」的实体（玩家背后 / 侧后看不见的实体）。
    * @param asyncOcclusion 异步遮挡判定子项（见 {@link AsyncOcclusion}）：以「自持区块遮挡位图 +
-   *                   专用异步线程池步进射线」取代实体线程上的原生命中射线。<b>默认开启</b>
-   *                   （位图口径已与同步射线对齐、并完成真机验证；未接线时自动回落同步射线）。
+   *                   专用异步线程池步进射线」执行遮挡判定。<b>本模块只有这一条射线路径</b>
+   *                   （原生命中射线已彻底移除）。
    */
   public record EntityCulling(boolean enabled, boolean raycast, double forceVisibleDistance,
-      int updateIntervalTicks, int raySamples, int recheckBudget, Frustum frustum,
+      int updateIntervalTicks, int raySamples, Frustum frustum,
       AsyncOcclusion asyncOcclusion) {
 
     /**
@@ -233,20 +221,15 @@ public final class BandwidthConfig {
     /**
      * 异步实体遮挡判定子项。
      *
-     * <p><b>它解决什么</b>：原实现用 {@code World#rayTraceBlocks} 在实体所属线程逐条打射线，受线程归属
-     * 约束无法异步，只能靠 {@code recheck-budget} 限流 → 收敛延迟随追踪实体数线性增长
-     * （500 实体约 21 秒）。本子项改为「维护层自持区块遮挡位图 + 计算层纯内存步进射线（专用线程池）+
-     * 发布层回到实体线程 hide/show」，从而取消条数封顶、把射线 CPU 移出主/区域线程。
-     *
-     * <p><b>默认开启</b>：位图与射线的遮挡口径与同步射线一致（同为服务端逐状态
-     * {@code BlockData#isOccluding()} 真值），且已完成真机验证（启用 / 停用 / 热重载无线程泄漏）。
-     * 关闭时 {@code EntityCuller} 完全保持原有同步射线行为（想退回排查时改成 {@code false} 即可）。
-     * 未接线（反矿透未启用、或引擎启动失败）时也会自动回落同步射线并打一次中文 WARN。
+     * <p><b>为什么是本模块唯一的射线路径</b>：原实现用 {@code World#rayTraceBlocks} 在实体所属线程逐条
+     * 打射线，受线程归属约束无法异步，只能靠条数封顶限流 → 收敛延迟随追踪实体数线性增长（500 实体约
+     * 21 秒）。现在改为「维护层自持区块遮挡位图 + 计算层纯内存步进射线（专用线程池）+ 发布层回到实体
+     * 线程 hide/show」：取消条数封顶、把射线 CPU 移出主/区域线程。<b>原生命中射线已彻底移除</b>，
+     * 因此本子项没有开关——遮挡判定恒走位图。
      *
      * <p><b>安全语义不退化</b>：近身强制可见、fail-open（异常/超时/位图缺失/epoch 冲突一律按可见处理）、
      * 陈旧结果超时丢弃、跨世界迟到结果作废、防抖，全部在下游实现中保持。
      *
-     * @param enabled           子开关：为 {@code false} 时不建遮挡位图、不起专用池，回退现状同步射线。
      * @param timeBudgetMillis  每周期每玩家的射线时间预算（毫秒）：异步不减少总 CPU，只搬走它，因此必须用
      *                          <b>时间预算</b>（而非条数封顶）为成本设上界；超预算的实体会顺延到下一周期。
      *                          钳制 {@value #MIN_OCCLUSION_TIME_BUDGET_MS}..{@value #MAX_OCCLUSION_TIME_BUDGET_MS}。
@@ -259,23 +242,23 @@ public final class BandwidthConfig {
      * @param hysteresisCycles  防抖：同一实体的判定需连续该周期数一致才允许切换显示状态；
      *                          钳制 0..{@value #MAX_OCCLUSION_HYSTERESIS_CYCLES}（0 = 不防抖）。
      */
-    public record AsyncOcclusion(boolean enabled, double timeBudgetMillis, int threads,
+    public record AsyncOcclusion(double timeBudgetMillis, int threads,
         int maxOccludingBlocks, int timeoutCycles, int hysteresisCycles) {
     }
 
-    /** 异步遮挡子项的内置默认（开启 + 保守档），供兼容构造使用。 */
+    /** 异步遮挡子项的内置默认（保守档），供兼容构造使用。 */
     private static final AsyncOcclusion DEFAULT_ASYNC_OCCLUSION =
-        new AsyncOcclusion(true, 2.0D, 1, 0, 3, 1);
+        new AsyncOcclusion(2.0D, 1, 0, 3, 1);
 
     /**
-     * 兼容构造：未指定异步遮挡子项时按内置默认（开启）处理。
+     * 兼容构造：未指定异步遮挡子项时按内置默认处理。
      *
      * <p>测试专用豁免：生产路径一律走 {@link BandwidthConfig#from}（显式解析全部子项）；
      * 本构造保留以便既有单测构造固定档案而不必关心新增子项，避免无谓的测试改写。
      */
     public EntityCulling(boolean enabled, boolean raycast, double forceVisibleDistance,
-        int updateIntervalTicks, int raySamples, int recheckBudget, Frustum frustum) {
-      this(enabled, raycast, forceVisibleDistance, updateIntervalTicks, raySamples, recheckBudget,
+        int updateIntervalTicks, int raySamples, Frustum frustum) {
+      this(enabled, raycast, forceVisibleDistance, updateIntervalTicks, raySamples,
           frustum, DEFAULT_ASYNC_OCCLUSION);
     }
   }
@@ -376,13 +359,9 @@ public final class BandwidthConfig {
             // 兜底，玩家几乎察觉不到。
             clampUpper(Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),
                 MAX_UPDATE_INTERVAL_TICKS, "entity-culling.update-interval-ticks", clampAdjustments),
-            // 语义已变：原生射线改造后本键表示「每个实体最多尝试的候选顶点数」（不再表示采样数）。
-            // 钳制 1..MAX_RAY_SAMPLES，默认即上限（包围盒至多 7 个可见顶点 → 取上限就是全部顶点都试）。
+            // 语义：每个实体最多尝试的候选顶点数；钳制 1..MAX_RAY_SAMPLES，默认即上限（包围盒至多 7 个可见
+            // 顶点 → 取上限就是全部顶点都试）。
             Math.max(1, Math.min(MAX_RAY_SAMPLES, root.getInt("entity-culling.ray-samples", MAX_RAY_SAMPLES))),
-            // 周期复检预算默认 12（性能优先）：约「每 0.5 秒（10 tick）多复检 12 个可见追踪实体」，
-            // 兼顾收敛速度与每周期主线程射线次数；建议区间 8~24。
-            clampUpper(Math.max(1, root.getInt("entity-culling.recheck-budget", 12)),
-                MAX_RECHECK_BUDGET, "entity-culling.recheck-budget", clampAdjustments),
             new EntityCulling.Frustum(
                 root.getBoolean("entity-culling.frustum.enabled", true),
                 // FOV 默认 110（客户端可设置的最大值）：取最大保证「玩家把 FOV 拉满也看不到被剔除的实体」，
@@ -396,10 +375,8 @@ public final class BandwidthConfig {
                 clampUpper(root.getDouble("entity-culling.frustum.min-distance", 24.0D),
                     24.0D, MAX_FRUSTUM_MIN_DISTANCE, "entity-culling.frustum.min-distance",
                     clampAdjustments)),
-            // 异步遮挡判定默认开启：位图/补丁/同步回退三者已统一为同一遮挡口径，且完成真机验证；
-            // 未接线（反矿透未启用或引擎启动失败）时自动回落同步射线并打一次中文 WARN。
+            // 遮挡判定恒走异步位图（原生命中射线已移除），故本子项无开关，只余调优键。
             new EntityCulling.AsyncOcclusion(
-                root.getBoolean("entity-culling.async-occlusion", true),
                 // 时间预算默认 2.0ms/玩家/周期（保守起步，真机标定）；两端都钳。
                 clampRange(root.getDouble("entity-culling.occlusion-time-budget-ms", 2.0D),
                     2.0D, MIN_OCCLUSION_TIME_BUDGET_MS, MAX_OCCLUSION_TIME_BUDGET_MS,

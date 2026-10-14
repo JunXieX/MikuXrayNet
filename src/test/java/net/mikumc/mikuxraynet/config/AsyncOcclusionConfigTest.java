@@ -2,7 +2,6 @@ package net.mikumc.mikuxraynet.config;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import net.mikumc.mikuxraynet.config.BandwidthConfig.EntityCulling.AsyncOcclusion;
@@ -11,10 +10,9 @@ import org.bukkit.configuration.file.YamlConfiguration;
 import org.junit.jupiter.api.Test;
 
 /**
- * 异步实体遮挡子项（{@code entity-culling.async-occlusion.*}）的默认值、显式解析与安全钳制测试。
+ * 遮挡判定子项（{@code entity-culling.occlusion-*}）的默认值与安全钳制测试。
  *
- * <p>本子项<b>默认开启</b>（位图/补丁/同步回退已统一为同一遮挡口径并完成真机验证）；这里的断言同时
- * 钉住「三个开关各自参与配置指纹」这一约定，避免热重载漏检。
+ * <p>遮挡判定恒走异步位图（原生命中射线已移除），因此本子项<b>没有开关</b>，只剩调优键。
  */
 class AsyncOcclusionConfigTest {
 
@@ -29,9 +27,8 @@ class AsyncOcclusionConfigTest {
   }
 
   @Test
-  void defaultsAreOnAndConservative() {
+  void defaultsAreConservative() {
     AsyncOcclusion async = BandwidthConfig.from(yaml("enabled: true\n")).entityCulling().asyncOcclusion();
-    assertTrue(async.enabled(), "异步遮挡默认必须开启（口径已对齐 + 真机验证通过）");
     assertEquals(2.0D, async.timeBudgetMillis(), 1.0E-9D, "时间预算默认 2.0ms");
     assertEquals(1, async.threads(), "专用池默认单线程");
     assertEquals(0, async.maxOccludingBlocks(), "最大穿越遮挡数默认 0（最严格）");
@@ -43,7 +40,6 @@ class AsyncOcclusionConfigTest {
   void explicitValuesAreParsedAsIs() {
     BandwidthConfig config = BandwidthConfig.from(yaml("""
         entity-culling:
-          async-occlusion: true
           occlusion-time-budget-ms: 8.5
           occlusion-threads: 3
           max-occluding-blocks: 2
@@ -51,7 +47,6 @@ class AsyncOcclusionConfigTest {
           occlusion-hysteresis-cycles: 4
         """));
     AsyncOcclusion async = config.entityCulling().asyncOcclusion();
-    assertTrue(async.enabled());
     assertEquals(8.5D, async.timeBudgetMillis(), 1.0E-9D);
     assertEquals(3, async.threads());
     assertEquals(2, async.maxOccludingBlocks());
@@ -98,19 +93,14 @@ class AsyncOcclusionConfigTest {
     assertEquals(5, config.clampAdjustments().size(), "五个越界键各记一条明细");
   }
 
+  /** 已移除的 {@code entity-culling.recheck-budget} 不再被解析（它是同步射线时代的条数封顶）。 */
   @Test
-  void asyncSwitchParticipatesInConfigFingerprint() {
-    // 默认已是 true，故这里必须用「显式 false vs 显式 true」对照，不能拿默认值当 off 用
-    int off = BandwidthConfig.from(yaml("""
-        enabled: true
+  void removedRecheckBudgetIsIgnored() {
+    BandwidthConfig config = BandwidthConfig.from(yaml("""
         entity-culling:
-          async-occlusion: false
-        """)).configHash();
-    int on = BandwidthConfig.from(yaml("""
-        enabled: true
-        entity-culling:
-          async-occlusion: true
-        """)).configHash();
-    assertNotEquals(off, on, "开关必须参与配置指纹（否则热重载检测不到该侧变化）");
+          recheck-budget: 12
+        """));
+    // 不抛异常、且不影响任何其它键（配置项已废弃，静默忽略）
+    assertEquals(2.0D, config.entityCulling().asyncOcclusion().timeBudgetMillis(), 1.0E-9D);
   }
 }

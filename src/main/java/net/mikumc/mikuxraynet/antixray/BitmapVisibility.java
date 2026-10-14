@@ -8,12 +8,12 @@ import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
 
 /**
  * 邻近显形的「位图可见性判定」：复用反矿透已建好的遮挡位图（{@link OcclusionStores}）在纯内存里回答
- * 「这个坐标对玩家可见吗」，取代原先只能在玩家线程上跑的精确判定（{@code World#rayTraceBlocks} + 6 邻块读）。
+ * 「这个坐标对玩家可见吗」。<b>这是显形侧唯一的可见性判定实现</b>（原生命中射线已移除）。
  *
- * <p><b>为什么能搬离玩家线程</b>：精确判定要调 Bukkit API（读世界方块、原生射线），只能在玩家所属线程做；
- * 位图判定只读 {@link OcclusionStores}（底层是单写多读容器，读侧无锁）与纯浮点步进
- * （{@link OcclusionRay}），因此可整段交给工作线程（见 {@code ProximityRevealer}），把这两笔 CPU 从主线程 /
- * 区域线程上搬走——那里正是本功能最重、最该省的地方。
+ * <p><b>为什么在纯内存里做</b>：位图判定只读 {@link OcclusionStores}（底层是单写多读容器，读侧无锁）
+ * 与纯浮点步进（{@link OcclusionRay}），不触碰任何 Bukkit API，因此可整段交给工作线程
+ * （见 {@code ProximityRevealer}），把这两笔 CPU 从主线程 / 区域线程上搬走——那里正是本功能最重、
+ * 最该省的地方。
  *
  * <p><b>严格缺数据规则（与实体遮挡路径的 fail-open 刻意相反）</b>：位图查不到 section、或该世界还没有位图时
  * 一律按「遮挡」处理（{@link SolidOcclusion#INSTANCE}）。理由：显形与隐藏的代价不对称——隐藏侧
@@ -25,10 +25,6 @@ import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
  * {@code BlockData#isOccluding()} + barrier 判非遮挡 + 岩浆判遮挡）构建。步进射线只统计「遮挡方块」，
  * 因此玻璃、蜡烛等非遮挡方块不再阻断射线（旧实现是「命中任何别的方块即不通畅」）——这一语义变化与用户
  * 既定的「尽可能保证玩家可见性」方向一致。
- *
- * <p><b>与降级路径（{@code ProximityRevealer} 的原生射线）在 barrier 与岩浆上均已统一</b>：本类读的是视觉
- * 口径位图（barrier 不阻断射线、岩浆阻断射线）；降级路径的可见性查询也已改走同一入口
- * {@code BukkitOcclusion.visualOccluding}（同一 barrier 例外与岩浆例外）。两条路径因此完全一致。
  *
  * <p><b>岩浆已并入共享位图</b>：岩浆现由唯一规则入口 {@code OcclusionRules.visualVerdict} 判为遮挡，因此
  * 本类的位图天然包含岩浆——暴露面识别与步进射线都能正确对待岩浆，无需在发布侧再补判。

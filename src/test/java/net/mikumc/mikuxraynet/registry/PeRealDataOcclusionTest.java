@@ -178,16 +178,15 @@ class PeRealDataOcclusionTest {
   }
 
   /**
-   * <b>核心验收点</b>：同一批状态 id 在<b>异步</b>与<b>同步</b>两条射线路径下结论一致（真值用可注入桩）。
+   * <b>核心验收点</b>：同一批状态 id 在位图口径与视觉规则口径下结论一致（真值用可注入桩）。
    *
    * <p>两路各代表什么：
    * <ul>
-   *   <li><b>异步</b>：{@link BlockStateRegistry#isEntityOccluding}——实体口径位图，异步实体剔除与位图显形的
-   *       数据源（{@code entity-culling.async-occlusion=true} 时走它）；</li>
-   *   <li><b>同步</b>：{@link OcclusionRules#visualVerdict}——同步原生射线命中 {@code BlockData} 时走的
-   *       逐状态视觉规则（{@code entity-culling.async-occlusion=false} 时走它）。</li>
+   *   <li>{@link BlockStateRegistry#isEntityOccluding}——遮挡位图的逐状态口径，实体剔除与位图显形的
+   *       数据源；</li>
+   *   <li>{@link OcclusionRules#visualVerdict}——拿去校验「位图口径 == 视觉规则口径」，即视觉规则的正确性。</li>
    * </ul>
-   * 把同一批状态同时喂给两路并断言逐条一致，即钉死「异步开 / 关在同一方块上结论一致」。
+   * 把同一批状态同时喂给两路并断言逐条一致，即钉死「位图与视觉规则在同一方块上结论一致」。
    *
    * <p><b>为什么真值要用桩</b>：离线环境 {@code Bukkit.createBlockData(...).isOccluding()} 不可用
    * （{@code No RegistryAccess implementation found}），故注入 {@link StateOcclusionOracle} 桩模拟

@@ -194,11 +194,11 @@ class DiagnosticsTest {
         "磁盘缓存必须分列过期清理、负载被拒、写入被拒、积压被拒与异常，否则「命中率异常」无法自证：" + text);
     assertTrue(text.contains("==== MikuXrayNet 运行状态（v1.2.5） ===="),
         "状态面板首行必须回显插件版本（区分不同构建的日志靠它）：" + text);
-    assertTrue(text.contains("异步遮挡：已接线｜位图 section 4096，队列 3"),
-        "状态面板必须单列异步遮挡的接线状态、位图驻留量与专用池队列深度"
-            + "（否则「开了开关但没接线 / 引擎跟不上」无法从日志判断）：" + text);
+    assertTrue(text.contains("遮挡判定：已接线｜位图 section 4096，队列 3"),
+        "状态面板必须单列遮挡判定的接线状态、位图驻留量与专用池队列深度"
+            + "（否则「引擎跟不上 / 未接线」无法从日志判断）：" + text);
     assertTrue(text.contains("提交 200，完成 190，超时丢弃 2，队列满拒收 1，判定异常 9，缺遮挡数据 55 次"),
-        "异步遮挡的判定计数必须齐全（「判定异常」持续非 0 = 存在异常输入；「缺遮挡数据」持续偏高 = 区块没被建表）：" + text);
+        "遮挡判定的计数必须齐全（「判定异常」持续非 0 = 存在异常输入；「缺遮挡数据」持续偏高 = 区块没被建表）：" + text);
     assertTrue(text.contains("方块补丁 88 格（失败 4 格，状态id回落 6 格）"),
         "方块变更补丁的格数、失败数与「状态id回落」数必须可见"
             + "（补丁长期为 0 = 位图不会被方块变更刷新；状态id回落 >0 = 补丁退回了 Material 级近似、"
@@ -233,7 +233,7 @@ class DiagnosticsTest {
     assertTrue(line.contains("区块改写 100（异常 2，超时放行 2）"), line);
     assertTrue(line.contains("显形发送 7"), line);
     assertTrue(line.contains("实体隐藏 6/恢复 5（当前隐藏中 4）"), line);
-    assertTrue(line.contains("异步遮挡 已接线（位图 4096，队列 3，缺数据 55）"), line);
+    assertTrue(line.contains("遮挡判定 已接线（位图 4096，队列 3，缺数据 55）"), line);
     assertTrue(line.contains("磁盘缓存命中 30"), line);
     assertTrue(line.contains("队列 10/2048"), line);
     // 精简版不得把整面板的内容都塞进来（如依赖状态、AFK、带宽开关段）

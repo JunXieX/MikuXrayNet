@@ -7,15 +7,13 @@ import java.util.List;
 /**
  * 邻近显形的「选择逻辑」：视锥剔除 + 可见性判定的纯计算部分。
  *
- * <p><b>为什么拆出来</b>：「读方块」与「射线求交」都需要 Bukkit 世界对象，无法离线单测。因此这里只保留
+ * <p><b>为什么拆出来</b>：「读方块」与「步进射线求交」都需要世界/位图数据源，无法离线单测。因此这里只保留
  * 可离线验证的纯函数：视锥角度计算、方块暴露面识别、候选采样点生成，以及「哪些候选点值得一试」。
- * 生产代码把「读世界方块」注入为 {@link RayQuery}、把「射线求交」注入为 {@link RayProbe}，
+ * 生产代码把「遮挡查询」注入为 {@link RayQuery}、把「射线求交」注入为 {@link RayProbe}，
  * 单测注入内存表/内存探针即可覆盖全部判定分支——不再自造体素步进。
  *
- * <p><b>生产注入的两种实现</b>：① {@code ProximityRevealer} 的<b>位图路径</b>——由
- * {@link BitmapVisibility} 注入「遮挡位图查询 + 位图步进射线」，可整段在工作线程执行（无 Bukkit API）；
- * ② <b>降级路径</b>——位图不可用时由 {@code ProximityRevealer} 注入「读世界方块 + 原生射线
- * {@code World#rayTraceBlocks}」，只在玩家线程执行。
+ * <p><b>生产注入的唯一实现</b>：由 {@link BitmapVisibility} 注入「遮挡位图查询 + 位图步进射线」，
+ * 可整段在工作线程执行（无 Bukkit API）。
  *
  * <p><b>视锥</b>（{@link #withinFrustum}）：{@code fovDegrees} 是<b>竖直方向的张开全角</b>（与 Minecraft
  * 客户端 FOV 设置同义），按客户端的矩形投影分解成两轴判定——竖直半角 = {@code fov/2}，
@@ -42,7 +40,7 @@ import java.util.List;
  *   <li>只在<b>暴露面</b>上取至多 {@link #MAX_SAMPLE_POINTS} 个候选点：
  *       ① 正对玩家（按视线方向选面）的那个暴露面的中心 → ② 包围盒最近点（仅当它确实落在暴露面上）
  *       → ③ 该暴露面四角中离眼睛最近的至多 3 个；</li>
- *   <li>按序做原生射线检测（生产为 {@code World#rayTraceBlocks}，由 {@link RayProbe} 注入），
+ *   <li>按序做步进射线检测（生产为遮挡位图步进，由 {@link RayProbe} 注入），
  *       任一条通畅即判可见并立即返回；全部被挡才判不可见。</li>
  * </ol>
  * 六面全被遮挡（完全掩埋）时一个采样点都不产生 → 直接判不可见，从根上保证不会「隔着墙还原」。
@@ -56,7 +54,7 @@ public final class ProximitySelector {
   public record Eye(double x, double y, double z, double dirX, double dirY, double dirZ) {
   }
 
-  /** 世界坐标遮挡查询（显形流程用主线程读世界方块，单测可注入纯内存实现）。 */
+  /** 世界坐标遮挡查询（生产由遮挡位图提供，单测可注入纯内存实现）。 */
   @FunctionalInterface
   public interface RayQuery {
 
@@ -64,18 +62,17 @@ public final class ProximitySelector {
      * 该坐标是否<b>视觉遮挡</b>（玩家看不穿：含服务端 isOccluding 的方块，以及视觉不透明的岩浆）。
      *
      * <p>「视觉遮挡」由唯一规则入口 {@code OcclusionRules.visualVerdict} 定义（barrier 判非遮挡、
-     * 岩浆判遮挡），位图路径与降级路径都经它，故此处不再叠加任何额外判断。
+     * 岩浆判遮挡），生产实现读共享遮挡位图，故此处不再叠加任何额外判断。
      */
     boolean isOccluding(int x, int y, int z);
   }
 
   /**
-   * 原生射线探针：从玩家眼睛射向给定世界坐标点，回答「途中是否通畅」。
+   * 射线探针：从玩家眼睛射向给定世界坐标点，回答「途中是否通畅」。
    *
-   * <p>生产实现由 {@code ProximityRevealer} 注入，内部调用 Paper 的
-   * {@code World#rayTraceBlocks(Location, Vector, double, FluidCollisionMode, boolean)}，
-   * 因此<b>必须在拥有该玩家的线程调用</b>（Paper 主线程 / Folia 所属区域线程）。
-   * 单测注入内存实现，从而在不依赖 Bukkit 的前提下覆盖「多候选点、任一通畅即可见」的判定分支。
+   * <p>生产实现由 {@link BitmapVisibility} 注入，内部走遮挡位图的纯内存步进（{@code OcclusionRay}），
+   * 因此可在工作线程执行、无需任何 Bukkit API。单测注入内存实现，从而在不依赖 Bukkit 的前提下覆盖
+   * 「多候选点、任一通畅即可见」的判定分支。
    */
   @FunctionalInterface
   public interface RayProbe {
@@ -351,7 +348,7 @@ public final class ProximitySelector {
         clear = probe.isClear(point[0], point[1], point[2]);
       } catch (Throwable throwable) {
         // 探针异常：无法判定 → 按「通畅」处理（偏显形，方向由用户指定：宁可多还原一块，
-        // 也不让玩家对着假石头挖矿）。确定性判定不受影响：命中了别的方块仍算「不通畅」（见 rayClear）。
+        // 也不让玩家对着假石头挖矿）。确定性判定不受影响：路径上有遮挡方块仍算「不通畅」。
         clear = true;
       }
       if (clear) {

@@ -457,40 +457,26 @@ class ConfigDefaultsTest {
   }
 
   /**
-   * 实体剔除周期复检预算默认 12（性能优先，兼顾收敛速度与每周期主线程射线次数；建议区间 8~24）：
-   * 必须有非零默认值，否则「先可见、之后才被挡住」的实体在本轮轮转分片下会收敛过慢（预算过小）
-   * 或每周期读方块次数失控（预算过大）。复检周期同时回落到 10 tick（性能优先）。
+   * 实体剔除复检周期默认 10 tick（性能优先）：遮挡/可见切换的延迟由「已隐藏实体每周期全量复检」
+   * 兜底，玩家几乎察觉不到。
    */
   @Test
-  void entityCullingRecheckBudgetDefaultsToTwelve() {
+  void entityCullingUpdateIntervalDefaultsToTen() {
     BandwidthConfig config = BandwidthConfig.from(yaml("enabled: true\n"));
 
-    assertEquals(12, config.entityCulling().recheckBudget(),
-        "周期复检预算默认 12（性能优先；建议区间 8~24）");
     assertEquals(10, config.entityCulling().updateIntervalTicks(),
         "复检周期默认 10 tick（性能优先）");
   }
 
-  /** 非法值（0 / 负数）必须保守钳制到至少 1，避免复检完全不推进。 */
-  @Test
-  void entityCullingRecheckBudgetIsClampedToAtLeastOne() {
-    assertEquals(1, BandwidthConfig.from(yaml("entity-culling:\n  recheck-budget: 0\n"))
-        .entityCulling().recheckBudget(), "recheck-budget: 0 必须钳制为 1");
-    assertEquals(1, BandwidthConfig.from(yaml("entity-culling:\n  recheck-budget: -5\n"))
-        .entityCulling().recheckBudget(), "recheck-budget 负数必须钳制为 1");
-    assertEquals(20, BandwidthConfig.from(yaml("entity-culling:\n  recheck-budget: 20\n"))
-        .entityCulling().recheckBudget(), "显式取值按原样解析");
-  }
-
   /**
-   * 旧配置里残留已删除的 {@code entity-culling.threads} 键时，解析必须<b>静默忽略</b>该未知键
-   * （不报警、不影响同段其它键、不影响默认值）：射线已改用 Paper 原生 {@code rayTraceBlocks}，
-   * 判定直接在实体所属线程完成，该键自 1.1.x 起不再生效、现已彻底删除。
+   * 旧配置里残留已删除的 {@code entity-culling.recheck-budget} / {@code entity-culling.threads} 键时，
+   * 解析必须<b>静默忽略</b>这些未知键（不报警、不影响同段其它键、不影响默认值）：两者都是同步射线
+   * 时代的档位（条数封顶 / 线程数），遮挡判定改为异步位图后已彻底删除。
    */
   @Test
-  void removedEntityCullingThreadsKeyIsSilentlyIgnored() {
+  void removedEntityCullingKeysAreSilentlyIgnored() {
     BandwidthConfig config = BandwidthConfig.from(yaml(
-        "entity-culling:\n  threads: 4\n  ray-samples: 6\n"));
+        "entity-culling:\n  recheck-budget: 12\n  threads: 4\n  ray-samples: 6\n"));
 
     assertTrue(config.entityCulling().raycast(), "同段其它键照常生效（不受已删除键影响）");
     assertEquals(6, config.entityCulling().raySamples(), "同段其它键仍按显式取值解析");
@@ -782,7 +768,6 @@ class ConfigDefaultsTest {
         entity-culling:
           force-visible-distance: 99999.0
           update-interval-ticks: 100000
-          recheck-budget: 100000
         afk:
           seconds: 100000000
           distance: 99999.0
@@ -804,7 +789,6 @@ class ConfigDefaultsTest {
     assertEquals(BandwidthConfig.MAX_FORCE_VISIBLE_DISTANCE,
         config.entityCulling().forceVisibleDistance(), 1.0E-9D);
     assertEquals(BandwidthConfig.MAX_UPDATE_INTERVAL_TICKS, config.entityCulling().updateIntervalTicks());
-    assertEquals(BandwidthConfig.MAX_RECHECK_BUDGET, config.entityCulling().recheckBudget());
     assertEquals(BandwidthConfig.MAX_AFK_SECONDS, config.afk().seconds());
     assertEquals(BandwidthConfig.MAX_AFK_DISTANCE, config.afk().distance(), 1.0E-9D);
     assertEquals(BandwidthConfig.MAX_LATENCY_THRESHOLD_MILLIS, config.latency().thresholdMillis());
@@ -830,15 +814,12 @@ class ConfigDefaultsTest {
         latency:
           reduce-view-distance: 3
           min-view-distance: 6
-        entity-culling:
-          recheck-budget: 20
         """));
     assertEquals(3, inRange.blockChanges().mergeRadius(), "上限内的半径原样生效");
     assertEquals(8192, inRange.blockChanges().maxPerPacket());
     assertEquals(50, inRange.blockChanges().mergeWindowMillis());
     assertEquals(3, inRange.latency().reduceViewDistance(), "上限内的降视距原样生效（新上限 4）");
     assertEquals(6, inRange.latency().minViewDistance(), "下限之上的视距下限原样生效");
-    assertEquals(20, inRange.entityCulling().recheckBudget());
     assertTrue(inRange.clampAdjustments().isEmpty(),
         "上限内的值不得产生钳制明细：" + inRange.clampAdjustments());
 
@@ -864,7 +845,6 @@ class ConfigDefaultsTest {
     assertEquals(1024.0D, BandwidthConfig.MAX_FORCE_VISIBLE_DISTANCE, 1.0E-9D);
     assertEquals(16.0D, BandwidthConfig.MIN_FORCE_VISIBLE_DISTANCE, 1.0E-9D);
     assertEquals(40, BandwidthConfig.MAX_UPDATE_INTERVAL_TICKS);
-    assertEquals(2048, BandwidthConfig.MAX_RECHECK_BUDGET);
     assertEquals(86400, BandwidthConfig.MAX_AFK_SECONDS);
     assertEquals(1024.0D, BandwidthConfig.MAX_AFK_DISTANCE, 1.0E-9D);
     assertEquals(60000, BandwidthConfig.MAX_LATENCY_THRESHOLD_MILLIS);
@@ -884,7 +864,6 @@ class ConfigDefaultsTest {
     assertTrue(defaults.entityCulling().forceVisibleDistance() >= BandwidthConfig.MIN_FORCE_VISIBLE_DISTANCE,
         "默认值必须不低于硬下限，否则默认配置自身会被抬升并打出误导性 WARN");
     assertTrue(defaults.entityCulling().updateIntervalTicks() <= BandwidthConfig.MAX_UPDATE_INTERVAL_TICKS);
-    assertTrue(defaults.entityCulling().recheckBudget() <= BandwidthConfig.MAX_RECHECK_BUDGET);
     assertTrue(defaults.afk().distance() <= BandwidthConfig.MAX_AFK_DISTANCE);
     assertTrue(defaults.latency().reduceViewDistance() <= BandwidthConfig.MAX_REDUCE_VIEW_DISTANCE);
     assertTrue(defaults.latency().minViewDistance() <= BandwidthConfig.MAX_MIN_VIEW_DISTANCE);
@@ -941,7 +920,6 @@ class ConfigDefaultsTest {
         entity-culling:
           force-visible-distance: 32.0
           update-interval-ticks: 10
-          recheck-budget: 12
         afk:
           drop-particles: true
           drop-block-break-animation: true
@@ -959,7 +937,6 @@ class ConfigDefaultsTest {
     assertEquals(8, explicit.blockChanges().immediateRadius());
     assertEquals(32.0D, explicit.entityCulling().forceVisibleDistance(), 1.0E-9D);
     assertEquals(10, explicit.entityCulling().updateIntervalTicks());
-    assertEquals(12, explicit.entityCulling().recheckBudget());
     assertTrue(explicit.afk().dropParticles());
     assertTrue(explicit.afk().dropBlockBreakAnimation());
     assertEquals(400, explicit.latency().thresholdMillis());

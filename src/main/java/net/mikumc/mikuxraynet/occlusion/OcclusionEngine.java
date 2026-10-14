@@ -4,7 +4,7 @@ import java.util.ArrayDeque;
 import java.util.UUID;
 
 /**
- * 异步遮挡判定引擎：把「实体是否被完全遮挡」的射线计算从实体所属线程搬到<b>专用线程池</b>，
+ * 遮挡判定引擎：把「实体是否被完全遮挡」的射线计算从实体所属线程搬到<b>专用线程池</b>，
  * 从而取消条数封顶（收敛延迟不再随在线实体数线性增长），并让射线 CPU 离开主/区域线程。
  *
  * <p><b>输入全是纯值</b>：{@link Request} 只含坐标、时间与回调，不含任何 Bukkit/封包引用——
@@ -77,7 +77,7 @@ public final class OcclusionEngine implements AutoCloseable {
    * @param threads      专用池线程数（≥1；与反矿透改写池隔离，避免互相饿死）
    * @param maxOccluding 步进射线允许穿过的最大遮挡方块数（0 = 最严格）
    * @param maxRayLength 最远射线长度（格）：超过它的端点直接判「不通畅」（= 按可见处理，fail-open）。
-   *                     既封顶单条射线的步数（成本），也与既有同步射线的「超长截断 → 退回可见」语义保持一致；
+   *                     既封顶单条射线的步数（成本），也保证「超长截断 → 退回可见」的语义；
    *                     {@code <= 0} 或非有限值表示不设上限（此时由调用方的距离门负责限长）。
    * @param queueCapacity 任务队列容量（满则拒收，fail-open）
    */

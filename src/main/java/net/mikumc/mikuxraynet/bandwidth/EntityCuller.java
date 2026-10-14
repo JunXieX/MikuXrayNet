@@ -15,7 +15,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.antixray.ProximitySelector;
-import net.mikumc.mikuxraynet.bootstrap.BukkitOcclusion;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.occlusion.OcclusionEngine;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
@@ -23,10 +22,7 @@ import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
-import org.bukkit.FluidCollisionMode;
 import org.bukkit.Location;
-import org.bukkit.World;
-import org.bukkit.block.Block;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Firework;
 import org.bukkit.entity.Player;
@@ -37,42 +33,33 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.util.BoundingBox;
-import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 
 /**
  * 实体射线剔除：被不透明方块完全遮挡的实体对玩家隐藏，节省下行的实体跟踪带宽。
  *
- * <p><b>两种判定模式</b>（由 {@code entity-culling.async-occlusion} 选择，安全语义完全一致）：
- * <ul>
- *   <li><b>回落模式（仅在未接线 / 开关关闭时启用）</b>——线程模型（严格「Bukkit API 只在自己线程调用」）：
- *       <ol>
- *         <li>主线程/区域线程：从 {@link PlayerTrackEntityEvent} 或周期任务里抓取「眼睛坐标 + 包围盒顶点」；</li>
- *         <li>同一线程：用 Paper 原生射线（{@code World#rayTraceBlocks}）逐顶点判定是否被遮挡；</li>
- *         <li>同一线程：执行 {@link Player#hideEntity} / {@link Player#showEntity}。</li>
- *       </ol>
- *       原生射线是 Bukkit API，必须在实体所属线程调用，因此不再把体素路径交给工作线程预计算
- *       （旧实现：worker 算路径 → 回主线程读方块），也没有了 {@code int[]} 路径分配与 worker 往返。
- *       受线程归属约束，此模式只能用 {@code recheck-budget} 限流 → 收敛延迟随追踪实体数线性增长。</li>
- *   <li><b>异步模式（{@code async-occlusion=true}，默认开启）</b>——数据源换成「反矿透解码时旁路
- *       生成的区块遮挡位图」（{@link OcclusionStores}），射线由 {@link OcclusionEngine} 的<b>专用池</b>
- *       执行（纯内存步进，零 Bukkit 访问）：
- *       <ol>
- *         <li>实体所属线程：只抓几何快照（眼睛 + 包围盒候选顶点），组成本质为纯数值的
- *             {@link OcclusionEngine.Request} 入队（{@link #submitAsync}）；</li>
- *         <li>专用池线程：按世界取该区块的遮挡位图逐顶点步进判定（{@link OcclusionEngine}）；</li>
- *         <li>回投：经 {@code Schedulers.onEntity} 跳回实体所属线程，逐条校验
- *             （在线 / 归属 / 世界未变 / 实体有效）后再 hide/show（{@link #publishAsync}）。</li>
- *       </ol>
- *       因此本模式<b>不在实体线程读任何方块</b>，也就<b>取消了 {@code recheck-budget} 的条数封顶</b>
- *       （每周期提交全部追踪实体，收敛延迟不再随实体数线性增长）；射线 CPU 改由专用池的<b>时间预算</b>
- *       封顶（超预算者顺延到下一周期，不丢判定）。代价是引入「结果陈旧窗口」，由截止时间丢弃 +
- *       世界作废守卫 + 可选防抖（{@code occlusion-hysteresis-cycles}）压制。</li>
- * </ul>
+ * <p><b>唯一的判定路径（异步位图）</b>——数据源是「反矿透解码时旁路生成的区块遮挡位图」
+ * （{@link OcclusionStores}），射线由 {@link OcclusionEngine} 的<b>专用池</b>执行（纯内存步进，零 Bukkit
+ * 访问），原生命中射线（{@code World#rayTraceBlocks}）已彻底移除：
+ * <ol>
+ *   <li>实体所属线程：只抓几何快照（眼睛 + 包围盒候选顶点），组成本质为纯数值的
+ *       {@link OcclusionEngine.Request} 入队（{@link #submitAsync}）；</li>
+ *   <li>专用池线程：按世界取该区块的遮挡位图逐顶点步进判定（{@link OcclusionEngine}）；</li>
+ *   <li>回投：经 {@code Schedulers.onEntity} 跳回实体所属线程，逐条校验
+ *       （在线 / 归属 / 世界未变 / 实体有效）后再 hide/show（{@link #publishAsync}）。</li>
+ * </ol>
+ * 因此本模块<b>不在实体线程读任何方块</b>，也就<b>没有条数封顶</b>（每周期提交全部追踪实体，收敛延迟
+ * 不随实体数线性增长）；射线 CPU 由专用池的<b>时间预算</b>封顶（超预算者顺延到下一周期，不丢判定）。
+ * 代价是引入「结果陈旧窗口」，由截止时间丢弃 + 世界作废守卫 + 可选防抖（{@code occlusion-hysteresis-cycles}）
+ * 压制。
+ *
+ * <p><b>位图缺失时只做视锥剔除</b>：反矿透是本插件的主打功能、恒处于开启状态，因此遮挡位图正常情况下
+ * 总是可用（未接线 = 引擎启动失败等罕见故障）。此时射线遮挡判定整体跳过（fail-open：不隐藏），
+ * 仅保留下面的视锥剔除——这与「无数据 = 不遮挡 = 少藏」的安全方向一致，绝不误藏实体。
  *
  * <p>安全策略：强制可见距离内的实体一律可见；只有当包围盒的所有可见顶点射线都被遮挡时才隐藏
  * （宁可少隐藏，也不隐藏可见实体）；玩家自身、其它玩家与烟花不做剔除。
- * 「强制可见距离内的恢复」在两种模式下都是<b>实体线程上的同步 {@code show}</b>，绝不经过异步链路，
+ * 「强制可见距离内的恢复」是<b>实体线程上的同步 {@code show}</b>，绝不经过异步链路，
  * 因此近身安全下限不受异步延迟影响。
  *
  * <p><b>视锥剔除（{@code entity-culling.frustum}）</b>：在「被墙完全挡住」之外，再剔除
@@ -93,15 +80,12 @@ import org.bukkit.util.Vector;
  *       可见距离时 {@code showIfHidden}；超出该距离一律不打射线（成本有界，见 {@link RecheckMode}）。
  *       额外只对<b>视锥隐藏</b>的条目做一次纯数学的锥内复判（不打射线）：一旦它回到视野锥内立即恢复，
  *       保证「转头后 ≤ 1 个复检周期重新出现」。</li>
- *   <li><b>通道②·全部追踪实体（含已隐藏者）</b>：按<b>轮转分片</b>每周期只复检
- *       {@code entity-culling.recheck-budget} 个，游标推进，故 {@code ceil(追踪数 / budget)} 个周期内
- *       必然覆盖全部追踪实体。该通道允许对超出强制可见距离的实体<b>打射线</b>，承担两件事：
- *       <b>①</b> 把「入场时可见、之后才被墙/地形挡住」的实体收敛到隐藏；
- *       <b>②</b> 把「曾因遮挡被隐藏、之后遮挡物被炸开/挖开」的实体恢复可见——这是远距离已隐藏实体
- *       唯一的再评估入口（通道①对远距离条目不射线）。每条射线的成本已由 {@code recheck-budget} 封顶，
- *       故「包含已隐藏者」不会让开销随隐藏数无界增长。</li>
+ *   <li><b>通道②·全部追踪实体（含已隐藏者）</b>：每周期提交<b>全部</b>追踪实体（无条数封顶——
+ *       射线在专用池里跑，成本由时间预算封顶）。承担两件事：<b>①</b> 把「入场时可见、之后才被墙/地形
+ *       挡住」的实体收敛到隐藏；<b>②</b> 把「曾因遮挡被隐藏、之后遮挡物被炸开/挖开」的实体恢复可见
+ *       ——这是远距离已隐藏实体唯一的再评估入口（通道①对远距离条目不射线）。</li>
  * </ol>
- * 两条通道都复用同一套评估链路（实体所属线程做原生射线并 hide/show），不另写一套。
+ * 两条通道都复用同一套评估链路（提交快照 → 专用池判定 → 回投 hide/show），不另写一套。
  * <b>距离闸门</b>：任何通道内、处于强制可见距离内的实体一律可见（{@code showIfHidden}），绝不隐藏——
  * 这是既有的安全策略。入场那一刻的首评（{@code onTrack}）不受距离闸门限制，故「远距离实体照常被剔除」
  * 这一行为不变。
@@ -125,18 +109,15 @@ public final class EntityCuller implements Listener {
   private final EntityOwnership ownership;
   /** 直通判定（只读 BypassRegistry 的登录期快照；见 {@link BypassLookup}）。 */
   private final BypassLookup bypass;
-  /** 遮挡判定（生产实现为本类的 Paper 原生射线；离线单测可注入确定性结果，见 {@link Occlusion}）。 */
-  private final Occlusion occlusion;
   /**
-   * 异步遮挡数据仓库注册表（按世界分域）；{@code null} = 未接线（同步原生射线路径）。
-   *
-   * <p>仅在 {@code entity-culling.async-occlusion=true} 且反矿透已建表时非 null（由装配方传入）。
+   * 遮挡数据仓库注册表（按世界分域）；{@code null} = 引擎启动失败等罕见故障（此时跳过射线遮挡判定，
+   * 只做视锥剔除，见类注释）。
    */
   private final OcclusionStores occlusionStores;
-  /** 异步遮挡计数（引擎与诊断共用；未接线时为 {@code null}）。 */
+  /** 遮挡计数（引擎与诊断共用）。 */
   private final OcclusionStats occlusionStats;
   /**
-   * 异步遮挡引擎；{@link #start()} 时按配置创建、{@link #stop()} 时关闭，{@code null} = 走同步路径。
+   * 异步遮挡引擎；{@link #start()} 时创建、{@link #stop()} 时关闭，{@code null} = 引擎未起（罕见）。
    *
    * <p><b>为什么是 volatile</b>：工作线程的 {@code ResultSink} 会读它；停用/热重载会在命令线程把它置空
    * 并关闭。读侧只需判断「引擎是否还在」，读到一个过期引用也不会出错（引擎自身在 {@code close()} 后
@@ -237,45 +218,31 @@ public final class EntityCuller implements Listener {
    */
   EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
       EntityOwnership ownership, BypassLookup bypass) {
-    this(plugin, config, stats, ownership, bypass, null);
+    this(plugin, config, stats, ownership, bypass, null, null);
   }
 
-  /**
-   * 完整构造（追加遮挡判定注入；离线单测可对归属 / 直通 / 遮挡三者全部注入假实现）。
-   *
-   * <p>{@code occlusion} 为 {@code null} 时回落生产实现 {@link #isFullyOccluded}（Paper 原生射线）；
-   * 提供该注入点是因为离线环境连 {@code Material} 都初始化不了（{@code org.bukkit.Registry} 不可用），
-   * 真实的 {@code World#rayTraceBlocks} 判定结果无从成立，而「复检能否真正隐藏实体」这条链路又必须被
-   * 端到端回归（见 {@code EntityCullerTest}）。
-   */
-  EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
-      EntityOwnership ownership, BypassLookup bypass, Occlusion occlusion) {
-    this(plugin, config, stats, ownership, bypass, occlusion, null, null);
-  }
-
-  /** 生产装配入口（追加异步遮挡仓库与计数）；离线单测可注入 {@code null} 走同步路径。 */
+  /** 生产装配入口（追加遮挡仓库与计数）。 */
   EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
       OcclusionStores occlusionStores, OcclusionStats occlusionStats) {
-    this(plugin, config, stats, EntityCuller::ownedByCurrentRegion, BypassRegistry::isBypassedNow, null,
+    this(plugin, config, stats, EntityCuller::ownedByCurrentRegion, BypassRegistry::isBypassedNow,
         occlusionStores, occlusionStats);
   }
 
   /**
-   * 完整构造（追加异步遮挡仓库与计数；离线单测可对归属 / 直通 / 遮挡 / 异步四者全部注入假实现）。
+   * 完整构造（追加遮挡仓库与计数；离线单测可对归属 / 直通 / 遮挡数据三者全部注入假实现）。
    *
-   * <p>{@code occlusionStores}/{@code occlusionStats} 两者要么同时给出（且 {@code async-occlusion=true}），
-   * 要么同时为 {@code null}：任一缺失都回落同步原生射线路径，绝不半接线（否则会出现「引擎起来了却没有
-   * 数据源」这类难查的静默失效）。
+   * <p>{@code occlusionStores}/{@code occlusionStats} 两者要么同时给出，要么同时为 {@code null}：
+   * 任一缺失都视为「引擎不可用」，此时跳过射线遮挡判定（只做视锥剔除），绝不半接线（否则会出现
+   * 「引擎起来了却没有数据源」这类难查的静默失效）。
    */
   EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
-      EntityOwnership ownership, BypassLookup bypass, Occlusion occlusion,
+      EntityOwnership ownership, BypassLookup bypass,
       OcclusionStores occlusionStores, OcclusionStats occlusionStats) {
     this.plugin = plugin;
     this.config = config;
     this.stats = stats;
     this.ownership = ownership;
     this.bypass = bypass == null ? BypassRegistry::isBypassedNow : bypass;
-    this.occlusion = occlusion == null ? this::isFullyOccluded : occlusion;
     this.forceVisibleSquared = config.forceVisibleDistance() * config.forceVisibleDistance();
     BandwidthConfig.EntityCulling.Frustum frustum = config.frustum();
     this.frustumCulling = frustum != null && frustum.enabled();
@@ -286,9 +253,9 @@ public final class EntityCuller implements Listener {
         ? config.forceVisibleDistance()
         : Math.max(frustum.minDistance(), config.forceVisibleDistance());
     this.frustumGateSquared = gate * gate;
-    // 异步遮挡接线：仓库与计数齐备、开关打开、且确实要做射线判定时才算「已接线」（见字段说明）。
+    // 遮挡接线：仓库与计数齐备、且确实要做射线判定时才算「已接线」（见字段说明）。
     BandwidthConfig.EntityCulling.AsyncOcclusion async = config.asyncOcclusion();
-    boolean wired = async != null && async.enabled() && config.raycast()
+    boolean wired = async != null && config.raycast()
         && occlusionStores != null && occlusionStats != null;
     this.occlusionStores = wired ? occlusionStores : null;
     this.occlusionStats = wired ? occlusionStats : null;
@@ -365,35 +332,24 @@ public final class EntityCuller implements Listener {
   }
 
   /**
-   * 遮挡判定：该实体是否被完全遮挡（所有可见顶点射线都不通畅）。
-   *
-   * <p>生产实现为本类的 Paper 原生射线 {@link #isFullyOccluded}；离线单测注入确定性结果，
-   * 以便端到端验证「复检能否真正隐藏实体」这条链路（离线无法初始化 {@code Material}）。
-   */
-  @FunctionalInterface
-  interface Occlusion {
-    boolean isFullyOccluded(Player player, Entity entity);
-  }
-
-  /**
-   * 周期复检通道语义：决定「实体超出强制可见距离时」还能不能打射线。
+   * 周期复检通道语义：决定「实体超出强制可见距离时」是否还做遮挡判定。
    *
    * <p><b>为什么必须显式区分</b>：本轮修复前用单一的 {@code fromRecheck} 布尔同时承担了「计数归属」与
-   * 「超出强制可见距离后不再打射线」两件事，导致<b>两条</b>复检通道都在到达 {@code evaluate} 前提前返回，
+   * 「超出强制可见距离后不再判定」两件事，导致<b>两条</b>复检通道都在到达 {@code evaluate} 前提前返回，
    * 实体一旦「入场时可见、之后才被挡住」就再也不会被隐藏，{@code recheckHidden} 恒为 0（与类注释矛盾）。
    */
   private enum RecheckMode {
-    /** 入场首评（{@code onTrack}）：不受距离闸门限制，远距离实体照常打射线并可能隐藏。 */
+    /** 入场首评（{@code onTrack}）：不受距离闸门限制，远距离实体照常判定并可能隐藏。 */
     INITIAL,
     /**
-     * 通道①·已隐藏实体复检：只做「强制可见距离内的恢复」，超出距离一律不打射线。
-     * 这些账本条目可能随玩家走远而长期滞留，若每周期都打射线则成本随会话无界增长。
+     * 通道①·已隐藏实体复检：只做「强制可见距离内的恢复」，超出距离一律不提交判定。
+     * 这些账本条目可能随玩家走远而长期滞留，若每周期都提交则成本随会话无界增长。
      */
     RESTORE_ONLY,
     /**
-     * 通道②·轮转分片复检：数量已由 {@code entity-culling.recheck-budget} 封顶，故允许对超出强制可见
-     * 距离的实体打射线——既能隐藏「先可见、之后才被挡住」的实体，也能恢复「遮挡物已消失」的已隐藏实体
-     * （方向由射线结果决定）；成本上界＝每周期预算次射线。
+     * 通道②·轮转复检：提交全部追踪实体，允许对超出强制可见距离的实体做遮挡判定——既能隐藏「先可见、
+     * 之后才被挡住」的实体，也能恢复「遮挡物已消失」的已隐藏实体（方向由判定结果决定）；成本由专用池的
+     * 时间预算封顶（超预算者顺延到下一周期）。
      */
     ROTATION
   }
@@ -401,7 +357,6 @@ public final class EntityCuller implements Listener {
   /** 注册事件监听与周期复检任务。 */
   public void start() {
     // 异步引擎必须先于周期任务创建：首个复检周期就会向它提交（见 submitAsync）。
-    // 任一环节失败都只回落同步射线（剔除模块本身是可选优化），绝不影响监听注册。
     startEngine();
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     long interval = Math.max(1, config.updateIntervalTicks());
@@ -415,10 +370,10 @@ public final class EntityCuller implements Listener {
     }
     plugin.getLogger().info("带宽模块已启用：实体剔除（强制可见距离 " + config.forceVisibleDistance()
         + " 格；射线遮挡 " + (config.raycast()
-            ? asyncRaycast()
-                ? "开（异步遮挡：专用池 " + engineWorkerCount() + " 线程，每周期时间预算 "
-                    + formatBudgetMillis() + " ms/玩家，条数封顶已取消）"
-                : "开（Paper 原生射线，每实体至多 " + config.raySamples() + " 个包围盒顶点）"
+            ? raycastReady()
+                ? "开（遮挡位图：专用池 " + engineWorkerCount() + " 线程，每周期时间预算 "
+                    + formatBudgetMillis() + " ms/玩家，无条数封顶）"
+                : "开（遮挡位图不可用：本轮跳过射线遮挡判定，仅做视锥剔除）"
             : "关")
         + "；视锥剔除 " + (frustumCulling
             ? "开（距离门 " + Math.sqrt(frustumGateSquared) + " 格，FOV " + frustumFov + "°）" : "关")
@@ -446,10 +401,11 @@ public final class EntityCuller implements Listener {
   }
 
   /**
-   * 创建异步遮挡引擎（仅当装配方给出了仓库与计数、且配置要求走异步射线时）。
+   * 创建遮挡判定引擎（仅当装配方给出了仓库与计数时）。
    *
    * <p>引擎自带专用线程池（线程名 {@code MikuXrayNet-Occlusion-N}）：<b>刻意与反矿透改写池隔离</b>——
-   * 改写有 50 ms 级预算，共享池会造成互相饿死。创建失败只回落同步射线并打一次中文 WARN。
+   * 改写有 50 ms 级预算，共享池会造成互相饿死。创建失败只打一次中文 WARN（此时射线遮挡判定整体跳过，
+   * 仅保留视锥剔除）。
    *
    * <p>包可见：供离线单测直接起引擎（{@link #start} 依赖 Bukkit 的事件注册，离线不可用）。
    */
@@ -466,7 +422,7 @@ public final class EntityCuller implements Listener {
     } catch (Throwable throwable) {
       engine = null;
       plugin.getLogger().log(Level.WARNING,
-          "异步遮挡引擎启动失败，已回退同步原生射线（不影响实体剔除的其它行为）", throwable);
+          "遮挡判定引擎启动失败，射线遮挡判定已跳过（仅做视锥剔除；不影响实体剔除的其它行为）", throwable);
     }
   }
 
@@ -498,8 +454,8 @@ public final class EntityCuller implements Listener {
     return String.format(java.util.Locale.ROOT, "%.1f", budgetNanos / 1_000_000.0D);
   }
 
-  /** 异步射线路径是否可用（引擎已起 + 仓库已接线；{@link #stop()} 后恒为 false）。 */
-  private boolean asyncRaycast() {
+  /** 射线遮挡判定是否可用（引擎已起 + 数据源已接线；{@link #stop()} 后恒为 false）。 */
+  private boolean raycastReady() {
     return engine != null && occlusionStores != null;
   }
 
@@ -556,15 +512,16 @@ public final class EntityCuller implements Listener {
   }
 
   /**
-   * 异步遮挡是否已真正接线（引擎已起 + 位图仓库可用）——诊断用；未接线时为 {@code false}。
+   * 遮挡判定引擎是否已真正接线（引擎已起 + 数据源可用）——诊断用；未接线时为 {@code false}。
    *
-   * <p>注意与「配置里开了」不是一回事：反矿透未启用、或引擎启动失败时本值仍为 false。
+   * <p>正常情况下恒为 true（遮挡判定是本模块唯一的射线路径）。为 false 表示引擎启动失败等罕见故障，
+   * 此时射线遮挡判定整体跳过、仅做视锥剔除——诊断据此如实回显。
    */
   public boolean asyncOcclusionActive() {
-    return asyncRaycast();
+    return raycastReady();
   }
 
-  /** 异步遮挡专用池当前排队的判定数（诊断用）；未接线时为 0。 */
+  /** 遮挡判定专用池当前排队的判定数（诊断用）；未接线时为 0。 */
   public int occlusionQueueDepth() {
     OcclusionEngine current = engine;
     return current == null ? 0 : current.queueDepth();
@@ -660,10 +617,9 @@ public final class EntityCuller implements Listener {
 
   /**
    * 周期复检：① 已隐藏实体每周期全部复检（尽快恢复可见，行为不退化）；
-   * ② 其余追踪实体按轮转分片复检，每周期不超过 {@code recheck-budget} 个，
-   * 因此在 {@code ceil(追踪数 / budget)} 个周期内覆盖全部追踪实体。
+   * ② 其余追踪实体每周期全部提交遮挡判定（无条数封顶，成本由专用池时间预算封顶）。
    *
-   * <p>包可见：供离线单测直接驱动「轮转分片 + 预算」账本行为（真实链路依赖 Bukkit 调度，离线不可用）。
+   * <p>包可见：供离线单测直接驱动复检账本与提交流程（真实链路依赖 Bukkit 调度，离线不可用）。
    */
   void recheck(Player player) {
     if (stopping || !active() || !player.isOnline()) {
@@ -737,22 +693,18 @@ public final class EntityCuller implements Listener {
       }
     }
 
-    // ② 全部追踪实体（<b>含已隐藏者</b>）：轮转分片，每周期只取 recheck-budget 个。
-    //    本通道允许对远距离实体打射线（ROTATION），承担两件事：
+    // ② 全部追踪实体（<b>含已隐藏者</b>）：每周期提交<b>全部</b>（无条数封顶——射线在专用池里跑，
+    //    提交只做「实体线程抓快照 + 入队」，成本由引擎的时间预算封顶）。
+    //    本通道允许对远距离实体做判定（ROTATION），承担两件事：
     //      · 把「先可见、之后才被挡住」的实体收敛到隐藏；
     //      · 把「曾因遮挡被隐藏、之后遮挡物消失（被炸开/被挖开）」的实体恢复可见。通道①对远距离条目
-    //        刻意不打射线（成本有界），因此这里是远距离已隐藏实体唯一的再评估入口。
-    //    成本仍由 recheck-budget 封顶（每周期至多预算次射线）：ceil(追踪数 / 预算) 个周期覆盖全部追踪
-    //    实体，隐藏实体只是排到属于自己的那一轮，不会让射线次数随隐藏数无界增长。
-    //    <b>异步路径下本通道取消条数封顶</b>：提交只做「实体线程抓快照 + 入队」，射线本身在专用池里跑，
-    //    因此每周期提交<b>全部</b>追踪实体——收敛延迟不再随在线实体数线性增长（这正是本子项的目的）。
-    //    射线 CPU 由引擎的时间预算封顶（超预算者顺延到下一周期、不丢判定），故「提交全部」不会让开销无界。
+    //        刻意不提交判定（成本有界），因此这里是远距离已隐藏实体唯一的再评估入口。
+    //    超预算者顺延到下一周期、不丢判定，故「提交全部」不会让开销无界。
     TrackedRotation rotation = rotations.get(playerId);
     if (rotation == null) {
       return;
     }
-    int slice = asyncRaycast() ? Integer.MAX_VALUE : config.recheckBudget();
-    for (Entity entity : rotation.nextBatch(slice)) {
+    for (Entity entity : rotation.nextBatch(Integer.MAX_VALUE)) {
       if (!owns(entity)) {
         continue;
       }
@@ -771,18 +723,15 @@ public final class EntityCuller implements Listener {
   }
 
   /**
-   * 在实体所属线程直接评估：距离闸门 → 原生射线判定 → hide/show。
+   * 在实体所属线程评估遮挡：距离闸门 → 视锥剔除 → 提交遮挡判定（专用池）→ 回投 hide/show。
    *
-   * <p>不再有 worker 往返与 {@code int[]} 路径分配：{@code World#rayTraceBlocks} 是 Bukkit API，
-   * 必须在实体所属线程调用（事件与周期复检本就落在该线程上）。
-   *
-   * <p>{@code mode} 决定「实体超出强制可见距离时」是否打射线（见 {@link RecheckMode}）：
+   * <p>{@code mode} 决定「实体超出强制可见距离时」是否做判定（见 {@link RecheckMode}）：
    * <ul>
-   *   <li>{@link RecheckMode#INITIAL}（入场首评）与 {@link RecheckMode#ROTATION}（轮转分片复检）：
-   *       允许对远距离实体打射线并隐藏，因此 {@code evaluate} 里的 hide 分支可达——这正是复检能够
+   *   <li>{@link RecheckMode#INITIAL}（入场首评）与 {@link RecheckMode#ROTATION}（轮转复检）：
+   *       允许对远距离实体做判定并隐藏，因此 {@code evaluate} 里的 hide 分支可达——这正是复检能够
    *       真正收敛到隐藏的入口；</li>
-   *   <li>{@link RecheckMode#RESTORE_ONLY}（已隐藏实体复检）：超出距离一律不打射线，只等实体重新回到
-   *       强制可见距离内再恢复，成本有界。</li>
+   *   <li>{@link RecheckMode#RESTORE_ONLY}（已隐藏实体复检）：超出距离一律不提交判定，只等实体重新
+   *       回到强制可见距离内再恢复，成本有界。</li>
    * </ul>
    * 无论哪条通道，处于强制可见距离内的实体一律 {@code showIfHidden}（安全策略：绝不隐藏近处实体）。
    */
@@ -801,11 +750,11 @@ public final class EntityCuller implements Listener {
         return;
       }
       // 超出强制可见距离：
-      //  ① RESTORE_ONLY：不打射线（远距离账本条目可能长期滞留，每周期打射线会让成本随会话无界增长）。
+      //  ① RESTORE_ONLY：不提交判定（远距离账本条目可能长期滞留，每周期判定会让成本随会话无界增长）。
       //     账本条目保留——Paper 的 hideEntity 状态跨 untrack 仍生效，账本是「重新进入强制可见距离时
       //     该不该 showEntity」的唯一依据；实体一旦回到近处，上面的 showIfHidden 分支即恢复它。
       //     视锥隐藏条目的「回到视野锥内即恢复」由 recheck 通道①的纯数学复判负责（见那里的注释）。
-      //  ② ROTATION：允许打射线并隐藏。数量已由 recheck-budget 封顶，故成本有界（每周期至多预算次射线）。
+      //  ② ROTATION：提交全部追踪实体，成本由专用池的时间预算封顶（超预算者顺延，不丢判定）。
       //  ③ INITIAL：入场首评不受距离闸门限制，远距离实体照常剔除（既有行为不变）。
       if (mode == RecheckMode.RESTORE_ONLY) {
         return;
@@ -815,15 +764,15 @@ public final class EntityCuller implements Listener {
         evaluate(player, entity, true, mode != RecheckMode.INITIAL, true);
         return;
       }
-      // 射线遮挡判定（异步路径）：实体线程只抓快照并提交，判定与发布在专用池 / 回投里完成
-      // （见 submitAsync / publishAsync）。这一支取代了下面的原生射线，且<b>不再读方块</b>。
-      if (asyncRaycast()) {
-        submitAsync(player, entity, mode != RecheckMode.INITIAL);
+      // 遮挡判定：实体线程只抓快照并提交，判定与发布在专用池 / 回投里完成（见 submitAsync /
+      // publishAsync）。位图不可用（引擎未起，罕见）时 submitAsync 直接返回、不改变显示状态，
+      // 即「无数据 = 不遮挡 = 少藏」的安全方向（实体保持可见）。
+      if (!config.raycast()) {
+        // 只开视锥剔除（raycast=false）：不做遮挡判定，实体保持可见。
+        evaluate(player, entity, false, mode != RecheckMode.INITIAL);
         return;
       }
-      // 射线遮挡判定（同步路径）：raycast=false（只开视锥剔除）时按「不遮挡」处理，实体保持可见。
-      evaluate(player, entity, config.raycast() && occlusion.isFullyOccluded(player, entity),
-          mode != RecheckMode.INITIAL);
+      submitAsync(player, entity, mode != RecheckMode.INITIAL);
     } catch (Throwable throwable) {
       // 任意失败都按「保持可见」处理（fail-open：绝不误藏实体）
       logThrottled(throwable);
@@ -839,11 +788,11 @@ public final class EntityCuller implements Listener {
   }
 
   /**
-   * 异步射线路径的<b>提交侧</b>（运行在实体所属线程）：抓几何快照 → 组纯值任务 → 入队。
+   * 遮挡判定的<b>提交侧</b>（运行在实体所属线程）：抓几何快照 → 组纯值任务 → 入队。
    *
    * <p><b>为什么只抓快照</b>：{@code getEyeLocation} / {@code getBoundingBox} 都是 Bukkit API，必须在实体
    * 所属线程读取；读出的坐标是纯数值，交给专用池后工作线程<b>绝不触碰任何 Bukkit API</b>（Folia 上跨区域
-   * 读会先打 ERROR 再抛异常）。与同步路径相比，只是把「射线本身」从实体线程搬到了专用池。
+   * 读会先打 ERROR 再抛异常）。
    *
    * <p><b>失败与拒收都不改变显示状态</b>：抓几何失败、或任务因队列满被拒收时，一律<b>保持实体当前
    * 显示状态</b>（与引擎「超时丢弃同样不改变显示状态」一致）：当前状态由此前一次成功判定决定，
@@ -1032,81 +981,9 @@ public final class EntityCuller implements Listener {
   }
 
   /**
-   * 实体所属线程：用 Paper 原生射线判定实体是否被完全遮挡。
-   *
-   * <p>把包围盒「朝向玩家一侧」的可见顶点逐一射向玩家眼睛，任一条通畅即判「未被完全遮挡」；
- * 可见顶点由 {@code visibleVertices} 给出（包围盒至多 7 个），再由 {@code entity-culling.ray-samples}
-   * （已钳制 1..7，上限即 {@link BandwidthConfig#MAX_RAY_SAMPLES}）截断实际尝试的顶点数。
-   *
-   * <p><b>失败语义 fail-open</b>：任何异常都返回 {@code false}（不遮挡）——绝不误藏实体。
-   *
-   * @return true 表示所有候选顶点的射线都被遮挡（可隐藏）
-   */
-  boolean isFullyOccluded(Player player, Entity entity) {
-    try {
-      Location eye = player.getEyeLocation();
-      World world = entity.getWorld();
-      BoundingBox box = entity.getBoundingBox();
-      double[][] vertices = visibleVertices(eye.getX(), eye.getY(), eye.getZ(),
-          box.getMinX(), box.getMinY(), box.getMinZ(), box.getMaxX(), box.getMaxY(), box.getMaxZ());
-      int limit = Math.min(Math.max(1, config.raySamples()), vertices.length);
-      // 复用同一枚 Vector 承载每个采样点的射线方向：方向只被 rayTraceBlocks 读取、不被持有，
-      // 且本轮评估始终运行在单一实体所属线程上，反复改写其分量是安全的；省下原先「每个采样点
-      // new 一个 Vector + normalize() 再 new 一个」的分配。
-      Vector direction = new Vector();
-      for (int i = 0; i < limit; i++) {
-        if (isClear(world, eye, vertices[i][0], vertices[i][1], vertices[i][2], direction)) {
-          return false;
-        }
-      }
-      return true;
-    } catch (Throwable throwable) {
-      logThrottled(throwable);
-      return false;
-    }
-  }
-
-  /**
-   * 从眼睛射向该世界坐标点：命中「可遮挡方块」即算被挡；未命中、或命中的是非遮挡方块
-   * （玻璃/台阶/植物等，玩家仍能看见其后的实体）算通畅。
-   *
-   * <p>{@code FluidCollisionMode.NEVER}：流体不参与射线（水里的实体照常可见）。
-   *
-   * <p><b>遮挡判定经统一入口 {@link BukkitOcclusion#visualOccluding}（实体口径）</b>：直接取命中方块的
-   * <b>逐状态真值</b>（{@code BlockData#isOccluding()} + 唯一的 barrier 例外），而非
-   * {@code Material#isOccluding()} 的方块级近似。这样本同步射线与异步位图（{@code EntityOcclusionTable}，
-   * 同源真值）在<b>状态相关方块</b>（双台阶 vs 单台阶）与 barrier 上结论一致——即
-   * {@code entity-culling.async-occlusion} 开 / 关都不会改变同一方块的判定。
-   */
-  private static boolean isClear(World world, Location eye, double x, double y, double z,
-      Vector direction) {
-    double dx = x - eye.getX();
-    double dy = y - eye.getY();
-    double dz = z - eye.getZ();
-    double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (distance < 1.0E-6D) {
-      return true;
-    }
-    // 手写归一化并写入调用方复用的 direction（等价于 new Vector(dx,dy,dz).normalize()，但不新分配对象）
-    double inverse = 1.0D / distance;
-    direction.setX(dx * inverse);
-    direction.setY(dy * inverse);
-    direction.setZ(dz * inverse);
-    // 射线长度封顶：实体在追踪范围边缘时 eye→顶点可能达上百格，截断到 MAX_RAY_LENGTH；
-    // 截断只会让更远的遮挡方块打不到而返回「通畅」（fail-open 保持可见），绝不改变「近处命中的遮挡判定」。
-    RayTraceResult hit = world.rayTraceBlocks(eye, direction, Math.min(distance, MAX_RAY_LENGTH),
-        FluidCollisionMode.NEVER, true);
-    if (hit == null || hit.getHitBlock() == null) {
-      return true;
-    }
-    Block block = hit.getHitBlock();
-    return !BukkitOcclusion.visualOccluding(block.getBlockData());
-  }
-
-  /**
    * 取实体包围盒上「朝向玩家一侧」的可见顶点，用于多射线判定（任一射线不被遮挡即视为可见）。
    *
-   * <p>原生射线改造后本方法仍需要：一次判定最多尝试 {@code ray-samples} 个顶点。
+   * <p>一次判定最多尝试 {@code ray-samples} 个顶点。
    *
    * @return 顶点数组，每项为 (x, y, z)
    */

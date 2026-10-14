@@ -109,7 +109,7 @@ public final class PacketEventsHook {
   private static String occlusionConsistencyCheck(BlockStateRegistry registry) {
     int drift = registry.occlusionDriftStateCount();
     if (registry.entityOccludingStateCount() < 0) {
-      return "实体遮挡口径：未构建（离线场景），已回落伪装口径——异步实体位图此时与同步射线口径不同，请反馈";
+      return "实体遮挡口径：未构建（离线场景），已回落伪装口径——实体位图此时与伪装口径不同，请反馈";
     }
     if (drift == 0) {
       return "两套口径一致性：伪装口径与实体口径同源（逐状态真值），逐状态判定差异 0"

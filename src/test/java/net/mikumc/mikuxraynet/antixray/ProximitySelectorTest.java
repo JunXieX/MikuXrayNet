@@ -218,9 +218,8 @@ class ProximitySelectorTest {
   /**
    * 测试用「从眼睛到目标点的体素路径」（不含起点与终点所在体素）。
    *
-   * <p>生产已改用 Paper 原生 {@code World#rayTraceBlocks}（见 {@code ProximityRevealer}），
-   * 这里保留一份独立的等距步进实现，只为离线断言「候选点选择 + 任一通畅即可见」的语义不被削弱；
-   * 它不参与生产路径。
+   * <p>生产已改用遮挡位图步进射线（见 {@link BitmapVisibility}），这里保留一份独立的等距步进实现，
+   * 只为离线断言「候选点选择 + 任一通畅即可见」的语义不被削弱；它不参与生产路径。
    */
   private static int[] voxelPath(ProximitySelector.Eye eye, double toX, double toY, double toZ) {
     double deltaX = toX - eye.x();
@@ -312,7 +311,7 @@ class ProximitySelectorTest {
 
   /**
    * 由内存遮挡表构造探针：等价于「用体素步进做单点射线」，供 {@code isVisible} 的离线断言使用
-   * （生产注入的是 {@code World#rayTraceBlocks}，见 {@code ProximityRevealer}）。
+   * （生产注入的是遮挡位图步进射线，见 {@link BitmapVisibility}）。
    */
   private static ProximitySelector.RayProbe probe(ProximitySelector.Eye eye,
       ProximitySelector.RayQuery table) {

@@ -13,18 +13,6 @@ import org.bukkit.block.data.BlockData;
  * 本类只是它的 Bukkit 适配层。凡在运行期拿到 {@link BlockData} 的调用点都应经本类，不要直接调
  * {@code isOccluding()}。
  *
- * <p><b>两种口径，按用途选对</b>：
- * <ul>
- *   <li>{@link #visualOccluding(BlockData)}——<b>视觉口径</b>（服务端逐状态真值 + 唯一的 barrier 例外，
- *       不含 {@code occlusion.extra-*} 覆盖）：实体剔除的同步射线（{@code EntityCuller.isClear}）与邻近显形的
- *       可见性判定（{@code ProximityRevealer}）都用它——「隐藏」与「显形」都回答同一个问题
- *       「玩家视觉能否看穿」，只是方向相反。它与异步遮挡位图（{@code EntityOcclusionTable}）同源，
- *       因此同一方块在「同步 / 异步」「隐藏 / 显形」四条路径上结论一致。</li>
- *   <li>{@link #camouflageOccluding(BlockData, java.util.Set, java.util.Set)}——<b>伪装口径</b>
- *       （视觉口径 + {@code occlusion.extra-*} 名称覆盖）：反矿透边界邻块（{@code NeighborChunkProvider}）
- *       用它，与 {@code ObfuscationProcessor} 内部的伪装判定保持同源。</li>
- * </ul>
- *
  * <p><b>覆盖表的作用域（既定语义）</b>：{@code occlusion.extra-occluding} / {@code extra-non-occluding}
  * <b>只</b>作用于「伪装」判定，<b>不</b>进入显形与实体剔除（两者走视觉口径）。因此当管理员配置了覆盖项时，
  * 同一方块在「伪装」与「显形/实体剔除」上<b>可能得出不同结论</b>——这是有意的：覆盖表是校正「哪些方块该被
@@ -36,19 +24,6 @@ import org.bukkit.block.data.BlockData;
 public final class BukkitOcclusion {
 
   private BukkitOcclusion() {
-  }
-
-  /**
-   * 视觉口径：逐状态真值（{@code BlockData#isOccluding()}）套用唯一那处 barrier 例外。
-   *
-   * <p>「玩家视觉能否看穿」是同一个问题，「隐藏」与「显形」只是方向相反：实体剔除的同步射线
-   * （{@code EntityCuller.isClear}）与邻近显形的可见性判定（{@code ProximityRevealer} 的原生射线降级路径）
-   * 都走本方法，与异步位图（{@code EntityOcclusionTable}）同源。
-   *
-   * @param data 命中/查询到的方块状态；{@code null} 按「不遮挡」处理（未知即不遮挡，少算一个遮挡面）
-   */
-  public static boolean visualOccluding(BlockData data) {
-    return data != null && OcclusionRules.visualVerdict(name(data), data.isOccluding());
   }
 
   /**

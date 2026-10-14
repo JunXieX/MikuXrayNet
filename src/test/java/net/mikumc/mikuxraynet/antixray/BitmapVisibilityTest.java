@@ -85,7 +85,7 @@ class BitmapVisibilityTest {
   @Test
   void nullStoresIsNotVisible() {
     assertFalse(BitmapVisibility.local().isVisible(eye(), null, WORLD, SAMPLES, 8, 0, 5),
-        "整体无位图 → 不显形（严格方向；生产由 ProximityRevealer 回落原生射线路径，不走本判定）");
+        "整体无位图 → 不显形（严格方向：位图缺失时绝不裸发）");
   }
 
   /**

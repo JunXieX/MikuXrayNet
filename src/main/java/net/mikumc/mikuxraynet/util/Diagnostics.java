@@ -73,7 +73,7 @@ public final class Diagnostics {
       Rewrite rewrite,
       Proximity proximity,
       Index index,
-      // 异步遮挡域（entity-culling.async-occlusion）：位图驻留量、专用池队列深度与判定计数
+      // 遮挡判定域：位图驻留量、专用池队列深度与判定计数
       Occlusion occlusion,
       Throttle throttle,
       Pool pool,
@@ -153,18 +153,18 @@ public final class Diagnostics {
     }
 
     /**
-     * 异步遮挡域：位图驻留量与专用池队列深度，以及判定计数（提交 / 完成 / 超时丢弃 / 队列满拒收 /
+     * 遮挡判定域：位图驻留量与专用池队列深度，以及判定计数（提交 / 完成 / 超时丢弃 / 队列满拒收 /
      * 判定异常 / 遮挡数据缺失）与射线累计耗时。
      *
      * <p><b>为什么「缺遮挡数据」必须单列</b>：它是「区块没被建过表」的覆盖率观测点——只要它持续偏高，
      * 就说明大量区块查不到位图（射线一律按不遮挡放行，实体只是少藏、不会误藏）。真机调优时它比
-     * 「隐藏数」更能说明异步路径是否真的覆盖到了玩家周围的区块。
+     * 「隐藏数」更能说明遮挡判定是否真的覆盖到了玩家周围的区块。
      *
      * <p><b>为什么「判定异常」必须单列</b>：单条判定在工作线程内抛异常会被就地吞掉（不改变显示状态，
      * 方向安全），但若这类输入持续出现，说明射线链路存在越界/畸形坐标等异常输入；这一计数不落盘、
      * 不进日志，若此处不回显便完全不可观测（故障会表现为「部分判定静默丢失」而无人知晓）。
      *
-     * @param active          异步遮挡是否已真正接线（引擎已起 + 位图仓库可用）；与配置开关不是一回事
+     * @param active          遮挡判定引擎是否已真正接线（引擎已起 + 数据源可用）
      * @param sectionsResident 当前驻留的遮挡 section 条目总数（跨世界求和）
      * @param queueDepth      专用池当前排队的判定数（持续接近队列上限说明引擎线程跟不上）
      * @param patchFailures   补丁失败（拿不到新方块口径）的格数（这些格已被置为「不遮挡」，属「少藏」方向）
@@ -177,7 +177,7 @@ public final class Diagnostics {
         long unknownSection, long nanosTotal, long patched, long patchFailures,
         long stateIdFallbacks) {
 
-      /** 异步遮挡未接线时的零值兜底。 */
+      /** 遮挡判定未接线时的零值兜底。 */
       public static final Occlusion EMPTY =
           new Occlusion(false, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
@@ -261,9 +261,9 @@ public final class Diagnostics {
         + "（合并 " + s.throttle().blockChangesMerged() + " 个原包）"
         + "｜实体隐藏 " + s.throttle().entitiesHidden() + "/恢复 " + s.throttle().entitiesShown()
         + "（当前隐藏中 " + s.throttle().entitiesHiddenNow() + "）"
-        // 异步遮挡只带最关键的三个量（是否接线 / 队列积压 / 缺数据），避免单行摘要被塞满
+        // 遮挡判定只带最关键的三个量（是否接线 / 队列积压 / 缺数据），避免单行摘要被塞满
         + "｜磁盘缓存命中 " + s.diskCache().hits() + "，条目约 " + s.diskCache().entries()
-        + "｜异步遮挡 " + (s.occlusion().active() ? "已接线" : "未接线")
+        + "｜遮挡判定 " + (s.occlusion().active() ? "已接线" : "未接线")
         + "（位图 " + s.occlusion().sectionsResident() + "，队列 " + s.occlusion().queueDepth()
         + "，缺数据 " + s.occlusion().unknownSection() + "）"
         + "｜队列 " + s.pool().queueSize() + "/" + s.pool().queueCapacity();
@@ -431,10 +431,10 @@ public final class Diagnostics {
   }
 
   /**
-   * 组装异步遮挡域快照：未接线（管线未建 / 引擎未起）时直接复用零值组。
+   * 组装遮挡判定域快照：未接线（管线未建 / 引擎未起）时直接复用零值组。
    *
-   * <p>{@code active} 取自「引擎已起 + 位图仓库可用」这一真实接线状态，而非配置开关——两者在
-   * 「反矿透未启用 / 引擎启动失败」时会不一致，回显必须如实反映实际生效情况。
+   * <p>{@code active} 取自「引擎已起 + 数据源可用」这一真实接线状态：正常情况下恒为 true，
+   * 为 false 表示引擎启动失败等罕见故障（此时射线遮挡判定整体跳过、仅做视锥剔除），回显如实反映。
    */
   private static Snapshot.Occlusion occlusionSnapshot(ThrottlePipeline pipeline,
       OcclusionStats stats) {
@@ -539,9 +539,9 @@ public final class Diagnostics {
         // 视锥剔除单列：它的失效模式是「转头后实体迟一步出现」，与射线剔除（该看见的被藏）完全不同，
         // 分列后管理员据此判断该不该调大 frustum.min-distance 或关掉该子项。
         + "）｜视锥剔除 隐藏 " + s.throttle().frustumHidden() + "/恢复 " + s.throttle().frustumShown());
-    // 异步遮挡单列：它取代了实体线程上的原生射线，其「是否接线 / 位图覆盖 / 是否积压」与同步路径
-    // 下的口径完全不同，必须独立观测；「缺遮挡数据」持续偏高说明区块没被建表（射线一律放行）。
-    lines.add("异步遮挡：" + (s.occlusion().active() ? "已接线" : "未接线（走同步原生射线）")
+    // 遮挡判定单列：它取代了实体线程上的原生命中射线，其「是否接线 / 位图覆盖 / 是否积压」必须独立
+    // 观测；「缺遮挡数据」持续偏高说明区块没被建表（射线一律放行）。
+    lines.add("遮挡判定：" + (s.occlusion().active() ? "已接线" : "未接线（仅做视锥剔除）")
         + "｜位图 section " + s.occlusion().sectionsResident()
         + "，队列 " + s.occlusion().queueDepth()
         + "｜判定 提交 " + s.occlusion().submitted() + "，完成 " + s.occlusion().computed()
@@ -878,7 +878,6 @@ public final class Diagnostics {
         .append("，raycast=").append(c.entityCulling().raycast())
         .append("，force-visible-distance=").append(c.entityCulling().forceVisibleDistance())
         .append("，update-interval-ticks=").append(c.entityCulling().updateIntervalTicks())
-        .append("，recheck-budget=").append(c.entityCulling().recheckBudget())
         .append("，ray-samples=").append(c.entityCulling().raySamples())
         // 视锥子项与「有效距离门」一并回显：有效门 = max(frustum.min-distance, force-visible-distance)，
         // 只打印配置值会让「配了 24 却从 32 格才生效」看起来像读错配置。

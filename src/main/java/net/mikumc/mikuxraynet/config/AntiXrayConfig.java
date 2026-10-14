@@ -487,8 +487,7 @@ public final class AntiXrayConfig {
    * @param frustumMinDistance    该距离内的候选豁免视锥判定；默认 {@link #FRUSTUM_MIN_DISTANCE_DEFAULT}，
    *                              <b>不低于 {@link #FRUSTUM_MIN_DISTANCE_FLOOR}</b>（低于下限会被抬升并 WARN）
    * @param raycastEnabled        是否做射线可见性判定（被墙挡住的不显形；<b>默认开启</b>）
-   * @param raycastSamples        <b>每方块最多尝试的候选点数</b>（射线改用 Paper 原生
-   *                              {@code World#rayTraceBlocks} 后不再表示采样数）；
+   * @param raycastSamples        <b>每方块最多尝试的候选点数</b>；
    *                              钳制 1..{@link #PROXIMITY_RAY_SAMPLES_MAX}（默认即上限 5）
    * @param instantReveal         事件驱动即时显形（周期巡检的补充，见 {@link InstantReveal}）
    * @param overRevealSampling    过度显形抽样统计的抽样率分母 N（1/N 抽样，只计数不改行为；
@@ -924,7 +923,7 @@ public final class AntiXrayConfig {
                 root.getDouble("proximity.frustum.min-distance", FRUSTUM_MIN_DISTANCE_DEFAULT),
                 floorAdjustments),
             root.getBoolean("proximity.raycast.enabled", true),
-            // 语义已变：原生射线改造后本键表示「每方块最多尝试的候选点数」（不再表示采样数）。
+            // 本键表示「每方块最多尝试的候选点数」。
             // 钳制 1..PROXIMITY_RAY_SAMPLES_MAX（有效上限 = 暴露面上的候选点数），默认即上限 5。
             // 用 clampCeiling 而非裸 Math.min/max：两端钳制都留痕，管理员能看到配置已被改写。
             clampCeiling(root.getInt("proximity.raycast.samples", 5), 1, PROXIMITY_RAY_SAMPLES_MAX,

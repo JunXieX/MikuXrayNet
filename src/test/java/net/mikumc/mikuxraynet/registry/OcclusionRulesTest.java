@@ -280,16 +280,16 @@ class OcclusionRulesTest {
   }
 
   /**
-   * <b>同步射线 / 异步位图 / 显形</b>三条路径对同一批状态结论一致（都回答同一个视觉问题）。
+   * <b>遮挡位图 / 显形</b>两条路径对同一批状态结论一致（都回答同一个视觉问题）。
    *
    * <p>离线建模：位图口径用真实的 {@link EntityOcclusionTable}（下标即状态 id，按 {@code baseVerdict}
-   * 建位——与 {@code BlockStateRegistry} 对实体口径的建法一致）；同步射线与显形口径用
-   * {@link OcclusionRules#visualVerdict}（生产分别为 {@code BukkitOcclusion#visualOccluding} 的
-   * {@code EntityCuller} / {@code ProximityRevealer} 调用点）。三者在每个状态上必须相等；
-   * barrier 在三者下都判非遮挡（其后方方块可见 → 显形）。
+   * 建位——与 {@code BlockStateRegistry} 对实体口径的建法一致）；显形口径用
+   * {@link OcclusionRules#visualVerdict}（生产为 {@code BitmapVisibility} 读同一张位图、以及
+   * {@code ProximityRevealer} 的可见性判定）。两者在每个状态上必须相等；
+   * barrier 在两者下都判非遮挡（其后方方块可见 → 显形）。
    */
   @Test
-  void syncAsyncAndRevealAgreeOnEveryState() {
+  void bitmapAndRevealAgreeOnEveryState() {
     String[] names = {"stone", "deepslate", "glass", "barrier", "oak_slab"};
     boolean[] truths = {true, true, false, true, true}; // 逐状态真值（oak_slab 这里代表双台阶）
 
@@ -302,13 +302,13 @@ class OcclusionRulesTest {
     EntityOcclusionTable table = EntityOcclusionTable.build(entityOccluding);
 
     for (int id = 0; id < names.length; id++) {
-      boolean bitmap = table.isOccluding(id);                               // 异步位图口径
-      boolean syncOrReveal = OcclusionRules.visualVerdict(names[id], truths[id]); // 同步射线 = 显形口径
-      assertEquals(syncOrReveal, bitmap,
-          names[id] + "：同步射线 / 显形 与 异步位图 的口径必须一致");
+      boolean bitmap = table.isOccluding(id);                               // 遮挡位图口径
+      boolean reveal = OcclusionRules.visualVerdict(names[id], truths[id]); // 显形口径
+      assertEquals(reveal, bitmap,
+          names[id] + "：显形 与 遮挡位图 的口径必须一致");
     }
     assertFalse(table.isOccluding(3), "位图：barrier（真值遮挡）在实体口径下必须判非遮挡");
     assertFalse(OcclusionRules.visualVerdict("barrier", true),
-        "同步射线 / 显形：barrier 同样判非遮挡 → 其后方矿石能显形（体验正确，不泄露）");
+        "显形：barrier 同样判非遮挡 → 其后方矿石能显形（体验正确，不泄露）");
   }
 }

@@ -22,8 +22,8 @@ import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
 import org.junit.jupiter.api.Test;
 
 /**
- * 反矿透改写路径的「异步遮挡建表旁路」测试：{@link ObfuscationProcessor#rewrite} 在解码之后、改写之前
- * 把各 section 的遮挡位图写入 {@link OcclusionStores} 中该世界那一张表，供带宽侧异步射线只读消费。
+ * 反矿透改写路径的「遮挡建表旁路」测试：{@link ObfuscationProcessor#rewrite} 在解码之后、改写之前
+ * 把各 section 的遮挡位图写入 {@link OcclusionStores} 中该世界那一张表，供实体剔除与显形侧只读消费。
  *
  * <p>覆盖三种形态：单值实心段（快路径 → {@link SolidOcclusion}）、全空气段
  * （→ {@link EmptyOcclusion}「已知全不遮挡」）、混合段（→ 逐格位图），并端到端验证
@@ -107,7 +107,7 @@ class OcclusionCaptureTest {
 
   @Test
   void captureIsSkippedWhenOcclusionStoreIsNull() {
-    // 未启用异步遮挡（仓库注册表=null）时，改写照常进行且不抛异常、也不携带遮挡负载
+    // 遮挡仓库注册表=null（构建/离线场景）时，改写照常进行且不抛异常、也不携带遮挡负载
     ObfuscationProcessor processor = processor((OcclusionStores) null);
     ObfuscationProcessor.Result result = processor.rewrite(singleValue(STONE, 4096), 1, 42L, null,
         "world", net.mikumc.mikuxraynet.config.AntiXrayConfig.Dimension.NORMAL, 0, 5, 6);

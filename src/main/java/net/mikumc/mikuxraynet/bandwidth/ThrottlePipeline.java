@@ -93,16 +93,16 @@ public final class ThrottlePipeline {
     this(plugin, config, new ThrottleStats());
   }
 
-  /** 未接线异步遮挡的构造（离线单测 / 反矿透未启用）：实体剔除走同步原生射线。 */
+  /** 无遮挡位图的构造（离线单测 / 反矿透未启用）：实体剔除只做视锥剔除。 */
   public ThrottlePipeline(Plugin plugin, BandwidthConfig config, ThrottleStats stats) {
     this(plugin, config, stats, null, null);
   }
 
   /**
-   * 生产装配构造：追加「异步遮挡数据仓库 + 计数」。
+   * 生产装配构造：追加「遮挡数据仓库 + 计数」。
    *
-   * @param occlusionStores 反矿透侧按世界分域的遮挡位图仓库；{@code null} = 未启用（回落同步射线）
-   * @param occlusionStats  异步遮挡计数（插件级唯一实例，跨热重载复用）
+   * @param occlusionStores 反矿透侧按世界分域的遮挡位图仓库；{@code null} = 位图不可用（仅做视锥剔除）
+   * @param occlusionStats  遮挡判定计数（插件级唯一实例，跨热重载复用）
    */
   public ThrottlePipeline(Plugin plugin, BandwidthConfig config, ThrottleStats stats,
       OcclusionStores occlusionStores, OcclusionStats occlusionStats) {
@@ -171,12 +171,11 @@ public final class ThrottlePipeline {
           ? "block-changes.merge" : "block-changes.enabled");
     }
     if (plan.entityCulling()) {
-      BandwidthConfig.EntityCulling.AsyncOcclusion async = config.entityCulling().asyncOcclusion();
-      if (async != null && async.enabled() && occlusionStores == null) {
-        // 明确告知「开关开了但没生效」：异步遮挡的数据源来自反矿透解码旁路，
-        // 反矿透未启用（或未启用该子项）时没有位图，本模块只能回退同步原生射线。
-        plugin.getLogger().warning("异步遮挡已在配置中开启，但反矿透未建遮挡位图（antixray 未启用或"
-            + "未开启该建表）：实体剔除已回退为同步原生射线（行为与未开启异步时一致）");
+      if (occlusionStores == null) {
+        // 明确告知「位图不可用」：遮挡位图来自反矿透解码旁路，反矿透未启用时没有位图，
+        // 此时射线遮挡判定整体跳过、仅做视锥剔除（fail-open：不误藏）。
+        plugin.getLogger().warning("反矿透未建遮挡位图（antixray 未启用）：实体剔除的射线遮挡判定已跳过，"
+            + "仅做视锥剔除（行为属安全方向：少藏而不误藏）");
       }
       entityCuller = register(
           () -> new EntityCuller(plugin, config.entityCulling(), stats, occlusionStores, occlusionStats),

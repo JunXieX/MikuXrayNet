@@ -84,10 +84,7 @@ public final class ReloadCoordinator {
           + "idle-close-seconds / maintenance-interval-seconds / compact-per-pass / queue-capacity / zstd.*）",
       // occlusion.* 虽参与指纹（改后旧缓存会一次性失效重建），但运行期用于判定的遮挡表由 PacketEventsHook
       // 在启动期一次性构建，reload 不会重建它——改了只有重启才真正生效。
-      "遮挡规则表（occlusion.extra-occluding / extra-non-occluding）",
-      // 异步遮挡「开关本身」必须重启：遮挡位图仓库（OcclusionStores）在 startAntiXray 时按该键一次性创建，
-      // reload 只重建带宽管线、拿不到反矿透侧那座仓库——开了也只会打一次中文 WARN 后回落同步原生射线。
-      "实体剔除异步遮挡开关（entity-culling.async-occlusion）");
+      "遮挡规则表（occlusion.extra-occluding / extra-non-occluding）");
 
   /**
    * 执行一次热重载。

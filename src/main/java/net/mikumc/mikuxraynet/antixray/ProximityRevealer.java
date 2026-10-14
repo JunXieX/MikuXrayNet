@@ -13,7 +13,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.Schedulers;
-import net.mikumc.mikuxraynet.bootstrap.BukkitOcclusion;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
@@ -22,10 +21,8 @@ import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
-import org.bukkit.FluidCollisionMode;
 import org.bukkit.Location;
 import org.bukkit.World;
-import org.bukkit.block.Block;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -36,8 +33,6 @@ import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
 import org.bukkit.event.world.WorldUnloadEvent;
 import org.bukkit.plugin.Plugin;
-import org.bukkit.util.RayTraceResult;
-import org.bukkit.util.Vector;
 
 /**
  * 邻近显形：周期巡检每个在线玩家，把其附近「曾被反矿透伪装过」的坐标的真实方块状态发回客户端。
@@ -61,18 +56,18 @@ import org.bukkit.util.Vector;
  *       因为「看得见却是假的方块」是本功能最严重的失效模式（真机反馈：点击/挖掘才变回来）。
  *       水平方向按 16:9 宽高比换算（120° → 水平半角约 72°），与客户端观感一致；</li>
  *   <li><b>可见性判定</b>（默认开启，多候选点 + 遮挡位图步进射线）：先识别方块的暴露面，只在暴露面上取
-   *       候选点（正对玩家的面中心 → 包围盒最近点 → 面四角），每个候选点用步进射线检测，任一条通畅即显形；
-   *       候选点数由 {@code proximity.raycast.samples} 限制（<b>有效上限 5</b>，即
-   *       {@code ProximitySelector.MAX_SAMPLE_POINTS}，配置给得再大也会被截断）；六面全被遮挡（完全掩埋）时一个点都不采
-   *       → 直接判不可见，绝不隔着墙还原。判定改走反矿透已建好的<b>遮挡位图</b>（{@link BitmapVisibility}），
-   *       因此可整段在工作线程上跑（不再需要 Bukkit API）；位图整体不可用（反矿透未启用
-   *       {@code entity-culling.async-occlusion}）时回落旧的原生射线路径（{@code World#rayTraceBlocks}）
-   *       ——那是<b>降级路径</b>，不是开关。</li>
-   *   <li><b>岩浆遮挡</b>（统一入口）：岩浆视觉不透明（服务端 {@code isOccluding()} 却返回 false），
-   *       现由 {@code OcclusionRules} 的视觉口径并入遮挡，因此位图与降级射线都天然把岩浆当遮挡——
-   *       刷在岩浆里的下界残骸在显形侧不会被还原，不必再单独补判。<b>水不参与</b>（透明，玩家应当能看见
-   *       水下的矿物）。</li>
-   * </ul>
+ *       候选点（正对玩家的面中心 → 包围盒最近点 → 面四角），每个候选点用步进射线检测，任一条通畅即显形；
+ *       候选点数由 {@code proximity.raycast.samples} 限制（<b>有效上限 5</b>，即
+ *       {@code ProximitySelector.MAX_SAMPLE_POINTS}，配置给得再大也会被截断）；六面全被遮挡（完全掩埋）时一个点都不采
+ *       → 直接判不可见，绝不隔着墙还原。判定走反矿透已建好的<b>遮挡位图</b>（{@link BitmapVisibility}），
+ *       因此可整段在工作线程上跑（不需要任何 Bukkit API）。<b>这是唯一的可见性判定路径</b>——
+ *       原生命中射线（{@code World#rayTraceBlocks}）已移除；位图缺失（罕见故障）时按「遮挡」处理
+ *       （严格方向：不显形），绝不裸发。</li>
+ *   <li><b>岩浆遮挡</b>（统一入口）：岩浆视觉不透明（服务端 {@code isOccluding()} 却返回 false），
+ *       现由 {@code OcclusionRules} 的视觉口径并入遮挡，因此位图天然把岩浆当遮挡——
+ *       刷在岩浆里的下界残骸在显形侧不会被还原，不必再单独补判。<b>水不参与</b>（透明，玩家应当能看见
+ *       水下的矿物）。</li>
+ * </ul>
  *
  * <p><b>缺数据的方向（与实体遮挡路径刻意相反）</b>：位图查不到 section、或该世界尚无位图时一律按「遮挡」
  * 处理（见 {@link BitmapVisibility}），即<b>本轮不显形</b>。「无数据 ≠ 通畅」——若按通畅处理，整片尚未
@@ -82,10 +77,9 @@ import org.bukkit.util.Vector;
  *
  * <p><b>线程纪律</b>：位置读取、方块读取与发包都在主线程 / Folia 区域线程（非 Folia 为统一主线程任务，
  * Folia 为各玩家的区域任务）；纯计算（视锥角度 + 遮挡位图可见性）交给 {@link MikuWorkPool} 的工作线程，
- * 算完再回到玩家所属线程，只做「区块加载检查 + 读真实方块 + 发包」。旧的原生射线可见性判定
- * （{@code World#rayTraceBlocks} + 6 邻块读）是 Bukkit API，只能在玩家线程做；位图判定
- * （{@link BitmapVisibility}）不需要，因而被搬到了工作线程。工作队列已满时退化为「玩家线程直接做同一套
- * 纯计算」，功能不降级、绝不阻塞。
+ * 算完再回到玩家所属线程，只做「区块加载检查 + 读真实方块 + 发包」。位图判定（{@link BitmapVisibility}）
+ * 只读无锁位图与纯浮点步进、不需要任何 Bukkit API，因而可与视锥一同被搬到工作线程。工作队列已满时退化为
+ * 「玩家线程直接做同一套纯计算」，功能不降级、绝不阻塞。
  *
  * <p><b>发包纪律</b>：显形包改用 <b>Paper 原生 API</b>（{@code Player#sendMultiBlockChange} /
  * {@code Player#sendBlockChange}）直接发出，不再自拼包结构——因此不触碰 ProtocolLib 的
@@ -117,8 +111,8 @@ public final class ProximityRevealer implements Listener {
    *
    * <p><b>为什么需要它</b>：旧的循环只在发包额度 {@code budget.remaining() <= 0} 时断环，而可见性判定
    * 失败、区块未加载都是直接 {@code return}、<b>不扣发包额度</b>——于是发包额度只限「发了多少包」，
-   * 不限「评估了多少候选」。每评估一个候选要在主线程 / 区域线程上读 6 个邻块并行 ≤4 条原生射线，是
-   * 本功能最重的部分；一批「永远看不见的坐标」（整块埋住、上方流体等）会把评估量顶到候选上限
+   * 不限「评估了多少候选」。每评估一个候选要做暴露面识别 + 多候选点位图步进，是本功能最重的部分；
+   * 一批「永远看不见的坐标」（整块埋住、上方岩浆等）会把评估量顶到候选上限
    * {@link #MAX_CANDIDATES} 而一个包都不发。这里单独设一个评估额度：无论是否发得出包，评估次数触顶即
    * 停。候选本就按距离由近到远取（见 ProximityScanner），因此超出的候选只是延后到后续周期（分片轮转）
    * 评估，<b>可见的矿仍会显形，最坏多等一个周期</b>——绝不丢显形。
@@ -200,8 +194,7 @@ public final class ProximityRevealer implements Listener {
   /**
    * 工作线程算出的显形计划：仅含通过筛选（视锥剔除 + 位图可见性）的候选三元组。
    *
-   * <p>位图可见性只在「异步遮挡位图可用」时并入本步（见 {@link #computePlan}）；否则可见性仍由发布侧
-   * 用原生射线判定（{@code rayClear}），此时 {@link #rayCulled} 恒为 0。
+   * <p>{@link #rayCulled} 为并入本步的位图可见性剔除数。
    */
   private static final class Plan {
 
@@ -276,9 +269,8 @@ public final class ProximityRevealer implements Listener {
   private final BypassRegistry bypassRegistry;
   private final MikuWorkPool workPool;
   /**
-   * 异步遮挡位图注册表（与实体剔除共用同一份，{@code entity-culling.async-occlusion} 关闭时为
-   * {@code null}）。非 null 时可见性判定改走位图（可搬离玩家线程，见 {@link BitmapVisibility}），
-   * 为 null 时回落旧的原生射线路径。
+   * 遮挡位图注册表（与实体剔除共用同一份）。可见性判定恒走位图（{@link BitmapVisibility}，可搬离玩家
+   * 线程）；{@code null} 表示位图不可用（罕见故障），此时按「遮挡」处理（严格方向：不显形）。
    */
   private final OcclusionStores occlusionStores;
   private final AtomicInteger errorCounter = new AtomicInteger();
@@ -305,8 +297,6 @@ public final class ProximityRevealer implements Listener {
   private final AtomicBoolean firstRevealDiagnosed = new AtomicBoolean();
   /** 「显形索引安全阀触发」只提示一次（CAS 抢占），避免每轮巡检刷屏。 */
   private final AtomicBoolean capacityWarned = new AtomicBoolean();
-  /** 「可见性判定失败」只提示一次（CAS 抢占）：原生射线改造后新增的失败模式必须可见但不刷屏。 */
-  private final AtomicBoolean visibilityWarned = new AtomicBoolean();
   /** 事件显形的每玩家每 tick 限额（默认 16，防爆刷；见 {@link TickQuota}）。 */
   private final TickQuota instantQuota = new TickQuota();
   /** 过度显形抽样器（1/N，只计数不改行为；N=0 关闭）。 */
@@ -352,8 +342,8 @@ public final class ProximityRevealer implements Listener {
    * <p><b>为什么不需要 ProtocolLib 协议管理器</b>：显形发包已改用 Paper 原生 API（见类注释「发包纪律」），
    * 封包通道由本插件其它模块继续使用，本类不读取它——因此不留无用形参。
    *
-   * @param occlusionStores 异步遮挡位图注册表（与实体剔除共用）；{@code null} 表示未启用异步遮挡，
-   *                        此时可见性判定回落原生射线路径（见类注释）
+   * @param occlusionStores 遮挡位图注册表（与实体剔除共用）；{@code null} 表示位图不可用（罕见故障），
+   *                        此时 {@link BitmapVisibility} 按「遮挡」处理（严格方向：不显形）
    */
   public ProximityRevealer(Plugin plugin, AntiXrayConfig config,
       ObfuscatedChunkIndex chunkIndex, RevealedSet revealedSet, ProximityStats stats,
@@ -400,17 +390,12 @@ public final class ProximityRevealer implements Listener {
         + "，显形发包 " + (batchRevealSends ? "已合并（Paper 原生多方块变更包）" : "逐坐标单包"));
   }
 
-  /** 启动摘要里的「可见性判定」一句话（区分位图路径与无位图时的原生射线降级路径）。 */
+  /** 启动摘要里的「可见性判定」一句话。 */
   private String visibilitySummary() {
     if (!proximity.raycastEnabled()) {
       return "已关闭";
     }
-    String samples = "暴露面上至多 " + proximity.raycastSamples() + " 个候选点";
-    if (occlusionStores != null) {
-      return "已开启（遮挡位图步进射线 + " + samples + "，工作线程执行）";
-    }
-    return "已开启（降级：Paper 原生射线 rayTraceBlocks + " + samples + "；"
-        + "因未启用 entity-culling.async-occlusion 无位图可用）";
+    return "已开启（遮挡位图步进射线 + 暴露面上至多 " + proximity.raycastSamples() + " 个候选点，工作线程执行）";
   }
 
   /** 停用：注销任务与事件监听，并清空两个显形索引（不留副作用）。 */
@@ -596,10 +581,8 @@ public final class ProximityRevealer implements Listener {
 
     boolean frustum = proximity.frustumEnabled();
     boolean visibility = proximity.raycastEnabled();
-    // 位图可见性：仅在「异步遮挡位图可用」且「可见性判定已启用」时成立；否则回落原生射线（发布侧判定）。
-    // 位图整体不可用（反矿透未启用 entity-culling.async-occlusion）时走降级路径，不是开关。
-    boolean bitmapVisibility = occlusionStores != null && visibility;
-
+    // 可见性判定唯一走遮挡位图（原生命中射线已移除）。位图缺失（罕见故障）时 BitmapVisibility 按「遮挡」
+    // 处理（严格方向：不显形），绝不裸发——「无数据 ≠ 通畅」是显形侧的既定安全方向。
     if (!frustum && !visibility) {
       // 两项筛选都关闭：无任何可做的判定，直接发包
       sendCandidates(player, world, candidates, null, null, budget, scanTally, false);
@@ -609,26 +592,20 @@ public final class ProximityRevealer implements Listener {
     // 只把纯值交给工作线程；这里的 Player 引用仅供「交回所属线程」调度使用，工作线程不对它做任何调用
     ProximitySelector.Eye eye = eyeOf(player);
 
-    if (!frustum && !bitmapVisibility) {
-      // 只有可见性判定、且走原生射线（无位图）：旧行为——在玩家线程上逐个判定，无需 worker 纯计算
-      sendCandidates(player, world, candidates, null, eye, budget, scanTally, false);
-      return;
-    }
-
     int[] coordinates = flatten(candidates);
 
     if (workPool == null || !workPool.hasCapacity()) {
       // 队列已满 / 未装配工作池：保底路径——在当前线程直接做同一套纯计算（视锥 + 位图可见性）。
-      // 位图判定不再需要 Bukkit API，「搬离玩家线程」只是性能优化，退化后功能不降级。
+      // 位图判定不需要 Bukkit API，「搬离玩家线程」只是性能优化，退化后功能不降级。
       sendCandidates(player, world, null,
-          computePlan(eye, coordinates, worldName, bitmapVisibility), eye, budget, scanTally,
-          bitmapVisibility);
+          computePlan(eye, coordinates, worldName, visibility), eye, budget, scanTally,
+          visibility);
       return;
     }
 
     try {
       workPool.execute(() -> {
-        Plan plan = computePlan(eye, coordinates, worldName, bitmapVisibility);
+        Plan plan = computePlan(eye, coordinates, worldName, visibility);
         // 读方块与发包必须回到玩家所属线程。世界在候选筛选时已捕获（见 reveal 的 world 局部量），
         // 这里绝不再取 player.getWorld()：异步回调期间玩家可能已切换世界，重取会让「旧世界的候选坐标」
         // 配上「新世界的 ChunkKey」（污染已显形集合）并发出冗余包。改用捕获的世界，且校验玩家仍在同一
@@ -636,7 +613,7 @@ public final class ProximityRevealer implements Listener {
         Schedulers.onEntity(plugin, player, () -> {
           try {
             if (player.isOnline() && player.getWorld() == world) {
-              sendCandidates(player, world, null, plan, eye, budget, scanTally, bitmapVisibility);
+              sendCandidates(player, world, null, plan, eye, budget, scanTally, visibility);
             }
           } catch (Throwable throwable) {
             logThrottled(throwable);
@@ -647,33 +624,33 @@ public final class ProximityRevealer implements Listener {
       // 入队失败（线程池关闭等）：退化为当前线程纯计算，绝不丢显形
       logThrottled(throwable);
       sendCandidates(player, world, null,
-          computePlan(eye, coordinates, worldName, bitmapVisibility), eye, budget, scanTally,
-          bitmapVisibility);
+          computePlan(eye, coordinates, worldName, visibility), eye, budget, scanTally,
+          visibility);
     }
   }
 
   /**
-   * 工作线程 / 保底线程：候选筛选（纯计算，不触碰任何 Bukkit API）——视锥角度 +（位图可用时）遮挡位图可见性。
+   * 工作线程 / 保底线程：候选筛选（纯计算，不触碰任何 Bukkit API）——视锥角度 + 遮挡位图可见性。
    *
    * <p><b>为什么可见性也能在这里做</b>：位图判定只读 {@link OcclusionStores}（无锁读）与纯浮点步进
-   * （见 {@link BitmapVisibility}），不像旧的 {@code World#rayTraceBlocks} 那样是 Bukkit API——
-   * 因此可与视锥一同落到工作线程，把本功能最重的一笔 CPU 从玩家线程搬走。
+   * （见 {@link BitmapVisibility}），不是 Bukkit API——因此可与视锥一同落到工作线程，把本功能最重的一笔
+   * CPU 从玩家线程搬走。
    *
    * <p><b>缺数据即不可见</b>：位图查不到 section / 该世界尚无位图时按「遮挡」处理，候选本轮被剔除、
    * 留在伪装清单里等下一个周期——「无数据 ≠ 通畅」，否则整片未建表的区域会被一次性还原成真实方块。
    *
-   * @param worldName         候选所属世界名（位图按世界分域，须与写入侧口径一致）
-   * @param bitmapVisibility  本轮的可见性判定是否走遮挡位图（由 {@link #reveal} 判定并传入，保证整轮
-   *                          「位图判定 or 原生射线判定」是同一个取值）
+   * @param worldName  候选所属世界名（位图按世界分域，须与写入侧口径一致）
+   * @param visibility 本轮是否做可见性判定（= {@code proximity.raycast.enabled}，由 {@link #reveal}
+   *                   传入，保证整轮取值一致）
    */
   private Plan computePlan(ProximitySelector.Eye eye, int[] coordinates, String worldName,
-      boolean bitmapVisibility) {
+      boolean visibility) {
     boolean frustum = proximity.frustumEnabled();
     double minDistance = proximity.frustumMinDistance();
     double fov = proximity.frustumFov();
     int maxPoints = proximity.raycastSamples();
     // 每线程复用的位图判定器（内部 OcclusionRay 游标不可跨线程共享）：这里只取当前线程那一份。
-    BitmapVisibility bitmap = bitmapVisibility ? BitmapVisibility.local() : null;
+    BitmapVisibility bitmap = visibility ? BitmapVisibility.local() : null;
 
     int count = coordinates.length / 3;
     int[] kept = new int[coordinates.length];
@@ -719,7 +696,7 @@ public final class ProximityRevealer implements Listener {
    * 逐个候选做可见性判定 → 发包 → 标记已显形；{@code eye} 为 {@code null} 时不启用可见性判定。
    *
    * @param visibilityInPlan 可见性是否已在 {@link #computePlan} 里按遮挡位图判完（true 时 sendOne 不再
-   *                         重复判定；false 时按原生射线在玩家线程判定）
+   *                         重复判定；false 时 sendOne 在当前线程用位图判定，如事件即时显形路径）
    */
   private void sendCandidates(Player player, World world,
       List<ObfuscatedChunkIndex.Position> candidates, Plan plan, ProximitySelector.Eye eye,
@@ -729,7 +706,7 @@ public final class ProximityRevealer implements Listener {
     tally.chunksSkipped = scanTally.chunksSkipped;
     tally.chunksDeferred = scanTally.chunksDeferred;
     tally.positionsEvaluated = scanTally.positionsEvaluated;
-    // 位图可见性的剔除发生在 computePlan（见其 rayCulled）；原生射线路径的剔除在 sendOne 里累计
+    // 位图可见性的剔除发生在 computePlan（见其 rayCulled）；未走计划的路径在 sendOne 里累计
     tally.rayCulled = plan != null ? plan.rayCulled : 0;
     int candidateCount = plan != null
         ? plan.candidateCount
@@ -774,7 +751,8 @@ public final class ProximityRevealer implements Listener {
    * 单个坐标：区块未加载则跳过、不可见则跳过，否则读真实方块；批量模式累积、否则立即发包并标记。
    *
    * @param visibilityInPlan 可见性是否已在工作线程按遮挡位图判完（见 {@link #sendCandidates}）；
-   *                         为 true 时此处不再重复判定（位图已含岩浆与 barrier 的视觉口径）
+   *                         为 true 时此处不再重复判定；为 false 时在当前线程用位图判定
+   *                         （事件即时显形路径；位图缺失时按「遮挡」处理，严格方向：不显形）
    */
   private void sendOne(Player player, World world, int x, int y, int z, ProximitySelector.Eye eye,
       Budget budget, PassTally tally, RevealBatch batch, boolean visibilityInPlan) {
@@ -784,10 +762,11 @@ public final class ProximityRevealer implements Listener {
       return;
     }
 
-    // 可见性判定：位图路径已在工作线程判完（visibilityInPlan=true，此处跳过）；降级路径在位图不可用时
-    // 才在玩家线程用 Paper 原生射线判定。两条路径都经统一视觉口径（OcclusionRules），含岩浆与 barrier 例外。
+    // 可见性判定（事件即时显形等未走 computePlan 的路径）：在当前线程用遮挡位图判定。位图缺失时按
+    // 「遮挡」处理（严格方向：不显形），绝不裸发——「无数据 ≠ 通畅」。
     if (eye != null && proximity.raycastEnabled() && !visibilityInPlan
-        && !isVisible(world, eye, x, y, z)) {
+        && !BitmapVisibility.local().isVisible(eye, occlusionStores, world.getName(),
+            proximity.raycastSamples(), x, y, z)) {
       stats.revealsRayCulled.increment();
       tally.rayCulled++;
       return;
@@ -1147,92 +1126,6 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * <b>降级路径</b>（位图整体不可用时）的可见性判定：在玩家所属线程上读 6 个邻块判暴露面，然后对暴露面上的
-   * 至多 {@code proximity.raycast.samples} 个候选点用 Paper 原生射线（{@code World#rayTraceBlocks}）
-   * 逐一检测，任一条通畅即可见。
-   *
-   * <p><b>为什么保留</b>：位图由反矿透改写链路建立（见 {@code OcclusionStores}）；若该功能未启用
-   * （{@code entity-culling.async-occlusion=false}）或未装配，便没有位图可用——此时必须仍能判可见性，
-   * 只是代价回到「在玩家线程上做 Bukkit 读 + 原生射线」。这是<b>降级路径</b>，不是用户开关。
-   *
-   * <p><b>与位图路径同源</b>：这里的遮挡查询走统一入口 {@link BukkitOcclusion#visualOccluding}
-   * （服务端逐状态真值 + barrier 判非遮挡 + 岩浆判遮挡），因此与位图显形路径、实体剔除位图完全一致——
-   * 岩浆（视觉不透明）在两条路径下都判遮挡，其后方/下方方块不显形。
-   *
-   * <p><b>判定失败的方向</b>：读世界/射线出现<b>异常</b>（无法判定）时按「可见」处理，即<b>显形</b>
-   * ——方向由用户指定「尽可能保证玩家可见性」：宁可多还原一块，也不让玩家对着假石头挖矿。
-   * 确定性的结论不受影响：六面全掩埋（含六面全岩浆）、射线命中别的方块这两条仍然判「不显形」
-   * （前者本就看不到，后者是「绝不隔墙还原」，都不属于「无法判定」）。
-   */
-  private boolean isVisible(World world, ProximitySelector.Eye eye, int x, int y, int z) {
-    try {
-      // 候选点数（由 proximity.raycast.samples 提供；有效上限 5，即 ProximitySelector.MAX_SAMPLE_POINTS）
-      int maxPoints = proximity.raycastSamples();
-      // 射线起点必须是带世界的 Location：rayTraceBlocks 依赖它定位起始体素
-      Location eyeLocation = new Location(world, eye.x(), eye.y(), eye.z());
-      ProximitySelector.RayQuery query = new ProximitySelector.RayQuery() {
-        @Override
-        public boolean isOccluding(int blockX, int blockY, int blockZ) {
-          BlockData data = world.getBlockData(blockX, blockY, blockZ);
-          // 显形与隐藏回答的是同一个问题——「玩家视觉能否看穿」——只是方向相反。因此这里与实体口径同源，
-          // 走统一入口 {@link BukkitOcclusion#visualOccluding}（服务端逐状态真值 + barrier 判非遮挡 +
-          // 岩浆判遮挡），与位图显形路径（{@code BitmapVisibility}，读实体口径位图）完全一致。
-          //
-          // <b>纠正一处旧论证</b>：旧实现以「显形必须更保守 → barrier 仍算遮挡 → 更少显形」为由走服务端
-          // 原始真值；但 barrier 的 isOccluding=true 是<b>服务端材质级怪值</b>，而 barrier 对玩家
-          // <b>完全不可见</b>——「矿石只被 barrier 挡住」时玩家本就能看穿它，显形才是正确体验，不是泄露。
-          // 「更少显形 = 更安全」只对石头/深板岩这类<b>真实</b>遮挡方块成立，不应套到 barrier 上。
-          return BukkitOcclusion.visualOccluding(data);
-        }
-      };
-      return ProximitySelector.isVisible(eye, x, y, z, query, maxPoints,
-          (pointX, pointY, pointZ) -> rayClear(world, eyeLocation, x, y, z, pointX, pointY, pointZ));
-    } catch (Throwable throwable) {
-      // 无法判定 → 按「可见」处理（偏显形；方向由用户指定，理由见方法注释）
-      logVisibilityFailure(throwable);
-      return true;
-    }
-  }
-
-  /**
-   * 单点原生射线检测：从眼睛射向世界坐标 {@code (pointX, pointY, pointZ)}。
-   *
-   * <p>返回 true = 途中未被任何方块截住（可视为通畅）；命中「目标方块自身」也容忍为通畅
-   * （候选点正落在方块表面上时的边界情形，射线恰好在端点处碰到本方块）。
-   * 命中其它方块（含玻璃等非遮挡方块）一律判为「不通畅」——宁可漏显形，也绝不隔着墙还原。
-   */
-  private static boolean rayClear(World world, Location eyeLocation, int targetX, int targetY,
-      int targetZ, double pointX, double pointY, double pointZ) {
-    double dx = pointX - eyeLocation.getX();
-    double dy = pointY - eyeLocation.getY();
-    double dz = pointZ - eyeLocation.getZ();
-    double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (distance < 1.0E-6D) {
-      // 眼位与候选点重合：视为通畅（贴得太近，无从遮挡）
-      return true;
-    }
-    Vector direction = new Vector(dx, dy, dz).normalize();
-    // FluidCollisionMode.NEVER：流体不参与射线（流体规则由 isVisible 显式判定）
-    RayTraceResult hit = world.rayTraceBlocks(eyeLocation, direction, distance,
-        FluidCollisionMode.NEVER, true);
-    if (hit == null || hit.getHitBlock() == null) {
-      return true;
-    }
-    Block block = hit.getHitBlock();
-    return block.getX() == targetX && block.getY() == targetY && block.getZ() == targetZ;
-  }
-
-  /** 可见性判定失败（异常）只提示一次：新增失败模式必须可见，但不刷屏。 */
-  private void logVisibilityFailure(Throwable throwable) {
-    if (visibilityWarned.compareAndSet(false, true)) {
-      plugin.getLogger().log(Level.WARNING,
-          "邻近显形可见性判定失败：本次按「可见」处理（偏显形，保证玩家看到真实方块）。"
-              + "此类失败通常源于世界读取异常，请反馈此日志（确定性判定不受影响，仍按原规则处理）。",
-          throwable);
-    }
-  }
-
-  /**
    * 周期清理过期条目（区块卸载未触发时的兜底）：伪装清单与已显形标记都要清，避免长期堆积。
    *
    * <p>两个结构的活跃时间都会在扫描到该区块时刷新，因此玩家身边的条目不会被误清。
@@ -1474,9 +1367,9 @@ public final class ProximityRevealer implements Listener {
    * 取本 tick 剩余额度 → 逐偏移「仍在伪装清单 + 该玩家未显形过」→ 复用 {@link #sendOne}
    * （射线判定、发包、标记、统计全在既有链路里）。失败只记日志，绝不抛出。
    *
-   * <p><b>为什么事件路径仍用原生射线</b>：本路径由「玩家刚挖开/放置的方块」触发，其价值就是同 tick 纠正，
-   * 因此不异步化；此时用原生射线（{@code visibilityInPlan=false}）既省去一次线程往返，其 fail-open
-   * （读世界异常按可见）也更贴合「尽可能保证玩家可见性」的方向。周期巡检不受此影响（见类注释）。
+   * <p><b>为什么事件路径的可见性判定就地做</b>：本路径由「玩家刚挖开/放置的方块」触发，其价值就是同
+   * tick 纠正，因此不异步化；可见性判定直接在当前线程用遮挡位图完成（{@code visibilityInPlan=false}），
+   * 省去一次线程往返。位图缺失时按「不显形」处理（严格方向），绝不裸发。周期巡检不受此影响（见类注释）。
    */
   private void revealImmediately(Player player, int cx, int cy, int cz) {
     try {
@@ -1520,7 +1413,7 @@ public final class ProximityRevealer implements Listener {
         if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
           continue;
         }
-        // 事件路径不并入位图判定（见 revealImmediately 注释）：false = 由 sendOne 用原生射线判定
+        // 事件路径不预先算计划（见 revealImmediately 注释）：false = sendOne 在当前线程用遮挡位图判定
         sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
       }
       flushBatch(player, batch, tally, budget);
@@ -1601,7 +1494,7 @@ public final class ProximityRevealer implements Listener {
           if (!evaluated.add(packCoordinate(x, y, z))) {
             continue;
           }
-          // 事件路径不并入位图判定（见 revealImmediately 注释）：false = 由 sendOne 用原生射线判定
+          // 事件路径不预先算计划（见 revealImmediately 注释）：false = sendOne 在当前线程用遮挡位图判定
           sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
         }
       }

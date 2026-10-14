@@ -62,11 +62,10 @@ public final class AntiXrayRuntime {
   private ProximityStats proximityStats;
   private DiskCacheStore diskCacheStore;
   /**
-   * 异步实体遮挡的遮挡数据仓库（按世界分域）；{@code entity-culling.async-occlusion=false} 时为
-   * {@code null}（零开销）。
+   * 遮挡数据仓库（按世界分域）；反矿透未启用时为 {@code null}。
    *
    * <p>由反矿透解码工作线程持续写入（见 {@code ObfuscationProcessor#captureOcclusion}），
-   * 由带宽侧的异步遮挡引擎只读消费（见 {@code bandwidth.ThrottlePipeline}）。
+   * 由带宽侧的遮挡判定引擎与显形侧只读消费。
    *
    * <p><b>为什么按世界分域</b>：位图键只有区块坐标，而本插件全服单例、同时服务多个世界；
    * 不分域会让主世界与下界的同名区块互相覆盖，进而隐藏<b>本可见</b>的实体（安全方向错误）。
@@ -74,13 +73,13 @@ public final class AntiXrayRuntime {
    */
   private OcclusionStores occlusionStores;
   /**
-   * 出站方块变更 → 遮挡位图单格补丁监听器；未启用异步遮挡时为 {@code null}。
+   * 出站方块变更 → 遮挡位图单格补丁监听器；未装配时为 {@code null}。
    *
    * <p>它让「玩家挖开遮挡物」这类变更即时反映到遮挡位图，避免陈旧「遮挡」位把<b>本已可见</b>的实体
    * 继续隐藏（属正确性要求，见 {@link OcclusionPatchListener}）。
    */
   private OcclusionPatchListener occlusionPatchListener;
-  /** 异步遮挡计数（插件级唯一实例，与带宽侧共用；补丁计数也写在这里）。 */
+  /** 遮挡判定计数（插件级唯一实例，与带宽侧共用；补丁计数也写在这里）。 */
   private final OcclusionStats occlusionStats;
   private BypassRegistry bypassRegistry;
   private boolean antiXrayActive;
@@ -130,12 +129,10 @@ public final class AntiXrayRuntime {
     // palette.enabled=false（或带宽总开关关闭）时 widthBudget=false，即完全不收缩、不降级，零开销。
     BandwidthConfig.Palette palette = config.bandwidth().palette();
     boolean paletteUsable = config.bandwidth().enabled() && palette.enabled();
-    // 异步实体遮挡建表：仅当 bandwidth.yml 的 entity-culling.async-occlusion 开启时才建（关闭即零开销）。
+    // 遮挡位图恒建：它是实体剔除与邻近显形可见性判定的唯一数据源（原生命中射线已移除）。
     // 数据仓库在此创建并交给改写链路写入（ObfuscationProcessor#captureOcclusion）；
-    // 带宽侧的异步遮挡引擎只读消费（见 ThrottlePipeline）。
-    OcclusionStores occlusionStores = config.bandwidth().entityCulling().asyncOcclusion().enabled()
-        ? new OcclusionStores()
-        : null;
+    // 带宽侧的遮挡判定引擎只读消费（见 ThrottlePipeline），显形侧只读消费（见 ProximityRevealer）。
+    OcclusionStores occlusionStores = new OcclusionStores();
     ObfuscationProcessor processor = ObfuscationProcessor.create(codec, registry, antiXray, logger,
         new ObfuscationProcessor.PaletteOptions(paletteUsable && palette.strictVerify(),
             // P0-1 位宽预算封顶（默认开）：修包体膨胀 + 拿降位宽/单值降级收益
@@ -274,7 +271,7 @@ public final class AntiXrayRuntime {
     }
 
     // 先建邻近显形器（持有显形链路），再把它交给方块变更观察监听器做事件驱动即时显形（P1-4）。
-    // 遮挡位图仓库一并传入：非 null 时可见性判定改走位图（可搬离玩家线程），null 时回落原生射线路径。
+    // 遮挡位图仓库一并传入：显形可见性判定恒走该位图（原生命中射线已移除）。
     ProximityRevealer revealer = new ProximityRevealer(plugin, antiXray, chunkIndex, revealed, stats,
         bypassRegistry, workPool, occlusionStores);
     this.blockChangeRevealListener = new BlockChangeRevealListener(plugin, protocolManager,
@@ -506,8 +503,8 @@ public final class AntiXrayRuntime {
   }
 
   /**
-   * 异步遮挡数据仓库注册表（供带宽侧的异步遮挡引擎只读消费，见 {@code ThrottlePipeline}）；
-   * 未启用 {@code entity-culling.async-occlusion} 时为 {@code null}。
+   * 遮挡数据仓库注册表（供带宽侧的遮挡判定引擎与显形侧只读消费，见 {@code ThrottlePipeline}）；
+   * 反矿透未启用时为 {@code null}。
    */
   public OcclusionStores occlusionStores() {
     return occlusionStores;
