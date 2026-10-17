@@ -317,6 +317,9 @@ public final class AntiXrayRuntime {
       listener.start();
       this.occlusionPatchListener = listener;
     } catch (Throwable throwable) {
+      // start() 可能已把 AsyncListenerHandler 注册进 ProtocolLib（在 handler.start() 抛出的场合），
+      // 不注销会让它永久留在异步管理器里；stop() 对 handler 为 null 的情形是安全的空操作。
+      listener.stop();
       logger.log(Level.WARNING, "遮挡位图方块补丁装配失败（位图只在区块重载时重建）", throwable);
     }
   }

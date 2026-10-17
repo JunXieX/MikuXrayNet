@@ -406,14 +406,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 看门狗超时（默认 2.5 秒），加载节奏被打断。此处还没登记处理延迟，直接返回即可，
     // 放行由 ProtocolLib 自行完成（不要调 signalOnce，那会多放行一次）。
     RewriteTask task;
+    // 后面还要用（看门狗预算 / 邻块判定），故在 try 外声明。
+    long timeoutMillis;
+    AntiXrayConfig.Dimension dimension;
     try {
       int minHeight = world.getMinHeight();
       int sectionCount = (world.getMaxHeight() - minHeight) / 16;
       // 维度由 World#getEnvironment() 判定（不依赖世界名；CUSTOM 归入 normal），决定用哪段 dimensions 配置。
-      AntiXrayConfig.Dimension dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
+      dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
       // 超时实时读「当前」配置：reload 改了 advanced.timeout-millis 必须立即生效（本监听器不随 reload 重建）。
       // 同一区块的任务构造与看门狗注册共用这一个值，保证两者一致。
-      long timeoutMillis = live().timeoutMillis();
+      timeoutMillis = live().timeoutMillis();
       task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
           world.getName(), dimension, minHeight, sectionCount, timeoutMillis,
           gate == null

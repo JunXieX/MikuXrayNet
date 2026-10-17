@@ -259,15 +259,30 @@ public final class OcclusionEngine implements AutoCloseable {
       return false; // 没有可试的顶点 → 按可见处理（fail-open）
     }
     lookup.store = stores == null ? null : stores.lookup(request.worldName());
-    for (int i = 0; i < count; i++) {
-      int base = i * 3;
-      if (ray.hasLineOfSight(lookup, request.eyeX(), request.eyeY(), request.eyeZ(),
-          vertices[base], vertices[base + 1], vertices[base + 2], maxOccluding, 0.0D,
-          maxRayLengthSquared)) {
-        return false; // 有通畅顶点 = 看得见
+    try {
+      for (int i = 0; i < count; i++) {
+        int base = i * 3;
+        double dx = vertices[base] - request.eyeX();
+        double dy = vertices[base + 1] - request.eyeY();
+        double dz = vertices[base + 2] - request.eyeZ();
+        // 超出射线长度上限的顶点不能交给 hasLineOfSight：它对「超距」与「被墙挡住」都返回 false，
+        // 混用会把远处实体判成完全遮挡（方向错误：该显示却多藏）。这里按 fail-open 直接视为可见。
+        if (dx * dx + dy * dy + dz * dz > maxRayLengthSquared) {
+          return false;
+        }
+        if (ray.hasLineOfSight(lookup, request.eyeX(), request.eyeY(), request.eyeZ(),
+            vertices[base], vertices[base + 1], vertices[base + 2], maxOccluding, 0.0D,
+            maxRayLengthSquared)) {
+          return false; // 有通畅顶点 = 看得见
+        }
       }
+      return true;
+    } finally {
+      // 必须释放世界仓库引用：本 lookup 是工作线程的<b>长期存活字段</b>（见 CountingLookup 说明），
+      // 不清空会让该线程一直强引用「最后服务的那个世界」的整张位图——世界卸载后
+      // OcclusionStores.removeWorld 只摘外层 map，这份引用会让整张表无法回收。
+      lookup.store = null;
     }
-    return true;
   }
 
   /**

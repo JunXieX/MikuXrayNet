@@ -133,6 +133,10 @@ public final class ThrottlePipeline {
       plugin.getLogger().fine("带宽优化已在配置中关闭（bandwidth.yml: enabled=false）");
       return;
     }
+    // 先置位再装配：装配中途若抛出非预期异常（例如子模块工厂里的日志/反射失败之外的路径），
+    // 调用方的 stop() 仍能进入清理分支，撤销已注册的模块；若把它留在末尾，半途异常会让
+    // started 保持 false，stop() 直接返回，已注册的监听与任务永久残留（反复 reload 持续累积）。
+    started.set(true);
 
     ProtocolManager protocolManager = null;
     AsynchronousManager asynchronousManager = null;
@@ -202,8 +206,6 @@ public final class ThrottlePipeline {
     } else {
       logDisabled("高延迟降视距", "latency.enabled");
     }
-
-    started.set(true);
   }
 
   /** 注销全部子模块；可重复调用，异常安全（并发调用时恰好一个线程执行清理）。 */

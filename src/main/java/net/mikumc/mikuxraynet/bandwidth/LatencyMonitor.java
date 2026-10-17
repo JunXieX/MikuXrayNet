@@ -260,6 +260,7 @@ public final class LatencyMonitor implements Listener {
       if (player == null) {
         continue;
       }
+      // 原始值按值捕获：随后 clear() 不影响已投递的回调
       int original = entry.getValue();
       if (stillEnabled) {
         // 热重载路径：回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）

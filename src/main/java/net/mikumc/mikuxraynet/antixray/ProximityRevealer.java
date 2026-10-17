@@ -304,7 +304,13 @@ public final class ProximityRevealer implements Listener {
   /** 过度显形抽样器（1/N，只计数不改行为；N=0 关闭）。 */
   private final OverRevealSampler overRevealSampler;
 
-  private ScheduledTask globalTask;
+  private volatile ScheduledTask globalTask;
+  /**
+   * 停用闸：{@code stop()} 置位后，任何在途的调度（尤其是 Folia 上 {@code start()} 的遍历期间、
+   * 或玩家加入事件的并发回调）都必须立即放弃，否则一条「停用后才建起来」的区域任务无人取消、
+   * 会空转到实体退役并钉住本实例（热重载逐代累积）。
+   */
+  private volatile boolean stopping;
 
   /**
    * Folia 每玩家的区域巡检任务句柄 + 该玩家的分片轮转计数。
@@ -370,6 +376,7 @@ public final class ProximityRevealer implements Listener {
 
   /** 启动巡检：非 Folia 为统一主线程任务；Folia 为各玩家的区域任务（句柄与分片计数按 UUID 保存，见 entityScans）。 */
   public void start() {
+    stopping = false;
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     long interval = Math.max(1, proximity.intervalTicks());
     if (PlatformSupport.isFolia()) {
@@ -402,17 +409,16 @@ public final class ProximityRevealer implements Listener {
 
   /** 停用：注销任务与事件监听，并清空两个显形索引（不留副作用）。 */
   public void stop() {
+    // 先置闸再取消：在途的 scheduleEntityTask（Folia start() 遍历 / 并发 onJoin）会在入表后复查并自行取消，
+    // 否则该句柄无人知晓、任务空转到实体退役并钉住本实例。
+    stopping = true;
     if (globalTask != null) {
       globalTask.cancel();
       globalTask = null;
     }
     // Folia 每玩家任务句柄全部取消：句柄若被丢弃，区域任务会在停用后继续跑到实体退役（泄漏）
     for (EntityScan scan : entityScans.values()) {
-      try {
-        scan.task().cancel();
-      } catch (Throwable ignored) {
-        // 任务可能已随实体退役结束，取消失败可忽略
-      }
+      cancelQuietly(scan.task());
     }
     entityScans.clear();
     HandlerList.unregisterAll(this);
@@ -423,10 +429,35 @@ public final class ProximityRevealer implements Listener {
 
   /** 在玩家所属线程上启动周期巡检并保存句柄与分片计数（调度失败则无句柄可存）。 */
   private void scheduleEntityTask(Player player, long interval) {
+    if (stopping) {
+      return;
+    }
     ScheduledTask task = Schedulers.repeatOnEntity(plugin, player, interval, interval, () -> pass(player));
-    if (task != null) {
-      // 计数随句柄一起建：任务首次执行至少在一个周期之后，故 pass() 读到的一定是本条目
-      entityScans.put(player.getUniqueId(), new EntityScan(task, new AtomicLong()));
+    if (task == null) {
+      return;
+    }
+    // 计数随句柄一起建：任务首次执行至少在一个周期之后，故 pass() 读到的一定是本条目
+    EntityScan previous = entityScans.put(player.getUniqueId(), new EntityScan(task, new AtomicLong()));
+    if (previous != null) {
+      // 同一玩家重复调度（重复的加入事件等）：旧句柄留着就会空转到实体退役
+      cancelQuietly(previous.task());
+    }
+    if (stopping) {
+      // 入账后复查停用闸：stop() 可能已清完表，这条晚到的句柄不会有人取消
+      EntityScan current = entityScans.remove(player.getUniqueId());
+      if (current != null) {
+        cancelQuietly(current.task());
+      } else {
+        cancelQuietly(task);
+      }
+    }
+  }
+
+  private static void cancelQuietly(ScheduledTask task) {
+    try {
+      task.cancel();
+    } catch (Throwable ignored) {
+      // 任务可能已随实体退役结束，取消失败可忽略
     }
   }
 
@@ -488,6 +519,9 @@ public final class ProximityRevealer implements Listener {
 
   /** 全服巡检（非 Folia：主线程，遍历在线玩家并共享本次发包额度）。 */
   private void passAll() {
+    if (stopping) {
+      return;
+    }
     warnIfCapacityExceeded();
     maybeExpire();
     // 本轮看哪一片：同一轮里所有玩家看同一片（分片轮转的节奏只与巡检次数有关，见 SCAN_SHARDS）。
@@ -509,6 +543,9 @@ public final class ProximityRevealer implements Listener {
 
   /** 单个玩家的巡检（Folia：在玩家所属区域线程执行）。 */
   private void pass(Player player) {
+    if (stopping) {
+      return;
+    }
     warnIfCapacityExceeded();
     maybeExpire();
     // 分片计数必须<b>按玩家</b>推进：Folia 下每个玩家各有一条独立任务，若共用一个全局计数，

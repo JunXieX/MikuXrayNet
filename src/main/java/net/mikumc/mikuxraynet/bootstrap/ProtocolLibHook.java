@@ -119,21 +119,28 @@ public final class ProtocolLibHook {
 
   /** 注销拦截；可重复调用，异常安全。 */
   public void unregister() {
-    try {
-      ProtocolLibAsyncListener current = listener;
-      if (current != null) {
+    ProtocolLibAsyncListener current = listener;
+    AsyncListenerHandler handler = asyncListenerHandler;
+    AsynchronousManager asynchronous = asynchronousManager;
+    listener = null;
+    asyncListenerHandler = null;
+    asynchronousManager = null;
+    // 两步注销各自 try：Bukkit 钩子清理失败不应连带跳过异步监听器注销（否则 handler 永久留在
+    // ProtocolLib 里，回调继续跑，热重载逐代累积）。
+    if (current != null) {
+      try {
         // 先注销监听器自己的 Bukkit 事件监听（玩家退出清理），与构造时的注册配对
         current.unregisterBukkitHooks();
+      } catch (Throwable throwable) {
+        logger.log(Level.WARNING, "注销 Bukkit 事件钩子时出现异常（继续注销封包监听器）", throwable);
       }
-      if (asynchronousManager != null && asyncListenerHandler != null) {
-        asynchronousManager.unregisterAsyncHandler(asyncListenerHandler);
+    }
+    if (asynchronous != null && handler != null) {
+      try {
+        asynchronous.unregisterAsyncHandler(handler);
+      } catch (Throwable throwable) {
+        logger.log(Level.WARNING, "注销 ProtocolLib 异步拦截时出现异常（通常可忽略）", throwable);
       }
-    } catch (Throwable throwable) {
-      logger.log(Level.WARNING, "注销 ProtocolLib 异步拦截时出现异常（通常可忽略）", throwable);
-    } finally {
-      asyncListenerHandler = null;
-      asynchronousManager = null;
-      listener = null;
     }
   }
 

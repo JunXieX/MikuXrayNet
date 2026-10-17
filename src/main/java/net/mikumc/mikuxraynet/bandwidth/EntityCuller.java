@@ -141,13 +141,17 @@ public final class EntityCuller implements Listener {
   private final AtomicInteger errorCounter = new AtomicInteger();
 
   /**
-   * 账本条目：被隐藏的实体 + 它是否「因视锥剔除而隐藏」。
+   * 账本条目：被隐藏的实体 + 它是否「因视锥剔除而隐藏」+ <b>加入时捕获的 entityId</b>。
    *
    * <p>标记决定周期复检通道①如何对待远距离条目：{@code frustumCulled=true} 的条目在实体重新回到
    * 视野锥内时要立刻恢复（纯数学复判）；{@code false}（射线遮挡隐藏）的条目保持既有行为（等实体靠近）。
    * 没有这个标记就无从区分，只能二选一，必然造成「转头后远处实体长期不出现」或「远距离射线成本无界」。
+   *
+   * <p><b>为什么自带 id</b>：Folia 上实体可能迁到别的 region，此后读 {@code entity.getEntityId()}
+   * （走 {@code CraftEntity#getHandle}）会触发线程校验。跨区域条目必须能被「不触碰实体」地摘除，
+   * 唯一可用的键就是加入那一刻捕获的 id。
    */
-  record HiddenEntry(Entity entity, boolean frustumCulled) {
+  record HiddenEntry(Entity entity, boolean frustumCulled, int entityId) {
   }
 
   /** 玩家 → 已被隐藏的实体（entityId → {@link HiddenEntry}）。 */
@@ -693,6 +697,10 @@ public final class EntityCuller implements Listener {
       for (HiddenEntry entry : hiddenMap.values()) {
         Entity entity = entry.entity();
         if (!owns(entity)) {
+          // 跨区域（Folia）：<b>不能触碰实体</b>（读任何状态都会先打 ERROR 再抛），但账本必须摘除——
+          // 否则该条目会永久留在 hidden 里钉住 Entity/World，且 hiddenCount() 虚高。
+          // 用「加入时捕获的entityId + 实例引用」做不触碰实体的精确摘除。
+          removeLedgerEntry(playerId, entry.entityId(), entity);
           continue;
         }
         if (!entity.isValid()) {
@@ -743,6 +751,12 @@ public final class EntityCuller implements Listener {
     }
     for (Entity entity : rotation.nextBatch(Integer.MAX_VALUE)) {
       if (!owns(entity)) {
+        // 跨区域（Folia）：不能触碰实体，但轮转队列必须摘除——否则条目永久留在队列里钉住
+        // Entity/World，且后续每周期都要白跑一趟。按实例引用摘除（只比较引用，不读实体状态）。
+        int removedId = rotation.remove(entity);
+        if (removedId >= 0) {
+          removeStreak(playerId, removedId);
+        }
         continue;
       }
       if (!entity.isValid()) {
@@ -1133,6 +1147,20 @@ public final class EntityCuller implements Listener {
     }
   }
 
+  /**
+   * 不触碰实体的摘除重载（跨区域条目专用）：用调用方提供的 {@code entityId} 定位，仍按<b>实例引用</b>
+   * 校验，因此不会误删「后来复用该 id 的新实体」的条目。
+   */
+  private void removeLedgerEntry(UUID playerId, int entityId, Entity entity) {
+    Map<Integer, HiddenEntry> map = hidden.get(playerId);
+    if (map != null) {
+      HiddenEntry existing = map.get(entityId);
+      if (existing != null && existing.entity() == entity) {
+        map.remove(entityId, existing);
+      }
+    }
+  }
+
   /** @return 是否真的新登记并执行了 hideEntity（已隐藏 / 失败时为 false）。 */
   private boolean hide(Player player, Entity entity, boolean frustumCulled) {
     if (stopping) {
@@ -1148,7 +1176,7 @@ public final class EntityCuller implements Listener {
       // 已隐藏。仅升级标记：由射线遮挡改判为「视锥隐藏」时必须改写标记，否则通道①会把它当成射线隐藏，
       // 导致玩家转头后它永远不会被恢复（这正是标记存在的意义）。
       if (frustumCulled && !existing.frustumCulled()) {
-        map.put(entity.getEntityId(), new HiddenEntry(entity, true));
+        map.put(entity.getEntityId(), new HiddenEntry(entity, true, existing.entityId()));
         // 这里必须自己计数：hide() 返回 false（没有新发生隐藏），所以 evaluate() 里受 if (hide(...))
         // 保护的 frustumHidden 不会递增；而该条目此后会被通道①按视锥条目恢复并计 frustumShown。
         // 不补这一笔，/mxnet status 的「视锥剔除 隐藏/恢复」会出现「恢复 > 隐藏」的自相矛盾。
@@ -1157,15 +1185,16 @@ public final class EntityCuller implements Listener {
       return false;
     }
     try {
-      HiddenEntry entry = new HiddenEntry(entity, frustumCulled);
+      int entityId = entity.getEntityId();
+      HiddenEntry entry = new HiddenEntry(entity, frustumCulled, entityId);
       player.hideEntity(plugin, entity);
-      map.put(entity.getEntityId(), entry);
+      map.put(entityId, entry);
       // 停用竞态收口（Folia：stop() 可能在另一条区域线程上并发执行）：<b>入账之后再读一次</b> volatile
       // stopping。这样保证「本次读到 false ⇒ stop() 尚未置位 ⇒ 其 restoreAll 必然发生在本次入账之后、
       // 一定看得到本条目」；读到 true 则说明 stop() 已在恢复，必须自行回滚本次隐藏——否则该实体既不在
       // 新管线账本里、也没被旧管线恢复，将<b>永久不可见</b>（直到玩家重登）。
       if (stopping) {
-        if (map.remove(entity.getEntityId(), entry)) {
+        if (map.remove(entityId, entry)) {
           // 条目仍在账本里 ⇒ restoreAll 无从看到它（账本已被摘走/清空），必须自行恢复。
           // 本次隐藏从未计入 entitiesHidden，故这里也不计 entitiesShown（两侧口径保持对称）。
           undoHide(player, entity);
