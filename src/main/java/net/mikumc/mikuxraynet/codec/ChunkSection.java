@@ -414,8 +414,15 @@ public class ChunkSection {
     Palette currentPalette = this.palette;
     int[] states = new int[257];
     int distinct = 0;
+    // 直接调色板的数据值就是状态 id，且位宽来自注册表上限：损坏/伪造数据里的 id 仍可能超出注册表条目数。
+    // 一旦越界，下面的 idFor 会在「已切换位宽与调色板之后」才抛异常，把这个 section 留成半改写的损坏态。
+    // 因此先在收集阶段拦下：越界即放弃降级、不改动任何状态（fail-open 的方向是「保持原表示」）。
+    int stateLimit = direct ? registryAccessor.getUniqueBlockStateCount() : Integer.MAX_VALUE;
     for (int i = 0; i < SECTION_VOLUME; i++) {
       int state = direct ? this.data.get(i) : currentPalette.valueFor(this.data.get(i));
+      if (direct && (state < 0 || state >= stateLimit)) {
+        return false; // 越界状态 id：保持原表示，绝不做半途改写
+      }
       boolean seen = false;
       for (int j = 0; j < distinct; j++) {
         if (states[j] == state) {
