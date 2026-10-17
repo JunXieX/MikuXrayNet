@@ -136,6 +136,7 @@ final class MovePacketFields {
 
     Field namedEntityId = null;
     Field firstInt = null;
+    int intFieldCount = 0;
     Field namedX = null;
     Field namedY = null;
     Field namedZ = null;
@@ -157,6 +158,7 @@ final class MovePacketFields {
         }
         Class<?> fieldType = field.getType();
         if (fieldType == int.class) {
+          intFieldCount++;
           if (firstInt == null) {
             firstInt = field;
           }
@@ -180,10 +182,18 @@ final class MovePacketFields {
     }
 
     try {
-      Field entityIdField = namedEntityId != null ? namedEntityId : firstInt;
+      // 兜底只允许「唯一一个 int 字段」：位移包里唯一的 int 就是实体 id。若实际有多个 int 字段，
+      // 按声明序取第一个很可能取到的不是 id（例如某些版本新增的数值字段），而本模块用该值查白名单
+      // 与统计——取错会把白名单实体当成普通实体取消其零位移包（白名单失效）。此时按「解析不出」处理
+      // 更安全：整类 fail-open 放行，绝不猜。
+      Field entityIdField = namedEntityId;
       if (entityIdField == null) {
-        lastFailure = "继承链上找不到实体 id 字段（int）。字段形态：" + inventory;
-        return UNRESOLVED;
+        if (intFieldCount != 1) {
+          lastFailure = "继承链上的 int 字段数=" + intFieldCount + " 且均非 entityId，无法安全推断实体 id"
+              + "（已按解析不出处理）。字段形态：" + inventory;
+          return UNRESOLVED;
+        }
+        entityIdField = firstInt;
       }
       FieldAccessor entityId = Accessors.getFieldAccessor(entityIdField);
 

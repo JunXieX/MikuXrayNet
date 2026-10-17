@@ -149,6 +149,16 @@ class MovePacketFieldsTest {
     assertNull(MovePacketFields.of(new NoEntityIdShorts()), "缺少 entityId 时必须判为定位失败");
   }
 
+  /**
+   * 有多个 int 字段且没有名为 entityId 的那个 → 必须判为定位失败，<b>不得</b>按声明序猜第一个。
+   * 猜错的 id 会让白名单实体被当成普通实体，从而取消其零位移包（白名单失效）。
+   */
+  @Test
+  void multipleIntFieldsWithoutNamedEntityIdAreUnresolved() {
+    assertNull(MovePacketFields.of(new AmbiguousInts()),
+        "多个 int 且无 entityId 时必须判为定位失败，绝不按声明序猜");
+  }
+
   @Test
   void nullHandleIsUnresolved() {
     assertNull(MovePacketFields.of(null));
@@ -178,6 +188,15 @@ class MovePacketFieldsTest {
   }
 
   private static class NoEntityIdShorts {
+    private short xa;
+    private short ya;
+    private short za;
+  }
+
+  /** 两个 int 字段且都未命名为 entityId：不足以安全推断哪个是实体 id。 */
+  private static class AmbiguousInts {
+    private int first;
+    private int second;
     private short xa;
     private short ya;
     private short za;

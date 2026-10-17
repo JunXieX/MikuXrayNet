@@ -216,6 +216,10 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
       String typeKey = typeKeyFor(entity.getType());
       if (typeKey != null) {
         entityTypeIndex.put(entity.getEntityId(), typeKey);
+      } else {
+        // 非白名单实体：必须清掉可能残留的旧映射。实体 id 会被服务端复用，若上一个占用者在白名单里，
+        // 残留映射会让这个新实体被误判为白名单（零位移包不再取消）——方向安全但白费带宽。
+        entityTypeIndex.remove(entity.getEntityId());
       }
     } catch (Throwable throwable) {
       // fail-open：登记失败最多让该实体走「未命中白名单」（保守侧），绝不影响封包主链路

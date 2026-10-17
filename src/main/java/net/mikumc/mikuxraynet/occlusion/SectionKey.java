@@ -75,8 +75,9 @@ public final class SectionKey {
   /**
    * 由「方块世界坐标」打包其所属 section 的键（{@code x>>4, y>>4, z>>4}）。
    *
-   * <p>越界不抛异常：越界坐标按位掩码截断后仍得到某个键，由调用方按「查不到即不遮挡」处理。
-   * 射线遍历使用本方法，因此它必须无分支、不抛异常（热路径）。
+   * <p><b>越界不抛异常</b>：越界坐标按位掩码截断后仍得到某个键。因此它只适合<b>坐标必然合法</b>
+   * 且失败可容忍的场景；写入路径（方块补丁）必须改用 {@link #packSection}，否则越界坐标会被
+   * 静默写到另一个 section 上。射线遍历不经过本方法（它直接以 {@code >>4} 得到的三个分量查表）。
    */
   public static long packBlock(int x, int y, int z) {
     return packUnchecked(x >> 4, y >> 4, z >> 4);

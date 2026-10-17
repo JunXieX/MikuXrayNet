@@ -88,7 +88,11 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    */
   public void setBlockOccluding(int x, int y, int z, boolean occluding) {
     synchronized (writeMutex) {
-      long key = SectionKey.packBlock(x, y, z);
+      // 用带校验的 packSection（而非射线热路径用的 packBlock）：包里的坐标一旦越出 28 位水平 /
+      // 8 位 sectionY 范围，packBlock 会按位截断成<b>另一个 section 的键</b>，把补丁静默写到错误的
+      // 几何上去（该段位图从此与真实世界不符）。补丁调用方按 patchFailures 统计并跳过本格，故此处
+      // 显式拒绝是安全方向。
+      long key = SectionKey.packSection(x >> 4, y >> 4, z >> 4);
       int localX = x & SectionOcclusion.LOCAL_MASK;
       int localY = y & SectionOcclusion.LOCAL_MASK;
       int localZ = z & SectionOcclusion.LOCAL_MASK;

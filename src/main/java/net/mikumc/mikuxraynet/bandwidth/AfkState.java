@@ -39,8 +39,17 @@ public final class AfkState {
    * <p>用 VarHandle 而不是把字段换成 {@code AtomicBoolean}：本类在<b>每个玩家</b>上各持一个实例，
    * 再嵌一个原子对象就多一次对象头与间接跳转；VarHandle 直接对字段做 CAS，零额外分配。
    */
-  private static final java.lang.invoke.VarHandle AFK = java.lang.invoke.MethodHandles
-      .lookup().findVarHandle(AfkState.class, "afk", boolean.class);
+  private static final java.lang.invoke.VarHandle AFK = afkHandle();
+
+  /** 取 {@link #afk} 的 VarHandle；把受检的 {@code NoSuchFieldException} 就地收敛成初始化失败。 */
+  private static java.lang.invoke.VarHandle afkHandle() {
+    try {
+      return java.lang.invoke.MethodHandles.lookup()
+          .findVarHandle(AfkState.class, "afk", boolean.class);
+    } catch (ReflectiveOperationException impossible) {
+      throw new ExceptionInInitializerError(impossible);
+    }
+  }
 
   private volatile long lastActiveMillis;
   private volatile boolean afk;

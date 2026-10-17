@@ -44,8 +44,10 @@ public final class OcclusionPayload {
    *
    * @param column 下标即 section 偏移；元素 {@code null} 表示该段全不遮挡
    * @return 编码后的字节（长度 = {@link #encodedLength}）
+   * @throws IllegalArgumentException 段数超出 {@link #MAX_SECTIONS}（解码侧同样拒绝，编出的负载不可解）
    */
   public static byte[] encode(SectionOcclusion[] column) {
+    checkColumnLength(column);
     int bitmapCount = 0;
     for (SectionOcclusion section : column) {
       if (tagOf(section) == TAG_BITMAP) {
@@ -71,6 +73,7 @@ public final class OcclusionPayload {
 
   /** {@link #encode} 的输出长度（供上层做容量预判，避免被拒时白编码）。 */
   public static int encodedLength(SectionOcclusion[] column) {
+    checkColumnLength(column);
     int bitmapCount = 0;
     for (SectionOcclusion section : column) {
       if (tagOf(section) == TAG_BITMAP) {
@@ -78,6 +81,24 @@ public final class OcclusionPayload {
       }
     }
     return HEADER_BYTES + column.length + bitmapCount * BITMAP_BYTES;
+  }
+
+  /**
+   * 段数上限校验（编码侧与解码侧同口径）。
+   *
+   * <p><b>为什么必须校验</b>：负载的段数写在 4 字节头部里，而解码侧只接受 {@code 0..MAX_SECTIONS}；
+   * 若编码侧放行更多段，编出的负载在下次读盘/读缓存时必然被判为畸形而丢弃——遮挡数据静默丢失
+   * （实体侧少藏、显形侧的「已知全不遮挡」信息也一并丢失）。正常世界最多 24 段，触界只可能来自
+   * 异常输入，故直接拒绝（调用方本就按 fail-open 处理编码失败）。
+   */
+  private static void checkColumnLength(SectionOcclusion[] column) {
+    if (column == null) {
+      throw new IllegalArgumentException("column 不得为 null");
+    }
+    if (column.length > MAX_SECTIONS) {
+      throw new IllegalArgumentException(
+          "遮挡负载段数 " + column.length + " 超过上限 " + MAX_SECTIONS + "，拒绝编码");
+    }
   }
 
   /** 段 → 标签；{@code null}（理论上不该出现）按「已知全不遮挡」处理，避免编出非法负载。 */

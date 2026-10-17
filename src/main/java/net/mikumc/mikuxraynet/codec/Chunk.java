@@ -233,7 +233,15 @@ public class Chunk implements AutoCloseable {
     if (bitsPerValue == 0) {
       ByteBufUtil.readVarInt(this.inputBuffer);
     } else if (bitsPerValue <= 3) {
-      for (int i = ByteBufUtil.readVarInt(this.inputBuffer); i > 0; i--) {
+      // 间接调色板：先读条目数，再逐条读状态 id。条目数必须落在 [0, 2^bits] 内——负数会让下面的
+      // 循环一次都不执行（于是把后面本应是调色板条目的字节当成位打包数据读），超过容量则是损坏编码。
+      // 两种情况都会让本 section 及其后的字节整体错位，必须在此拒绝（由上层解码 fail-open）。
+      int paletteSize = ByteBufUtil.readVarInt(this.inputBuffer);
+      if (paletteSize < 0 || paletteSize > (1 << bitsPerValue)) {
+        throw new IndexOutOfBoundsException(
+            "biome palette size out of range: " + paletteSize + " (bits " + bitsPerValue + ")");
+      }
+      for (int i = 0; i < paletteSize; i++) {
         ByteBufUtil.readVarInt(this.inputBuffer);
       }
     }

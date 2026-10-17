@@ -63,9 +63,9 @@ public final class BitmapOcclusion implements SectionOcclusion {
    *
    * <p>输出使用两种快路径：
    * <ul>
-   *   <li>没有任何一格遮挡 → 返回 {@code null}（等价于「不遮挡」，且与「未知 section」同义，省下位图）；</li>
-   *   <li>每一格都遮挡 → 返回 {@link SolidOcclusion#INSTANCE}；</li>
-   *   <li>其余 → 返回逐格 {@link BitmapOcclusion}。</li>
+   *   <li>没有任何一格遮挡 → {@link EmptyOcclusion#INSTANCE}（共享「已知全不遮挡」，省下位图）；</li>
+   *   <li>每一格都遮挡 → {@link SolidOcclusion#INSTANCE}；</li>
+   *   <li>其余 → 逐格 {@link BitmapOcclusion}。</li>
    * </ul>
    *
    * <p>{@code states} 的长度须不小于 {@link #BLOCK_COUNT}；下标语义与

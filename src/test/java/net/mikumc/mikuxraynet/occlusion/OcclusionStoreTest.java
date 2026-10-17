@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
@@ -151,5 +152,19 @@ class OcclusionStoreTest {
     assertNotNull(built);
     assertTrue(built.isOccludingLocal(1, 2, 3));
     assertFalse(built.isOccludingLocal(1, 2, 4));
+  }
+
+  /**
+   * <b>越界坐标必须被拒绝</b>：{@code setBlockOccluding} 用带校验的 {@code SectionKey.packSection}，
+   * 不会像 {@code packBlock} 那样按位截断成「另一个 section 的键」——否则补丁会被静默写到错误的几何上，
+   * 该段位图从此与真实世界不符（该显示却多藏 / 该藏却显示）。
+   */
+  @Test
+  void outOfRangeCoordinatesAreRejectedInsteadOfSilentlyRepacked() {
+    OcclusionStore store = new OcclusionStore();
+    int farX = (SectionKey.HORIZONTAL_MAX + 1) << 4; // chunkX 超出 28 位有符号范围
+    assertThrows(IllegalArgumentException.class,
+        () -> store.setBlockOccluding(farX, 0, 0, true));
+    assertEquals(0, store.loadedSectionCount(), "越界坐标不得写入任何 section");
   }
 }

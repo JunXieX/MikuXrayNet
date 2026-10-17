@@ -1292,7 +1292,7 @@ public final class ProximityRevealer implements Listener {
    */
   public void onBlockChangeObserved(Player player, String worldName, int x, int y, int z) {
     if (player == null || worldName == null
-        || !instant.enabled() || instant.maxPerTick() <= 0) {
+        || !instant.enabled() || instant.maxPerTick() <= 0 || stopping) {
       return;
     }
     // 黑名单世界不做事件即时显形（在调度前就返回，避免产生任何任务）：纯判定，不触碰 Bukkit。
@@ -1385,7 +1385,7 @@ public final class ProximityRevealer implements Listener {
    */
   public void onSectionChangeObserved(Player player, String worldName, int[] coordinates, int count) {
     if (player == null || worldName == null || coordinates == null || count <= 0
-        || !instant.enabled() || instant.maxPerTick() <= 0) {
+        || !instant.enabled() || instant.maxPerTick() <= 0 || stopping) {
       return;
     }
     // 黑名单世界不做事件即时显形（在调度前就返回，避免产生任何任务）：纯判定，不触碰 Bukkit。
