@@ -848,6 +848,7 @@ class ConfigDefaultsTest {
     assertEquals(40, BandwidthConfig.MAX_UPDATE_INTERVAL_TICKS);
     assertEquals(86400, BandwidthConfig.MAX_AFK_SECONDS);
     assertEquals(1024.0D, BandwidthConfig.MAX_AFK_DISTANCE, 1.0E-9D);
+    assertEquals(4.0D, BandwidthConfig.MIN_AFK_DISTANCE, 1.0E-9D);
     assertEquals(60000, BandwidthConfig.MAX_LATENCY_THRESHOLD_MILLIS);
     assertEquals(4, BandwidthConfig.MAX_REDUCE_VIEW_DISTANCE);
     assertEquals(3600, BandwidthConfig.MAX_SUSTAIN_SECONDS);
@@ -866,6 +867,8 @@ class ConfigDefaultsTest {
         "默认值必须不低于硬下限，否则默认配置自身会被抬升并打出误导性 WARN");
     assertTrue(defaults.entityCulling().updateIntervalTicks() <= BandwidthConfig.MAX_UPDATE_INTERVAL_TICKS);
     assertTrue(defaults.afk().distance() <= BandwidthConfig.MAX_AFK_DISTANCE);
+    assertTrue(defaults.afk().distance() >= BandwidthConfig.MIN_AFK_DISTANCE,
+        "默认值必须不低于硬下限，否则默认配置自身会被抬升并打出误导性 WARN");
     assertTrue(defaults.latency().reduceViewDistance() <= BandwidthConfig.MAX_REDUCE_VIEW_DISTANCE);
     assertTrue(defaults.latency().minViewDistance() <= BandwidthConfig.MAX_MIN_VIEW_DISTANCE);
     assertTrue(defaults.latency().minViewDistance() >= BandwidthConfig.MIN_VIEW_DISTANCE_FLOOR);
@@ -976,6 +979,26 @@ class ConfigDefaultsTest {
     BandwidthConfig aboveCeiling = BandwidthConfig.from(yaml("latency:\n  min-view-distance: 99\n"));
     assertEquals(BandwidthConfig.MAX_MIN_VIEW_DISTANCE, aboveCeiling.latency().minViewDistance(),
         "超过新上限的值钳制到 16");
+  }
+
+  /**
+   * {@code afk.distance} 的新安全下限：0/负数会让 AFK 玩家连脚下的粒子与破坏动画都被丢弃
+   * （判定式 {@code 距离² ≤ distance²} 恒成立），属体验崩塌而非调优，故抬到 4 并留痕。
+   */
+  @Test
+  void afkDistanceBelowFloorIsRaisedAndReported() {
+    for (String raw : new String[] {"0.0", "-8.0"}) {
+      BandwidthConfig raised =
+          BandwidthConfig.from(yaml("afk:\n  distance: " + raw + "\n"));
+      assertEquals(BandwidthConfig.MIN_AFK_DISTANCE, raised.afk().distance(), 1.0E-9D,
+          "afk.distance=" + raw + " 必须被抬到下限 " + BandwidthConfig.MIN_AFK_DISTANCE);
+      assertTrue(String.join("、", raised.clampAdjustments()).contains("afk.distance=" + raw),
+          "抬升必须留下明细供加载时一次性 WARN：" + raised.clampAdjustments());
+    }
+
+    BandwidthConfig atFloor = BandwidthConfig.from(yaml("afk:\n  distance: 4.0\n"));
+    assertEquals(4.0D, atFloor.afk().distance(), 1.0E-9D, "恰好等于下限的值原样生效");
+    assertTrue(atFloor.clampAdjustments().isEmpty(), "取值在下限处不得产生明细");
   }
 
   /**

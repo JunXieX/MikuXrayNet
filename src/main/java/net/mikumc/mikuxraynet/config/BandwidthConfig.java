@@ -72,6 +72,15 @@ public final class BandwidthConfig {
   public static final int MAX_AFK_SECONDS = 86400;
   /** AFK 丢包距离上限（格）：越大越少误丢玩家看得见的远处包，故放宽到 1024。 */
   public static final double MAX_AFK_DISTANCE = 1024.0D;
+  /**
+   * AFK 丢包距离<b>下限</b>（格，4）。
+   *
+   * <p><b>为什么必须有下限</b>：该值直接作为「丢弃阈值」的平方参与比较（{@code 距离² ≤ distance²} 才放行）。
+   * 配成 0 或负数会被钳到 0，于是 AFK 玩家身边<b>连自己脚下</b>的粒子 / 方块破坏动画都会被丢弃——
+   * 这不是「少丢几个远处包」，而是「全部低价值包一律丢弃」，玩家能从落空的手感上直接察觉，
+   * 且配置里看不出任何异常。4 格以内的特效基本都发生在玩家眼前，保留它们是体验底线。
+   */
+  public static final double MIN_AFK_DISTANCE = 4.0D;
   /** 延迟观察阈值上限（毫秒）：60 秒以上的延迟早已断线，阈值再高永不触发。 */
   public static final int MAX_LATENCY_THRESHOLD_MILLIS = 60000;
   /** 单次降视距上限（区块）：一次降 32 格会让弱网玩家几乎看不见，收到安全极限 4。 */
@@ -400,10 +409,13 @@ public final class BandwidthConfig {
                     clampAdjustments))),
         new Afk(
             root.getBoolean("afk.enabled", true),
-            clampUpper(Math.max(1, root.getInt("afk.seconds", 300)),
+            clampUpper(clampLower(root.getInt("afk.seconds", 300),
+                1, "afk.seconds", clampAdjustments),
                 MAX_AFK_SECONDS, "afk.seconds", clampAdjustments),
-            clampUpper(root.getDouble("afk.distance", 16.0D),
-                16.0D, MAX_AFK_DISTANCE, "afk.distance", clampAdjustments),
+            // 两端都钳（单趟 clampRange，保证每键至多一条明细）：上限防「配得过大等于不丢」，
+            // 下限防 0/负数把「只看远处包」变成「全部低价值包一律丢弃」（见 MIN_AFK_DISTANCE 说明）。
+            clampRange(root.getDouble("afk.distance", 16.0D),
+                16.0D, MIN_AFK_DISTANCE, MAX_AFK_DISTANCE, "afk.distance", clampAdjustments),
             root.getBoolean("afk.drop-particles", true),
             // 默认 true（性能优先）：破坏动画包数量可观，丢弃可省带宽；玩家体验由「AFK 判定只看真实操作」
             // 兜底——只要玩家还在交互/移动/聊天就不会被判定为 AFK，因此真在操作的人看不到动画中断。
