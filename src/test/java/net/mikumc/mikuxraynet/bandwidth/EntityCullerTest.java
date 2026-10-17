@@ -308,15 +308,18 @@ class EntityCullerTest {
   }
 
   /**
-   * Folia 回归：已隐藏实体<b>离开本区域</b>后，周期复检不得读取它的任何状态。
+   * Folia 回归：已隐藏实体<b>离开本区域</b>后，周期复检不得读取它的任何状态，同时必须把它从账本摘除。
    *
    * <p>真机症状（Lophine 26.3 / Folia）：{@code EntityCuller.recheck} 在玩家所在区域线程上读跨区域实体的
    * entityId → {@code TickThread.ensureTickThread} <b>先打 ERROR 再抛</b> IllegalStateException，
    * 任务每轮刷屏。这里把「跨区域实体」建模为「归属判定为 false + 一旦被读状态就抛」——
    * 实现里只要还有一次越界读取，本用例即失败。
+   *
+   * <p><b>账本必须摘除</b>：条目留在 {@code hidden} 里会永久钉住 Entity/World（跨区域后不会再有人来清），
+   * 且 {@code hiddenCount()} 虚高。摘除只按「加入时捕获的 entityId + 实例引用」，不触碰实体。
    */
   @Test
-  void foreignRegionEntityIsSkippedWithoutTouchingItsState() {
+  void foreignRegionEntityIsDroppedFromLedgerWithoutTouchingItsState() {
     ThrottleStats stats = new ThrottleStats();
     PlayerStub player = new PlayerStub();
     WorldStub world = new WorldStub();
@@ -330,12 +333,14 @@ class EntityCullerTest {
     culler.evaluate(player.proxy(), foreign.proxy(), true);
     culler.evaluate(player.proxy(), owned.proxy(), true);
     assertEquals(2, culler.hiddenCount());
+    int readsBefore = foreign.stateReads();
     foreign.foreign = true;
 
     culler.recheck(player.proxy()); // 关键：不得抛异常（更不得读 foreign 的状态）
 
-    assertEquals(2, culler.hiddenCount(),
-        "跨区域实体本轮既不清理也不报错，留待重新进入追踪范围时的 onTrack 复评或退出时的账本清理");
+    assertEquals(readsBefore, foreign.stateReads(), "跨区域实体一次状态都不得被读取");
+    assertEquals(1, culler.hiddenCount(),
+        "跨区域条目必须从账本摘除（否则永久钉住 Entity/World），本区域条目保留");
   }
 
   /**

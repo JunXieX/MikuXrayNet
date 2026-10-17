@@ -158,13 +158,19 @@ class OcclusionStoreTest {
    * <b>越界坐标必须被拒绝</b>：{@code setBlockOccluding} 用带校验的 {@code SectionKey.packSection}，
    * 不会像 {@code packBlock} 那样按位截断成「另一个 section 的键」——否则补丁会被静默写到错误的几何上，
    * 该段位图从此与真实世界不符（该显示却多藏 / 该藏却显示）。
+   *
+   * <p>可达的越界只来自 Y：方块坐标是 int，水平 {@code x>>4} 最大恰为 {@link SectionKey#HORIZONTAL_MAX}；
+   * 而 {@code y>>4} 可到 ±1.34 亿，远超 8 位 sectionY 范围。
    */
   @Test
   void outOfRangeCoordinatesAreRejectedInsteadOfSilentlyRepacked() {
     OcclusionStore store = new OcclusionStore();
-    int farX = (SectionKey.HORIZONTAL_MAX + 1) << 4; // chunkX 超出 28 位有符号范围
+    int tooHighY = (SectionKey.SECTION_Y_MAX + 1) << 4;
     assertThrows(IllegalArgumentException.class,
-        () -> store.setBlockOccluding(farX, 0, 0, true));
+        () -> store.setBlockOccluding(0, tooHighY, 0, true));
+    int tooLowY = (SectionKey.SECTION_Y_MIN - 1) << 4;
+    assertThrows(IllegalArgumentException.class,
+        () -> store.setBlockOccluding(0, tooLowY, 0, true));
     assertEquals(0, store.loadedSectionCount(), "越界坐标不得写入任何 section");
   }
 }

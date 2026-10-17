@@ -124,7 +124,9 @@ public final class ProximitySelector {
   /** 构造眼睛快照；方向向量会被归一化，零向量按「朝向 +Z」处理。 */
   public static Eye eye(double x, double y, double z, double dirX, double dirY, double dirZ) {
     double length = Math.sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
-    if (length < 1.0E-6D) {
+    // length 非有限（NaN / Inf，例如上游读到损坏的朝向）时同样回落 +Z：否则下面的除法会把 NaN
+    // 传播进所有角度比较，使视锥判定恒为 false——整片矿永远不显形（玩家对着假石头挖矿）。
+    if (!(length >= 1.0E-6D) || !Double.isFinite(length)) {
       return new Eye(x, y, z, 0.0D, 0.0D, 1.0D);
     }
     return new Eye(x, y, z, dirX / length, dirY / length, dirZ / length);
