@@ -140,6 +140,19 @@ class DiagnosticsTest {
   }
 
   @Test
+  void dumpEchoesAsyncOcclusionTuningKeys() {
+    // 异步遮挡是实体剔除唯一的射线路径，其调优键直接决定「成本上限」与「多藏倾向」；
+    // dump 缺任一项时，排查「实体迟迟不显示 / 隐藏过久」只能靠猜配置。
+    String dump = Diagnostics.formatDump(fixed(bandwidth("enabled: true\n")),
+        "20260925-000000");
+    for (String key : new String[] {"entity-culling.occlusion-time-budget-ms=",
+        "occlusion-threads=", "max-occluding-blocks=", "occlusion-timeout-cycles=",
+        "occlusion-hysteresis-cycles="}) {
+      assertTrue(dump.contains(key), "dump 必须回显异步遮挡调优键 " + key + "：" + dump);
+    }
+  }
+
+  @Test
   void dumpEchoesPlatformZstdAndCeilingAdjustments() {
     // 平台判定与 zstd 前置（含 zstd-sha256）此前未回显，dump 与实现漂移；这里锁住它们必须出现。
     String plain = Diagnostics.formatDump(

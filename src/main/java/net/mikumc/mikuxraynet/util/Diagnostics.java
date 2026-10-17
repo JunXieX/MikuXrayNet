@@ -940,6 +940,16 @@ public final class Diagnostics {
         .append("，frustum.有效距离=").append(c.entityCulling().frustum() == null
             ? "无" : frustumEffectiveDistance(c.entityCulling()))
         .append('\n');
+    // 异步遮挡的全部调优键：它们直接决定射线成本与「多藏」倾向，dump 里缺任一项，
+    // 排查「实体为什么迟迟不显示 / 隐藏得太久」时就只能靠猜配置。
+    BandwidthConfig.EntityCulling.AsyncOcclusion async = c.entityCulling().asyncOcclusion();
+    sb.append("entity-culling.occlusion-time-budget-ms=")
+        .append(async == null ? "无" : async.timeBudgetMillis())
+        .append("，occlusion-threads=").append(async == null ? "无" : async.threads())
+        .append("，max-occluding-blocks=").append(async == null ? "无" : async.maxOccludingBlocks())
+        .append("，occlusion-timeout-cycles=").append(async == null ? "无" : async.timeoutCycles())
+        .append("，occlusion-hysteresis-cycles=").append(async == null ? "无" : async.hysteresisCycles())
+        .append('\n');
     sb.append("afk.enabled=").append(c.afk().enabled())
         .append("，seconds=").append(c.afk().seconds())
         .append("，distance=").append(c.afk().distance())

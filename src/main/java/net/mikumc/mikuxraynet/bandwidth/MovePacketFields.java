@@ -42,7 +42,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 final class MovePacketFields {
 
-  /** 实体 id 的字段名（Mojang 映射，1.20.5 起稳定）；缺失时退化为「继承链上第一个非静态 int」。 */
+  /** 实体 id 的字段名（Mojang 映射，1.20.5 起稳定）；缺失时仅在「继承链上恰有一个 int 字段」时按它推断。 */
   private static final String ENTITY_ID = "entityId";
   /** ≤26.2 形态的三个位移分量字段名（顺序即 {@code dx, dy, dz}）。 */
   private static final String DELTA_X = "xa";
