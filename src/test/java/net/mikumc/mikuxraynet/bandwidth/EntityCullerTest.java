@@ -1129,6 +1129,10 @@ class EntityCullerTest {
         case "getX" -> location.getX();
         case "getY" -> location.getY();
         case "getZ" -> location.getZ();
+        // 视锥判定改用「yaw/pitch + eyeHeight」手算方向（生产不再 new Location / Vector）
+        case "getYaw" -> location.getYaw();
+        case "getPitch" -> location.getPitch();
+        case "getEyeHeight" -> 1.62D;
         case "hideEntity" -> null;
         case "showEntity" -> {
           showCalls.incrementAndGet();

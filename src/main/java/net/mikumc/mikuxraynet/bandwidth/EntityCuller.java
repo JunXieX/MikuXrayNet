@@ -4,6 +4,7 @@ import io.papermc.paper.event.player.PlayerTrackEntityEvent;
 import io.papermc.paper.event.player.PlayerUntrackEntityEvent;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -34,7 +35,6 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.util.BoundingBox;
-import org.bukkit.util.Vector;
 
 /**
  * 实体射线剔除：被不透明方块完全遮挡的实体对玩家隐藏，节省下行的实体跟踪带宽。
@@ -95,6 +95,9 @@ public final class EntityCuller implements Listener {
 
   /** 单个小体积实体（如物品、投掷物）只取中心顶点即可。 */
   private static final double SMALL_BOX = 0.25D;
+
+  /** 候选顶点上限（与配置项的钳制上限同源，见 {@link BandwidthConfig#MAX_RAY_SAMPLES}）。 */
+  private static final int MAX_RAY_SAMPLES = BandwidthConfig.MAX_RAY_SAMPLES;
 
   /**
    * 单条遮挡射线的最大长度（格）。射线只用于判断「眼睛与实体之间是否有遮挡方块」；实体一旦超出该长度，
@@ -858,24 +861,26 @@ public final class EntityCuller implements Listener {
       return;
     }
     try {
-      Location eye = player.getEyeLocation();
+      // 眼睛坐标用零分配 getter（getEyeLocation 每次提交都会 new 一个 Location）；提交频率是
+      // 「每玩家每周期每远处实体」，属热路径。
+      double eyeX = player.getX();
+      double eyeY = player.getY() + player.getEyeHeight();
+      double eyeZ = player.getZ();
       String worldName = entity.getWorld().getName();
       BoundingBox box = entity.getBoundingBox();
-      double[][] visible = visibleVertices(eye.getX(), eye.getY(), eye.getZ(),
-          box.getMinX(), box.getMinY(), box.getMinZ(), box.getMaxX(), box.getMaxY(), box.getMaxZ());
-      int limit = Math.min(Math.max(1, config.raySamples()), visible.length);
-      // 展平成连续数组（纯基本类型，跨线程传递零装箱；工作线程只按 (x,y,z) 三元组读取）
-      double[] vertices = new double[limit * 3];
-      for (int i = 0; i < limit; i++) {
-        vertices[i * 3] = visible[i][0];
-        vertices[i * 3 + 1] = visible[i][1];
-        vertices[i * 3 + 2] = visible[i][2];
-      }
+      // 顶点直接写进「最多 ray-samples 个点」的一维数组：旧写法先建 double[][]（+ 最多 7 个内层数组）、
+      // 再展平成第二个数组，每次提交 9 份短命分配。这里只有一份，且长度即提交长度。
+      int limit = Math.min(Math.max(1, config.raySamples()), MAX_RAY_SAMPLES);
+      double[] scratch = new double[MAX_RAY_SAMPLES * 3];
+      int count = Math.min(limit, visibleVerticesFlat(eyeX, eyeY, eyeZ,
+          box.getMinX(), box.getMinY(), box.getMinZ(), box.getMaxX(), box.getMaxY(), box.getMaxZ(),
+          scratch));
+      double[] vertices = count * 3 == scratch.length ? scratch : Arrays.copyOf(scratch, count * 3);
       // 截止时刻：超过 timeoutCycles 个提交周期仍未回投的判定由引擎丢弃（不改变显示状态），
       // 避免用陈旧几何去隐藏实体（见 OcclusionEngine 的截止时间说明）。
       long deadline = System.nanoTime() + timeoutNanos;
       OcclusionEngine.Request request = new OcclusionEngine.Request(player.getUniqueId(),
-          entity.getEntityId(), worldName, deadline, eye.getX(), eye.getY(), eye.getZ(), vertices,
+          entity.getEntityId(), worldName, deadline, eyeX, eyeY, eyeZ, vertices,
           (result, occluded) ->
               // 回投发生在专用池线程：先跳回玩家/实体所属线程，再触碰任何 Bukkit API
               Schedulers.onEntity(plugin, player,
@@ -990,30 +995,48 @@ public final class EntityCuller implements Listener {
       return true;
     }
     try {
-      Location eye = player.getEyeLocation();
-      Vector direction = eye.getDirection();
-      ProximitySelector.Eye snapshot = ProximitySelector.eye(eye.getX(), eye.getY(), eye.getZ(),
-          direction.getX(), direction.getY(), direction.getZ());
+      ProximitySelector.Eye snapshot = eyeOf(player);
       // 快路径：中心在锥内 → 直接可见（常见情形只多这一次判定，成本不变）
       if (ProximitySelector.withinFrustum(snapshot, entity.getX(), entity.getY(), entity.getZ(),
           0.0D, frustumFov)) {
         return true;
       }
-      // 慢路径：中心已在锥外，再试包围盒水平 4 个角——任一在锥内即判可见（大型实体不被误藏）
+      // 慢路径：中心已在锥外，再试包围盒水平 4 个角——任一在锥内即判可见（大型实体不被误藏）。
+      // 直接逐个传参而不建两个临时 double[]：本方法在「每玩家每周期每远距离实体」上被调用，
+      // 两处小数组分配纯属热路径垃圾。
       BoundingBox box = entity.getBoundingBox();
       double midY = (box.getMinY() + box.getMaxY()) / 2.0D;
-      for (double x : new double[] {box.getMinX(), box.getMaxX()}) {
-        for (double z : new double[] {box.getMinZ(), box.getMaxZ()}) {
-          if (ProximitySelector.withinFrustum(snapshot, x, midY, z, 0.0D, frustumFov)) {
-            return true;
-          }
-        }
-      }
-      return false;
+      double minX = box.getMinX();
+      double maxX = box.getMaxX();
+      double minZ = box.getMinZ();
+      double maxZ = box.getMaxZ();
+      return ProximitySelector.withinFrustum(snapshot, minX, midY, minZ, 0.0D, frustumFov)
+          || ProximitySelector.withinFrustum(snapshot, maxX, midY, minZ, 0.0D, frustumFov)
+          || ProximitySelector.withinFrustum(snapshot, minX, midY, maxZ, 0.0D, frustumFov)
+          || ProximitySelector.withinFrustum(snapshot, maxX, midY, maxZ, 0.0D, frustumFov);
     } catch (Throwable throwable) {
       logThrottled(throwable);
       return true;
     }
+  }
+
+  /**
+   * 零中间分配地取「眼睛位置 + 单位视线方向」。
+   *
+   * <p><b>为什么不用 {@code player.getEyeLocation().getDirection()}</b>：那会为每个实体每次评估
+   * new 一个 {@code Location} 与一个 {@code Vector}；本方法是「每玩家每周期每实体」的热路径
+   * （默认 10 tick、数十个追踪实体），属于纯垃圾。这里用 {@code getX/getY/getZ/getEyeHeight/
+   * getYaw/getPitch} 直接算，与 {@code Location#getDirection()} 的公式逐项一致
+   * （{@code dx = -cos(pitch)·sin(yaw)}，{@code dy = -sin(pitch)}，{@code dz = cos(pitch)·cos(yaw)}），
+   * 结果本身就是单位向量；再交给 {@link ProximitySelector#eye} 做一次极廉价的归一化兜底。
+   */
+  private static ProximitySelector.Eye eyeOf(Player player) {
+    double yaw = Math.toRadians(player.getYaw());
+    double pitch = Math.toRadians(player.getPitch());
+    double horizontal = Math.cos(pitch);
+    return ProximitySelector.eye(player.getX(), player.getY() + player.getEyeHeight(),
+        player.getZ(), -horizontal * Math.sin(yaw), -Math.sin(pitch),
+        horizontal * Math.cos(yaw));
   }
 
   /**
@@ -1036,15 +1059,44 @@ public final class EntityCuller implements Listener {
    *
    * <p>一次判定最多尝试 {@code ray-samples} 个顶点。
    *
+   * <p><b>测试专用豁免</b>：生产路径走 {@link #visibleVerticesFlat}（直接写进一维数组，只分配一次）；
+   * 本方法当前仅单测在用，保留以免破坏测试。
+   *
    * @return 顶点数组，每项为 (x, y, z)
    */
   static double[][] visibleVertices(double eyeX, double eyeY, double eyeZ,
       double minX, double minY, double minZ, double maxX, double maxY, double maxZ) {
+    double[] flat = new double[MAX_RAY_SAMPLES * 3];
+    int count = visibleVerticesFlat(eyeX, eyeY, eyeZ, minX, minY, minZ, maxX, maxY, maxZ, flat);
+    double[][] vertices = new double[count][3];
+    for (int i = 0; i < count; i++) {
+      vertices[i][0] = flat[i * 3];
+      vertices[i][1] = flat[i * 3 + 1];
+      vertices[i][2] = flat[i * 3 + 2];
+    }
+    return vertices;
+  }
+
+  /**
+   * 顶点选取的<b>生产实现</b>：把候选顶点按 {@code x,y,z} 连续写进 {@code out}，返回顶点数。
+   *
+   * <p>与 {@link #visibleVertices} 逐点等价，但只分配调用方给出的那一个一维数组（由 {@link #submitAsync}
+   * 按 {@code ray-samples} 定长创建并随后随请求交给工作线程）。旧写法先建 {@code double[][]} + 最多 7 个
+   * 内层数组、再展平成第三个数组——每次提交 9 份垃圾，而提交频率是「每玩家每周期每远处实体」。
+   *
+   * @param out 输出数组，长度须 ≥ {@link #MAX_RAY_SAMPLES} × 3
+   * @return 写入的顶点数（1 = 小包围盒退化为中心点；否则 7）
+   */
+  static int visibleVerticesFlat(double eyeX, double eyeY, double eyeZ,
+      double minX, double minY, double minZ, double maxX, double maxY, double maxZ, double[] out) {
     double sizeX = maxX - minX;
     double sizeY = maxY - minY;
     double sizeZ = maxZ - minZ;
     if (sizeX <= SMALL_BOX && sizeY <= SMALL_BOX && sizeZ <= SMALL_BOX) {
-      return new double[][] {{(minX + maxX) / 2.0D, (minY + maxY) / 2.0D, (minZ + maxZ) / 2.0D}};
+      out[0] = (minX + maxX) / 2.0D;
+      out[1] = (minY + maxY) / 2.0D;
+      out[2] = (minZ + maxZ) / 2.0D;
+      return 1;
     }
 
     boolean nearestXIsMin = Math.abs(eyeX - minX) < Math.abs(eyeX - maxX);
@@ -1058,15 +1110,20 @@ public final class EntityCuller implements Listener {
     double farY = nearestYIsMin ? maxY : minY;
     double farZ = nearestZIsMin ? maxZ : minZ;
 
-    return new double[][] {
-        {nearX, nearY, nearZ},
-        {farX, nearY, nearZ},
-        {nearX, farY, nearZ},
-        {nearX, nearY, farZ},
-        {farX, farY, nearZ},
-        {farX, nearY, farZ},
-        {nearX, farY, farZ}
-    };
+    put(out, 0, nearX, nearY, nearZ);
+    put(out, 1, farX, nearY, nearZ);
+    put(out, 2, nearX, farY, nearZ);
+    put(out, 3, nearX, nearY, farZ);
+    put(out, 4, farX, farY, nearZ);
+    put(out, 5, farX, nearY, farZ);
+    put(out, 6, nearX, farY, farZ);
+    return 7;
+  }
+
+  private static void put(double[] out, int index, double x, double y, double z) {
+    out[index * 3] = x;
+    out[index * 3 + 1] = y;
+    out[index * 3 + 2] = z;
   }
 
   /**
