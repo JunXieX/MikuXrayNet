@@ -899,9 +899,15 @@ public final class ObfuscationProcessor {
               BitmapOcclusion.fromStateLookup(section::getBlockState, entityOcclusionTable);
         }
       }
+      // 先编码、后发布：encode 用普通数组读遍历位图字，而 restoreColumn 一旦执行，这批位图就对
+      // 封包线程的方块补丁（setBlockOccluding，opaque 写）可见——两者对同一 long[] 构成数据竞争，
+      // 且会把「发布瞬间之后才落下的补丁」漏在编码结果外（该结果会随磁盘缓存持久化，日后回灌
+      // 时把陈旧遮挡位写回活表，方向是「该显示却多藏」）。编码时 column 仍是本线程私有对象，
+      // 任何其它线程都碰不到，竞争窗口结构上消失，且零额外开销。
+      byte[] payload = OcclusionPayload.encode(column);
       stores.of(worldName).restoreColumn(chunkX, minSectionY, chunkZ, column);
       // 同时返回编码后的负载：调用方把它随改写结果一并缓存，使缓存命中路径也能恢复遮挡数据
-      return OcclusionPayload.encode(column);
+      return payload;
     } catch (Throwable ignored) {
       // 建表失败不影响反矿透改写（fail-open）
       return null;

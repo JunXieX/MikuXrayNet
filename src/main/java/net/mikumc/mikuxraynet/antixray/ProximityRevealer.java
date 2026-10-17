@@ -853,11 +853,16 @@ public final class ProximityRevealer implements Listener {
         return false;
       }
     }
+    // 回显记号必须在<b>发包之前</b>写：显形包离开 send* 时就已经进了服务端发送队列，出站监听器可能在
+    // 本方法返回前就在另一线程上看完它——若等 send 返回再补记号，那次「回显」会被当成真实变更，
+    // 把该坐标从<b>全服共享</b>的伪装索引里摘掉（于是其他玩家再也无法被主动显形该坐标）。
+    // 与上方 revealed 标记同一条「先标记、后动作」纪律。代价：发包失败时会留下一条短寿命记号，
+    // 需在下方回滚分支里撤销（否则同坐标 ≤2 秒内的真实变更会被误判为回显而漏摘索引）。
+    markOurReveal(playerId, worldName, x, y, z);
     if (send.getAsBoolean()) {
-      // 记号：本次确实为该玩家发出了该坐标的显形包，出站监听器看到的同坐标变更即判为回显
-      markOurReveal(playerId, worldName, x, y, z);
       return true;
     }
+    unmarkOurReveal(playerId, worldName, x, y, z);
     if (revealedSet != null) {
       // 只回滚「本次这个玩家」的标记：其它玩家此前成功收到的显形仍有效，连带摘除只会让它们重复显形
       revealedSet.removePosition(playerId, worldName, x, y, z);
@@ -885,6 +890,27 @@ public final class ProximityRevealer implements Listener {
       perPlayer.put(new EchoKey(worldName, x, y, z),
           System.nanoTime() + REVEAL_ECHO_WINDOW_NANOS);
     } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /**
+   * 撤销一条回显记号（发包失败时调用）。
+   *
+   * <p>只删「完全相同的那枚记号」：若同一坐标在极短窗口内被另一条路径重新标记过（值不同），
+   * 这里不动它，避免把有效的回显保护一并抹掉。
+   */
+  private void unmarkOurReveal(UUID playerId, String worldName, int x, int y, int z) {
+    if (playerId == null || worldName == null) {
+      return;
+    }
+    try {
+      ConcurrentHashMap<EchoKey, Long> perPlayer = revealEcho.get(playerId);
+      if (perPlayer != null) {
+        perPlayer.remove(new EchoKey(worldName, x, y, z));
+      }
+    } catch (Throwable throwable) {
+      // 撤销失败只会多留一条 ≤2 秒的记号（极小概率漏摘一次索引），不影响正确性
       logThrottled(throwable);
     }
   }
@@ -955,22 +981,29 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 合并包的「发包 + 成功补记回显记号 / 失败整批回滚」步（包级可见，便于离线单测）。
+   * 合并包的「预写回显记号 + 发包 + 失败整批撤销」步（包级可见，便于离线单测）。
    *
-   * <p>调用方已在 {@link #claimForSend} 里完成原子复核与「已显形」标记，这里只负责把 {@code fresh} 这批
-   * 坐标一次发出：<b>发出成功</b>后才为它们补记回显记号（记号必须后于发包，见 {@link #claimForSend}）；
-   * 发送失败则回滚这些坐标的「已显形」标记（返回 false，调用方随后退化为逐坐标 {@link #markThenSend}，
-   * 未发出的坐标后续周期仍会重试）。
+   * <p>调用方已在 {@link #claimForSend} 里完成原子复核与「已显形」标记。这里先为 {@code fresh} 这批
+   * 坐标写好回显记号<b>再</b>发出（记号必须先于发包：包一离开 send* 就进了服务端发送队列，出站监听器
+   * 可能在本次调用返回前就已判定，详见方法内注释）；发送失败则撤销记号并回滚「已显形」标记，
+   * 返回 false（调用方随后退化为逐坐标 {@link #markThenSend}，未发出的坐标后续周期仍会重试）。
    */
   boolean sendBatchOrRollback(UUID playerId, String worldName, List<int[]> positions, int[] fresh,
       java.util.function.BooleanSupplier send) {
+    // 回显记号必须在发包<b>之前</b>全部写好：一次 sendMultiBlockChange 会把 N 个坐标同时推进服务端
+    // 发送队列，出站监听器可能在本次调用返回前就逐坐标判完——若等发包成功后再补，批量越大越必然
+    // 全部判为「真实变更」，从而把整批坐标从全服共享的伪装索引里摘掉（其他玩家再也无法主动显形）。
+    for (int index : fresh) {
+      int[] position = positions.get(index);
+      markOurReveal(playerId, worldName, position[0], position[1], position[2]);
+    }
     if (send.getAsBoolean()) {
-      // 回显记号写在发包成功之后：失败时不留记号，避免「记号在、包没发成」把随后的真实变更误判为回显
-      for (int index : fresh) {
-        int[] position = positions.get(index);
-        markOurReveal(playerId, worldName, position[0], position[1], position[2]);
-      }
       return true;
+    }
+    // 发包失败：撤销刚写的记号（否则 ≤2 秒内同坐标的真实变更会被误判为回显而漏摘索引）
+    for (int index : fresh) {
+      int[] position = positions.get(index);
+      unmarkOurReveal(playerId, worldName, position[0], position[1], position[2]);
     }
     if (revealedSet != null) {
       for (int index : fresh) {
@@ -1065,14 +1098,16 @@ public final class ProximityRevealer implements Listener {
       BlockData state = batch.states.get(index);
       boolean sent;
       if (revealedMarksWritten) {
-        // 「已显形」标记已在 claimForSend 写好：发送成功即保留并补记回显记号（记号必须后于发包），
-        // 失败则回滚（该坐标仍在伪装清单里，后续周期重试）
+        // 「已显形」标记已在 claimForSend 写好。回显记号同样必须先于发包（理由见 sendBatchOrRollback）：
+        // 包一离开 sendSingle 就进了服务端发送队列，出站监听器可能在本方法返回前就已判定。
+        markOurReveal(playerId, worldName, position[0], position[1], position[2]);
         sent = sendSingle(player, world, position[0], position[1], position[2], state);
-        if (sent) {
-          markOurReveal(playerId, worldName, position[0], position[1], position[2]);
-        } else if (revealedSet != null) {
-          // 只回滚本玩家的标记（同 markThenSend），避免连带作废其它玩家的有效显形
-          revealedSet.removePosition(playerId, worldName, position[0], position[1], position[2]);
+        if (!sent) {
+          unmarkOurReveal(playerId, worldName, position[0], position[1], position[2]);
+          if (revealedSet != null) {
+            // 只回滚本玩家的标记（同 markThenSend），避免连带作废其它玩家的有效显形
+            revealedSet.removePosition(playerId, worldName, position[0], position[1], position[2]);
+          }
         }
       } else {
         // 合并包已回滚本批标记：逐坐标重新走「先复核 + 标记、再发包、失败回滚」（见 markThenSend）

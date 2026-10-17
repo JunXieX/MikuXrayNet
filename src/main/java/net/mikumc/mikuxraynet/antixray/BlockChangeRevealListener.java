@@ -65,7 +65,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private final ProximityRevealer instantRevealer;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
-  private AsyncListenerHandler handler;
+  private volatile AsyncListenerHandler handler;
 
   /**
    * @param obfuscatedChunkIndex 伪装区块索引；{@code null} 表示不做邻近显形（只做索引注销）

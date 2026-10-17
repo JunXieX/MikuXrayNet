@@ -3,6 +3,7 @@ package net.mikumc.mikuxraynet.bandwidth;
 import com.comphenix.protocol.AsynchronousManager;
 import com.comphenix.protocol.ProtocolLibrary;
 import com.comphenix.protocol.ProtocolManager;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
@@ -81,13 +82,19 @@ public final class ThrottlePipeline {
   /** 异步遮挡计数（插件级唯一，跨热重载复用；未接线时不影响任何行为）。 */
   private final OcclusionStats occlusionStats;
 
-  private EntityPacketFilter entityPacketFilter;
-  private BlockChangeMerger blockChangeMerger;
-  private EntityCuller entityCuller;
-  private AfkTracker afkTracker;
-  private LatencyMonitor latencyMonitor;
+  private volatile EntityPacketFilter entityPacketFilter;
+  private volatile BlockChangeMerger blockChangeMerger;
+  private volatile EntityCuller entityCuller;
+  private volatile AfkTracker afkTracker;
+  private volatile LatencyMonitor latencyMonitor;
 
-  private boolean started;
+  /**
+   * 是否已启动；用 CAS 而非普通布尔，使 {@link #stop()} 在并发调用下恰好执行一次清理。
+   *
+   * <p>模块字段同样 volatile：命令线程（reload 的停旧建新）写、全局区域线程（周期诊断）读，
+   * 与 {@code MikuXrayNet#throttlePipeline} 是同一类线程关系。
+   */
+  private final AtomicBoolean started = new AtomicBoolean();
 
   public ThrottlePipeline(Plugin plugin, BandwidthConfig config) {
     this(plugin, config, new ThrottleStats());
@@ -196,15 +203,14 @@ public final class ThrottlePipeline {
       logDisabled("高延迟降视距", "latency.enabled");
     }
 
-    started = true;
+    started.set(true);
   }
 
-  /** 注销全部子模块；可重复调用，异常安全。 */
+  /** 注销全部子模块；可重复调用，异常安全（并发调用时恰好一个线程执行清理）。 */
   public void stop() {
-    if (!started) {
+    if (!started.compareAndSet(true, false)) {
       return;
     }
-    started = false;
     close("高延迟降视距", latencyMonitor, LatencyMonitor::stop);
     close("AFK 降级", afkTracker, AfkTracker::stop);
     close("实体剔除（射线遮挡 / 视锥剔除）", entityCuller, EntityCuller::stop);

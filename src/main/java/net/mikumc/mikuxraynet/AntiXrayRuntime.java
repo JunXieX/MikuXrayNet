@@ -46,10 +46,13 @@ public final class AntiXrayRuntime {
   private final MikuXrayNet plugin;
   private final Logger logger;
 
-  private ProtocolLibHook protocolLibHook;
-  private MikuWorkPool workPool;
-  private ProximityRevealer proximityRevealer;
-  private BlockChangeRevealListener blockChangeRevealListener;
+  // 以下装配字段由 onEnable（全局区域线程）/ 热重载（命令线程，可来自玩家区域线程）写入，
+  // 由诊断任务（全局区域线程）读取——与 MikuXrayNet#throttlePipeline 完全相同的线程关系，
+  // 因此同样必须是 volatile（否则诊断可能读到旧引用或 null 之外的陈旧值）。
+  private volatile ProtocolLibHook protocolLibHook;
+  private volatile MikuWorkPool workPool;
+  private volatile ProximityRevealer proximityRevealer;
+  private volatile BlockChangeRevealListener blockChangeRevealListener;
   /**
    * 按区块共享的伪装坐标索引（内存 = O(有伪装的已加载区块数)）。
    *
@@ -59,8 +62,8 @@ public final class AntiXrayRuntime {
   private volatile ObfuscatedChunkIndex obfuscatedChunkIndex;
   /** 按玩家的已显形集合（内存 = O(玩家身边确实显形过的坐标数)）；volatile 原因同上。 */
   private volatile RevealedSet revealedSet;
-  private ProximityStats proximityStats;
-  private DiskCacheStore diskCacheStore;
+  private volatile ProximityStats proximityStats;
+  private volatile DiskCacheStore diskCacheStore;
   /**
    * 遮挡数据仓库（按世界分域）；反矿透未启用时为 {@code null}。
    *
@@ -71,18 +74,18 @@ public final class AntiXrayRuntime {
    * 不分域会让主世界与下界的同名区块互相覆盖，进而隐藏<b>本可见</b>的实体（安全方向错误）。
    * 世界卸载时整体摘除该世界的表（见 {@link #invalidateWorld}）。
    */
-  private OcclusionStores occlusionStores;
+  private volatile OcclusionStores occlusionStores;
   /**
    * 出站方块变更 → 遮挡位图单格补丁监听器；未装配时为 {@code null}。
    *
    * <p>它让「玩家挖开遮挡物」这类变更即时反映到遮挡位图，避免陈旧「遮挡」位把<b>本已可见</b>的实体
    * 继续隐藏（属正确性要求，见 {@link OcclusionPatchListener}）。
    */
-  private OcclusionPatchListener occlusionPatchListener;
+  private volatile OcclusionPatchListener occlusionPatchListener;
   /** 遮挡判定计数（插件级唯一实例，与带宽侧共用；补丁计数也写在这里）。 */
   private final OcclusionStats occlusionStats;
-  private BypassRegistry bypassRegistry;
-  private boolean antiXrayActive;
+  private volatile BypassRegistry bypassRegistry;
+  private volatile boolean antiXrayActive;
 
   AntiXrayRuntime(MikuXrayNet plugin, OcclusionStats occlusionStats) {
     this.plugin = plugin;

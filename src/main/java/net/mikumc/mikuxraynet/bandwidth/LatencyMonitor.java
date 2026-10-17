@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -114,6 +115,12 @@ public final class LatencyMonitor implements Listener {
     if (previous != null) {
       previous.cancel();
     }
+    // 入账后再读一次 volatile stopping（理由同 EntityCuller.scheduleRecheck）：若 stop() 的取消循环
+    // 已经跑完，它看不到这条任务，必须自行取消。
+    if (stopping) {
+      checkTasks.remove(player.getUniqueId(), task);
+      task.cancel();
+    }
   }
 
   private void cancelCheckTask(UUID playerId) {
@@ -123,11 +130,20 @@ public final class LatencyMonitor implements Listener {
     }
   }
 
+  /**
+   * 取消全部巡检任务。
+   *
+   * <p><b>逐项 remove 而非遍历后 clear</b>：本方法在命令线程执行，{@code onJoin} → {@link #scheduleCheck}
+   * 在玩家所属区域线程执行（Folia 上真正并发）。「先迭代、后 clear」会让迭代之后才入表的任务
+   * 永远不被 cancel，持续空跑到玩家退出并钉住已停用的旧实例。
+   */
   private void cancelCheckTasks() {
-    for (ScheduledTask task : checkTasks.values()) {
-      task.cancel();
+    for (UUID playerId : new ArrayList<>(checkTasks.keySet())) {
+      ScheduledTask task = checkTasks.remove(playerId);
+      if (task != null) {
+        task.cancel();
+      }
     }
-    checkTasks.clear();
   }
 
   /** 单个玩家的采样与降级/还原（必须在玩家所属线程执行）。 */
@@ -184,7 +200,13 @@ public final class LatencyMonitor implements Listener {
         return;
       }
       // 记录原始 raw（可能为 -1）：还原时原样回写，API 才会把 send 视距还原为服端默认（见类注释）。
-      originalViewDistance.put(player.getUniqueId(), raw);
+      //
+      // 用 putIfAbsent 而不是 put：若该玩家此前已被降过级（record 仍在），本次读到的 raw 已经是
+      // <b>上一次的降级结果</b>；再 put 一次就会把「真正的原始视距」覆盖成降级值，此后 restore()
+      // 只能把玩家还原到那个降级值——视距被永久压低，直到重新登录。重复进入 reduce 时
+      // （PingState.reduced 因 Folia 区域迁移等读到陈旧值）必须保留最早记录的那份原始值。
+      Integer previous = originalViewDistance.putIfAbsent(player.getUniqueId(), raw);
+      boolean recordedByUs = previous == null;
       player.setSendViewDistance(target);
       // 停用竞态收口（Folia：stop() 可能在另一条区域线程上并发执行）：<b>写入之后再读一次</b> volatile
       // stopping。这样保证「本次读到 false ⇒ stop() 尚未置位 ⇒ 其 restoreAll 必然发生在本次写入之后、
@@ -192,11 +214,13 @@ public final class LatencyMonitor implements Listener {
       // 一起丢弃、新实例又不知道，玩家会<b>永久卡在降级后的视距</b>。
       if (stopping) {
         // restoreAll 若已把该记录摘走／随整表 clear() 丢弃，就再也不会替我们还原，因此这里<b>无条件</b>
-        // 回滚：若它已经还原过，重复写回同一个 raw 值只是幂等重复，无害。回滚必须写回 raw（可能为 -1），
-        // 与记录值同源，才能保证还原语义一致。
-        originalViewDistance.remove(player.getUniqueId(), raw);
+        // 回滚：若它已经还原过，重复写回同一个值只是幂等重复，无害。
+        // 回滚值必须是「表中真正的那份原始值」：本次若是沿用前人记录（recordedByUs=false），
+        // 写回 raw（= 上一次的降级值）会把视距钉在降级状态。
+        int restoreTo = recordedByUs ? raw : previous;
+        originalViewDistance.remove(player.getUniqueId(), restoreTo);
         try {
-          player.setSendViewDistance(raw);
+          player.setSendViewDistance(restoreTo);
         } catch (Throwable throwable) {
           plugin.getLogger().fine("停用竞态回滚视距失败：" + throwable.getMessage());
         }

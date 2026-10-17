@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
@@ -240,6 +241,15 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private volatile boolean stopping;
 
   /**
+   * 已交给区域调度器、但尚未进入工作池的抓取任务（{@link #scheduleCaptureThenRewrite} 登记）。
+   *
+   * <p><b>为什么需要它</b>：这类任务既不在 {@code MikuWorkPool.pending} 里（还没入池），其超时看门狗
+   * 也会随停用被 {@code shutdownNow} 丢弃——如果登记后不做记录，停用时就没有任何途径枚举并放行它们。
+   * 停用（{@link #unregisterBukkitHooks()}）会遍历本集合主动放行。
+   */
+  private final Set<RewriteTask> pendingCaptures = ConcurrentHashMap.newKeySet();
+
+  /**
    * @param liveConfig       实时配置源（读取「当前」配置，保证热重载后世界黑名单即时生效）；可为 null（回落 config）
    * @param neighborProvider 邻区块贴边快照提供者；仅在 {@code neighbors.enabled} 时被使用
    * @param handleChunkBatch 是否拦截 1.20.2+ 的区块批量包（不可用时由装配方降级为 false）
@@ -294,6 +304,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 首行置位：此后任何迟到的抓取回调都必须自行放行（见 stopping 字段说明），
     // 否则该区块封包会永久无人 signalOnce（停用期工作池与看门狗均已关闭，不会再有兜底）。
     stopping = true;
+    // 仅靠 stopping 还不够：区域调度器在插件停用后可能<b>根本不执行</b>抓取回调，此时上面的检查
+    // 永远跑不到。这里主动把「已调度但未入工作池」的抓取任务全部放行（signalOnce 的闸门 CAS
+    // 保证与「回调稍后仍执行」这一路恰好一个生效，不会重复放行）。
+    for (RewriteTask pending : Set.copyOf(pendingCaptures)) {
+      pending.releaseOnTimeout();
+    }
+    pendingCaptures.clear();
     if (quitHookRegistered) {
       quitHookRegistered = false;
       try {
@@ -382,21 +399,36 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     // 与 world.getMinHeight() 同一处安全取数点：这两个值都必须在此（网络线程读 Bukkit）取出，
     // 之后只传纯值给任务；worker 线程严禁触碰 Bukkit API。
-    int minHeight = world.getMinHeight();
-    int sectionCount = (world.getMaxHeight() - minHeight) / 16;
-    // 维度由 World#getEnvironment() 判定（不依赖世界名；CUSTOM 归入 normal），决定用哪段 dimensions 配置。
-    AntiXrayConfig.Dimension dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
-    // 超时实时读「当前」配置：reload 改了 advanced.timeout-millis 必须立即生效（本监听器不随 reload 重建）。
-    // 同一区块的任务构造与看门狗注册共用这一个值，保证两者一致。
-    long timeoutMillis = live().timeoutMillis();
-    RewriteTask task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
-        world.getName(), dimension, minHeight, sectionCount, timeoutMillis,
-        gate == null
-            ? () -> asynchronousManager.signalPacketTransmission(event)
-            : () -> {
-              gate.chunkDone();
-              asynchronousManager.signalPacketTransmission(event);
-            });
+    //
+    // 这段必须包 try/catch：闸门一旦取到就已把该玩家的 pending 计数 +1，而归还它的唯一途径
+    // （gate.chunkDone()）在还没构造出来的 task 的 delivery 闭包里。若中途抛异常（Folia 上跨线程读
+    // World、世界正在卸载等），这次 pending 永远回不去 —— 该玩家的 CHUNK_BATCH_FINISHED 会被拖到
+    // 看门狗超时（默认 2.5 秒），加载节奏被打断。此处还没登记处理延迟，直接返回即可，
+    // 放行由 ProtocolLib 自行完成（不要调 signalOnce，那会多放行一次）。
+    RewriteTask task;
+    try {
+      int minHeight = world.getMinHeight();
+      int sectionCount = (world.getMaxHeight() - minHeight) / 16;
+      // 维度由 World#getEnvironment() 判定（不依赖世界名；CUSTOM 归入 normal），决定用哪段 dimensions 配置。
+      AntiXrayConfig.Dimension dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
+      // 超时实时读「当前」配置：reload 改了 advanced.timeout-millis 必须立即生效（本监听器不随 reload 重建）。
+      // 同一区块的任务构造与看门狗注册共用这一个值，保证两者一致。
+      long timeoutMillis = live().timeoutMillis();
+      task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
+          world.getName(), dimension, minHeight, sectionCount, timeoutMillis,
+          gate == null
+              ? () -> asynchronousManager.signalPacketTransmission(event)
+              : () -> {
+                gate.chunkDone();
+                asynchronousManager.signalPacketTransmission(event);
+              });
+    } catch (Throwable throwable) {
+      if (gate != null) {
+        gate.chunkDone(); // 归还刚登记的批次计数，等价于本区块从未开始
+      }
+      logThrottled("区块任务构造失败（世界状态读取异常），已按原包放行", throwable);
+      return;
+    }
 
     ScheduledFuture<?> timeout;
     // 延迟登记必须先于看门狗注册（与旧实现顺序对调，行为等价性说明）：
@@ -756,6 +788,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
 
     Runnable capture = () -> {
+      // 首行注销登记：此后该任务的放行责任回到「本回调内部」或「工作池 / 看门狗」，
+      // 停用路径不再需要（也不应该）替它放行。
+      pendingCaptures.remove(task);
       // 停用中（插件停用 / 热重载）：本回调可能已不再被执行，即便执行也不能再走「先抓取、再入工作池」——
       // 工作池与看门狗都已随停用关闭，入队只会被丢弃。立刻自行放行原包，避免该区块封包永久无人
       // signalOnce（玩家卡在区块加载界面直到重登）。
@@ -781,11 +816,15 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     };
 
     try {
+      // 登记必须先于调度：调度成功那一刻回调就可能立即执行（Paper 的主线程队列、Folia 的区域线程），
+      // 若先调度后登记，回调里的 remove 会晚于随后的 add，把登记永久留在表里。
+      pendingCaptures.add(task);
       // RegionScheduler：Paper 上落在主线程、Folia 上落在该区块所属区域线程（同一套 API，无需分支）。
       // 跨区域读取失败会由 provider 按缺失策略降级。
       Bukkit.getRegionScheduler().execute(getPlugin(), world, task.chunkX(), task.chunkZ(), capture);
       return true;
     } catch (Throwable throwable) {
+      pendingCaptures.remove(task);
       logThrottled("邻区块抓取调度失败，已按缺失策略降级", throwable);
       return false;
     }

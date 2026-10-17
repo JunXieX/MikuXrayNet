@@ -556,6 +556,12 @@ public final class EntityCuller implements Listener {
     if (previous != null) {
       previous.cancel();
     }
+    // 与 hide() 同一套「入账后再读一次 volatile」收口：若 stop() 的取消循环已在我们入表<b>之前</b>
+    // 跑完，它永远看不到这条任务，必须由我们自己取消（否则任务空跑到玩家退出并钉住旧实例）。
+    if (stopping) {
+      recheckTasks.remove(player.getUniqueId(), task);
+      task.cancel();
+    }
   }
 
   private void cancelRecheckTask(UUID playerId) {
@@ -565,11 +571,22 @@ public final class EntityCuller implements Listener {
     }
   }
 
+  /**
+   * 取消全部复检任务。
+   *
+   * <p><b>逐项 remove 而非遍历后 clear</b>：本方法在命令线程执行，而 {@code onJoin} → {@link #scheduleRecheck}
+   * 在玩家所属区域线程执行（Folia 上是真正并发）。「先遍历 values()、后 clear()」会把迭代之后才 put
+   * 进来的句柄直接扔掉——那个任务从未被 cancel，会随实体调度器一直跑到玩家退出，并让整个已停用的
+   * 旧实例无法被 GC。逐项 {@code remove} 是原子的：并发 put 的那条要么被本方法看到并取消，
+   * 要么留给 {@link #scheduleRecheck} 的 {@code stopping} 收口自行取消。
+   */
   private void cancelRecheckTasks() {
-    for (ScheduledTask task : recheckTasks.values()) {
-      task.cancel();
+    for (UUID playerId : new ArrayList<>(recheckTasks.keySet())) {
+      ScheduledTask task = recheckTasks.remove(playerId);
+      if (task != null) {
+        task.cancel();
+      }
     }
-    recheckTasks.clear();
   }
 
   @EventHandler(ignoreCancelled = true)

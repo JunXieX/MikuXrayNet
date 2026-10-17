@@ -42,11 +42,32 @@ public final class SwmrLongMap<V> {
 
   private final StampedLock lock = new StampedLock();
 
-  private volatile long[] keys;
-  private volatile Object[] values;
-  private volatile byte[] slots;
+  /**
+   * 当前表代（键/值/槽位三数组<b>一次</b>发布）。
+   *
+   * <p><b>为什么必须打包成一个不可变对象</b>：三个数组若各自用一个 volatile 字段发布，乐观读侧
+   * 也是三次独立 volatile 读，StampedLock 的乐观戳只能保证「读前读后有写则重试」，
+   * <b>挡不住「读到新一代的 keys + 旧一代的 slots」这种跨代组合</b>（三次读在同步序上可以分别落在
+   * 写者的三次写之间）。此时 {@code mask} 取自新数组、下标却用于旧数组，会抛
+   * {@link ArrayIndexOutOfBoundsException}——而异常在 {@code validate} 之前抛出，乐观读的
+   * 「事后校验」完全失效。打包成单个对象后，一次 volatile 读必然拿到同一代，结构上不可能跨代。
+   */
+  private volatile Table<V> table;
   private volatile int size;
   private volatile int tombstones;
+
+  /** 一代表结构：三个数组容量一致，构造完成后<b>整体不可变</b>（只允许原地改数组元素，不允许换数组）。 */
+  private static final class Table<V> {
+    final long[] keys;
+    final Object[] values;
+    final byte[] slots;
+
+    Table(int capacity) {
+      this.keys = new long[capacity];
+      this.values = new Object[capacity];
+      this.slots = new byte[capacity];
+    }
+  }
 
   public SwmrLongMap() {
     this(MIN_CAPACITY);
@@ -54,10 +75,7 @@ public final class SwmrLongMap<V> {
 
   /** 以「期望条目数」构造（实际容量向上取到 2 的幂，并按负载因子放大）。 */
   public SwmrLongMap(int expectedEntries) {
-    int capacity = capacityFor(Math.max(MIN_CAPACITY, expectedEntries));
-    this.keys = new long[capacity];
-    this.values = new Object[capacity];
-    this.slots = new byte[capacity];
+    this.table = new Table<>(capacityFor(Math.max(MIN_CAPACITY, expectedEntries)));
   }
 
   /**
@@ -65,17 +83,14 @@ public final class SwmrLongMap<V> {
    *
    * @return 对应值；键不存在返回 {@code null}
    */
-  @SuppressWarnings("unchecked")
   public V get(long key) {
     long stamp = lock.tryOptimisticRead();
-    long[] k = keys;
-    Object[] v = values;
-    byte[] s = slots;
-    V result = probeGet(k, v, s, key);
+    Table<V> t = table;
+    V result = probeGet(t, key);
     if (!lock.validate(stamp)) {
       stamp = lock.readLock();
       try {
-        result = probeGet(keys, values, slots, key);
+        result = probeGet(table, key);
       } finally {
         lock.unlockRead(stamp);
       }
@@ -130,14 +145,14 @@ public final class SwmrLongMap<V> {
   public V remove(long key) {
     long stamp = lock.writeLock();
     try {
-      int capacity = keys.length;
-      int mask = capacity - 1;
+      Table<V> t = table;
+      int mask = t.keys.length - 1;
       int index = spread(key) & mask;
-      while (slots[index] != 0) {
-        if (slots[index] == USED && keys[index] == key) {
-          Object previous = values[index];
-          slots[index] = TOMBSTONE;
-          values[index] = null;
+      while (t.slots[index] != 0) {
+        if (t.slots[index] == USED && t.keys[index] == key) {
+          Object previous = t.values[index];
+          t.slots[index] = TOMBSTONE;
+          t.values[index] = null;
           size--;
           tombstones++;
           return (V) previous;
@@ -159,14 +174,14 @@ public final class SwmrLongMap<V> {
     return size == 0;
   }
 
-  /** 清空（独占）。 */
+  /** 清空（独占）。原地清空当前代，不换数组（换数组会让并发的乐观读跨代，见 {@link #table} 说明）。 */
   public void clear() {
     long stamp = lock.writeLock();
     try {
-      int capacity = keys.length;
-      for (int i = 0; i < capacity; i++) {
-        values[i] = null;
-        slots[i] = 0;
+      Table<V> t = table;
+      for (int i = 0; i < t.slots.length; i++) {
+        t.values[i] = null;
+        t.slots[i] = 0;
       }
       size = 0;
       tombstones = 0;
@@ -180,16 +195,17 @@ public final class SwmrLongMap<V> {
   // ------------------------------------------------------------------
 
   private V putLocked(long key, V value) {
-    int capacity = keys.length;
+    Table<V> t = table;
+    int capacity = t.keys.length;
     int mask = capacity - 1;
     int index = spread(key) & mask;
     int firstTombstone = -1;
-    while (slots[index] != 0) {
-      if (slots[index] == USED) {
-        if (keys[index] == key) {
+    while (t.slots[index] != 0) {
+      if (t.slots[index] == USED) {
+        if (t.keys[index] == key) {
           @SuppressWarnings("unchecked")
-          V previous = (V) values[index];
-          values[index] = value;
+          V previous = (V) t.values[index];
+          t.values[index] = value;
           return previous;
         }
       } else if (firstTombstone < 0) {
@@ -204,9 +220,9 @@ public final class SwmrLongMap<V> {
       index = firstTombstone;
       tombstones--;
     }
-    keys[index] = key;
-    values[index] = value;
-    slots[index] = USED;
+    t.keys[index] = key;
+    t.values[index] = value;
+    t.slots[index] = USED;
     size++;
 
     if ((size + tombstones) * 1.0f / capacity >= LOAD_FACTOR) {
@@ -217,12 +233,12 @@ public final class SwmrLongMap<V> {
 
   @SuppressWarnings("unchecked")
   private V getLocked(long key) {
-    int capacity = keys.length;
-    int mask = capacity - 1;
+    Table<V> t = table;
+    int mask = t.keys.length - 1;
     int index = spread(key) & mask;
-    while (slots[index] != 0) {
-      if (slots[index] == USED && keys[index] == key) {
-        return (V) values[index];
+    while (t.slots[index] != 0) {
+      if (t.slots[index] == USED && t.keys[index] == key) {
+        return (V) t.values[index];
       }
       index = (index + 1) & mask;
     }
@@ -230,33 +246,28 @@ public final class SwmrLongMap<V> {
   }
 
   private void rehash(int newCapacity) {
-    long[] oldKeys = keys;
-    Object[] oldValues = values;
-    byte[] oldSlots = slots;
-    int oldCapacity = oldKeys.length;
+    Table<V> old = table;
+    int oldCapacity = old.slots.length;
 
-    long[] newKeys = new long[newCapacity];
-    Object[] newValues = new Object[newCapacity];
-    byte[] newSlots = new byte[newCapacity];
+    Table<V> fresh = new Table<>(newCapacity);
     int newMask = newCapacity - 1;
 
     for (int i = 0; i < oldCapacity; i++) {
-      if (oldSlots[i] != USED) {
+      if (old.slots[i] != USED) {
         continue;
       }
-      long key = oldKeys[i];
+      long key = old.keys[i];
       int index = spread(key) & newMask;
-      while (newSlots[index] != 0) {
+      while (fresh.slots[index] != 0) {
         index = (index + 1) & newMask;
       }
-      newKeys[index] = key;
-      newValues[index] = oldValues[i];
-      newSlots[index] = USED;
+      fresh.keys[index] = key;
+      fresh.values[index] = old.values[i];
+      fresh.slots[index] = USED;
     }
 
-    this.keys = newKeys;
-    this.values = newValues;
-    this.slots = newSlots;
+    // 单次 volatile 写发布整代：乐观读要么看到旧代、要么看到新代，绝不可能跨代混用数组。
+    this.table = fresh;
     this.tombstones = 0;
   }
 
@@ -264,13 +275,14 @@ public final class SwmrLongMap<V> {
   // 无锁探测
   // ------------------------------------------------------------------
 
-  private static <V> V probeGet(long[] keys, Object[] values, byte[] slots, long key) {
-    int mask = keys.length - 1;
+  private static <V> V probeGet(Table<V> t, long key) {
+    int mask = t.keys.length - 1;
     int index = spread(key) & mask;
+    byte[] slots = t.slots;
     while (slots[index] != 0) {
-      if (slots[index] == USED && keys[index] == key) {
+      if (slots[index] == USED && t.keys[index] == key) {
         @SuppressWarnings("unchecked")
-        V value = (V) values[index];
+        V value = (V) t.values[index];
         return value;
       }
       index = (index + 1) & mask;

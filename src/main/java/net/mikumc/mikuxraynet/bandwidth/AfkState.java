@@ -33,6 +33,15 @@ package net.mikumc.mikuxraynet.bandwidth;
  */
 public final class AfkState {
 
+  /**
+   * {@link #afk} 的 CAS 句柄（Java 25 无 {@code AtomicBoolean} 的「无需额外对象」替代品）。
+   *
+   * <p>用 VarHandle 而不是把字段换成 {@code AtomicBoolean}：本类在<b>每个玩家</b>上各持一个实例，
+   * 再嵌一个原子对象就多一次对象头与间接跳转；VarHandle 直接对字段做 CAS，零额外分配。
+   */
+  private static final java.lang.invoke.VarHandle AFK = java.lang.invoke.MethodHandles
+      .lookup().findVarHandle(AfkState.class, "afk", boolean.class);
+
   private volatile long lastActiveMillis;
   private volatile boolean afk;
 
@@ -99,12 +108,21 @@ public final class AfkState {
     return nowMillis - lastActiveMillis >= timeoutMillis;
   }
 
-  /** 超时则进入 AFK；返回 {@code true} 表示本次刚好「进入 AFK」（用于计数与日志）。 */
+  /**
+   * 超时则进入 AFK；返回 {@code true} 表示本次刚好「进入 AFK」（用于计数与日志）。
+   *
+   * <p><b>用 CAS 而非「读 afk → 写 afk」</b>：本方法由<b>封包线程</b>调用，而 ProtocolLib 的异步回调
+   * 可能并发。旧写法是 check-then-act，两颗粒子包同时到达时两者都能通过检查，导致「同一段 AFK
+   * 被上报两次」（正是类注释承诺不成立的场景）。CAS 保证恰好一个线程返回 true。
+   *
+   * <p>仍可能与 {@link #touch}（区域线程）交错而把「刚活动的玩家」判为 AFK 一拍——这是与坐标撕裂读
+   * 同源的既有取舍：{@code touch} 会在下一次交互/移动时立刻把 {@code afk} 复位，且该判定只用于
+   * 决定是否丢弃一颗远处粒子包。
+   */
   public boolean enterIfTimedOut(long nowMillis, long timeoutMillis) {
     if (afk || !isTimedOut(nowMillis, timeoutMillis)) {
       return false;
     }
-    afk = true;
-    return true;
+    return AFK.compareAndSet(this, false, true);
   }
 }

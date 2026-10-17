@@ -63,8 +63,8 @@ public final class MikuXrayNet extends JavaPlugin {
   private final OcclusionStats occlusionStats = new OcclusionStats();
   /** 诊断转储 / status 数据源（热重载时重建；volatile 原因同 {@link #throttlePipeline}）。 */
   private volatile Diagnostics diagnostics;
-  /** 周期运行摘要任务（bandwidth.yml: diagnostics.interval-seconds；0 = 关闭）。 */
-  private ScheduledTask diagnosticsTask;
+  /** 周期运行摘要任务（bandwidth.yml: diagnostics.interval-seconds；0 = 关闭）。volatile：命令线程与全局区域线程都会读写。 */
+  private volatile ScheduledTask diagnosticsTask;
   /**
    * 反矿透侧运行时（ProtocolLib 接入、工作池、显形结构、磁盘缓存、直通名单）；onEnable 起可用。
    *

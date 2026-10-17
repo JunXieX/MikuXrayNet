@@ -247,6 +247,20 @@ public final class NeighborChunkProvider {
   }
 
   /**
+   * 当前线程是否拥有该区块所在 region（Folia 用；Paper 上恒为 true）。
+   *
+   * <p>任何异常都按「拥有」处理（fail-open）：判定不可用时退回改动前的行为，
+   * 由调用方的 {@code catch (Throwable)} 与缺失策略兜底。
+   */
+  private static boolean ownsChunk(World world, int chunkX, int chunkZ) {
+    try {
+      return org.bukkit.Bukkit.isOwnedByCurrentRegion(world, chunkX, chunkZ);
+    } catch (Throwable throwable) {
+      return true;
+    }
+  }
+
+  /**
    * 抓取一侧邻块（生产路径）。
    *
    * <p><b>为什么改用 {@code Chunk#getChunkSnapshot}</b>：旧实现对贴边层逐格调用
@@ -270,6 +284,13 @@ public final class NeighborChunkProvider {
       NeighborEdges.Side side) {
     try {
       int[] neighbor = neighborChunk(side, chunkX, chunkZ);
+      // Folia：抓取回调只保证当前线程拥有「中心区块」所在 region，四个邻块可能属于另一个 region。
+      // 跨 region 读 ChunkSnapshot 会触发 TickThread 校验——它<b>先打一条 ERROR 再抛异常</b>，
+      // catch 只能吞掉异常、吞不掉那条日志（每次抓取最多 4 条刷屏）。因此先问归属，
+      // 不属于本 region 的邻块直接按「缺失」处理（由缺失策略决定，默认 hide，安全方向）。
+      if (!ownsChunk(world, neighbor[0], neighbor[1])) {
+        return null;
+      }
       if (!world.isChunkLoaded(neighbor[0], neighbor[1])) {
         return null;
       }

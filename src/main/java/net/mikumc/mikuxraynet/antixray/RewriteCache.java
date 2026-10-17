@@ -205,7 +205,11 @@ public final class RewriteCache<V> {
     while (entries.size() > maximumSize) {
       CacheEntry<V> candidate = clockQueue.pollFirst();
       if (candidate == null) {
-        // 理论上不会发生：每个存活条目在创建时都已入队
+        // 已知窗口（非「理论上不会发生」）：并发 put 可能在「已 entries.putIfAbsent、尚未入队」之间
+        // 被本方法看到——此时 entries.size() 已超标但队列暂时为空。此刻直接放弃本轮淘汰是安全的：
+        // 那个 put 紧接着就会入队并自己再调一次 evictOverflow；超额量上界 = 同时在途的 put 数
+        // （≤ 工作线程数），对内存影响可忽略。把入队也塞进本锁虽能消除该窗口，但会把所有 put
+        // 串行化，代价远大于收益。
         return;
       }
       if (entries.get(candidate.key) != candidate) {

@@ -195,6 +195,14 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   private final PlayerPositionSnapshots positions = new PlayerPositionSnapshots();
   /** 每玩家的位置刷新任务句柄（退出 / 实体退役 / 停用时逐一取消）。 */
   private final ConcurrentHashMap<UUID, ScheduledTask> positionTasks = new ConcurrentHashMap<>();
+  /**
+   * 停用中标记：{@link #stop()} 首行置位，供 {@link #schedulePositionRefresh} 做「入账后再读一次」收口。
+   *
+   * <p>Folia 上 stop() 跑在命令线程、onJoin→schedulePositionRefresh 跑在玩家区域线程，两者真正并发；
+   * 没有这道闸，stop() 的取消循环可能先跑完，之后入表的位置刷新任务（<b>每 tick</b> 执行）
+   * 就永远无人取消。
+   */
+  private volatile boolean stopping;
   private final AtomicInteger errorCounter = new AtomicInteger();
   /** 「位置快照不可用 → 近身判定一律立即放行」的一次性提示闸。 */
   private final AtomicBoolean snapshotFailOpenNoticed = new AtomicBoolean();
@@ -244,6 +252,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
   /** 注销监听器并偿还所有正在延迟中的原包。 */
   public void stop() {
+    // 首行置位：此后任何迟到的 schedulePositionRefresh 都会自行取消（见 stopping 字段说明）。
+    stopping = true;
     // 顺序很关键：必须先注销异步监听器、再排空。旧顺序（先 flush 再 unregister）在两者之间留了一个
     // 窗口：封包线程仍可为新建的 Pending 成功 schedule 定时器，随后 shutdownNow 把定时器连其队列一起
     // 丢弃——该批 held 原包既没被取消也没被放行，只能等 ProtocolLib 超时兜底（停用瞬间滞留原包）。
@@ -296,6 +306,12 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     if (previous != null) {
       previous.cancel();
     }
+    // 入账后再读一次 volatile stopping（理由同 EntityCuller.scheduleRecheck）：若 stop() 的取消循环
+    // 已经跑完，它看不到这条任务，必须自行取消。
+    if (stopping) {
+      positionTasks.remove(playerId, task);
+      task.cancel();
+    }
   }
 
   /**
@@ -333,16 +349,24 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     positions.discard(playerId);
   }
 
-  /** 停用兜底：取消全部位置刷新任务。 */
+  /**
+   * 停用兜底：取消全部位置刷新任务。
+   *
+   * <p><b>逐项 remove 而非遍历后 clear</b>：本方法在命令线程执行，{@code onJoin} → {@link #schedulePositionRefresh}
+   * 在玩家所属区域线程执行（Folia 上真正并发）。若先迭代再 clear，迭代之后才入表的任务会被直接丢弃
+   * 且从未 cancel——而它是<b>每 tick</b> 执行的，会持续空跑到玩家退出并钉住整个已停用实例。
+   */
   private void cancelAllPositionRefreshTasks() {
-    for (ScheduledTask task : positionTasks.values()) {
-      try {
-        task.cancel();
-      } catch (Throwable ignored) {
-        // 任务可能已随实体退役结束，取消失败可忽略
+    for (UUID playerId : new ArrayList<>(positionTasks.keySet())) {
+      ScheduledTask task = positionTasks.remove(playerId);
+      if (task != null) {
+        try {
+          task.cancel();
+        } catch (Throwable ignored) {
+          // 任务可能已随实体退役结束，取消失败可忽略
+        }
       }
     }
-    positionTasks.clear();
   }
 
   /**

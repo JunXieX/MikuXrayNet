@@ -158,7 +158,6 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
 
   /** 注册监听器；白名单非空时启动实体类型索引的增量维护与低频兜底重建。 */
   public void start() {
-    protocolManager.addPacketListener(this);
     if (!whitelist.isEmpty()) {
       if (PlatformSupport.isFolia()) {
         // 保留平台差异：Folia 下无法从单一线程安全枚举全服实体，因此不做类型索引（白名单退化为对所有实体生效）
@@ -175,6 +174,11 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
             INDEX_REBUILD_TICKS);
       }
     }
+    // 封包监听必须<b>最后</b>注册：白名单判定依赖上面建好的类型索引，而全量建索引在大服上要遍历
+    // 所有世界的已加载区块（数百毫秒级）。若先行注册，封包线程会在索引仍为空时就开始判定——
+    // isWhitelisted 恒为 false，于是白名单本想豁免的实体（盔甲架 / 展示实体等）在该窗口内
+    // 会被误取消零位移包。先建索引、后开闸，窗口即不复存在。
+    protocolManager.addPacketListener(this);
     plugin.getLogger().fine("带宽模块已启用：零位移实体包取消（白名单 " + whitelist.size() + " 项）");
   }
 

@@ -93,7 +93,14 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
     this.eyeX = eye.x();
     this.eyeY = eye.y();
     this.eyeZ = eye.z();
-    return ProximitySelector.isVisible(eye, x, y, z, this, maxPoints, this);
+    try {
+      return ProximitySelector.isVisible(eye, x, y, z, this, maxPoints, this);
+    } finally {
+      // 判定结束后必须释放仓库引用：本实例寄居在 ThreadLocal 里，主线程 / 各区域线程与服务端同寿命。
+      // 若不清空，世界卸载或插件停用后 store 已被 OcclusionStores 摘除，却仍被每一条线程强引用，
+      // 其整张位图（每 section 512B × 已建表 section 数）无法回收——热重载会逐代累积。
+      this.store = null;
+    }
   }
 
   /** 本次判定是否触碰过「无数据」的 section（仅在 {@link #isVisible} 之后读取才有效，见字段说明）。 */

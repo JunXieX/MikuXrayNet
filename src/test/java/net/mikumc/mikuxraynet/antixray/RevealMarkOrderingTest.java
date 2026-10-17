@@ -184,23 +184,46 @@ class RevealMarkOrderingTest {
   }
 
   /**
-   * 批量路径的回显记号<b>必须后于发包</b>：发包失败时不得留下记号，否则会出现「记号在、包没发成」的窗口，
-   * 其间该坐标的<b>真实</b>方块变更会被误判为回显而漏摘共享索引（其他玩家看到幻影伪装）。
+   * 批量路径的回显记号<b>必须早于发包</b>、并在发包失败时撤销。
+   *
+   * <p>理由：{@code sendMultiBlockChange} 一返回，包就已经在服务端发送队列里，出站监听器可能在本方法
+   * 返回<b>之前</b>就在另一线程上处理完它们。若等发包成功后再补记号，那次「回显」会被当成真实变更，
+   * 把整批坐标从<b>全服共享</b>的伪装索引里摘掉（其他玩家再也无法被主动显形）。
+   *
+   * <p>代价是发包失败时会短暂留下记号，因此失败分支必须撤销它——否则同坐标 ≤2 秒内的真实变更
+   * 会被误判为回显而漏摘索引。本用例把这两侧都钉住。
    */
   @Test
-  void batchEchoMarkerIsWrittenOnlyAfterSendSucceeds() {
+  void batchEchoMarkerIsWrittenBeforeSendAndRolledBackOnFailure() {
     index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
     List<int[]> positions = List.of(new int[] {1, 64, 1});
 
     int[] fresh = revealer.claimForSend(PLAYER, WORLD, positions);
     assertEquals(1, fresh.length, "坐标应新登记");
-    assertFalse(revealer.consumeOurRevealEcho(PLAYER, WORLD, 1, 64, 1),
-        "只登记「已显形」时不得留下回显记号（记号必须后于发包）");
+    // 用桩在「发包那一刻」检查记号是否已存在：这正是「出站监听器先于 send 返回」的真实交错。
+    boolean[] markerVisibleDuringSend = new boolean[1];
+    boolean sent = revealer.sendBatchOrRollback(PLAYER, WORLD, positions, fresh, () -> {
+      markerVisibleDuringSend[0] = revealer.consumeOurRevealEcho(PLAYER, WORLD, 1, 64, 1);
+      return true;
+    });
+    assertTrue(sent, "合并包已发出");
+    assertTrue(markerVisibleDuringSend[0],
+        "回显记号必须早于发包写入（否则异步监听器会把自己的显形包误判为真实变更）");
+  }
+
+  /** 发包失败时必须撤销预写的回显记号，否则随后同坐标的真实变更会被误判为回显。 */
+  @Test
+  void failedBatchSendRemovesThePreWrittenEchoMarker() {
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
+    List<int[]> positions = List.of(new int[] {1, 64, 1});
+
+    int[] fresh = revealer.claimForSend(PLAYER, WORLD, positions);
+    assertEquals(1, fresh.length, "坐标应新登记");
 
     assertFalse(revealer.sendBatchOrRollback(PLAYER, WORLD, positions, fresh, () -> false),
         "合并包未发出");
     assertFalse(revealer.consumeOurRevealEcho(PLAYER, WORLD, 1, 64, 1),
-        "发包失败不得留下回显记号，否则真实变更会被误判为回显");
+        "发包失败必须撤销预写的回显记号，否则真实变更会被误判为回显");
 
     int[] again = revealer.claimForSend(PLAYER, WORLD, positions);
     assertTrue(revealer.sendBatchOrRollback(PLAYER, WORLD, positions, again, () -> true),

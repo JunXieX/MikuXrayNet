@@ -543,6 +543,14 @@ public final class DiskCacheStore implements AutoCloseable {
 
   private void doPut(String worldName, int chunkX, int chunkZ, int configHash, long writtenAt,
       byte[] payload) throws IOException {
+    // 复核实际负载长度：put() 的上限判定用的是调用方给的 encodedBytes（惰性负载在判定后才真正编码）。
+    // 若两者不一致（调用方估算公式漂移、supplier 返回了别的对象），超长负载会被写进去却永远读不回来
+    //（decodeEntry 对 payloadLength > MAX_PAYLOAD_SIZE 一律抛异常）——"写成功却读不回"的不对称。
+    // 在这里按真实长度再拦一次，把不变式收归存储层自己保证，成本仅一次比较。
+    if (payload.length > BufferedLinearV3Format.MAX_PAYLOAD_SIZE) {
+      stats.rejectedBySize.increment();
+      return;
+    }
     int regionX = BufferedLinearV3Format.regionCoordinate(chunkX);
     int regionZ = BufferedLinearV3Format.regionCoordinate(chunkZ);
     Handle handle = handle(worldName, regionX, regionZ, true);
@@ -728,26 +736,49 @@ public final class DiskCacheStore implements AutoCloseable {
    *
    * <p>与旧实现（跑在磁盘线程上）的唯一差别是执行线程：这里能安全地长跑，因为磁盘线程已被
    * {@link RegionFile#beginCompact()} 挡在该文件之外，且其余文件仍由磁盘线程正常服务。
+   *
+   * <p><b>{@code compact()} 返回后的一切收尾都必须回到磁盘线程执行</b>：{@code compact} 的 finally
+   * 已经 {@code endCompact()}（volatile 清标志），从那一刻起磁盘线程对该文件的避让全部解除。
+   * 若此时仍在压缩线程上改 {@code Handle} 的 {@code accountedEntries} / {@code pendingBytes}
+   * 或调用 {@link #removeAndClose}（内部会 {@code flushDirty} 写 channel），就与磁盘线程的
+   * {@code doPut}/{@code doGet} 构成无 happens-before 的数据竞争——轻则待落盘记账被清零、单文件
+   * 大小上限被击穿，重则两个线程同时写同一 FileChannel 的偏移表而损坏缓存文件。
    */
   private void runCompact(List<RegionKey> candidates, RegionKey key, Handle handle, int nextIndex) {
     try {
+      int dropped = 0;
+      Throwable failure = null;
       try {
-        int dropped = handle.file.compact((chunkIndex, entry) -> keepEntry(entry));
-        if (dropped > 0) {
-          handle.accountedEntries = Math.max(0L, handle.accountedEntries - dropped);
-          approximateEntries.updateAndGet(value -> Math.max(0, value - dropped));
-        }
-        // 压缩会把内存里的全部槽位（含脏的）整文件重写：待落盘记账随之清零
-        handle.clearPending();
+        dropped = handle.file.compact((chunkIndex, entry) -> keepEntry(entry));
       } catch (Throwable throwable) {
-        // 压缩失败：句柄可能已不可用（例如文件被外部删除），直接关闭并让它下次重新打开。
-        // 此刻 compact 的 finally 已解除独占标志，故这里的关闭不与压缩互斥冲突。
-        fail("磁盘缓存压缩回收失败，已关闭该区域文件句柄：" + handle.file.path(), throwable);
-        removeAndClose(key, handle);
+        failure = throwable;
+      }
+      // 收尾（记账 / 失败关闭）一律回投磁盘线程：那是 Handle 与 RegionFile 状态唯一的合法所有者。
+      final int compactDropped = dropped;
+      final Throwable compactFailure = failure;
+      if (!execute(() -> finishCompact(key, handle, compactDropped, compactFailure))) {
+        // 磁盘线程已关闭或积压被拒：收尾不会再发生（Handle 记账与失败关闭都会丢），
+        // 这里直接关闭通道，避免 fd / 文件锁悬挂到 JVM 退出。
+        closeHandleQuietly(handle);
       }
     } finally {
       scheduleCompactStep(candidates, nextIndex);
     }
+  }
+
+  /** 【磁盘线程】压缩收工后的记账与失败清理（见 {@link #runCompact} 的线程纪律说明）。 */
+  private void finishCompact(RegionKey key, Handle handle, int dropped, Throwable failure) {
+    if (failure != null) {
+      fail("磁盘缓存压缩回收失败，已关闭该区域文件句柄：" + handle.file.path(), failure);
+      removeAndClose(key, handle);
+      return;
+    }
+    if (dropped > 0) {
+      handle.accountedEntries = Math.max(0L, handle.accountedEntries - dropped);
+      approximateEntries.updateAndGet(value -> Math.max(0, value - dropped));
+    }
+    // 压缩会把内存里的全部槽位（含脏的）整文件重写：待落盘记账随之清零
+    handle.clearPending();
   }
 
   /** 条目保留判定：只按过期时间丢弃（内容新鲜度由负载里的原始字节指纹保证，见类注释）。 */
@@ -922,7 +953,10 @@ public final class DiskCacheStore implements AutoCloseable {
         approximateEntries.addAndGet(count);
       }
     } catch (Throwable throwable) {
-      // 计数失败只影响上限的准确度（偏小），绝不影响缓存读写（fail-open）
+      // 计数失败只影响上限的准确度（偏小），绝不影响缓存读写（fail-open）。
+      // 同时归还「已补计」标记：否则该句柄存续期间 max-entries 对这份文件完全失明（旧条目不占额度），
+      // 与「宁可偏大提前拒绝」的取向相反。归还后下次句柄重开时会重新扫描补计。
+      entryCounted.remove(key);
       fail("统计磁盘缓存既有条目失败（max-entries 计数可能偏小，不影响缓存功能）", throwable);
     }
   }
@@ -951,21 +985,30 @@ public final class DiskCacheStore implements AutoCloseable {
           || character == '.' || character == '_' || character == '-';
       builder.append(safe ? character : '_');
     }
-    return builder.length() == 0 ? "unknown" : builder.toString().toLowerCase(Locale.ROOT);
+    String normalized = builder.length() == 0 ? "unknown" : builder.toString().toLowerCase(Locale.ROOT);
+    // 只由点组成（"." / ".." / "..."）会解析成父目录或自身：pathFor 的 resolve 会逃出缓存根目录，
+    // 之后 invalidateWorld 的 Files.deleteIfExists 甚至可能在缓存目录之外删文件。
+    // 世界名由服主控制、现实触发面极小，但归一化代价为零，直接兜住。
+    return normalized.chars().allMatch(character -> character == '.') ? "unknown" : normalized;
   }
 
   // ------------------------------------------------------------------ 调度
 
-  /** 提交一个不等待结果的任务（写入、落盘等）。 */
-  private void execute(ThrowingRunnable task) {
+  /**
+   * 提交一个不等待结果的任务（写入、落盘等）。
+   *
+   * @return true = 已成功入队（任务一定会被执行）；false = 未入队（已关闭 / 积压被拒 / 提交异常）。
+   *         调用方若依赖「任务必然执行」来做收尾（如压缩后的记账），必须检查该返回值。
+   */
+  private boolean execute(ThrowingRunnable task) {
     // closed 也视为「不可提交」：关闭排队期间仍可能有工作线程越过 usable() 判定才提交，
     // 若放行就会在排空之后重新打开句柄（见 close() 说明）。
     if (closed || executor == null || executor.isShutdown()) {
-      return;
+      return false;
     }
     if (pendingOps.get() >= config.queueCapacity()) {
       stats.rejectedByBacklog.increment();
-      return;
+      return false;
     }
     pendingOps.incrementAndGet();
     try {
@@ -978,9 +1021,11 @@ public final class DiskCacheStore implements AutoCloseable {
           pendingOps.decrementAndGet();
         }
       });
+      return true;
     } catch (Throwable throwable) {
       pendingOps.decrementAndGet();
       stats.errors.increment();
+      return false;
     }
   }
 

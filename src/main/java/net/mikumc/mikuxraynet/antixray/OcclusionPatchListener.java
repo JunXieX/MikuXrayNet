@@ -202,7 +202,7 @@ public final class OcclusionPatchListener extends PacketAdapter {
   private final StateIdResolver idResolver;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
-  private AsyncListenerHandler handler;
+  private volatile AsyncListenerHandler handler;
 
   public OcclusionPatchListener(Plugin plugin, ProtocolManager protocolManager, OcclusionStores stores,
       OcclusionStats stats, IntPredicate stateLookup) {
