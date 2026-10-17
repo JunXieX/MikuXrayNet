@@ -230,7 +230,14 @@ public final class AfkTracker implements Listener {
         location.getX(), location.getY(), location.getZ()));
   }
 
-  /** 当前处于 AFK 状态的玩家数（诊断用，非热路径）。 */
+  /**
+   * 当前处于 AFK 状态的玩家数（诊断用，非热路径）。
+   *
+   * <p>口径是「无操作时长已超过阈值」而不是 {@link AfkState#afk()} 状态位：状态位只在确实有低价值包
+   * 到达时才会被置位（见 {@code enterIfTimedOut} 的调用点），拿它统计会<b>低估</b>挂机人数——
+   * 一个挂机但不产生任何粒子/动画包的玩家不该在面板上显示为「不 AFK」。面板要回答的是
+   * 「现在有多少人在挂机」。
+   */
   public int afkCount() {
     long now = System.currentTimeMillis();
     int count = 0;
