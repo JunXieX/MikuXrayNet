@@ -75,6 +75,36 @@ class SwmrLongMapTest {
     assertEquals(1, map.size());
   }
 
+  /**
+   * 批量删除：只删存在的键、返回真实删除数，且不影响其它键（整列摘除路径依赖它）。
+   */
+  @Test
+  void removeAllDeletesOnlyPresentKeys() {
+    SwmrLongMap<String> map = new SwmrLongMap<>();
+    for (int i = 0; i < 50; i++) {
+      map.put(key(i), "v" + i);
+    }
+    long[] batch = new long[20];
+    for (int i = 0; i < 20; i++) {
+      batch[i] = key(i); // 0..19 存在
+    }
+    assertEquals(20, map.removeAll(batch), "全部存在时删除数应等于批量键数");
+    assertEquals(30, map.size());
+    for (int i = 0; i < 20; i++) {
+      assertNull(map.get(key(i)), "已删除键 " + i + " 不得再命中");
+    }
+    for (int i = 20; i < 50; i++) {
+      assertEquals("v" + i, map.get(key(i)), "未列入批量的键必须保留");
+    }
+
+    // 重复删除同一批：已不存在，返回 0 且不改变条目数
+    assertEquals(0, map.removeAll(batch));
+    assertEquals(30, map.size());
+    // 空数组 / null 是 no-op
+    assertEquals(0, map.removeAll(new long[0]));
+    assertEquals(0, map.removeAll(null));
+  }
+
   @Test
   void concurrentWritersAndReadersStayConsistent() throws Exception {
     SwmrLongMap<String> map = new SwmrLongMap<>(16);

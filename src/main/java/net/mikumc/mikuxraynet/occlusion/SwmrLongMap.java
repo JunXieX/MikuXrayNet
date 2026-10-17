@@ -145,24 +145,72 @@ public final class SwmrLongMap<V> {
   public V remove(long key) {
     long stamp = lock.writeLock();
     try {
-      Table<V> t = table;
-      int mask = t.keys.length - 1;
-      int index = spread(key) & mask;
-      while (t.slots[index] != 0) {
-        if (t.slots[index] == USED && t.keys[index] == key) {
-          Object previous = t.values[index];
-          t.slots[index] = TOMBSTONE;
-          t.values[index] = null;
-          size--;
-          tombstones++;
-          return (V) previous;
-        }
-        index = (index + 1) & mask;
-      }
-      return null;
+      return removeLocked(key);
     } finally {
       lock.unlockWrite(stamp);
     }
+  }
+
+  /**
+   * 批量删除（<b>整批只取一次写锁</b>）。
+   *
+   * <p>供「整列摘除」这类一次删几十到几百个键的路径使用：逐个调 {@link #remove} 会为每个键各取一次
+   * 写锁（区块卸载时固定 256 次），而这里的键数量虽大但**绝大多数并不在表里**（一个区块通常只有
+   * 二十来段建过表）。因此先用无锁乐观读筛出真正存在的键，再有则取一次写锁批量删——
+   * 表里没有该列时开销降到 256 次只读探测、零写锁。
+   *
+   * @return 实际删除的条目数
+   */
+  public int removeAll(long[] keys) {
+    if (keys == null || keys.length == 0) {
+      return 0;
+    }
+    long stamp = lock.tryOptimisticRead();
+    Table<V> t = table;
+    int present = 0;
+    for (long key : keys) {
+      if (probeGet(t, key) != null) {
+        present++;
+      }
+    }
+    if (!lock.validate(stamp)) {
+      // 期间有写入：乐观结论不可信，直接按「全部可能存在」处理（多删几个不存在的键不影响语义）
+      present = 1;
+    }
+    if (present == 0) {
+      return 0;
+    }
+    int removed = 0;
+    stamp = lock.writeLock();
+    try {
+      for (long key : keys) {
+        if (removeLocked(key) != null) {
+          removed++;
+        }
+      }
+    } finally {
+      lock.unlockWrite(stamp);
+    }
+    return removed;
+  }
+
+  @SuppressWarnings("unchecked")
+  private V removeLocked(long key) {
+    Table<V> t = table;
+    int mask = t.keys.length - 1;
+    int index = spread(key) & mask;
+    while (t.slots[index] != 0) {
+      if (t.slots[index] == USED && t.keys[index] == key) {
+        Object previous = t.values[index];
+        t.slots[index] = TOMBSTONE;
+        t.values[index] = null;
+        size--;
+        tombstones++;
+        return (V) previous;
+      }
+      index = (index + 1) & mask;
+    }
+    return null;
   }
 
   /** 当前条目数（不含墓碑）。 */

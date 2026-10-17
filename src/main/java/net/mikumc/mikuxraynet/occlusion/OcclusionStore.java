@@ -173,13 +173,13 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * 摘除整列（某区块的全部 section）；区块/世界卸载时调用。
    *
    * <p>逐 section 摘除覆盖 8 位 sectionY 的全部取值——不遍历整张表即可保证该列一条不剩。
+   * 一次取写锁批量删（见 {@link SwmrLongMap#removeAll}）：一个区块通常只有二十来段建过表，
+   * 若逐键各取一次写锁，就等于为主线程上的区块卸载付 256 次加解锁。
    */
   public void removeColumn(int chunkX, int chunkZ) {
     long[] keys = SectionKey.columnKeys(chunkX, chunkZ);
     synchronized (writeMutex) {
-      for (long key : keys) {
-        sections.remove(key);
-      }
+      sections.removeAll(keys);
     }
   }
 
