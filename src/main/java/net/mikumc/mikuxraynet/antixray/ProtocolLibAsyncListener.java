@@ -682,8 +682,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 该文案会拼接 result.failure()（内容随异常而变）：用固定分类键限流，避免每出现一个新摘要就多计一条
       logThrottled("区块改写异常", "区块改写异常（已按原包放行，未写入任何缓存）："
           + result.failure(), null);
-      // 失败区块的 data == source 且位置为空，下面 changed 分支不会成立；这里直接结束，避免重复计数。
-      return;
+      // 不提前 return：绝对路径下失败的 data == source 且位置为空（不缓存、writeBack 直接早退），
+      // 但「失败了却仍带位置」的边界结果不该被静默吞掉——让它照常走 writeBack 的写回/索引维护，
+      // 由那里按既有语义决定写回与否。
     }
     if (result.changed()) {
       stats.chunksRewritten.increment();
@@ -703,7 +704,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
           }
         }
       }
-    } else {
+    } else if (!result.failed()) {
+      // 失败的区块已在上面计入 chunksSkipped（与 chunksFailed 同口径），这里不能再计一次。
       stats.chunksSkipped.increment();
     }
 
