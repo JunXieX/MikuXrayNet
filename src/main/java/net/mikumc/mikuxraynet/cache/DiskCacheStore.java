@@ -366,13 +366,14 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
     if (approximateEntries.get() >= config.maxEntries()) {
-      // 已达条目上限：只拒绝「新条目」，覆盖已有条目的写入照常放行。覆盖不增加条目数（见 doPut 的
-      // replaced 判定），若在这里一刀切，达到上限后缓存会彻底停止更新——旧条目继续被命中，新内容
-      // 永远落不了盘，且没有任何计数器能区分「真满了」与「覆盖被误拒」。
-      if (!overwritesExisting(worldName, chunkX, chunkZ)) {
-        stats.rejectedByCapacity.increment();
-        return;
-      }
+      // 已达条目上限即拒绝写入（不区分「新条目」与「覆盖已有条目」）。
+      //
+      // 曾考虑放行「覆盖已有条目」以免缓存停止更新，但唯一可靠的判据（该区块是否已有条目）只存在于
+      // RegionFile 的槽位表，而那属于磁盘线程：非磁盘线程要么同步等待（在改写工作线程上多一个磁盘 IO，
+      // 且磁盘线程自己调用时是自等自），要么只能猜。两者都比「满了就拒」更差——缓存只是可选加速，
+      // 到了上限后不再更新旧条目不会影响任何正确性（内容新鲜度由源字节指纹保证，过期条目会被回收）。
+      stats.rejectedByCapacity.increment();
+      return;
     }
     if (pendingOps.get() >= config.queueCapacity()) {
       stats.rejectedByBacklog.increment(); // 此前静默返回：积压导致写入被丢弃必须可见
@@ -391,26 +392,6 @@ public final class DiskCacheStore implements AutoCloseable {
     }
     long writtenAt = System.currentTimeMillis();
     execute(() -> doPut(worldName, chunkX, chunkZ, configHash, writtenAt, encoded));
-  }
-
-  /**
-   * 条目上限判定用：该区块是否<b>已经</b>在缓存里（覆盖写入不会增加条目数）。
-   *
-   * <p><b>为什么必须走磁盘线程</b>：只有 {@link RegionFile} 的槽位表知道「某区块是否已有条目」，
-   * 而它只归磁盘线程所有。这里提交一个带预算的查询（与读取同一条链路，超时即按「未命中 → 视为新条目」
-   * 处理，方向保守：宁可少收一条，也不让条目数超限）。查询内部只读偏移表，不触碰 LRU 之外的任何状态。
-   */
-  private boolean overwritesExisting(String worldName, int chunkX, int chunkZ) {
-    Boolean exists = submit(() -> {
-      int regionX = BufferedLinearV3Format.regionCoordinate(chunkX);
-      int regionZ = BufferedLinearV3Format.regionCoordinate(chunkZ);
-      Handle handle = handle(worldName, regionX, regionZ, false);
-      if (handle == null || handle.file.isCompacting()) {
-        return Boolean.FALSE;
-      }
-      return handle.file.get(BufferedLinearV3Format.chunkIndex(chunkX, chunkZ)) != null;
-    }, readTimeoutMillis);
-    return Boolean.TRUE.equals(exists);
   }
 
   /**
@@ -882,26 +863,41 @@ public final class DiskCacheStore implements AutoCloseable {
    * 该 {@code RegionFile}，随后在同一线程上 close 不会与任何写者交错。
    */
   private void closeCompactingHandlesAfterShutdown() {
+    // 绝大多数关闭都没有未收工的压缩：先做一次零分配的快速判断，避免每次关闭都多遍历一遍句柄表。
+    boolean anyCompacting = false;
+    for (Handle handle : open.values()) {
+      if (handle.file.isCompacting()) {
+        anyCompacting = true;
+        break;
+      }
+    }
+    if (!anyCompacting) {
+      return;
+    }
+    // 截止时刻对整个循环只算一次：逐个文件各自等满 5 秒会让「N 个文件都卡住」变成 N×5 秒，
+    // 而本方法跑在磁盘线程上、close() 还在等它收工。
     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(COMPACT_DRAIN_SECONDS);
     boolean warned = false;
     for (Map.Entry<RegionKey, Handle> entry : open.entrySet()) {
       Handle handle = entry.getValue();
-      while (handle.file.isCompacting() && System.nanoTime() < deadline) {
+      while (handle.file.isCompacting()) {
+        if (System.nanoTime() >= deadline) {
+          if (!warned) {
+            warned = true;
+            logger.warning("磁盘缓存关闭时仍有区域文件处于压缩中且未在 "
+                + COMPACT_DRAIN_SECONDS + " 秒内收工，相关句柄留待进程退出时释放（缓存只是可选加速）");
+          }
+          break;
+        }
         try {
           Thread.sleep(COMPACT_DRAIN_POLL_MILLIS);
         } catch (InterruptedException interrupted) {
           Thread.currentThread().interrupt();
           break;
         }
-        warned = false; // 新一轮等待重新计时提示（只在真正超时才提示）
       }
       if (handle.file.isCompacting()) {
-        if (!warned) {
-          warned = true;
-          logger.warning("磁盘缓存关闭时仍有区域文件处于压缩中且未在 "
-              + COMPACT_DRAIN_SECONDS + " 秒内收工，该文件句柄留待进程退出时释放（缓存只是可选加速）");
-        }
-        continue;
+        continue; // 仍是压缩独占：绝不能在压缩线程还在用它时关闭通道
       }
       removeAndClose(entry.getKey(), handle);
     }
