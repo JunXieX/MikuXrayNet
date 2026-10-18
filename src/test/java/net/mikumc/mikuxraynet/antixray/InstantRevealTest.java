@@ -284,10 +284,12 @@ class InstantRevealTest {
     quota.release(player, 11L, 16, granted, 6);
     assertEquals(10, quota.claim(player, 11L, 16, 16), "已发 6 个：只退还剩下的 10 个");
 
-    // tick 已推进：上一 tick 的剩余不得被加回新 tick
+    // tick 已推进：上一 tick 的撤销不得把剩余额度加回新 tick（新 tick 的领取结果必须仍是「已领满」）
     granted = quota.claim(player, 12L, 16, 16);
+    assertEquals(16, granted);
     quota.release(player, 11L, 16, granted, 0);
-    assertEquals(16, quota.claim(player, 12L, 16, 16), "跨 tick 的撤销必须被忽略");
+    assertEquals(0, quota.claim(player, 12L, 16, 16),
+        "跨 tick 的撤销必须被忽略：新 tick 已领满，不应因上一 tick 的撤销而多出额度");
   }
 
   /** max-per-tick = 0（配置关闭事件显形）时没有任何可用额度，调用方直接放弃。 */
