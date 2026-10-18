@@ -907,12 +907,6 @@ public final class DiskCacheStore implements AutoCloseable {
     }
   }
 
-  /** 压缩收尾兜底的最长等待（秒）。 */
-  private static final int COMPACT_DRAIN_SECONDS = 5;
-
-  /** 压缩收尾兜底的轮询间隔（毫秒）。 */
-  private static final long COMPACT_DRAIN_POLL_MILLIS = 20L;
-
   /**
    * 从打开表摘除句柄并关闭它，同时<b>收回该句柄计入的条目额度</b>并把该键从「已补计」集合移除——
    * 让下次打开时重新扫描磁盘、重新补计（否则计数只增不减，{@code max-entries} 会随句柄开关不断抬高）。
