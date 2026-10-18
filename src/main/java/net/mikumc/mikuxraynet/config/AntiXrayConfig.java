@@ -1046,11 +1046,16 @@ public final class AntiXrayConfig {
     Map<String, Integer> weights = new LinkedHashMap<>();
     for (String key : section.getKeys(false)) {
       int weight = section.getInt(key, 0);
-      if (weight <= 0) {
+      // 空白键（YAML 里的 "" / ~）归一化后是空名，不可能对应任何方块：留着只会让候选表里多一条
+      // 永远解析失败的条目，并让诊断里的「伪装 N 种」虚增。
+      if (weight <= 0 || key == null || key.trim().isEmpty()) {
         continue;
       }
       for (String name : expandTags(List.of(key), unknownTags)) {
-        weights.put(OcclusionRules.normalize(name), weight);
+        String normalized = OcclusionRules.normalize(name);
+        if (!normalized.isEmpty()) {
+          weights.put(normalized, weight);
+        }
       }
     }
     return weights;
@@ -1061,6 +1066,11 @@ public final class AntiXrayConfig {
    *
    * <p>每段形如 {@code {min-y: -64, max-y: -1, weights: {deepslate: 10, ...}}}；min-y/max-y 缺省时
    * 分别视为「负无穷/正无穷」。min &gt; max 的段（矛盾配置）直接丢弃——空段比错误段更安全。
+   *
+   * <p><b>weights 的键不做 tag(...) 展开</b>（与 {@code replacement-weights} 不同）：分区表里的键
+   * 会被当作最终方块名参与伪装分布，用户随手写 {@code tag(...)} 时若静默丢弃整段，管理员会以为已经
+   * 分层。因此这里把无法识别的键名原样保留——它会在构建世界档案时解析失败并被跳过（少一个候选，
+   * 不会误藏），同时不像丢弃整段那样改变分区结构。
    */
   private static List<ReplacementBand> parseBands(List<Map<?, ?>> raw) {
     if (raw == null || raw.isEmpty()) {
@@ -1077,8 +1087,11 @@ public final class AntiXrayConfig {
       if (entry.get("weights") instanceof Map<?, ?> weightMap) {
         for (Map.Entry<?, ?> weightEntry : weightMap.entrySet()) {
           int weight = weightEntry.getValue() instanceof Number number ? number.intValue() : 0;
-          if (weight > 0 && weightEntry.getKey() != null) {
-            weights.put(OcclusionRules.normalize(String.valueOf(weightEntry.getKey())), weight);
+          // 键必须是有效方块名：null / 空白（YAML 里的 ~ 或 ""）无法对应任何方块状态，
+          // 保留它只会让分区表里多一条永远解析失败的条目，并在诊断回显里显示成 "null"。
+          String name = weightEntry.getKey() == null ? "" : String.valueOf(weightEntry.getKey()).trim();
+          if (weight > 0 && !name.isEmpty()) {
+            weights.put(OcclusionRules.normalize(name), weight);
           }
         }
       }

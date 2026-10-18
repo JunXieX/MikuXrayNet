@@ -676,9 +676,14 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 失败结果不写入任何一级缓存（见 resultCacheable）：瞬时故障若被固化，同指纹区块在缓存有效期内
       // 不再重试改写，等于长期裸露。chunksFailed 计数即「失败且未入缓存」的次数，供诊断回显。
       stats.chunksFailed.increment();
+      // 口径（与 RewriteStats 的文档一致）：失败区块<b>同时</b>计入 chunksSkipped——它确实未改写。
+      // 只计 chunksFailed 会让面板上的「本来就无需改写 = 跳过 − 异常」变成负数，看起来像统计坏了。
+      stats.chunksSkipped.increment();
       // 该文案会拼接 result.failure()（内容随异常而变）：用固定分类键限流，避免每出现一个新摘要就多计一条
       logThrottled("区块改写异常", "区块改写异常（已按原包放行，未写入任何缓存）："
           + result.failure(), null);
+      // 失败区块的 data == source 且位置为空，下面 changed 分支不会成立；这里直接结束，避免重复计数。
+      return;
     }
     if (result.changed()) {
       stats.chunksRewritten.increment();

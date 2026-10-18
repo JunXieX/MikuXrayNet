@@ -98,4 +98,38 @@ class BandwidthFrustumConfigTest {
     assertNotEquals(base.configHash(), changedFrustum.configHash(),
         "改动 frustum 参数必须改变配置指纹");
   }
+
+  /**
+   * 白名单里的 null 项（YAML 写作 <code>[armor_stand, ~]</code>）不得让整份带宽配置解析失败：
+   * 一次手滑的空项若触发「整份回退上一份」，会连带丢掉白名单之外的全部改动。
+   */
+  @Test
+  void nullWhitelistEntryDoesNotBreakWholeConfig() {
+    BandwidthConfig parsed = config("""
+        entity-packets:
+          whitelist:
+            - armor_stand
+            - null
+        """);
+
+    assertEquals(1, parsed.entityPackets().whitelist().size(),
+        "null 项必须被过滤，其余白名单照常生效：" + parsed.entityPackets().whitelist());
+  }
+
+  /**
+   * 下限被静默抬升是禁止的：{@code ray-samples: 0} 必须抬到 1 并<b>留痕</b>，
+   * 否则管理员在 status 里看到的生效值与文件里写的值不一致，却没有任何提示。
+   */
+  @Test
+  void lowerBoundClampOfRaySamplesIsRecorded() {
+    BandwidthConfig clamped = config("""
+        entity-culling:
+          ray-samples: 0
+        """);
+
+    assertEquals(1, clamped.entityCulling().raySamples(), "0 必须被抬到下限 1");
+    assertTrue(clamped.clampAdjustments().stream()
+            .anyMatch(entry -> entry.startsWith("entity-culling.ray-samples=")),
+        "下限钳制必须留痕：" + clamped.clampAdjustments());
+  }
 }

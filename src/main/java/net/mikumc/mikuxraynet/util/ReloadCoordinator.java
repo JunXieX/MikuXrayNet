@@ -52,6 +52,9 @@ public final class ReloadCoordinator {
     }
   }
 
+  /** 重载会话互斥锁（串行化「读配置 → 失效缓存 → 重建任务」整段流程）。 */
+  private final Object reloadLock = new Object();
+
   /** 本次热重载后已即时生效的配置项。 */
   public static final List<String> APPLIED = List.of(
       "邻近显形（距离/周期/单次上限）",
@@ -92,6 +95,17 @@ public final class ReloadCoordinator {
    * @return 给管理员看的中文结果行（已含「已生效」与「需重启」两类清单）
    */
   public List<String> reload(Target target) {
+    // 重载会话必须串行：它内部是「停旧管线 → 建新管线 → 重启周期任务」的多步非原子流程。
+    // 两个管理员（或控制台 + 玩家）同时执行 reload 会交错：一方把另一方刚创建、尚未发布到字段的
+    // 管线覆盖掉，旧管线既不在字段里、也不会有人 stop —— 监听器重复注册、被隐藏的实体账本分裂
+    // （旧管线藏起的实体新管线不知道，停用时永远不会恢复）。这里用一把可重入锁把整个会话串起来。
+    synchronized (reloadLock) {
+      return reloadLocked(target);
+    }
+  }
+
+  /** 重载主流程（调用方已持有 {@link #reloadLock}）。 */
+  private List<String> reloadLocked(Target target) {
     List<String> lines = new ArrayList<>();
 
     int antiBefore = safeAntiXrayFingerprint(target);

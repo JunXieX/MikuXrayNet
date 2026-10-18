@@ -329,7 +329,7 @@ public final class BandwidthConfig {
             // 各模块总开关均默认 true：新增开关不得改变既有行为（原样保持「全部启用」）
             root.getBoolean("entity-packets.enabled", true),
             root.getBoolean("entity-packets.skip-zero-movement", true),
-            Set.copyOf(root.getStringList("entity-packets.whitelist"))),
+            Set.copyOf(nonNullStrings(root.getStringList("entity-packets.whitelist"))),
         new BlockChanges(
             root.getBoolean("block-changes.enabled", true),
             root.getBoolean("block-changes.merge", true),
@@ -338,16 +338,20 @@ public final class BandwidthConfig {
             clampUpper(clampLower(root.getInt("block-changes.merge-radius", 4),
                 MIN_MERGE_RADIUS, "block-changes.merge-radius", clampAdjustments),
                 MAX_MERGE_RADIUS, "block-changes.merge-radius", clampAdjustments),
-            clampUpper(Math.max(1, root.getInt("block-changes.max-per-packet", 4096)),
+            clampUpper(clampLower(root.getInt("block-changes.max-per-packet", 4096),
+                1, "block-changes.max-per-packet", clampAdjustments),
                 MAX_PER_PACKET_LIMIT, "block-changes.max-per-packet", clampAdjustments),
             root.getBoolean("block-changes.resend-on-overflow", true),
             // 默认 40（性能优先）：更长时间窗合并更多变更、更省包；玩家挖/放方块的实时手感由
             // immediate-radius（默认 8 格内原包立即放行）兜底，因此窗口略长也不会出现「顿感」。
-            clampUpper(Math.max(1, root.getInt("block-changes.merge-window-millis", 40)),
+            clampUpper(clampLower(root.getInt("block-changes.merge-window-millis", 40),
+                1, "block-changes.merge-window-millis", clampAdjustments),
                 MAX_MERGE_WINDOW_MILLIS, "block-changes.merge-window-millis", clampAdjustments),
-            clampUpper(Math.max(1, root.getInt("block-changes.max-pending-entries", 256)),
+            clampUpper(clampLower(root.getInt("block-changes.max-pending-entries", 256),
+                1, "block-changes.max-pending-entries", clampAdjustments),
                 MAX_PENDING_ENTRIES_LIMIT, "block-changes.max-pending-entries", clampAdjustments),
-            clampUpper(Math.max(0, root.getInt("block-changes.immediate-radius", 8)),
+            clampUpper(clampLower(root.getInt("block-changes.immediate-radius", 8),
+                0, "block-changes.immediate-radius", clampAdjustments),
                 MAX_IMMEDIATE_RADIUS, "block-changes.immediate-radius", clampAdjustments)),
         new Palette(
             root.getBoolean("palette.enabled", true),
@@ -366,11 +370,13 @@ public final class BandwidthConfig {
                 "entity-culling.force-visible-distance", clampAdjustments),
             // 默认 10（性能优先）：复检更省 CPU；遮挡/可见切换的延迟由「已隐藏实体每周期全量复检」
             // 兜底，玩家几乎察觉不到。
-            clampUpper(Math.max(1, root.getInt("entity-culling.update-interval-ticks", 10)),
+            clampUpper(clampLower(root.getInt("entity-culling.update-interval-ticks", 10),
+                1, "entity-culling.update-interval-ticks", clampAdjustments),
                 MAX_UPDATE_INTERVAL_TICKS, "entity-culling.update-interval-ticks", clampAdjustments),
             // 语义：每个实体最多尝试的候选顶点数；钳制 1..MAX_RAY_SAMPLES，默认即上限（包围盒至多 7 个可见
-            // 顶点 → 取上限就是全部顶点都试）。
-            Math.max(1, Math.min(MAX_RAY_SAMPLES, root.getInt("entity-culling.ray-samples", MAX_RAY_SAMPLES))),
+            // 顶点 → 取上限就是全部顶点都试）。两端都留痕、且每键至多一条明细。
+            clampRange(root.getInt("entity-culling.ray-samples", MAX_RAY_SAMPLES),
+                1, MAX_RAY_SAMPLES, "entity-culling.ray-samples", clampAdjustments),
             new EntityCulling.Frustum(
                 root.getBoolean("entity-culling.frustum.enabled", true),
                 // FOV 默认 110（客户端可设置的最大值）：取最大保证「玩家把 FOV 拉满也看不到被剔除的实体」，
@@ -423,22 +429,27 @@ public final class BandwidthConfig {
         new Latency(
             root.getBoolean("latency.enabled", true),
             // 默认 400（性能优先）：更早发现卡顿并介入；仅有明显持续卡顿才会触发（见 sustain-seconds）。
-            clampUpper(Math.max(1, root.getInt("latency.threshold-millis", 400)),
+            clampUpper(clampLower(root.getInt("latency.threshold-millis", 400),
+                1, "latency.threshold-millis", clampAdjustments),
                 MAX_LATENCY_THRESHOLD_MILLIS, "latency.threshold-millis", clampAdjustments),
             // 默认 2（性能优先）：降幅略大更省带宽；由 min-view-distance 与持续时间门槛兜底体验。
-            clampUpper(Math.max(1, root.getInt("latency.reduce-view-distance", 2)),
+            clampUpper(clampLower(root.getInt("latency.reduce-view-distance", 2),
+                1, "latency.reduce-view-distance", clampAdjustments),
                 MAX_REDUCE_VIEW_DISTANCE, "latency.reduce-view-distance", clampAdjustments),
             // 默认 30（性能优先）：仍需持续 30 秒才动作，足以排除偶发抖动。
-            clampUpper(Math.max(0, root.getInt("latency.sustain-seconds", 30)),
+            clampUpper(clampLower(root.getInt("latency.sustain-seconds", 30),
+                0, "latency.sustain-seconds", clampAdjustments),
                 MAX_SUSTAIN_SECONDS, "latency.sustain-seconds", clampAdjustments),
             // 默认 6：体验兜底——视距下限低于 6 会让弱网玩家几乎看不见，故设安全下限 6（低于下限会被抬升并 WARN）。
             clampUpper(clampLower(root.getInt("latency.min-view-distance", 6),
                 MIN_VIEW_DISTANCE_FLOOR, "latency.min-view-distance", clampAdjustments),
                 MAX_MIN_VIEW_DISTANCE, "latency.min-view-distance", clampAdjustments),
-            clampUpper(Math.max(1, root.getInt("latency.check-interval-seconds", 5)),
+            clampUpper(clampLower(root.getInt("latency.check-interval-seconds", 5),
+                1, "latency.check-interval-seconds", clampAdjustments),
                 MAX_CHECK_INTERVAL_SECONDS, "latency.check-interval-seconds", clampAdjustments)),
         new Diagnostics(
-            clampUpper(Math.max(0, root.getInt("diagnostics.interval-seconds", 0)),
+            clampUpper(clampLower(root.getInt("diagnostics.interval-seconds", 0),
+                0, "diagnostics.interval-seconds", clampAdjustments),
                 MAX_DIAGNOSTICS_INTERVAL_SECONDS, "diagnostics.interval-seconds", clampAdjustments)),
         clampAdjustments);
   }
@@ -450,6 +461,45 @@ public final class BandwidthConfig {
     }
     adjustments.add(key + "=" + value + "（上限 " + max + "）");
     return max;
+  }
+
+  /**
+   * 整数<b>区间</b>钳制（单趟，至多记一条明细）。
+   *
+   * <p>与浮点版 {@link #clampRange(double, double, double, double, String, List)} 同口径：同一键两端都
+   * 可能越界时（如 {@code ray-samples} 配 0 或 999），串联「下限 + 上限」会在极端值上记两条明细，
+   * 管理员会以为改了两处配置。单趟处理保证每键至多一条。
+   */
+  private static int clampRange(int value, int min, int max, String key,
+      List<String> adjustments) {
+    if (value < min) {
+      adjustments.add(key + "=" + value + "（下限 " + min + "）");
+      return min;
+    }
+    if (value > max) {
+      adjustments.add(key + "=" + value + "（上限 " + max + "）");
+      return max;
+    }
+    return value;
+  }
+
+  /**
+   * 过滤字符串列表中的 {@code null} 元素（YAML 里写 {@code [a, ~]} 会得到 null 项）。
+   *
+   * <p>{@code Set.copyOf} 对 null 元素会抛 {@code NullPointerException}，而加载路径对解析异常的处理是
+   * <b>整份配置回退上一份</b>——一个手滑的空项会让白名单之外的所有带宽开关一起失效，代价与原因完全不成比例。
+   */
+  private static List<String> nonNullStrings(List<String> values) {
+    if (values == null || values.isEmpty()) {
+      return List.of();
+    }
+    List<String> filtered = new ArrayList<>(values.size());
+    for (String value : values) {
+      if (value != null) {
+        filtered.add(value);
+      }
+    }
+    return filtered;
   }
 
   /** 整数下限钳制：低于下限则取下限并记录明细（供一次性 WARN）。 */

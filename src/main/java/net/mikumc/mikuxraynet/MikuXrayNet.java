@@ -137,10 +137,17 @@ public final class MikuXrayNet extends JavaPlugin {
         new ThrottlePipeline(this, config.bandwidth(), throttleStats, occlusionStores, occlusionStats);
     try {
       pipeline.start();
+      this.throttlePipeline = pipeline;
     } catch (Throwable throwable) {
       getLogger().warning("带宽优化装配失败（不影响反矿透）：" + throwable.getMessage());
+      // 装配失败的实例不发布：它可能已注册了部分监听器/任务（start 内部已尽力清理），
+      // 但若仍挂在字段上，诊断会把它当成「已启用」去读一套恒为 0 的计数，掩盖真正的失败。
+      try {
+        pipeline.stop();
+      } catch (Throwable ignored) {
+        // 清理失败只影响同一次失败诊断，不再外抛
+      }
     }
-    this.throttlePipeline = pipeline;
   }
 
   /** 带宽管线（供命令与诊断读取统计计数）。 */

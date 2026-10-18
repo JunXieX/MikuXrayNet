@@ -35,7 +35,12 @@ public final class WorldBlacklistConfig {
   private final List<String> exact;
   /** 通配匹配器（启动期预编译，热路径不做正则编译）。 */
   private final List<Pattern> globs;
-  /** 参与磁盘缓存指纹：名单变化会让相关世界的旧缓存失效重建。 */
+  /**
+   * 名单的内容哈希（跨进程稳定：字符串列表有规范 hashCode，顺序敏感）。
+   *
+   * <p><b>不参与磁盘缓存指纹</b>：黑名单世界的区块根本不会被改写、也就不会写入缓存，因此名单变化
+   * 天然不影响任何缓存条目的有效性。该值仅供诊断/测试核对「名单是否与上一份相同」。
+   */
   private final int configHash;
 
   private WorldBlacklistConfig(List<String> patterns) {

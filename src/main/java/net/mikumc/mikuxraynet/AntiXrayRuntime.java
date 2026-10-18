@@ -173,11 +173,19 @@ public final class AntiXrayRuntime {
     AntiXrayConfig.DiskCache diskCacheConfig = antiXray.diskCache();
     DiskCacheStore diskCache = null;
     if (diskCacheConfig.enabled()) {
-      ZstdSupport.initialize(new File(plugin.getDataFolder(), "lib").toPath(),
-          diskCacheConfig.zstdAutoDownload(), diskCacheConfig.zstdDownloadUrl(),
-          diskCacheConfig.zstdSha256(), diskCacheConfig.zstdTimeoutSeconds(), logger);
-      diskCache = new DiskCacheStore(new File(plugin.getDataFolder(), "cache").toPath(),
-          diskCacheConfig, logger);
+      try {
+        ZstdSupport.initialize(new File(plugin.getDataFolder(), "lib").toPath(),
+            diskCacheConfig.zstdAutoDownload(), diskCacheConfig.zstdDownloadUrl(),
+            diskCacheConfig.zstdSha256(), diskCacheConfig.zstdTimeoutSeconds(), logger);
+        diskCache = new DiskCacheStore(new File(plugin.getDataFolder(), "cache").toPath(),
+            diskCacheConfig, logger);
+      } catch (Throwable throwable) {
+        // 磁盘缓存只是可选加速：zstd 解析（含自动下载写盘）或缓存目录初始化失败时，必须只关掉缓存并
+        // 继续启用反矿透与带宽模块。旧实现让异常上抛到 onEnable —— 一个可选的加速层失败会拖垮整个插件。
+        diskCache = null;
+        logger.log(java.util.logging.Level.WARNING,
+            "磁盘缓存初始化失败，已按「不使用磁盘缓存」继续启用（改写结果仍走内存缓存）", throwable);
+      }
     }
 
     MikuWorkPool pool = new MikuWorkPool(antiXray.threads(), antiXray.queueCapacity());

@@ -193,8 +193,13 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
    */
   static List<String> suggestSubcommands(CommandSender sender, String[] args) {
     List<String> all = suggestSubcommands(args);
-    if (all.isEmpty() || sender == null) {
+    if (all.isEmpty()) {
       return all;
+    }
+    if (sender == null) {
+      // 取不到发送者就无法判定权限：一律不补全（旧实现此时直接返回全部子命令，等于把
+      // status / dump / reload 的存在暴露给无权限来源，与本方法「不暴露管理命令」的承诺相反）
+      return List.of();
     }
     List<String> visible = new ArrayList<>(all.size());
     for (String sub : all) {
