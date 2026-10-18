@@ -437,17 +437,17 @@ public final class ProximityRevealer implements Listener {
       return;
     }
     // 计数随句柄一起建：任务首次执行至少在一个周期之后，故 pass() 读到的一定是本条目
-    EntityScan previous = entityScans.put(player.getUniqueId(), new EntityScan(task, new AtomicLong()));
+    EntityScan mine = new EntityScan(task, new AtomicLong());
+    EntityScan previous = entityScans.put(player.getUniqueId(), mine);
     if (previous != null) {
       // 同一玩家重复调度（重复的加入事件等）：旧句柄留着就会空转到实体退役
       cancelQuietly(previous.task());
     }
     if (stopping) {
-      // 入账后复查停用闸：stop() 可能已清完表，这条晚到的句柄不会有人取消
-      EntityScan current = entityScans.remove(player.getUniqueId());
-      if (current != null) {
-        cancelQuietly(current.task());
-      } else {
+      // 入账后复查停用闸：stop() 可能已清完表，这条晚到的句柄不会有人取消。
+      // 只按「本条目」精确移除并取消，绝不 remove(key) 后盲取消——那会把并发中
+      // 另一个线程刚为同一玩家换上的新句柄一并摘掉（随后它既无人取消、也不再被 pass() 读到）。
+      if (entityScans.remove(player.getUniqueId(), mine)) {
         cancelQuietly(task);
       }
     }

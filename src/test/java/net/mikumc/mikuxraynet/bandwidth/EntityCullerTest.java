@@ -308,26 +308,29 @@ class EntityCullerTest {
   }
 
   /**
-   * Folia 回归：已隐藏实体<b>离开本区域</b>后，周期复检不得读取它的任何状态，同时必须把它从账本摘除。
+   * Folia 回归：已隐藏实体<b>离开本区域</b>后，周期复检不得读取它的任何状态，且<b>必须保留账本条目</b>。
    *
    * <p>真机症状（Lophine 26.3 / Folia）：{@code EntityCuller.recheck} 在玩家所在区域线程上读跨区域实体的
    * entityId → {@code TickThread.ensureTickThread} <b>先打 ERROR 再抛</b> IllegalStateException，
    * 任务每轮刷屏。这里把「跨区域实体」建模为「归属判定为 false + 一旦被读状态就抛」——
    * 实现里只要还有一次越界读取，本用例即失败。
    *
-   * <p><b>账本必须摘除</b>：条目留在 {@code hidden} 里会永久钉住 Entity/World（跨区域后不会再有人来清），
-   * 且 {@code hiddenCount()} 虚高。摘除只按「加入时捕获的 entityId + 实例引用」，不触碰实体。
+   * <p><b>为什么条目必须保留（不是泄漏）</b>：{@code owns} 是「当前线程是否拥有该实体的 region」，
+   * 玩家移动会让它从 false 变回 true。一旦按「跨区域就删账本」处理，该实体回到本区域时
+   * {@code showIfHidden} 再也找不到记录 → 永久隐藏到玩家重登（「该显示却仍隐藏」的方向错误）。
+   * 条目本身是有界的：玩家退出、插件停用都会整体清空 {@code hidden}。
    */
   @Test
-  void foreignRegionEntityIsDroppedFromLedgerWithoutTouchingItsState() {
+  void foreignRegionEntityIsSkippedWithoutTouchingItsState() {
     ThrottleStats stats = new ThrottleStats();
     PlayerStub player = new PlayerStub();
     WorldStub world = new WorldStub();
-    EntityStub foreign = new EntityStub(7001, world);
+    // 两者放在不同位置：恢复阶段要能区分「跨区域那条被正确恢复」与「本区域那条仍保持隐藏」
+    EntityStub foreign = new EntityStub(7001, world, 300.0D, 65.0D, 300.0D);
     EntityStub owned = new EntityStub(7002, world);
     EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
         new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 7, frustumOff()), stats,
-        entity -> entity != foreign.proxy(), playerId -> false);
+        entity -> !(entity == foreign.proxy() && foreign.foreign), playerId -> false);
 
     // 先在「同区域」时把两者隐藏（此时读状态合法），随后 foreign 离开本区域
     culler.evaluate(player.proxy(), foreign.proxy(), true);
@@ -339,8 +342,17 @@ class EntityCullerTest {
     culler.recheck(player.proxy()); // 关键：不得抛异常（更不得读 foreign 的状态）
 
     assertEquals(readsBefore, foreign.stateReads(), "跨区域实体一次状态都不得被读取");
-    assertEquals(1, culler.hiddenCount(),
-        "跨区域条目必须从账本摘除（否则永久钉住 Entity/World），本区域条目保留");
+    assertEquals(2, culler.hiddenCount(),
+        "跨区域条目必须保留（归还会变回 true，删了就会永久隐藏到重登）");
+
+    // 归属恢复（玩家移动回来）后，该条目必须重新生效：近身 → 立即恢复显示
+    foreign.foreign = false;
+    player.setPosition(300.0D, 65.0D, 300.0D); // 移到 foreign 处 → 强制可见距离内
+    culler.recheck(player.proxy());
+
+    assertEquals(1, culler.hiddenCount(), "归属恢复后该实体必须能被正常恢复（证明条目未被删）");
+    assertTrue(foreign.stateReads() > readsBefore,
+        "归属恢复后应当重新读取该实体的状态（说明条目重新参与复检）");
   }
 
   /**
@@ -1110,6 +1122,13 @@ class EntityCullerTest {
       location.setYaw(yaw);
     }
 
+    /** 移动玩家位置（用于验证「跨区域条目在归属恢复后重新生效」）。 */
+    void setPosition(double x, double y, double z) {
+      location.setX(x);
+      location.setY(y);
+      location.setZ(z);
+    }
+
     @Override
     public Object invoke(Object ignored, Method method, Object[] args) {
       if (isObjectMethod(method)) {
@@ -1129,10 +1148,12 @@ class EntityCullerTest {
         case "getX" -> location.getX();
         case "getY" -> location.getY();
         case "getZ" -> location.getZ();
-        // 视锥判定改用「yaw/pitch + eyeHeight」手算方向（生产不再 new Location / Vector）
+        // 视锥判定改用「yaw/pitch + eyeHeight」手算方向（生产不再 new Location / Vector）。
+        // eyeHeight 取 0：本替身的 getEyeLocation() 直接返回 location（Y 未额外加眼高），
+        // 两者必须一致，否则「眼睛高度」会与改造前不同、让视锥用例的几何前提悄悄漂移。
         case "getYaw" -> location.getYaw();
         case "getPitch" -> location.getPitch();
-        case "getEyeHeight" -> 1.62D;
+        case "getEyeHeight" -> 0.0D;
         case "hideEntity" -> null;
         case "showEntity" -> {
           showCalls.incrementAndGet();

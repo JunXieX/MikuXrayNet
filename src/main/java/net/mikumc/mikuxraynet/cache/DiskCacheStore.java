@@ -757,9 +757,16 @@ public final class DiskCacheStore implements AutoCloseable {
       final int compactDropped = dropped;
       final Throwable compactFailure = failure;
       if (!execute(() -> finishCompact(key, handle, compactDropped, compactFailure))) {
-        // 磁盘线程已关闭或积压被拒：收尾不会再发生（Handle 记账与失败关闭都会丢），
-        // 这里直接关闭通道，避免 fd / 文件锁悬挂到 JVM 退出。
-        closeHandleQuietly(handle);
+        // 未入队有且只有两种成因，处理方式必须区分：
+        // · 已关闭：最终落盘 + 关闭句柄的任务已由 close() 排入磁盘线程，句柄会被正常关闭，
+        //   这里什么都不做即可（绝不在此线程 close——close() 只是"已提交"该任务，磁盘线程可能
+        //   正在执行它，两个线程同时 close/flush 同一 FileChannel 会踩坏偏移表）；
+        // · 积压被拒：磁盘线程仍然存活且照常使用该句柄。此时若在压缩线程上 close，就是与
+        //   doPut/doGet/flushAll 并发写同一个 FileChannel —— 正是本轮要消除的那类竞争。
+        // 跳过收尾的代价是记账偏保守（accountedEntries 多算、pendingBytes 偏大）：
+        // 前者在句柄下次重开时按真实条目数重扫纠正，后者由下一次 flushAll 的 clearPending() 归零，
+        // 两者都只是"少收几条缓存"，绝不会损坏文件，也不会卡住封包链路。
+        logger.fine("磁盘缓存压缩收尾未能回投磁盘线程（已跳过本轮记账，缓存只是少收几条）");
       }
     } finally {
       scheduleCompactStep(candidates, nextIndex);

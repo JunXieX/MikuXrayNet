@@ -143,17 +143,17 @@ public final class EntityCuller implements Listener {
   private final AtomicInteger errorCounter = new AtomicInteger();
 
   /**
-   * 账本条目：被隐藏的实体 + 它是否「因视锥剔除而隐藏」+ <b>加入时捕获的 entityId</b>。
+   * 账本条目：被隐藏的实体 + 它是否「因视锥剔除而隐藏」。
    *
    * <p>标记决定周期复检通道①如何对待远距离条目：{@code frustumCulled=true} 的条目在实体重新回到
    * 视野锥内时要立刻恢复（纯数学复判）；{@code false}（射线遮挡隐藏）的条目保持既有行为（等实体靠近）。
    * 没有这个标记就无从区分，只能二选一，必然造成「转头后远处实体长期不出现」或「远距离射线成本无界」。
    *
-   * <p><b>为什么自带 id</b>：Folia 上实体可能迁到别的 region，此后读 {@code entity.getEntityId()}
-   * （走 {@code CraftEntity#getHandle}）会触发线程校验。跨区域条目必须能被「不触碰实体」地摘除，
-   * 唯一可用的键就是加入那一刻捕获的 id。
+   * <p><b>刻意不缓存 entityId</b>：账本键本身就是 id（跨区域时读实体取 id 会触发 Folia 线程校验），
+   * 而跨区域条目<b>不得摘除</b>（见 {@code recheck} 通道①的说明），因此从未有「不触碰实体地按 id 删」
+   * 这种需求——多存一个字段只会让每次隐藏都多一次读实体。
    */
-  record HiddenEntry(Entity entity, boolean frustumCulled, int entityId) {
+  record HiddenEntry(Entity entity, boolean frustumCulled) {
   }
 
   /** 玩家 → 已被隐藏的实体（entityId → {@link HiddenEntry}）。 */
@@ -699,10 +699,12 @@ public final class EntityCuller implements Listener {
       for (HiddenEntry entry : hiddenMap.values()) {
         Entity entity = entry.entity();
         if (!owns(entity)) {
-          // 跨区域（Folia）：<b>不能触碰实体</b>（读任何状态都会先打 ERROR 再抛），但账本必须摘除——
-          // 否则该条目会永久留在 hidden 里钉住 Entity/World，且 hiddenCount() 虚高。
-          // 用「加入时捕获的entityId + 实例引用」做不触碰实体的精确摘除。
-          removeLedgerEntry(playerId, entry.entityId(), entity);
+          // 跨区域（Folia）：<b>不能触碰实体</b>（读任何状态都会先打 ERROR 再抛），也<b>绝不能摘除条目</b>。
+          // 归属是「当前线程是否拥有该实体的 region」，而玩家移动会让 owns 从 false 变回 true；
+          // 一旦把条目删掉，等它回到本区域时 showIfHidden 再也找不到记录，该实体将永久保持隐藏
+          // 直到玩家重登——「该显示却仍隐藏」是本项目明令禁止的方向。
+          // 保留条目的代价是会话内有界的：{@code hidden} 在玩家退出与停用时整体清空，不会跨会话增长。
+          // hiddenCount() 因此可能略高于「此刻真正可见性已生效」的实体数（仅跨区域期间）。
           continue;
         }
         if (!entity.isValid()) {
@@ -753,12 +755,9 @@ public final class EntityCuller implements Listener {
     }
     for (Entity entity : rotation.nextBatch(Integer.MAX_VALUE)) {
       if (!owns(entity)) {
-        // 跨区域（Folia）：不能触碰实体，但轮转队列必须摘除——否则条目永久留在队列里钉住
-        // Entity/World，且后续每周期都要白跑一趟。按实例引用摘除（只比较引用，不读实体状态）。
-        int removedId = rotation.remove(entity);
-        if (removedId >= 0) {
-          removeStreak(playerId, removedId);
-        }
+        // 跨区域（Folia）：不能触碰实体，也<b>不得摘除轮转条目</b>——通道②是远距离实体唯一的再评估
+        // 入口（通道①对远距离条目不提交判定）；删掉后该实体既不会被重新判可见，也不会随 owns 恢复
+        // 而自动回来，等于永久隐藏。归属会随玩家移动变回 true，届时本条自然重新参与轮转。
         continue;
       }
       if (!entity.isValid()) {
@@ -860,8 +859,10 @@ public final class EntityCuller implements Listener {
       return;
     }
     try {
-      // 眼睛坐标用零分配 getter（getEyeLocation 每次提交都会 new 一个 Location）；提交频率是
+      // 眼睛坐标用零分配 getter（getEyeLocation 每次提交都会新建一个 Location）；提交频率是
       // 「每玩家每周期每远处实体」，属热路径。
+      // eyeY = 脚部 Y + getEyeHeight()：与 LivingEntity#getEyeLocation() 的算法完全一致
+      // （getEyeLocation 内部就是 getLocation().add(0, getEyeHeight(), 0)），因此几何不变。
       double eyeX = player.getX();
       double eyeY = player.getY() + player.getEyeHeight();
       double eyeZ = player.getZ();
@@ -1023,7 +1024,7 @@ public final class EntityCuller implements Listener {
    * 零中间分配地取「眼睛位置 + 单位视线方向」。
    *
    * <p><b>为什么不用 {@code player.getEyeLocation().getDirection()}</b>：那会为每个实体每次评估
-   * new 一个 {@code Location} 与一个 {@code Vector}；本方法是「每玩家每周期每实体」的热路径
+   * 构造一个 {@code Location} 与一个 {@code Vector}；本方法是「每玩家每周期每实体」的热路径
    * （默认 10 tick、数十个追踪实体），属于纯垃圾。这里用 {@code getX/getY/getZ/getEyeHeight/
    * getYaw/getPitch} 直接算，与 {@code Location#getDirection()} 的公式逐项一致
    * （{@code dx = -cos(pitch)·sin(yaw)}，{@code dy = -sin(pitch)}，{@code dz = cos(pitch)·cos(yaw)}），
@@ -1039,9 +1040,9 @@ public final class EntityCuller implements Listener {
   }
 
   /**
-   * 玩家与实体的欧氏距离是否在强制可见距离内（零分配：直接用坐标 getter，不 new {@link Location}）。
+   * 玩家与实体的欧氏距离是否在强制可见距离内（零分配：直接用坐标 getter，不构造 {@code Location}）。
    *
-   * <p>刻意不用 {@code Location#distanceSquared}：那会为玩家与实体各 new 一个 {@code Location}，
+   * <p>刻意不用 {@code Location#distanceSquared}：那会为玩家与实体各构造一个 {@code Location}，
    * 是每次评估的一笔固定分配，且它要求两侧都带世界，实体未加载时会直接抛异常。坐标 getter 在任何
    * 情况下都可用，失败方向也一致（判不出距离时按「近」处理 → 只 showIfHidden，绝不误藏）。
    * 生产环境里被追踪的实体必与玩家同世界（追踪事件只对同世界实体触发），故无需再做世界比较。
@@ -1203,20 +1204,6 @@ public final class EntityCuller implements Listener {
     }
   }
 
-  /**
-   * 不触碰实体的摘除重载（跨区域条目专用）：用调用方提供的 {@code entityId} 定位，仍按<b>实例引用</b>
-   * 校验，因此不会误删「后来复用该 id 的新实体」的条目。
-   */
-  private void removeLedgerEntry(UUID playerId, int entityId, Entity entity) {
-    Map<Integer, HiddenEntry> map = hidden.get(playerId);
-    if (map != null) {
-      HiddenEntry existing = map.get(entityId);
-      if (existing != null && existing.entity() == entity) {
-        map.remove(entityId, existing);
-      }
-    }
-  }
-
   /** @return 是否真的新登记并执行了 hideEntity（已隐藏 / 失败时为 false）。 */
   private boolean hide(Player player, Entity entity, boolean frustumCulled) {
     if (stopping) {
@@ -1232,7 +1219,7 @@ public final class EntityCuller implements Listener {
       // 已隐藏。仅升级标记：由射线遮挡改判为「视锥隐藏」时必须改写标记，否则通道①会把它当成射线隐藏，
       // 导致玩家转头后它永远不会被恢复（这正是标记存在的意义）。
       if (frustumCulled && !existing.frustumCulled()) {
-        map.put(entity.getEntityId(), new HiddenEntry(entity, true, existing.entityId()));
+        map.put(entity.getEntityId(), new HiddenEntry(entity, true));
         // 这里必须自己计数：hide() 返回 false（没有新发生隐藏），所以 evaluate() 里受 if (hide(...))
         // 保护的 frustumHidden 不会递增；而该条目此后会被通道①按视锥条目恢复并计 frustumShown。
         // 不补这一笔，/mxnet status 的「视锥剔除 隐藏/恢复」会出现「恢复 > 隐藏」的自相矛盾。
@@ -1242,7 +1229,7 @@ public final class EntityCuller implements Listener {
     }
     try {
       int entityId = entity.getEntityId();
-      HiddenEntry entry = new HiddenEntry(entity, frustumCulled, entityId);
+      HiddenEntry entry = new HiddenEntry(entity, frustumCulled);
       player.hideEntity(plugin, entity);
       map.put(entityId, entry);
       // 停用竞态收口（Folia：stop() 可能在另一条区域线程上并发执行）：<b>入账之后再读一次</b> volatile
