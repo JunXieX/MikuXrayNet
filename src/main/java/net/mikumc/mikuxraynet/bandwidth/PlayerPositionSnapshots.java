@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
@@ -34,25 +35,36 @@ import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
  */
 final class PlayerPositionSnapshots {
 
-  /** 玩家位置快照（精确坐标；判定用的方块坐标在读取侧取 floor，见 {@link #immediatePass}）。 */
-  record Position(double x, double y, double z) {
+  /**
+   * 玩家位置快照（精确坐标；判定用的方块坐标在读取侧取 floor，见 {@link #immediatePass}）。
+   *
+   * <p><b>为什么带世界名</b>：方块变更包里的坐标<b>不含世界标识</b>。合并窗口内玩家跨世界（传送门 /
+   * {@code /tp}）时，若仍把旧世界的变更照常合并发出，客户端会把这些坐标当成<b>新世界</b>的坐标，
+   * 表现为新世界对应位置出现「鬼影方块」，直到该区块被重新下发。有了世界名，封包线程就能在
+   * 「封包所属世界 ≠ 当前快照世界」时立刻判定为跨世界切换（见 {@link BlockChangeMerger}）。
+   *
+   * <p>世界名由<b>拥有该玩家的线程</b>读取后写入，封包线程只读这份快照——与坐标同一纪律，绝不跨线程读
+   * {@code Player#getWorld()}。
+   */
+  record Position(String world, double x, double y, double z) {
   }
 
   private final ConcurrentHashMap<UUID, Position> positions = new ConcurrentHashMap<>();
 
-  /** 刷新某玩家快照（必须在拥有该玩家的线程调用）。方块坐标未变时不发布，见类注释。 */
-  void refresh(UUID playerId, double x, double y, double z) {
+  /** 刷新某玩家快照（必须在拥有该玩家的线程调用）。方块坐标与世界均未变时不发布，见类注释。 */
+  void refresh(UUID playerId, String world, double x, double y, double z) {
     if (playerId == null) {
       return;
     }
     Position current = positions.get(playerId);
-    if (current != null && blockCoordinate(current.x()) == blockCoordinate(x)
+    if (current != null && Objects.equals(current.world(), world)
+        && blockCoordinate(current.x()) == blockCoordinate(x)
         && blockCoordinate(current.y()) == blockCoordinate(y)
         && blockCoordinate(current.z()) == blockCoordinate(z)) {
-      // 仍在同一方块：判定结果不可能改变，跳过分配与写入
+      // 仍在同一世界、同一方块：判定结果不可能改变，跳过分配与写入
       return;
     }
-    positions.put(playerId, new Position(x, y, z));
+    positions.put(playerId, new Position(world, x, y, z));
   }
 
   /** 只读快照；尚未建立时返回 {@code null}（调用方按 fail-open 处理）。 */

@@ -44,7 +44,17 @@ public class SingleValuePalette implements Palette {
 
   @Override
   public void read(ByteBuf buffer) {
-    this.value = ByteBufUtil.readVarInt(buffer);
+    int read = ByteBufUtil.readVarInt(buffer);
+    // 与 IndirectPalette.read 同一道入参校验：方块状态 id 必须落在注册表范围内。
+    // 否则负值/超大值会一路传到 ObfuscationProcessor 的 targets BitSet（BitSet.get(-1) 抛异常），
+    // 或被当成合法 id 去下标字节表——两种结果都让<b>整个区块</b> fail-open（原字节放行、矿全部裸露）。
+    // 这里按 fail-open 约定早失败：异常由上层解码兜底，只拒绝这一个 section。
+    int registry = this.chunkSection.registryAccessor().getUniqueBlockStateCount();
+    if (read < 0 || read >= registry) {
+      throw new IndexOutOfBoundsException(
+          "block state id out of range: " + read + " (registry " + registry + ")");
+    }
+    this.value = read;
   }
 
   @Override

@@ -136,7 +136,14 @@ public final class ThrottlePipeline {
     // 先置位再装配：装配中途若抛出非预期异常（例如子模块工厂里的日志/反射失败之外的路径），
     // 调用方的 stop() 仍能进入清理分支，撤销已注册的模块；若把它留在末尾，半途异常会让
     // started 保持 false，stop() 直接返回，已注册的监听与任务永久残留（反复 reload 持续累积）。
-    started.set(true);
+    //
+    // 用 CAS 而不是 set(true)：重复 start 会再 new 一整套子模块并覆盖字段，旧模块的 PacketAdapter /
+    // 异步监听 / 每 tick 任务句柄仍挂在 ProtocolLib 与调度器里，且 stop() 再也拿不到它们——永久泄漏。
+    // 当前调用方每次 reload 都新建实例，因此这只是纵深防御；被忽略时明确记一条，避免静默。
+    if (!started.compareAndSet(false, true)) {
+      plugin.getLogger().fine("带宽优化管线已处于运行状态，忽略重复的 start()（已启动的模块不会被重复注册）");
+      return;
+    }
 
     ProtocolManager protocolManager = null;
     AsynchronousManager asynchronousManager = null;

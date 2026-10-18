@@ -2,7 +2,6 @@ package net.mikumc.mikuxraynet.bandwidth;
 
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
-import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -25,6 +24,8 @@ import org.bukkit.plugin.Plugin;
  *
  * <p>视距的读写与还原全部在玩家所属线程执行（统一走每个玩家一条实体调度任务：Paper 上落在主线程，
  * Folia 上落在区域线程）；原始视距只存内存，玩家退出即清理，插件停用时统一还原。
+ * <b>例外（Folia 停用链路）</b>：停用瞬间跨区域的玩家无法在当前线程安全写视距，此时只打一次性 WARN，
+ * 其视距需重登才还原——这是 Folia 区域化线程的硬限制，不是本模块的缺陷（见 {@link #restoreNow}）。
  *
  * <p><b>读写必须成对</b>：本类只动「send 视距」（{@code getSendViewDistance()} /
  * {@code setSendViewDistance()}）—— Paper 上 {@code view-distance} 与 {@code send-view-distance}
@@ -154,7 +155,14 @@ public final class LatencyMonitor implements Listener {
     // 世界黑名单：命中世界不做任何带宽优化。若该玩家此前已被降过视距（例如从普通世界走进黑名单
     // 世界），此处立即还原，避免黑名单世界仍处于降级状态；否则直接跳过采样。
     if (WorldBlacklistConfig.isBlacklistedNow(player.getWorld().getName())) {
-      restore(player);
+      if (restore(player)) {
+        // 已真正还原：状态机的「已降级」标记必须同步清掉。否则回到普通世界后 shouldReduce 因
+        // reduced==true 恒返回 false，该玩家本轮再也不会被降级（功能静默失效）。
+        PingState state = watches.get(player.getUniqueId());
+        if (state != null) {
+          state.markRestored();
+        }
+      }
       return;
     }
     PingState state = watches.computeIfAbsent(player.getUniqueId(), uuid -> new PingState());
@@ -169,7 +177,11 @@ public final class LatencyMonitor implements Listener {
     if (state.shouldReduce(ping, now, config.thresholdMillis(), sustainMillis)) {
       reduce(player);
     } else if (state.shouldRestore(ping, config.thresholdMillis())) {
-      restore(player);
+      // 只有还原<b>成功</b>才回报「已还原」：失败时状态机继续保持「已降级」，下一次采样继续重试
+      // （旧实现由 shouldRestore 自己先清标记，一次瞬时异常就会让玩家永久卡在降级视距）。
+      if (restore(player)) {
+        state.markRestored();
+      }
     }
   }
 
@@ -233,12 +245,16 @@ public final class LatencyMonitor implements Listener {
     }
   }
 
-  private void restore(Player player) {
-    // 用 get（而非 remove）取原值：还原失败时保留原值，下一次 tick 仍可重试——
-    // 旧实现先 remove 再 set，一旦 set 抛异常原视距就永久丢失，玩家被永久卡在降级后的视距。
+  /**
+   * 还原玩家视距；返回是否<b>确实</b>已还原（降级记录已摘除）。
+   *
+   * <p>用 {@code get}（而非 {@code remove}）取原值：还原失败时保留原值，下一次 tick 仍可重试——
+   * 旧实现先 {@code remove} 再 {@code set}，一旦 {@code set} 抛异常原视距就永久丢失，玩家被永久卡在降级后的视距。
+   */
+  private boolean restore(Player player) {
     Integer original = originalViewDistance.get(player.getUniqueId());
     if (original == null) {
-      return;
+      return false;
     }
     try {
       // 与 reduce 配对：还原也写 send 视距（originalViewDistance 记录的正是原始 raw，含未设置时的 -1
@@ -246,38 +262,51 @@ public final class LatencyMonitor implements Listener {
       player.setSendViewDistance(original);
     } catch (Throwable throwable) {
       plugin.getLogger().fine("还原视距失败（保留原值，下次检查重试）：" + throwable.getMessage());
-      return;
+      return false;
     }
     originalViewDistance.remove(player.getUniqueId(), original);
     stats.viewDistanceRestored.increment();
+    return true;
   }
 
-  /** 停用兜底：还原全部被下调的视距。 */
+  /**
+   * 停用兜底：还原全部被下调的视距。
+   *
+   * <p><b>记录绝不「先清后还原」</b>：热重载路径下还原动作被投递到玩家所属线程异步执行，回调可能因实体退役
+   * 或停用竞态而根本不跑；若此处先把整表 {@code clear()}，旧实例又即将被丢弃，那份原始视距就永久丢失，
+   * 玩家会卡在降级后的视距直到重登。因此一律由 {@link #restore} 在<b>写入成功后</b>按值精确摘除条目。
+   */
   private void restoreAll() {
     boolean stillEnabled = plugin.isEnabled();
-    for (Map.Entry<UUID, Integer> entry : originalViewDistance.entrySet()) {
-      Player player = Bukkit.getPlayer(entry.getKey());
+    for (UUID playerId : new ArrayList<>(originalViewDistance.keySet())) {
+      Player player = Bukkit.getPlayer(playerId);
       if (player == null) {
+        originalViewDistance.remove(playerId);
         continue;
       }
-      // 原始值按值捕获：随后 clear() 不影响已投递的回调
-      int original = entry.getValue();
       if (stillEnabled) {
-        // 热重载路径：回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
-        Schedulers.onEntity(plugin, player, () -> setSendViewDistance(player, original));
+        // 热重载路径：回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）。
+        // 回调里走 restore()：只有真正写回成功才摘除记录，失败则留表（虽随旧实例丢弃，但至少不会
+        // 因为「先清表」而在回调尚未执行时就丢掉原始值）。
+        Schedulers.onEntity(plugin, player, () -> restore(player));
       } else {
         // 停用路径：调度器已不可用，同步还原
-        restoreNow(player, original);
+        restoreNow(player, playerId);
       }
     }
-    originalViewDistance.clear();
   }
 
   /**
    * 停用路径的<b>同步</b>还原（不再经调度器）：Paper 主线程恒可同步；Folia 仅当玩家属于当前区域时才可同步，
    * 跨区域者无法在当前线程安全写视距，打一次性中文 WARN 提示「需重登才能还原」。
+   *
+   * @param playerId 玩家 id（用于按值精确摘除降级记录）
    */
-  private void restoreNow(Player player, int original) {
+  private void restoreNow(Player player, UUID playerId) {
+    Integer original = originalViewDistance.get(playerId);
+    if (original == null) {
+      return;
+    }
     if (!ownsCurrentRegion(player)) {
       if (crossRegionRestoreNoticed.compareAndSet(false, true)) {
         plugin.getLogger().warning("插件停用时检测到跨区域（Folia）玩家视距无法同步还原："
@@ -286,6 +315,7 @@ public final class LatencyMonitor implements Listener {
       return;
     }
     setSendViewDistance(player, original);
+    originalViewDistance.remove(playerId, original);
   }
 
   /** 当前线程是否拥有该玩家（Paper 上恒真；Folia 上即「该玩家所在区域线程」）。判定异常时按「拥有」处理。 */

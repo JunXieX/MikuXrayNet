@@ -301,7 +301,12 @@ public final class NeighborChunkProvider {
           new SideSnapshot() {
             @Override
             public boolean isOccluding(int localX, int localY, int localZ) {
-              return BukkitOcclusion.camouflageOccluding(snapshot.getBlockData(localX, localY, localZ),
+              // localY 是「区块内相对 Y」（0 = 世界最低高度）。Paper 的 ChunkSnapshot#getBlockData(x,y,z)
+              // 的 y 参数是<b>世界绝对 Y</b>（26.x 支持负值，如主世界 -64..319），因此这里必须加回 baseY：
+              // 少了这一步会把相对 Y 当成绝对 Y 去读，主世界会整体错层 64 格（读到的是 y-64 那一层），
+              // 邻块贴边的遮挡判定随之失真——正是「边界一圈漏伪装」或「多伪装」的来源。
+              return BukkitOcclusion.camouflageOccluding(
+                  snapshot.getBlockData(localX, localY + baseY, localZ),
                   extraOccluding, extraNonOccluding);
             }
 

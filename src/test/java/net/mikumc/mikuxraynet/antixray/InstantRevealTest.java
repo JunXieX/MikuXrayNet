@@ -11,6 +11,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -148,24 +149,59 @@ class InstantRevealTest {
 
   // ---------------------------------------------------------- 每 tick 限额
 
-  /** 限额按「每玩家每 tick」生效：扣减后保持，tick 推进自动回满，退出精确清理。 */
+  /**
+   * 限额按「每玩家每 tick」生效：{@link ProximityRevealer.TickQuota#claim} 原子「取额度 + 预扣」，
+   * tick 推进自动回满，退出精确清理。
+   */
   @Test
   void tickQuotaResetsPerTickAndPerPlayer() {
     ProximityRevealer.TickQuota quota = new ProximityRevealer.TickQuota();
     UUID player = UUID.randomUUID();
     UUID other = UUID.randomUUID();
 
-    assertEquals(16, quota.remaining(player, 100L, 16), "本 tick 未使用：满额");
-    quota.setRemaining(player, 100L, 5);
-    assertEquals(5, quota.remaining(player, 100L, 16), "扣减后保持剩余额度");
-    assertEquals(16, quota.remaining(other, 100L, 16), "限额按玩家隔离");
-
-    quota.setRemaining(player, 100L, 0);
-    assertEquals(0, quota.remaining(player, 100L, 16), "额度用尽后本 tick 不再显形（限额生效）");
-    assertEquals(16, quota.remaining(player, 101L, 16), "下一 tick 自动回满（周期兜底继续显形）");
+    assertEquals(16, quota.claim(player, 100L, 16, 16), "本 tick 未使用：满额");
+    assertEquals(0, quota.claim(player, 100L, 16, 16), "预扣后本 tick 额度用尽（限额生效）");
+    assertEquals(16, quota.claim(other, 100L, 16, 16), "限额按玩家隔离");
+    assertEquals(16, quota.claim(player, 101L, 16, 16), "下一 tick 自动回满（周期兜底继续显形）");
 
     quota.clear(player);
-    assertEquals(16, quota.remaining(player, 101L, 16), "退出清理后按满额对待（新玩家语义）");
+    assertEquals(16, quota.claim(player, 101L, 16, 16), "退出清理后按满额对待（新玩家语义）");
+  }
+
+  /**
+   * 并发领取不得超发：Folia 上同一玩家的事件显形可能由不同区域线程并发触发，
+   * 旧实现「读 remaining → 发包 → setRemaining 写回」会让每次调用都拿到满额。
+   */
+  @Test
+  void tickQuotaClaimsAreAtomicAcrossThreads() throws Exception {
+    ProximityRevealer.TickQuota quota = new ProximityRevealer.TickQuota();
+    UUID player = UUID.randomUUID();
+    int threads = 8;
+    int maxPerTick = 16;
+    AtomicInteger grantedTotal = new AtomicInteger();
+    ExecutorService pool = Executors.newFixedThreadPool(threads);
+    try {
+      CountDownLatch start = new CountDownLatch(1);
+      CountDownLatch done = new CountDownLatch(threads);
+      for (int t = 0; t < threads; t++) {
+        pool.execute(() -> {
+          try {
+            start.await();
+          } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+          }
+          grantedTotal.addAndGet(quota.claim(player, 5L, maxPerTick, maxPerTick));
+          done.countDown();
+        });
+      }
+      start.countDown();
+      assertTrue(done.await(5, TimeUnit.SECONDS), "并发领取不得超时");
+    } finally {
+      pool.shutdownNow();
+      pool.awaitTermination(5, TimeUnit.SECONDS);
+    }
+    assertEquals(maxPerTick, grantedTotal.get(),
+        "并发领取的总量必须恰好等于限额（旧实现会成倍超发）");
   }
 
   // ---------------------------------------------------------- 发包额度线程安全（任务 5）
@@ -230,11 +266,35 @@ class InstantRevealTest {
     assertEquals(2, budget.remaining(), "全部归还后恢复初始额度");
   }
 
-  /** max-per-tick = 0（配置关闭事件显形）时 remaining 恒为 0，调用方直接放弃。 */
+  /**
+   * 预扣后「一个包都没发」可以撤销（{@link ProximityRevealer.TickQuota#release}）：路过但没发包的事件
+   * 不应白占一个 tick 的份额；已发出的部分不退还；tick 推进后不得把上一 tick 的剩余加回去。
+   */
+  @Test
+  void tickQuotaReleaseReturnsOnlyUnusedShareWithinSameTick() {
+    ProximityRevealer.TickQuota quota = new ProximityRevealer.TickQuota();
+    UUID player = UUID.randomUUID();
+
+    int granted = quota.claim(player, 10L, 16, 16);
+    assertEquals(16, granted);
+    quota.release(player, 10L, 16, granted, 0);
+    assertEquals(16, quota.claim(player, 10L, 16, 16), "一个包都没发：撤销后恢复满额");
+
+    granted = quota.claim(player, 11L, 16, 16);
+    quota.release(player, 11L, 16, granted, 6);
+    assertEquals(10, quota.claim(player, 11L, 16, 16), "已发 6 个：只退还剩下的 10 个");
+
+    // tick 已推进：上一 tick 的剩余不得被加回新 tick
+    granted = quota.claim(player, 12L, 16, 16);
+    quota.release(player, 11L, 16, granted, 0);
+    assertEquals(16, quota.claim(player, 12L, 16, 16), "跨 tick 的撤销必须被忽略");
+  }
+
+  /** max-per-tick = 0（配置关闭事件显形）时没有任何可用额度，调用方直接放弃。 */
   @Test
   void zeroMaxPerTickDisablesQuota() {
     ProximityRevealer.TickQuota quota = new ProximityRevealer.TickQuota();
     UUID player = UUID.randomUUID();
-    assertEquals(0, quota.remaining(player, 7L, 0), "限额为 0：本 tick 没有可用额度");
+    assertEquals(0, quota.claim(player, 7L, 0, 0), "限额为 0：本 tick 没有可用额度");
   }
 }

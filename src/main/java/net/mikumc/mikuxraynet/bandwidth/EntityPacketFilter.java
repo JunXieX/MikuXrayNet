@@ -59,7 +59,9 @@ import org.bukkit.plugin.Plugin;
  *       （{@link #INDEX_REBUILD_TICKS} 周期触发，每次最多 {@link #REBUILD_CHUNK_BUDGET} 个区块）
  *       补齐万一漏接的事件。启动时先做一次不限额的全量建索引，让插件启用前就已存在的实体立即生效。</li>
  *   <li><b>Folia 系</b>：不做索引（无法跨区域安全枚举全服实体，且该平台是否为所有实体触发上述事件
- *       未经核实），白名单退化为「对所有实体生效」，只影响保守性、不影响正确性——与改动前一致。</li>
+ *       未经核实）。因此白名单在此平台<b>实际不生效</b>：{@code isWhitelisted} 恒为 false，盔甲架 /
+ *       展示框等「机制上不移动」的实体的零位移包也会被取消（见 {@code MovePacketFields} 对 onGround
+ *       取舍的说明）。这只影响观感保守性、不影响正确性，但在面板上表现为「取消数偏高」属预期。</li>
  * </ul>
  */
 public final class EntityPacketFilter extends PacketAdapter implements Listener {

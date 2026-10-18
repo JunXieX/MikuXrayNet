@@ -740,6 +740,13 @@ public final class ProximityRevealer implements Listener {
   private void sendCandidates(Player player, World world,
       List<ObfuscatedChunkIndex.Position> candidates, Plan plan, ProximitySelector.Eye eye,
       Budget budget, ProximityScanner.Tally scanTally, boolean visibilityInPlan) {
+    if (stopping) {
+      // 停用 / 热重载已开始：绝不继续发包。本方法可能在异步工作池算完 computePlan 后才被回投到玩家线程
+      // 执行（见 reveal 的 Schedulers.onEntity 回调），此时旧实例的索引已被 stop() 清空，
+      // 若仍按快照里的候选发包，会：① 停用后继续向客户端发送显形包；② 往已清空的 revealedSet
+      // 重新写入标记（内存残留）。停机后未显形的坐标由新实例的下一个巡检周期补上。
+      return;
+    }
     PassTally tally = new PassTally();
     tally.chunksScanned = scanTally.chunksScanned;
     tally.chunksSkipped = scanTally.chunksSkipped;
@@ -1448,7 +1455,7 @@ public final class ProximityRevealer implements Listener {
    */
   private void revealImmediately(Player player, int cx, int cy, int cz) {
     try {
-      if (!player.isOnline()
+      if (stopping || !player.isOnline()
           || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
         return;
       }
@@ -1469,7 +1476,10 @@ public final class ProximityRevealer implements Listener {
 
       UUID playerId = player.getUniqueId();
       long tick = Bukkit.getCurrentTick();
-      Budget budget = new Budget(instantQuota.remaining(playerId, tick, instant.maxPerTick()));
+      // 原子「取额度 + 预扣」（见 TickQuota#claim）：并发事件不会各自拿到满额，限额不会被突破。
+      int maxPerTick = instant.maxPerTick();
+      int granted = instantQuota.claim(playerId, tick, maxPerTick, maxPerTick);
+      Budget budget = new Budget(granted);
       if (budget.remaining() <= 0) {
         return;
       }
@@ -1492,7 +1502,7 @@ public final class ProximityRevealer implements Listener {
         sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
       }
       flushBatch(player, batch, tally, budget);
-      instantQuota.setRemaining(playerId, tick, Math.max(0, budget.remaining()));
+      instantQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
@@ -1505,7 +1515,7 @@ public final class ProximityRevealer implements Listener {
    */
   private void revealSectionImmediately(Player player, int[] coordinates, int count) {
     try {
-      if (!player.isOnline()
+      if (stopping || !player.isOnline()
           || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
         return;
       }
@@ -1518,7 +1528,10 @@ public final class ProximityRevealer implements Listener {
       Location location = player.getLocation();
       UUID playerId = player.getUniqueId();
       long tick = Bukkit.getCurrentTick();
-      Budget budget = new Budget(instantQuota.remaining(playerId, tick, instant.maxPerTick()));
+      // 与逐坐标路径共用同一份原子额度（见 TickQuota#claim）：两条路径并发时不会各拿满额。
+      int maxPerTick = instant.maxPerTick();
+      int granted = instantQuota.claim(playerId, tick, maxPerTick, maxPerTick);
+      Budget budget = new Budget(granted);
       if (budget.remaining() <= 0) {
         return;
       }
@@ -1574,7 +1587,7 @@ public final class ProximityRevealer implements Listener {
         }
       }
       flushBatch(player, batch, tally, budget);
-      instantQuota.setRemaining(playerId, tick, Math.max(0, budget.remaining()));
+      instantQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
@@ -1633,31 +1646,65 @@ public final class ProximityRevealer implements Listener {
   /**
    * 每玩家每 tick 的事件显形限额（纯数据结构，可离线单测）。
    *
-   * <p>槽位 {@code long[2] = [tick, 剩余额度]}，tick 变化即自动重置为满额；额度按「事件显形实际
-   * 发包数」扣减（读剩余 → 发包 → 写回剩余），因此限额是「每玩家每 tick 真实发包数」的口径。
-   * 条目随玩家退出精确清理（见 {@link #onQuit}）。
+   * <p>槽位 {@code long[2] = [tick, 剩余额度]}，tick 变化即自动重置为满额；额度由 {@link #claim} 在
+   * <b>同一临界区</b>内「读剩余 + 预扣」，因此即便同一玩家的事件显形在 Folia 上被不同区域线程并发触发，
+   * 限额也不会被成倍突破。条目随玩家退出精确清理（见 {@link #onQuit}）。
    */
   static final class TickQuota {
 
     private final ConcurrentHashMap<UUID, long[]> slots = new ConcurrentHashMap<>();
 
-    /** 本 tick 的剩余额度；本 tick 尚未使用过或已进入下一 tick 时返回满额。 */
-    int remaining(UUID player, long tick, int maxPerTick) {
-      long[] slot = slots.get(player);
-      if (slot == null) {
-        return maxPerTick;
-      }
+    /**
+     * 原子地「取本 tick 剩余额度 + 预扣 {@code wanted}」：返回实际可用的额度（{@code 0..wanted}）。
+     *
+     * <p><b>为什么必须一次完成</b>：若拆成「先读剩余 → 发包 → 写回剩余」，那是读-改-写三步，中间没有
+     * 任何互斥。Folia 上同一玩家的事件显形可能由不同区域线程并发触发（单包路径与 section 批量路径），
+     * 两次调用都读到满额 → 限额被突破到 {@code maxPerTick × 并发数}，防爆刷失效；后写回者还会把
+     * 先写回者的扣减覆盖掉。
+     *
+     * <p>语义：本 tick 未发完的额度<b>不退还</b>——预扣即代表「本 tick 这一份额度已被占用」，
+     * 方向保守（只会少发、绝不多发）。调用方若本次一个包都没发（{@code spent == 0}），可用
+     * {@link #release} 撤销这次预扣，避免让「路过但没发包」的事件白占一个 tick 的份额。
+     *
+     * @param wanted 本次希望领取的额度上限
+     * @return 本次实际可用的额度；调用方据此创建 {@link Budget}
+     */
+    int claim(UUID player, long tick, int maxPerTick, int wanted) {
+      long[] slot = slots.computeIfAbsent(player, ignored -> new long[2]);
       synchronized (slot) {
-        return slot[0] == tick ? (int) slot[1] : maxPerTick;
+        int available = slot[0] == tick ? (int) slot[1] : maxPerTick;
+        int granted = Math.max(0, Math.min(wanted, available));
+        slot[0] = tick;
+        slot[1] = available - granted;
+        return granted;
       }
     }
 
-    /** 写回本 tick 的剩余额度（发包后调用；tick 变化时写回值即新 tick 的满额起点）。 */
-    void setRemaining(UUID player, long tick, int remaining) {
-      long[] slot = slots.computeIfAbsent(player, ignored -> new long[2]);
+    /**
+     * 撤销一次「领取后一个包都没发」的预扣（{@code spent} 为实际发出的包数）。
+     *
+     * <p>只回补本次领走的份额，且只在本 tick 内生效（tick 已推进时槽位表示的是新 tick 的额度，
+     * 不得把上一 tick 的剩余加回去）。槽位回补到满额时顺手摘除条目，避免「只扫描不显形」的玩家
+     * 在表里留下空槽位。
+     */
+    void release(UUID player, long tick, int maxPerTick, int granted, int spent) {
+      int unused = granted - Math.max(0, spent);
+      if (unused <= 0) {
+        return;
+      }
+      long[] slot = slots.get(player);
+      if (slot == null) {
+        return;
+      }
       synchronized (slot) {
-        slot[0] = tick;
-        slot[1] = remaining;
+        if (slot[0] != tick) {
+          return;
+        }
+        long restored = Math.min(maxPerTick, slot[1] + unused);
+        slot[1] = restored;
+        if (restored >= maxPerTick) {
+          slots.remove(player, slot);
+        }
       }
     }
 

@@ -242,8 +242,12 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     handler = asynchronousManager.registerAsyncHandler(this);
     handler.start();
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
-    for (Player player : plugin.getServer().getOnlinePlayers()) {
-      schedulePositionRefresh(player);
+    // immediate-radius <= 0 时近身判定恒为 false（见 shouldPassThroughImmediately），快照完全用不到，
+    // 此时不为任何玩家起「每 tick 刷新位置」的任务——否则是纯调度开销。
+    if (config.immediateRadius() > 0) {
+      for (Player player : plugin.getServer().getOnlinePlayers()) {
+        schedulePositionRefresh(player);
+      }
     }
     plugin.getLogger().fine("带宽模块已启用：方块变更合并（时间窗 " + config.mergeWindowMillis()
         + "ms，邻域半径 " + config.mergeRadius() + "，立即放行半径 " + config.immediateRadius()
@@ -278,12 +282,18 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
   @EventHandler(ignoreCancelled = true)
   public void onJoin(PlayerJoinEvent event) {
-    schedulePositionRefresh(event.getPlayer());
+    if (config.immediateRadius() > 0) {
+      schedulePositionRefresh(event.getPlayer());
+    }
   }
 
   @EventHandler(ignoreCancelled = true)
   public void onQuit(PlayerQuitEvent event) {
     cancelPositionRefresh(event.getPlayer().getUniqueId());
+    // 玩家离线后再没有「新封包」会把残留在 Pending 里的原包冲刷掉（冲刷只由窗口定时器 / 溢出 /
+    // 跨世界守卫触发），而那条 Pending 会一直挂在表里直到下一轮窗口定时器——期间它持有的
+    // PacketEvent 在异步监听器的登记表里多留一份。这里直接把它的原包主动放行，不留悬空引用。
+    flushNow(event.getPlayer().getUniqueId());
   }
 
   /**
@@ -323,7 +333,10 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    */
   private void refreshPosition(Player player, UUID playerId) {
     try {
-      positions.refresh(playerId, player.getX(), player.getY(), player.getZ());
+      // 世界名必须与坐标在同一线程（拥有该玩家的线程）读取后一起写进快照：封包线程只读快照，
+      // 绝不自己调 player.getWorld()（Folia 上那是跨区域读实体状态）。
+      positions.refresh(playerId, player.getWorld().getName(), player.getX(), player.getY(),
+          player.getZ());
     } catch (Throwable throwable) {
       positions.discard(playerId);
       noticeSnapshotFailOpen(throwable);
@@ -419,6 +432,37 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   }
 
   /**
+   * 本包所属世界是否已不是该玩家「当前」所在的世界（跨世界切换窗口）。
+   *
+   * <p>判据只有一份：玩家所属线程每 tick 写入快照的世界名。快照缺失（刚登录 / 刚重置 / 读取异常）时
+   * 无法判断，按「不是跨世界」处理（即照常走后续流程）——这与其它快照缺失点的 fail-open 方向一致：
+   * 宁可按旧逻辑合并，也不凭空丢弃合并能力。
+   */
+  private boolean isCrossWorld(UUID playerId, String packetWorld) {
+    PlayerPositionSnapshots.Position snapshot = positions.get(playerId);
+    return snapshot != null && snapshot.world() != null && !snapshot.world().equals(packetWorld);
+  }
+
+  /**
+   * 立即冲刷该玩家的合并缓冲（玩家退出 / 跨世界切换时使用）。
+   *
+   * <p>绝不能像 {@link #flushInternal} 那样内联在本（封包）线程跑：聚簇 + 构包 + 发送会阻塞所有玩家的
+   * 出站封包。这里只是把「提前到期」交给唯一的冲刷线程；执行器已关闭（停用中）时退回内联，
+   * 语义与 {@code onPacketSending} 的溢出冲刷一致（恰好放行一次）。
+   */
+  private void flushNow(UUID playerId) {
+    Pending target = pending.get(playerId);
+    if (target == null) {
+      return;
+    }
+    try {
+      flusher.execute(() -> flush(target));
+    } catch (Throwable rejected) {
+      flush(target);
+    }
+  }
+
+  /**
    * 该玩家的近身变更判定：<b>只读位置快照</b>（封包线程不触碰任何 Bukkit API）。
    *
    * <p>fail-open：快照尚未建立（刚登录 / 刚重置）或读取异常 → 按近身处理（立即放行）。
@@ -464,7 +508,18 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
     // 世界黑名单：命中世界不做任何带宽优化（变更合并一并跳过，原包照常放行）。
     // 名单为空（默认）时 isBlacklistedNow 直接早退，热路径近乎零开销。
-    if (WorldBlacklistConfig.isBlacklistedNow(player.getWorld().getName())) {
+    String worldName = player.getWorld().getName();
+    if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
+      return;
+    }
+    // 跨世界守卫：封包里的方块坐标<b>不含世界标识</b>，若本包属于「玩家已经离开的世界」（合并窗口内
+    // 传送门 / /tp 跨世界），把它照常合并、甚至只入缓冲等窗口到期，都会在客户端按<b>新世界</b>的坐标
+    // 解释这些变更 → 新世界对应位置出现「鬼影方块」，直到该区块被重新下发。
+    // 此处改为：本包立即原样放行（客户端此时仍在旧世界，语义正确），并<b>立刻冲刷</b>该玩家在旧世界
+    // 攒下的缓冲，绝不把它们留给新世界。世界名取自玩家所属线程写入的快照，不在封包线程读实体状态。
+    if (isCrossWorld(player.getUniqueId(), worldName)) {
+      flushNow(player.getUniqueId());
+      stats.blockChangesPassed.increment();
       return;
     }
 

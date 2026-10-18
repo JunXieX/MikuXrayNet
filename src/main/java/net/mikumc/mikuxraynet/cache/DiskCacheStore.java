@@ -366,19 +366,51 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
     if (approximateEntries.get() >= config.maxEntries()) {
-      stats.rejectedByCapacity.increment();
-      return;
+      // 已达条目上限：只拒绝「新条目」，覆盖已有条目的写入照常放行。覆盖不增加条目数（见 doPut 的
+      // replaced 判定），若在这里一刀切，达到上限后缓存会彻底停止更新——旧条目继续被命中，新内容
+      // 永远落不了盘，且没有任何计数器能区分「真满了」与「覆盖被误拒」。
+      if (!overwritesExisting(worldName, chunkX, chunkZ)) {
+        stats.rejectedByCapacity.increment();
+        return;
+      }
     }
     if (pendingOps.get() >= config.queueCapacity()) {
       stats.rejectedByBacklog.increment(); // 此前静默返回：积压导致写入被丢弃必须可见
       return;
     }
-    byte[] encoded = payload.get();
+    byte[] encoded;
+    try {
+      encoded = payload.get();
+    } catch (Throwable throwable) {
+      // 与类注释「任何异常都只记日志并计数」一致：负载工厂异常绝不上抛到封包链路。
+      fail("磁盘缓存在编码负载时出错（本次写入按跳过处理）", throwable);
+      return;
+    }
     if (encoded == null || encoded.length == 0) {
       return;
     }
     long writtenAt = System.currentTimeMillis();
     execute(() -> doPut(worldName, chunkX, chunkZ, configHash, writtenAt, encoded));
+  }
+
+  /**
+   * 条目上限判定用：该区块是否<b>已经</b>在缓存里（覆盖写入不会增加条目数）。
+   *
+   * <p><b>为什么必须走磁盘线程</b>：只有 {@link RegionFile} 的槽位表知道「某区块是否已有条目」，
+   * 而它只归磁盘线程所有。这里提交一个带预算的查询（与读取同一条链路，超时即按「未命中 → 视为新条目」
+   * 处理，方向保守：宁可少收一条，也不让条目数超限）。查询内部只读偏移表，不触碰 LRU 之外的任何状态。
+   */
+  private boolean overwritesExisting(String worldName, int chunkX, int chunkZ) {
+    Boolean exists = submit(() -> {
+      int regionX = BufferedLinearV3Format.regionCoordinate(chunkX);
+      int regionZ = BufferedLinearV3Format.regionCoordinate(chunkZ);
+      Handle handle = handle(worldName, regionX, regionZ, false);
+      if (handle == null || handle.file.isCompacting()) {
+        return Boolean.FALSE;
+      }
+      return handle.file.get(BufferedLinearV3Format.chunkIndex(chunkX, chunkZ)) != null;
+    }, readTimeoutMillis);
+    return Boolean.TRUE.equals(exists);
   }
 
   /**
@@ -457,6 +489,8 @@ public final class DiskCacheStore implements AutoCloseable {
         try {
           flushAll();
           closeAllHandles();
+          // 压缩超时未收工 → closeAllHandles 会跳过那些句柄；这里在磁盘线程上兜底等待并关闭
+          closeCompactingHandlesAfterShutdown();
         } catch (Throwable throwable) {
           fail("关闭磁盘缓存时出现异常", throwable);
         }
@@ -827,6 +861,57 @@ public final class DiskCacheStore implements AutoCloseable {
     }
     approximateEntries.set(0);
   }
+
+  /** 压缩收尾兜底的最长等待（秒）。 */
+  private static final int COMPACT_DRAIN_SECONDS = 5;
+
+  /** 压缩收尾兜底的轮询间隔（毫秒）。 */
+  private static final long COMPACT_DRAIN_POLL_MILLIS = 20L;
+
+  /**
+   * 关闭时若压缩线程超时仍未收工，对那些「因压缩独占而被 {@link #removeAndClose} 跳过」的句柄做兜底关闭。
+   *
+   * <p><b>为什么需要</b>：{@code close()} 先等压缩线程（{@code CLOSE_TIMEOUT_MILLIS}），超时后仍继续
+   * 排空磁盘线程；{@code closeAllHandles} → {@code removeAndClose} 见到 {@code isCompacting()} 会整条跳过。
+   * 而压缩结束后 {@code runCompact} 的收尾 {@code execute(finishCompact)} 会因 {@code closed} 被拒——
+   * 于是该 {@code FileChannel} 与文件锁<b>永远没人关闭</b>（每次 reload 泄漏一个句柄与一把锁）。
+   *
+   * <p><b>安全前提</b>：本方法只在 {@code close()} 里、且仍在<b>磁盘线程</b>上执行；此刻压缩线程早已
+   * {@code shutdown()} + {@code awaitTermination}，唯一可能的并发是「那一轮压缩马上跑完」。因此这里
+   * 自旋等待 {@code isCompacting()} 变为 false（有硬上限），一旦看到 false，说明压缩线程已经不再触碰
+   * 该 {@code RegionFile}，随后在同一线程上 close 不会与任何写者交错。
+   */
+  private void closeCompactingHandlesAfterShutdown() {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(COMPACT_DRAIN_SECONDS);
+    boolean warned = false;
+    for (Map.Entry<RegionKey, Handle> entry : open.entrySet()) {
+      Handle handle = entry.getValue();
+      while (handle.file.isCompacting() && System.nanoTime() < deadline) {
+        try {
+          Thread.sleep(COMPACT_DRAIN_POLL_MILLIS);
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          break;
+        }
+        warned = false; // 新一轮等待重新计时提示（只在真正超时才提示）
+      }
+      if (handle.file.isCompacting()) {
+        if (!warned) {
+          warned = true;
+          logger.warning("磁盘缓存关闭时仍有区域文件处于压缩中且未在 "
+              + COMPACT_DRAIN_SECONDS + " 秒内收工，该文件句柄留待进程退出时释放（缓存只是可选加速）");
+        }
+        continue;
+      }
+      removeAndClose(entry.getKey(), handle);
+    }
+  }
+
+  /** 压缩收尾兜底的最长等待（秒）。 */
+  private static final int COMPACT_DRAIN_SECONDS = 5;
+
+  /** 压缩收尾兜底的轮询间隔（毫秒）。 */
+  private static final long COMPACT_DRAIN_POLL_MILLIS = 20L;
 
   /**
    * 从打开表摘除句柄并关闭它，同时<b>收回该句柄计入的条目额度</b>并把该键从「已补计」集合移除——

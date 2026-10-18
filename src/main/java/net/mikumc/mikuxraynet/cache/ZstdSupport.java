@@ -72,6 +72,9 @@ public final class ZstdSupport {
    */
   static final long MAX_DOWNLOAD_BYTES = 16L * 1024 * 1024;
 
+  /** 下载线程收尾预算（毫秒）：interrupt 后通常立即结束，这里只是给「删临时文件」留出确定性窗口。 */
+  private static final long DOWNLOAD_THREAD_JOIN_MILLIS = 2_000L;
+
   /** zstd 来源（仅用于日志）。 */
   public enum Source {
     /** 服务端自带（插件类路径可见）。 */
@@ -736,8 +739,17 @@ public final class ZstdSupport {
       Thread.currentThread().interrupt();
       throw new IOException("下载被中断", exception);
     } finally {
-      // 只取消、不等待：调用方已经不再阻塞（超时语义），残留线程是守护线程，随进程退出
+      // 先停线程再让调用方删临时文件：超时后下载线程可能仍在写 target，若此处不等待就返回，
+      // downloadOnce 的 finally（deleteQuietly(temp)）会与写入线程竞争——删除先执行、写入随后重建文件，
+      // 于是缓存目录里永久残留一个 .tmp（Windows 上删除还会因句柄占用直接失败）。
+      // 这里给一个很短的收尾预算：interrupt 会让阻塞中的 read/connect 立刻返回，
+      // 拿不到也只是多留一个临时文件（下次启动不认领它，但不会影响功能）。
       executor.shutdownNow();
+      try {
+        executor.awaitTermination(DOWNLOAD_THREAD_JOIN_MILLIS, TimeUnit.MILLISECONDS);
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+      }
     }
   }
 
