@@ -387,8 +387,8 @@ public final class BandwidthConfig {
                     clampAdjustments),
                 // 距离门默认 24（性能优先）：更远才允许视锥剔除；其有效值为
                 // max(本值, force-visible-distance)，故默认下实际从强制可见距离 32 格起生效。
-                clampUpper(root.getDouble("entity-culling.frustum.min-distance", 24.0D),
-                    24.0D, MAX_FRUSTUM_MIN_DISTANCE, "entity-culling.frustum.min-distance",
+                clampRange(root.getDouble("entity-culling.frustum.min-distance", 24.0D),
+                    24.0D, 0.0D, MAX_FRUSTUM_MIN_DISTANCE, "entity-culling.frustum.min-distance",
                     clampAdjustments)),
             // 遮挡判定恒走异步位图（原生命中射线已移除），故本子项无开关，只余调优键。
             new EntityCulling.AsyncOcclusion(
