@@ -329,7 +329,7 @@ public final class BandwidthConfig {
             // 各模块总开关均默认 true：新增开关不得改变既有行为（原样保持「全部启用」）
             root.getBoolean("entity-packets.enabled", true),
             root.getBoolean("entity-packets.skip-zero-movement", true),
-            Set.copyOf(nonNullStrings(root.getStringList("entity-packets.whitelist"))),
+            Set.copyOf(nonNullStrings(root.getStringList("entity-packets.whitelist")))),
         new BlockChanges(
             root.getBoolean("block-changes.enabled", true),
             root.getBoolean("block-changes.merge", true),
