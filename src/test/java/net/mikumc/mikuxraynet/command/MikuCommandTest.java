@@ -51,4 +51,13 @@ class MikuCommandTest {
     assertEquals(List.of("status", "dump", "reload"), MikuCommand.suggestSubcommands(new String[0]),
         "补全项必须与 /mikuxraynet <status|dump|reload> 的用法逐项一致");
   }
+
+  /** 取不到发送者时无法判定权限：必须一个都不补，绝不能把管理命令暴露给无权限来源。 */
+  @Test
+  void nullSenderGetsNoCompletions() {
+    assertTrue(MikuCommand.suggestSubcommands(null, new String[0]).isEmpty(),
+        "sender 为 null 时不得补出任何子命令");
+    assertTrue(MikuCommand.suggestSubcommands(null, new String[] {"s"}).isEmpty(),
+        "sender 为 null 时也不得按前缀补出子命令");
+  }
 }
