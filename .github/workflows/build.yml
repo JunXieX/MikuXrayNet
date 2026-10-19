@@ -41,6 +41,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-report
+          retention-days: 1
           path: target/benchmark-report.md
           if-no-files-found: ignore
 
@@ -48,6 +49,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: mikuxraynet-jar
+          retention-days: 1
           path: target/MikuXrayNet-*.jar
           if-no-files-found: error
 
