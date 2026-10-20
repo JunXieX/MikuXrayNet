@@ -108,25 +108,37 @@ class ThrottlePipelineTest {
   }
 
   /**
-   * 回归：重复 {@code start()} 必须<b>直接返回</b>，不得把正在运行的模块当成「上次残留」注销。
+   * 回归：「已在运行」的判定必须是 {@code startLocked()} 的<b>第一条</b>语句。
    *
-   * <p>{@code startLocked()} 里有一次「补清理上次注销失败的模块」（{@code retryFailedCloses}）。
-   * 若把它排在「是否已在运行」判定之前，重复 start 就会走到那里，把当前正在运行的模块全部 close 掉，
-   * 随后又因 started 已为 true 而返回——留下「started=true 但模块全被注销」的半死状态：
-   * 监听器没了、诊断却仍报告已启用。本测试用「配置全关」（此时 retryFailedCloses 无字段可动）
-   * 无法覆盖，故直接断言「两次 start 后 stop 只清理一次」这一可观测行为。
+   * <p>为什么这条顺序如此重要：紧跟在判定之后的是 {@code retryFailedCloses()}——它会注销字段里的模块
+   * （那是为「上一次 stop() 注销失败、刻意保留的句柄」准备的）。一旦把重试排在运行态判定之前，
+   * 重复 start() 就会把<b>当前正在运行</b>的模块全部关掉，随后又因 started 已为 true 而返回，
+   * 留下「started=true 但模块全被注销」的半死状态：监听器没了，诊断却仍报已启用，玩家侧的
+   * 实体剔除/省包全部静默失效。
+   *
+   * <p>本测试用反射把 {@code started} 预置为 true 再调 {@code start()}：若判定确实在最前，方法会立刻返回、
+   * 完全不触碰 Bukkit（离线环境可用）；若判定被挪到后面，执行流就会走到依赖 Bukkit 的装配段并抛
+   * {@code NullPointerException}（离线无服务端实例），测试随即失败——正是我们要钉住的回归。
    */
   @Test
-  void repeatedStartDoesNotUnregisterRunningModules() {
+  void startReturnsImmediatelyWhenAlreadyRunning() throws Exception {
     ThrottlePipeline pipeline = new ThrottlePipeline(pluginStub(), config("enabled: true\n"));
-    // 用 register 的失败路径无关；这里直接驱动 start/stop 的可重入语义：
-    // 配置为 enabled=true 时若 ProtocolLib 不可用，依赖封包的模块不会注册，但 start 仍会置位 started。
+    java.lang.reflect.Field started = ThrottlePipeline.class.getDeclaredField("started");
+    started.setAccessible(true);
+    ((AtomicBoolean) started.get(pipeline)).set(true);
+
+    // 已在运行：必须立刻返回，绝不进入任何需要 Bukkit 的装配路径
     pipeline.start();
-    // 第二次 start：必须被拦在方法开头（否则会把上面刚装好的模块注销掉）
+  }
+
+  /** {@code stop()} 可重复调用：首次清理后字段已置空，再次调用必须是纯 no-op（不抛异常）。 */
+  @Test
+  void stopIsIdempotent() {
+    ThrottlePipeline pipeline = new ThrottlePipeline(pluginStub(), config("enabled: false\n"));
+    // 总开关关闭时 start() 在触碰 Bukkit 之前就返回（离线可跑），stop() 自然也没有模块可清理
     pipeline.start();
-    // 到这里 started 仍应为 true（诊断据此报告「已启用」）；stop() 能正常收尾且不抛异常
+    pipeline.start();
     pipeline.stop();
-    // 再 stop 一次：字段已全部置空，必须是纯 no-op（不得因重试逻辑而抛错）
     pipeline.stop();
   }
 
