@@ -5,6 +5,7 @@ import java.io.File;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.antixray.BlockChangeRevealListener;
+import net.mikumc.mikuxraynet.antixray.ChunkKey;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
@@ -524,17 +525,38 @@ public final class AntiXrayRuntime {
    * 内存表的整列摘除，不读世界内容、不做任何计算。
    */
   void invalidateChunk(String worldName, int chunkX, int chunkZ) {
+    // 1) 遮挡位图：整列摘除（本区块已无玩家，几何数据无人使用，下次下发时整列重建）。
     OcclusionStores stores = occlusionStores;
-    if (stores == null) {
-      return;
-    }
-    try {
-      OcclusionStore store = stores.lookup(worldName);
-      if (store != null) {
-        store.removeColumn(chunkX, chunkZ);
+    if (stores != null) {
+      try {
+        OcclusionStore store = stores.lookup(worldName);
+        if (store != null) {
+          store.removeColumn(chunkX, chunkZ);
+        }
+      } catch (Throwable throwable) {
+        logger.log(Level.WARNING, "摘除区块遮挡位图时出现异常（已忽略）", throwable);
       }
-    } catch (Throwable throwable) {
-      logger.log(Level.WARNING, "摘除区块遮挡位图时出现异常（已忽略）", throwable);
+    }
+    // 2) 显形索引：同步摘除该区块的伪装清单。
+    //
+    // 这是「索引只随区块卸载清理」策略的<b>唯一</b>回收路径（时间过期已被取消，见
+    // ObfuscatedChunkIndex 的说明）：漏了这一步，索引就会随「本局游戏曾改写过的区块数」无界增长。
+    // 为什么可以安全摘除：区块卸载意味着该区块已不在任何玩家的客户端里，其伪装坐标此刻不可能被显形；
+    // 区块下次被下发时会重新改写并重新登记（改写结果走缓存时同样会重新记录）。
+    ObfuscatedChunkIndex index = obfuscatedChunkIndex;
+    if (index != null) {
+      try {
+        if (index.invalidateChunk(worldName, chunkX, chunkZ)) {
+          // 该区块的清单消失 ⇒ 其上所有玩家的「已显形」标记必须同步作废，否则成为孤儿标记：
+          // sizeFor 虚增会让邻近显形的「整块跳过」提前成立，真实坐标被周期跳过（漏显形）。
+          RevealedSet revealed = revealedSet;
+          if (revealed != null) {
+            revealed.clearChunk(new ChunkKey(worldName, chunkX, chunkZ));
+          }
+        }
+      } catch (Throwable throwable) {
+        logger.log(Level.WARNING, "摘除区块显形索引时出现异常（已忽略）", throwable);
+      }
     }
   }
 

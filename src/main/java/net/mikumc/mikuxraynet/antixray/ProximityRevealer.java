@@ -1362,10 +1362,23 @@ public final class ProximityRevealer implements Listener {
     expireNow();
   }
 
-  /** 实际执行两个结构的过期清理（工作线程或退化时的调用线程；纯并发结构操作，任意线程安全）。 */
+  /**
+   * 实际执行过期清理（工作线程或退化时的调用线程；纯并发结构操作，任意线程安全）。
+   *
+   * <p><b>伪装索引不再按时间过期</b>（玩家体验优先）：索引条目现在<b>只随区块卸载清理</b>
+   * （见 {@code AntiXrayRuntime#invalidateChunk}）。原因是时间过期会让「玩家走远超过 expire-seconds
+   * 又折返」的区块在未重新下发时丢失伪装清单——那些矿就再也不会被显形，玩家会一直看到假方块。
+   * 玩家折返是极常见的操作（挖矿来回、跑图回头），不能靠「区块大概会重发」来赌。
+   *
+   * <p>内存仍是有界的：区块卸载即整列摘除（服务端卸载区块本就意味着附近无玩家），
+   * 因此索引驻留量 ≈ 当前已加载且被改写过的区块数。
+   *
+   * <p>「已显形集合」仍按时间过期：它是<b>按玩家</b>记录的，玩家长期不下线时若不清理会随其活动范围
+   * 无界增长；而它过期只意味着「可能重复显形一次」（浪费一点带宽），不会让玩家看到假方块——
+   * 方向安全。
+   */
   private void expireNow() {
     try {
-      chunkIndex.expire();
       revealedSet.expire();
     } catch (Throwable throwable) {
       logThrottled(throwable);

@@ -159,10 +159,19 @@ public final class Diagnostics {
     /** 显形索引域：伪装区块索引（按区块共享）与按玩家的已显形集合的持有量与安全阀计数。 */
     public record Index(int obfuscatedChunkCount, int obfuscatedPositionCount,
         int revealedPositionCount, long revealedRegisteredTotal,
-        long indexEvictedByCapacity, long revealedDroppedByCapacity) {
+        long indexEvictedByCapacity, long revealedDroppedByCapacity,
+        long obfuscatedRegisteredTotal, long obfuscatedInvalidatedTotal) {
 
       /** 显形索引未启用时的零值兜底。 */
-      public static final Index EMPTY = new Index(0, 0, 0, 0L, 0L, 0L);
+      public static final Index EMPTY = new Index(0, 0, 0, 0L, 0L, 0L, 0L, 0L);
+
+      /** 兼容构造（不含累计登记/摘除，等价于「无从判断」，用于既有调用点与单测）。 */
+      public Index(int obfuscatedChunkCount, int obfuscatedPositionCount,
+          int revealedPositionCount, long revealedRegisteredTotal,
+          long indexEvictedByCapacity, long revealedDroppedByCapacity) {
+        this(obfuscatedChunkCount, obfuscatedPositionCount, revealedPositionCount,
+            revealedRegisteredTotal, indexEvictedByCapacity, revealedDroppedByCapacity, 0L, 0L);
+      }
     }
 
     /**
@@ -420,7 +429,9 @@ public final class Diagnostics {
             revealedSet == null ? 0 : revealedSet.positionCount(),
             revealedSet == null ? 0L : revealedSet.registeredTotal(),
             chunkIndex == null ? 0L : chunkIndex.evictedByCapacity(),
-            revealedSet == null ? 0L : revealedSet.droppedByCapacity());
+            revealedSet == null ? 0L : revealedSet.droppedByCapacity(),
+            chunkIndex == null ? 0L : chunkIndex.registeredChunks(),
+            chunkIndex == null ? 0L : chunkIndex.invalidatedChunks());
     Snapshot.Throttle throttle = pipeline == null ? Snapshot.Throttle.EMPTY
         : new Snapshot.Throttle(throttleStats.entityPacketsCancelled.sum(),
             throttleStats.entityPacketsPassed.sum(),
@@ -559,8 +570,11 @@ public final class Diagnostics {
     // 口径说明：这里刻意分列「实时坐标数」与「累计登记数」——前者随登出 / 过期 / 区块失效归零，
     // 后者只增不减。若只显示实时值，玩家中途重登或走远后被清理时会看到「发送 N 但已显形 0」，
     // 极易被误读成「显形路径没有登记」（实际登记在发包成功后必然发生）。
-    lines.add("显形索引：伪装区块 " + s.index().obfuscatedChunkCount() + "（坐标 "
-        + s.index().obfuscatedPositionCount()
+    // 伪装索引的口径必须与「累计登记 / 卸载清理」一起显示：它只随区块卸载清理（不再按时间过期），
+    // 玩家走开后会归零。若只显示实时值，「改写 N 但伪装区块 0」会被误读成「索引没记上、反矿透失效」。
+    lines.add("显形索引：伪装区块 " + s.index().obfuscatedChunkCount() + "（当前驻留；累计登记 "
+        + s.index().obfuscatedRegisteredTotal() + "，卸载清理 " + s.index().obfuscatedInvalidatedTotal()
+        + "，坐标 " + s.index().obfuscatedPositionCount()
         + "）｜已显形 坐标 " + s.index().revealedPositionCount() + "（当前在线）｜累计登记 "
         + s.index().revealedRegisteredTotal()
         + "｜安全阀触发 " + s.index().indexEvictedByCapacity() + "/" + s.index().revealedDroppedByCapacity()

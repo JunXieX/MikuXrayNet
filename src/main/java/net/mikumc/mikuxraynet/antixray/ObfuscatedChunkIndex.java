@@ -18,7 +18,8 @@ import java.util.function.LongSupplier;
  * 也只占 1 份。
  *
  * <p><b>失效时机</b>：① 世界卸载（{@link #invalidateWorld}）；② 区块卸载（{@link #invalidateChunk}，
- * 由 {@code ChunkUnloadEvent} 驱动，另有 {@link #expire} 过期兜底）；③ 该区块观测到方块变更
+ * 由 {@code ChunkUnloadEvent} 驱动，<b>这是唯一的回收路径</b>——{@link #expire} 仍保留但生产路径
+ * 已不再调用，见其说明）；③ 该区块观测到方块变更
  * （{@link #removePosition}，出站方块变更封包路径，只摘除变更的那一个坐标，与既有行为一致）；
  * ④ 区块被重新下发（{@link #recordChunk} 直接覆盖该区块条目）。
  *
@@ -80,6 +81,17 @@ public final class ObfuscatedChunkIndex {
   private final AtomicInteger totalPositions = new AtomicInteger();
   /** 安全阀：仅当坐标总量越过上限（正常运营不该发生）时按「最旧优先」淘汰掉的坐标数。 */
   private final LongAdder evictedByCapacity = new LongAdder();
+
+  /**
+   * 累计登记过的区块数（只增不减）与累计因卸载/世界卸载摘除的区块数。
+   *
+   * <p><b>为什么需要它们</b>：面板上的「伪装区块」是<b>实时驻留量</b>——玩家走开后区块卸载、条目被摘除，
+   * 它会归零。而「改写 1974」是累计值。两个数字放在一起看，服主很容易误判成「改写成功了但索引没记上、
+   * 反矿透失效」。给出累计登记与累计摘除后，「驻留 0」就能被解释为「都随卸载清掉了」而不是「没登记」。
+   */
+  private final LongAdder registeredChunks = new LongAdder();
+  /** 累计因区块卸载 / 世界卸载而摘除的区块数。 */
+  private final LongAdder invalidatedChunks = new LongAdder();
 
   private final int maxPositions;
   private final long expireNanos;
@@ -209,6 +221,7 @@ public final class ObfuscatedChunkIndex {
       return entry;
     });
     totalPositions.updateAndGet(current -> Math.max(0, current + delta[0]));
+    registeredChunks.increment();
     return removedHolder[0];
   }
 
@@ -413,6 +426,7 @@ public final class ObfuscatedChunkIndex {
       return false;
     }
     subtract(totalPositions, removed.size());
+    invalidatedChunks.increment();
     return true;
   }
 
@@ -428,11 +442,21 @@ public final class ObfuscatedChunkIndex {
       ChunkEntry removed = chunks.remove(key);
       if (removed != null) {
         subtract(totalPositions, removed.size());
+        invalidatedChunks.increment();
       }
     }
   }
 
-  /** 清理超过过期时间且近期未被扫描到的条目（巡检任务周期调用）。 */
+  /**
+   * 清理超过过期时间的条目。
+   *
+   * <p><b>生产路径已不再调用</b>（玩家体验优先）：时间过期会让「玩家走远超过 expire-seconds 又折返」
+   * 的区块在未重新下发时丢失伪装清单，那些矿从此不再显形、玩家一直看到假方块；而玩家折返是极常见的
+   * 操作。改为<b>只随区块卸载清理</b>（{@code AntiXrayRuntime#invalidateChunk}）：区块卸载本就意味着
+   * 附近无玩家，驻留量因此 ≈ 已加载且被改写过的区块数，内存仍有界。
+   *
+   * <p>本方法保留给单测与「需要主动收敛」的极端场景使用。
+   */
   public void expire() {
     expire(clock.getAsLong());
   }
@@ -463,6 +487,16 @@ public final class ObfuscatedChunkIndex {
   /** 当前伪装区块数（诊断用）。 */
   public int chunkCount() {
     return chunks.size();
+  }
+
+  /** 累计登记过的区块数（只增不减；诊断用，与实时驻留量对照可判断「驻留 0」是否正常）。 */
+  public long registeredChunks() {
+    return registeredChunks.sum();
+  }
+
+  /** 累计因区块/世界卸载而摘除的区块数（诊断用）。 */
+  public long invalidatedChunks() {
+    return invalidatedChunks.sum();
   }
 
   /** 当前累计伪装坐标数（诊断用）。 */
