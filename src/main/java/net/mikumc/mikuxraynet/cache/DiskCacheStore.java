@@ -129,6 +129,15 @@ public final class DiskCacheStore implements AutoCloseable {
 
     private final RegionFile file;
     private volatile long lastAccessNanos;
+    /**
+     * 最近一次访问的墙钟毫秒（只有磁盘线程写、诊断与淘汰读）。
+     *
+     * <p><b>为什么除了 {@link #lastAccessNanos} 还要这一个</b>：纳秒那个是单调时钟，专门用于
+     * 「闲置多久该关句柄」的差值判定（不受系统改时间影响）；而<b>文件级 LRU 淘汰</b>要在多个句柄之间
+     * 比较先后、并写进诊断日志给服主看，墙钟毫秒更直观且可跨重启比较。两者都在 {@link #touch()} 里更新，
+     * 不额外增加热路径开销。
+     */
+    private volatile long lastAccessMillis;
 
     /**
      * 已接受但尚未 append 到文件里的负载字节（只有磁盘线程访问）。
@@ -167,10 +176,12 @@ public final class DiskCacheStore implements AutoCloseable {
     private Handle(RegionFile file) {
       this.file = file;
       this.lastAccessNanos = System.nanoTime();
+      this.lastAccessMillis = System.currentTimeMillis();
     }
 
     private void touch() {
       this.lastAccessNanos = System.nanoTime();
+      this.lastAccessMillis = System.currentTimeMillis();
     }
   }
 
@@ -1040,7 +1051,63 @@ public final class DiskCacheStore implements AutoCloseable {
         return null;
       }
     }
+    // 新开一个文件后立刻检查「打开的文件数」上限：超限就按最久未访问淘汰整个区域文件。
+    // 放在这里而不是维护周期，是因为磁盘占用增长只发生在「新开文件」这一刻；早一步回收就不会先涨后降。
+    evictRegionFilesIfNeeded();
+    if (open.get(key) != created) {
+      // 极端情况：本毫秒内刚打开的这个句柄恰好被上面那次淘汰挑中（多个句柄时间戳相同）。
+      // 句柄已被关闭，绝不能返回给调用方，按未命中/跳过降级（fail-open）。
+      return null;
+    }
     return created;
+  }
+
+  /**
+   * 打开的区域文件数超上限时，按「最久未访问」淘汰整个文件（真正的磁盘回收）。
+   *
+   * <p><b>为什么必须有这一层</b>：{@code max-entries} 只统计<b>当前已打开</b>文件的条目——关句柄即归还
+   * 额度、重开才由 {@code countDiskEntries} 补计，因此它约束的是「同时打开的文件的条目数」，
+   * 而不是磁盘上的总量。若只靠它，磁盘条目可达「区域文件数 × 每文件条目数」，且触顶后旧实现只拒写、
+   * 不淘汰，缓存会永久停更。{@code max-region-files} 直接约束磁盘上的文件数，二者共同界定磁盘占用：
+   * 前者控「每个文件多满」，后者控「一共有几个文件」。
+   *
+   * <p><b>为什么淘汰整文件而不是逐条目</b>：缓存只是可选加速层，丢一个文件只影响命中率、不影响正确性；
+   * 而逐条目淘汰需要重写文件（压缩），成本高得多。被淘汰的文件下次访问时按未命中重建。
+   *
+   * <p>只在磁盘线程上调用（{@link #handle} 内），因此对 {@code open} 的遍历与摘除无需额外加锁；
+   * 压缩中的句柄一律跳过——它正独占该文件，此时关闭通道会让压缩失败。
+   */
+  private void evictRegionFilesIfNeeded() {
+    int limit = Math.max(1, config.maxRegionFiles());
+    int excess = open.size() - limit;
+    if (excess <= 0) {
+      return;
+    }
+    int before = open.size();
+    while (open.size() > limit) {
+      RegionKey victimKey = null;
+      Handle victim = null;
+      for (Map.Entry<RegionKey, Handle> entry : open.entrySet()) {
+        Handle candidate = entry.getValue();
+        if (candidate.file.isCompacting()) {
+          continue; // 压缩独占：此时关闭通道会让压缩以 ClosedChannelException 失败
+        }
+        if (victim == null || candidate.lastAccessMillis < victim.lastAccessMillis) {
+          victim = candidate;
+          victimKey = entry.getKey();
+        }
+      }
+      if (victim == null) {
+        // 全部句柄都在压缩中：本轮放弃，等下一次打开或维护周期再试（容量暂时超标可接受）
+        return;
+      }
+      removeAndClose(victimKey, victim);
+      if (open.size() >= before) {
+        // 兜底：removeAndClose 未能摘除（句柄已被别处移除等），避免死循环
+        return;
+      }
+      before = open.size();
+    }
   }
 
   /**

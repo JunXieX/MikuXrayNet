@@ -531,9 +531,21 @@ public final class BufferedLinearV3Format {
     return Integer.BYTES + ENTRY_HEADER_SIZE + payloadLength;
   }
 
-  /** 编码一条条目（含校验和）。 */
+  /**
+   * 编码一条条目（含校验和）。
+   *
+   * <p><b>写侧与读侧同口径校验负载上限</b>：{@code decodeEntry} 对 {@code payloadLength > MAX_PAYLOAD_SIZE}
+   * 一律抛异常（该槽位当空）。若写侧不设同一道闸，就会出现「写成功却读不回」的不对称——记录白白占着
+   * 文件与偏移表，读取时却被判损坏，垃圾永远靠压缩回收。超限一律返回 {@code null}（不抛异常），
+   * 由调用方按「未写入」处理。
+   *
+   * @return 编码结果；负载超过 {@link #MAX_PAYLOAD_SIZE} 时返回 {@code null}
+   */
   public static byte[] encodeEntry(Entry entry, int hashSeed) {
     byte[] payload = entry.payload() == null ? new byte[0] : entry.payload();
+    if (payload.length > MAX_PAYLOAD_SIZE) {
+      return null;
+    }
     ByteBuffer buffer = ByteBuffer.allocate(ENTRY_HEADER_SIZE + payload.length);
     buffer.putInt(payload.length);
     buffer.putLong(entry.generation());
@@ -596,10 +608,22 @@ public final class BufferedLinearV3Format {
   /**
    * 编码一条记录（{@link #BUCKET_SIZE} 个槽位；空槽写长度为 0）。
    *
+   * <p><b>写侧与读侧同口径校验负载上限</b>：与 {@link #encodeEntry} 同理，任一非空槽的负载超过
+   * {@link #MAX_PAYLOAD_SIZE} 时整桶返回 {@code null}（该桶写不出去，读取侧本来也只会把它判成损坏）。
+   *
    * @param slots    长度应为 {@link #BUCKET_SIZE}，不足部分按空槽处理
    * @param hashSeed 条目校验种子
+   * @return 编码结果；任一非空槽负载超限时返回 {@code null}
    */
   public static byte[] encodeBucket(Entry[] slots, int hashSeed) {
+    // 先做一次纯校验（不分配），避免为「注定写不出去」的桶先算好容量再整块分配
+    if (slots != null) {
+      for (Entry slot : slots) {
+        if (slot != null && slot.payload() != null && slot.payload().length > MAX_PAYLOAD_SIZE) {
+          return null;
+        }
+      }
+    }
     // 容量已按内容精确算好（见 encodedBucketLength），直接把每条条目写进结果数组——不再走
     // ByteArrayOutputStream + toByteArray() 的「先写进中间缓冲、再整块复制一份」双重拷贝，也不再为每个
     // 条目单独分配一个编码临时数组（记录是热路径：一个区域文件最多 BUCKET_COUNT 条记录会被反复重编码）。

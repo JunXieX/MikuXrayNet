@@ -18,10 +18,13 @@ import java.util.Arrays;
  *   <li>{@link Chunk} 构造时 {@link #acquire()} 取用，{@link Chunk#close()} 时 {@link #recycle()} 归还；
  *       归还只把 scratch 放回空闲池，不保留任何区块数据（数组下次借出时由借出方重新初始化或校验）；</li>
  *   <li>调用方忘记 close，scratch 只是失去引用交给 GC，既不泄漏也不影响正确性（下次取用的是新实例）；</li>
- *   <li>空闲池每线程最多保留 {@value #MAX_IDLE_PER_THREAD} 个 scratch，占用有界。</li>
+ *   <li>空闲池每线程最多保留 {@value #MAX_IDLE_PER_THREAD} 个 scratch，占用有界；</li>
+ *   <li>条目挂在<b>线程对象</b>上（{@link ThreadLocal} 的存储随线程存活）：插件停用 / 热重载后到再次
+ *       启用之前不会有任何编解码用到这些数组，它们却仍按线程占着内存，因此由
+ *       {@link #clearThreadLocals()} 在生命周期钩子上主动移除当前线程的条目。</li>
  * </ul>
  */
-final class ChunkScratch {
+public final class ChunkScratch {
 
   /** 每线程空闲池上限：正常串行处理时只需 1 个，留 2 个只作为嵌套解码（同线程同时开两个 Chunk）的余量。 */
   private static final int MAX_IDLE_PER_THREAD = 2;
@@ -72,6 +75,10 @@ final class ChunkScratch {
 
   private boolean inUse;
 
+  /** 只经 {@link #acquire()} 取用：本类对外可见仅是为提供线程级清理入口，构造不外放。 */
+  private ChunkScratch() {
+  }
+
   /** 取一个 scratch（优先复用本线程空闲池里的）；用毕必须 {@link #recycle()} 归还。 */
   static ChunkScratch acquire() {
     ChunkScratch scratch = IDLE.get().pollLast();
@@ -82,6 +89,21 @@ final class ChunkScratch {
     scratch.byteCursor = 0;
     scratch.longCursor = 0;
     return scratch;
+  }
+
+  /**
+   * 移除<b>当前线程</b>的 scratch 复用缓存（空闲池里的实例及其中的数组一并交给 GC）。
+   *
+   * <p><b>为什么需要显式入口</b>：{@link ThreadLocal} 的条目存放在线程对象里，只要该线程还活着
+   * （区域线程 / 工作线程会跨插件重载一直存活），这些按线程缓存的数组就一直留着；停用之后到再次
+   * 启用之前没有任何编解码会用到它们，属于纯占位——每线程最多 {@value #MAX_IDLE_PER_THREAD} 个
+   * scratch，单个含 24 个 section 的调色板反查表与位打包数组，合计可达数百 KB 甚至更多。
+   *
+   * <p><b>只在停用 / 热重载时调用</b>：本方法会丢弃整池复用实例，调用后同线程的下一次编解码要重新
+   * 分配全部数组；放进封包热路径会把这个复用带来的收益抵消掉，因此它只出现在生命周期钩子上。
+   */
+  public static void clearThreadLocals() {
+    IDLE.remove();
   }
 
   /** 归还 scratch；重复归还无效（第二次调用什么也不做）。 */

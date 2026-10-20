@@ -18,6 +18,7 @@ import net.mikumc.mikuxraynet.bootstrap.ProtocolLibHook;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
 import net.mikumc.mikuxraynet.cache.ZstdSupport;
 import net.mikumc.mikuxraynet.codec.ChunkCodec;
+import net.mikumc.mikuxraynet.codec.ChunkScratch;
 import net.mikumc.mikuxraynet.codec.ChunkVersionFlags;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
@@ -425,6 +426,10 @@ public final class AntiXrayRuntime {
       workPool.close();
       workPool = null;
     }
+    // 工作池已关：本线程之后不会再借还区块 scratch，顺手丢掉当前线程的 ThreadLocal 复用缓存。
+    // 只在停用 / 热重载时调用——ThreadLocal 条目不会随工作池重建自行消失，放进热路径会
+    // 丢掉空闲池、让下一次编解码重新分配几百 KB 数组，反而抵消复用收益。
+    ChunkScratch.clearThreadLocals();
     if (bypassRegistry != null) {
       bypassRegistry.stop();
       bypassRegistry = null;

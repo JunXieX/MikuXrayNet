@@ -398,6 +398,23 @@ public final class AntiXrayConfig {
   public static final int DISK_CACHE_MAX_FILE_SIZE_MB_MAX = 1024;
 
   /**
+   * {@code disk-cache.max-region-files}（磁盘上保留的区域文件数上限）的<b>默认值</b>：4096。
+   *
+   * <p>一个区域文件覆盖 32×32 = 1024 个区块，4096 个文件约合 400 万个区块的改写结果；而默认
+   * {@code max-entries} 只有 20000 条，正常运营下先撞到的总是条目上限——本项只是兜住「条目一直没到顶、
+   * 文件却随世界数量持续增长」的情形，避免磁盘被无止境地铺满。
+   */
+  public static final int DISK_CACHE_MAX_REGION_FILES_DEFAULT = 4096;
+
+  /**
+   * {@code disk-cache.max-region-files} 的<b>安全上限</b>：65536。
+   *
+   * <p>超出上限时按「最久未访问」淘汰，维护期要遍历这些区域文件；65536 个文件约合 6700 万个区块，
+   * 已远超任何正常服务器的缓存规模。上限只为拦住手滑多打一位数（如 409600）造成的超长淘汰扫描。
+   */
+  public static final int DISK_CACHE_MAX_REGION_FILES_MAX = 65_536;
+
+  /**
    * {@code disk-cache.bucket-cache-size}（每个区域文件常驻内存的槽位记录数）的安全上限。
    *
    * <p>槽位粒度记录（{@code BufferedLinearV3Format.BUCKET_SHIFT = 0}）下「1 条记录 = 1 个区块」，
@@ -534,11 +551,30 @@ public final class AntiXrayConfig {
    * @param zstdTimeoutSeconds         zstd 下载的总等待上限（秒；超时即失败并回退，默认 10）
    * @param zstdSha256                 自动下载文件的期望 SHA-256（十六进制，已归一为小写）；
    *                                   {@code ""} = 不校验（默认），非空则下载后校验，不匹配即拒绝使用该 jar
+   * @param maxRegionFiles             磁盘上最多保留多少个区域文件（超出按最久未访问淘汰，默认
+   *                                   {@link AntiXrayConfig#DISK_CACHE_MAX_REGION_FILES_DEFAULT}，
+   *                                   钳制 16..{@link AntiXrayConfig#DISK_CACHE_MAX_REGION_FILES_MAX}）；
+   *                                   与 {@code maxEntries} 一起界定磁盘占用
    */
   public record DiskCache(boolean enabled, int maxEntries, int maxFileSizeMb, int expireSeconds,
       int bucketCacheSize, int idleCloseSeconds, int maintenanceIntervalSeconds, int compactPerPass,
       int queueCapacity, boolean zstdAutoDownload, String zstdDownloadUrl,
-      int zstdTimeoutSeconds, String zstdSha256) {
+      int zstdTimeoutSeconds, String zstdSha256, int maxRegionFiles) {
+
+    /**
+     * 不含区域文件上限的构造：按 {@link AntiXrayConfig#DISK_CACHE_MAX_REGION_FILES_DEFAULT} 补齐。
+     *
+     * <p><b>为什么保留</b>：区域文件上限是后加的限额，既有调用点（测试夹具、以及只关心其余键的装配代码）
+     * 仍按原来的 13 个参数构造；没有它，每加一个磁盘限额键都得把所有调用点改一遍。
+     */
+    public DiskCache(boolean enabled, int maxEntries, int maxFileSizeMb, int expireSeconds,
+        int bucketCacheSize, int idleCloseSeconds, int maintenanceIntervalSeconds,
+        int compactPerPass, int queueCapacity, boolean zstdAutoDownload, String zstdDownloadUrl,
+        int zstdTimeoutSeconds, String zstdSha256) {
+      this(enabled, maxEntries, maxFileSizeMb, expireSeconds, bucketCacheSize, idleCloseSeconds,
+          maintenanceIntervalSeconds, compactPerPass, queueCapacity, zstdAutoDownload,
+          zstdDownloadUrl, zstdTimeoutSeconds, zstdSha256, DISK_CACHE_MAX_REGION_FILES_DEFAULT);
+    }
   }
 
   /**
@@ -1021,7 +1057,13 @@ public final class AntiXrayConfig {
                 DISK_CACHE_ZSTD_TIMEOUT_MAX_SECONDS, "disk-cache.zstd.timeout-seconds",
                 floorAdjustments, ceilingAdjustments),
             // 下载文件的期望 SHA-256：留空 = 不校验（默认）
-            zstdSha256(root)),
+            zstdSha256(root),
+            // 磁盘上最多保留多少个区域文件（超出按最久未访问淘汰）：与 max-entries 一起界定磁盘占用。
+            // 下限 16 —— 再小的话缓存刚热起来就会被淘汰挤掉，命中率趋近 0（等于白写磁盘）；
+            // 上限见 DISK_CACHE_MAX_REGION_FILES_MAX，只拦失控配置。
+            clampCeiling(root.getInt("disk-cache.max-region-files",
+                DISK_CACHE_MAX_REGION_FILES_DEFAULT), 16, DISK_CACHE_MAX_REGION_FILES_MAX,
+                "disk-cache.max-region-files", floorAdjustments, ceilingAdjustments)),
         PlatformSupport.Mode.parse(root.getString("advanced.platform", "auto")),
         // 未配置时的内置兜底必须与打包 antixray.yml 的默认值保持一致（有单测对照）
         // 上限见 CACHE_MAXIMUM_SIZE_MAX：每条约 20~25 KB，饱和时内存占用与条目数成正比。

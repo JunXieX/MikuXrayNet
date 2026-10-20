@@ -210,17 +210,20 @@ final class MovePacketFields {
         return new Access(entityId, Shape.VEC_DELTA, null, null, null,
             Accessors.getFieldAccessor(vecDeltaField), stepCount, zero);
       }
-      if (anyShort.size() < 3) {
-        lastFailure = "继承链上既没有 VecDelta 位移字段，也凑不齐三个 short 位移分量。字段形态：" + inventory;
+      // 三个位移分量必须「都按名字认出」才敢用；否则按「解析不出」整类 fail-open。
+      //
+      // 为什么不再退回「按声明序硬取」：{@code getDeclaredFields()} 的返回顺序是 JVM 实现细节，
+      // 换版本/换服务端实现就可能变。一旦把 (xa, ya, za) 的次序取错，读出的「位移」是错位的三个分量，
+      // 于是**真实的位移包**会被误判成「零位移」而被取消——客户端位置不再同步（橡皮筋、回弹）。
+      // 相比之下「解析不出 → 放行原包」只是少省一点带宽，方向安全得多。
+      if (namedX == null || namedY == null || namedZ == null) {
+        lastFailure = "位移分量未能全部按名字识别（xa=" + (namedX != null)
+            + ", ya=" + (namedY != null) + ", za=" + (namedZ != null)
+            + "），已按解析不出处理、原包一律放行。字段形态：" + inventory;
         return UNRESOLVED;
       }
-      // 名字认全时按名字定序（不依赖 getDeclaredFields 的返回顺序这一非规范保证）；否则用展平序
-      boolean byName = namedX != null && namedY != null && namedZ != null;
-      Field deltaX = byName ? namedX : anyShort.get(0);
-      Field deltaY = byName ? namedY : anyShort.get(1);
-      Field deltaZ = byName ? namedZ : anyShort.get(2);
-      return new Access(entityId, Shape.SHORTS, Accessors.getFieldAccessor(deltaX),
-          Accessors.getFieldAccessor(deltaY), Accessors.getFieldAccessor(deltaZ), null, null, null);
+      return new Access(entityId, Shape.SHORTS, Accessors.getFieldAccessor(namedX),
+          Accessors.getFieldAccessor(namedY), Accessors.getFieldAccessor(namedZ), null, null, null);
     } catch (Throwable throwable) {
       // 解析失败只影响该类（按「解析不出」缓存）；把原因记下来供一次性告警打印，避免下次只能靠猜版本差异
       lastFailure = "解析 " + concrete.getSimpleName() + " 时抛出 " + throwable

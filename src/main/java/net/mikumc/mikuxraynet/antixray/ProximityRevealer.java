@@ -91,8 +91,9 @@ import org.bukkit.util.Vector;
  * 它会把这个坐标从显形索引里摘掉（与真实方块变更的处理相同，都是「该坐标已发回真实方块」）。
  * 磁盘缓存不受影响：条目是否可用只由负载里的原始区块字节指纹判定，与这里无关。
  * {@code proximity.batch-reveal-sends}（默认开启）时把一个周期内通过筛选的坐标累积起来、
- * 周期末一次 {@code sendMultiBlockChange} 发出（Paper 按 16³ 区块段自动合并，每个涉及的段一个包），
- * 失败时退化为逐坐标 {@code sendBlockChange}；关闭时逐坐标发单方块变更包（旧行为，供 A/B 与回退）。
+ * 周期末按 16³ 区块段分组、逐段 {@code sendMultiBlockChange} 发出（该 API 的一个包只承载一个段，
+ * 跨段调用会被整包拒绝），某段失败时该段退化为逐坐标 {@code sendBlockChange}；
+ * 关闭时逐坐标发单方块变更包（旧行为，供 A/B 与回退）。
  * 同一坐标只显形一次（<b>先写入该玩家的 {@link RevealedSet} 标记、再发包，发送失败则回滚标记</b>，
  * 理由见 {@link #markThenSend}）；区块被重新下发或被卸载时
  * 该区块的已显形标记一并失效（客户端又会看到伪装结果，必须重新显形）。单个坐标失败只记日志并跳过，
@@ -956,11 +957,11 @@ public final class ProximityRevealer implements Listener {
     // 把该坐标从<b>全服共享</b>的伪装索引里摘掉（于是其他玩家再也无法被主动显形该坐标）。
     // 与上方 revealed 标记同一条「先标记、后动作」纪律。代价：发包失败时会留下一条短寿命记号，
     // 需在下方回滚分支里撤销（否则同坐标 ≤2 秒内的真实变更会被误判为回显而漏摘索引）。
-    markOurReveal(playerId, worldName, x, y, z);
+    long echoExpiry = markOurReveal(playerId, worldName, x, y, z);
     if (send.getAsBoolean()) {
       return true;
     }
-    unmarkOurReveal(playerId, worldName, x, y, z);
+    unmarkOurReveal(playerId, worldName, x, y, z, echoExpiry);
     if (revealedSet != null) {
       // 只回滚「本次这个玩家」的标记：其它玩家此前成功收到的显形仍有效，连带摘除只会让它们重复显形
       revealedSet.removePosition(playerId, worldName, x, y, z);
@@ -973,10 +974,14 @@ public final class ProximityRevealer implements Listener {
    *
    * <p>本条不影响任何显形判定，纯粹是一枚短寿命记号：漏记只会退化为「照旧摘共享索引」（即修复前的
    * 行为），绝不产生新故障。因此任何异常都只记日志。
+   *
+   * @return 本次写入的过期时刻（纳秒），调用方必须原样交给 {@link #unmarkOurReveal} 做条件删除；
+   *         入参为空或写入异常时返回 {@code 0}——它不是合法的过期时刻（早于任何当前时刻，
+   *         即便残留也会被 {@link #consumeOurRevealEcho} 判为已过期），调用方据此跳过撤销
    */
-  private void markOurReveal(UUID playerId, String worldName, int x, int y, int z) {
+  private long markOurReveal(UUID playerId, String worldName, int x, int y, int z) {
     if (playerId == null || worldName == null) {
-      return;
+      return 0L;
     }
     try {
       ConcurrentHashMap<EchoKey, Long> perPlayer =
@@ -985,27 +990,36 @@ public final class ProximityRevealer implements Listener {
         // 上界兜底：满即整体清空（只可能少判一次回显，不影响正确性）
         perPlayer.clear();
       }
-      perPlayer.put(new EchoKey(worldName, x, y, z),
-          System.nanoTime() + REVEAL_ECHO_WINDOW_NANOS);
+      long expiry = System.nanoTime() + REVEAL_ECHO_WINDOW_NANOS;
+      perPlayer.put(new EchoKey(worldName, x, y, z), expiry);
+      return expiry;
     } catch (Throwable throwable) {
       logThrottled(throwable);
+      return 0L;
     }
   }
 
   /**
    * 撤销一条回显记号（发包失败时调用）。
    *
-   * <p>只删「完全相同的那枚记号」：若同一坐标在极短窗口内被另一条路径重新标记过（值不同），
-   * 这里不动它，避免把有效的回显保护一并抹掉。
+   * <p><b>只删「值仍是本次写入的那枚记号」</b>（{@code remove(key, value)} 条件删除）：同一坐标在极短
+   * 窗口内可能被另一条路径重新标记过——它写入的是新的过期时刻，代表一次<b>正在生效</b>的回显保护。
+   * 若这里无条件 {@code remove(key)}，就会把那枚新记号一并抹掉：该坐标随后的回显会被
+   * {@link BlockChangeRevealListener} 当成真实变更，从<b>按区块全服共享</b>的伪装索引里摘除，
+   * 此后该坐标再也不会被主动显形（该玩家与其它玩家一起漏显形，直到区块重载）。
+   * 条件删除保证「谁写的谁撤销」：值已被改写就说明有更新的有效记号，绝不越权删除。
+   *
+   * @param expiry {@link #markOurReveal} 返回的过期时刻；{@code 0} 表示当时未写入，本方法直接返回
    */
-  private void unmarkOurReveal(UUID playerId, String worldName, int x, int y, int z) {
-    if (playerId == null || worldName == null) {
+  private void unmarkOurReveal(UUID playerId, String worldName, int x, int y, int z, long expiry) {
+    if (playerId == null || worldName == null || expiry == 0L) {
       return;
     }
     try {
       ConcurrentHashMap<EchoKey, Long> perPlayer = revealEcho.get(playerId);
       if (perPlayer != null) {
-        perPlayer.remove(new EchoKey(worldName, x, y, z));
+        // 两参 remove 先比较值再删除（值为 Long，按 equals 比较）：期间已被改写则保留那枚新记号
+        perPlayer.remove(new EchoKey(worldName, x, y, z), expiry);
       }
     } catch (Throwable throwable) {
       // 撤销失败只会多留一条 ≤2 秒的记号（极小概率漏摘一次索引），不影响正确性
@@ -1085,23 +1099,28 @@ public final class ProximityRevealer implements Listener {
    * 坐标写好回显记号<b>再</b>发出（记号必须先于发包：包一离开 send* 就进了服务端发送队列，出站监听器
    * 可能在本次调用返回前就已判定，详见方法内注释）；发送失败则撤销记号并回滚「已显形」标记，
    * 返回 false（调用方随后退化为逐坐标 {@link #markThenSend}，未发出的坐标后续周期仍会重试）。
+   *
+   * <p>本方法以<b>一个 16³ 区块段</b>为一批调用（见 {@link #flushBatch} 的分组），{@code fresh} 必须
+   * 全部落在同一个段内——跨段的坐标属于另一个 {@code sendMultiBlockChange} 包，不能混进同一次发送。
    */
   boolean sendBatchOrRollback(UUID playerId, String worldName, List<int[]> positions, int[] fresh,
       java.util.function.BooleanSupplier send) {
     // 回显记号必须在发包<b>之前</b>全部写好：一次 sendMultiBlockChange 会把 N 个坐标同时推进服务端
     // 发送队列，出站监听器可能在本次调用返回前就逐坐标判完——若等发包成功后再补，批量越大越必然
     // 全部判为「真实变更」，从而把整批坐标从全服共享的伪装索引里摘掉（其他玩家再也无法主动显形）。
-    for (int index : fresh) {
-      int[] position = positions.get(index);
-      markOurReveal(playerId, worldName, position[0], position[1], position[2]);
+    long[] echoExpiries = new long[fresh.length];
+    for (int i = 0; i < fresh.length; i++) {
+      int[] position = positions.get(fresh[i]);
+      echoExpiries[i] = markOurReveal(playerId, worldName, position[0], position[1], position[2]);
     }
     if (send.getAsBoolean()) {
       return true;
     }
-    // 发包失败：撤销刚写的记号（否则 ≤2 秒内同坐标的真实变更会被误判为回显而漏摘索引）
-    for (int index : fresh) {
-      int[] position = positions.get(index);
-      unmarkOurReveal(playerId, worldName, position[0], position[1], position[2]);
+    // 发包失败：撤销刚写的记号（否则 ≤2 秒内同坐标的真实变更会被误判为回显而漏摘索引）。
+    // 按「本次写入的过期时刻」条件删除：期间被别的路径重新标记过的坐标保留那枚新记号。
+    for (int i = 0; i < fresh.length; i++) {
+      int[] position = positions.get(fresh[i]);
+      unmarkOurReveal(playerId, worldName, position[0], position[1], position[2], echoExpiries[i]);
     }
     if (revealedSet != null) {
       for (int index : fresh) {
@@ -1114,13 +1133,15 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 发出本周期累积的显形（批量模式）：优先一次 {@code Player#sendMultiBlockChange}——Paper 会按
-   * 16³ 区块段自行合并，因此「本周期 N 个坐标」通常只产生「涉及的段数」个多方块变更包。
+   * 发出本周期累积的显形（批量模式）：先按 {@code (x>>4, y>>4, z>>4)} 分成若干区块段，再逐段
+   * {@code Player#sendMultiBlockChange}——该 API 的一个包只承载一个段，跨段调用会被整包拒绝，
+   * 因此分组是发包的前提，而不是可选的优化。
    *
-   * <p>只有一个坐标时直接用 {@code sendBlockChange}（单包更小，也与旧行为一致）。
-   * 批量调用整体失败时退化为逐坐标 {@code sendBlockChange}（同一条原生通道），单个坐标失败只计数并
-   * 跳过。发包一律走「先标记、再发包、失败回滚」（见 {@link #markThenSend}）：成功发出的坐标保留标记，
-   * 未发出的坐标回滚标记，因此发包失败既不影响其它坐标、也不污染已显形索引，且失败坐标后续仍会重试。
+   * <p>只有一个坐标的组直接用 {@code sendBlockChange}（单包更小，也与旧行为一致）。
+   * 某段发送失败时只回滚该段并退化为逐坐标 {@code sendBlockChange}（同一条原生通道），其余段照常保留；
+   * 单个坐标失败只计数并跳过。发包一律走「先标记、再发包、失败回滚」（见 {@link #markThenSend}）：
+   * 成功发出的坐标保留标记，未发出的坐标回滚标记，因此发包失败既不影响其它坐标、也不污染已显形索引，
+   * 且失败坐标后续仍会重试。
    *
    * <p><b>发包前复核（恰好一次）</b>：批次在累积时仅按「候选未显形」过滤，跨路径（周期巡检与事件即时
    * 显形共用本方法）同 tick 仍可能对同一坐标各累积一次。因此发包容纳集合由 {@link #claimForSend} 在
@@ -1134,9 +1155,8 @@ public final class ProximityRevealer implements Listener {
     if (batch == null || batch.size() == 0) {
       return;
     }
-    World world = batch.world;
     UUID playerId = player.getUniqueId();
-    String worldName = world.getName();
+    String worldName = batch.world.getName();
 
     // 原子复核 + 标记：只对「本周期尚未显形、本次真正新登记」的坐标发包（见 claimForSend）。
     int[] fresh = claimForSend(playerId, worldName, batch.positions);
@@ -1152,13 +1172,59 @@ public final class ProximityRevealer implements Listener {
       return;
     }
 
-    // 「已显形」标记由 claimForSend 写好；合并包失败时 sendBatchOrRollback 会整批回滚，届时逐坐标重新「复核 + 标记」。
+    // 「已显形」标记由 claimForSend 写好；某段的合并包失败时 sendBatchOrRollback 只回滚该段的标记，
+    // 该段随后逐坐标重新「复核 + 标记」。段与段互不影响：已发成功的段不重发，失败的段不漏发。
+    for (List<Integer> section : groupBySection(batch, fresh).values()) {
+      sendSection(player, batch, playerId, worldName, section, tally, budget);
+    }
+  }
+
+  /** 冲刷批次内的 section 分组键。 */
+  private record SectionKey(int x, int y, int z) {
+  }
+
+  /**
+   * 把本批待发坐标按 16³ 区块段分组，<b>组内与组间都保持 {@code fresh} 的原有顺序</b>
+   * （{@link LinkedHashMap} 保序，组内下标按 {@code fresh} 的先后追加）。
+   *
+   * <p><b>为什么必须分组</b>：{@code Player#sendMultiBlockChange} 的一个包只承载一个区块段的坐标，
+   * 跨段调用会被整包拒绝。若把整批坐标塞进一次调用，只要本周期跨了两个段（现实中几乎必然），
+   * 整批就会失败并退化成逐坐标单发——功能不丢，但包数与 CPU 随显形数线性暴涨，且没有单独的观测点。
+   */
+  private static Map<SectionKey, List<Integer>> groupBySection(RevealBatch batch, int[] fresh) {
+    Map<SectionKey, List<Integer>> sections = new LinkedHashMap<>();
+    for (int index : fresh) {
+      int[] position = batch.positions.get(index);
+      SectionKey key = new SectionKey(position[0] >> 4, position[1] >> 4, position[2] >> 4);
+      sections.computeIfAbsent(key, ignored -> new ArrayList<>(2)).add(index);
+    }
+    return sections;
+  }
+
+  /**
+   * 发出同一 16³ 区块段内的一组显形坐标（见 {@link #flushBatch} 的分组说明）。
+   *
+   * <p>组内多于一个坐标时走一次 {@link #sendBatchOrRollback}（先写回显记号 → 发包 → 失败整组回滚）；
+   * 只有一个坐标、或合并包构建失败时走逐坐标单发包。两条路径都保持「先标记、后发包、失败回滚」，
+   * 且同一个坐标只会被其中一条路径发出：合并成功即返回，失败组的标记已整组回滚，随后由
+   * {@link #markThenSend} 重新复核后单发——既不重复发包，也不漏发包。
+   */
+  private void sendSection(Player player, RevealBatch batch, UUID playerId, String worldName,
+      List<Integer> group, PassTally tally, Budget budget) {
+    // 「已显形」标记由 claimForSend 写好；本段合并包失败时 sendBatchOrRollback 只回滚本段的标记，
+    // 届时逐坐标重新「复核 + 标记」（见下方 else 分支）。
     boolean revealedMarksWritten = true;
-    if (fresh.length > 1) {
+    if (group.size() > 1) {
+      // 下标数组只在真的要发合并包时才分配：稀疏显形的常态是每段一个坐标，那种情况走下面的单包路径。
+      int[] indexes = new int[group.size()];
+      int slot = 0;
+      for (int index : group) {
+        indexes[slot++] = index;
+      }
       Map<Position, BlockData> changes;
       try {
-        changes = new LinkedHashMap<>(fresh.length * 2);
-        for (int index : fresh) {
+        changes = new LinkedHashMap<>(indexes.length * 2);
+        for (int index : indexes) {
           int[] position = batch.positions.get(index);
           changes.put(Position.block(position[0], position[1], position[2]),
               batch.states.get(index));
@@ -1169,7 +1235,7 @@ public final class ProximityRevealer implements Listener {
       }
       if (changes != null) {
         Map<Position, BlockData> payload = changes;
-        boolean sent = sendBatchOrRollback(playerId, worldName, batch.positions, fresh, () -> {
+        boolean sent = sendBatchOrRollback(playerId, worldName, batch.positions, indexes, () -> {
           try {
             player.sendMultiBlockChange(payload);
             return true;
@@ -1180,37 +1246,35 @@ public final class ProximityRevealer implements Listener {
           }
         });
         if (sent) {
-          for (int i = 0; i < fresh.length; i++) {
-            stats.revealsSent.increment();
-            tally.sent++;
-          }
+          stats.revealsSent.add(indexes.length);
+          tally.sent += indexes.length;
           return;
         }
-        revealedMarksWritten = false; // 合并包未发出 → 本批「已显形」标记已整批回滚
+        revealedMarksWritten = false; // 本段合并包未发出 → 本段「已显形」标记已整段回滚
       }
-      // changes 构建失败：「已显形」标记仍在（revealedMarksWritten 保持 true），落到下面的逐坐标单包
+      // changes 构建失败：本段「已显形」标记仍在（revealedMarksWritten 保持 true），落到下面的逐坐标单包
     }
 
-    for (int index : fresh) {
+    for (int index : group) {
       int[] position = batch.positions.get(index);
       BlockData state = batch.states.get(index);
       boolean sent;
       if (revealedMarksWritten) {
         // 「已显形」标记已在 claimForSend 写好。回显记号同样必须先于发包（理由见 sendBatchOrRollback）：
         // 包一离开 sendSingle 就进了服务端发送队列，出站监听器可能在本方法返回前就已判定。
-        markOurReveal(playerId, worldName, position[0], position[1], position[2]);
-        sent = sendSingle(player, world, position[0], position[1], position[2], state);
+        long echoExpiry = markOurReveal(playerId, worldName, position[0], position[1], position[2]);
+        sent = sendSingle(player, batch.world, position[0], position[1], position[2], state);
         if (!sent) {
-          unmarkOurReveal(playerId, worldName, position[0], position[1], position[2]);
+          unmarkOurReveal(playerId, worldName, position[0], position[1], position[2], echoExpiry);
           if (revealedSet != null) {
             // 只回滚本玩家的标记（同 markThenSend），避免连带作废其它玩家的有效显形
             revealedSet.removePosition(playerId, worldName, position[0], position[1], position[2]);
           }
         }
       } else {
-        // 合并包已回滚本批标记：逐坐标重新走「先复核 + 标记、再发包、失败回滚」（见 markThenSend）
+        // 合并包已回滚本段标记：逐坐标重新走「先复核 + 标记、再发包、失败回滚」（见 markThenSend）
         sent = markThenSend(playerId, worldName, position[0], position[1], position[2],
-            () -> sendSingle(player, world, position[0], position[1], position[2], state));
+            () -> sendSingle(player, batch.world, position[0], position[1], position[2], state));
       }
       if (!sent) {
         stats.revealsSkipped.increment();

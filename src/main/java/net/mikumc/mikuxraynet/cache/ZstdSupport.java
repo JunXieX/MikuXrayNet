@@ -8,6 +8,7 @@ import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -43,7 +44,7 @@ import java.util.logging.Logger;
  *   <li><b>运行期已有</b>（服务端自带：类路径可见，探测时做一次最小压缩往返）；</li>
  *   <li>{@code plugins/MikuXrayNet/lib/} 下**已下载**的 jar（{@link URLClassLoader} 加载）；</li>
  *   <li>按配置**自动下载**（默认 Maven Central；优先平台专用包约 0.4 MB，失败再退全平台包约 6.2 MB；
- *       连接/读取/总等待三重超时，默认 10 秒）；</li>
+ *       连接 5 秒 / 读取 15 秒 / 总等待不超过 30 秒，配置值更小时以配置为准）；</li>
  *   <li>都不行 → 由 {@link BufferedLinearV3Format} 回退 JDK {@code Deflater}（磁盘缓存仍可用）。</li>
  * </ol>
  * 任一环节失败都只记中文日志并降级，<b>绝不抛异常、绝不阻塞超过超时</b>（fail-open）。
@@ -74,6 +75,33 @@ public final class ZstdSupport {
 
   /** 下载线程收尾预算（毫秒）：interrupt 后通常立即结束，这里只是给「删临时文件」留出确定性窗口。 */
   private static final long DOWNLOAD_THREAD_JOIN_MILLIS = 2_000L;
+
+  /**
+   * 单次下载尝试的<b>连接</b>超时上限（毫秒）：5 秒。
+   *
+   * <p><b>为什么不能直接用剩余总预算</b>：出口对下载源 DROP（丢包但不回 RST）时，{@code connect}
+   * 会一直挂到超时为止。旧实现把「剩余总预算」（配置允许到 120 秒）直接当连接超时用，于是开服会在
+   * {@code onEnable} 上白等两分钟（真机反馈约 122 秒）。建连只是下载的第一步，不该占用整段预算。
+   */
+  private static final int CONNECT_TIMEOUT_MILLIS = 5_000;
+
+  /**
+   * 单次下载尝试的<b>读取</b>超时上限（毫秒）：15 秒。
+   *
+   * <p>与连接超时同理：连上了却收不到数据（假响应、半开连接）也必须有时限。15 秒足够慢速镜像传完
+   * 约 0.4 MB 的平台包，剩下的预算还能留给 6.2 MB 的全平台包兜底。
+   */
+  private static final int READ_TIMEOUT_MILLIS = 15_000;
+
+  /**
+   * 下载的<b>总等待</b>硬上限（毫秒）：30 秒。
+   *
+   * <p><b>为什么必须有</b>：该下载发生在 {@code onEnable} 的主线程上，而配置允许把
+   * {@code disk-cache.zstd.timeout-seconds} 配到 120 秒，且平台包失败后还要再试一次全平台包。
+   * 统一封顶 30 秒，保证「最坏情况开服也只被拖住半分钟」。线程收尾另有
+   * {@link #DOWNLOAD_THREAD_JOIN_MILLIS}（interrupt 后通常立即结束）。
+   */
+  private static final long DOWNLOAD_TOTAL_BUDGET_MILLIS = 30_000L;
 
   /** zstd 来源（仅用于日志）。 */
   public enum Source {
@@ -107,10 +135,20 @@ public final class ZstdSupport {
   private static volatile Codec codec;
   /** 类路径探测是否已完成（只做一次）。 */
   private static volatile boolean probed;
-  /** {@link #initialize} 是否已执行（幂等：重复调用直接返回，不再下载/不再提示）。 */
+  /**
+   * {@link #initialize} 是否已<b>成功</b>解析出可用 zstd（幂等：成功后重复调用直接返回，不再下载/不再提示）。
+   *
+   * <p>只许在成功路径上置位：初始化失败必须保持 false，否则本次进程内再也不会重试（旧实现即如此）。
+   */
   private static volatile boolean initialized;
   /** 「自动下载未做完整性校验」的 WARN 只打一次。 */
   private static final AtomicBoolean UNVERIFIED_WARNING = new AtomicBoolean();
+  /** 「下载文件 SHA-256 不符」的 WARN 只打一次（初始化失败后可重试，重试不得刷屏）。 */
+  private static final AtomicBoolean HASH_MISMATCH_WARNING = new AtomicBoolean();
+  /** 「自动下载失败」的 WARN 只打一次（同上）。 */
+  private static final AtomicBoolean DOWNLOAD_FAILURE_WARNING = new AtomicBoolean();
+  /** 「未启用自动下载」的 WARN 只打一次（同上）。 */
+  private static final AtomicBoolean AUTODOWNLOAD_DISABLED_WARNING = new AtomicBoolean();
   /** 当前来源。 */
   private static volatile Source source = Source.NONE;
   /** 最后一次失败原因（诊断用，只出现在日志里）。 */
@@ -382,7 +420,10 @@ public final class ZstdSupport {
    * <p>成功后 {@link #available()} 恒为 true；失败则保持 false（由 {@link BufferedLinearV3Format}
    * 回退 Deflater）。**本方法不抛异常**，失败只记中文日志。
    *
-   * <p><b>幂等</b>：本方法在一次进程生命周期内只生效一次；重复调用直接返回，不再下载、不再打印任何提示。
+   * <p><b>幂等只在成功后成立</b>：真正解析出可用的 zstd 之后，重复调用直接返回，不再下载、不再打印任何提示；
+   * 解析失败（服务端没有、本地没有、下载也没成）时保持「未初始化」，下一次调用（例如重载配置后）仍会再试一次——
+   * 旧实现在<b>开始前</b>就置位「已初始化」，一次失败即被判为「已经做过」，本次进程内永不重试。
+   * 为避免重试把日志刷满，各失败结论的 WARN 由各自的闸门保证只打一次。
    *
    * @param libraryDir     本插件的 lib 目录（{@code plugins/MikuXrayNet/lib}），可为 null（则跳过②③）
    * @param autoDownload   是否允许自动下载
@@ -405,12 +446,18 @@ public final class ZstdSupport {
    */
   public static void initialize(Path libraryDir, boolean autoDownload, String downloadUrl,
       String expectedSha256, int timeoutSeconds, Logger logger) {
-    // 幂等：启动期只解析一次；重复调用不再下载、不再打印任何提示（避免重复日志与重复网络请求）
+    // 幂等：只在成功解析出可用 zstd 之后才置位（见下方各成功分支）；失败保持未初始化，
+    // 下一次调用（例如重载配置后）还能再试一次——旧实现在开始前就置位，一次失败即永不重试。
     synchronized (LOCK) {
       if (initialized) {
         return;
       }
-      initialized = true;
+    }
+
+    if (libraryDir != null) {
+      // 上次在下载途中退出（强杀 / 落盘时文件仍被占用）会留下 <jar>.tmp：它永远不会被认作成品，
+      // 这里在启动初始化时顺手清掉，避免长年占着磁盘。服务端自带 zstd 时也清，因为残留与来源无关。
+      cleanResidualTempFiles(libraryDir);
     }
 
     codec(); // ① 运行期已有（服务端自带）
@@ -418,6 +465,7 @@ public final class ZstdSupport {
       // 正常就绪（成功路径）降为 FINE：开服日志只保留插件「已启用」一行；
       // 下方所有「未启用自动下载 / 校验未通过 / 下载失败」等异常路径仍为 WARNING。
       logger.fine(detectionLine() + "；来源=" + source.label());
+      initialized = true;
       return;
     }
 
@@ -434,6 +482,7 @@ public final class ZstdSupport {
           String used = i == 0 && classifier != null ? classifier : null;
           logger.fine(detectionLine() + "；来源=" + source.label() + "（"
               + artifactDetail(used, sizeOf(candidate)) + "）");
+          initialized = true;
           return;
         }
       }
@@ -442,10 +491,13 @@ public final class ZstdSupport {
     // ③ 自动下载（默认开启）
     if (autoDownload) {
       boolean verify = expectedSha256 != null && !expectedSha256.isBlank();
-      if (!verify && UNVERIFIED_WARNING.compareAndSet(false, true)) {
-        // 供应链面：未提供期望哈希时无法做完整性校验，至少要一次性明确告知（不静默）
-        logger.warning(detectionLine() + "；自动下载未配置期望 SHA-256（disk-cache.zstd-sha256 为空），"
-            + "本次下载仅校验「可加载性」，未做完整性校验；如需校验请把下面打印的实际 SHA-256 填回配置");
+      if (!verify) {
+        // 供应链面：未提供期望哈希时无法做完整性校验，至少要一次性明确告知（不静默）。
+        // 提示里点名「INFO 级」的那一行：默认日志级别下服主只看得到 WARNING，必须告诉他去哪里取实际值。
+        warnOnce(UNVERIFIED_WARNING, logger, detectionLine()
+            + "；自动下载未配置期望 SHA-256（disk-cache.zstd-sha256 为空），"
+            + "本次下载仅校验「可加载性」，未做完整性校验；下载成功后会以 INFO 打印该文件的实际 SHA-256，"
+            + "复制后填回 disk-cache.zstd-sha256 即可启用校验");
       }
       Codec downloaded = downloadCodec(libraryDir, downloadUrl, expectedSha256, timeoutSeconds);
       if (downloaded != null) {
@@ -454,26 +506,31 @@ public final class ZstdSupport {
         if (verify) {
           logger.fine("ZSTD 前置：下载文件已通过 SHA-256 校验（" + lastDownloadedSha256 + "）");
         } else if (!lastDownloadedSha256.isEmpty()) {
-          // 未配置期望哈希：把实际值一次性打印出来，供服主复制填入 disk-cache.zstd-sha256（幂等，不会重复）
-          logger.fine("ZSTD 前置：已计算实际 SHA-256：" + lastDownloadedSha256
-              + "，可填入 disk-cache.zstd-sha256 以启用校验");
+          // 未配置期望哈希：把实际值一次性打印出来，供服主复制填入 disk-cache.zstd-sha256。
+          // 用 INFO 而不是 FINE：默认日志级别下 FINE 根本不可见，而这条正是「怎么把校验配上」的唯一指引；
+          // 成功即置位 initialized，因此整个进程内只会打印一次。
+          logger.info("ZSTD 前置：本次下载文件的实际 SHA-256：" + lastDownloadedSha256
+              + "，填入 disk-cache.zstd-sha256 即可在下次启动时启用完整性校验");
         }
+        initialized = true;
         return;
       }
       if (verify && hashMismatchDetected) {
         // 下载成功但摘要不符：该 jar 已被拒绝（未落盘），回退内置压缩（fail-open）
-        logger.warning(detectionLine() + "；自动下载的 jar SHA-256 校验未通过，已拒绝使用该文件"
+        warnOnce(HASH_MISMATCH_WARNING, logger, detectionLine()
+            + "；自动下载的 jar SHA-256 校验未通过，已拒绝使用该文件"
             + "（期望 " + expectedSha256.trim() + "，实际 "
             + (lastDownloadedSha256.isEmpty() ? "无" : lastDownloadedSha256)
             + "），已回退内置压缩（磁盘缓存仍可用，压缩率略低）");
         return;
       }
-      logger.warning(detectionLine() + "；自动下载失败，已回退内置压缩（磁盘缓存仍可用，压缩率略低）"
+      warnOnce(DOWNLOAD_FAILURE_WARNING, logger, detectionLine()
+          + "；自动下载失败，已回退内置压缩（磁盘缓存仍可用，压缩率略低）"
           + (lastError.isEmpty() ? "" : "（原因：" + lastError + "）"));
       return;
     }
 
-    logger.warning(detectionLine()
+    warnOnce(AUTODOWNLOAD_DISABLED_WARNING, logger, detectionLine()
         + "；未启用自动下载，已回退内置压缩（磁盘缓存仍可用，压缩率略低）");
   }
 
@@ -565,7 +622,8 @@ public final class ZstdSupport {
    * 按配置下载 zstd-jni 到 {@code libraryDir} 并加载。
    *
    * <p>先试**平台专用包**（约 0.4 MB），失败再试**全平台包**（约 6.2 MB）；两次尝试共享同一个
-   * 总等待预算（{@code timeoutSeconds}），因此最坏等待时间仍不会超过该值。
+   * 总等待预算 = {@code min(timeoutSeconds, 30 秒)}，因此最坏等待时间不会超过该值——即便配置把
+   * {@code disk-cache.zstd.timeout-seconds} 写到 120 秒，开服也不会被下载拖过 30 秒。
    *
    * <p>每次尝试都校验两级：① 落盘文件必须非空；② 必须能被加载并完成一次压缩往返（否则删除该文件，
    * 避免下次启动误用坏文件）。任一失败返回 {@code null}，**不抛异常**。
@@ -584,8 +642,11 @@ public final class ZstdSupport {
     if (libraryDir == null) {
       return null;
     }
-    long deadlineNanos =
-        System.nanoTime() + TimeUnit.SECONDS.toNanos(Math.max(1, timeoutSeconds));
+    // 总预算 = min(配置值, 硬上限)：配置允许到 120 秒，但这段等待发生在 onEnable 主线程上，
+    // 故统一封顶 30 秒（见 DOWNLOAD_TOTAL_BUDGET_MILLIS）。
+    long budgetMillis = Math.min(DOWNLOAD_TOTAL_BUDGET_MILLIS,
+        TimeUnit.SECONDS.toMillis(Math.max(1, timeoutSeconds)));
+    long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMillis);
     downloadedClassifier = "";
     downloadedBytes = 0L;
     lastDownloadedSha256 = "";
@@ -593,7 +654,11 @@ public final class ZstdSupport {
     for (String attempt : downloadClassifiers(platformClassifier())) {
       long remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
       if (remainingMillis <= 0L) {
-        lastError = "下载总等待已用尽（" + Math.max(1, timeoutSeconds) + "s）";
+        // 预算耗尽即失败，但**保留上一次尝试的真实原因**（连接被拒 / 404 / 读取超时…）：
+        // 用「预算不足」覆盖它会让服主以为只是配得太小，而真正要排查的是那个原因。
+        if (lastError.isEmpty()) {
+          lastError = "下载总等待已用尽（" + budgetMillis + "ms）";
+        }
         return null;
       }
       Codec found = downloadOnce(libraryDir, baseUrl, attempt, expectedSha256, remainingMillis);
@@ -637,7 +702,7 @@ public final class ZstdSupport {
       Files.createDirectories(libraryDir);
       // 流式下载：返回下载内容的实际 SHA-256（未配置期望哈希时也由 initialize 打印，供服主复制）
       String actual = download(downloadUrl(baseUrl, GROUP, ARTIFACT, VERSION, classifier), temp,
-          (int) Math.min(Integer.MAX_VALUE, Math.max(1L, timeoutMillis)));
+          timeoutMillis);
       lastDownloadedSha256 = actual;
       if (!Files.isRegularFile(temp) || Files.size(temp) <= 0L) {
         lastError = "下载文件为空";
@@ -676,8 +741,13 @@ public final class ZstdSupport {
   }
 
   /**
-   * 下载到临时文件：在守护线程上执行并以 {@code timeoutMillis} 为**总等待上限**
-   * （连接超时 / 读取超时也各自设为该值），保证调用方等待时间有硬上限。
+   * 下载到临时文件：在守护线程上执行，并以 {@code budgetMillis} 为**总等待上限**；
+   * 连接与读取各自再设上限（{@link #CONNECT_TIMEOUT_MILLIS} / {@link #READ_TIMEOUT_MILLIS}），
+   * 且都不得超过剩余预算。三者叠起来保证调用方的等待时间有硬上限。
+   *
+   * <p><b>为什么连接超时要单独收窄</b>：出口把下载源 DROP 掉时，建连会一直挂到超时；若直接用剩余预算
+   * （最长 30 秒）当连接超时，两次候选就会把整个预算耗在「连不上」上。5 秒足够建起一次正常连接，
+   * 也足够快地判定「这条路不通」，把剩余预算留给下一个候选。
    *
    * <p><b>流式校验 + 体积上限</b>：边下载边计算 SHA-256、边累计字节数——① 一旦累计超过
    * {@link #MAX_DOWNLOAD_BYTES} 立即中止（在写满磁盘/耗尽带宽之前拒绝超大或异常响应）；
@@ -686,7 +756,9 @@ public final class ZstdSupport {
    *
    * @return 下载内容的 SHA-256 十六进制小写摘要
    */
-  private static String download(String url, Path target, int timeoutMillis) throws IOException {
+  private static String download(String url, Path target, long budgetMillis) throws IOException {
+    int connectTimeoutMillis = (int) Math.max(1L, Math.min(CONNECT_TIMEOUT_MILLIS, budgetMillis));
+    int readTimeoutMillis = (int) Math.max(1L, Math.min(READ_TIMEOUT_MILLIS, budgetMillis));
     ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
       Thread thread = new Thread(runnable, "MikuXrayNet-ZstdDownload");
       thread.setDaemon(true);
@@ -696,8 +768,8 @@ public final class ZstdSupport {
       Callable<String> task = () -> {
         HttpURLConnection connection =
             (HttpURLConnection) URI.create(url).toURL().openConnection();
-        connection.setConnectTimeout(timeoutMillis);
-        connection.setReadTimeout(timeoutMillis);
+        connection.setConnectTimeout(connectTimeoutMillis);
+        connection.setReadTimeout(readTimeoutMillis);
         connection.setInstanceFollowRedirects(true);
         connection.setRequestProperty("User-Agent", "MikuXrayNet");
         MessageDigest digest;
@@ -729,9 +801,11 @@ public final class ZstdSupport {
         return HexFormat.of().formatHex(digest.digest());
       };
       Future<String> future = executor.submit(task);
-      return future.get(timeoutMillis, TimeUnit.MILLISECONDS);
+      return future.get(budgetMillis, TimeUnit.MILLISECONDS);
     } catch (TimeoutException exception) {
-      throw new IOException("下载超时（" + timeoutMillis + "ms）：" + url, exception);
+      // 三个数都写进失败原因：只报「超时」无法区分「连不上」与「连上收不完」，排查时会误导
+      throw new IOException("下载超时（总等待 " + budgetMillis + "ms，连接 " + connectTimeoutMillis
+          + "ms，读取 " + readTimeoutMillis + "ms）：" + url, exception);
     } catch (ExecutionException exception) {
       Throwable cause = exception.getCause() == null ? exception : exception.getCause();
       throw new IOException("下载失败：" + cause, cause);
@@ -791,12 +865,47 @@ public final class ZstdSupport {
       lastDownloadedSha256 = "";
       hashMismatchDetected = false;
       UNVERIFIED_WARNING.set(false);
+      HASH_MISMATCH_WARNING.set(false);
+      DOWNLOAD_FAILURE_WARNING.set(false);
+      AUTODOWNLOAD_DISABLED_WARNING.set(false);
     }
   }
 
   /** <b>仅测试用</b>：最近一次下载落盘文件的实际 SHA-256（十六进制小写）；无下载时为空串。 */
   static String lastDownloadedSha256() {
     return lastDownloadedSha256;
+  }
+
+  /**
+   * 清理本插件 lib 目录里残留的 {@code *.jar.tmp}。
+   *
+   * <p><b>为什么需要</b>：下载总是先写 {@code <jar>.tmp} 再原子替换，进程在下载途中被强杀（或收尾时
+   * 文件仍被占用）就会把这个临时文件留在目录里；它永远不会被认作成品，只会一直占着磁盘。
+   *
+   * <p><b>为什么收得这么窄</b>：只扫 {@code libraryDir} 的<b>当层</b>（不递归）、只认
+   * {@code *.jar.tmp} 后缀、只删常规文件——lib 目录里同时可能有服主自己放进去的 jar，绝不碰它们。
+   * 任何异常（目录不存在、无权限）都只当清理失败：那是收尾动作，不能影响 zstd 解析主流程（fail-open）。
+   */
+  private static void cleanResidualTempFiles(Path libraryDir) {
+    try (DirectoryStream<Path> leftovers = Files.newDirectoryStream(libraryDir, "*.jar.tmp")) {
+      for (Path leftover : leftovers) {
+        if (Files.isRegularFile(leftover)) {
+          deleteQuietly(leftover);
+        }
+      }
+    } catch (Throwable ignored) {
+      // 目录不存在 / 列举失败：下次启动还会再清，不影响本次解析
+    }
+  }
+
+  /**
+   * 一次性 WARN：初始化失败后不再置位 {@code initialized}（下次可重试），若每次重试都把同一段提示重打一遍，
+   * 日志会被刷满却提供不了新信息。因此每个结论各配一个闸门，只在该结论首次出现时打印。
+   */
+  private static void warnOnce(AtomicBoolean gate, Logger logger, String message) {
+    if (gate.compareAndSet(false, true)) {
+      logger.warning(message);
+    }
   }
 
   private static void closeQuietly(URLClassLoader loader) {

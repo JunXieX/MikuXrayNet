@@ -41,6 +41,11 @@ final class RegionFile implements AutoCloseable {
   private static final AtomicBoolean LOCK_WARNING = new AtomicBoolean();
 
   /**
+   * 「锁被同一 JVM 内的旧实例持有」的 WARN 只打一次（与 {@link #LOCK_WARNING} 分开，两种成因各自只提示一次）。
+   */
+  private static final AtomicBoolean SELF_HELD_WARNING = new AtomicBoolean();
+
+  /**
    * 「压缩预算不足、本次压缩已跳过」的 WARN 只打一次。
    *
    * <p>该状态会随每轮维护复现（垃圾占比仍在阈值以上，文件仍被选中），逐轮打印会把日志刷满；
@@ -168,14 +173,16 @@ final class RegionFile implements AutoCloseable {
   /**
    * 跨进程排他锁：持有强引用以防 {@link FileLock} 被 GC 而提前释放；
    * 通道关闭（close / compact 替换文件）时由 JVM 自动释放，故不做显式 release。
-   * 「同 JVM 自持」时不重复持锁，保持 {@code null}（见 {@link #acquireLock(java.nio.channels.FileChannel)}）。
+   * 本实例对该文件不可用（含同一 JVM 内旧实例仍持锁）时不持锁，保持 {@code null}
+   * （见 {@link #acquireLock(java.nio.channels.FileChannel)}）。
    */
   private FileLock lock;
   /**
-   * 跨进程锁被其它进程占用（{@code tryLock} 返回 null 或抛异常）时置 true：本实例对该文件
-   * <b>读写全部停用</b>——读一律视为未命中、写一律跳过，只打一次性中文 WARN。
-   * <p>这是「两个服务端实例共享同一缓存目录」这一误配下的正确行为：既然锁不在本进程手里，
-   * 就不能再读写该文件，否则两个实例会互相踩（旧行为是「只 WARN 后照常读写」）。
+   * 取不到跨进程锁（{@code tryLock} 返回 null、抛异常，或同一 JVM 内已有旧实例持锁）时置 true：
+   * 本实例对该文件<b>读写全部停用</b>——读一律视为未命中、写一律跳过，只打一次性中文 WARN。
+   * <p>这是「两个实例共用同一缓存目录」下的正确行为：既然锁不在本实例手里，就不能再读写该文件，
+   * 否则两个实例会互相踩（旧行为是「只 WARN 后照常读写」）。同一 JVM 内的重叠（{@code /reload} 时
+   * 旧实例尚未收工）尤其危险：新旧两个实例会同时往同一区域文件追加记录，交错即写出半截记录。
    *
    * <p><b>为什么必须 volatile</b>：<b>写</b>发生在压缩线程的 {@link #reopenChannel()}（压缩换文件后重开
    * 通道、重新取锁），<b>读</b>发生在磁盘线程的各入口（{@link #get}/{@link #put}/{@link #clear} 等），
@@ -210,49 +217,72 @@ final class RegionFile implements AutoCloseable {
     this.lockUnavailable = lockUnavailable;
   }
 
-  /** 取锁结果：{@code lock} 为取得的锁（自持或占用时为 {@code null}）；{@code occupied} = 被其它进程占用。 */
-  private record LockHold(FileLock lock, boolean occupied) {
+  /**
+   * 取锁结果：{@code lock} 为取得的锁（不可用时为 {@code null}）；{@code occupied} = 本实例对该文件不可用；
+   * {@code sameJvm} = 不可用的成因是「同一 JVM 内仍有旧实例持锁」（仅用于挑选用哪条一次性提示）。
+   */
+  private record LockHold(FileLock lock, boolean occupied, boolean sameJvm) {
   }
 
   /**
    * 尝试取跨进程排他文件锁，并把结果归为两类（<b>必须在读取文件内容之前调用</b>）。
    *
-   * <p><b>被占用（{@code occupied=true}）就停用本实例的读写</b>（见 {@link #lockUnavailable}），而不是旧
-   * 行为的「只 WARN 后照常读写」：「两个服务端实例共享同一缓存目录」时，锁在对方手里说明该文件此刻归
-   * 对方所有，本实例再去读写只会与对方互相踩。停用后读退化为未命中、写被跳过，交给上层回退重算，功能
-   * 毫发无损（fail-open）。
+   * <p><b>取不到锁（{@code occupied=true}）就停用本实例的读写</b>（见 {@link #lockUnavailable}），而不是
+   * 旧行为的「只 WARN 后照常读写」：锁在对方手里说明该文件此刻归对方所有，本实例再去读写只会与对方
+   * 互相踩。停用后读退化为未命中、写被跳过，交给上层回退重算，功能毫发无损（fail-open）。
    *
-   * <p><b>关键例外——同 JVM 自持</b>：{@code tryLock()} 抛 {@link OverlappingFileLockException} 表示锁
-   * 被<b>本 JVM 的另一个句柄</b>持有（reload / 重开时旧句柄尚未关闭，或并发开同一文件），这不是「另一个
-   * 服务端实例」。此时按<b>可用</b>处理且本实例不重复持锁，否则会把本进程自己的磁盘缓存永久停用。
-   * 判定依据：{@code FileLock} 的重叠检测在同一 JVM 内以文件为键，抛此异常即证明锁属于本进程；
-   * 跨进程占用只会让 {@code tryLock()} 返回 {@code null}。
+   * <p><b>同一 JVM 内的重叠同样按不可用处理</b>：{@code tryLock()} 抛
+   * {@link OverlappingFileLockException} 表示锁被<b>本 JVM 的另一个句柄</b>持有——典型是 {@code /reload}
+   * 之后旧实例还没收工，或并发打开同一文件。它虽然不是「另一个服务端实例」，但同样意味着<b>此刻有人
+   * 正在写这个区域文件</b>；若照旧按「可用」放行，新旧两个实例就会同时往同一个文件追加记录，交错时写出
+   * 半截记录（bucket 整块追加，交错的写入无法解析），整份缓存随之不可读。因此这里与「被其它进程占用」
+   * 走<b>同一条降级路径</b>（读未命中、写跳过），区别只在于一次性的提示文案
+   * （见 {@link #warnLockUnavailableOnce(boolean)}）：旧实例退出后重启即可恢复。
+   *
+   * <p>判定依据：{@code FileLock} 的重叠检测在同一 JVM 内以文件为键，抛此异常即证明锁属于本进程的另一个
+   * 句柄；跨进程占用只会让 {@code tryLock()} 返回 {@code null}（或抛其它异常）。
    */
   private static LockHold acquireLock(FileChannel channel) {
     Boolean override = lockOutcomeOverrideForTest;
     if (override != null) {
       // 测试注入（见 lockOutcomeOverrideForTest）：只替换「判定」，读写降级逻辑仍是生产代码
-      return new LockHold(null, !override); // true = 按自持（可用）；false = 按占用（停用）
+      return new LockHold(null, !override, false); // true = 按可用；false = 按不可用（停用）
     }
     try {
       FileLock acquired = channel.tryLock();
-      return new LockHold(acquired, acquired == null);
+      return new LockHold(acquired, acquired == null, false);
     } catch (Throwable throwable) {
-      return new LockHold(null, !isSelfHeld(throwable));
+      // 任何取锁异常都按「本实例对该文件不可用」：重叠异常只是其中一种成因，绝不能因此放行写入
+      return new LockHold(null, true, isSelfHeld(throwable));
     }
   }
 
   /**
-   * 同 JVM 自持判定：只有 {@link OverlappingFileLockException} 表示锁被<b>本 JVM 的其它句柄</b>持有
+   * 重叠判定：只有 {@link OverlappingFileLockException} 表示锁被<b>本 JVM 的其它句柄</b>持有
    * （{@code FileLock} 的重叠检测在同一 JVM 内以文件为键）；跨进程占用则表现为 {@code tryLock()} 返回
    * {@code null}。此处单独成函数以便回归测试直接断言该映射。
+   *
+   * <p><b>只用于挑提示文案</b>：两种情形都已按「本实例对该文件不可用」处理（见
+   * {@link #acquireLock(FileChannel)}），本方法不再影响「可用/不可用」的判定结果。
    */
   static boolean isSelfHeld(Throwable throwable) {
     return throwable instanceof OverlappingFileLockException;
   }
 
-  /** 锁不可用的中文 WARN 只打一次（多文件被占用时不刷屏）。 */
-  private static void warnLockUnavailableOnce() {
+  /**
+   * 锁不可用的中文 WARN 只打一次（多文件被占用时不刷屏）；两种成因各自独立计一次，互不遮蔽。
+   *
+   * @param sameJvm 锁被同一 JVM 内的其它句柄持有（{@code /reload} 时旧实例未退出）
+   */
+  private static void warnLockUnavailableOnce(boolean sameJvm) {
+    if (sameJvm) {
+      if (SELF_HELD_WARNING.compareAndSet(false, true)) {
+        LOGGER.warning("磁盘缓存区域文件仍被同一 JVM 内的旧实例持锁（上一次 /reload 的旧实例尚未退出），"
+            + "本实例对它的磁盘缓存已停用（读视为未命中、写被跳过，功能不受影响）；"
+            + "两个实例同时写同一文件会写出半截记录，因此停用是刻意为之，旧实例退出后重启即可恢复");
+      }
+      return;
+    }
     if (LOCK_WARNING.compareAndSet(false, true)) {
       LOGGER.warning("磁盘缓存区域文件已被其它进程占用，本实例对它的磁盘缓存已停用"
           + "（读视为未命中、写被跳过，功能不受影响）；请勿让两个服务端实例共享同一缓存目录");
@@ -297,7 +327,7 @@ final class RegionFile implements AutoCloseable {
     //（实测「另一个程序已锁定文件的一部分」）；若先读头，open 会失败而不是优雅停用。
     LockHold hold = acquireLock(channel);
     if (hold.occupied()) {
-      warnLockUnavailableOnce();
+      warnLockUnavailableOnce(hold.sameJvm());
       // 停用态：不读头、不建索引，返回一个只在内存里的「空壳」句柄——后续 get 一律未命中、
       // put/flush/compact 一律跳过（见各方法开头的判定），功能不受影响（fail-open）。
       return new RegionFile(path, channel, BufferedLinearV3Format.DEFAULT_HASH_SEED,
@@ -806,6 +836,11 @@ final class RegionFile implements AutoCloseable {
     }
 
     byte[] raw = BufferedLinearV3Format.encodeBucket(slots[bucket], hashSeed);
+    if (raw == null) {
+      // 该桶里有负载超过 MAX_PAYLOAD_SIZE 的条目：读侧必然把它判成损坏（槽位当空），写出去只是白占空间。
+      // 直接按「本次未能落盘」返回 false，由调用方保留脏标记、下次再试（调用方会拒写这类负载，正常不触发）。
+      return false;
+    }
     // 必须按本文件头部声明的方案压缩（不能用全局 currentCompression）：否则头与数据错配、读回整桶丢失
     byte[] compressed = BufferedLinearV3Format.compress(raw, compression);
     ByteBuffer buffer = ByteBuffer.allocate(8 + compressed.length);
@@ -892,6 +927,11 @@ final class RegionFile implements AutoCloseable {
             continue;
           }
           byte[] raw = BufferedLinearV3Format.encodeBucket(all[bucket], hashSeed);
+          if (raw == null) {
+            // 该桶含超限负载（读侧本就判损坏）：压缩时直接丢弃，别把它搬进新文件继续占位
+            dropped++;
+            continue;
+          }
           // 与 flushBucket 同口径：按本文件声明的方案压缩，压缩回收不改变文件的压缩方案
           byte[] compressed = BufferedLinearV3Format.compress(raw, compression);
           ByteBuffer buffer = ByteBuffer.allocate(8 + compressed.length);
@@ -1105,9 +1145,9 @@ final class RegionFile implements AutoCloseable {
     LockHold hold = acquireLock(channel);
     this.lock = hold.lock();
     if (hold.occupied()) {
-      // 替换后（若还能替换成功）锁已被别的进程抢走：同样停用读写，避免与对方互相踩
+      // 替换后（若还能替换成功）锁已被别的进程/同一 JVM 的旧实例抢走：同样停用读写，避免与对方互相踩
       this.lockUnavailable = true;
-      warnLockUnavailableOnce();
+      warnLockUnavailableOnce(hold.sameJvm());
     } else {
       this.lockUnavailable = false;
     }
@@ -1317,7 +1357,10 @@ final class RegionFile implements AutoCloseable {
         continue;
       }
       try {
-        flushBucket(candidate);
+        if (!flushBucket(candidate)) {
+          // 该桶含超限负载（写不出去、读侧本来也判损坏）：保留脏标记，换下一个候选
+          continue;
+        }
         writePosTable();
         // 与 flushDirty 同口径：偏移表写成功后才清 dirty（失败则保持为真、下轮重试，避免新副本成为孤儿）
         dirty[candidate] = false;

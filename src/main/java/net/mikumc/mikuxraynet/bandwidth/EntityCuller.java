@@ -776,7 +776,14 @@ public final class EntityCuller implements Listener {
     if (rotation == null) {
       return;
     }
-    for (Entity entity : rotation.nextBatch(Integer.MAX_VALUE)) {
+    // 每周期限量提交：队列容量是固定值（OCCLUSION_QUEUE_CAPACITY），而「提交全部追踪实体」在多人时
+    // 必然超过它（按类注释的定容规则，50 人 × 100 追踪即 5000 > 4096）——超出的部分被引擎拒收后
+    // 本周期就再没有机会，通道②的「先可见后被挡收敛」与「遮挡物消失后恢复」会随人数增长而退化。
+    // 改为按在线人数分摊配额 + 轮转游标：队列不再溢出，未提交的实体顺延到下一周期（不丢判定）。
+    // 代价是远处实体的再评估周期变长（观感上慢几拍），换来的是任何人数下都不再丢判定。
+    int online = Math.max(1, Bukkit.getOnlinePlayers().size());
+    int perCycle = Math.max(8, OCCLUSION_QUEUE_CAPACITY / online);
+    for (Entity entity : rotation.nextBatch(perCycle)) {
       if (!owns(entity)) {
         // 跨区域（Folia）：不能触碰实体，也<b>不得摘除轮转条目</b>——通道②是远距离实体唯一的再评估
         // 入口（通道①对远距离条目不提交判定）；删掉后该实体既不会被重新判可见，也不会随 owns 恢复

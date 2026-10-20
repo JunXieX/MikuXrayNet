@@ -505,12 +505,18 @@ public final class Diagnostics {
         + "，条目 " + s.rewrite().cacheEntries()
         + "，磁盘查询 " + (s.rewrite().cacheMisses() + s.rewrite().cacheContentRejected()));
     lines.add("区块改写：改写 " + s.rewrite().chunksRewritten() + "，替换方块 " + s.rewrite().blocksReplaced()
-        + "，跳过 " + s.rewrite().chunksSkipped()
-        + "，异常 " + s.rewrite().chunksFailed() + "，写回失败 " + s.rewrite().writeBackFailures()
-        + "，超时放行 " + s.rewrite().chunksTimedOut()
-        // 「因队列满整块未伪装」单列：它意味着该区块的矿物以真实状态下发（对透视端可见），
-        // 是本模块唯一的功能性静默失效，必须与「跳过」区分开。
-        + "，队列满未伪装 " + s.rewrite().chunksSkippedQueueFull());
+        + "，写回失败 " + s.rewrite().writeBackFailures());
+    // 「未改写」按原始计数器分列，并写明各自的归属关系：chunksSkipped 是「已处理但原包放行」的<b>总量</b>，
+    // chunksFailed 是它的子集；而「队列满」与「超时放行」都在各自的提前返回分支里计数、并不计入
+    // chunksSkipped。任何用减法（如 跳过 − 异常）去推算「本来就无需改写」的写法都会漏掉这两条路径，
+    // 因此这里只给原值、不做推算。
+    lines.add("未改写：跳过 " + s.rewrite().chunksSkipped()
+        + "（已处理但原包放行，无目标方块 / 无改动 / 异常均计入）"
+        + "，其中异常 " + s.rewrite().chunksFailed()
+        // 「因队列满整块未伪装」意味着该区块的矿物以真实状态下发（对透视端可见），是本模块唯一的
+        // 功能性静默失效，必须与「跳过」分开看；它不在「跳过」内，故单列并注明。
+        + "，队列满未伪装 " + s.rewrite().chunksSkippedQueueFull() + "（不计入「跳过」，该区块完全未伪装）"
+        + "，超时放行 " + s.rewrite().chunksTimedOut() + "（不计入「跳过」，原包按时限放行）");
     // 字节口径（P0-1）：只统计真正改写的区块（未改动/失败放行的原样字节不采样，避免稀释比例）。
     // 节省比例 = 节省字节 / 原始字节；开启 palette.width-budget 后这一行应体现「封顶+裁剪」的收益。
     lines.add(bytesLine(s.rewrite()));
@@ -557,7 +563,9 @@ public final class Diagnostics {
         // 积压被拒单列：它不代表配置上限在拦，而是磁盘线程跟不上（压缩/落盘成瓶颈），
         // 处理方式与调容量上限完全不同，因此不与「写入被拒」合并。
         + "，积压被拒 " + s.diskCache().rejectedByBacklog()
-        + "，异常 " + s.diskCache().errors());
+        // 该计数混合了「读超时按未命中降级」（属于设计内的 fail-open，不代表故障）与真实读写异常，
+        // 只看数字会把正常的超时降级当成故障，故在文案里写明口径。
+        + "，异常 " + s.diskCache().errors() + "（含读超时降级与真实异常）");
     lines.add("带宽：零位移取消 " + s.throttle().entityPacketsCancelled()
         // 括号内先给「放行」总数（与旧口径兼容），再给到达口径三分 + 字段形态口径：
         // 「取消 0」必须能区分「没有纯位移包」「位移从不为 0」「包没到达」「字段布局变了」四种成因，

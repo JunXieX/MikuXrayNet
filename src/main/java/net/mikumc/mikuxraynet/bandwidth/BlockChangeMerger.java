@@ -130,11 +130,22 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * <p><b>「过时」是相对的、可撤销</b>：同坐标若之后又被重新缓冲，{@code onPacketSending} 会立即把
    * 该坐标从本集合移除（此刻缓冲条目才是最新的）——因此它不会把「更新的变更」当旧态误删。
    * 只在持有该 {@code Pending} 的锁内读写。
+   *
+   * <p><b>有界</b>：条目上限见 {@link #passedLimit}。窗口期若持续有近身直通 / 批量直通包（大规模显形、
+   * 流水、爆炸连续发生），集合会一直增长；没有上限就等于让「内存有界」这条约束失效。
    */
   private static final class Pending {
     private final UUID uuid;
     private final List<Held> held = new ArrayList<>();
     private final Set<Coord> passed = new HashSet<>();
+    /**
+     * {@link #passed} 的条目上限；超限即整体清空（见 {@link #rememberDelivered}）。
+     *
+     * <p><b>为什么按 {@code maxPendingEntries × 4}</b>：正常窗口里「已直通坐标」与「缓冲条目」同量级
+     * （每条被直通的变更至多对应一条缓冲条目），4 倍缓冲上限留足余量，不至于让正常流量频繁触发清空；
+     * 同时保证上限随配置缩放，且不低于 {@link #MIN_PASSED_LIMIT} 这一「极小缓冲配置下也不至于每包清空」的下限。
+     */
+    private final int passedLimit;
     private final BlockChangeBatch<WrappedBlockData> batch;
     private ScheduledFuture<?> timer;
     private final AtomicBoolean flushed = new AtomicBoolean();
@@ -151,6 +162,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     private Pending(UUID uuid, int maxEntries) {
       this.uuid = uuid;
       this.batch = new BlockChangeBatch<>(maxEntries);
+      this.passedLimit = passedLimit(maxEntries);
     }
   }
 
