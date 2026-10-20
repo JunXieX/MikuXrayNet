@@ -285,16 +285,23 @@ public final class AntiXrayRuntime {
 
     // 先建邻近显形器（持有显形链路），再把它交给方块变更观察监听器做事件驱动即时显形（P1-4）。
     // 遮挡位图仓库一并传入：显形可见性判定恒走该位图（原生命中射线已移除）。
-    ProximityRevealer revealer = new ProximityRevealer(plugin, antiXray, chunkIndex, revealed, stats,
-        bypassRegistry, workPool, occlusionStores);
-    this.blockChangeRevealListener = new BlockChangeRevealListener(plugin, protocolManager,
-        chunkIndex, revealed, stats, revealer);
+    //
+    // 构造与启动整体落在 try 内：构造期异常（例如 PacketAdapter 注册被拒、配置字段异常）若冒出
+    // startAntiXray，会一路顶到 onEnable 让整个插件启用失败——而此时 ProtocolLib 拦截、线程池、
+    // 磁盘缓存均已装配却永远不会被 stopForDisable 清理（线程/句柄泄漏，且带宽与命令也一并失效）。
+    // 这与本类「任一环节不可用都只停用该模块，不影响其它功能」的契约矛盾。
     try {
-      blockChangeRevealListener.start();
+      ProximityRevealer revealer = new ProximityRevealer(plugin, antiXray, chunkIndex, revealed, stats,
+          bypassRegistry, workPool, occlusionStores);
+      BlockChangeRevealListener listener = new BlockChangeRevealListener(plugin, protocolManager,
+          chunkIndex, revealed, stats, revealer);
+      // 先落到字段再启动：start() 中途抛异常时 stopProximity() 必须能停掉已启动的那一半
       this.proximityRevealer = revealer;
+      this.blockChangeRevealListener = listener;
+      listener.start();
       revealer.start();
     } catch (Throwable throwable) {
-      logger.warning("邻近显形装配失败（不影响反矿透主体）：" + throwable.getMessage());
+      logger.log(Level.WARNING, "邻近显形装配失败（不影响反矿透主体）", throwable);
       stopProximity();
     }
   }
@@ -319,15 +326,16 @@ public final class AntiXrayRuntime {
           + "（位图只在区块重载时重建，方块变更不会即时反映）");
       return;
     }
-    OcclusionPatchListener listener = new OcclusionPatchListener(plugin, protocolManager,
-        occlusionStores, occlusionStats, registry::isEntityOccluding);
+    // 构造同样纳入 try：构造期异常不得冒出 startAntiXray（理由见 startProximity）。
     try {
-      listener.start();
+      OcclusionPatchListener listener = new OcclusionPatchListener(plugin, protocolManager,
+          occlusionStores, occlusionStats, registry::isEntityOccluding);
       this.occlusionPatchListener = listener;
+      listener.start();
     } catch (Throwable throwable) {
       // start() 可能已把 AsyncListenerHandler 注册进 ProtocolLib（在 handler.start() 抛出的场合），
       // 不注销会让它永久留在异步管理器里；stop() 对 handler 为 null 的情形是安全的空操作。
-      listener.stop();
+      stopOcclusionPatch();
       logger.log(Level.WARNING, "遮挡位图方块补丁装配失败（位图只在区块重载时重建）", throwable);
     }
   }
@@ -355,14 +363,26 @@ public final class AntiXrayRuntime {
     }
   }
 
-  /** 停用邻近显形：注销巡检任务与变更注销监听，并清空显形索引。 */
+  /** 停用邻近显形：注销巡检任务与变更注销监听，并清空显形索引（释放内存）。 */
   private void stopProximity() {
+    stopProximity(true);
+  }
+
+  /**
+   * 停用邻近显形。
+   *
+   * @param clearIndexes 是否同时清空<b>与改写链路共享</b>的伪装索引 / 已显形集合。
+   *                     插件停用或配置关闭时必须为 {@code true}（释放内存、做到「关闭即零开销」）；
+   *                     热重载必须为 {@code false}（见 {@link ProximityRevealer#stop(boolean)}：
+   *                     索引只在区块下发时写入，清空会让已加载区块的伪装坐标永久失联）。
+   */
+  private void stopProximity(boolean clearIndexes) {
     if (blockChangeRevealListener != null) {
       blockChangeRevealListener.stop();
       blockChangeRevealListener = null;
     }
     if (proximityRevealer != null) {
-      proximityRevealer.stop();
+      proximityRevealer.stop(clearIndexes);
       proximityRevealer = null;
     }
   }
@@ -426,26 +446,35 @@ public final class AntiXrayRuntime {
    * 现在关闭时释放索引并停用显形；启用时复用既有索引重启显形。
    */
   void restartProximity() {
-    stopProximity();
     if (!antiXrayActive || proximityStats == null) {
       // 反矿透整体未启用（或尚未装配完成）时邻近显形无从接入改写链路，重启项静默无效。
       // 必须显式告知管理员「为什么没生效」，否则「重启邻近显形」这类操作会被误读为已生效。
+      stopProximity();
       logger.fine("反矿透未启用，proximity 重启项已跳过");
       return;
     }
     AntiXrayConfig antiXray = plugin.mikuConfig().antiXray();
     if (!antiXray.proximity().enabled()) {
-      // 关闭：stopProximity 已停周期任务、注销变更注销监听并清空索引内容；这里再置空字段，
+      // 关闭：停周期任务、注销变更注销监听并清空索引内容；这里再置空字段，
       // 之后不再登记/发送任何显形——与启动路径「关闭即不建索引、零开销」保持一致。
+      stopProximity();
       obfuscatedChunkIndex = null;
       revealedSet = null;
       logger.fine("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
       return;
     }
+    // 启用：只停任务、绝不清空共享索引——索引只在区块封包下发时写入，而热重载不会让服务端重发
+    // 已加载区块；清空会让这些区块的伪装坐标永久失联（玩家眼前的假方块再也不显形，直到区块重发）。
+    stopProximity(false);
+    AntiXrayConfig.Proximity proximity = antiXray.proximity();
     if (obfuscatedChunkIndex == null || revealedSet == null) {
-      // 显形索引只能在插件启用时随改写链路一并接入：热重载无法凭空补齐，明确提示需重启而非静默失效。
-      logger.fine("邻近显形在配置中已启用，但本功能只能随插件启用时初始化、热重载无法重建；重启服务器后生效");
-      return;
+      // 启动时 proximity 是关闭的、此刻才首次启用：新建索引并赋给字段即可——改写链路持有的是
+      // 「读字段」的 Supplier（见 startAntiXray 里的 hook.register），新对象立刻生效，无需重启服务端。
+      obfuscatedChunkIndex =
+          new ObfuscatedChunkIndex(proximity.maxPositions(), proximity.expireSeconds());
+      revealedSet =
+          new RevealedSet(proximity.maxPositionsPerPlayer(), proximity.expireSeconds());
+      logger.fine("邻近显形已按热重载配置首次启用（已新建伪装索引与已显形集合）");
     }
     startProximity(antiXray, obfuscatedChunkIndex, revealedSet, proximityStats);
   }

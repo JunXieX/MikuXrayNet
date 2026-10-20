@@ -33,9 +33,17 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
  * bucket 压缩用 zstd（服务端自带的 zstd-jni，{@code scope=provided}，不打进插件 jar；
  * 运行期不可用时自动回退 JDK Deflater），旧 Deflate 缓存仍可读取（详见该类的压缩方案说明）。
  *
- * <p><b>缓存键与失效</b>：键 = {@code (世界名, chunkX, chunkZ, 配置指纹)}。
- * 配置指纹来自 {@code antixray.yml} 中影响改写结果的配置项，且只用「哈希有规范定义」的稳定分量
+ * <p><b>缓存键与失效</b>：键 = {@code (sanitize 后的世界名, chunkX, chunkZ, 条目指纹)}；条目指纹 =
+ * 调用方给的配置指纹混入<b>原始世界名</b>的稳定哈希（见 {@link #mixWorldName}）。配置指纹来自
+ * {@code antixray.yml} 中影响改写结果的配置项，且只用「哈希有规范定义」的稳定分量
  * （字符串/数字/列表/映射/枚举名），因此同一份配置在<b>任意进程</b>上都算出同一个指纹。
+ *
+ * <p><b>为什么世界名必须进指纹</b>：目录名由 {@link #sanitize} 归一化得到（非法字符→{@code '_'}、
+ * 转小写），{@code world-1} 与 {@code world_1} 会落到同一目录、共用同一个物理文件。而改写结果还依赖
+ * 世界名（伪装方块的随机种子、{@code world-overrides} 的隐藏清单），所以「原始字节相同 ⇒ 改写结果相同」
+ * 只在<b>同一个世界内</b>成立：两个世界若共用指纹，hide-blocks 更少的一方写下的负载就会被另一方读到，
+ * 真矿随之泄露。混入原始世界名后，这类同名世界即使共用文件也必然指纹不符 → 按未命中惰性清理，
+ * <b>绝不会互相命中</b>（代价只是各自的条目不再被对方复用，命中率略低）。
  *
  * <p><b>内容新鲜度由负载自己证明</b>：条目负载里带着原始区块字节指纹，与本次要改写的字节不符即视为
  * 未命中（见 {@code DiskPayload}）。这是唯一的「内容是否过期」判据——它天然覆盖「区块被挖过/被重建」
@@ -519,6 +527,9 @@ public final class DiskCacheStore implements AutoCloseable {
 
   private byte[] doGet(String worldName, int chunkX, int chunkZ, int configHash)
       throws IOException {
+    // 比对用的指纹必须与写入侧同源：配置指纹 + 原始世界名（见 mixWorldName）。
+    // sanitize 后同名的两个世界会共用本文件，靠这一项把它们的条目彻底分开。
+    int fingerprint = mixWorldName(worldName, configHash);
     int regionX = BufferedLinearV3Format.regionCoordinate(chunkX);
     int regionZ = BufferedLinearV3Format.regionCoordinate(chunkZ);
     Handle handle = handle(worldName, regionX, regionZ, false);
@@ -531,8 +542,9 @@ public final class DiskCacheStore implements AutoCloseable {
     if (entry == null) {
       return null;
     }
-    if (entry.configHash() != configHash) {
-      // 配置变了：惰性清理，绝不返回旧配置改写的负载。
+    if (entry.configHash() != fingerprint) {
+      // 指纹不符：配置变了，或同名目录下的另一个世界写下的条目（见 mixWorldName）。两种情况都必须
+      // 惰性清理，绝不返回不符合本次改写前提的负载。
       // 必须计数：这是「升级/改配置后命中率骤降」的唯一成因出口，否则该清理完全不可见
       //（过期清理恒为 0，管理员会误以为条目有效却读不到）。
       stats.configMismatchRemoved.increment();
@@ -566,6 +578,9 @@ public final class DiskCacheStore implements AutoCloseable {
       stats.rejectedBySize.increment();
       return;
     }
+    // 写入侧与读取侧必须同源：条目里存的是「配置指纹 + 原始世界名」混合后的指纹（见 mixWorldName）。
+    // 只存配置指纹的话，sanitize 后同名的另一个世界会用完全相同的指纹读走这条负载。
+    int fingerprint = mixWorldName(worldName, configHash);
     int regionX = BufferedLinearV3Format.regionCoordinate(chunkX);
     int regionZ = BufferedLinearV3Format.regionCoordinate(chunkZ);
     Handle handle = handle(worldName, regionX, regionZ, true);
@@ -600,7 +615,7 @@ public final class DiskCacheStore implements AutoCloseable {
     }
 
     BufferedLinearV3Format.Entry entry =
-        new BufferedLinearV3Format.Entry(0L, writtenAt, configHash, payload);
+        new BufferedLinearV3Format.Entry(0L, writtenAt, fingerprint, payload);
     if (!handle.file.bucketRawLengthFitsAfterPut(chunkIndex, payload.length)) {
       // 加入本条后该桶的原始长度会超过读取侧上界（BufferedLinearV3Format#MAX_RAW_SIZE）：读取时整桶会被
       // 判为损坏、整桶当空。写入侧先行拒绝（计入既有大小拒绝计数），避免「写成功却读不回」的不对称。
@@ -986,22 +1001,10 @@ public final class DiskCacheStore implements AutoCloseable {
     }
 
     Handle created = new Handle(file);
-    if (entryCounted.add(key) && file.sizeBytes() > BufferedLinearV3Format.DATA_AREA_OFFSET) {
-      // 重启后 approximateEntries 从 0 开始：必须把磁盘上已有的条目补计进来，
-      // 否则 max-entries 上限在重启后完全失效（旧条目不占额度，磁盘可无限增长）。
-      // 异步一次性扫描（逐 bucket 解码计数），不阻塞触发本次打开的读写；此后由
-      // put/remove/compact 增量维护。排程与扫描之间恰被落盘的新写入会被重复计入一次——
-      // 计数本就是近似值，偏差方向是「提前拒绝新写入」，保守无害。
-      try {
-        executor.execute(() -> countDiskEntries(key, created));
-      } catch (Throwable throwable) {
-        // 排程失败（停用等）：放回待计数集合，下次打开重试
-        entryCounted.remove(key);
-      }
-    }
+    // 先入表、再排程补计：补计提交被拒时，句柄必须已经在表里，才能被 removeAndClose 真正摘除
+    // （它只处理表内的句柄）。这里仍保留「先到者优先」的兜底——全部操作都在磁盘线程上串行，正常撞不上。
     Handle raced = open.putIfAbsent(key, created);
     if (raced != null) {
-      // 理论上不会发生（全部在磁盘线程串行），兜底：保留先到者。
       // 只 close 不 delete——文件可能正被先到者使用，删除会破坏对方句柄（A9）。
       try {
         created.file.close();
@@ -1009,6 +1012,33 @@ public final class DiskCacheStore implements AutoCloseable {
         fail("关闭重复打开的磁盘缓存区域文件失败（不影响先到者）", throwable);
       }
       return raced;
+    }
+    if (entryCounted.add(key) && file.sizeBytes() > BufferedLinearV3Format.DATA_AREA_OFFSET) {
+      // 重启后 approximateEntries 从 0 开始：必须把磁盘上已有的条目补计进来，
+      // 否则 max-entries 上限在重启后完全失效（旧条目不占额度，磁盘可无限增长）。
+      // 异步一次性扫描（逐 bucket 解码计数），不阻塞触发本次打开的读写；此后由
+      // put/remove/compact 增量维护。排程与扫描之间恰被落盘的新写入会被重复计入一次——
+      // 计数本就是近似值，偏差方向是「提前拒绝新写入」，保守无害。
+      boolean scheduled;
+      try {
+        // execute() 已把「队列满 / 已关闭 / RejectedExecutionException」统一折算成 false 并计入 errors，
+        // 因此正常只看返回值；这里的 try/catch 只是不让任何意外异常穿透 handle()。
+        scheduled = execute(() -> countDiskEntries(key, created));
+      } catch (Throwable throwable) {
+        scheduled = false;
+        fail("磁盘缓存补计任务提交失败", throwable);
+      }
+      if (!scheduled) {
+        // 提交被拒时不能只清 entryCounted 就返回：句柄此刻已在 open 表里，之后 handle() 会直接命中
+        // 这个已有句柄、再也不会走到本分支，注释承诺的「下次打开重试」永远不会发生——该文件的旧条目
+        // 从此不占 max-entries 额度，磁盘可超上限增长。因此按既有语义把句柄摘除并关闭
+        // （removeAndClose 会一并归还额度、清掉 entryCounted 标记），让下一次打开重新扫描补计；
+        // 本次读写按未命中/跳过降级（fail-open）。
+        removeAndClose(key, created);
+        logger.warning("磁盘缓存补计任务未能提交，已摘除该区域文件句柄"
+            + "（下次打开会重新补计，本次读写按未命中处理）：" + path);
+        return null;
+      }
     }
     return created;
   }
@@ -1049,13 +1079,35 @@ public final class DiskCacheStore implements AutoCloseable {
   }
 
   /**
+   * 把<b>原始</b>世界名混入配置指纹，得到真正写进条目的指纹（读、写两侧都必须走这里）。
+   *
+   * <p><b>为什么必须混</b>：缓存目录名是 {@link #sanitize} 归一化后的世界名，{@code world-1} 与
+   * {@code world_1} 会落到同一目录、共用同一个区域文件；而改写结果还依赖世界名（伪装方块的随机种子、
+   * {@code world-overrides} 的隐藏清单）。若指纹只由配置决定，两个世界就会互相命中：hide-blocks 更少的
+   * 一方写下的负载被另一方读走，本该藏起来的矿直接露给客户端。混入世界名后，跨世界的条目必然指纹不符，
+   * 按未命中惰性清理（计入 {@code configMismatchRemoved}），不会再互相命中。
+   *
+   * <p><b>为什么用 {@link String#hashCode()}</b>：它的算法由语言规范固定，同一世界名在任意进程、任意
+   * JDK 上都得到同一个值，符合类注释「同一份配置在任意进程算出同一指纹」的要求，且零分配。世界名不同但
+   * 哈希相同（一对世界名约 2^-32 量级）时只会退化成「两个世界共用条目」，即修复前的行为，不会更差；
+   * 条目里能放指纹的字段只有 {@code int}，再叠加强摘要也换不来更多位宽，故不引入额外计算。
+   *
+   * <p>本条改动会让旧版本写下的磁盘条目一律指纹不符，首次读取时被惰性清理并重建一次
+   * （缓存只是可选加速，这次重建的代价可以接受）。
+   */
+  static int mixWorldName(String worldName, int configHash) {
+    return configHash * 31 + worldName.hashCode();
+  }
+
+  /**
    * 世界名 → 目录名：只保留安全字符，避免路径穿越或非法文件名。
    *
-   * <p><b>目录名碰撞（既定取舍，靠源指纹兜底）</b>：非安全字符统一替换为 {@code '_'} 并转小写，因此
-   * 形如 {@code a/b}、{@code a_b}、{@code A_B} 的不同世界名会落到同一目录、共用同一物理文件，彼此
-   * 可能命中对方写下的条目。这是刻意接受的：条目新鲜度由负载里的<b>原始区块字节指纹</b>判定
-   * （见 {@code DiskPayload.decode}），只有「原始字节完全相同」才会命中——而原始字节相同意味着改写结果
-   * 也相同，跨世界复用它们不会产生错误内容；指纹不符则按未命中处理，最多损失一点命中率，绝不错服。
+   * <p><b>目录名碰撞</b>：非安全字符统一替换为 {@code '_'} 并转小写，因此形如 {@code a/b}、{@code a_b}、
+   * {@code A_B} 的不同世界名会落到同一目录、共用同一物理文件。本方法只负责「路径安全」，<b>不负责区分
+   * 世界</b>：区分世界由条目指纹完成——读、写两侧都把<b>原始世界名</b>的哈希混进指纹（见
+   * {@link #mixWorldName}），于是共用同一文件的另一个世界写下的条目在本世界看来指纹不符，按未命中惰性
+   * 清理，绝不会被当作自己的改写结果返回（否则 hide-blocks 更少的一方会把真矿露给对方）。代价只是这类
+   * 同名世界各自不复用对方的条目，命中率略低。
    */
   private static String sanitize(String worldName) {
     StringBuilder builder = new StringBuilder(worldName.length());

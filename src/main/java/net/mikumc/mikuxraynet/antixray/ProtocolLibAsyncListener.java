@@ -461,9 +461,21 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 只在真的需要时才抓：mode=all 的世界改写不做 6 面遮挡判定（见 ObfuscationProcessor#rewrite），
     // 邻块数据用不到，抓取与随之而来的区域线程调度都是纯开销。
     UUID playerId = player.getUniqueId();
-    if (neighborsNeeded(world.getName(), dimension)
-        && neighborProvider.cached(world.getName(), accessor.chunkX(), accessor.chunkZ()) == null
-        && scheduleCaptureThenRewrite(task, accessor, world, timeout, playerId)) {
+    // 这三个调用都可能抛 Throwable（实时配置读取、邻块缓存查询、区域调度器受理）。此刻延迟已登记、
+    // 看门狗已注册，异常一旦漏出去，本封包就只能干等看门狗（默认 2500 ms）才被放行——违反「失败立即
+    // fail-open」。故与下面 workPool.execute 的失败分支保持一致：取消看门狗 + 立刻放行原包。
+    try {
+      if (neighborsNeeded(world.getName(), dimension)
+          && neighborProvider.cached(world.getName(), accessor.chunkX(), accessor.chunkZ()) == null
+          && scheduleCaptureThenRewrite(task, accessor, world, timeout, playerId)) {
+        return;
+      }
+    } catch (Throwable throwable) {
+      // 本区块以原始（未伪装）状态下发，计入「已处理但未改写」口径；日志走分类限流，异常时不会刷屏。
+      stats.chunksSkipped.increment();
+      logThrottled("邻区块抓取调度异常，已按原包放行", throwable);
+      timeout.cancel(false);
+      task.signalOnce();
       return;
     }
 
@@ -787,9 +799,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 让主线程 / Folia 区域线程抓取邻块贴边快照，抓完再把改写交给工作线程。
    *
    * <p>抓取期间**不**取得写入权，因此看门狗超时仍能放行原包（fail-open）；若抓取回调迟于超时执行，
-   * 工作线程拿到写入权会失败并直接跳过改写。
+   * 回调会在抓取之前就终止（任务已过期，后续改写注定被 {@link RewriteTask#tryBeginWrite()} 拒绝）。
    *
-   * @return true 表示调度成功（放行责任由抓取链路或看门狗承担）；false 表示无法调度，调用方按缺失策略改写
+   * @return true 表示调度成功（放行责任由抓取链路或看门狗承担）；false 表示无法调度，调用方按缺失策略
+   *         继续（停用竞态下本方法可能已直接放行该任务，{@link RewriteTask#signalOnce()} 幂等，重复放行无害）
    */
   private boolean scheduleCaptureThenRewrite(RewriteTask task, ChunkPacketAccessor accessor, World world,
       ScheduledFuture<?> timeout, UUID playerId) {
@@ -805,8 +818,32 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 工作池与看门狗都已随停用关闭，入队只会被丢弃。立刻自行放行原包，避免该区块封包永久无人
       // signalOnce（玩家卡在区块加载界面直到重登）。
       if (stopping) {
+        // 再摘一次登记兜底（重复 remove 幂等）：任何早退分支都必须确保条目不会滞留，
+        // 否则 RewriteTask → delivery → PacketEvent → NMS 区块数据整条引用链都会被钉在表里。
+        pendingCaptures.remove(task);
         timeout.cancel(false);
         task.signalOnce();
+        return;
+      }
+      // 抓取之前先挡掉「已过期」的任务：抓取要做 4 份 ChunkSnapshot（约 0.8 ms）且全落在主线程 /
+      // 区域线程上，而超过处理时限的任务随后的改写注定被 tryBeginWrite 拒绝——属纯浪费；工作池饱和时
+      // 过期任务会成堆压在区域线程上，正是最该挡住的时候。
+      // 这里必须先用 expired() 收窄：releaseOnTimeout() 不是「是否已放行」的查询接口，只要写入权还是
+      // OPEN 就会被它抢到并放行原包。对尚未到期的正常任务这么调，等于把每个需要邻块的区块都按原包放行、
+      // 彻底跳过抓取与改写，功能直接失效。
+      if (task.expired()) {
+        pendingCaptures.remove(task);
+        // 已到时限：由本回调抢先放行（fail-open 语义本就成立），并沿用看门狗的「超时放行」计数口径；
+        // 返回 false 表示看门狗 / 停用兜底已先一步放行，同样不必再抓取。
+        if (task.releaseOnTimeout()) {
+          stats.chunksTimedOut.increment();
+        }
+        // 停用竞态兜底：若 stopping 恰在上一处检查之后置位，本次 remove 可能早于 unregisterBukkitHooks
+        // 的快照，任务因而不在快照里，而看门狗又会随 close() 一同关闭——此时由本线程放行
+        // （signalOnce 幂等，已放行过则什么都不做）。
+        if (stopping) {
+          task.signalOnce();
+        }
         return;
       }
       try {
@@ -829,6 +866,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 登记必须先于调度：调度成功那一刻回调就可能立即执行（Paper 的主线程队列、Folia 的区域线程），
       // 若先调度后登记，回调里的 remove 会晚于随后的 add，把登记永久留在表里。
       pendingCaptures.add(task);
+      // 登记后立刻复查 stopping——与 MikuWorkPool#execute「登记后再读一次 closed」是同一套双检协议：
+      // 读到 false ⇒ 停用流程尚未置位 ⇒ 其「取登记表快照」一定晚于本次登记 ⇒ 本任务必在快照内，由停用兜底放行；
+      // 读到 true ⇒ 本次登记可能正落在「快照之后、clear 之前」，既不在快照里、条目又被 clear 抹掉，而停用期
+      // 的 RegionScheduler 还可能把回调整个丢弃 ⇒ 该 RewriteTask 再无任何人 signalOnce，玩家永久卡在区块
+      // 加载界面。故这里自行解除登记并立即放行，返回 false 让调用方走「原包放行」分支（信号幂等，重复无害）。
+      if (stopping) {
+        pendingCaptures.remove(task);
+        timeout.cancel(false);
+        task.signalOnce();
+        return false;
+      }
       // RegionScheduler：Paper 上落在主线程、Folia 上落在该区块所属区域线程（同一套 API，无需分支）。
       // 跨区域读取失败会由 provider 按缺失策略降级。
       Bukkit.getRegionScheduler().execute(getPlugin(), world, task.chunkX(), task.chunkZ(), capture);

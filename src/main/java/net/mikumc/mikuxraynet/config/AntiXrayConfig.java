@@ -9,6 +9,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
@@ -31,10 +32,13 @@ import org.bukkit.configuration.ConfigurationSection;
  * <p><b>世界黑名单</b>：已从本文件<b>迁出</b>为独立的 {@code blacklist.yml}
  * （见 {@link WorldBlacklistConfig}），因为它现在同时对反矿透与带宽优化生效。反矿透各入口统一查询
  * {@link WorldBlacklistConfig#isBlacklistedNow(String)}；本类不再持有该名单。
+ * 名单的优先级<b>最高</b>：{@code world-overrides} 里写 {@code enabled: true} 也不能让名单内的世界
+ * 重新启用（要启用须先从黑名单移除）。
  *
  * <p><b>解析优先级（高 → 低）</b>：
  * <ol>
- *   <li>{@code world-overrides}（按世界名，精确名 &gt; 通配；保留为手动出口，默认空）；</li>
+ *   <li>{@code world-overrides}（按世界名，精确名 &gt; 通配；保留为手动出口，默认空）；
+ *       其中 {@code enabled} 可覆盖该世界所属维度的启用开关（显式值优先，未写则沿用维度）；</li>
  *   <li>{@code dimensions.<维度>}（维度由 {@link Dimension#of(World.Environment)} 判定，与世界名无关）；</li>
  *   <li>内置默认（本类常量）。</li>
  * </ol>
@@ -554,6 +558,8 @@ public final class AntiXrayConfig {
    * 各覆盖值为 {@code null} 表示「该键未覆盖，回落该世界所属<b>维度</b>的生效值」。
    *
    * @param glob               由 {@code pattern} 预编译的通配匹配器（不含 {@code *} 时为 null，走精确名比较）
+   * @param enabled            覆盖的反矿透开关；null = 沿用所属维度（{@code dimensions.<维度>.enabled}）。
+   *                           非 null 时优先于维度开关，但世界黑名单仍然最高优先（名单内世界一律不启用）
    * @param hideBlocks         覆盖的隐藏方块清单；null = 回落
    * @param replacementWeights 覆盖的伪装权重表；null = 回落
    * @param replacementBands   覆盖的按 Y 分区伪装表；null = 回落
@@ -562,9 +568,10 @@ public final class AntiXrayConfig {
    * @param mode               覆盖的伪装模式；null = 回落
    * @param useBlockBelow      覆盖的 use-block-below；null = 回落
    */
-  public record WorldOverride(String pattern, Pattern glob, List<String> hideBlocks,
-      Map<String, Integer> replacementWeights, List<ReplacementBand> replacementBands,
-      Integer minY, Integer maxY, ObfuscationMode mode, Boolean useBlockBelow) {
+  public record WorldOverride(String pattern, Pattern glob, Boolean enabled,
+      List<String> hideBlocks, Map<String, Integer> replacementWeights,
+      List<ReplacementBand> replacementBands, Integer minY, Integer maxY,
+      ObfuscationMode mode, Boolean useBlockBelow) {
 
     /** 是否与某世界名精确相等（精确名优先级高于通配）。 */
     public boolean exactMatches(String worldName) {
@@ -640,6 +647,9 @@ public final class AntiXrayConfig {
     }
   }
 
+  /** {@link #overrideEnabledCache} 的条目上限（与 {@code ObfuscationProcessor} 的世界档案缓存同一量级）。 */
+  private static final int OVERRIDE_ENABLED_CACHE_MAX = 4096;
+
   private final boolean enabled;
   /** 各维度生效视图（下标 = {@link Dimension#ordinal()}）。 */
   private final EffectiveObfuscation[] dimensionEffectives;
@@ -678,6 +688,21 @@ public final class AntiXrayConfig {
   private final List<WorldOverride> worldOverrides;
   /** 与 {@link #worldOverrides} 平行的生效视图：{@code [覆盖段下标][维度下标]}（构造期预计算）。 */
   private final EffectiveObfuscation[][] overrideEffectives;
+  /**
+   * 高度键（{@code min-y} / {@code max-y}）或覆盖开关类型不符、已按安全默认值处理时的明细；空列表 = 无。
+   * 解析侧不持日志，加载时由 {@link #warnIfConfigAdjusted} 一次性 WARN——绝不静默吞掉写法错误。
+   */
+  private final List<String> typeAdjustments;
+  /** 是否有覆盖段显式写了 {@code enabled}；没有时 {@link #antiXrayAppliesTo} 走 O(1) 快路径，不做任何匹配。 */
+  private final boolean hasEnabledOverride;
+  /**
+   * 世界名 → 覆盖段 enabled 的判定缓存（仅在 {@link #hasEnabledOverride} 为 true 时使用）。
+   *
+   * <p>封包入口按世界名查询，属于热路径；键是任意世界名，故按 {@link #OVERRIDE_ENABLED_CACHE_MAX}
+   * 整体清空而不做淘汰算法（与 {@code ObfuscationProcessor} 的覆盖档案缓存同一套做法）。
+   */
+  private final ConcurrentHashMap<String, OverrideEnabled> overrideEnabledCache =
+      new ConcurrentHashMap<>();
 
   private AntiXrayConfig(boolean enabled, EffectiveObfuscation[] dimensionEffectives,
       boolean[] dimensionEnabled, boolean dimensionsMissing, boolean layerObfuscation,
@@ -685,7 +710,8 @@ public final class AntiXrayConfig {
       DiskCache diskCache, PlatformSupport.Mode platform, int cacheMaximumSize,
       int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis, int queueCapacity,
       Set<String> unresolvedTags, List<WorldOverride> worldOverrides,
-      List<String> floorAdjustments, List<String> ceilingAdjustments) {
+      List<String> floorAdjustments, List<String> ceilingAdjustments,
+      List<String> typeAdjustments) {
     this.enabled = enabled;
     this.dimensionEffectives = dimensionEffectives.clone();
     this.dimensionEnabled = dimensionEnabled.clone();
@@ -709,12 +735,24 @@ public final class AntiXrayConfig {
     // 被安全上限回落过的键（空 = 未回落）；同样由 warnIfConfigAdjusted 一次性提示
     this.ceilingAdjustments =
         ceilingAdjustments == null ? List.of() : List.copyOf(ceilingAdjustments);
+    // 高度键/覆盖开关类型不符的明细（空 = 全部合法）；加载时由 warnIfConfigAdjusted 一次性提示
+    this.typeAdjustments = typeAdjustments == null ? List.of() : List.copyOf(typeAdjustments);
+    // 没有任何覆盖段写 enabled 时，运行期无需按世界名匹配（避免给每个区块封包增加无谓开销）
+    boolean anyEnabledOverride = false;
+    for (WorldOverride override : this.worldOverrides) {
+      if (override.enabled() != null) {
+        anyEnabledOverride = true;
+        break;
+      }
+    }
+    this.hasEnabledOverride = anyEnabledOverride;
     // 预计算各覆盖段在「每个维度」上的生效视图：合并只在构造期做一次，运行期命中后直接取用（O(1)）。
     EffectiveObfuscation[][] merged = new EffectiveObfuscation[this.worldOverrides.size()][Dimension.values().length];
     for (int i = 0; i < this.worldOverrides.size(); i++) {
       WorldOverride override = this.worldOverrides.get(i);
       for (Dimension dimension : Dimension.values()) {
-        merged[i][dimension.ordinal()] = merge(override, this.dimensionEffectives[dimension.ordinal()]);
+        merged[i][dimension.ordinal()] = merge(override,
+            this.dimensionEffectives[dimension.ordinal()], effectiveEnabled(override, dimension));
       }
     }
     this.overrideEffectives = merged;
@@ -749,8 +787,20 @@ public final class AntiXrayConfig {
         this.diskCache.zstdSha256());
   }
 
-  /** 把某覆盖段合并到某维度的生效值上（覆盖值优先，未覆盖回落维度值）。 */
-  private static EffectiveObfuscation merge(WorldOverride override, EffectiveObfuscation base) {
+  /**
+   * 把某覆盖段合并到某维度的生效值上（覆盖值优先，未覆盖回落维度值）。
+   *
+   * <p>{@code enabled} 是该覆盖段在此维度上的最终启用值（非 null 的覆盖值优先，否则沿用维度开关，
+   * 见 {@link #effectiveEnabled}）。为 false 时返回<b>空视图</b>：没有目标方块，{@code WorldProfile}
+   * 因而不具备生效条件，该世界的改写、邻块抓取与显形登记会自动跳过——与 {@code dimensions.<维度>}
+   * 的 {@code enabled: false} 走同一条既有通道，不需要在改写链路里再加分支。
+   */
+  private static EffectiveObfuscation merge(WorldOverride override, EffectiveObfuscation base,
+      boolean enabled) {
+    if (!enabled) {
+      return new EffectiveObfuscation(List.of(), Map.of(), List.of(), Integer.MIN_VALUE,
+          Integer.MAX_VALUE, base.mode(), base.useBlockBelow());
+    }
     return new EffectiveObfuscation(
         override.hideBlocks() == null ? base.hideBlocks() : List.copyOf(override.hideBlocks()),
         override.replacementWeights() == null ? base.replacementWeights()
@@ -761,6 +811,16 @@ public final class AntiXrayConfig {
         normalizeMax(override.maxY() == null ? base.maxY() : override.maxY()),
         override.mode() == null ? base.mode() : override.mode(),
         override.useBlockBelow() == null ? base.useBlockBelow() : override.useBlockBelow());
+  }
+
+  /**
+   * 覆盖段在某维度上的启用值：非 null 的覆盖值优先于维度开关，null = 沿用该维度。
+   *
+   * <p>黑名单不在这里判：它是运行期可变的独立配置（{@code blacklist.yml}），统一在
+   * {@link #enabledForWorld} / {@link #antiXrayAppliesTo} 的入口处判定，优先级最高。
+   */
+  private boolean effectiveEnabled(WorldOverride override, Dimension dimension) {
+    return override.enabled() == null ? dimensionEnabled[dimension.ordinal()] : override.enabled();
   }
 
   /** 高度下界归一：null（未配置）→ {@code Integer.MIN_VALUE}（不限制）。 */
@@ -809,6 +869,8 @@ public final class AntiXrayConfig {
   /** 从配置根节点解析。 */
   public static AntiXrayConfig from(ConfigurationSection root) {
     Set<String> unknownTags = new LinkedHashSet<>();
+    // 高度键（min-y/max-y）与覆盖开关类型不符时的明细：解析侧不持日志，统一交给加载路径一次性 WARN
+    List<String> typeAdjustments = new ArrayList<>(2);
 
     // ---- dimensions：按维度分段（新结构；缺段则全部回落内置默认并标记，供调用方一次性 WARN）----
     ConfigurationSection dimensions = root.getConfigurationSection("dimensions");
@@ -827,12 +889,14 @@ public final class AntiXrayConfig {
       anyDimensionSection = true;
       dimensionEnabled[dimension.ordinal()] =
           section.getBoolean("enabled", Boolean.TRUE.equals(DEFAULT_ENABLED.get(dimension)));
-      effectives[dimension.ordinal()] = parseDimensionSection(section, fallback, unknownTags);
+      effectives[dimension.ordinal()] = parseDimensionSection(section, fallback, unknownTags,
+          typeAdjustments, "dimensions." + dimension.key());
     }
 
     // ---- world-overrides：最高优先级（按世界名；默认空）----
     List<WorldOverride> overrides =
-        parseWorldOverrides(root.getConfigurationSection("world-overrides"), unknownTags);
+        parseWorldOverrides(root.getConfigurationSection("world-overrides"), unknownTags,
+            typeAdjustments);
 
     // ---- 安全下限：被抬升的键记进 floorAdjustments，加载时一次性 WARN（解析侧不持日志）----
     List<String> floorAdjustments = new ArrayList<>(3);
@@ -983,7 +1047,8 @@ public final class AntiXrayConfig {
         unknownTags,
         overrides,
         floorAdjustments,
-        ceilingAdjustments);
+        ceilingAdjustments,
+        typeAdjustments);
   }
 
   /**
@@ -997,7 +1062,8 @@ public final class AntiXrayConfig {
 
   /** 解析某个维度段（未出现的键回落该维度的内置默认）。 */
   private static EffectiveObfuscation parseDimensionSection(ConfigurationSection section,
-      EffectiveObfuscation fallback, Set<String> unknownTags) {
+      EffectiveObfuscation fallback, Set<String> unknownTags, List<String> typeAdjustments,
+      String path) {
     List<String> hideBlocks = fallback.hideBlocks();
     if (section.contains("hide-blocks")) {
       List<String> raw = section.getStringList("hide-blocks");
@@ -1023,14 +1089,20 @@ public final class AntiXrayConfig {
     // 的 replacement-bands 视为最终意图——写照了却一个合法分段都没有，说明本意就是不要分区伪装；
     // 后果仅是伪装分布不再随高度分层（外观问题），不会让任何方块漏伪装（隐藏清单与权重表照旧生效）。
     List<ReplacementBand> bands = section.contains("replacement-bands")
-        ? parseBands(section.getMapList("replacement-bands")) : fallback.replacementBands();
-    int minY = section.contains("min-y") ? section.getInt("min-y") : fallback.minY();
-    int maxY = section.contains("max-y") ? section.getInt("max-y") : fallback.maxY();
+        ? parseBands(section.getMapList("replacement-bands"), path + ".replacement-bands",
+            typeAdjustments)
+        : fallback.replacementBands();
+    // 宽松解析：getInt 会把带引号的 "64" 与浮点静默当成 0，把高度范围收窄成 [0,0]；
+    // 这里改用宽松解析，解析失败/类型不符时保持回落值（内置默认 = 不限制）并一次性告警
+    Integer minY = lenientYValue(section.get("min-y"), path + ".min-y", typeAdjustments);
+    Integer maxY = lenientYValue(section.get("max-y"), path + ".max-y", typeAdjustments);
     ObfuscationMode mode = section.contains("mode")
         ? obfuscationMode(section.getString("mode")) : fallback.mode();
     boolean useBlockBelow = section.contains("use-block-below")
         ? section.getBoolean("use-block-below") : fallback.useBlockBelow();
-    return new EffectiveObfuscation(hideBlocks, weights, bands, minY, maxY, mode, useBlockBelow);
+    return new EffectiveObfuscation(hideBlocks, weights, bands,
+        minY == null ? fallback.minY() : minY, maxY == null ? fallback.maxY() : maxY,
+        mode, useBlockBelow);
   }
 
   /**
@@ -1066,20 +1138,28 @@ public final class AntiXrayConfig {
    *
    * <p>每段形如 {@code {min-y: -64, max-y: -1, weights: {deepslate: 10, ...}}}；min-y/max-y 缺省时
    * 分别视为「负无穷/正无穷」。min &gt; max 的段（矛盾配置）直接丢弃——空段比错误段更安全。
+   * 段内的 min-y/max-y 与维度段同口径宽松解析（带引号的数字按数字解析；类型不符时保持「不限制」
+   * 并一次性告警），避免 YAML 写法错误让整段悄悄变成「覆盖全部高度」。
    *
    * <p><b>weights 的键不做 tag(...) 展开</b>（与 {@code replacement-weights} 不同）：分区表里的键
    * 会被当作最终方块名参与伪装分布，用户随手写 {@code tag(...)} 时若静默丢弃整段，管理员会以为已经
    * 分层。因此这里把无法识别的键名原样保留——它会在构建世界档案时解析失败并被跳过（少一个候选，
    * 不会误藏），同时不像丢弃整段那样改变分区结构。
    */
-  private static List<ReplacementBand> parseBands(List<Map<?, ?>> raw) {
+  private static List<ReplacementBand> parseBands(List<Map<?, ?>> raw, String path,
+      List<String> typeAdjustments) {
     if (raw == null || raw.isEmpty()) {
       return List.of();
     }
     List<ReplacementBand> bands = new ArrayList<>(raw.size());
-    for (Map<?, ?> entry : raw) {
-      int minY = entry.get("min-y") instanceof Number number ? number.intValue() : Integer.MIN_VALUE;
-      int maxY = entry.get("max-y") instanceof Number number ? number.intValue() : Integer.MAX_VALUE;
+    for (int index = 0; index < raw.size(); index++) {
+      Map<?, ?> entry = raw.get(index);
+      String bandPath = path + "[" + index + "]";
+      // 与维度段同口径：带引号的数字/字符串按数字解析；类型不符时保持「不限制」并一次性告警
+      Integer bandMinY = lenientYValue(entry.get("min-y"), bandPath + ".min-y", typeAdjustments);
+      Integer bandMaxY = lenientYValue(entry.get("max-y"), bandPath + ".max-y", typeAdjustments);
+      int minY = bandMinY == null ? Integer.MIN_VALUE : bandMinY;
+      int maxY = bandMaxY == null ? Integer.MAX_VALUE : bandMaxY;
       if (minY > maxY) {
         continue;
       }
@@ -1104,11 +1184,12 @@ public final class AntiXrayConfig {
 
   /**
    * 解析逐世界覆盖段（最高优先级）：每个键是世界名模式（精确名或含 {@code *} 的通配），
-   * 值直接是该世界要覆盖的子键（hide-blocks / replacement-weights / replacement-bands /
-   * min-y / max-y / mode / use-block-below）。未出现的键保持 {@code null}（回落该世界所属维度）。
+   * 值直接是该世界要覆盖的子键（enabled / hide-blocks / replacement-weights / replacement-bands /
+   * min-y / max-y / mode / use-block-below）。未出现的键保持 {@code null}（回落该世界所属维度）；
+   * enabled 的类型不符时同样保持 null（沿用维度）并记入一次性告警，绝不静默当成 false。
    */
   private static List<WorldOverride> parseWorldOverrides(ConfigurationSection section,
-      Set<String> unknownTags) {
+      Set<String> unknownTags, List<String> typeAdjustments) {
     if (section == null) {
       return List.of();
     }
@@ -1120,6 +1201,10 @@ public final class AntiXrayConfig {
       }
       // 通配模式预编译为正则（'*' → 任意字符序列）；不含 '*' 时走精确名比较，无需匹配器
       Pattern glob = compileGlob(pattern);
+      // 覆盖键的完整路径（仅用于类型不符时的告警文案，让服主能一眼定位到哪一行）
+      String path = "world-overrides." + pattern;
+      // enabled：可覆盖所属维度的启用开关；缺省 null = 沿用维度（绝不静默当成 false）
+      Boolean enabled = lenientBoolean(world, "enabled", path + ".enabled", typeAdjustments);
 
       List<String> hideBlocks = null;
       if (world.contains("hide-blocks")) {
@@ -1142,18 +1227,106 @@ public final class AntiXrayConfig {
         }
       }
       List<ReplacementBand> replacementBands = world.contains("replacement-bands")
-          ? parseBands(world.getMapList("replacement-bands")) : null;
-      Integer minY = world.contains("min-y") ? world.getInt("min-y") : null;
-      Integer maxY = world.contains("max-y") ? world.getInt("max-y") : null;
+          ? parseBands(world.getMapList("replacement-bands"), path + ".replacement-bands",
+              typeAdjustments)
+          : null;
+      // 与维度段同口径的宽松解析；类型不符时保持 null（沿用所属维度），不会被当成 0 收窄高度
+      Integer minY = lenientYValue(world.get("min-y"), path + ".min-y", typeAdjustments);
+      Integer maxY = lenientYValue(world.get("max-y"), path + ".max-y", typeAdjustments);
       ObfuscationMode mode = world.contains("mode")
           ? obfuscationMode(world.getString("mode")) : null;
       Boolean useBlockBelow = world.contains("use-block-below")
           ? world.getBoolean("use-block-below") : null;
 
-      overrides.add(new WorldOverride(pattern, glob, hideBlocks, replacementWeights,
+      overrides.add(new WorldOverride(pattern, glob, enabled, hideBlocks, replacementWeights,
           replacementBands, minY, maxY, mode, useBlockBelow));
     }
     return List.copyOf(overrides);
+  }
+
+  /**
+   * 宽松解析高度键（{@code min-y} / {@code max-y}）的原始值。
+   *
+   * <p><b>为什么不用 {@code ConfigurationSection#getInt}</b>：类型化 getter 只认 YAML 的整数节点，
+   * 写成带引号的数字（{@code "64"}）或浮点（{@code 64.0}）时会静默返回调用方给的默认值 0——高度范围
+   * 于是被悄悄收窄成 {@code [0,0]}，该世界几乎不再伪装，日志里却没有任何提示。这里接受整数、长整数与
+   * 可带正负号的十进制数字字符串；其它类型或无法解析时返回 null（= 该键不限制高度，调用方按回落值
+   * 处理），并把键与原始值记进 {@code typeAdjustments}，由加载路径一次性 WARN（绝不静默改配置）。
+   *
+   * @param raw              YAML 原始值（{@code ConfigurationSection#get} 或 map 的取值）
+   * @param path             键的完整路径，用于告警定位（如 {@code dimensions.normal.min-y}）
+   * @param typeAdjustments 类型不符明细的收集器
+   * @return 解析出的高度；键缺失/留空/类型不符时为 null
+   */
+  private static Integer lenientYValue(Object raw, String path, List<String> typeAdjustments) {
+    if (raw == null) {
+      return null; // 键缺失或留空 = 不限制（与「没写」同义，不告警）
+    }
+    Long value = integralValue(raw);
+    if (value == null || value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
+      typeAdjustments.add(path + "=" + describe(raw) + "（类型不符，已按不限制处理）");
+      return null;
+    }
+    return value.intValue();
+  }
+
+  /**
+   * 把 YAML 原始值转成整数：只接受整数类型（Integer / Long / Short / Byte）与十进制数字字符串
+   * （可带正负号）；浮点、布尔、列表等一律返回 null（由 {@link #lenientYValue} 告警并回落）。
+   */
+  private static Long integralValue(Object raw) {
+    if (raw instanceof Integer || raw instanceof Long || raw instanceof Short
+        || raw instanceof Byte) {
+      return ((Number) raw).longValue();
+    }
+    if (raw instanceof String text) {
+      String trimmed = text.trim();
+      if (trimmed.isEmpty()) {
+        return null;
+      }
+      try {
+        return Long.parseLong(trimmed);
+      } catch (NumberFormatException ignored) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /** 告警里回显原始值的写法（字符串加引号，便于服主看出「多写了一对引号」）。 */
+  private static String describe(Object raw) {
+    return raw instanceof String text ? "\"" + text + "\"" : String.valueOf(raw);
+  }
+
+  /**
+   * 宽松解析布尔开关（{@code world-overrides.<世界>.enabled}）。
+   *
+   * <p>接受 YAML 布尔与 {@code "true"} / {@code "false"} 字符串（大小写不敏感、去首尾空白）；
+   * 其它类型返回 null（= 沿用所属维度）并记进 {@code typeAdjustments}。这里刻意不走
+   * {@code getBoolean}：它对类型不符的取值同样静默返回默认值，会让「本想关闭」的世界悄悄保持启用。
+   */
+  private static Boolean lenientBoolean(ConfigurationSection section, String key, String path,
+      List<String> typeAdjustments) {
+    if (!section.contains(key)) {
+      return null;
+    }
+    Object raw = section.get(key);
+    if (raw instanceof Boolean value) {
+      return value;
+    }
+    if (raw instanceof String text) {
+      String trimmed = text.trim();
+      if ("true".equalsIgnoreCase(trimmed)) {
+        return Boolean.TRUE;
+      }
+      if ("false".equalsIgnoreCase(trimmed)) {
+        return Boolean.FALSE;
+      }
+    }
+    if (raw != null) {
+      typeAdjustments.add(path + "=" + describe(raw) + "（类型不符，已忽略该覆盖，沿用所属维度）");
+    }
+    return null;
   }
 
   /**
@@ -1378,17 +1551,28 @@ public final class AntiXrayConfig {
    * 配置项被安全下限抬升或被安全上限回落时的<b>一次性</b>中文 WARN（进程级闸门 {@code once} 只提示一次）。
    *
    * <p><b>为什么必须提示</b>：生效值与管理员的 yml 不一致，若不说明，管理员会以为「配的还是我写的值」，
-   * 或反过来怀疑插件读错配置。这里分两条分别给出被抬升 / 被回落的键与原因（下限指向「玩家看得见假方块」，
-   * 上限指向「扫描量 O(r²) 拖垮主线程 / 缓存把内存打满」）。
+   * 或反过来怀疑插件读错配置。这里分三条分别给出被抬升 / 被回落 / 类型不符的键与原因（下限指向
+   * 「玩家看得见假方块」，上限指向「扫描量 O(r²) 拖垮主线程 / 缓存把内存打满」，类型不符指向
+   * 「高度键被静默当成 0 而使伪装范围收窄」）。
    *
    * @param once 进程级一次性闸门（同一实例重复 reload 不会重复刷屏）
    */
   public void warnIfConfigAdjusted(Logger logger, AtomicBoolean once) {
-    if (logger == null || (floorAdjustments.isEmpty() && ceilingAdjustments.isEmpty())) {
+    if (logger == null
+        || (floorAdjustments.isEmpty() && ceilingAdjustments.isEmpty()
+            && typeAdjustments.isEmpty())) {
       return;
     }
     if (!once.compareAndSet(false, true)) {
       return;
+    }
+    // 类型不符：getInt/getBoolean 会静默取默认值（0 / false），这里改为一次性点名并说明已按安全默认处理
+    if (!typeAdjustments.isEmpty()) {
+      logger.warning("antixray.yml 的 " + String.join("、", typeAdjustments) + "。"
+          + "类型不符的键已按更安全的默认值处理：高度键不再限制高度（world-overrides 里则回落所属维度），"
+          + "enabled 沿用所属维度。旧实现会把带引号或浮点的高度静默当成 0，"
+          + "使高度范围被收窄成 [0,0]，该世界几乎不再伪装；"
+          + "请写成不带引号的整数，例如 min-y: -64、max-y: 320，开关写成 enabled: false。");
     }
     if (!floorAdjustments.isEmpty()) {
       logger.warning("antixray.yml 的 " + String.join("、", floorAdjustments) + " 低于安全下限，已按下限生效"
@@ -1416,6 +1600,11 @@ public final class AntiXrayConfig {
   /** 被安全上限回落过的配置键明细（空列表 = 未回落）；供诊断回显。 */
   public List<String> ceilingAdjustments() {
     return ceilingAdjustments;
+  }
+
+  /** 高度键/覆盖开关类型不符、已按安全默认值处理的明细（空列表 = 无）；供诊断回显与单测。 */
+  public List<String> typeAdjustments() {
+    return typeAdjustments;
   }
 
   /** 逐世界覆盖段（声明序）；空列表 = 无覆盖。 */
@@ -1454,13 +1643,85 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 反矿透是否应作用于该世界：总开关开启 <b>且</b> 该世界不在世界黑名单内（见 {@link WorldBlacklistConfig}）。
+   * 逐世界 {@code enabled} 覆盖的缓存值。
+   *
+   * <p>{@link ConcurrentHashMap} 不能存 null，而「没有匹配到覆盖段」与「匹配到了但没写 enabled」都表示
+   * 「沿用维度」，故用三态枚举把它们与显式的 true / false 区分开。
+   */
+  private enum OverrideEnabled {
+    /** 没有匹配到覆盖段，或匹配到的覆盖段没写 enabled（= 沿用所属维度）。 */
+    ABSENT,
+    /** 覆盖段显式启用。 */
+    ENABLED,
+    /** 覆盖段显式关闭。 */
+    DISABLED
+  }
+
+  /**
+   * 「某世界是否启用反矿透」的统一判定。
+   *
+   * <p>优先级（高 → 低）：总开关 {@link #enabled()} / 世界黑名单（{@link WorldBlacklistConfig}）→
+   * {@code world-overrides.<世界>.enabled}（非 null 时）→ {@code dimensions.<维度>.enabled}。
+   * <b>黑名单仍然最高优先</b>：名单内的世界即使覆盖段写了 {@code enabled: true} 也不会启用
+   * （要重新启用须先从黑名单移除）。
+   *
+   * @param dimension 该世界所属维度；传 {@code null} 表示只判「世界级」开关（拿不到维度时用，见
+   *                  {@link #antiXrayAppliesTo(String)}）
+   */
+  public boolean enabledForWorld(String worldName, Dimension dimension) {
+    if (!enabled || WorldBlacklistConfig.isBlacklistedNow(worldName)) {
+      return false;
+    }
+    Boolean override = overrideEnabled(worldName);
+    if (override != null) {
+      return override;
+    }
+    return dimension == null || dimensionEnabled[dimension.ordinal()];
+  }
+
+  /**
+   * 反矿透是否应作用于该世界：总开关开启 <b>且</b> 该世界不在世界黑名单内 <b>且</b> 未被
+   * {@code world-overrides.<世界>.enabled: false} 关闭。
    *
    * <p><b>这是所有反矿透入口（区块改写、邻近显形、事件即时显形、方块变更观察）统一的判定出口</b>——
-   * 各处不得自行重复实现匹配逻辑。黑名单现在是独立配置，对反矿透与带宽优化<b>同时</b>生效。
+   * 各处不得自行重复实现匹配逻辑。黑名单现在是独立配置，对反矿透与带宽优化<b>同时</b>生效，
+   * 且优先级高于 world-overrides。
+   *
+   * <p>封包入口只拿得到世界名、拿不到维度，故这里<b>不</b>判维度开关；维度开关在构建世界档案时生效
+   * （维度关闭 ⇒ 档案为空；覆盖段未写 enabled 时沿用维度值，见 {@link #overrideEffective}）。
    */
   public boolean antiXrayAppliesTo(String worldName) {
-    return enabled && !WorldBlacklistConfig.isBlacklistedNow(worldName);
+    return enabledForWorld(worldName, null);
+  }
+
+  /**
+   * 取某世界的覆盖开关：匹配到的覆盖段显式写了 {@code enabled} 时返回其值，否则返回 null
+   * （= 沿用所属维度）。
+   *
+   * <p>结果按世界名缓存。没有<b>任何</b>覆盖段写 enabled（默认配置）时直接返回 null，让
+   * {@link #antiXrayAppliesTo} 保持「总开关 + 黑名单」的 O(1) 快路径，不给每个区块封包增加
+   * 字符串/正则匹配；只有在确有 enabled 覆盖时，才为首次见到的世界名匹配一次并缓存。
+   */
+  private Boolean overrideEnabled(String worldName) {
+    if (!hasEnabledOverride || worldName == null) {
+      return null;
+    }
+    OverrideEnabled cached = overrideEnabledCache.get(worldName);
+    if (cached == null) {
+      int index = matchOverride(worldName);
+      Boolean value = index < 0 ? null : worldOverrides.get(index).enabled();
+      cached = value == null ? OverrideEnabled.ABSENT
+          : (value ? OverrideEnabled.ENABLED : OverrideEnabled.DISABLED);
+      // 上界保护：超限整体清空，只让下一次多匹配一遍字符串，不影响正确性
+      if (overrideEnabledCache.size() >= OVERRIDE_ENABLED_CACHE_MAX) {
+        overrideEnabledCache.clear();
+      }
+      overrideEnabledCache.put(worldName, cached);
+    }
+    if (cached == OverrideEnabled.ABSENT) {
+      return null;
+    }
+    return cached == OverrideEnabled.ENABLED;
   }
 
   /** 是否对同一高度层统一使用同一种伪装方块。 */

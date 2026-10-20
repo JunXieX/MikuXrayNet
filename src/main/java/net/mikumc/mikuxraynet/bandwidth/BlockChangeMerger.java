@@ -508,7 +508,17 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
     // 世界黑名单：命中世界不做任何带宽优化（变更合并一并跳过，原包照常放行）。
     // 名单为空（默认）时 isBlacklistedNow 直接早退，热路径近乎零开销。
-    String worldName = player.getWorld().getName();
+    //
+    // 封包线程读 player.getWorld() 属跨线程读取（Folia 上是跨区域读实体状态），异常一律 fail-open
+    // 直通：取不到世界名就无法判定黑名单与跨世界，此时绝不把变更包卡进缓冲，原包原样放行。
+    String worldName;
+    try {
+      worldName = player.getWorld().getName();
+    } catch (Throwable ignored) {
+      // 无法判定世界：直通（原包照常下发，不入缓冲、不登记延迟）
+      stats.blockChangesPassed.increment();
+      return;
+    }
     if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       return;
     }
@@ -526,6 +536,28 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     AsyncMarker marker = event.getAsyncMarker();
     if (marker == null) {
       return;
+    }
+
+    // 解析前短路：MULTI_BLOCK_CHANGE 的坐标数直接由坐标数组长度得出，无需先把整包解析成
+    // List<Update<WrappedBlockData>>（每坐标一个 WrappedBlockData + 一个 Update 记录 + ArrayList 扩容）。
+    // 反矿透显形包常有数十到数千个坐标，若先解析再判 bypassesMerge 直通，这份分配在封包线程上纯属浪费，
+    // 多人同时显形时是可见的 GC 抖动源。
+    // 短路条件里的 pending 为空，等价于原路径的「直通 + rememberDelivered 空操作」：没有待发缓冲就不存在
+    // 会被旧态覆盖的条目。读不到坐标数组时跳过短路，退回下面的完整解析路径（fail-open）。
+    // 注意：此处不替代后面的 bypassesMerge 分支——本玩家已有 Pending 时仍须解析出坐标去记覆盖标记。
+    if (event.getPacketType() == PacketType.Play.Server.MULTI_BLOCK_CHANGE) {
+      short[] coordShorts;
+      try {
+        coordShorts = event.getPacket().getShortArrays().readSafely(0);
+      } catch (Throwable ignored) {
+        // 读不出坐标数组：跳过短路，走原路径（由 readUpdates 自行 fail-open）
+        coordShorts = null;
+      }
+      if (coordShorts != null && bypassesMerge(true, coordShorts.length)
+          && pending.get(player.getUniqueId()) == null) {
+        stats.blockChangesPassed.increment();
+        return;
+      }
     }
 
     List<Update<WrappedBlockData>> updates = readUpdates(event.getPacketType(), event.getPacket());

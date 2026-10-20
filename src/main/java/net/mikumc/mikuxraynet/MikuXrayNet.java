@@ -95,8 +95,20 @@ public final class MikuXrayNet extends JavaPlugin {
     // （默认不可见，需要排查时打开调试日志即可）；任何功能不可用 / 降级 / 失败都会由各自模块打 WARNING。
     getLogger().fine("运行平台：" + PlatformSupport.platformDescription());
     this.runtime = new AntiXrayRuntime(this, occlusionStats);
-    runtime.startBypassRegistry();
-    runtime.startAntiXray();
+    // 反矿透装配失败绝不能让整个插件启用失败：带宽模块与命令与它相互独立，必须照常可用。
+    // 旧实现让异常直接冒出 onEnable —— 此时 ProtocolLib 拦截、线程池、磁盘缓存可能已装配，
+    // 却永远不会执行 stopForDisable()，线程/文件句柄全部泄漏，且 Bukkit 会把整个插件判为启用失败。
+    try {
+      runtime.startBypassRegistry();
+      runtime.startAntiXray();
+    } catch (Throwable throwable) {
+      getLogger().log(Level.WARNING, "反矿透模块装配失败（带宽优化与管理命令仍可用）", throwable);
+      try {
+        runtime.stopForDisable();
+      } catch (Throwable cleanupFailure) {
+        getLogger().log(Level.WARNING, "反矿透模块清理失败（可能残留线程/句柄，建议重启）", cleanupFailure);
+      }
+    }
     startBandwidth();
     new CommandRegistrar(this).register();
     startDiagnosticsTask();

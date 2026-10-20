@@ -387,7 +387,10 @@ class DiskCacheStoreTest {
 
     BufferedLinearV3Format.Entry[] slots =
         new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
-    slots[slot] = new BufferedLinearV3Format.Entry(0L, System.currentTimeMillis(), configHash, data);
+    // 条目里的指纹与生产写入侧同源：配置指纹混入原始世界名（见 DiskCacheStore#mixWorldName）。
+    // 本用例验证的是「旧压缩方案（0x01 Deflate）仍可读」，与指纹口径无关，故只同步这一处。
+    slots[slot] = new BufferedLinearV3Format.Entry(0L, System.currentTimeMillis(),
+        DiskCacheStore.mixWorldName(WORLD, configHash), data);
     byte[] raw = BufferedLinearV3Format.encodeBucket(slots, seed);
     byte[] deflated = deflate(raw);
 

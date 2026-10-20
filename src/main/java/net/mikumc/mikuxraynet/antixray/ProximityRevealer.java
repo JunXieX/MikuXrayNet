@@ -409,6 +409,22 @@ public final class ProximityRevealer implements Listener {
 
   /** 停用：注销任务与事件监听，并清空两个显形索引（不留副作用）。 */
   public void stop() {
+    stop(true);
+  }
+
+  /**
+   * 停止巡检并注销事件监听。
+   *
+   * <p><b>{@code clearIndexes} 必须区分「停用」与「热重载」</b>：{@code chunkIndex} 与
+   * {@code revealedSet} 是<b>与改写链路共享</b>的结构，且只在该区块封包被下发时写入
+   * （{@code ProtocolLibAsyncListener#writeBack}）。热重载不会让服务端重发已加载区块，因此若在
+   * reload 时清空它们，这些区块里的伪装坐标就永久失联：玩家眼前本该被「邻近显形」还原的矿物会一直
+   * 显示成假方块，直到该区块因走远/重登/切维度被重新下发。故热重载路径必须传 {@code false}——
+   * 只停任务、保留数据；只有插件停用（或配置把 proximity 关掉）时才清空以释放内存。
+   *
+   * @param clearIndexes 是否同时清空「按区块共享的伪装索引 / 按玩家的已显形集合 / 回显记号」
+   */
+  public void stop(boolean clearIndexes) {
     // 先置闸再取消：在途的 scheduleEntityTask（Folia start() 遍历 / 并发 onJoin）会在入表后复查并自行取消，
     // 否则该句柄无人知晓、任务空转到实体退役并钉住本实例。
     stopping = true;
@@ -422,9 +438,11 @@ public final class ProximityRevealer implements Listener {
     }
     entityScans.clear();
     HandlerList.unregisterAll(this);
-    chunkIndex.clear();
-    revealedSet.clear();
-    revealEcho.clear();
+    if (clearIndexes) {
+      chunkIndex.clear();
+      revealedSet.clear();
+      revealEcho.clear();
+    }
   }
 
   /** 在玩家所属线程上启动周期巡检并保存句柄与分片计数（调度失败则无句柄可存）。 */
@@ -696,8 +714,17 @@ public final class ProximityRevealer implements Listener {
     int keptCount = 0;
     int frustumCulled = 0;
     int rayCulled = 0;
+    // 判定次数上限：可见性判定（视锥 + 遮挡位图射线）是本轮最贵的一段，必须与发包侧同一个上界，
+    // 否则「单次上限」只限制了发包数、没有限制判定数——工作线程会为一个周期内根本发不出去的候选
+    // 白跑射线（默认配置下候选 512 个、发包上限 256，等于约一半的射线纯浪费）。
+    int evaluationsLeft = MAX_EVALUATIONS_PER_PASS;
 
     for (int i = 0; i < count; i++) {
+      if (evaluationsLeft <= 0) {
+        // 额度用尽：剩余候选留到下一轮（它们在索引里，不会丢），本轮不再付出判定成本
+        break;
+      }
+      evaluationsLeft--;
       int x = coordinates[i * 3];
       int y = coordinates[i * 3 + 1];
       int z = coordinates[i * 3 + 2];
@@ -794,6 +821,23 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
+   * 当前线程是否拥有该区块（Folia 区域化线程模型的访问前置条件）。
+   *
+   * <p>非 Folia 恒为 {@code true}（单主线程，不存在跨 region 问题）；判定本身抛异常时按
+   * <b>「不拥有」</b>处理——宁可少显形一个坐标，也绝不跨 region 读世界（那会触发 TickThread 校验）。
+   */
+  private static boolean ownsChunk(World world, int chunkX, int chunkZ) {
+    if (!PlatformSupport.isFolia()) {
+      return true;
+    }
+    try {
+      return Bukkit.isOwnedByCurrentRegion(world, chunkX, chunkZ);
+    } catch (Throwable throwable) {
+      return false;
+    }
+  }
+
+  /**
    * 单个坐标：区块未加载则跳过、不可见则跳过，否则读真实方块；批量模式累积、否则立即发包并标记。
    *
    * @param visibilityInPlan 可见性是否已在工作线程按遮挡位图判完（见 {@link #sendCandidates}）；
@@ -802,6 +846,16 @@ public final class ProximityRevealer implements Listener {
    */
   private void sendOne(Player player, World world, int x, int y, int z, ProximitySelector.Eye eye,
       Budget budget, PassTally tally, RevealBatch batch, boolean visibilityInPlan) {
+    // Folia 线程纪律：本方法运行在<b>玩家所属</b> region 线程上，但候选坐标可能远至
+    // proximity.distance（默认 96 格 = 6 个区块）——那些区块可能属于另一个 region。跨 region 调
+    // world.isChunkLoaded / world.getBlockData 会触发 Folia 的 TickThread 校验（先打一条 ERROR 日志
+    // 再抛异常）：异常虽会被下面的 catch 吞掉，但后果是「玩家看得见的假方块永远不会被还原」
+    // （少显形 = 安全方向错误），且每次抓取刷一条 ERROR。与 NeighborChunkProvider 同一处理口径：
+    // 先问归属，不属于本 region 就跳过——该坐标留在索引里，下一轮巡检在本 region 接管后仍会补上。
+    if (!ownsChunk(world, x >> 4, z >> 4)) {
+      stats.revealsSkipped.increment();
+      return;
+    }
     if (!world.isChunkLoaded(x >> 4, z >> 4)) {
       // 区块未加载：本次跳过，坐标留在索引里等玩家真正靠近
       stats.revealsSkipped.increment();
@@ -1470,7 +1524,8 @@ public final class ProximityRevealer implements Listener {
           cx, cy, cz, radius)) {
         return;
       }
-      if (!world.isChunkLoaded(cx >> 4, cz >> 4)) {
+      // 与周期路径同一 Folia 纪律：先判 region 归属，再问区块是否加载（跨 region 读会触发 TickThread 校验）
+      if (!ownsChunk(world, cx >> 4, cz >> 4) || !world.isChunkLoaded(cx >> 4, cz >> 4)) {
         return;
       }
 
@@ -1564,7 +1619,7 @@ public final class ProximityRevealer implements Listener {
             cx, cy, cz, radius)) {
           continue;
         }
-        if (!world.isChunkLoaded(cx >> 4, cz >> 4)) {
+        if (!ownsChunk(world, cx >> 4, cz >> 4) || !world.isChunkLoaded(cx >> 4, cz >> 4)) {
           continue;
         }
         for (int o = 0; o < offsets.length; o++) {

@@ -149,7 +149,19 @@ public class Chunk implements AutoCloseable {
         this.scratch.keepOutputCapacity(out.capacity());
         return Arrays.copyOfRange(array, out.arrayOffset(), out.arrayOffset() + readable);
       } catch (IndexOutOfBoundsException overflow) {
-        // 源区间已在入口校验 ⇒ 此处越界一定来自输出缓冲区写满（唯一允许重试的情形，与真损坏无关）。
+        // 源区间已在入口校验，因此「输出写满」是唯一允许重试的情形。但**不能把所有越界都当成写满**：
+        // 编码链路自身（调色板 id 越界、位宽/长度不一致等）也会抛 IndexOutOfBoundsException，若一并
+        // 当成容量不足，就会反复翻倍重写到 64 MiB 才放弃——既掩盖真正的编码 BUG、又把报错文案带偏，
+        // 还会在大区块上产生一次数十 MB 的瞬时分配。故只在「剩余可写空间已经很小」时才判定为写满。
+        // 判据用 Netty 自己的溢出消息（{@code ensureWritable0} 只在容量不足时抛出
+        // "writerIndex(...) + minWritableBytes(...) exceeds maxCapacity(...)"）：
+        // 它精确对应「输出写满」，而编码链路自身的越界（调色板 id、位宽/长度不一致）不会带这条消息。
+        // 只看「剩余空间 <= N 字节」会误判——一次 section 写入可能还需要几千字节。
+        String message = overflow.getMessage();
+        boolean outOfSpace = message != null && message.contains("exceeds maxCapacity");
+        if (!outOfSpace) {
+          throw overflow; // 编码逻辑越界：按失败上抛，由封包链路 fail-open 放行原包
+        }
         // 扩容重写只会在「输出超过该线程历史最大长度」时发生，稳态下不再触发。
         if (out.capacity() >= ChunkScratch.MAX_OUTPUT_CAPACITY) {
           // 已达绝对上限：绝不继续翻倍（否则会指数膨胀到 OOM，而 OOM 是 Error、不被上层
@@ -229,6 +241,18 @@ public class Chunk implements AutoCloseable {
 
   private void skipBiomePalettedContainer() {
     int bitsPerValue = this.inputBuffer.readUnsignedByte();
+
+    // 群系容器只有 4×4×4 = 64 格，位宽上限就是 8（每 long 至少容纳 8 项）。1.18+ 的间接调色板最多
+    // 3 位，4..8 位是直接位打包；再大必然是解析错位或格式漂移。
+    //
+    // 为什么必须在此显式拒绝：目标版本（26.2）已经没有 long 数组长度字段可供交叉校验，若按公式
+    // 「算出长度后静默跳过」，一旦错位就会被跳过错误字节数，后面所有 section 随之错位。而错位处
+    // 大多是 0 字节，会被解析成「合法的空 section」——于是整块不抛异常、不改写，矿物原样下发给
+    // 透视端，chunksFailed 仍是 0、日志无任何异常，完全不可观测。这是本插件最严重的失效模式。
+    if (bitsPerValue > 8) {
+      throw new IllegalArgumentException(
+          "biome paletted container bitsPerValue " + bitsPerValue + " 超出上限 8（疑似解析错位）");
+    }
 
     if (bitsPerValue == 0) {
       ByteBufUtil.readVarInt(this.inputBuffer);

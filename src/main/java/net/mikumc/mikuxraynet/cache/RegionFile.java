@@ -12,6 +12,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.LinkedHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
+import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 
 /**
  * 单个区域缓存文件（{@code r.<regionX>.<regionZ>.b_linear}）的读写句柄，格式见 {@link BufferedLinearV3Format}。
@@ -40,6 +41,14 @@ final class RegionFile implements AutoCloseable {
   private static final AtomicBoolean LOCK_WARNING = new AtomicBoolean();
 
   /**
+   * 「压缩预算不足、本次压缩已跳过」的 WARN 只打一次。
+   *
+   * <p>该状态会随每轮维护复现（垃圾占比仍在阈值以上，文件仍被选中），逐轮打印会把日志刷满；
+   * 一次性提示足以让服主知道「有文件因预算上限没被回收」，并据此调整配置或清理文件。
+   */
+  private static final AtomicBoolean COMPACT_BUDGET_WARNING = new AtomicBoolean();
+
+  /**
    * 桶头声明的 {@code rawLength} 相对<b>整文件大小</b>的许可倍数上限。
    *
    * <p><b>为什么要这道闸</b>：{@code rawLength} 直接来自（可能损坏/被篡改的）文件，解压会按它先分配原始
@@ -55,15 +64,51 @@ final class RegionFile implements AutoCloseable {
   private static final long MAX_RAW_LENGTH_RATIO = 1024L;
 
   /**
-   * 单次 {@link #compact} 允许累计解压的原始字节上限（256 MiB）。
+   * 单次 {@link #compact} 允许累计解压的原始字节<b>保底预算</b>（256 MiB）。
    *
    * <p>压缩要先把全部槽位记录载入内存（见 {@link #compact} 的内存尖峰说明）。即便每条记录都通过了
-   * {@link #MAX_RAW_LENGTH_RATIO} 钳制，全部记录叠加仍可能很大；这里对「累计解压字节」再加一道总量闸：
-   * 超限即中止本次压缩、直接抛异常（此时尚未创建临时文件，原文件毫发无损，交由调用方走既有安全路径）。
-   * 取值依据：合法文件的活动数据受 {@code max-file-size-mb}（默认远小于此）与逐条目负载上限共同约束，
-   * 整文件解压后极少超过 256 MiB，故它只拦异常/伪造输入。
+   * {@link #MAX_RAW_LENGTH_RATIO} 钳制，全部记录叠加仍可能很大，因此对「累计解压字节」设一道总量闸。
+   * 256 MiB 是历史取值，现在只作为<b>下限</b>：真实预算按「配置允许的单文件上限」放大，见
+   * {@link #MAX_COMPACT_TOTAL_RAW}。
    */
-  private static final long MAX_COMPACT_TOTAL_RAW = 256L * 1024 * 1024;
+  private static final long MAX_COMPACT_TOTAL_RAW_FLOOR = 256L * 1024 * 1024;
+
+  /**
+   * 压缩预算相对「单文件上限」预留的余量（256 MiB）。
+   *
+   * <p>预算比的是<b>解压后的原始字节</b>，而 {@code max-file-size-mb} 限制的是<b>落盘（压缩后）字节</b>；
+   * 同一份数据的原始量通常大于落盘量，故预算要比单文件上限再宽一些，否则「文件还没到上限」就先被预算
+   * 挡下，垃圾依旧得不到回收。
+   */
+  private static final long MAX_COMPACT_TOTAL_RAW_MARGIN = 256L * 1024 * 1024;
+
+  /**
+   * 压缩预算的<b>硬上限</b>（2 GiB）。
+   *
+   * <p>预算随配置放大，但内存不能被配置无限放大：无论 {@code max-file-size-mb} 怎么调，一次压缩允许
+   * 解压的原始量都不超过此值。超限即<b>放弃本次压缩</b>（不抛异常、不关句柄、不丢脏数据，见
+   * {@link #compact}），文件暂时不回收，但缓存读写与数据完整性不受影响。
+   */
+  private static final long MAX_COMPACT_TOTAL_RAW_HARD_CAP = 2L * 1024 * 1024 * 1024;
+
+  /**
+   * 单次 {@link #compact} 允许累计解压的原始字节上限。
+   *
+   * <p><b>为什么不再固定 256 MiB</b>：固定值低于 {@code disk-cache.max-file-size-mb} 的合法上限
+   * （1024 MB）。区域文件的活动数据一旦超过这个固定值，压缩必然超预算 → 旧实现直接抛异常 → 调用方
+   * （{@code DiskCacheStore#finishCompact}）关闭句柄并丢弃脏数据，而垃圾一条也没回收，于是每 30 秒
+   * 再解压一遍再失败，文件永远回收不掉。预算因此改为<b>从配置派生</b>：以配置允许的最大单文件字节为
+   * 基准再加余量，保证任何合法配置下「单文件达到上限」时压缩都不会因预算被跳过。
+   *
+   * <p><b>为什么取配置的安全上限而不是运行期值</b>：本类的 {@code open} 只接收 {@code bucketCacheSize}，
+   * 运行期的 {@code maxFileSizeBytes} 在 {@code DiskCacheStore} 手里；为透传它而改构造/打开签名会波及
+   * 另一个类，超出本次修复范围。取「配置允许的最大值」是保守方向：配置调小时预算更宽，只会让极端文件
+   * 也能被压缩，绝不会误伤正常文件；真正的内存护栏是 {@link #MAX_COMPACT_TOTAL_RAW_HARD_CAP}。
+   */
+  private static final long MAX_COMPACT_TOTAL_RAW = Math.min(MAX_COMPACT_TOTAL_RAW_HARD_CAP,
+      Math.max(MAX_COMPACT_TOTAL_RAW_FLOOR,
+          AntiXrayConfig.DISK_CACHE_MAX_FILE_SIZE_MB_MAX * 1024L * 1024L
+              + MAX_COMPACT_TOTAL_RAW_MARGIN));
 
   /** 条目的保留判定（用于压缩回收时丢弃过期/旧代次条目）。 */
   @FunctionalInterface
@@ -131,8 +176,15 @@ final class RegionFile implements AutoCloseable {
    * <b>读写全部停用</b>——读一律视为未命中、写一律跳过，只打一次性中文 WARN。
    * <p>这是「两个服务端实例共享同一缓存目录」这一误配下的正确行为：既然锁不在本进程手里，
    * 就不能再读写该文件，否则两个实例会互相踩（旧行为是「只 WARN 后照常读写」）。
+   *
+   * <p><b>为什么必须 volatile</b>：<b>写</b>发生在压缩线程的 {@link #reopenChannel()}（压缩换文件后重开
+   * 通道、重新取锁），<b>读</b>发生在磁盘线程的各入口（{@link #get}/{@link #put}/{@link #clear} 等），
+   * 且这些入口都是先看 {@link #lockUnavailable}、再看 {@link #compacting}——也就是说读它时还没有经过
+   * {@code compacting} 这道 volatile 屏障，两者之间不存在别的 happens-before。若不用 volatile，磁盘线程
+   * 可能长期看到旧值 false，于是「锁已被别的进程抢走」仍被当作可用继续写，两个进程互踩同一份缓存文件。
+   * 声明为 volatile 后，压缩线程的写与磁盘线程的读构成 happens-before，置位一旦完成即对后续读取可见。
    */
-  private boolean lockUnavailable;
+  private volatile boolean lockUnavailable;
   private long fileSize;
   private long liveBytes;
   private long garbageBytes;
@@ -204,6 +256,20 @@ final class RegionFile implements AutoCloseable {
     if (LOCK_WARNING.compareAndSet(false, true)) {
       LOGGER.warning("磁盘缓存区域文件已被其它进程占用，本实例对它的磁盘缓存已停用"
           + "（读视为未命中、写被跳过，功能不受影响）；请勿让两个服务端实例共享同一缓存目录");
+    }
+  }
+
+  /**
+   * 「压缩预算不足、本次压缩已跳过」的中文 WARN 只打一次（见 {@link #COMPACT_BUDGET_WARNING}）。
+   *
+   * <p>提示里给出实测的累计解压字节与预算，便于服主判断是「配置的 max-file-size-mb 太大」还是
+   * 「文件本身异常」——两种情况都只需调配置或清理文件，不必重启服务端。
+   */
+  private static void warnCompactBudgetOnce(long rawBytes) {
+    if (COMPACT_BUDGET_WARNING.compareAndSet(false, true)) {
+      LOGGER.warning("磁盘缓存压缩已跳过：累计解压字节 " + rawBytes + " 超过预算上限 "
+          + MAX_COMPACT_TOTAL_RAW + "（本次不压缩、不关闭句柄、不丢弃脏数据，垃圾留待后续回收）；"
+          + "若长期出现，请调小 disk-cache.max-file-size-mb 或清理对应区域文件");
     }
   }
 
@@ -658,6 +724,14 @@ final class RegionFile implements AutoCloseable {
     if (lockUnavailable) {
       return false; // 该文件归其它进程所有：跳过（不落盘、不报错）
     }
+    if (compacting) {
+      // 与其它入口同一纪律：压缩期间不触碰 slots/loaded。本方法要读 slots/lazyBuckets、可能物化整桶，
+      // 还要用 loaded.get 改 LRU 顺序，而压缩线程正在整体重建这两者；此时清一个槽位，压缩线程随后
+      // 用自己那份快照重建 slots，刚清掉的条目又回来了，甚至把 slots 覆盖成空桶。
+      // 返回 false 表示「本次没清掉」：调用方的条目计数因此不扣（与「没清」一致），陈旧条目留到压缩
+      // 结束后的落盘/回收处理（fail-open，绝不为了清一条而打乱压缩）。
+      return false;
+    }
     int bucket = bucketIndex(chunkIndex);
     BufferedLinearV3Format.Entry[] bucketSlots = slots[bucket];
     if (bucketSlots == null) {
@@ -779,13 +853,17 @@ final class RegionFile implements AutoCloseable {
       BufferedLinearV3Format.Entry[][] all =
           new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_COUNT][];
       // 累计解压字节的记账数组：即使每条记录都过了 rawLength 钳制，全部记录叠加仍可能过大，
-      // 因此再加一道总量闸。超限即在此抛异常——此刻临时文件尚未创建，原文件毫发无损。
+      // 因此再加一道总量闸。超限时<b>放弃本次压缩</b>而不是抛异常：抛异常会让调用方
+      // （DiskCacheStore#finishCompact）关闭句柄并丢弃脏数据，而垃圾一条也没回收，下一轮维护又会重新
+      // 解压到超限、再次失败——文件永远回收不掉。放弃则只做「复位」：compact 的 finally 清掉 compacting，
+      // 句柄、内存态与脏数据原样保留，缓存读写与数据完整性都不受影响；垃圾留到配置调小、文件变小或
+      // 条目过期之后再回收（此时同样只打一次 WARN，见 warnCompactBudgetOnce）。
       long[] compactRawBudget = {0L};
       for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
         all[bucket] = ensureLoaded(bucket, compactRawBudget);
         if (compactRawBudget[0] > MAX_COMPACT_TOTAL_RAW) {
-          throw new IOException("压缩回收累计解压字节 " + compactRawBudget[0]
-              + " 超过上限 " + MAX_COMPACT_TOTAL_RAW + "，已中止本次压缩（保持原文件不变）");
+          warnCompactBudgetOnce(compactRawBudget[0]);
+          return 0;
         }
       }
 
@@ -961,6 +1039,14 @@ final class RegionFile implements AutoCloseable {
   @Override
   public void close() throws IOException {
     if (closed) {
+      return;
+    }
+    if (compacting) {
+      // 与其它入口同一纪律：压缩期间不触碰 slots/loaded。close 会 flushDirty（读槽位数组、写偏移表）
+      // 并关闭 channel，而压缩线程正拿这条 channel 做 force / 换文件 / reopenChannel；此刻关它会让压缩
+      // 半途失败，甚至把压缩线程刚重建的 slots 覆盖成空桶（closeQuietly 之后句柄永久失效）。
+      // 这里直接返回且<b>不置 closed</b>：句柄保持可用，等压缩结束（compacting 复位）后由后续的 close
+      // 正常收尾，不会漏关；调用方（DiskCacheStore）本就会跳过压缩中的句柄，这里只是把同一纪律落到实处。
       return;
     }
     closed = true;

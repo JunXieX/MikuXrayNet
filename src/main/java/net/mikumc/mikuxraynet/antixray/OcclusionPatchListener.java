@@ -24,6 +24,7 @@ import net.mikumc.mikuxraynet.bootstrap.BukkitOcclusion;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
+import net.mikumc.mikuxraynet.occlusion.SectionKey;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
@@ -127,6 +128,18 @@ public final class OcclusionPatchListener extends PacketAdapter {
     private final AtomicBoolean warned = new AtomicBoolean();
     /** 懒解析并缓存下来的 {@code (Object)int} 句柄；未解析成功前为 {@code null}。 */
     private volatile MethodHandle idAccessor;
+    /**
+     * 解析是否已有<b>定论</b>（成功，或已判定本进程内不可用）。
+     *
+     * <p><b>为什么需要这个哨兵</b>：{@link #idAccessor} 只在成功时被赋值，若解析失败（目标版本把
+     * {@code Block#getId} 改名/移走，或 {@code publicLookup().unreflect} 被拒），它永远是 {@code null}，
+     * 于是<b>每一个</b>方块变更坐标都会重新跑一遍 {@link #findGetIdMethod}（{@code Class#getMethods()}
+     * 会分配并遍历上百个 {@code Method}）——一个 4096 坐标的 {@code MULTI_BLOCK_CHANGE} 就是数十万次
+     * 方法名比较 + 大量临时分配，且全部落在 netty 封包线程上。这与类注释承诺的「只在首次使用时解析
+     * 一次、失败后永久返回 -1」直接矛盾，也是「一次前置/服务端不兼容更新 → 网络线程打满」的放大路径。
+     * 定论之后一律直接返回 -1，走 Material 级回落。
+     */
+    private volatile boolean resolutionSettled;
 
     NmsStateIdResolver(Logger logger) {
       this.logger = logger;
@@ -137,27 +150,68 @@ public final class OcclusionPatchListener extends PacketAdapter {
       if (nmsHandle == null) {
         return -1;
       }
-      try {
-        MethodHandle accessor = idAccessor;
-        if (accessor == null) {
-          Method method = findGetIdMethod(nmsHandle.getClass());
-          if (method == null) {
-            warnOnce(null);
-            return -1;
-          }
-          // Lookup#unreflect 声明<b>受检异常</b> IllegalAccessException；这里与 invokeExact（声明 throws
-          // Throwable）一样必须落在 try 内自吞，绝不上抛——失败语义见 warnOnce（只打一次 WARN、此后永久
-          // 返回 -1 = 回落 Material 级）。
-          accessor = MethodHandles.publicLookup().unreflect(method)
-              .asType(MethodType.methodType(int.class, Object.class));
-          idAccessor = accessor;
+      MethodHandle accessor = idAccessor;
+      if (accessor == null) {
+        if (resolutionSettled) {
+          // 已判定不可用：永久返回 -1，绝不在网络线程上重跑反射扫描
+          return -1;
         }
+        accessor = resolveAccessor(nmsHandle);
+        if (accessor == null) {
+          return -1;
+        }
+      }
+      try {
         return (int) accessor.invokeExact(nmsHandle);
       } catch (Throwable throwable) {
-        // 覆盖：unreflect 的 IllegalAccessException、invokeExact 的 Throwable、以及 NMS 类查找的运行时异常
-        warnOnce(throwable);
+        // invokeExact 声明 throws Throwable（版本不匹配 / 参数类型不符都会走到这里）：
+        // 一旦失败就永久定论，避免每个坐标都再抛一次异常。
+        settleFailure(throwable);
         return -1;
       }
+    }
+
+    /**
+     * 同步解析一次并缓存句柄（只在首次使用时进入，之后的调用走 {@link #idAccessor} 快路径）。
+     *
+     * <p>解析失败同样置 {@link #resolutionSettled}，保证 {@link #findGetIdMethod} 在本进程内最多执行一次。
+     *
+     * @return 可用的句柄；不可用返回 {@code null}
+     */
+    private synchronized MethodHandle resolveAccessor(Object nmsHandle) {
+      if (resolutionSettled) {
+        return null;
+      }
+      try {
+        Method method = findGetIdMethod(nmsHandle.getClass());
+        if (method == null) {
+          resolutionSettled = true;
+          warnOnce(null);
+          return null;
+        }
+        // Lookup#unreflect 声明<b>受检异常</b> IllegalAccessException；这里与 invokeExact（声明 throws
+        // Throwable）一样必须落在 try 内自吞，绝不上抛——失败语义见 warnOnce（只打一次 WARN、此后永久
+        // 返回 -1 = 回落 Material 级）。
+        MethodHandle accessor = MethodHandles.publicLookup().unreflect(method)
+            .asType(MethodType.methodType(int.class, Object.class));
+        this.idAccessor = accessor;
+        this.resolutionSettled = true;
+        return accessor;
+      } catch (Throwable throwable) {
+        // 覆盖：unreflect 的 IllegalAccessException 与 NMS 类查找的运行时异常
+        resolutionSettled = true;
+        warnOnce(throwable);
+        return null;
+      }
+    }
+
+    /** 调用期失败（{@code invokeExact}）：清掉句柄并永久定论，此后一律回落 Material 级。 */
+    private void settleFailure(Throwable throwable) {
+      synchronized (this) {
+        this.idAccessor = null;
+        this.resolutionSettled = true;
+      }
+      warnOnce(throwable);
     }
 
     /**
@@ -295,7 +349,9 @@ public final class OcclusionPatchListener extends PacketAdapter {
     unpackMultiCoords(section.getX() << 4, section.getY() << 4, section.getZ() << 4, positions, coords);
     byte[] verdicts = new byte[positions.length];
     for (int i = 0; i < positions.length; i++) {
-      verdicts[i] = resolve(data[i]);
+      // 单个坏元素（缺失 / 解析异常）只让该格记 UNRESOLVED，继续解析后面的坐标：
+      // 一个槽位读不出来不该让同包其余坐标一起漏补丁。
+      verdicts[i] = resolveOrUnresolved(data[i]);
     }
     applyPatches(store, coords, verdicts, stats);
   }
@@ -327,6 +383,11 @@ public final class OcclusionPatchListener extends PacketAdapter {
    * 只写内存位图。
    */
   private byte resolve(WrappedBlockData data) {
+    if (data == null) {
+      // 包内该槽位没有方块数据：按「拿不到口径」处理。若放任下面的 data.getHandle() 抛 NPE，整包剩余
+      // 坐标会一起漏补丁，与「单格失败不影响其它格」的承诺相矛盾。
+      return UNRESOLVED;
+    }
     byte byState = stateLookup == null
         ? UNRESOLVED
         : resolveStateLevel(data.getHandle(), idResolver, stateLookup);
@@ -338,6 +399,21 @@ public final class OcclusionPatchListener extends PacketAdapter {
       byte fallback = BukkitOcclusion.entityOccludingByMaterial(data.getType()) ? OCCLUDING : CLEAR;
       stats.stateIdFallbacks.increment();
       return fallback;
+    } catch (Throwable throwable) {
+      return UNRESOLVED;
+    }
+  }
+
+  /**
+   * 解析单格的判定；元素缺失（{@code null}）或解析过程抛出异常时，只让<b>这一格</b>记
+   * {@link #UNRESOLVED}（调用方据此把该格置为不遮挡并计入失败数），其余坐标照常处理。
+   *
+   * <p>补这一层是因为 {@link WrappedBlockData} 的句柄读取会抛异常：若异常从解析循环里逃出去，
+   * 整包剩下的坐标都会漏补丁——那与「单格失败不影响其它格」的承诺直接矛盾。
+   */
+  private byte resolveOrUnresolved(WrappedBlockData data) {
+    try {
+      return resolve(data);
     } catch (Throwable throwable) {
       return UNRESOLVED;
     }
@@ -372,9 +448,17 @@ public final class OcclusionPatchListener extends PacketAdapter {
   /**
    * 纯函数部分（包可见，供离线单测）：把「坐标三元组 + 三态判定」应用到某个世界的遮挡位图。
    *
+   * <p>先按判定把坐标摊进批量数组，再<b>整批</b>交给 {@link OcclusionStore#setBlocksOccluding}：
+   * 一个 {@code MULTI_BLOCK_CHANGE} 最多 4096 个坐标，逐格写入就是 4096 次全局写锁，而同一把锁还被
+   * 解码建表与区块卸载持有，封包线程会与之反复竞争。整批只取一次锁后，这条路径的临界区只剩一次
+   * 连续写入（见 {@link OcclusionStore#setBlocksOccluding} 的 javadoc）。
+   *
    * <p>三态语义见 {@link #CLEAR} / {@link #OCCLUDING} / {@link #UNRESOLVED}；{@code UNRESOLVED} 的格
    * 被置为<b>不遮挡</b>（清掉该格可能陈旧的「遮挡」位），<b>只动这一格、不摘整段</b>——理由见类注释
    * （整段摘除会放大实体侧的「少藏」面，并给显形侧制造 16³ 死区）。
+   *
+   * <p>计数口径：{@link OcclusionStats#patched} 只累加「有口径且真正写进去」的格；拿不到口径的格、
+   * 以及越界被 {@code SectionKey} 拒绝的格都计入 {@link OcclusionStats#patchFailures}，每格只计一次。
    *
    * @param coords    {@code x,y,z} 连续存放的坐标三元组
    * @param verdicts  每格一个三态判定，长度必须与 {@code coords.length / 3} 相等（否则整体跳过）
@@ -383,31 +467,45 @@ public final class OcclusionPatchListener extends PacketAdapter {
     if (store == null || coords == null || verdicts == null || coords.length != verdicts.length * 3) {
       return;
     }
-    for (int i = 0; i < verdicts.length; i++) {
+    int cells = verdicts.length;
+    int[] xs = new int[cells];
+    int[] ys = new int[cells];
+    int[] zs = new int[cells];
+    boolean[] occluding = new boolean[cells];
+    // 未解析的格也要写成「不遮挡」，但它不属「已按变更改写」：先把这类格从成功数里扣掉，再由下面
+    // 统一记入失败数。只有坐标合法、真正写得进去的才扣——越界的未解析格本就没写进去，计一次即可。
+    int unresolvedPatchable = 0;
+    for (int i = 0; i < cells; i++) {
       int x = coords[i * 3];
       int y = coords[i * 3 + 1];
       int z = coords[i * 3 + 2];
-      try {
-        switch (verdicts[i]) {
-          case OCCLUDING -> {
-            store.setBlockOccluding(x, y, z, true);
-            stats.patched.increment();
-          }
-          case CLEAR -> {
-            store.setBlockOccluding(x, y, z, false);
-            stats.patched.increment();
-          }
-          default -> {
-            // 拿不到新方块口径：把该格置为「不遮挡」（绝不留下陈旧「遮挡」位），但保留该段其余格的数据——
-            // 整段摘除会让实体侧一次少藏 4096 格，并在显形位图判定下变成一整段「死区」（见类注释）。
-            store.setBlockOccluding(x, y, z, false);
-            stats.patchFailures.increment();
-          }
-        }
-      } catch (Throwable throwable) {
-        // 单格失败不影响其它格（例如坐标越界被 SectionKey 拒绝）
-        stats.patchFailures.increment();
+      byte verdict = verdicts[i];
+      xs[i] = x;
+      ys[i] = y;
+      zs[i] = z;
+      occluding[i] = verdict == OCCLUDING;
+      if (verdict != OCCLUDING && verdict != CLEAR && isPatchable(x, y, z)) {
+        unresolvedPatchable++;
       }
+    }
+    int applied = store.setBlocksOccluding(xs, ys, zs, occluding);
+    stats.patched.add(applied - unresolvedPatchable);
+    stats.patchFailures.add(cells - applied + unresolvedPatchable);
+  }
+
+  /**
+   * 该格坐标能否落进遮挡位图：判据与 {@link SectionKey#packSection} 完全一致（越界的 section 被拒）。
+   *
+   * <p><b>只用于统计归因</b>，不用于过滤写入——写入仍整批交给 {@link OcclusionStore}，由它按
+   * {@link SectionKey#packSection} 权威校验并跳过越界格。因此这里即便与权威判据出现偏差，也只会让
+   * 计数略有出入，不会漏写或错写任何一格：「坐标是否合法」始终只有 SectionKey 一处实现。
+   */
+  private static boolean isPatchable(int x, int y, int z) {
+    try {
+      SectionKey.packSection(x >> 4, y >> 4, z >> 4);
+      return true;
+    } catch (IllegalArgumentException outOfRange) {
+      return false;
     }
   }
 

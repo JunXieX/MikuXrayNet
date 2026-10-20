@@ -256,7 +256,16 @@ public final class AfkTracker implements Listener {
     }
     Player player = event.getPlayer();
     // 世界黑名单：命中世界不做任何带宽优化（AFK 丢包一并跳过）。
-    if (WorldBlacklistConfig.isBlacklistedNow(player.getWorld().getName())) {
+    // 封包线程读 player.getWorld() 属跨线程读取（Folia 上是跨区域读实体状态）：取不到世界名时
+    // 无法判定黑名单，按「不处理」返回（原包照常放行），绝不因一次读取失败把封包扣住。
+    String worldName;
+    try {
+      worldName = player.getWorld().getName();
+    } catch (Throwable ignored) {
+      // 无法判定世界：放行原包
+      return;
+    }
+    if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       return;
     }
     // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API

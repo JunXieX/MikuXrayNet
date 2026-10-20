@@ -494,18 +494,39 @@ public final class EntityCuller implements Listener {
   }
 
   /**
-   * 恢复某玩家当前被隐藏的全部实体并清空其账本（复检发现该玩家直通时使用）。
+   * 恢复某玩家当前被隐藏的实体（复检发现该玩家直通 / 身处黑名单世界时使用）。
    *
-   * <p>Folia：这些实体可能已随玩家走远/传送落在别的区域，读它们的状态会触发 TickThread 校验
-   * （先打 ERROR 再抛），因此先问归属，跨区域者直接跳过（随后由其所在区域自然退役）。
+   * <p><b>为什么不能先整表摘走、再逐条发</b>：Folia 上玩家跨区域 / 跨世界（进黑名单世界、直通分支、
+   * 传送）时，账本里的实体可能已落在别的区域线程。旧实现先用 {@link #drainPlayer} 把整张表摘走，再对
+   * {@code !owns(entity)} 的条目直接跳过——这些条目既没有下发 {@code showEntity}，账本里也不再有任何
+   * 记录；等玩家回到该区域，{@code showIfHidden} 再也找不到它，实体对该玩家<b>永久不可见</b>（直到重登）。
+   *
+   * <p>因此这里按归属分成两组：<b>本区域</b>的条目就地恢复——{@code showEntity} 成功才摘账本，失败则
+   * 保留条目等下一轮重试（与 {@link #showIfHidden} 的「写入成功才删原值」同一语义）；<b>跨区域</b>的条目
+   * <b>原样保留</b>，本线程一次都不碰它。跨区域条目不在本线程补发，是因为 {@code showEntity} 同时作用于
+   * 玩家连接与实体两侧，而本线程既不拥有该实体、也不保证拥有玩家所在区域（Folia 会先打 ERROR 再抛）；
+   * 等归属变回 true 后，本方法（直通 / 黑名单玩家每周期都会走到这里）与通道①自然会补发。
+   * 保留条目的代价是会话内有界的（玩家退出、插件停用都会整体清空），远小于「条目没了、包也没发」。
    */
   private void restorePlayer(Player player) {
-    for (HiddenEntry entry : drainPlayer(player.getUniqueId()).values()) {
+    UUID playerId = player.getUniqueId();
+    Map<Integer, HiddenEntry> map = hidden.get(playerId);
+    if (map == null) {
+      return;
+    }
+    for (HiddenEntry entry : map.values()) {
       Entity entity = entry.entity();
       if (!owns(entity)) {
+        // 跨区域（Folia）：不能读它的状态，更不能摘条目（见方法注释）；归属恢复后由后续复检补发
         continue;
       }
-      show(player, entity);
+      if (!entity.isValid()) {
+        // 实体已被服务端回收：只摘账本——玩家的隐藏状态随实体一同释放，既无需也无法再 showEntity
+        removeLedgerEntry(playerId, entity);
+        continue;
+      }
+      // 先真正下发 showEntity、成功后才摘条目：下发失败时条目留在账本里，下一轮复检会重试
+      showIfHidden(player, entity);
     }
   }
 
@@ -663,8 +684,9 @@ public final class EntityCuller implements Listener {
     }
     UUID playerId = player.getUniqueId();
 
-    // 世界黑名单：命中世界不做任何带宽优化。玩家此刻就在黑名单世界时，恢复其全部已隐藏实体
-    // （避免从普通世界走进来时残留隐藏），直接返回；不再开周期预算、不再提交任何判定。
+    // 世界黑名单：命中世界不做任何带宽优化。玩家此刻就在黑名单世界时，恢复其全部<b>本区域</b>已隐藏
+    // 实体（避免从普通世界走进来时残留隐藏；跨区域条目保留在账本里，见 restorePlayer），直接返回；
+    // 不再开周期预算、不再提交任何判定。
     if (WorldBlacklistConfig.isBlacklistedNow(player.getWorld().getName())) {
       restorePlayer(player);
       return;
@@ -676,8 +698,9 @@ public final class EntityCuller implements Listener {
     // 若因「本玩家直通」就不开周期，这些任务会一直顺延（直到有别的玩家开周期），白白积压。
     beginEngineCycle();
 
-    // 直通玩家恢复其全部已隐藏实体，且不再提交任何射线复检。判定只读登录期快照（纯内存、线程安全），
-    // 不再调用任何 Bukkit 权限 API —— 因此本类周期路径上不存在任何权限查询。
+    // 直通玩家恢复其全部本区域已隐藏实体（跨区域条目保留，见 restorePlayer），且不再提交任何射线复检。
+    // 判定只读登录期快照（纯内存、线程安全），不再调用任何 Bukkit 权限 API —— 因此本类周期路径上
+    // 不存在任何权限查询。
     // 语义一致性：运行期改权限需重进服务器才生效，故「复检恢复可见」只对登录时已带权限的玩家生效
     // （见 BypassLookup，这是既定语义，不是缺陷）。
     if (bypass.isBypassed(playerId)) {
@@ -898,7 +921,9 @@ public final class EntityCuller implements Listener {
    *
    * <p><b>每一步校验都不能省</b>：结果从提交到回投之间可能已过若干周期——期间玩家可能退出、实体可能
    * 失效 / 被卸载 / 离开本区域，甚至被传送到<b>另一个世界</b>（按旧世界几何算出的遮挡结论毫无意义，
-   * 必须作废）。任何一条校验不通过都<b>不改变显示状态</b>（fail-open 的安全方向）。
+   * 必须作废）。此外<b>玩家自己也可能走到实体身边</b>：遮挡结论本身没变，但近处实体一律可见是硬安全
+   * 策略，因此 hide 之前还要再过一次强制可见距离闸门（见下方）。任何一条校验不通过都<b>不改变显示
+   * 状态</b>（fail-open 的安全方向）。
    *
    * <p>包可见：真实回投要经 {@code Schedulers.onEntity}（离线不可用），单测直接调用本方法模拟
    * 「已跳回实体线程」这一步，从而覆盖全部状态校验与防抖判定。
@@ -922,6 +947,14 @@ public final class EntityCuller implements Listener {
     if (!entity.isValid()) {
       removeLedgerEntry(player.getUniqueId(), entity);
       removeStreak(player.getUniqueId(), request.entityId());
+      return;
+    }
+    // 迟到结果的距离闸门：提交判定时实体还在强制可见距离之外，回投前玩家可能已经走近到该距离以内
+    // （步行、坐船、末影珍珠都能在几个 tick 内跨过几十格）。遮挡结论本身不会因此改变，但「绝不隐藏
+    // 近处实体」是硬安全策略：此时必须整条丢弃本次 hide，否则近身实体会凭空消失，直到下一个复检
+    // 周期才被通道①恢复。距离用<b>当前</b>坐标重算（复用零分配的 {@link #withinForceVisible}），
+    // 不看提交时的陈旧快照——要防的正是「提交之后玩家又走近」这一段。
+    if (occluded && withinForceVisible(player, entity)) {
       return;
     }
     if (!passesHysteresis(player.getUniqueId(), request.entityId(), occluded)) {

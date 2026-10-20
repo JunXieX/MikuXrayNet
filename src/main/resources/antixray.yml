@@ -23,7 +23,9 @@ enabled: true
 #     enabled             —— 本维度是否启用反矿透
 #     mode                —— all（默认，所有目标方块都伪装，靠邻近显形还原）
 #                            | enclosed（只伪装六面都被包住的，暴露在洞穴里的保持原样）
-#     min-y / max-y       —— 可选：只在该高度范围内伪装（不写 = 不限制）
+#     min-y / max-y       —— 可选：只在该高度范围内伪装（不写 = 不限制）。
+#                            只接受整数（可带正负号）；写成带引号的 "64" 或浮点 64.0 会被忽略
+#                            （= 不限制）并在控制台提示一次，不会被悄悄当成 0 把范围收窄成 [0,0]
 #     hide-blocks         —— 要隐藏的方块清单（填方块注册名）
 #     replacement-weights —— 伪装方块与随机权重（权重越大出现越多，须为正整数）
 #     replacement-bands   —— 按高度分层指定伪装表（配了即优先于上面的回落表）
@@ -128,6 +130,15 @@ dimensions:
 #   · 名字支持精确匹配与通配（world_*）；同时命中时精确名优先，多个通配同时命中取最具体的；
 #   · 可覆盖的键与 dimensions 段相同（enabled / mode / min-y / max-y / hide-blocks /
 #     replacement-weights / replacement-bands / use-block-below）；
+#   · enabled 在这里表示「该世界是否启用反矿透」，会覆盖所属维度的 enabled：
+#       enabled: false —— 该世界完全不伪装（即使其维度是启用的；常用于主城 / 小游戏世界）；
+#       enabled: true  —— 该世界启用（即使其维度是关闭的，例如默认关闭的末地）；
+#       不写           —— 沿用所属维度（维度关闭时该世界同样不启用；要在关闭的维度里
+#                         单独启用某个世界，必须显式写 enabled: true）。
+#     注意：blacklist.yml 的世界黑名单优先级仍然最高——名单内的世界即使这里写 enabled: true
+#     也不会启用（要启用须先从黑名单移除）。
+#   · min-y / max-y 只接受整数（可带正负号）；写成带引号的 "64" 或浮点 64.0 会被忽略
+#     （= 不限制）并在控制台提示一次，不会被悄悄当成 0 把高度范围收窄成 [0,0]。
 #   · 只写需要覆盖的键即可（例如某个世界只换伪装方块清单，其余全部沿用其维度）；
 #
 #   ★ hide-blocks 空清单在这里的语义与 dimensions 段相反（务必看清）：
@@ -138,12 +149,15 @@ dimensions:
 #   · 修改后执行 /mikuxraynet reload 生效。
 # 示例（默认全部注释，不覆盖任何世界）：
 # world-overrides:
+#   main_hub:                           # 主城世界：关闭反矿透（其余设置仍沿用主世界维度）
+#     enabled: false
 #   world_nether:                       # 地狱某世界：换目标与伪装清单 + 限定高度
 #     hide-blocks: [ancient_debris, nether_gold_ore]
 #     replacement-weights: {netherrack: 10, basalt: 4, blackstone: 2}
 #     min-y: 0
 #     max-y: 120
-#   world_the_end:                      # 末地某世界：只覆盖隐藏清单，其余回落其维度
+#   world_the_end:                      # 末地某世界：末地维度默认关闭，必须显式启用
+#     enabled: true
 #     hide-blocks: [end_stone_bricks, purpur_block]
 #   resource_*:                         # 通配：所有 resource_ 前缀的世界用 enclosed 模式
 #     mode: enclosed

@@ -185,17 +185,30 @@ public final class ObfuscationProcessor {
       BitSet targets = new BitSet(registry.getUniqueBlockStateCount());
       List<String> resolvedTargets = new ArrayList<>();
       for (String name : effective.hideBlocks()) {
-        int stateId = BlockStateRegistry.resolveStateId(name);
-        if (stateId < 0) {
-          logger.warning(label + "配置中的隐藏方块名称无法识别，已跳过：" + name);
-        } else {
+        // hide-blocks 填的是「方块注册名」，语义上要隐藏该方块的**全部状态**（箱子有 24 种朝向/含水
+        // 组合、楼梯/台阶/含水方块同理）。旧实现只取「默认状态」一个 id，其余状态照旧下发给客户端——
+        // 透视端仍能看到它们，而诊断面板完全看不出来（被藏的那一个默认态仍在正常计数）。
+        int[] stateIds = registry.allStateIds(name);
+        if (stateIds.length == 0) {
+          // 注册表里没有该名称（探测未收录等极端情况）：退回单状态解析，保持旧行为
+          int stateId = BlockStateRegistry.resolveStateId(name);
+          if (stateId < 0) {
+            logger.warning(label + "配置中的隐藏方块名称无法识别，已跳过：" + name);
+            continue;
+          }
           targets.set(stateId);
           resolvedTargets.add(name);
+          continue;
         }
+        for (int stateId : stateIds) {
+          targets.set(stateId);
+        }
+        resolvedTargets.add(name);
       }
-      // 启动自检：把「实际匹配到的目标方块清单」打出来，便于一眼看出是否漏了深层矿变体（降为 FINE）
+      // 启动自检：把「实际匹配到的目标方块清单」打出来，便于一眼看出是否漏了深层矿变体（降为 FINE）；
+      // 同时给出状态总数，便于核对多状态方块（如箱子）是否整类隐藏。
       logger.fine(label + "目标方块解析完成：" + resolvedTargets.size() + '/' + effective.hideBlocks().size()
-          + " 种 → " + resolvedTargets);
+          + " 种 → " + resolvedTargets + "（共 " + targets.cardinality() + " 个状态）");
 
       int[][] fallback = weightedTable(effective.replacementWeights(), logger, label);
 

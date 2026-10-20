@@ -5,9 +5,10 @@ import java.util.function.IntPredicate;
 /**
  * 遮挡数据仓库：{@code (chunkX, sectionY, chunkZ) -> SectionOcclusion} 的单写多读存放处。
  *
- * <p><b>写入方</b>（建表：反矿透解码工作线程；单格补丁：方块变更处）——所有写入都在本类的
+ * <p><b>写入方</b>（建表：反矿透解码工作线程；单格 / 批量补丁：方块变更处）——所有写入都在本类的
  * {@link #writeMutex} 内串行，使「读—改—写」这类复合操作（单格补丁）具备原子性。
- * {@link #setBlockOccluding} 需要先取旧值再写新值，若与并发建表交错会把一格补丁写丢，
+ * {@link #setBlockOccluding} 需要先取旧值再写新值，若与并发建表交错会把一格补丁写丢；
+ * {@link #setBlocksOccluding} 则让一个方块变更包的全部坐标共用一次加锁（见其 javadoc），
  * 因此该互斥是所有写入路径的公共闸门，而不只是补丁路径。
  *
  * <p><b>读取方</b>（异步射线线程）——不取 {@link #writeMutex}，走 {@link SwmrLongMap} 的乐观读；
@@ -88,49 +89,102 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    */
   public void setBlockOccluding(int x, int y, int z, boolean occluding) {
     synchronized (writeMutex) {
-      // 用带校验的 packSection（而非射线热路径用的 packBlock）：包里的坐标一旦越出 28 位水平 /
-      // 8 位 sectionY 范围，packBlock 会按位截断成<b>另一个 section 的键</b>，把补丁静默写到错误的
-      // 几何上去（该段位图从此与真实世界不符）。补丁调用方按 patchFailures 统计并跳过本格，故此处
-      // 显式拒绝是安全方向。
-      long key = SectionKey.packSection(x >> 4, y >> 4, z >> 4);
-      int localX = x & SectionOcclusion.LOCAL_MASK;
-      int localY = y & SectionOcclusion.LOCAL_MASK;
-      int localZ = z & SectionOcclusion.LOCAL_MASK;
+      applyCellLocked(x, y, z, occluding);
+    }
+  }
 
-      SectionOcclusion current = sections.get(key);
-      // 「无该段数据」（null）与「已知该段全不遮挡」（{@link EmptyOcclusion} 共享快路径）在语义上都等价于
-      // 「零个遮挡位」——空段既可能是「从未建表」，也可能是「建表时判为全不遮挡」或「位图被清空后回落」。
-      // 两者必须同路径处理：否则对 EmptyOcclusion 走到下面的 (BitmapOcclusion) 强转会抛 ClassCastException，
-      // 被 applyPatches 当成「补丁失败」吞掉——于是「在空气段里新放置的遮挡方块」永远进不了位图。
-      // 方向性：该格漏记为遮挡 = 实体射线少算一格遮挡（少藏，安全侧），但显形侧会据此把该方块后方
-      // 本不可见的坐标误判为可见而还原（偏漏防）。故按「零遮挡位」统一处理，保证位图与真实世界一致。
-      if (current == null || current.isEmpty()) {
-        if (!occluding) {
-          return;
+  /**
+   * 批量单格补丁：整批只取一次 {@link #writeMutex}。
+   *
+   * <p><b>为什么必须要有批量入口</b>：一个 {@code MULTI_BLOCK_CHANGE} 包最多带 4096 个坐标，逐格调用
+   * {@link #setBlockOccluding} 就是 4096 次加解锁。而同一把锁还被解码工作线程的整列建表
+   * （{@link #restoreColumn}）与区块卸载（{@link #removeColumn}）持有，封包线程会与它们反复竞争：
+   * 既把建表那侧的长临界区切碎，又让网络线程在锁上停顿成千上万次。整批只取一次锁后，锁次数从 4096
+   * 降到 1，临界区变成一段连续的内存写入——这正是「网络线程零计算、少阻塞」纪律的落点。
+   *
+   * <p><b>越界语义</b>：单格的越界判定仍由 {@link SectionKey#packSection} 权威给出（抛
+   * {@link IllegalArgumentException}）。本方法<b>跳过</b>该格、继续处理后面的格，而不是让整批失败——
+   * 一个坏坐标不该连累同包其余 4095 格；跳过的格数由调用方计入失败计数。
+   *
+   * @param xs        每格的方块 X 坐标
+   * @param ys        每格的方块 Y 坐标
+   * @param zs        每格的方块 Z 坐标
+   * @param occluding 每格变更后是否遮挡
+   * @return 实际应用的格数；越界坐标被跳过（不写入），由调用方计入失败计数
+   */
+  public int setBlocksOccluding(int[] xs, int[] ys, int[] zs, boolean[] occluding) {
+    if (xs == null || ys == null || zs == null || occluding == null) {
+      return 0;
+    }
+    int cells = xs.length;
+    if (ys.length != cells || zs.length != cells || occluding.length != cells) {
+      return 0;
+    }
+    int applied = 0;
+    synchronized (writeMutex) {
+      for (int i = 0; i < cells; i++) {
+        try {
+          applyCellLocked(xs[i], ys[i], zs[i], occluding[i]);
+          applied++;
+        } catch (IllegalArgumentException outOfRange) {
+          // 越界坐标：本格不写入，继续处理后面的格（整批不因一格被拒而回滚）
         }
-        BitmapOcclusion created = new BitmapOcclusion();
-        created.setOccluding(localX, localY, localZ, true);
-        sections.put(key, created);
+      }
+    }
+    return applied;
+  }
+
+  /**
+   * 写入单格补丁。<b>调用方必须已持有 {@link #writeMutex}</b>。
+   *
+   * <p>抽出来是为了让单格入口与批量入口共用同一套「取旧值 → 表示升降级 → 写回」逻辑：批量入口要在
+   * 一个临界区内连续写多格，不能再逐格加锁。
+   *
+   * @throws IllegalArgumentException 坐标超出 {@link SectionKey} 可表示范围；由调用方决定如何计数
+   */
+  private void applyCellLocked(int x, int y, int z, boolean occluding) {
+    // 用带校验的 packSection（而非射线热路径用的 packBlock）：包里的坐标一旦越出 28 位水平 /
+    // 8 位 sectionY 范围，packBlock 会按位截断成<b>另一个 section 的键</b>，把补丁静默写到错误的
+    // 几何上去（该段位图从此与真实世界不符）。补丁调用方按 patchFailures 统计并跳过本格，故此处
+    // 显式拒绝是安全方向。
+    long key = SectionKey.packSection(x >> 4, y >> 4, z >> 4);
+    int localX = x & SectionOcclusion.LOCAL_MASK;
+    int localY = y & SectionOcclusion.LOCAL_MASK;
+    int localZ = z & SectionOcclusion.LOCAL_MASK;
+
+    SectionOcclusion current = sections.get(key);
+    // 「无该段数据」（null）与「已知该段全不遮挡」（{@link EmptyOcclusion} 共享快路径）在语义上都等价于
+    // 「零个遮挡位」——空段既可能是「从未建表」，也可能是「建表时判为全不遮挡」或「位图被清空后回落」。
+    // 两者必须同路径处理：否则对 EmptyOcclusion 走到下面的 (BitmapOcclusion) 强转会抛 ClassCastException，
+    // 被 applyPatches 当成「补丁失败」吞掉——于是「在空气段里新放置的遮挡方块」永远进不了位图。
+    // 方向性：该格漏记为遮挡 = 实体射线少算一格遮挡（少藏，安全侧），但显形侧会据此把该方块后方
+    // 本不可见的坐标误判为可见而还原（偏漏防）。故按「零遮挡位」统一处理，保证位图与真实世界一致。
+    if (current == null || current.isEmpty()) {
+      if (!occluding) {
         return;
       }
+      BitmapOcclusion created = new BitmapOcclusion();
+      created.setOccluding(localX, localY, localZ, true);
+      sections.put(key, created);
+      return;
+    }
 
-      if (current.isSolid()) {
-        if (occluding) {
-          return; // 已全遮挡，无需改动
-        }
-        BitmapOcclusion downgraded = BitmapOcclusion.solid();
-        downgraded.setOccluding(localX, localY, localZ, false);
-        sections.put(key, downgraded);
-        return;
+    if (current.isSolid()) {
+      if (occluding) {
+        return; // 已全遮挡，无需改动
       }
+      BitmapOcclusion downgraded = BitmapOcclusion.solid();
+      downgraded.setOccluding(localX, localY, localZ, false);
+      sections.put(key, downgraded);
+      return;
+    }
 
-      BitmapOcclusion bitmap = (BitmapOcclusion) current;
-      bitmap.setOccluding(localX, localY, localZ, occluding);
-      if (bitmap.isEmpty()) {
-        // 位图清空 = 已知该段全不遮挡：换成共享空快路径（而不是删条目——删掉会退化成「未知」，
-        // 既浪费日后重建、又会让覆盖率指标误报「缺数据」）
-        sections.put(key, EmptyOcclusion.INSTANCE);
-      }
+    BitmapOcclusion bitmap = (BitmapOcclusion) current;
+    bitmap.setOccluding(localX, localY, localZ, occluding);
+    if (bitmap.isEmpty()) {
+      // 位图清空 = 已知该段全不遮挡：换成共享空快路径（而不是删条目——删掉会退化成「未知」，
+      // 既浪费日后重建、又会让覆盖率指标误报「缺数据」）
+      sections.put(key, EmptyOcclusion.INSTANCE);
     }
   }
 

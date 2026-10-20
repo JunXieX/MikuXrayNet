@@ -78,7 +78,16 @@ public final class LatencyMonitor implements Listener {
         + config.sustainSeconds() + " 秒，降 " + config.reduceViewDistance() + " 区块）");
   }
 
-  /** 停用：取消任务并还原所有被下调的视距。 */
+  /**
+   * 停用：取消任务并还原所有被下调的视距。
+   *
+   * <p><b>为什么清表必须区分「停用」与「热重载」</b>：热重载路径下 {@link #restoreAll()} 把还原动作
+   * 投递到玩家所属线程（{@code Schedulers.onEntity}），回调在本方法返回之后才执行；若此处无条件
+   * {@code clear()}，回调里的 {@link #restore(Player)} 会读到 {@code null} 而直接放弃——所有处于
+   * 降视距状态的玩家会永久卡在降级后的视距，直到重新登录。这与 {@link #restoreAll()} 的
+   * 「记录绝不先清后还原」纪律直接矛盾。故只有「插件真的被停用」（此时 {@code restoreAll} 走同步
+   * 还原、记录已被逐条精确摘除）才整体清表。
+   */
   public void stop() {
     // 先取消在途任务、再同步还原：setEnabled(false) 先置 isEnabled=false 再调 onDisable，
     // 停用链路的 EntityScheduler 一律被拒（旧实现经 Schedulers 静默吞掉 → 视距卡在降级值直到重登）。
@@ -87,7 +96,11 @@ public final class LatencyMonitor implements Listener {
     HandlerList.unregisterAll(this);
     restoreAll();
     watches.clear();
-    originalViewDistance.clear();
+    if (!plugin.isEnabled()) {
+      // 停用路径：restoreAll 已同步还原并逐条摘除，这里只兜底清掉已下线玩家的残留记录。
+      // 热重载路径（plugin 仍启用）绝不能清：还原回调尚未执行，清表等于丢弃原始视距。
+      originalViewDistance.clear();
+    }
   }
 
   @EventHandler(ignoreCancelled = true)

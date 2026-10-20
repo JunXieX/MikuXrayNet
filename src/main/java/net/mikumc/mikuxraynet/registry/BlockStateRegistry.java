@@ -11,9 +11,11 @@ import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collection;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
@@ -78,6 +80,20 @@ public final class BlockStateRegistry implements RegistryAccessor {
    */
   private final EntityOcclusionTable entityOcclusionTable;
 
+  /** 空 id 数组（{@link #allStateIds(String)} 未命中时的返回值，避免每次分配）。 */
+  private static final int[] EMPTY_IDS = new int[0];
+
+  /**
+   * 方块类型名（{@link OcclusionRules#normalize(String)} 归一化后）→ 它的<b>全部</b>状态 id。
+   *
+   * <p><b>为什么需要</b>：{@code hide-blocks} 填的是「方块注册名」，语义上应隐藏该方块的<b>所有</b>
+   * 状态；而 {@link #resolveStateId(String)} 只解析出「默认状态」一个 id。多状态方块（箱子有 24 种
+   * 朝向/含水组合、楼梯、含水方块等）若只藏默认态，其余状态照旧下发——透视端仍能看到它们，而诊断面板
+   * 完全看不出来（被藏的那一个默认态仍在正常计数）。这里在启动期顺手记下「名称 → 全部状态 id」，
+   * 供隐藏清单使用。仅启动期构建一次，运行期只做一次哈希查找。
+   */
+  private final Map<String, int[]> stateIdsByBlock;
+
   /** 逐状态真值解析成功（并生效）的状态数。 */
   private final int truthStateCount;
   /** 逐状态真值解析失败、回落启发式的状态数。 */
@@ -92,7 +108,8 @@ public final class BlockStateRegistry implements RegistryAccessor {
   private BlockStateRegistry(int uniqueBlockStateCount, int maxBitsPerBlockState, BitSet airStates,
       BitSet fluidStates, BitSet occludingStates,
       EntityOcclusionTable entityOcclusionTable, int truthStateCount, int heuristicFallbackStateCount,
-      int overrideHitStateCount, int occlusionDriftStateCount, List<String> heuristicFallbackNames) {
+      int overrideHitStateCount, int occlusionDriftStateCount, List<String> heuristicFallbackNames,
+      Map<String, int[]> stateIdsByBlock) {
     this.uniqueBlockStateCount = uniqueBlockStateCount;
     this.maxBitsPerBlockState = maxBitsPerBlockState;
     this.airStates = airStates;
@@ -104,6 +121,7 @@ public final class BlockStateRegistry implements RegistryAccessor {
     this.overrideHitStateCount = overrideHitStateCount;
     this.occlusionDriftStateCount = occlusionDriftStateCount;
     this.heuristicFallbackNames = heuristicFallbackNames;
+    this.stateIdsByBlock = stateIdsByBlock;
   }
 
   /**
@@ -168,6 +186,8 @@ public final class BlockStateRegistry implements RegistryAccessor {
     int overrideHitCount = 0;
     int driftCount = 0;
     Set<String> fallbackNames = new LinkedHashSet<>();
+    // 「方块名 → 全部状态 id」收集器（构建期一次性；见 stateIdsByBlock 的说明）
+    Map<String, List<Integer>> idsByName = new HashMap<>();
 
     for (int id = 0; id < count; id++) {
       // 空洞 id（映射异常）本身不是有效状态：直接跳过，不参与任何位图
@@ -210,6 +230,7 @@ public final class BlockStateRegistry implements RegistryAccessor {
         driftCount++; // 只有覆盖表能造成伪装/实体口径分歧
       }
       String key = OcclusionRules.normalize(name);
+      idsByName.computeIfAbsent(key, ignored -> new ArrayList<>()).add(id);
       if (occludingOverrides.contains(key) || nonOccludingOverrides.contains(key)) {
         overrideHitCount++; // 该状态命中用户覆盖表（判定以覆盖表为准）
       }
@@ -217,9 +238,20 @@ public final class BlockStateRegistry implements RegistryAccessor {
 
     List<String> fallbackNameList = new ArrayList<>(fallbackNames);
     fallbackNameList.sort(String::compareTo);
+    // 冻结为「名称 → int[]」，运行期只读、无装箱
+    Map<String, int[]> stateIdsByBlock = new HashMap<>(idsByName.size() * 2);
+    for (Map.Entry<String, List<Integer>> entry : idsByName.entrySet()) {
+      List<Integer> collected = entry.getValue();
+      int[] array = new int[collected.size()];
+      for (int i = 0; i < array.length; i++) {
+        array[i] = collected.get(i);
+      }
+      stateIdsByBlock.put(entry.getKey(), array);
+    }
     return new BlockStateRegistry(count, width, airStates, fluidStates, occludingStates,
         EntityOcclusionTable.build(entityOccludingStates),
-        truthCount, fallbackCount, overrideHitCount, driftCount, List.copyOf(fallbackNameList));
+        truthCount, fallbackCount, overrideHitCount, driftCount, List.copyOf(fallbackNameList),
+        stateIdsByBlock);
   }
 
   /** 逐状态真值来源：无 oracle（离线）返回 {@code null}；状态字符串不可得也返回 {@code null}（回落）。 */
@@ -260,6 +292,23 @@ public final class BlockStateRegistry implements RegistryAccessor {
       return -1;
     }
     return WrappedBlockState.getDefaultState(version, type, false).getGlobalId();
+  }
+
+  /**
+   * 方块类型名 → 它的<b>全部</b>状态 id（未知名称返回空数组）。仅启动期用于解析配置。
+   *
+   * <p>与 {@link #resolveStateId(String)} 的区别：后者只给「默认状态」一个 id，本方法给该方块的
+   * <b>所有</b>状态 id。{@code hide-blocks} 的语义是「隐藏这个方块」，因此必须用本方法——否则
+   * 多状态方块（箱子 24 态、楼梯、含水方块等）只会藏住默认态，其余状态照旧下发给客户端。
+   *
+   * <p>名称容忍 {@code namespace:} 前缀与大小写差异，归一化口径与 {@link OcclusionRules#normalize} 一致。
+   */
+  public int[] allStateIds(String name) {
+    if (name == null || name.isBlank()) {
+      return EMPTY_IDS;
+    }
+    int[] ids = stateIdsByBlock.get(OcclusionRules.normalize(name));
+    return ids == null ? EMPTY_IDS : ids;
   }
 
   @Override

@@ -20,6 +20,17 @@ public final class ChunkBatchGate {
   private final AtomicBoolean released = new AtomicBoolean();
 
   private boolean finished;
+  /**
+   * 超时兜底是否已经到点。
+   *
+   * <p><b>为什么必须记下来</b>：{@link #forceRelease()} 可能在 {@link #finish(Runnable)} 之前触发
+   * （看门狗线程与封包线程的调度竞态：{@code scheduleTimeout} 先于 {@code finish} 调用）。此时放行动作
+   * 还没登记，{@code releaseOnce()} 只能空转、也不会置位 {@code released}——这一次「唯一一次超时兜底」
+   * 就此被消耗。若此后仍有区块任务永不回调 {@link #chunkDone()}，批次结束包就永久无人放行
+   * （客户端卡在加载界面），违反 fail-open 不变量。记下「已强制到点」后，迟到的 {@code finish()}
+   * 会立刻放行，不再等未完成的计数。
+   */
+  private boolean forced;
   private Runnable release;
 
   /** 本批次内新增一个待完成的区块改写任务。 */
@@ -48,15 +59,31 @@ public final class ChunkBatchGate {
    * @param releaseAction 放行动作；由本闸门保证只执行一次
    */
   public void finish(Runnable releaseAction) {
+    boolean alreadyForced;
     synchronized (this) {
       this.finished = true;
       this.release = releaseAction;
+      alreadyForced = this.forced;
+    }
+    if (alreadyForced) {
+      // 超时兜底已在本次登记之前到点：立刻放行，绝不再等未完成的计数
+      // （否则那次兜底就白费了，见 {@link #forced} 的说明）。
+      releaseOnce();
+      return;
     }
     maybeRelease();
   }
 
-  /** 超时兜底：忽略未完成的计数强制放行一次。 */
+  /**
+   * 超时兜底：忽略未完成的计数强制放行一次。
+   *
+   * <p>即便放行动作此刻尚未登记也要记账（{@link #forced}），由迟到的 {@link #finish(Runnable)} 消费，
+   * 保证「唯一一次超时兜底」不会因为一次线程调度竞态而丢失。
+   */
   public void forceRelease() {
+    synchronized (this) {
+      this.forced = true;
+    }
     releaseOnce();
   }
 
