@@ -10,7 +10,6 @@ import com.destroystokyo.paper.event.entity.EntityAddToWorldEvent;
 import com.destroystokyo.paper.event.entity.EntityRemoveFromWorldEvent;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.EnumSet;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -136,8 +135,16 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
    *
    * <p>只在 {@code GlobalRegionScheduler}（Paper 主线程）上读写，天然单线程，无需任何并发控制。
    */
-  private int rebuildWorldCursor;
-  private final Map<String, Integer> rebuildChunkCursors = new HashMap<>();
+  /**
+   * 兜底重建的推进游标：<b>世界级</b>用原子整数、<b>逐世界区块级</b>用并发 map。
+   *
+   * <p><b>为什么不用 int + HashMap</b>：{@code stop()} 会在「停用/热重载」时清空它们，而
+   * {@code ThrottlePipeline} 明确声明「停用/重载可能来自不同线程」。当前 Paper 上两者恰好同在主线程、
+   * Folia 上根本不建索引任务，因此实际不可达；但一旦该前提变化（或调用方换线程），普通 HashMap 的并发写
+   * 就是数据竞争（最坏死循环/丢更新，表现为兜底重建卡在某个世界）。改成并发容器后该前提不再需要成立。
+   */
+  private final AtomicInteger rebuildWorldCursor = new AtomicInteger();
+  private final Map<String, Integer> rebuildChunkCursors = new ConcurrentHashMap<>();
 
   public EntityPacketFilter(Plugin plugin, ProtocolManager protocolManager,
       BandwidthConfig.EntityPackets config, ThrottleStats stats) {
@@ -228,7 +235,7 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     }
     entityTypeIndex.clear();
     rebuildChunkCursors.clear();
-    rebuildWorldCursor = 0;
+    rebuildWorldCursor.set(0);
   }
 
   /**
@@ -268,17 +275,40 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     }
   }
 
-  /** 实体离开世界：摘除其类型索引，避免实体 id 被复用后残留错误映射。 */
+  /**
+   * 实体离开世界：摘除其类型索引，避免实体 id 被复用后残留错误映射。
+   *
+   * <p><b>必须用事件自带的世界，不能用 {@code entity.getWorld()}</b>：Paper 的
+   * {@link EntityRemoveFromWorldEvent} 在 Javadoc 里明确写着「实体在事件触发前已被更新，
+   * 因此实体的 world 可能与 getWorld() 不同」；{@code getWorld()} 的语义是「实体正在离开的那个世界」。
+   *
+   * <p>旧实现按 {@code entity.getWorld()} 取键，跨世界传送（A→B）时就会去 <b>B</b> 的索引里删掉同号的
+   * 另一个实体，而 A 里的旧记录留着：① B 里那个白名单实体被误摘 → 它的零位移包会被取消；
+   * ② A 的残留记录会让将来复用该 id 的普通实体被误判为白名单（少取消一些包）。两个方向都只影响
+   * 白名单命中率、不改变实体位置同步，但根因明确，直接改用正确来源。
+   *
+   * <p>顺带把「当前世界」也清一次（幂等）：{@code EntityAddToWorldEvent} 会为目标世界重新登记，
+   * 所以多清一条的代价只是某个同号实体短暂不被豁免；而漏清一条会留下永久残留。
+   */
   @EventHandler
   public void onEntityRemoveFromWorld(EntityRemoveFromWorldEvent event) {
     try {
       Entity entity = event.getEntity();
-      Map<Integer, String> perWorld = entityTypeIndex.get(entity.getWorld().getName());
-      if (perWorld != null) {
-        perWorld.remove(entity.getEntityId());
-      }
+      int entityId = entity.getEntityId();
+      // 权威来源：事件声明「正在离开的那个世界」（见方法说明，不能拿 entity.getWorld() 代替）
+      removeFromWorldIndex(event.getWorld().getName(), entityId);
+      // 兜底：实体此刻可能已被更新到目标世界，把当前世界也清一次（幂等，见方法说明）
+      removeFromWorldIndex(entity.getWorld().getName(), entityId);
     } catch (Throwable throwable) {
       logThrottled(throwable);
+    }
+  }
+
+  /** 从某世界的类型索引里摘除一个实体 id（表不存在即无残留可清，绝不顺手建表）。 */
+  private void removeFromWorldIndex(String worldName, int entityId) {
+    Map<Integer, String> perWorld = entityTypeIndex.get(worldName);
+    if (perWorld != null) {
+      perWorld.remove(entityId);
     }
   }
 
@@ -296,9 +326,8 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
    *
    * <p>注意只摘外层、不 {@code clear} 内层表：内层表可能正被实体离开世界的事件写入，直接清空会与
    * 那些线程竞争；丢掉引用后整张内层表随之不可达，交给 GC 回收更简单也更安全。
-   * 同理也不在这里动 {@code rebuildChunkCursors}——它是普通 {@link HashMap}，只允许兜底重建所在的主线程
-   * 读写（见其字段注释），跨线程摘除会与 {@code put}/{@code clear} 竞争；且它每完成一轮覆盖就整体
-   * {@code clear()}，本身不随卸载增长，无需在此处理。
+   * 同理也不在这里动 {@code rebuildChunkCursors}——它每完成一轮覆盖就整体 {@code clear()}，
+   * 本身不随卸载增长，无需在此处理（且与游标字段一样已是并发容器，跨线程动它也不会坏）。
    */
   @EventHandler
   public void onWorldUnload(WorldUnloadEvent event) {
@@ -430,15 +459,15 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
       if (worlds.isEmpty()) {
         return;
       }
-      if (rebuildWorldCursor >= worlds.size()) {
-        rebuildWorldCursor = 0;
+      if (rebuildWorldCursor.get() >= worlds.size()) {
+        rebuildWorldCursor.set(0);
       }
       int remaining = chunkBudget;
-      while (remaining > 0 && rebuildWorldCursor < worlds.size()) {
-        World world = worlds.get(rebuildWorldCursor);
+      while (remaining > 0 && rebuildWorldCursor.get() < worlds.size()) {
+        World world = worlds.get(rebuildWorldCursor.get());
         Chunk[] chunks = world.getLoadedChunks();
         if (chunks.length == 0) {
-          rebuildWorldCursor++;
+          rebuildWorldCursor.incrementAndGet();
           continue;
         }
         int cursor = Math.floorMod(rebuildChunkCursors.getOrDefault(world.getName(), 0), chunks.length);
@@ -466,12 +495,12 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
         rebuildChunkCursors.put(world.getName(), worldDone ? 0 : cursor + take);
         remaining -= take;
         if (worldDone) {
-          rebuildWorldCursor++;
+          rebuildWorldCursor.incrementAndGet();
         }
       }
-      if (rebuildWorldCursor >= worlds.size()) {
+      if (rebuildWorldCursor.get() >= worlds.size()) {
         // 一轮覆盖完成：游标全部归零，下个周期从头再来
-        rebuildWorldCursor = 0;
+        rebuildWorldCursor.set(0);
         rebuildChunkCursors.clear();
       }
     } catch (Throwable throwable) {
