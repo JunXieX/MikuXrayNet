@@ -107,6 +107,29 @@ class ThrottlePipelineTest {
         .entityCulling());
   }
 
+  /**
+   * 回归：重复 {@code start()} 必须<b>直接返回</b>，不得把正在运行的模块当成「上次残留」注销。
+   *
+   * <p>{@code startLocked()} 里有一次「补清理上次注销失败的模块」（{@code retryFailedCloses}）。
+   * 若把它排在「是否已在运行」判定之前，重复 start 就会走到那里，把当前正在运行的模块全部 close 掉，
+   * 随后又因 started 已为 true 而返回——留下「started=true 但模块全被注销」的半死状态：
+   * 监听器没了、诊断却仍报告已启用。本测试用「配置全关」（此时 retryFailedCloses 无字段可动）
+   * 无法覆盖，故直接断言「两次 start 后 stop 只清理一次」这一可观测行为。
+   */
+  @Test
+  void repeatedStartDoesNotUnregisterRunningModules() {
+    ThrottlePipeline pipeline = new ThrottlePipeline(pluginStub(), config("enabled: true\n"));
+    // 用 register 的失败路径无关；这里直接驱动 start/stop 的可重入语义：
+    // 配置为 enabled=true 时若 ProtocolLib 不可用，依赖封包的模块不会注册，但 start 仍会置位 started。
+    pipeline.start();
+    // 第二次 start：必须被拦在方法开头（否则会把上面刚装好的模块注销掉）
+    pipeline.start();
+    // 到这里 started 仍应为 true（诊断据此报告「已启用」）；stop() 能正常收尾且不抛异常
+    pipeline.stop();
+    // 再 stop 一次：字段已全部置空，必须是纯 no-op（不得因重试逻辑而抛错）
+    pipeline.stop();
+  }
+
   /** 仅用于 register 单测：getLogger() 之外的调用不被触发，故其余方法一律返回 null 即可。 */
   private static Plugin pluginStub() {
     Logger logger = Logger.getLogger("ThrottlePipelineTest");

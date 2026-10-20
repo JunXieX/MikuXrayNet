@@ -157,28 +157,27 @@ public final class ThrottlePipeline {
 
   /** 装配主体（调用方已持有 {@link #lifecycleLock}）。 */
   private void startLocked() {
+    // <b>先判「是否已在运行」，再碰任何字段</b>：重复 start() 必须直接返回，绝不能走到下面的
+    // retryFailedCloses()——那会把当前<b>正在运行</b>的模块当成「上次残留」关掉，随后 CAS 又因
+    // started 已为 true 而返回，最终留下「started=true 但所有模块都已被注销」的半死状态。
+    if (started.get()) {
+      plugin.getLogger().fine("带宽优化管线已处于运行状态，忽略重复的 start()（已启动的模块不会被重复注册）");
+      return;
+    }
     // 先复位「上次停用有清理失败」标志，再重试——顺序不能反：
     // 重试失败时 close() 会把它重新置位，复位若放在重试之后就会把这条真实告警抹掉。
     cleanupIncomplete = false;
-    // 上一次 stop() 里有注销失败的模块（字段被刻意保留以便重试）：先补一次清理，再判开关。
-    // 顺序很重要：即使本次配置把带宽整体关掉了，也必须先把上次残留的监听器/任务清干净，
-    // 否则它们会一直挂到进程退出（旧实现直接 return，连重试机会都没有）。
+    // 走到这里说明本管线<b>当前未运行</b>，字段里若还留着模块，只可能是上一次 stop() 注销失败（刻意保留）。
+    // 即使本次配置把带宽整体关掉了，也要先把它们清干净，否则会一直挂到进程退出。
     retryFailedCloses();
     if (!config.enabled()) {
       plugin.getLogger().fine("带宽优化已在配置中关闭（bandwidth.yml: enabled=false）");
       return;
     }
-    // 先置位再装配：装配中途若抛出非预期异常（例如子模块工厂里的日志/反射失败之外的路径），
-    // 调用方的 stop() 仍能进入清理分支，撤销已注册的模块；若把它留在末尾，半途异常会让
-    // started 保持 false，stop() 直接返回，已注册的监听与任务永久残留（反复 reload 持续累积）。
-    //
-    // 用 CAS 而不是 set(true)：重复 start 会再 new 一整套子模块并覆盖字段，旧模块的 PacketAdapter /
-    // 异步监听 / 每 tick 任务句柄仍挂在 ProtocolLib 与调度器里，且 stop() 再也拿不到它们——永久泄漏。
-    // 当前调用方每次 reload 都新建实例，因此这只是纵深防御；被忽略时明确记一条，避免静默。
-    if (!started.compareAndSet(false, true)) {
-      plugin.getLogger().fine("带宽优化管线已处于运行状态，忽略重复的 start()（已启动的模块不会被重复注册）");
-      return;
-    }
+    // 先置位再装配：装配中途若抛出非预期异常，调用方的 stop() 仍能进入清理分支撤销已注册的模块；
+    // 若留在末尾，半途异常会让 started 保持 false，stop() 直接返回，监听与任务永久残留（反复 reload 累积）。
+    // 同锁内刚确认过 started == false，这里直接 set 即可（重复 start 已在方法开头拦下）。
+    started.set(true);
 
     ProtocolManager protocolManager = null;
     AsynchronousManager asynchronousManager = null;
