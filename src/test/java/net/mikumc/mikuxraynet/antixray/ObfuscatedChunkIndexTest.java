@@ -289,6 +289,37 @@ class ObfuscatedChunkIndexTest {
     assertEquals(0, index.positionCount());
   }
 
+  /**
+   * 「累计登记」必须按<b>不同区块</b>计数：同一区块因内容变化会被反复改写并在索引里覆盖旧条目，
+   * 若每次都 ++，面板会出现「累计登记 − 卸载清理 ≠ 当前驻留」这种加不起来的三个数，
+   * 管理员无法用它判断「索引是不是都随卸载清掉了」。
+   */
+  @Test
+  void registeredChunkTotalCountsOnlyNewChunks() {
+    ObfuscatedChunkIndex index = index(1_000_000, 60 * SECOND_NANOS);
+
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, positions(3));
+    assertEquals(1L, index.registeredChunks(), "首次登记计入累计登记");
+
+    // 同一区块重复改写（内容变化 → 覆盖旧条目）：不得重复计入
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, positions(5));
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, positions(2));
+    assertEquals(1L, index.registeredChunks(), "同一区块重复改写不得重复计入累计登记");
+    assertEquals(1, index.chunkCount(), "覆盖后仍只有一个区块条目");
+    assertEquals(2, index.positionCount(), "坐标数按最新清单计");
+
+    index.recordChunkWithRemovals(WORLD, 1, 0, MIN_HEIGHT, positions(2));
+    assertEquals(2L, index.registeredChunks(), "新区块照常计入");
+
+    assertTrue(index.invalidateChunk(WORLD, 1, 0));
+    assertEquals(2L, index.registeredChunks(), "累计登记只增不减（卸载清理有独立计数）");
+    assertEquals(1L, index.invalidatedChunks(), "卸载清理单独计数（1 个区块）");
+    // 口径自洽：累计登记 − 卸载清理 = 当前驻留（安全阀未触发时恒成立）
+    assertEquals(1L, index.registeredChunks() - index.invalidatedChunks(),
+        "「累计登记 − 卸载清理」应等于当前驻留区块数（安全阀 0 时）");
+    assertEquals(1, index.chunkCount(), "当前驻留区块数");
+  }
+
   @Test
   void entriesExpireAfterWindowUnlessScanned() {
     long window = 10 * SECOND_NANOS;

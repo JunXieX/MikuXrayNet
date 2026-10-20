@@ -1070,7 +1070,10 @@ public final class AntiXrayConfig {
                 DISK_CACHE_MAX_ENTRIES_MAX, "disk-cache.max-entries", floorAdjustments,
                 ceilingAdjustments),
             // 上限见 DISK_CACHE_MAX_FILE_SIZE_MB_MAX：压缩回收会把整个区域文件读进内存重写。
-            clampCeiling(root.getInt("disk-cache.max-file-size-mb", 16), 1,
+            // 默认 32 MB 的依据：一个区域文件覆盖 1024 个区块，单条负载约 22~26 KB（改写后区块字节
+            // ~19.8 KB + 坐标表 + 遮挡负载），整区装满约需 24~27 MB；16 MB 只能装下约 2/3 的区块，
+            // 且文件满了以后没有垃圾可回收 → 该区域剩余区块永远无法进缓存、每次重发都要重算。
+            clampCeiling(root.getInt("disk-cache.max-file-size-mb", 32), 1,
                 DISK_CACHE_MAX_FILE_SIZE_MB_MAX, "disk-cache.max-file-size-mb", floorAdjustments,
                 ceilingAdjustments),
             // 过期秒数有安全下限（见 DISK_CACHE_EXPIRE_FLOOR_SECONDS）：从写入时刻算的过期时间配得比

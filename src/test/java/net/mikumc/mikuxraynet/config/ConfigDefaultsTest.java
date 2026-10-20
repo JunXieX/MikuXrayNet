@@ -622,7 +622,9 @@ class ConfigDefaultsTest {
     // disk-cache 全部 14 键
     assertTrue(config.diskCache().enabled(), "磁盘缓存默认开启");
     assertEquals(20000, config.diskCache().maxEntries(), "条目总数上限默认 20000");
-    assertEquals(16, config.diskCache().maxFileSizeMb(), "单区域文件上限默认 16 MB");
+    assertEquals(32, config.diskCache().maxFileSizeMb(),
+        "单区域文件上限默认 32 MB：16 MB 装不下一个区域文件的 1024 个区块（单条约 22~26 KB），"
+            + "文件满了没有可回收垃圾时该区域剩余区块将永久无法进缓存");
     assertEquals(7 * 24 * 60 * 60, config.diskCache().expireSeconds(),
         "条目过期默认 7 天（原 1800 秒：从写入时刻算起，配得比两次启动间隔还短 → 重启后条目全过期、"
             + "命中率恒为 0；实机 70 分钟后重启命中 0／未命中 2096）。内容新鲜度由原始字节指纹判定，"

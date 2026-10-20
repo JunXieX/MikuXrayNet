@@ -673,6 +673,8 @@ public final class Diagnostics {
     // 极易被误读成「显形路径没有登记」（实际登记在发包成功后必然发生）。
     // 伪装索引的口径必须与「累计登记 / 卸载清理」一起显示：它只随区块卸载清理（不再按时间过期），
     // 玩家走开后会归零。若只显示实时值，「改写 N 但伪装区块 0」会被误读成「索引没记上、反矿透失效」。
+    // 累计登记按「不同区块」去重（同一区块反复改写只计一次），因此三个数可对账：
+    //   累计登记 − 卸载清理 − 安全阀淘汰 = 当前驻留（正常运营下安全阀为 0）。
     lines.add("显形索引：伪装区块 " + s.index().obfuscatedChunkCount() + "（当前驻留；累计登记 "
         + s.index().obfuscatedRegisteredTotal() + "，卸载清理 " + s.index().obfuscatedInvalidatedTotal()
         + "，坐标 " + s.index().obfuscatedPositionCount()

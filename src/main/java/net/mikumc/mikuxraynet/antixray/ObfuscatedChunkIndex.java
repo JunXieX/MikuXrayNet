@@ -83,11 +83,14 @@ public final class ObfuscatedChunkIndex {
   private final LongAdder evictedByCapacity = new LongAdder();
 
   /**
-   * 累计登记过的区块数（只增不减）与累计因卸载/世界卸载摘除的区块数。
+   * 累计登记过的<b>不同</b>区块数（去重、只增不减）与累计因卸载/世界卸载摘除的区块数。
    *
    * <p><b>为什么需要它们</b>：面板上的「伪装区块」是<b>实时驻留量</b>——玩家走开后区块卸载、条目被摘除，
    * 它会归零。而「改写 1974」是累计值。两个数字放在一起看，服主很容易误判成「改写成功了但索引没记上、
    * 反矿透失效」。给出累计登记与累计摘除后，「驻留 0」就能被解释为「都随卸载清掉了」而不是「没登记」。
+   *
+   * <p><b>去重口径</b>：只有「该区块首次进入索引」才计数；同一区块因内容变化被重复改写（登记时覆盖
+   * 旧条目）不重复计数。这样「累计登记 − 卸载清理」才约等于当前驻留量（差额只剩安全阀淘汰）。
    */
   private final LongAdder registeredChunks = new LongAdder();
   /** 累计因区块卸载 / 世界卸载而摘除的区块数。 */
@@ -202,14 +205,22 @@ public final class ObfuscatedChunkIndex {
     // 移除差集同样在 compute 内算：与覆盖原子生效，并发覆盖不会拿到过期的旧清单去算差集。
     int[] delta = {0};
     int[][] removedHolder = {NO_REMOVALS};
+    boolean[] created = {false};
     chunks.compute(key, (ignored, previous) -> {
       delta[0] = localPositions.length - (previous == null ? 0 : previous.size());
       removedHolder[0] = previous == null ? NO_REMOVALS
           : removedByOverwrite(previous.locals(), localPositions);
+      created[0] = previous == null;
       return entry;
     });
     totalPositions.updateAndGet(current -> Math.max(0, current + delta[0]));
-    registeredChunks.increment();
+    // 只在「该区块此前不在索引里」时计入累计登记：同一区块因内容变化反复改写会多次走到这里，
+    // 旧实现每次都 ++，让面板上出现「累计登记 4288、卸载清理 2891、当前驻留 649」这种加不起来的
+    // 三个数（差额是重复登记的同一批区块），管理员没法用它判断「索引是不是都随卸载清掉了」。
+    // 现在 累计登记 − 卸载清理 − 安全阀淘汰 = 当前驻留（正常运营下安全阀为 0）。
+    if (created[0]) {
+      registeredChunks.increment();
+    }
     return removedHolder[0];
   }
 
