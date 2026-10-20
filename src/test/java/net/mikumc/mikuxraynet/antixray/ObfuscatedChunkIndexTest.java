@@ -329,10 +329,14 @@ class ObfuscatedChunkIndexTest {
   /**
    * 结构断言：{@link ObfuscatedChunkIndex}、{@link ChunkKey} 与其全部嵌套类型的任何字段，
    * 都不能是平台类型，也不能把平台类型当泛型实参——从根上杜绝「键悄悄钉住 World/Chunk/Player」。
+   *
+   * <p>类数 5 = {@code ObfuscatedChunkIndex} + {@code ChunkEntry} + {@code Position}
+   * + {@code ChunkKey} + {@code ChunkKey.Probe}（热路径复用的可变查询键，只含 String 与两个 int）。
+   * 该数字是「结构没被悄悄扩宽」的守门值：新增嵌套类型时这里会失败，提醒复核新类型是否引入了平台引用。
    */
   @Test
   void obfuscatedIndexHoldsNoPlatformReferences() {
-    assertNoPlatformReferences(4, "ObfuscatedChunkIndex + ChunkKey",
+    assertNoPlatformReferences(5, "ObfuscatedChunkIndex + ChunkKey",
         ObfuscatedChunkIndex.class, ChunkKey.class);
   }
 

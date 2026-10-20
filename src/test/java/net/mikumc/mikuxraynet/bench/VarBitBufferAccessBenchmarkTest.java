@@ -112,10 +112,28 @@ class VarBitBufferAccessBenchmarkTest {
     return buffer[position] >>> offset & mask;
   }
 
-  /** 特化实现的读法：把除法换成「乘法取高位 + 移位」，全程无除法。 */
+  /**
+   * 特化实现的读法：<b>全程无除法</b>。
+   *
+   * <p>分两种情形（与 {@link #shiftFor} 的参数一一对应）：
+   * <ul>
+   *   <li>{@code entriesPerLong} 是 2 的幂（位宽 4/8）→ 直接逻辑右移；</li>
+   *   <li>非 2 的幂（位宽 5/6/7）→ 用「乘魔数取高 32 位」的无符号除法替换
+   *       （{@code (index * magic) >>> 32}，要求 {@code index} 非负且 {@code magic} 在 long 内不溢出）。</li>
+   * </ul>
+   *
+   * <p><b>为什么不能统一套乘法形式</b>：2 的幂时若把「右移位数」也塞进同一个 {@code >>>}，
+   * 由于 {@code index * magic} 已经是 long，右移 32+log2 位会把结果抹成 0——这正是本基准第一版
+   * 在「位宽 8」上被等价性断言抓到的错误（期望 255、实得 7）。两种情形必须分开写。
+   */
   private static long readShifted(long[] buffer, int index, long[] shift, int bits, int mask) {
-    // shift = { 乘法倒数, 右移位数, 位内偏移掩码 }
-    int position = (int) ((index * shift[0]) >>> shift[1]);
+    // shift = { 魔数或 1, 右移位数（2 的幂）或 -1（表示走乘法路径）, entriesPerLong }
+    int position;
+    if (shift[1] >= 0L) {
+      position = index >>> (int) shift[1];
+    } else {
+      position = (int) ((index * shift[0]) >>> 32);
+    }
     int offset = (index - position * (int) shift[2]) * bits;
     return buffer[position] >>> offset & mask;
   }
@@ -136,16 +154,21 @@ class VarBitBufferAccessBenchmarkTest {
     return sum;
   }
 
-  /** 为 {@code entriesPerLong} 求「乘法倒数」参数（Hacker's Delight 的无符号除法替换）。 */
+  /**
+   * 为 {@code entriesPerLong} 求特化读法所需的参数。
+   *
+   * @return {@code { 魔数或 1, 右移位数（2 的幂时 >= 0，否则 -1 表示走乘法路径）, entriesPerLong }}
+   */
   private static long[] shiftFor(int bits, int entriesPerLong) {
     if (Integer.bitCount(entriesPerLong) == 1) {
-      // 2 的幂：直接用移位，乘法倒数退化为 1 与移位
+      // 2 的幂（位宽 4 → 16 项/long、位宽 8 → 8 项/long）：直接移位即可
       int log2 = Integer.numberOfTrailingZeros(entriesPerLong);
-      return new long[] {1L, 32 + log2, entriesPerLong};
+      return new long[] {1L, log2, entriesPerLong};
     }
-    // 非 2 的幂（位宽 5/6/7）：用「乘 2^32/d 再右移 32」的经典形式
+    // 非 2 的幂（位宽 5/6/7）：乘魔数取高 32 位，等价于无符号除以 entriesPerLong。
+    // magic = ceil(2^32 / d)，对 index < 2^31 且 d <= 12 的取值域恒有 floor(index*magic / 2^32) == index/d。
     long magic = ((1L << 32) + entriesPerLong - 1) / entriesPerLong;
-    return new long[] {magic, 32, entriesPerLong};
+    return new long[] {magic, -1L, entriesPerLong};
   }
 
   /** 构造一份位宽 {@code bits} 的位打包数据（确定性填充，值域落在位宽内）。 */
