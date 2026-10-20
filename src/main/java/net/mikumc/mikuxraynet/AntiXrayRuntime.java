@@ -2,6 +2,7 @@ package net.mikumc.mikuxraynet;
 
 import com.comphenix.protocol.ProtocolManager;
 import java.io.File;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.antixray.BlockChangeRevealListener;
@@ -87,6 +88,13 @@ public final class AntiXrayRuntime {
   private final OcclusionStats occlusionStats;
   private volatile BypassRegistry bypassRegistry;
   private volatile boolean antiXrayActive;
+  /**
+   * 「反矿透总开关已关闭、但邻近显形仍需继续兜底」的一次性提示闸门。
+   *
+   * <p><b>为什么需要一次性提示</b>：这是本类唯一「模块已关闭却仍有任务在跑」的例外，必须让管理员
+   * 看见取舍；但它每次 reload 都成立，逐次打印会把控制台刷满，故只在进程内首次出现时说明一次。
+   */
+  private final AtomicBoolean masterSwitchOffNotice = new AtomicBoolean();
 
   AntiXrayRuntime(MikuXrayNet plugin, OcclusionStats occlusionStats) {
     this.plugin = plugin;
@@ -98,10 +106,21 @@ public final class AntiXrayRuntime {
   // 权限只在进入服务器时判定一次：运行期改权限需重进服务器生效（见 BypassRegistry 类注释）。
   void startBypassRegistry() {
     BypassRegistry registry = new BypassRegistry(plugin);
+    boolean started;
     try {
-      registry.start();
+      started = registry.start();
     } catch (Throwable throwable) {
-      logger.log(Level.WARNING, "直通名单初始化失败，反矿透将以「无直通」继续运行", throwable);
+      // start() 已对可预期失败（注册被拒、快照调度失败）兜底并打出**准确**的后果说明；
+      // 这里只接「不该发生」的 Throwable，目的仅是保证本字段永远非 null、不阻断后面的反矿透装配。
+      // 旧实现把这一 catch 当成注册失败的唯一提示，但 start() 内部从不外抛 —— 那段文案既不可达，
+      // 又把后果说轻（只写「无直通」，没写「登录/退出也不会再维护名单」）。
+      started = false;
+      logger.log(Level.WARNING, "直通名单初始化出现未预期异常（本次启用按「无直通」继续）", throwable);
+    }
+    if (!started) {
+      // 不重复打印 start() 内部已给出的详细原因，只补一句调用方视角的后果与恢复方式。
+      logger.warning("直通名单未生效：持有 " + BypassRegistry.PERMISSION
+          + " 的玩家本次启用期间不会直通；重载 / 重启插件可重试");
     }
     this.bypassRegistry = registry;
   }
@@ -451,10 +470,17 @@ public final class AntiXrayRuntime {
   /**
    * 按新配置重建邻近显形（复用同一套显形结构，避免与改写链路脱钩）。
    *
-   * <p><b>为什么必须读新配置的 {@code proximity.enabled}</b>：索引与已显形集合在启动期一旦建立就一直
-   * 非 null，若只凭「字段非 null」判定就重启显形，则热重载把 {@code proximity.enabled} 改成 false 时
-   * 显形仍会照常启动——「关闭即零开销」的承诺在 reload 路径失效（旧缺陷：条件恒真、索引从不置空）。
+   * <p><b>为什么必须读新配置的开关（而不是凭「字段非 null」）</b>：索引与已显形集合在启动期一旦建立就
+   * 一直非 null，若只凭「字段非 null」判定就重启显形，则热重载把开关改成 false 时显形仍会照常启动——
+   * 「关闭即零开销」的承诺在 reload 路径失效（旧缺陷：条件恒真、索引从不置空）。
    * 现在关闭时释放索引并停用显形；启用时复用既有索引重启显形。
+   *
+   * <p><b>总开关关闭不在此门闸内（刻意如此）</b>：{@code antixray.yml: enabled=false} 只表示
+   * 「不再改写新区块」——改写链路会整体放行（{@code ProtocolLibAsyncListener#appliesTo} 读实时配置），
+   * 索引从此不再增长；但<b>客户端里已经存在的伪装方块只能靠邻近显形换回真实方块</b>。若这时把显形
+   * 停掉并清空索引，那些假矿就永远无法被还原（要等区块重发才换回真方块），属本项目禁止的
+   * 「该显形不显形 / 玩家体验异常」。存量索引会随区块卸载收缩、任务本身成本很小，因此宁可留着兜底；
+   * 只在控制台打一条一次性说明（见 {@link #masterSwitchOffNotice}），把这层取舍写清楚。
    */
   void restartProximity() {
     if (!antiXrayActive || proximityStats == null) {
@@ -465,14 +491,21 @@ public final class AntiXrayRuntime {
       return;
     }
     AntiXrayConfig antiXray = plugin.mikuConfig().antiXray();
-    if (!antiXray.proximity().enabled()) {
-      // 关闭：停周期任务、注销变更注销监听并清空索引内容；这里再置空字段，
-      // 之后不再登记/发送任何显形——与启动路径「关闭即不建索引、零开销」保持一致。
+    if (!proximitySwitchOn(antiXray)) {
+      // 关闭（只看 proximity.enabled）：停周期任务、注销事件监听并清空索引内容；
+      // 这里再置空字段，之后不再登记/发送任何显形——与启动路径「关闭即不建索引、零开销」保持一致。
       stopProximity();
       obfuscatedChunkIndex = null;
       revealedSet = null;
-      logger.fine("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false）");
+      logger.fine("邻近显形已在配置中关闭（antixray.yml: proximity.enabled=false），邻近显形已停用并释放索引");
       return;
+    }
+    // 总开关关闭、显形开关仍开：**继续运行**（见方法注释里的取舍说明）。
+    // 改写链路此时已整体放行，索引不会再增长，只有「已下发的假矿」需要兜底；
+    // 重启后 startAntiXray 走不到这里（enabled=false 会提前返回），故显形不会再启动。
+    if (!antiXray.enabled() && masterSwitchOffNotice.compareAndSet(false, true)) {
+      logger.info("反矿透总开关已关闭（antixray.yml: enabled=false）：不再改写新区块，"
+          + "但已下发的伪装区块仍需显形兜底，故邻近显形任务继续运行（重启后不再启动）");
     }
     // 启用：只停任务、绝不清空共享索引——索引只在区块封包下发时写入，而热重载不会让服务端重发
     // 已加载区块；清空会让这些区块的伪装坐标永久失联（玩家眼前的假方块再也不显形，直到区块重发）。
@@ -491,7 +524,30 @@ public final class AntiXrayRuntime {
     startProximity(antiXray, obfuscatedChunkIndex, revealedSet, proximityStats, false);
   }
 
-  /** 使全部改写缓存、邻块快照、显形结构失效并落盘磁盘缓存（配置热重载时调用）。 */
+  /**
+   * 邻近显形开关是否开启：<b>只反映 {@code proximity.enabled}，刻意不含反矿透总开关</b>。
+   *
+   * <p><b>为什么总开关不参与本门闸</b>：{@code enabled=false} 只意味着「不再改写新的区块」，
+   * 而客户端里已经存在的伪装方块仍必须靠邻近显形换回真实方块。若把总开关并进来，reload 就会停掉
+   * 显形并清空索引，那些假矿将永远无法还原（要等区块重发）——属本项目禁止的「该显形不显形」。
+   * 总开关只影响是否打印一条取舍说明（见 {@code restartProximity}），不参与启停判定。
+   *
+   * <p>抽成包级可见的<b>纯函数</b>（不触碰 Bukkit / 实例字段）是为了可离线单测：
+   * {@link AntiXrayRuntime} 实例的构造需要 {@code Plugin}，单测无法构造，而「总开关不得参与启停」
+   * 这一语义必须被测试钉住（否则很容易被后人"顺手"改回总开关优先）。
+   *
+   * @param config 当前代的反矿透配置（{@code null} 视为不运行：配置尚未加载时不应起任何巡检任务）
+   */
+  static boolean proximitySwitchOn(AntiXrayConfig config) {
+    return config != null && config.proximity().enabled();
+  }
+
+  /**
+   * 使<b>派生缓存</b>（改写缓存 + 邻块快照）失效并落盘磁盘缓存（配置热重载时调用）。
+   *
+   * <p><b>伪装索引 / 已显形集合刻意保留</b>：热重载不会让客户端重收已加载区块，清掉它们会让已下发的
+   * 假矿永远无法被还原（要等区块重发）。详见 {@code ProtocolLibAsyncListener#invalidateAll} 的说明。
+   */
   void invalidateRewriteCaches() {
     ProtocolLibHook hook = protocolLibHook;
     if (hook != null) {
@@ -604,6 +660,28 @@ public final class AntiXrayRuntime {
    */
   public OcclusionStores occlusionStores() {
     return occlusionStores;
+  }
+
+  /**
+   * 遮挡判定计数（<b>插件级唯一实例</b>，与带宽侧共用、跨热重载复用）。
+   *
+   * <p><b>为什么必须暴露</b>：遮挡位图的方块补丁监听（{@code OcclusionPatchListener}）随反矿透装配，
+   * 与「带宽管线是否建成」无关——带宽装配失败时它仍会持续往本实例写入。诊断若只能经
+   * {@code ThrottlePipeline#occlusionStats()} 取值，就会在这条异常路径上把「补丁正常工作」显示成
+   * 「未接线、补丁 0 格」。恒返回非 null（未启用时计数器恒为 0）。
+   */
+  public OcclusionStats occlusionStats() {
+    return occlusionStats;
+  }
+
+  /**
+   * 当前驻留的遮挡 section 条目总数（跨世界求和）。遮挡数据仓库未建立（反矿透未启用）时为 0。
+   *
+   * <p>与 {@link #occlusionStats()} 同理由：位图驻留量由反矿透侧持有，带宽管线缺失时也应可观测。
+   */
+  public int occlusionSectionsResident() {
+    OcclusionStores stores = occlusionStores;
+    return stores == null ? 0 : stores.residentSections();
   }
 
   /** 伪装区块索引（供诊断读取区块数 / 坐标数与安全阀计数）；未启用邻近显形时为 null。 */

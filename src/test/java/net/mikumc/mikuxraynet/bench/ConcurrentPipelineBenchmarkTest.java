@@ -1,15 +1,13 @@
 package net.mikumc.mikuxraynet.bench;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -120,7 +118,8 @@ class ConcurrentPipelineBenchmarkTest {
     report.append("\n### 6.2 显形索引并发读写\n\n");
     report.append("- 结构：{@code ObfuscatedChunkIndex}（伪装坐标，按区块共享，玩家线程与工作线程共享）\n");
     report.append("- 测「记录 + 查询 + 摘除」混合负载下的每操作耗时与并发争用代价\n");
-    report.append("- 每线程 ").append(INDEX_OPS_PER_THREAD).append(" 次操作，8 线程并发\n\n");
+    report.append("- 每线程 ").append(INDEX_OPS_PER_THREAD)
+        .append(" 次操作，按 1 / 4 / 8 线程分别测（每次操作 = 记录 + 查询 + 摘除，计 3 次）\n\n");
     report.append("| 线程数 | 总操作 | 总耗时(ms) | 每操作(ns) | 操作/秒 |\n");
     report.append("| --- | --- | --- | --- | --- |\n");
 
@@ -128,18 +127,31 @@ class ConcurrentPipelineBenchmarkTest {
       long[] result = runConcurrentIndexOps(index, threads);
       long nanos = result[0];
       long ops = result[1];
+      long roundOps = (long) threads * 3L * INDEX_OPS_PER_THREAD;
+      assertEquals(roundOps, ops, "线程数=" + threads + "：实际执行的操作数必须等于 threads×3×每线程次数");
       double perOpNanos = ops <= 0 ? 0.0 : (double) nanos / ops;
       double opsPerSecond = nanos <= 0 ? 0.0 : ops * 1_000_000_000.0 / nanos;
       report.append(String.format(Locale.ROOT, "| %d | %d | %.1f | %.1f | %.0f |%n",
           threads, ops, nanos / 1_000_000.0, perOpNanos, opsPerSecond));
+
+      // 每轮结束索引必须回到空表：每个线程都是「record 同一区块 → 立刻 invalidate 同一区块」，
+      // 净增恒为 0。逐轮断言，任何「记录丢失 / 摘除漏摘 / 计数漂移」都会当场暴露；只断言
+      // chunkCount()>=0 / positionCount()>=0 是恒真的，等于没测。
+      assertEquals(0, index.chunkCount(),
+          "线程数=" + threads + "：record+invalidate 成对调用后索引必须回到空表");
+      assertEquals(0, index.positionCount(),
+          "线程数=" + threads + "：伪装坐标计数必须回到 0");
+      assertEquals(0L, index.evictedByCapacity(),
+          "线程数=" + threads + "：正常量级下安全阀不得触发（否则说明驻留量被动增长）");
     }
     report.append("\n> 每操作耗时随线程数上升的幅度，反映并发容器争用的代价。\n");
     appendReport(report.toString());
     System.out.println(report);
 
-    // 正确性：并发写入后索引仍自洽（计数与条目数一致）
-    assertTrue(index.chunkCount() >= 0, "索引计数必须自洽");
-    assertFalse(index.positionCount() < 0, "伪装坐标计数不得为负");
+    // 正确性：全部轮次结束后索引仍是空表、计数为 0（record/invalidate 成对 ⇒ 净增恒为 0），
+    // 且累计操作数与理论值一致（LongAdder 没有丢计数）。
+    assertEquals(0, index.chunkCount(), "索引必须自洽：成对调用后不得留下任何区块条目");
+    assertEquals(0, index.positionCount(), "索引必须自洽：不得留下任何伪装坐标");
   }
 
   /** 用 {@code threads} 条线程各改写 {@link #CHUNKS_PER_THREAD} 个区块，返回总耗时。 */
@@ -163,10 +175,9 @@ class ConcurrentPipelineBenchmarkTest {
     try {
       CountDownLatch ready = new CountDownLatch(threads);
       CountDownLatch go = new CountDownLatch(1);
-      List<byte[]> outputs = new ArrayList<>(threads);
-      for (int t = 0; t < threads; t++) {
-        outputs.add(null);
-      }
+      // 用数组而不是 ArrayList 收结果：ArrayList#set 在多线程下并不保证可见性（虽然不扩容，
+      // 但这是数据竞争），数组 + CountDownLatch/awaitTermination 的 happens-before 才是确定的。
+      byte[][] outputs = new byte[threads][];
       for (int t = 0; t < threads; t++) {
         int slot = t;
         pool.execute(() -> {
@@ -177,16 +188,18 @@ class ConcurrentPipelineBenchmarkTest {
             Thread.currentThread().interrupt();
             return;
           }
-          outputs.set(slot, processor.rewrite(payload, SECTION_COUNT, SEED, null).data());
+          outputs[slot] = processor.rewrite(payload, SECTION_COUNT, SEED, null).data();
         });
       }
       ready.await();
       go.countDown();
       pool.shutdown();
       assertTrue(pool.awaitTermination(60, TimeUnit.SECONDS), "并发改写必须在时限内完成");
-      byte[] first = outputs.get(0);
-      for (byte[] output : outputs) {
-        assertTrue(Arrays.equals(first, output), "所有线程的输出必须逐字节相同");
+      byte[] first = outputs[0];
+      assertTrue(first != null, "0 号线程的输出不得缺失");
+      for (int slot = 0; slot < threads; slot++) {
+        assertTrue(outputs[slot] != null, "线程 " + slot + " 的输出不得缺失");
+        assertTrue(Arrays.equals(first, outputs[slot]), "所有线程的输出必须逐字节相同");
       }
       return first;
     } finally {

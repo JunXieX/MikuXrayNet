@@ -80,8 +80,10 @@ import org.bukkit.util.Vector;
  * <p><b>线程纪律</b>：位置读取、方块读取与发包都在主线程 / Folia 区域线程（非 Folia 为统一主线程任务，
  * Folia 为各玩家的区域任务）；纯计算（视锥角度 + 遮挡位图可见性）交给 {@link MikuWorkPool} 的工作线程，
  * 算完再回到玩家所属线程，只做「区块加载检查 + 读真实方块 + 发包」。位图判定（{@link BitmapVisibility}）
- * 只读无锁位图与纯浮点步进、不需要任何 Bukkit API，因而可与视锥一同被搬到工作线程。工作队列已满时退化为
- * 「玩家线程直接做同一套纯计算」，功能不降级、绝不阻塞。
+ * 只读无锁位图与纯浮点步进、不需要任何 Bukkit API，因而可与视锥一同被搬到工作线程。
+ * <b>工作队列已满时本轮直接跳过</b>（计入 {@code ProximityStats#passesSkippedNoCapacity}，下一巡检周期
+ * 继续）：绝不在玩家线程上同步跑满额判定——那会把本模块刻意搬走的整轮射线 CPU 压回主线程 / 区域线程，
+ * 恰好在服务器最忙（区块集中下发把改写队列塞满）的时刻造成毛刺。显形只延迟、不丢失。
  *
  * <p><b>发包纪律</b>：显形包改用 <b>Paper 原生 API</b>（{@code Player#sendMultiBlockChange} /
  * {@code Player#sendBlockChange}）直接发出，不再自拼包结构——因此不触碰 ProtocolLib 的
@@ -108,19 +110,27 @@ public final class ProximityRevealer implements Listener {
    * 避免「远处最多、近处还没轮到」的候选把名额占满。
    */
   private static final int CANDIDATE_OVERSAMPLE = 4;
-  private static final int MAX_CANDIDATES = 512;
   /**
-   * 单玩家单周期「候选评估」硬上限（与发包额度解耦）。
+   * 单周期候选窗口的硬上限：<b>取候选、评估、发包三者共用同一个数</b>。
    *
-   * <p><b>为什么需要它</b>：旧的循环只在发包额度 {@code budget.remaining() <= 0} 时断环，而可见性判定
-   * 失败、区块未加载都是直接 {@code return}、<b>不扣发包额度</b>——于是发包额度只限「发了多少包」，
-   * 不限「评估了多少候选」。每评估一个候选要做暴露面识别 + 多候选点位图步进，是本功能最重的部分；
-   * 一批「永远看不见的坐标」（整块埋住、上方岩浆等）会把评估量顶到候选上限
-   * {@link #MAX_CANDIDATES} 而一个包都不发。这里单独设一个评估额度：无论是否发得出包，评估次数触顶即
-   * 停。候选本就按距离由近到远取（见 ProximityScanner），因此超出的候选只是延后到后续周期（分片轮转）
-   * 评估，<b>可见的矿仍会显形，最坏多等一个周期</b>——绝不丢显形。
+   * <p><b>为什么三者必须对齐</b>：窗口 = {@code fetchLimit(budget)}，评估与发包都以它为界。旧实现另有
+   * 一个 256 的「评估上限」，于是①窗口后一半候选每周期被取出又丢弃（距离排序与堆选择白做，类注释
+   * 宣称的窗口覆盖也只剩一半）；②{@code proximity.max-reveals-per-tick} 配到 &gt;256 时被静默截断到
+   * 256（配置键形同虚设）。现在评估预算 = 取到的候选数：配置值在 ≤ 本值时完整生效，超出部分由
+   * {@link #effectiveRevealCeiling(int)} 钳制并在启动时 WARN 一次（绝不静默改配置）。
+   *
+   * <p>包级可见：单测据此断言「三个上限一致」，避免日后再次漂移。
    */
-  private static final int MAX_EVALUATIONS_PER_PASS = 256;
+  static final int MAX_CANDIDATES = 512;
+  /**
+   * <b>事件即时显形</b>（单次事件）的评估次数上限，与周期巡检的窗口无关。
+   *
+   * <p><b>为什么事件路径必须单独设上限</b>：它跑在玩家所属线程（Paper 主线程 / Folia 区域线程），候选
+   * 来自「一个 section 内全部变更坐标 × 曼哈顿偏移」——半径 8 时可达数十万次判定。周期巡检的评估跑在
+   * 工作线程且已受候选窗口约束，不需要也不应共用这个数。触顶即停，剩余候选交给同 tick 的后续事件或
+   * 下一个巡检周期（显形只延迟、不丢失）。
+   */
+  private static final int MAX_INSTANT_EVALUATIONS_PER_EVENT = 256;
 
   /**
    * 单个 section 的邻域初筛（封包线程）允许的最大「探测」次数：每个变更坐标 × 每个曼哈顿偏移算一次。
@@ -128,7 +138,7 @@ public final class ProximityRevealer implements Listener {
    * <p><b>为什么需要</b>：{@link #hasDisguisedNearSection} 对每个变更坐标遍历全部曼哈顿偏移
    * （半径 8 时约 833 个），且无任何次数上限；当邻域内没有伪装坐标（短路失效）时，满载的
    * {@code MULTI_BLOCK_CHANGE}（最多 4096 个坐标）会在 netty 线程上造成约 340 万次索引查找。
-   * 实体侧同类循环有 {@link #MAX_EVALUATIONS_PER_PASS} 兜底，这里同样加一个硬上限。
+   * 事件显形循环有 {@link #MAX_INSTANT_EVALUATIONS_PER_EVENT} 兜底，这里同样加一个硬上限。
    *
    * <p>取 {@code 64K}：足以完整扫描约 {@code 78} 个变更坐标的邻域——现实中的变更包坐标数远小于此
    * （方块交互个位数、爆炸几十个），因此正常路径不会被截断；同时把最坏工作量压到原值的约五十分之一。
@@ -202,21 +212,30 @@ public final class ProximityRevealer implements Listener {
   private static final class Plan {
 
     private final int[] coordinates;
+    /**
+     * 有效候选条数（每条 3 个 int）。
+     *
+     * <p><b>为什么显式保存而不是用 {@code coordinates.length / 3}</b>：{@code computePlan} 直接在
+     * 「取候选时分配的那个 int[]」上原地压缩（保留项前移，写下标恒 ≤ 读下标），因此数组可能比实际条数
+     * 长；尾段是已评估过的陈旧值，只允许由本字段限定长度、绝不读取。
+     */
+    private final int count;
     /** 本次取到的候选总数与其中被视锥剔除的数量（仅供一次性诊断日志使用）。 */
     private final int candidateCount;
     private final int frustumCulled;
     /** 并入本步的位图可见性剔除数（未并入时为 0）。 */
     private final int rayCulled;
 
-    private Plan(int[] coordinates, int candidateCount, int frustumCulled, int rayCulled) {
+    private Plan(int[] coordinates, int count, int candidateCount, int frustumCulled, int rayCulled) {
       this.coordinates = coordinates;
+      this.count = count;
       this.candidateCount = candidateCount;
       this.frustumCulled = frustumCulled;
       this.rayCulled = rayCulled;
     }
 
     private int count() {
-      return coordinates.length / 3;
+      return count;
     }
   }
 
@@ -261,7 +280,8 @@ public final class ProximityRevealer implements Listener {
   }
 
   private final Plugin plugin;
-  private final AntiXrayConfig config;
+  // 注意：本类不再持有 AntiXrayConfig 字段——入口门闸只看世界黑名单（见 shouldRevealInWorld），
+  // 构造参数只用于一次性快照 proximity / instant / batchRevealSends。
   private final AntiXrayConfig.Proximity proximity;
   private final AntiXrayConfig.InstantReveal instant;
   /** 是否把同一周期的显形合并成一个 Paper 原生多方块变更包发出（{@code proximity.batch-reveal-sends}）。 */
@@ -300,6 +320,8 @@ public final class ProximityRevealer implements Listener {
   private final AtomicBoolean firstRevealDiagnosed = new AtomicBoolean();
   /** 「显形索引安全阀触发」只提示一次（CAS 抢占），避免每轮巡检刷屏。 */
   private final AtomicBoolean capacityWarned = new AtomicBoolean();
+  /** 「工作线程无容量导致跳过巡检」只提示一次（CAS 抢占），避免队列持续打满时每周期刷屏。 */
+  private final AtomicBoolean noCapacityWarned = new AtomicBoolean();
   /** 事件显形的每玩家每 tick 限额（默认 16，防爆刷；见 {@link TickQuota}）。 */
   private final TickQuota instantQuota = new TickQuota();
   /** 过度显形抽样器（1/N，只计数不改行为；N=0 关闭）。 */
@@ -337,14 +359,23 @@ public final class ProximityRevealer implements Listener {
    * 乙玩家对同一坐标再也无法被主动显形（乙客户端仍持伪装区块，只能等区块重载才恢复）。
    * 有了这个短期标记，监听器就能区分「我们自己刚发的回显」与「真实变更」：前者只保留、不摘共享索引。
    *
-   * <p><b>有界</b>：条目在窗口到期后由「消费即删」或整体清空回收，每玩家另设条数上界；
-   * 玩家退出与插件停用时整体释放。
+   * <p><b>有界</b>：<b>记号</b>在「被消费」「同坐标再次被查询」或巡检周期的 {@link #pruneExpiredEchoes()}
+   * 里回收，每玩家另设条数上界。内层 map 本身只在玩家退出（{@link #onQuit}）与插件停用
+   * （{@link #stop(boolean)} 的 clearIndexes 路径）整体释放——<b>周期清理刻意不摘除空 map</b>，理由见
+   * {@link #pruneExpiredEchoes()}（摘了会与 {@link #markOurReveal} 的「取引用 → put」形成孤儿记号窗口）。
+   * 因此驻留量上界是「在线玩家数 × 一个空 ConcurrentHashMap」，可忽略；窗口到期却始终没被消费的
+   * 记号只可能来自「发包未被出站监听器观察到」的异常路径（例如停用瞬间的在途任务），周期清理保证
+   * 它不会滞留。热重载会重建本类实例，旧实例的整张表随实例一起回收。
    */
   private final ConcurrentHashMap<UUID, ConcurrentHashMap<EchoKey, Long>> revealEcho =
       new ConcurrentHashMap<>();
 
-  /** 回显标记的键：世界名 + 方块坐标（record 自带 equals/hashCode，避免手工位打包的碰撞风险）。 */
-  private record EchoKey(String world, int x, int y, int z) {
+  /**
+   * 回显标记的键：世界名 + 方块坐标（record 自带 equals/hashCode，避免手工位打包的碰撞风险）。
+   *
+   * <p>包级可见：{@link #pruneExpiredEchoes(ConcurrentHashMap, long)} 的离线单测需要构造键。
+   */
+  record EchoKey(String world, int x, int y, int z) {
   }
 
   /**
@@ -358,7 +389,6 @@ public final class ProximityRevealer implements Listener {
       ObfuscatedChunkIndex chunkIndex, RevealedSet revealedSet, ProximityStats stats,
       BypassRegistry bypassRegistry, MikuWorkPool workPool, OcclusionStores occlusionStores) {
     this.plugin = plugin;
-    this.config = config;
     this.proximity = config.proximity();
     this.instant = proximity.instantReveal();
     this.batchRevealSends = proximity.batchRevealSends();
@@ -392,8 +422,17 @@ public final class ProximityRevealer implements Listener {
       globalTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, scheduled -> passAll(),
           interval, interval);
     }
+    // 单周期实际生效的发包上限 = min(配置, 候选窗口)；配置超过窗口时只提示一次，绝不静默改配置，
+    // 也绝不为了兑现一个配得过大的值去放大取候选/评估量（那会把射线 CPU 无上限地推高）。
+    int configuredReveals = proximity.maxRevealsPerTick();
+    int effectiveReveals = effectiveRevealCeiling(configuredReveals);
+    if (configuredReveals > effectiveReveals) {
+      plugin.getLogger().warning("邻近显形：proximity.max-reveals-per-tick=" + configuredReveals
+          + " 超过候选窗口上限 " + MAX_CANDIDATES + "，单周期实际按 " + effectiveReveals
+          + " 生效（窗口 = min(上限, 额度 × " + CANDIDATE_OVERSAMPLE + ")）");
+    }
     plugin.getLogger().fine("邻近显形已启用：距离 " + proximity.distance() + " 格，周期 " + interval
-        + " tick，单次上限 " + proximity.maxRevealsPerTick() + " 个；视锥 "
+        + " tick，单次上限 " + effectiveReveals + " 个（配置 " + configuredReveals + "）；视锥 "
         + (proximity.frustumEnabled() ? proximity.frustumFov() + "°（最小距离 "
             + proximity.frustumMinDistance() + " 格内豁免）" : "已关闭")
         + "，可见性判定 " + visibilitySummary()
@@ -634,6 +673,22 @@ public final class ProximityRevealer implements Listener {
         + "一并反馈（调大 antixray.yml 的 proximity.max-positions* 只是掩盖问题，不是解决办法）。");
   }
 
+  /**
+   * 邻近显形是否应作用于该世界：<b>只排除世界黑名单</b>。
+   *
+   * <p><b>为什么不再叠加 {@code AntiXrayConfig#antiXrayAppliesTo}（总开关 + world-overrides）</b>：
+   * 候选本来就只来自「我们写过伪装索引」的区块——索引只会由改写链路登记，因此总开关关闭 / 某世界被
+   * 覆盖段关闭时索引为空，<b>天然零发包</b>。反过来，总开关（或某世界的覆盖段）在热重载后被关闭时，
+   * 服务端<b>不会重发</b>已加载的区块，客户端手里仍是伪装后的假矿；此时保留索引与巡检，正是为了让这些
+   * 假矿还能被邻近显形还原——否则玩家要等区块重发才看得到真方块，属「该显形不显形」的硬红线。
+   * 黑名单世界仍一律不显形（名单内的世界不做任何反矿透工作）。
+   *
+   * <p>这是周期巡检与两条事件即时显形入口共用的唯一门闸（WorldBlacklistConfig 为无锁静态查询）。
+   */
+  boolean shouldRevealInWorld(String worldName) {
+    return worldName != null && !WorldBlacklistConfig.isBlacklistedNow(worldName);
+  }
+
   /** 主线程 / 区域线程：局部扫描取候选 → （可选）工作线程筛选 → 读真实方块 → 发包 → 标记已显形。 */
   private void reveal(Player player, Budget budget, int shard) {
     if (!player.isOnline()
@@ -643,8 +698,9 @@ public final class ProximityRevealer implements Listener {
 
     World world = player.getWorld();
     String worldName = world.getName();
-    // 黑名单世界不做任何邻近显形（周期巡检）：antiXrayAppliesTo = 总开关 且 不在黑名单。
-    if (!config.antiXrayAppliesTo(worldName)) {
+    // 只排除黑名单世界：总开关关闭后仍保留索引与巡检，好让已下发到客户端的假矿还能被还原
+    //（索引为空时天然零发包，见 shouldRevealInWorld 的说明）。
+    if (!shouldRevealInWorld(worldName)) {
       return;
     }
 
@@ -673,12 +729,12 @@ public final class ProximityRevealer implements Listener {
 
     int[] coordinates = flatten(candidates);
 
-    if (workPool == null || !workPool.hasCapacity()) {
-      // 队列已满 / 未装配工作池：保底路径——在当前线程直接做同一套纯计算（视锥 + 位图可见性）。
-      // 位图判定不需要 Bukkit API，「搬离玩家线程」只是性能优化，退化后功能不降级。
-      sendCandidates(player, world, null,
-          computePlan(eye, coordinates, worldName, visibility), eye, budget, scanTally,
-          visibility);
+    if (!canOffloadPlanning(workPool)) {
+      // 队列已满 / 未装配工作池：本轮直接跳过（计入统计），候选仍在伪装索引里，下一巡检周期会重新取到。
+      // 为什么不在当前线程同步算完：这里的候选筛选最多要做 MAX_CANDIDATES 次「暴露面 + 多候选点射线」，
+      // 正是本模块刻意搬到工作线程的那笔 CPU；退化到主线程 / 区域线程，等于在「改写队列已塞满」这个
+      // 服务器最忙的时刻把它整笔还回去。显形只延迟一个周期、绝不丢失——宁可延迟也不能阻塞。
+      skipPassBecauseNoCapacity();
       return;
     }
 
@@ -700,16 +756,30 @@ public final class ProximityRevealer implements Listener {
         });
       });
     } catch (Throwable throwable) {
-      // 入队失败（线程池关闭等）：退化为当前线程纯计算，绝不丢显形
+      // 入队失败（线程池关闭 / 停用中）：与「无容量」同一处置——本轮跳过，绝不在玩家线程同步算完。
+      // 此时旧实例本就不会再发包（sendCandidates 入口的 stopping 闸），跳过不丢任何新实例的显形。
       logThrottled(throwable);
-      sendCandidates(player, world, null,
-          computePlan(eye, coordinates, worldName, visibility), eye, budget, scanTally,
-          visibility);
+      skipPassBecauseNoCapacity();
+    }
+  }
+
+  /** 本轮是否有可用的工作线程来执行纯计算筛选（包级可见，便于离线单测）。 */
+  static boolean canOffloadPlanning(MikuWorkPool workPool) {
+    return workPool != null && workPool.hasCapacity();
+  }
+
+  /** 无可用工作线程时跳过本轮巡检：计入统计 + 一次性提示（正常负载下只会是队列瞬时打满）。 */
+  private void skipPassBecauseNoCapacity() {
+    stats.passesSkippedNoCapacity.increment();
+    if (noCapacityWarned.compareAndSet(false, true) && plugin != null) {
+      plugin.getLogger().fine("邻近显形：工作线程队列持续无容量，本轮巡检已跳过（显形只延迟，不丢失）");
     }
   }
 
   /**
-   * 工作线程 / 保底线程：候选筛选（纯计算，不触碰任何 Bukkit API）——视锥角度 + 遮挡位图可见性。
+   * 工作线程：候选筛选（纯计算，不触碰任何 Bukkit API）——视锥角度 + 遮挡位图可见性。
+   * 「队列无容量就在玩家线程同步算」的保底路径已移除（见 {@link #reveal}），因此本方法只会在工作线程
+   * （或测试线程）上运行。
    *
    * <p><b>为什么可见性也能在这里做</b>：位图判定只读 {@link OcclusionStores}（无锁读）与纯浮点步进
    * （见 {@link BitmapVisibility}），不是 Bukkit API——因此可与视锥一同落到工作线程，把本功能最重的一笔
@@ -732,21 +802,14 @@ public final class ProximityRevealer implements Listener {
     BitmapVisibility bitmap = visibility ? BitmapVisibility.local() : null;
 
     int count = coordinates.length / 3;
-    int[] kept = new int[coordinates.length];
     int keptCount = 0;
     int frustumCulled = 0;
     int rayCulled = 0;
-    // 判定次数上限：可见性判定（视锥 + 遮挡位图射线）是本轮最贵的一段，必须与发包侧同一个上界，
-    // 否则「单次上限」只限制了发包数、没有限制判定数——工作线程会为一个周期内根本发不出去的候选
-    // 白跑射线（默认配置下候选 512 个、发包上限 256，等于约一半的射线纯浪费）。
-    int evaluationsLeft = MAX_EVALUATIONS_PER_PASS;
-
+    // 评估额度 = 取到的候选数（窗口已由 fetchLimit 封顶 MAX_CANDIDATES）：不再另设更小的上限。
+    // 旧实现另设 256，会让窗口后一半候选「取出即丢」，并使 max-reveals-per-tick 在 >256 时静默失效。
+    // 原地压缩：保留项写回 coordinates 的前段，写下标 keptCount 恒 ≤ 读下标 i，因此不会覆盖尚未读取的
+    // 候选；省掉一份与窗口等长的 int[]（默认 512×3），Plan.count() 限定有效长度。
     for (int i = 0; i < count; i++) {
-      if (evaluationsLeft <= 0) {
-        // 额度用尽：剩余候选留到下一轮（它们在索引里，不会丢），本轮不再付出判定成本
-        break;
-      }
-      evaluationsLeft--;
       int x = coordinates[i * 3];
       int y = coordinates[i * 3 + 1];
       int z = coordinates[i * 3 + 2];
@@ -769,15 +832,13 @@ public final class ProximityRevealer implements Listener {
         continue;
       }
 
-      kept[keptCount * 3] = x;
-      kept[keptCount * 3 + 1] = y;
-      kept[keptCount * 3 + 2] = z;
+      coordinates[keptCount * 3] = x;
+      coordinates[keptCount * 3 + 1] = y;
+      coordinates[keptCount * 3 + 2] = z;
       keptCount++;
     }
 
-    int[] result = new int[keptCount * 3];
-    System.arraycopy(kept, 0, result, 0, result.length);
-    return new Plan(result, count, frustumCulled, rayCulled);
+    return new Plan(coordinates, keptCount, count, frustumCulled, rayCulled);
   }
 
   /**
@@ -808,18 +869,15 @@ public final class ProximityRevealer implements Listener {
         : (candidates == null ? 0 : candidates.size());
     int frustumCulled = plan != null ? plan.frustumCulled : 0;
     RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
-    // 评估额度（本玩家本周期）：每次 sendOne 都算一次评估（含区块未加载 / 不可见的失败评估），
-    // 因此评估量有独立于发包额度的明确上界；触顶即停，余下候选留在索引里等下一个周期。
-    int evaluationsLeft = MAX_EVALUATIONS_PER_PASS;
-
+    // 候选量已被取候选窗口（fetchLimit ≤ MAX_CANDIDATES）封顶，这里只需发包额度闸门；
+    // 旧实现再套一层 256 的评估上限，等于把配置的 max-reveals-per-tick 静默砍半。
     if (candidates != null) {
       for (ObfuscatedChunkIndex.Position position : candidates) {
-        if (budget.remaining() <= 0 || evaluationsLeft <= 0) {
+        if (budget.remaining() <= 0) {
           break;
         }
         sendOne(player, world, position.x(), position.y(), position.z(), eye, budget, tally, batch,
             visibilityInPlan);
-        evaluationsLeft--;
       }
       flushBatch(player, batch, tally, budget);
       logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
@@ -831,12 +889,11 @@ public final class ProximityRevealer implements Listener {
 
     int count = plan.count();
     for (int i = 0; i < count; i++) {
-      if (budget.remaining() <= 0 || evaluationsLeft <= 0) {
+      if (budget.remaining() <= 0) {
         break;
       }
       sendOne(player, world, plan.coordinates[i * 3], plan.coordinates[i * 3 + 1],
           plan.coordinates[i * 3 + 2], eye, budget, tally, batch, visibilityInPlan);
-      evaluationsLeft--;
     }
     flushBatch(player, batch, tally, budget);
     logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
@@ -1015,11 +1072,17 @@ public final class ProximityRevealer implements Listener {
     try {
       ConcurrentHashMap<EchoKey, Long> perPlayer =
           revealEcho.computeIfAbsent(playerId, id -> new ConcurrentHashMap<>());
+      long now = System.nanoTime();
       if (perPlayer.size() >= REVEAL_ECHO_MAX_PER_PLAYER) {
-        // 上界兜底：满即整体清空（只可能少判一次回显，不影响正确性）
-        perPlayer.clear();
+        // 先只清「已过窗口」的记号：满表绝大多数是这些陈旧项，清完仍满才整体清空。
+        // 不先清理就直接 clear() 会把仍在 2 秒窗口内的有效记号一并抹掉——那些在途显形包随后会被当成
+        // 真实变更，从全服共享的伪装索引里摘掉（其它玩家只能等区块重发），正是本机制要防的失效。
+        pruneExpiredEchoes(perPlayer, now);
+        if (perPlayer.size() >= REVEAL_ECHO_MAX_PER_PLAYER) {
+          perPlayer.clear();
+        }
       }
-      long expiry = System.nanoTime() + REVEAL_ECHO_WINDOW_NANOS;
+      long expiry = now + REVEAL_ECHO_WINDOW_NANOS;
       perPlayer.put(new EchoKey(worldName, x, y, z), expiry);
       return expiry;
     } catch (Throwable throwable) {
@@ -1412,10 +1475,64 @@ public final class ProximityRevealer implements Listener {
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
+    try {
+      pruneExpiredEchoes();
+    } catch (Throwable throwable) {
+      // 清理回显记号失败绝不能影响已显形集合的过期清理：本块独立兜底、只记日志
+      logThrottled(throwable);
+    }
+  }
+
+  /**
+   * 清理所有已过窗口的回显记号（随巡检周期由 {@link #expireNow()} 调用）。
+   *
+   * <p><b>为什么需要显式清理</b>：记号本应「包被出站监听器看到即消费」，但停用瞬间的在途发包、玩家连接
+   * 恰好关闭等异常路径会让记号永远留在表里；只靠「同坐标再次被查询」回收意味着可能长期滞留。清理跑在
+   * 工作线程、与 {@link RevealedSet#expire()} 同频率；稳态下每个玩家的表都是空的（记号当 tick 即被
+   * 消费），因此通常命中 {@code isEmpty()} 早退，开销可忽略。
+   *
+   * <p><b>为什么清空后也不把内层 map 从 {@link #revealEcho} 摘除</b>：{@link #markOurReveal} 是
+   * 「{@code computeIfAbsent} 取到 map 引用 → 再 {@code put} 记号」，这两步之间没有原子性。若本方法
+   * 在清空后把 map 摘掉，恰好落在这两步之间的那条记号就会写进一张已脱管的 map——出站监听器
+   * （{@link #consumeOurRevealEcho}）只查 {@code revealEcho.get(playerId)}，看不到它，于是会把我们
+   * 自己刚发的显形包当成「真实变更」：从<b>按区块全服共享</b>的伪装索引里摘掉该坐标、并清掉所有玩家
+   * 在该坐标的已显形标记，其它玩家从此无法被主动显形（只能等区块重发）。反过来，空 map 的驻留上界
+   * 是「在线玩家数 × 一个空 ConcurrentHashMap」，而玩家退出（{@link #onQuit}）与插件停用
+   * （{@link #stop(boolean)} 的 clearIndexes 路径）会整体释放、热重载重建实例时整张表随旧实例回收
+   * ——留着不摘没有任何内存代价，却彻底消除上述孤儿窗口，因此这里<b>只删记号、不摘 map</b>。
+   */
+  private void pruneExpiredEchoes() {
+    long now = System.nanoTime();
+    for (ConcurrentHashMap<EchoKey, Long> marks : revealEcho.values()) {
+      if (marks.isEmpty()) {
+        continue;
+      }
+      pruneExpiredEchoes(marks, now);
+    }
+  }
+
+  /**
+   * 清理一张回显表里已过窗口的记号（包级可见的纯集合操作，便于离线单测；时钟由调用方给出）。
+   *
+   * @param nowNanos 当前时刻（纳秒），必须与 {@link #markOurReveal} 写入过期时刻的时钟同源（{@code System.nanoTime()}）
+   */
+  static void pruneExpiredEchoes(ConcurrentHashMap<EchoKey, Long> marks, long nowNanos) {
+    marks.entrySet().removeIf(entry -> entry.getValue() < nowNanos);
   }
 
   private int limit() {
     return Math.max(1, proximity.maxRevealsPerTick());
+  }
+
+  /**
+   * 单周期实际生效的发包上限：取候选窗口（{@link #MAX_CANDIDATES}）是硬上界。
+   *
+   * <p>取候选、评估、发包三者共用同一个窗口，因此配置值 ≤ 窗口时<b>完整生效</b>（旧实现另有 256 的
+   * 评估上限，会让配置值在 &gt;256 时静默失效）；超过窗口的部分无法兑现，由调用方在启动时 WARN 一次。
+   * 包级可见：单测据此断言「三个上限一致、不再漂移」。
+   */
+  static int effectiveRevealCeiling(int configured) {
+    return Math.max(1, Math.min(configured, MAX_CANDIDATES));
   }
 
   /** 取候选时按额度的若干倍取（视锥/射线会剔除一部分），并限制总量避免单次扫描过重。 */
@@ -1498,9 +1615,12 @@ public final class ProximityRevealer implements Listener {
   /**
    * 邻域初筛的区块键小缓存（线程本地复用，零分配）。
    *
-   * <p>半径上限为 {@code 8}（配置解析已钳制，见 {@link #instantOffsets}），故一次邻域查找涉及的方块
-   * 横向只跨 ±8 格（不足一个区块），涉及的区块数至多 {@code 2×2 = 4} 个（{@code x>>4} 与 {@code z>>4}
-   * 各两个取值）。容量 4 正好覆盖；万一超出（防御性）则退化为每次新建键，语义不变。
+   * <p><b>容量覆盖范围（实话口径）</b>：单坐标邻域（{@link #hasDisguisedNearby} /
+   * {@link #revealImmediately}）横向只跨 {@code ±radius} 格，{@code radius ≤ 4}（默认）时至多
+   * {@code 2×2 = 4} 个区块，容量 4 正好覆盖（{@code radius} 上限 8 时跨 17 格，每个轴可能到 3 个区块，
+   * 此时退化为逐次建键）。<b>section 聚合路径</b>（{@link #revealSectionImmediately}）的邻域是
+   * 「整段 16 格变更坐标 × 半径」，每个轴最多 3 个区块（{@code 3×3 = 9}），<b>必然可能超出容量</b>。
+   * 两种超出都只是退化为每次新建键——只影响分配、不影响正确性，语义不依赖容量大小。
    */
   private static final class ChunkKeyCache {
 
@@ -1620,8 +1740,8 @@ public final class ProximityRevealer implements Listener {
         return;
       }
       World world = player.getWorld();
-      // 黑名单世界不做任何邻近显形（事件即时）：与周期巡检共用同一判定出口。
-      if (!config.antiXrayAppliesTo(world.getName())) {
+      // 只排除黑名单世界：与周期巡检共用同一门闸（总开关关闭后仍要还原已下发的假矿）。
+      if (!shouldRevealInWorld(world.getName())) {
         return;
       }
       int radius = instant.radius();
@@ -1649,6 +1769,12 @@ public final class ProximityRevealer implements Listener {
       PassTally tally = new PassTally();
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
       String liveWorld = world.getName();
+      // 候选判定复用线程本地区块键缓存（键只用于 CHM 查询、绝不入表），避免逐候选 new ChunkKey。
+      // 单坐标邻域横向只跨 ±radius 格：radius ≤ 4（默认）时至多 2×2 个区块、正好落在缓存容量内，
+      // 该路径因此零分配；radius 更大（上限 8，跨 17 格）时可能超出容量，keyFor 退化为逐次建键
+      // （只影响分配，语义不变）。
+      ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
+      keys.begin(liveWorld);
       for (int[] offset : instantOffsets(radius)) {
         if (budget.remaining() <= 0) {
           break;
@@ -1656,7 +1782,7 @@ public final class ProximityRevealer implements Listener {
         int x = cx + offset[0];
         int y = cy + offset[1];
         int z = cz + offset[2];
-        if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
+        if (!isInstantCandidate(keys, playerId, liveWorld, x, y, z)) {
           continue;
         }
         // 事件路径不预先算计划（见 revealImmediately 注释）：false = sendOne 在当前线程用遮挡位图判定
@@ -1681,8 +1807,8 @@ public final class ProximityRevealer implements Listener {
         return;
       }
       World world = player.getWorld();
-      // 黑名单世界不做任何邻近显形（事件即时）：与周期巡检共用同一判定出口。
-      if (!config.antiXrayAppliesTo(world.getName())) {
+      // 只排除黑名单世界：与周期巡检共用同一门闸（总开关关闭后仍要还原已下发的假矿）。
+      if (!shouldRevealInWorld(world.getName())) {
         return;
       }
       int radius = instant.radius();
@@ -1701,6 +1827,12 @@ public final class ProximityRevealer implements Listener {
       PassTally tally = new PassTally();
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
       String liveWorld = world.getName();
+      // 候选判定复用线程本地区块键缓存（键只用于 CHM 查询、绝不入表），避免逐候选 new ChunkKey。
+      // 注意：section 路径的邻域是「整段 16 格变更坐标 × 半径」，每个轴最多 3 个区块（3×3=9），
+      // 超出 ChunkKeyCache 的容量 4 后 keyFor 会退化为逐次建键——只影响分配、不影响正确性；
+      // 只有单坐标路径（revealImmediately）在默认半径下才是真正零分配。
+      ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
+      keys.begin(liveWorld);
       int[][] offsets = instantOffsets(radius);
       // 去重：同一候选坐标可能同时落在多个变更坐标的邻域里，只评估一次（保证「恰好一次放行」）。
       // 去重集合用 HashSet<Long>，代价是每个候选一次 long 装箱 + 哈希节点分配（一个 section 变更的
@@ -1712,9 +1844,9 @@ public final class ProximityRevealer implements Listener {
       // 评估次数上限：budget 只在「成功发包」时递减，因此若候选<b>全部未命中</b>（邻域里大多是已显形、
       // 或已不在伪装清单里的坐标），内层循环会一路跑满 count × offsets——radius=8 时每个变更坐标有
       // 数百个偏移，一个 section（最多 4096 个变更坐标）可达数十万次判定，且全部落在玩家实体线程
-      // （Paper 主线程 / Folia 区域线程）。周期巡检有 MAX_EVALUATIONS_PER_PASS 兜底，这里同样加硬上限：
-      // 触顶即停，剩余候选交给同 tick 的后续事件或下一个巡检周期处理（显形只延迟、不丢失）。
-      int evaluationsLeft = MAX_EVALUATIONS_PER_PASS;
+      // （Paper 主线程 / Folia 区域线程）。因此事件路径单独设硬上限（周期巡检跑在工作线程、且受候选
+      // 窗口约束，不需要共用这个数）：触顶即停，剩余候选交给同 tick 的后续事件或下一个巡检周期处理。
+      int evaluationsLeft = MAX_INSTANT_EVALUATIONS_PER_EVENT;
       boolean exhausted = false;
       for (int i = 0; i < count && !exhausted; i++) {
         int cx = coordinates[i * 3];
@@ -1737,7 +1869,7 @@ public final class ProximityRevealer implements Listener {
           int y = cy + offsets[o][1];
           int z = cz + offsets[o][2];
           evaluationsLeft--;
-          if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
+          if (!isInstantCandidate(keys, playerId, liveWorld, x, y, z)) {
             continue;
           }
           if (!evaluated.add(packCoordinate(x, y, z))) {
@@ -1759,12 +1891,29 @@ public final class ProximityRevealer implements Listener {
     return ((long) (x & 0x3FFFFFF) << 38) | ((long) (y & 0xFFF) << 26) | (z & 0x3FFFFFF);
   }
 
-  /** 纯数据判定：坐标仍在伪装清单（已伪装）且该玩家尚未显形过（与周期显形不重复、同 tick 不重复）。 */
+  /**
+   * 纯数据判定：坐标仍在伪装清单（已伪装）且该玩家尚未显形过（与周期显形不重复、同 tick 不重复）。
+   *
+   * <p><b>为什么另有带 {@link ChunkKeyCache} 的重载</b>：事件路径每个候选都要查一次索引（按区块）与一次
+   * 已显形集合（按玩家 × 区块），而这两个结构都提供「按世界名 + 分量查询」的零分配入口
+   * （{@link ObfuscatedChunkIndex#containsPosition(ChunkKey, int, int, int)} 与
+   * {@link RevealedSet#contains(UUID, String, int, int, int, int, int)}）。旧实现每个候选 new 两个
+   * {@link ChunkKey}，一个满载 section 事件可达上千个短命对象，且全部落在玩家所属线程上。本重载由
+   * 调用方在循环外 {@code begin(worldName)} 一次、循环内复用同一份线程本地键。
+   */
   boolean isInstantCandidate(UUID playerId, String worldName, int x, int y, int z) {
-    if (!chunkIndex.containsPosition(worldName, x, y, z)) {
+    ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
+    keys.begin(worldName);
+    return isInstantCandidate(keys, playerId, worldName, x, y, z);
+  }
+
+  /** 同 {@link #isInstantCandidate(UUID, String, int, int, int)}，但复用调用方准备好的区块键缓存。 */
+  private boolean isInstantCandidate(ChunkKeyCache keys, UUID playerId, String worldName,
+      int x, int y, int z) {
+    if (!chunkIndex.containsPosition(keys.keyFor(x, z), x, y, z)) {
       return false;
     }
-    return !revealedSet.contains(playerId, ChunkKey.ofBlock(worldName, x, z), x, y, z);
+    return !revealedSet.contains(playerId, worldName, x >> 4, z >> 4, x, y, z);
   }
 
   /** 曼哈顿距离 ≤ radius 即命中（含恰好等于；纯函数，供触发判定与单测复用）。 */

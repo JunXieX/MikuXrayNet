@@ -3,6 +3,7 @@ package net.mikumc.mikuxraynet.config;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import org.bukkit.configuration.ConfigurationSection;
 
@@ -20,6 +21,14 @@ import org.bukkit.configuration.ConfigurationSection;
  * 匹配逻辑，又持有「当前活动实例」的静态引用，供<b>封包线程</b>（netty）无锁查询。写方是插件加载 / 热重载
  * 线程（{@link #publish(WorldBlacklistConfig)} 一次 volatile 写），读方是任意线程——读侧只做字符串比较
  * 与正则匹配，<b>不触碰任何 Bukkit API</b>，因此在封包热路径上安全。
+ *
+ * <p><b>按世界名的结果缓存</b>：名单非空时，每个封包入口都要查一次本类（实体包 / 方块变更包 / 区块包…），
+ * 而带通配的名单每次查询都会 {@code Pattern.matcher(...)} 新建一个 Matcher 并跑一次正则——在 netty 线程上
+ * 属可避免的每包开销。因此 {@link #isBlacklisted(String)} 把「世界名 → 是否豁免」的结果缓存进
+ * {@link ConcurrentHashMap}（世界数量天然有限，另设上界整体清空兜底）。缓存是<b>实例字段</b>，随
+ * {@link #publish} 换新实例一起重建，所以热重载后立即失效，不存在「旧名单结果残留」。
+ * 并发语义与 {@code AntiXrayConfig#overrideEnabledCache} 相同：同一世界名被并发首次查询时可能多算一次，
+ * 但结果相同、无副作用。
  *
  * <p>未加载（或停用）时静态实例为空名单：{@link #isBlacklistedNow(String)} 恒返回 false，即「所有世界
  * 照常生效」，与既有默认行为一致（fail-open）。
@@ -43,12 +52,28 @@ public final class WorldBlacklistConfig {
    */
   private final int configHash;
 
+  /**
+   * 匹配结果缓存的上界（条目数）：世界数量天然有限（几十个量级），设上限只为拦住「异常输入 / 插件动态
+   * 构造世界名」这类失控来源。超限时整体清空（与 {@code AntiXrayConfig} 的 override 缓存同一套做法），
+   * 只让下一次多算一遍，不影响正确性。
+   */
+  private static final int RESULT_CACHE_MAX = 4096;
+
+  /**
+   * 世界名 → 是否命中本名单（封包热路径的结果缓存）。
+   *
+   * <p>构造后本实例的 {@link #patterns} 不可变，因此单实例内缓存永不过期；名单变化走 {@link #publish}
+   * 换新实例，缓存随之重建。{@link ConcurrentHashMap} 保证封包线程无锁读，最坏情况是同一世界名被并发
+   * 首查时多算一次（结果相同）。
+   */
+  private final ConcurrentHashMap<String, Boolean> resultCache = new ConcurrentHashMap<>();
+
   private WorldBlacklistConfig(List<String> patterns) {
     this.patterns = List.copyOf(patterns);
     List<String> exactNames = new ArrayList<>(this.patterns.size());
     List<Pattern> globPatterns = new ArrayList<>(this.patterns.size());
     for (String pattern : this.patterns) {
-      Pattern glob = compileGlob(pattern);
+      Pattern glob = WorldGlobs.compile(pattern);
       if (glob == null) {
         exactNames.add(pattern);
       } else {
@@ -115,7 +140,10 @@ public final class WorldBlacklistConfig {
   }
 
   /**
-   * 某世界是否命中本名单（<b>纯函数</b>：构造期已拆分并预编译，热路径零新增分配）。
+   * 某世界是否命中本名单（匹配逻辑纯函数；结果按世界名缓存，见 {@link #resultCache}）。
+   *
+   * <p>空名单直接早退（封包热路径的零开销形态）；非空时命中缓存的路径只做一次 CHM 读，
+   * 不再产生 Matcher 分配与正则执行。
    *
    * @return true 表示该世界不使用任何反矿透与带宽优化功能
    */
@@ -123,6 +151,20 @@ public final class WorldBlacklistConfig {
     if (worldName == null || patterns.isEmpty()) {
       return false;
     }
+    Boolean cached = resultCache.get(worldName);
+    if (cached != null) {
+      return cached;
+    }
+    boolean blacklisted = computeBlacklisted(worldName);
+    if (resultCache.size() >= RESULT_CACHE_MAX) {
+      resultCache.clear();
+    }
+    resultCache.put(worldName, blacklisted);
+    return blacklisted;
+  }
+
+  /** 实际匹配（精确名整串相等优先，其次逐个通配）；只在 {@link #isBlacklisted} 缓存未命中时调用。 */
+  private boolean computeBlacklisted(String worldName) {
     for (int i = 0; i < exact.size(); i++) {
       if (exact.get(i).equals(worldName)) {
         return true;
@@ -149,12 +191,5 @@ public final class WorldBlacklistConfig {
   /** 参与磁盘缓存指纹的取值（名单变化 → 相关世界旧缓存一次性失效重建）。 */
   public int configHash() {
     return configHash;
-  }
-
-  /** 编译世界名通配模式：含 {@code *} 时预编译为正则（{@code *} → 任意字符序列）；不含则返回 {@code null}（走精确名比较）。 */
-  private static Pattern compileGlob(String pattern) {
-    return pattern.indexOf('*') >= 0
-        ? Pattern.compile("\\Q" + pattern.replace("*", "\\E.*\\Q") + "\\E")
-        : null;
   }
 }

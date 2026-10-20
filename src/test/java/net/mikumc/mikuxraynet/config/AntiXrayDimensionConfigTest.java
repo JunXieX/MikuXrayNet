@@ -222,7 +222,9 @@ class AntiXrayDimensionConfigTest {
     AntiXrayConfig off = config("obfuscation:\n  remove-block-entities: false\n");
     AntiXrayConfig on = config("obfuscation:\n  remove-block-entities: true\n");
 
-    RewriteCache<String> cache = new RewriteCache<>(8, 3600);
+    // 生产构造是「条目数 + 字节数 + 过期秒数 + 体积函数」：本用例只关心 configHash 命中，
+    // 故字节上限取不限、体积函数返回 0（不计账）。
+    RewriteCache<String> cache = new RewriteCache<>(8, Long.MAX_VALUE, 3600, value -> 0L);
     cache.put("world", 3, 4, off.configHash(), "旧负载（未剔除方块实体）");
 
     assertEquals("旧负载（未剔除方块实体）", cache.get("world", 3, 4, off.configHash()),

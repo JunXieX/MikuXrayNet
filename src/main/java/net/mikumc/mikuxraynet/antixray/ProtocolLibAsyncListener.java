@@ -270,7 +270,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     this.processor = processor;
     this.workPool = workPool;
     this.asynchronousManager = asynchronousManager;
-    this.cache = new RewriteCache<>(config.cacheMaximumSize(), config.cacheExpireAfterAccessSeconds());
+    // 条目数与字节数双上限：区块改写结果同时持有「改写后字节 + 伪装坐标数组 + 整列遮挡负载」，
+    // 只按条目数封顶会让默认 40960 条在大服上吃掉 1~2 GB 堆（见 cache.maximum-bytes 的注释）。
+    this.cache = new RewriteCache<>(config.cacheMaximumSize(), config.cacheMaximumBytes(),
+        config.cacheExpireAfterAccessSeconds(), ProtocolLibAsyncListener::cachedChunkBytes);
     this.neighborProvider = neighborProvider;
     // 只记录「提供者是否可用」；是否真的抓取由 neighborsNeeded 实时读当前配置的 neighbors.enabled 决定。
     this.neighborsAvailable = neighborProvider != null;
@@ -281,7 +284,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     this.diskCache = diskCache;
     // 批次闸门表在超限逐出时按间隔输出中文 WARN（旧实现静默逐出，真机无法察觉异常玩家）。
     this.batches = new BatchTable(MAX_PENDING_BATCHES, plugin.getLogger());
+    // 把本监听器的统计容器交给改写处理器：建表失败 / 发布时跳过被补丁段这两类事件只发生在处理器内部，
+    // 不注入的话它们在面板上永远不可见（诊断读的就是这同一个 RewriteStats 实例）。
+    this.processor.bindStats(stats);
     registerQuitHook();
+  }
+
+  /** 单条改写缓存的近似字节占用：改写后区块字节 + 伪装坐标（int）+ 整列遮挡负载（null 视为 0）。 */
+  private static long cachedChunkBytes(CachedChunk chunk) {
+    return chunk.data().length
+        + (long) chunk.positions().length * Integer.BYTES
+        + (chunk.occlusion() == null ? 0L : chunk.occlusion().length);
   }
 
   /**
@@ -417,6 +430,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 超时实时读「当前」配置：reload 改了 advanced.timeout-millis 必须立即生效（本监听器不随 reload 重建）。
       // 同一区块的任务构造与看门狗注册共用这一个值，保证两者一致。
       timeoutMillis = live().timeoutMillis();
+      // 遮挡补丁戳快照必须在这里（持包线程）取：放到 worker 解码之后再取，会把「封包生成 → 解码」
+      // 这段（排队 + 区域线程 hop + 解码，常态 1~10 ms）内落库的方块补丁一并收编，随后建表发布时
+      // 用「解码时刻的旧几何」把它们覆盖掉（该显示却多藏）。持包时刻取快照后只剩亚毫秒级窗口。
+      // 未启用遮挡建表时返回 null（零开销），worker 侧会退化为自行取快照。
       task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
           world.getName(), dimension, minHeight, sectionCount, timeoutMillis,
           gate == null
@@ -424,7 +441,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
               : () -> {
                 gate.chunkDone();
                 asynchronousManager.signalPacketTransmission(event);
-              });
+              },
+          processor.capturePatchStamps(world.getName(), accessor.chunkX(), accessor.chunkZ(),
+              minHeight >> 4, sectionCount));
     } catch (Throwable throwable) {
       if (gate != null) {
         gate.chunkDone(); // 归还刚登记的批次计数，等价于本区块从未开始
@@ -446,6 +465,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         if (task.releaseOnTimeout()) {
           stats.chunksTimedOut.increment();
         }
+        // 看门狗到点即任务终结（不论是否由本线程放行），必须解除「已交给区域调度器、尚未入池」的登记：
+        // 区域回调若永不执行（世界卸载 / 区域重建），这枚登记会连同 PacketEvent 和整块区块字节
+        // 一起驻留到插件停用为止——封包虽已被放行，内存却泄漏。
+        pendingCaptures.remove(task);
       }, timeoutMillis);
     } catch (Throwable throwable) {
       // 已登记延迟但看门狗没注册成功（通常为插件停用中）：走一次放行动作把刚登记的延迟
@@ -690,7 +713,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // min-y/max-y 过滤与分区伪装表需要把 section 内相对 Y 换算成绝对 Y。
     ObfuscationProcessor.Result result = processor.rewrite(source, task.sectionCount(),
         seed(task.worldName(), task.chunkX(), task.chunkZ()), neighbors,
-        task.worldName(), task.dimension(), task.minHeight(), task.chunkX(), task.chunkZ());
+        task.worldName(), task.dimension(), task.minHeight(), task.chunkX(), task.chunkZ(),
+        task.occlusionStamps());
 
     if (result.failed()) {
       // 解码/重编码异常：必须可观测——否则「本该伪装却失败」会被并进「跳过」里，看起来一切正常。
@@ -933,14 +957,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 本次改写结果「一个坐标都没伪装」（无目标方块 / 矿已被挖空 / 配置变更后不再匹配）：
       // 既不能写回封包，也不能就此返回——该区块若此前登记过坐标，其索引条目与各玩家的已显形标记
       // 会全部变成陈旧数据（继续为「本次并未伪装」的坐标发冗余显形包）。这里显式失效该区块的登记。
-      ObfuscatedChunkIndex staleIndex = index();
-      if (staleIndex != null) {
-        staleIndex.invalidateChunk(task.worldName(), task.chunkX(), task.chunkZ());
-        RevealedSet staleRevealed = revealed();
-        if (staleRevealed != null) {
-          staleRevealed.clearChunk(new ChunkKey(task.worldName(), task.chunkX(), task.chunkZ()));
-        }
-      }
+      dropChunkRegistration(task);
       return;
     }
     // remove-block-entities 实时读「当前」配置：它直接决定写进封包的字节，reload 切换必须立即生效。
@@ -950,10 +967,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       stats.writeBackFailures.increment();
       logThrottled("区块改写结果未能写回封包（写回后回读不一致），本轮按原包内容放行", null);
       // 写回未确认生效时，客户端拿到的仍是原始（未伪装）字节，本区块其实没有隐藏任何矿物。
-      // 若此时仍把坐标登记进伪装索引，邻近显形只会为「本就没被伪装的坐标」发冗余显形包，
-      // 既浪费带宽又把索引/统计撑大——与本类「verified=false 不剔除方块实体」的既有短路同向，
-      // 这里直接跳过索引登记（也不动已显形集合）。计数观测点让「本该登记却因写回失败被跳过」可见。
+      // 因此这里不仅要跳过本次登记，还要把该区块<b>此前</b>的登记整体作废：否则旧清单会继续
+      // 指示邻近显形为「本次根本没伪装」的坐标发冗余包，并让玩家在该区块的已显形标记变成孤儿
+      // （标记 ⊆ 清单的不变式被破坏 → 后续「整块跳过」判据失真）。与 positions 为空的分支同一处置。
       stats.indexSkippedOnWriteBackFailure.increment();
+      dropChunkRegistration(task);
       return;
     }
 
@@ -992,6 +1010,25 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         // 它们下个周期重复显形一遍（纯浪费带宽与主线程开销）。
         revealed.clearChunk(new ChunkKey(task.worldName(), task.chunkX(), task.chunkZ()), playerId);
       }
+    }
+  }
+
+  /**
+   * 作废某区块的伪装索引条目与<b>所有玩家</b>在该区块的已显形标记（客户端这次拿的是未伪装 / 无伪装内容）。
+   *
+   * <p>两处调用：① 本次结果没有任何伪装坐标；② 写回未确认生效（客户端收到的是原始字节）。
+   * 两种情况下「索引里记着的坐标」都不再是客户端真实看到的伪装结果，必须整体失效，
+   * 否则邻近显形会为不存在的伪装发冗余包，并留下孤儿标记（破坏 revealed ⊆ 清单 的不变式）。
+   */
+  private void dropChunkRegistration(RewriteTask task) {
+    ObfuscatedChunkIndex staleIndex = index();
+    if (staleIndex == null) {
+      return;
+    }
+    staleIndex.invalidateChunk(task.worldName(), task.chunkX(), task.chunkZ());
+    RevealedSet staleRevealed = revealed();
+    if (staleRevealed != null) {
+      staleRevealed.clearChunk(new ChunkKey(task.worldName(), task.chunkX(), task.chunkZ()));
     }
   }
 
@@ -1115,19 +1152,24 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     return config != null && config.antiXrayAppliesTo(worldName);
   }
 
-  /** 使全部改写缓存、邻块快照与显形结构立即失效（配置热重载时调用）。 */
+  /**
+   * 使全部<b>派生缓存</b>立即失效（配置热重载时调用）——只清改写缓存与邻块快照。
+   *
+   * <p><b>为什么绝不能同时清伪装索引 / 已显形集合</b>：索引记录的是「服务端已经发给客户端的伪装坐标」，
+   * 而热重载<b>不会</b>让客户端重收已加载区块——客户端里那些区块仍是假矿。清空索引后，邻近显形再也
+   * 不知道「哪里是假矿」，玩家挖到也不会还原，直到区块因走远/重登被重发（与 {@code ProximityRevealer}
+   * 停止时「热重载必须不清共享索引」的纪律直接矛盾）。
+   * <ul>
+   *   <li>新配置下重新改写的区块会自行覆盖（{@code recordChunkWithRemovals} 按区块整条替换）对应条目，
+   *       旧条目也会在区块卸载时被清，因此保留不会让索引长期偏离新配置；</li>
+   *   <li>{@code RevealedSet} 只是「已发过显形包」的去重集合，保留无害；反过来清空会让下一轮巡检把
+   *       同一批坐标重新发一遍（热重载瞬间的重复发包风暴）。</li>
+   * </ul>
+   */
   public void invalidateAll() {
     cache.invalidateAll();
     if (neighborProvider != null) {
       neighborProvider.invalidateAll();
-    }
-    ObfuscatedChunkIndex index = index();
-    if (index != null) {
-      index.clear();
-    }
-    RevealedSet revealed = revealed();
-    if (revealed != null) {
-      revealed.clear();
     }
   }
 
@@ -1148,6 +1190,15 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
   /** 使某个世界的缓存整体失效（世界卸载时调用），同时清掉该世界的显形结构。 */
   public void invalidateWorld(String worldName) {
+    // 先放行并摘除该世界「已交给区域调度器、尚未入池」的抓取任务：世界卸载后这些回调可能永不执行
+    // （看门狗到点会放行封包，但登记本身也得有出口，否则整条 PacketEvent 引用链滞留到停用）。
+    for (RewriteTask pending : Set.copyOf(pendingCaptures)) {
+      if (worldName == null || !worldName.equals(pending.worldName())) {
+        continue;
+      }
+      pendingCaptures.remove(pending);
+      pending.releaseOnTimeout();
+    }
     cache.invalidateWorld(worldName);
     if (neighborProvider != null) {
       neighborProvider.invalidateWorld(worldName);
@@ -1165,6 +1216,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** 当前缓存条目数（诊断用）。 */
   public int cacheSize() {
     return cache.size();
+  }
+
+  /** 当前缓存条目占用的近似字节数（诊断用；与 {@code cache.maximum-bytes} 对账）。 */
+  public long cacheBytes() {
+    return cache.bytes();
   }
 
   private void logThrottled(String message, Throwable throwable) {

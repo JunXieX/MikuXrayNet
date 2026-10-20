@@ -1043,6 +1043,66 @@ class EntityCullerTest {
         "视锥「隐藏 / 恢复」两侧口径必须自洽（恢复不得多于隐藏）");
   }
 
+  /**
+   * B4 回归：多工作线程下同一实体的判定可能「后完成但更旧」。更旧的结论必须整条丢弃——否则它会把新结论
+   * 刚写好的状态覆盖回去（刚因「看得见」恢复的实体又被打回隐藏，违反「实体绝不能被误隐藏」）。
+   * 提交序单调递增：只有不小于已应用序号的结论才允许生效，更新的结论照常应用。
+   */
+  @Test
+  void staleAsyncResultWithOlderSubmitSeqIsDiscarded() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler =
+        newAsyncCuller(stats, new OcclusionStores(), new OcclusionStats(), 1, 8);
+    PlayerStub player = new PlayerStub();
+    EntityStub entity = new EntityStub(37_001, new WorldStub());
+
+    // 新结论先回投（序号 2）：完全遮挡 → 隐藏
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), true, true, 2L);
+    assertEquals(1, culler.hiddenCount(), "新结论必须生效");
+
+    // 旧结论后回投（序号 1，判为通畅）：必须丢弃，不得把刚隐藏的实体显示出来
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), false, true, 1L);
+    assertEquals(1, culler.hiddenCount(), "更旧的结论不得覆盖新结论");
+    assertEquals(0, player.showCalls.get(), "被丢弃的旧结论不得下发任何可见性操作");
+
+    // 更新的结论（序号 3）仍必须正常应用（闸门只丢「更旧」，不拦「更新」）
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), false, true, 3L);
+    assertEquals(0, culler.hiddenCount(), "更新的结论必须照常应用");
+    assertEquals(1, player.showCalls.get());
+  }
+
+  /**
+   * B7 回归：远距离的「射线隐藏」条目在复检中被改判为「视锥隐藏」时，除了补计 {@code frustumHidden}，
+   * 还必须补计 {@code recheckHidden}（这同样属于「复检发现新遮挡」），否则该口径系统性偏低。
+   */
+  @Test
+  void frustumMarkerUpgradeIsCountedAsRecheckHidden() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 2.0D)),
+        stats, entity -> true, playerId -> false);
+    EntityStub entity = new EntityStub(9401, world, 100.0D, 65.0D, -100.0D);
+
+    // ① 入场首评（非复检）由射线通道隐藏：不计复检、不计视锥
+    culler.evaluate(player.proxy(), entity.proxy(), true, false, false);
+    assertEquals(1L, stats.entitiesHidden.sum());
+    assertEquals(0L, stats.recheckHidden.sum());
+    assertEquals(0L, stats.frustumHidden.sum());
+
+    // ② 复检改判为「锥外 + 超距」→ 标记升级：视锥口径与复检致隐藏各补一笔
+    culler.evaluate(player.proxy(), entity.proxy(), true, true, true);
+    assertEquals(1L, stats.frustumHidden.sum(), "标记由射线升级为视锥时必须补计视锥隐藏");
+    assertEquals(1L, stats.recheckHidden.sum(), "标记升级属于复检发现的新遮挡，必须计入复检致隐藏");
+    assertEquals(1, culler.hiddenCount(), "标记升级不是新隐藏：账本仍只有一条");
+    assertEquals(1L, stats.entitiesHidden.sum());
+  }
+
   private static Set<Integer> idsOf(List<Entity> entities) {
     Set<Integer> ids = new HashSet<>();
     for (Entity entity : entities) {
@@ -1265,6 +1325,66 @@ class EntityCullerTest {
         default -> defaultValue(method.getReturnType());
       };
     }
+  }
+
+  /**
+   * <b>B4 账本生命周期回归（第 10 轮 P3 补测）</b>：提交序号账本必须随「实体失效 / 玩家退出」清理。
+   *
+   * <p>为什么必须钉住：{@code appliedSeq} 是第 9 轮新增的乱序保护账本；若失效判定或退出路径漏清，
+   * 它会随「曾出现过的实体」无界增长（entityId 被复用后旧条目也只剩噪音）。生产触发点：
+   * {@code evaluate} 的失效分支 → {@code removeEntityState}，以及 {@code onQuit} 的整表摘除。
+   *
+   * <p>用生产侧唯一序号写入点 {@code acceptSubmitSeq}（回投路径）填充账本，再走真实清理入口；
+   * 断言「失效只摘对应实体、退出整表清空」，反向（漏清 / 连坐）都会判红。
+   */
+  @Test
+  void invalidEntityAndQuitRemoveSubmitSeqLedger() throws Exception {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler = newCuller(stats);
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub live = new EntityStub(88_001, world);
+    EntityStub dead = new EntityStub(88_002, world);
+
+    Method accept = EntityCuller.class.getDeclaredMethod(
+        "acceptSubmitSeq", UUID.class, int.class, long.class);
+    accept.setAccessible(true);
+    assertTrue((Boolean) accept.invoke(culler, player.id(), live.id(), 1L));
+    assertTrue((Boolean) accept.invoke(culler, player.id(), dead.id(), 2L));
+    assertEquals(2, submitSeqLedgerSize(culler, player.id()), "前置：两个实体都写入了提交序号");
+
+    // ① 实体失效：evaluate 的失效分支必须把该实体的提交序号一并摘除（防抖账本同路径）
+    dead.valid = false;
+    culler.evaluate(player.proxy(), dead.proxy(), false);
+    assertEquals(1, submitSeqLedgerSize(culler, player.id()),
+        "失效实体必须从提交序号账本移除");
+    assertTrue(submitSeqLedgerContains(culler, player.id(), live.id()),
+        "其它实体的提交序号条目不得被连带清掉");
+
+    // ② 玩家退出：整张玩家账本丢弃（玩家已离线，任何判定结果都不可能再用于切换显示状态）
+    culler.onQuit(new PlayerQuitEvent(player.proxy(), Component.empty(),
+        PlayerQuitEvent.QuitReason.DISCONNECTED));
+    assertEquals(0, submitSeqLedgerSize(culler, player.id()),
+        "玩家退出后该玩家的提交序号账本必须清空");
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<UUID, Map<Integer, Long>> submitSeqLedger(EntityCuller culler)
+      throws Exception {
+    Field field = EntityCuller.class.getDeclaredField("appliedSeq");
+    field.setAccessible(true);
+    return (Map<UUID, Map<Integer, Long>>) field.get(culler);
+  }
+
+  private static int submitSeqLedgerSize(EntityCuller culler, UUID playerId) throws Exception {
+    Map<Integer, Long> ledger = submitSeqLedger(culler).get(playerId);
+    return ledger == null ? 0 : ledger.size();
+  }
+
+  private static boolean submitSeqLedgerContains(EntityCuller culler, UUID playerId, int entityId)
+      throws Exception {
+    Map<Integer, Long> ledger = submitSeqLedger(culler).get(playerId);
+    return ledger != null && ledger.containsKey(entityId);
   }
 
   /** 插件替身：只提供 Logger。 */

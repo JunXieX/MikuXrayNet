@@ -58,7 +58,7 @@ public final class BypassRegistry implements Listener {
   /**
    * 注册登录/退出监听，并对「启用时已在线」的玩家做一次快照判定。可重复调用，异常安全。
    *
-   * <p><b>先注册成功再发布 {@code active}（本次修复）</b>：旧实现先把 {@code active = this} 再
+   * <p><b>先注册成功再发布 {@code active}</b>：旧实现先把 {@code active = this} 再
    * {@code registerEvents}，一旦注册<b>半程失败</b>，{@code active} 已指向本实例、但监听未注册，
    * 名单永不更新 → 该显示真矿的 bypass 玩家反而被 fail-closed（看不到真矿）。现在改为：
    * 只有 {@code registerEvents} 成功才接管 {@code active}；失败则<b>保留前一实例</b>（不 stop、不覆盖），
@@ -66,18 +66,27 @@ public final class BypassRegistry implements Listener {
    *
    * <p><b>幂等且清理前一实例</b>：注册成功后，先停用「当前活动实例」（若不同）再接管，最后做一次性快照。
    * 若当前活动实例正是本实例（重复 {@code start()}），直接返回，避免重复注册监听。
+   * （当前装配在每次插件启用时只 {@code new + start} 一次，生产路径不会命中「换实例接管」分支；
+   * 该分支保留是因为 {@code start()} 的公开契约允许复用，且已有单测覆盖其清理语义。）
+   *
+   * @return {@code true} 表示本实例已注册监听并成为活动名单（可继续用于直通判定）；
+   *         {@code false} 表示注册失败、本实例未接管（此时 {@code active} 仍是原实例或为 null）。
+   *         调用方据此回显「本次启用期间不会直通」这类后果——不能假定 {@code start()} 一定成功。
    */
-  public void start() {
+  public boolean start() {
     // 已是当前活动实例：重复启动无副作用，直接返回（否则会重复注册监听，事件被处理两次）
     if (active == this) {
-      return;
+      return true;
     }
     try {
       plugin.getServer().getPluginManager().registerEvents(this, plugin);
     } catch (Throwable throwable) {
-      // 注册失败：不发布 active、不清前一实例，保留既有可用名单（绝不 fail-closed）
-      plugin.getLogger().warning("直通名单初始化失败（不影响按登录/退出维护）：" + throwable.getMessage());
-      return;
+      // 注册失败：不发布 active、不清前一实例，保留既有可用名单（绝不 fail-closed）。
+      // 必须如实写明后果：监听没注册 ⇒ 名单不会随登录/退出更新，持有 bypass 权限的玩家本轮也不会直通。
+      warn("直通名单初始化失败：登录/退出监听未注册，持有 " + PERMISSION
+          + " 的玩家本次启用期间不会直通（可按「无直通」继续，重载插件可重试）；原因："
+          + throwable);
+      return false;
     }
     // 注册成功：清理「当前活动实例」（可能是另一个实例）——其监听必须先注销、名单先清空，
     // 避免两个实例并存导致名单双份维护、互相不一致（stale 名单 + 监听泄漏）。
@@ -92,8 +101,23 @@ public final class BypassRegistry implements Listener {
       // 区域线程；只跑一次，此后不再有任何刷新——运行期改权限需重进服务器。
       Bukkit.getGlobalRegionScheduler().run(plugin, scheduled -> snapshotOnlinePlayers());
     } catch (Throwable throwable) {
-      // 快照只是「补齐启用时已在线玩家」，失败不影响登录/退出事件维护的名单
-      plugin.getLogger().warning("直通名单初始化失败（不影响按登录/退出维护）：" + throwable.getMessage());
+      // 快照只是「补齐启用时已在线玩家」，失败不影响登录/退出事件维护的名单——文案必须写清这一点，
+      // 与上面注册失败的后果区分开（那里是真的不会维护名单）。
+      warn("直通名单一次性快照登记失败（启用时已在线的玩家未登记；登录/退出仍会维护名单）：" + throwable);
+    }
+    return true;
+  }
+
+  /**
+   * 打一行 WARNING；{@code plugin} 为空时跳过。
+   *
+   * <p>为什么允许 {@code plugin == null}：本类被离线单测当作纯数据结构使用（{@code new BypassRegistry(null)}
+   * 后只喂 {@code refresh}/{@code snapshot}），任何成功的日志调用都必须对 null 插件免疫——
+   * 否则一次「失败的 start()」会在打印失败原因时二次 NPE，把有界的失败变成抛异常。
+   */
+  private void warn(String message) {
+    if (plugin != null) {
+      plugin.getLogger().warning(message);
     }
   }
 

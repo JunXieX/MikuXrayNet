@@ -393,11 +393,21 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   }
 
   /**
-   * 统一的变更观察入口：先注销（既有行为），再触发事件显形（P1-4，可选）。
+   * 统一的变更观察入口：先注销（既有行为），再<b>仅对真实变更</b>触发事件显形（P1-4，可选）。
    *
    * <p>两个动作共用同一次坐标解析，热路径上不产生任何额外分配；事件显形的全部筛选
    * （邻域初筛、身边半径、射线、限额、去重）都在 {@link ProximityRevealer#onBlockChangeObserved}
    * 内部完成，未启用时只有一个空引用判断的开销。
+   *
+   * <p><b>回显不产生新的观察事件</b>：{@code unregisterCoordinate} 会告诉我们这次变更是不是
+   * 「本插件刚为该玩家发出的显形回显」。回显只代表服务端把玩家本就该看到的真实方块发了一遍，
+   * 服务端内容没有任何变化，因此<b>不应</b>再触发一次事件显形——否则每发一个单方块显形包都会：
+   * ① 在 netty 线程上白扫一遍变更点的曼哈顿邻域（默认半径 4 共 129 个偏移）；
+   * ② 让 {@code revealImmediately} claim 掉该 tick 的整份即时显形额度，去显形「刚被我们显形
+   * 过的那块」的邻居（那条路径绕过周期巡检的视锥剔除、分片轮转与候选窗口，会让显形带宽被自身
+   * 回显放大）。多方块变更路径早已按同一口径过滤（见 {@code processSection}：整段回显直接返回、
+   * 不派发），单方块路径此前漏了这一步。真实变更（玩家挖开 / 爆炸 / 放置）返回 {@code false}，
+   * 仍照常触发邻域显形。
    */
   private void observeChange(Player player, String worldName, int x, int y, int z) {
     // 黑名单世界不做任何反矿透工作：不注销显形、不触发事件即时显形。
@@ -408,7 +418,9 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     // 也会看到「我们自己发出的显形回显」。回显不改变服务端内容，必须与真实变更区别对待
     // （见 unregisterCoordinate）；磁盘缓存方面两者都不需要作废任何条目——条目有效性由负载里的
     // 原始区块字节指纹判定（见 DiskCacheStore 类注释），回显不改变区块字节。
-    unregisterCoordinate(player, worldName, x, y, z);
+    if (unregisterCoordinate(player, worldName, x, y, z)) {
+      return; // 回显：服务端内容未变，不产生新的观察事件（理由见方法注释）
+    }
     if (instantRevealer != null) {
       instantRevealer.onBlockChangeObserved(player, worldName, x, y, z);
     }
@@ -432,16 +444,20 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * 后，我们发出的显形包会回显到这里。若另一个玩家已先把该坐标从共享索引里摘掉，本次 {@code removePosition}
    * 就未命中，但本玩家刚写入的标记仍在——那是一枚孤儿标记（已显形数虚增会让「整块跳过」提前成立，
    * 真实坐标被长期漏显形）。因此这里无条件摘标记：正常情况无副作用，异常情况恰好清掉孤儿。
+   *
+   * @return {@code true} = 这是本插件刚为该玩家发出的显形回显（服务端内容未变，调用方<b>不得</b>
+   *         据此再触发新的观察事件）；{@code false} = 真实变更，或无法判定（世界名未知 / 索引未装配
+   *         ——此时按真实变更处理，保留既有行为，绝不因判定能力缺失而漏掉邻域显形）。
    */
-  private void unregisterCoordinate(Player player, String worldName, int x, int y, int z) {
+  private boolean unregisterCoordinate(Player player, String worldName, int x, int y, int z) {
     if (worldName == null || obfuscatedChunkIndex == null) {
-      return;
+      return false;
     }
     if (isOurRevealEcho(player, worldName, x, y, z)) {
       // 回显（本插件自己刚为该玩家发出的显形包）：服务端内容没有变化，因此<b>绝不能</b>摘共享伪装索引
       // ——索引按区块全服共享，摘掉会让其它玩家对同一坐标再也无法被主动显形（他们的客户端仍持伪装
       // 区块，只能等区块重载才恢复）。本玩家的已显形标记也保留：它确实已被显形，再发一次毫无意义。
-      return;
+      return true;
     }
     boolean removedFromIndex = obfuscatedChunkIndex.removePosition(worldName, x, y, z);
     if (revealedSet != null) {
@@ -450,6 +466,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     if (removedFromIndex && stats != null) {
       stats.unregistered.increment();
     }
+    return false;
   }
 
   /**

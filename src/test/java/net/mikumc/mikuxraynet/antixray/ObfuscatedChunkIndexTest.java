@@ -212,6 +212,32 @@ class ObfuscatedChunkIndexTest {
     assertNotNull(index.entry(new ChunkKey(WORLD, 1, 0)), "本次登记的区块必须正常写入");
   }
 
+  /**
+   * <b>本轮修复回归</b>：触顶时覆盖「已存在」的区块只按净增量预判，不得无谓淘汰其它区块。
+   *
+   * <p>旧实现按「新清单全长」预判：覆盖长度相同的同一区块也会先淘汰最旧区块，而被淘汰区块上所有玩家的
+   * 已显形标记随之作废（{@code writeBack} 会整体清掉），那些坐标要等区块重新下发才可能再次显形。
+   */
+  @Test
+  void reRecordingExistingChunkAtCapacityDoesNotEvictOthers() {
+    ObfuscatedChunkIndex index = index(10, 60 * SECOND_NANOS);
+    clock[0] = 1;
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, positions(5));
+    clock[0] = 2;
+    index.recordChunk(WORLD, 1, 0, MIN_HEIGHT, positions(5));
+    assertEquals(10, index.positionCount(), "前置：总量恰好触顶");
+
+    clock[0] = 3;
+    java.util.List<ChunkKey> evicted = new java.util.ArrayList<>();
+    index.recordChunkWithRemovals(WORLD, 1, 0, MIN_HEIGHT, positions(5), evicted);
+
+    assertTrue(evicted.isEmpty(), "覆盖长度相同的同一区块：净增量为 0，不得淘汰任何区块");
+    assertNotNull(index.entry(new ChunkKey(WORLD, 0, 0)),
+        "另一个区块必须保留（它的玩家已显形标记不应被连带作废）");
+    assertEquals(10, index.positionCount(), "总量不变");
+    assertEquals(0L, index.evictedByCapacity(), "安全阀淘汰计数必须保持 0");
+  }
+
   // ------------------------------------------------------------------ 失效时机
   @Test
   void removePositionOnlyDropsThatCoordinate() {

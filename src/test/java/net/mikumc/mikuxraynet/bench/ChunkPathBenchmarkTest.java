@@ -40,8 +40,12 @@ import static org.junit.jupiter.api.Assertions.fail;
  * 形态集合取 {@link BenchFixtures#productionShapes()}（全实心 / 稀疏矿脉 / 洞穴 / 乱序调色板 / 主世界地下），
  * 以便在同一批负载上对「调色板收缩 + 单值/低位宽降级」在两种压缩口径下的收益做可复现的对照。
  *
- * <p>断言只覆盖「语义一致 + 各路径都能稳定完成 + 数值被成功采集」，不断言「谁更快」——
- * CI 机器的耗时列会抖动，结论由读者看表得出。PacketEvents 路径若离线不可用，则跳过该路径并报告原因，而不是失败。
+ * <p>断言覆盖「语义一致 + 各路径都能稳定完成 + 数值被成功采集」，不断言「谁更快」——
+ * CI 机器的耗时列会抖动，结论由读者看表得出。
+ *
+ * <p><b>PacketEvents 路径是硬前提，不可跳过</b>：packetevents 是 provided 硬前置，PeModelPath 的读/写
+ * 只用 PE 真实 API，离线夹具下必须可用。路径不可用（缺前置、PE 映射资源缺失、或两边布局不再兼容）
+ * 一律<b>直接失败</b>——它是本基准唯一的「独立于自研 codec」的正确性证据，静默跳过等于把校验降级为 0。
  */
 class ChunkPathBenchmarkTest {
 
@@ -81,8 +85,17 @@ class ChunkPathBenchmarkTest {
     OurCodecPath codecWithCompact = new OurCodecPath(true);
     List<ChunkPath> ourPaths = List.of(codecWithoutCompact, codecWithCompact);
 
-    String peUnavailableReason = probePePath(fixtures.getFirst());
-    ChunkPath pePath = peUnavailableReason == null ? new PeModelPath() : null;
+    // PacketEvents 路径不得静默跳过（见类注释）：先探测一次，任何异常都直接失败并带上原因。
+    ChunkPath pePath = new PeModelPath();
+    try {
+      byte[] probe = pePath.encode(fixtures.getFirst().bytes(), BenchFixtures.edits(1));
+      assertTrue(probe.length > 0, "PacketEvents 模型路径必须可用：探测编码结果不得为空");
+    } catch (AssertionError assertion) {
+      throw assertion;
+    } catch (Throwable failure) {
+      fail("PacketEvents 模型路径不可用 → 跨实现语义校验被跳过，不能算通过"
+          + "（PE 是硬前置，离线夹具下必须可用）：" + failure);
+    }
 
     // 1) 语义校验：同一输入 + 同一批改写，期望序列由「原始列的方块序列 + 改写」推出
     for (BenchFixtures.Fixture fixture : fixtures) {
@@ -101,12 +114,11 @@ class ChunkPathBenchmarkTest {
         assertTrue(outputWithCompact.length <= outputWithoutCompact.length,
             "开启收缩/降级不得使输出变长（" + label + "）：" + outputWithCompact.length + " > " + outputWithoutCompact.length);
 
-        if (pePath != null) {
-          byte[] peOutput = pePath.encode(fixture.bytes(), edits);
-          assertSameSequence("PacketEvents 模型（" + label + "）", expected, pePath.readStates(peOutput));
-          assertSameSequence("交叉解码：PE 读自研字节（" + label + "）", expected, pePath.readStates(outputWithCompact));
-          assertSameSequence("交叉解码：自研读 PE 字节（" + label + "）", expected, codecWithoutCompact.readStates(peOutput));
-        }
+        // 跨实现语义校验必须无条件执行（PE 路径不可用已在方法开头直接失败，这里不再有跳过分支）
+        byte[] peOutput = pePath.encode(fixture.bytes(), edits);
+        assertSameSequence("PacketEvents 模型（" + label + "）", expected, pePath.readStates(peOutput));
+        assertSameSequence("交叉解码：PE 读自研字节（" + label + "）", expected, pePath.readStates(outputWithCompact));
+        assertSameSequence("交叉解码：自研读 PE 字节（" + label + "）", expected, codecWithoutCompact.readStates(peOutput));
       }
     }
 
@@ -118,11 +130,9 @@ class ChunkPathBenchmarkTest {
       estimate = Math.max(estimate,
           estimateIterationNanos(path, fixtures.getFirst(), BenchFixtures.edits(heaviestEditCount)));
     }
-    if (pePath != null) {
-      estimate = Math.max(estimate,
-          estimateIterationNanos(pePath, fixtures.getFirst(), BenchFixtures.edits(heaviestEditCount)));
-    }
-    int pathCount = ourPaths.size() + (pePath == null ? 0 : 1);
+    estimate = Math.max(estimate,
+        estimateIterationNanos(pePath, fixtures.getFirst(), BenchFixtures.edits(heaviestEditCount)));
+    int pathCount = ourPaths.size() + 1;
     int rounds = chooseRounds(estimate, fixtures.size() * EDIT_COUNTS.length * pathCount);
 
     List<Row> rows = new ArrayList<>();
@@ -133,15 +143,13 @@ class ChunkPathBenchmarkTest {
         for (ChunkPath path : ourPaths) {
           rows.add(measure(path, fixture, edits, rounds, allocationBean));
         }
-        if (pePath != null) {
-          rows.add(measure(pePath, fixture, edits, rounds, allocationBean));
-        }
+        rows.add(measure(pePath, fixture, edits, rounds, allocationBean));
       }
       assertArrayEquals(pristine, fixture.bytes(), "被测路径不得改写输入字节（" + fixture.name() + "）");
     }
 
     // 3) 报告：写入文件并打印同一张表
-    String report = buildReport(fixtures.size(), rows, rounds, peUnavailableReason, allocationBean != null,
+    String report = buildReport(fixtures.size(), rows, rounds, allocationBean != null,
         System.nanoTime() - startedAt);
     Files.createDirectories(REPORT_PATH.getParent());
     // 保留另一个基准类已写入的「第 4 节 生产路径」，避免测试类执行顺序不同导致该节丢失
@@ -151,8 +159,7 @@ class ChunkPathBenchmarkTest {
     // 4) 只断言「数值被成功采集」与「各路径都稳定完成」
     assertTrue(rows.size() == fixtures.size() * EDIT_COUNTS.length * pathCount, "测量行数不足：" + rows.size());
     for (Row row : rows) {
-      assertTrue(row.medianNanos() > 0 && row.minNanos() > 0 && row.maxNanos() >= row.medianNanos(),
-          "耗时未成功采集：" + row);
+      assertTrue(row.medianNanos() > 0 && row.minNanos() > 0, "耗时未成功采集：" + row);
       assertTrue(row.outputBytes() > 0, "输出字节未成功采集：" + row);
       assertTrue(row.compressedBytes() > 0, "zlib6 压缩字节未成功采集：" + row);
       if (ZSTD_AVAILABLE) {
@@ -179,16 +186,6 @@ class ChunkPathBenchmarkTest {
       return marker < 0 ? "" : "\n" + content.substring(marker);
     } catch (IOException exception) {
       return "";
-    }
-  }
-
-  /** PacketEvents 路径的可用性探测：不可用（离线缺平台初始化等）时返回原因，测试转为跳过该路径。 */
-  private static String probePePath(BenchFixtures.Fixture fixture) {
-    try {
-      byte[] output = new PeModelPath().encode(fixture.bytes(), BenchFixtures.edits(1));
-      return output.length > 0 ? null : "PE 路径编码结果为空";
-    } catch (Throwable failure) {
-      return failure.getClass().getName() + ": " + failure.getMessage();
     }
   }
 
@@ -243,7 +240,6 @@ class ChunkPathBenchmarkTest {
     long[] durations = new long[rounds];
     long[] allocations = new long[rounds];
     byte[] firstOutput = null;
-    int lastOutputBytes = -1;
 
     for (int i = 0; i < rounds; i++) {
       // 每轮都从未被改动的原始字节重新解码，绝不复用上一轮被改过的数据
@@ -255,11 +251,13 @@ class ChunkPathBenchmarkTest {
 
       if (firstOutput == null) {
         firstOutput = output;
+      } else {
+        // 同一输入 + 同一改写必须产出完全相同的字节（不只是长度相同）：哈希序/随机/残留位造成的
+        // 非确定性会让报告里那几列「确定性指标」失真，必须在这里判红。
+        assertArrayEquals(firstOutput, output,
+            path.name() + "：同一输入重复运行的输出字节必须逐字节稳定（第 " + i + " 轮）");
       }
-      lastOutputBytes = output.length;
     }
-
-    assertEquals(firstOutput.length, lastOutputBytes, path.name() + "：同一输入的输出字节数必须稳定");
 
     Arrays.sort(durations);
     Arrays.sort(allocations);
@@ -334,7 +332,7 @@ class ChunkPathBenchmarkTest {
     return data.length == 0 ? 0.0D : (double) zeros / data.length;
   }
 
-  private static String buildReport(int fixtureCount, List<Row> rows, int rounds, String peUnavailableReason,
+  private static String buildReport(int fixtureCount, List<Row> rows, int rounds,
       boolean allocationsSupported, long elapsedNanos) {
     StringBuilder report = new StringBuilder();
 
@@ -351,14 +349,10 @@ class ChunkPathBenchmarkTest {
         .append(System.getProperty("java.vm.name")).append(' ').append(System.getProperty("java.version"))
         .append(" / ").append(System.getProperty("os.name")).append("\n\n");
 
-    if (peUnavailableReason != null) {
-      report.append("> **PacketEvents 模型路径已跳过**（未计入下表）：").append(peUnavailableReason).append("\n\n");
-    } else {
-      report.append("> PacketEvents 模型路径为「PE 模型近似」：读/写用 PE 真实 API（Chunk_v1_18.read/write + ")
-          .append("NetStreamInput/NetStreamOutput），方块改写用 DataPalette#set 并自行维护 blockCount——")
-          .append("PE 原生的 Chunk_v1_18#set(...) 依赖 WrappedBlockState 全局映射（需平台初始化），离线不可用。")
-          .append("该近似去掉了 PE 原生路径的两次方块状态映射查询，对 PE 有利（对结论更保守）。\n\n");
-    }
+    report.append("> PacketEvents 模型路径为「PE 模型近似」：读/写用 PE 真实 API（Chunk_v1_18.read/write + ")
+        .append("NetStreamInput/NetStreamOutput），方块改写用 DataPalette#set 并自行维护 blockCount——")
+        .append("PE 原生的 Chunk_v1_18#set(...) 依赖 WrappedBlockState 全局映射（需平台初始化），离线不可用。")
+        .append("该近似去掉了 PE 原生路径的两次方块状态映射查询，对 PE 有利（对结论更保守）。\n\n");
 
     if (!allocationsSupported) {
       report.append("> 当前 JVM 不支持线程分配量统计，分配列以 0 占位。\n\n");

@@ -84,7 +84,7 @@ class StageScalingBenchmarkTest {
     report.append("- 目的：定位 `ConcurrentPipelineBenchmarkTest` 里「8 线程仅 3.2x」的竞争源\n");
     report.append("- 三段：解码 `codec.decode` / 逐格判定 `getBlockState + targets.get` / 重编码 `finalizeOutput`\n");
     report.append("- 扩展性 = N 线程吞吐 ÷ 单线程吞吐；**越接近 N 越好**，明显低于 N 即为该段的竞争点\n\n");
-    report.append("| 阶段 | 1 线程(次/秒) | 2 线程 | 4 线程 | 8 线程 | 8 线程扩展性 |\n");
+    report.append("| 阶段 | 1 线程(次/秒) | 2 线程(次/秒) | 4 线程(次/秒) | 8 线程(次/秒) | 8 线程扩展性 |\n");
     report.append("| --- | --- | --- | --- | --- | --- |\n");
 
     String[] stageNames = {"解码", "逐格判定", "重编码"};
@@ -102,12 +102,27 @@ class StageScalingBenchmarkTest {
       }
       singleThreadThroughput[stage] = throughputs[0];
       eightThreadScaling[stage] = throughputs[0] <= 0 ? 0.0 : throughputs[3] / throughputs[0];
+      // 第 2~5 列必须是真正的每档吞吐（次/秒），第 6 列才是相对 1 线程的扩展倍数。
+      // 旧实现把第 5 列也写成扩展倍数，与表头「8 线程」不符、还与第 6 列完全重复，
+      // 读者会把倍数当吞吐读，进而误判哪一段在争用。
       report.append("| ").append(stageNames[stage]).append(" | ")
           .append(String.format(Locale.ROOT, "%.0f", throughputs[0])).append(" | ")
-          .append(String.format(Locale.ROOT, "%.2fx", throughputs[0] <= 0 ? 0.0 : throughputs[1] / throughputs[0])).append(" | ")
-          .append(String.format(Locale.ROOT, "%.2fx", throughputs[0] <= 0 ? 0.0 : throughputs[2] / throughputs[0])).append(" | ")
-          .append(String.format(Locale.ROOT, "%.2fx", eightThreadScaling[stage])).append(" | ")
+          .append(String.format(Locale.ROOT, "%.0f", throughputs[1])).append(" | ")
+          .append(String.format(Locale.ROOT, "%.0f", throughputs[2])).append(" | ")
+          .append(String.format(Locale.ROOT, "%.0f", throughputs[3])).append(" | ")
           .append(String.format(Locale.ROOT, "%.2fx", eightThreadScaling[stage])).append(" |\n");
+    }
+
+    // 报表结构自检：表头必须声明 4 个吞吐列 + 1 个扩展性列，且每个数据行都必须是 6 个单元格。
+    // 这条直接守「列名与语义不符 / 重复列」这类只有读者才会发现的错位（例如把第 5 列也写成倍数）。
+    assertTrue(report.toString().contains(
+            "| 阶段 | 1 线程(次/秒) | 2 线程(次/秒) | 4 线程(次/秒) | 8 线程(次/秒) | 8 线程扩展性 |"),
+        "报表表头必须声明 4 个吞吐列 + 1 个扩展性列：" + report);
+    for (String line : report.toString().split("\n")) {
+      if (line.startsWith("| ")) {
+        int cells = (int) line.chars().filter(character -> character == '|').count() - 1;
+        assertEquals(6, cells, "表格每行必须是 6 列（阶段 + 1/2/4/8 线程吞吐 + 扩展性）：" + line);
+      }
     }
 
     // ---- 对照实验：区分「锁竞争」与「内存带宽饱和」 ----
@@ -128,14 +143,19 @@ class StageScalingBenchmarkTest {
     report.append("\n> 「8x/1x」接近 1.00 表示单线程工作量增加不改变单次成本（无 GC/缓存退化）；"
         + "此时多线程仍不线性，即可判定瓶颈是**全核共享资源**（内存带宽/LLC）而非锁。\n");
 
-    report.append("\n> 表中 2/4/8 线程列均为「相对 1 线程的吞吐倍数」。\n");
+    report.append("\n> 表中 1/2/4/8 线程列为**吞吐（次/秒）**，最后一列为「相对 1 线程的倍数」。\n");
     report.append("> 判读：若「解码」与「重编码」扩展性都明显低于「逐格判定」，则瓶颈在 `ChunkScratch` "
         + "的线程复用池；若三段都低，则更可能是内存带宽或 GC 压力。\n");
     appendReport(report.toString());
     System.out.println(report);
 
-    for (double throughput : singleThreadThroughput) {
-      assertTrue(throughput > 0.0, "每段的单线程吞吐都必须被成功采集");
+    for (int stage = 0; stage < stageNames.length; stage++) {
+      assertTrue(singleThreadThroughput[stage] > 0.0,
+          "每段（" + stageNames[stage] + "）的单线程吞吐都必须被成功采集");
+      // 扩展比只有在单线程与 8 线程吞吐都 >0 时才是有效数字；0 值说明该档根本没跑完，
+      // 不能让它以「0.00x」的样子混进报告（会被误读成「完全无扩展」）。
+      assertTrue(eightThreadScaling[stage] > 0.0,
+          "每段（" + stageNames[stage] + "）的 8 线程扩展比必须被成功采集");
     }
   }
 

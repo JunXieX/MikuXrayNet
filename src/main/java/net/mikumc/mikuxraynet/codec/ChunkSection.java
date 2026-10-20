@@ -174,9 +174,20 @@ public class ChunkSection {
    * 状态 id），无法在不扫描数据的前提下证明「不含」，因此保守不跳过，语义与不开预筛完全一致。
    */
   public boolean paletteCouldContain(IntPredicate test) {
+    // 直接调色板没有条目表（size() 恒为 0），无法在不扫描数据的前提下证明「不含」，只能保守放行。
+    // 必须先单独判它：下面「0 条目 ⇒ 返回 false」只适用于间接调色板。
+    if (this.palette instanceof DirectPalette) {
+      return true;
+    }
     int entries = this.palette.size();
     if (entries == 0) {
-      return true;
+      // 间接调色板读到 0 条目（只可能来自损坏/非原版写入）：条目表为空 ⇒ 数据里任何索引都取不到
+      // 方块状态，整段必然不含目标方块，可安全跳过。这里**不能**沿用「保守返回 true」：那会让本段成为
+      // 候选，随后逐格 getBlockState 在 IndirectPalette.valueFor 抛 IndexOutOfBoundsException，
+      // 被上层 catch 成「整块区块 fail-open」——把本该照常改写的其余 section 一并放弃（该藏的矿全裸露）。
+      // 返回 false 后该 section 保持未修改，由 ChunkSectionHolder.write 原样搬运它自己的原始字节，
+      // 与 read() 里「空调色板按原样搬运、不改写」的既有口径一致。
+      return false;
     }
     for (int id = 0; id < entries; id++) {
       if (test.test(this.palette.valueFor(id))) {

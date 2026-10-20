@@ -38,6 +38,17 @@ public final class RewriteTask {
   private final int sectionCount;
   private final long deadlineNanos;
   private final Runnable delivery;
+  /**
+   * 持包时刻取的「整列遮挡补丁戳快照」；{@code null} = 未启用遮挡建表 / 未接线。
+   *
+   * <p><b>为什么由任务携带</b>：建表（captureOcclusion）在 worker 解码之后才取快照的话，
+   * 「封包生成 → 解码」这段（排队 + 区域线程 hop + 解码，常态 1~10 ms）里落库的方块补丁会被
+   * 快照一并读入，随后发布时被「解码时刻的旧几何」覆盖（该显示却多藏）。把快照提前到持包线程、
+   * 随任务传给 worker，可把保护窗口收窄到只剩「封包生成 → 持包线程」的亚毫秒级。
+   *
+   * <p>数组只在持包线程创建、之后只读，工作线程读取无需同步。
+   */
+  private final long[] occlusionStamps;
 
   private final AtomicInteger gate = new AtomicInteger(GATE_OPEN);
   private final AtomicBoolean signaled = new AtomicBoolean();
@@ -56,7 +67,7 @@ public final class RewriteTask {
   public RewriteTask(int chunkX, int chunkZ, String worldName, int minHeight,
       int sectionCount, long timeoutMillis, Runnable delivery) {
     this(chunkX, chunkZ, worldName, AntiXrayConfig.Dimension.NORMAL, minHeight, sectionCount,
-        timeoutMillis, delivery);
+        timeoutMillis, delivery, null);
   }
 
   /**
@@ -68,6 +79,17 @@ public final class RewriteTask {
    */
   public RewriteTask(int chunkX, int chunkZ, String worldName, AntiXrayConfig.Dimension dimension,
       int minHeight, int sectionCount, long timeoutMillis, Runnable delivery) {
+    this(chunkX, chunkZ, worldName, dimension, minHeight, sectionCount, timeoutMillis, delivery, null);
+  }
+
+  /**
+   * 完整构造：额外携带「持包时刻的遮挡补丁戳快照」（见 {@link #occlusionStamps()}）。
+   *
+   * @param occlusionStamps 持包线程取的整列戳快照；{@code null} 表示未启用遮挡建表（worker 侧自行取）
+   */
+  public RewriteTask(int chunkX, int chunkZ, String worldName, AntiXrayConfig.Dimension dimension,
+      int minHeight, int sectionCount, long timeoutMillis, Runnable delivery,
+      long[] occlusionStamps) {
     // 构造期快速失败：delivery 为空时唯一的放行动作会在首个 signalOnce() 里抛 NPE，异常路径一旦
     // 被上层吞掉，该封包就永久无人放行（卡包）。宁可在此立刻暴露编程错误，也不留一个「看似正常、
     // 实则永不放行」的任务。生产路径始终传入非空 lambda，故该分支不会在正常运行中触发。
@@ -82,6 +104,8 @@ public final class RewriteTask {
     this.sectionCount = sectionCount;
     this.deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
     this.delivery = delivery;
+    this.occlusionStamps = occlusionStamps == null || occlusionStamps.length == 0
+        ? null : occlusionStamps;
   }
 
   public int chunkX() {
@@ -107,6 +131,15 @@ public final class RewriteTask {
 
   public int sectionCount() {
     return sectionCount;
+  }
+
+  /**
+   * 持包时刻取的「整列遮挡补丁戳快照」（长度 = 该世界 section 数）；{@code null} = 未启用遮挡建表。
+   *
+   * <p>只读数组：由持包线程创建后不再修改，工作线程直接读取即可。
+   */
+  public long[] occlusionStamps() {
+    return occlusionStamps;
   }
 
   /** 是否已超过处理时限。 */

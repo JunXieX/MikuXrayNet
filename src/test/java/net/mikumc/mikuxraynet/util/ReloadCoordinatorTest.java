@@ -68,7 +68,11 @@ class ReloadCoordinatorTest {
 
     String text = String.join("\n", lines);
     assertTrue(text.contains("反矿透侧（123 → 124）"), "必须点名变化的侧与前后指纹：" + text);
-    assertTrue(text.contains("已失效"), text);
+    // 只宣告真正失效的东西：改写缓存 + 邻块快照。伪装索引 / 已显形集合在热重载时**刻意保留**
+    //（清掉会让已下发的假矿永远无法还原），所以回显不得再出现「显形索引已失效」这种相反说法。
+    assertTrue(text.contains("改写缓存与邻块快照已失效"), text);
+    assertTrue(text.contains("伪装索引 / 已显形集合刻意保留"), text);
+    assertFalse(text.contains("显形索引已失效"), "热重载刻意保留伪装索引，回显不得宣称它已失效：" + text);
     assertTrue(text.contains("已热生效"), text);
     assertTrue(text.contains("需要重启服务端才生效"), text);
     assertFalse(text.contains("带宽侧"), "带宽侧未变化时不得出现该侧的变化项：" + text);
@@ -145,6 +149,24 @@ class ReloadCoordinatorTest {
     String text = String.join("\n", lines);
     assertTrue(text.contains("两侧配置指纹均未变化"), text);
     assertTrue(text.contains("缓存已按安全起见刷新"), text);
+  }
+
+  /**
+   * 清单准确性回归：{@code neighbors.enabled} 的「关闭」是热生效的（区块改写路径实时读当前配置），
+   * 不能再被列进 RESTART_REQUIRED —— 否则管理员会为一项已生效的改动白重启一次，且以后不再相信这份清单。
+   * 同时必须保留真正只在启动期固化的两项（缺失策略 / 缓存容量），避免修正过度把整项删掉。
+   */
+  @Test
+  void neighborSwitchOffIsListedAsLiveAndNotAsRestartRequired() {
+    String applied = String.join("、", ReloadCoordinator.APPLIED);
+    String restart = String.join("、", ReloadCoordinator.RESTART_REQUIRED);
+
+    assertTrue(applied.contains("neighbors.enabled=false"),
+        "「关闭邻块快照」是热生效项，必须在 APPLIED 里点名：" + applied);
+    assertFalse(restart.contains("邻块快照开关"),
+        "已能热生效的开关不得再列入 RESTART_REQUIRED：" + restart);
+    assertTrue(restart.contains("missing-policy"), "缺失策略仍属启动期固化，必须留在需重启清单：" + restart);
+    assertTrue(restart.contains("cache-maximum-size"), "邻块缓存容量仍属启动期固化，必须留在需重启清单：" + restart);
   }
 
   @Test

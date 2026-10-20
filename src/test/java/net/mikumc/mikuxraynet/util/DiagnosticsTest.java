@@ -177,6 +177,50 @@ class DiagnosticsTest {
         "dump 的有效值必须是被回落后的上限（128 格）：" + capped);
   }
 
+  /**
+   * 新增的三条「此前完全静默」的路径必须在状态面板可见，dump 还要回显内存缓存的字节上限：
+   * <ul>
+   *   <li>写回未确认生效 → 连旧伪装索引一起作废的次数（否则客户端拿到原始字节后，索引还在指示
+   *       「这些坐标是假矿」，会持续发冗余显形包）；</li>
+   *   <li>遮挡建表失败次数（位图缺失 → 显形侧按「缺数据 = 遮挡」永久藏住玩家眼前的矿）；</li>
+   *   <li>发布时因「期间有方块补丁」而跳过覆盖的段数。</li>
+   * </ul>
+   */
+  @Test
+  void statusEchoesNewlyObservableSilentPathsAndDumpEchoesCacheByteCap() {
+    Diagnostics.Snapshot base = fixed();
+    Diagnostics.Snapshot.Rewrite rewrite = new Diagnostics.Snapshot.Rewrite(
+        90L, 10L, 42, 4096L, 30L, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
+        0L, 0L, 0L, "无采样",
+        3L, 7L, 11L);
+    Diagnostics.Snapshot withCounters = new Diagnostics.Snapshot(base.env(), rewrite,
+        base.proximity(), base.index(), base.occlusion(), base.throttle(), base.pool(),
+        base.diskCache(), base.chunkAccessor(), base.antiXray(), base.bandwidth());
+
+    String status = String.join("\n", Diagnostics.formatStatus(withCounters));
+    assertTrue(status.contains("写回失败 1（其中作废旧索引 3）"),
+        "写回未确认生效时必须回显「连旧索引一起作废」的次数（与写回失败同源、口径为其子集）：" + status);
+    assertTrue(status.contains("遮挡建表：失败 7 次"),
+        "遮挡建表失败必须可见（否则「矿挖不掉」无从归因）：" + status);
+    assertTrue(status.contains("，发布跳过 11 段"),
+        "发布时跳过覆盖的段数必须可见（该值偏高说明建表窗口内方块变更频繁）：" + status);
+
+    // 兼容构造（旧 15 参）必须仍然可用，且新增计数为 0（既有调用点/单测不被迫改）
+    Diagnostics.Snapshot legacy = new Diagnostics.Snapshot(base.env(),
+        new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 30L, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
+            0L, 0L, 0L, "无采样"),
+        base.proximity(), base.index(), base.occlusion(), base.throttle(), base.pool(),
+        base.diskCache(), base.chunkAccessor(), base.antiXray(), base.bandwidth());
+    assertEquals(0L, legacy.rewrite().occlusionCaptureFailures(),
+        "兼容构造的新增计数必须为 0（旧快照语义不变）");
+    assertTrue(String.join("\n", Diagnostics.formatStatus(legacy)).contains("写回失败 1（其中作废旧索引 0）"));
+
+    String dump = Diagnostics.formatDump(withAntiXray(antiXray("enabled: true\n")),
+        "20260925-000000");
+    assertTrue(dump.contains("maximum-bytes=" + AntiXrayConfig.CACHE_MAXIMUM_BYTES_DEFAULT),
+        "dump 必须回显内存改写缓存的字节上限（否则调大 cache.maximum-bytes 后无法核对生效值）：" + dump);
+  }
+
   @Test
   void statusContainsAllKeyFields() {
     List<String> lines = Diagnostics.formatStatus(fixed());

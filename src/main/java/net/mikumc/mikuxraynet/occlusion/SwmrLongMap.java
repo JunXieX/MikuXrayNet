@@ -98,7 +98,12 @@ public final class SwmrLongMap<V> {
     return result;
   }
 
-  /** 键是否存在（乐观读）。本方法当前仅单测在用，保留以免破坏测试。 */
+  /**
+   * 键是否存在（乐观读）。
+   *
+   * <p>当前无任何调用者（含单测）：保留为公开 API 的对称性入口，等价于
+   * {@code get(key) != null}。若将来要用，注意值类型不允许为 {@code null}。
+   */
   public boolean containsKey(long key) {
     return get(key) != null;
   }

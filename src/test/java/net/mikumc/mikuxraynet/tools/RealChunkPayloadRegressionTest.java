@@ -245,6 +245,7 @@ class RealChunkPayloadRegressionTest {
   @Test
   void obfuscatedPayloadContainsNoFullyOccludedOre() throws IOException {
     byte[] payload = readResource();
+    assertNotNull(payload, "classpath 里必须有真机负载资源 " + RESOURCE);
     ByteBuffer buffer = ByteBuffer.wrap(payload);
     buffer.getLong();
     int positionCount = buffer.getInt();
@@ -262,12 +263,24 @@ class RealChunkPayloadRegressionTest {
     // 这份负载是「已改写」的结果：若改写结果真的落进了字节，则再跑一遍应当几乎无可替换
     // （只有区块边界因缺少邻块快照、按 missing-policy=hide 多算的几个可能被再次替换）。
     ObfuscationProcessor.Result again = processor.rewrite(chunkBytes, sectionCount, 1L, null);
+    assertFalse(again.failed(), "用旧清单复跑真机负载不得失败：" + again.failure());
     int targetMatches = processor.diagnose(chunkBytes, sectionCount).targetMatches();
+    int stillReplaceable = again.obfuscatedPositions().length;
     System.out.println("[真机负载] 负载内目标矿（含暴露的）=" + targetMatches
-        + " 个；按本插件口径「仍可被替换」=" + again.obfuscatedPositions().length + " 个");
-    assertTrue(again.obfuscatedPositions().length * 4 < Math.max(1, targetMatches),
+        + " 个；按本插件口径「仍可被替换」=" + stillReplaceable + " 个");
+    // 旧写法是 {仍可替换 × 4 < max(1, 目标矿数)}：targetMatches==0（矿全部已被替换）时
+    // 「0 × 4 < 1」恒真通过，即使 stillReplaceable 很大也一样——等于什么都没断言。
+    // 这里把两种真实情形都钉死，任何一条被翻掉都会红：
+    if (targetMatches == 0) {
+      // 负载里已无任何目标矿 ⇒ 复跑也不得再替换出任何方块（否则「命中目标」计数与替换结果自相矛盾）
+      assertEquals(0, stillReplaceable,
+          "负载里已无目标矿时，按旧清单复跑不得再替换任何方块（否则替换来自非目标方块，属越权改写）");
+      return;
+    }
+    assertTrue(stillReplaceable * 4 < targetMatches,
         "负载里的目标矿绝大多数已不是「本应被伪装」的状态：说明改写结果已写进缓存字节，"
-            + "真机看到的仍是真实矿物只能发生在写回客户端这一侧（可能二）");
+            + "真机看到的仍是真实矿物只能发生在写回客户端这一侧（可能二）"
+            + "（仍可替换 " + stillReplaceable + " / 目标矿 " + targetMatches + "）");
   }
 
   // ------------------------------------------------------------------ 工具

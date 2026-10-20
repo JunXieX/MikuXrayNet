@@ -173,4 +173,158 @@ class OcclusionStoreTest {
         () -> store.setBlockOccluding(0, tooLowY, 0, true));
     assertEquals(0, store.loadedSectionCount(), "越界坐标不得写入任何 section");
   }
+
+  /**
+   * <b>建表期间落库的方块补丁不得被「解码时刻的旧几何」覆盖</b>（P1 竞态回归）。
+   *
+   * <p>时序：旧位图（整段遮挡）→ 取补丁戳快照 → 玩家挖开一格（补丁落库）→ 建表线程把「解码时刻
+   * 仍整段遮挡」的整列发布过来。发布必须跳过这一段，保留含补丁的活位图，否则刚挖开的墙会重新变成
+   * 遮挡，墙后矿不再显形（该显示却多藏）。
+   */
+  @Test
+  void patchAppliedBetweenSnapshotAndPublishSurvivesColumnRestore() {
+    OcclusionStore store = new OcclusionStore();
+    store.replaceSection(0, 0, 0, SolidOcclusion.INSTANCE);
+    long[] stamps = store.patchStamps(0, 0, 0, 1);
+    assertEquals(0L, stamps[0], "前置：建表前该段没有补丁戳");
+
+    store.setBlockOccluding(1, 2, 3, false); // 建表期间：玩家挖开一格
+    int skipped = store.restoreColumn(0, 0, 0,
+        new SectionOcclusion[] {SolidOcclusion.INSTANCE}, stamps);
+
+    assertEquals(1, skipped, "期间被补丁写过的段必须跳过覆盖");
+    SectionOcclusion live = store.section(0, 0, 0);
+    assertNotNull(live, "跳过覆盖应保留活位图，而不是把条目删掉");
+    assertFalse(live.isOccludingLocal(1, 2, 3), "挖开的格不得被旧几何重新标成遮挡");
+    assertTrue(live.isOccludingLocal(3, 2, 1), "其余格沿用活位图的遮挡状态");
+    assertEquals(1L, store.skippedPatchedSections(), "跳过段数必须计入观测点");
+  }
+
+  /** 快照取自补丁之后（补丁早已落库）：此时允许按新几何覆盖，不得误跳过。 */
+  @Test
+  void snapshotTakenAfterPatchAllowsOverwrite() {
+    OcclusionStore store = new OcclusionStore();
+    store.replaceSection(0, 0, 0, SolidOcclusion.INSTANCE);
+    store.setBlockOccluding(1, 2, 3, false);
+    long[] stamps = store.patchStamps(0, 0, 0, 1);
+
+    int skipped = store.restoreColumn(0, 0, 0,
+        new SectionOcclusion[] {SolidOcclusion.INSTANCE}, stamps);
+
+    assertEquals(0, skipped, "快照已包含该补丁：发布必须照常覆盖");
+    assertTrue(store.section(0, 0, 0).isOccludingLocal(1, 2, 3), "覆盖后按发布的新几何生效");
+    assertEquals(0L, store.skippedPatchedSections());
+  }
+
+  /** 旧入口（不带快照）必须保持原有语义：整列无条件覆盖。 */
+  @Test
+  void restoreColumnWithoutSnapshotKeepsLegacyOverwriteBehaviour() {
+    OcclusionStore store = new OcclusionStore();
+    store.replaceSection(0, 0, 0, SolidOcclusion.INSTANCE);
+    store.setBlockOccluding(1, 2, 3, false);
+
+    store.restoreColumn(0, 0, 0, new SectionOcclusion[] {SolidOcclusion.INSTANCE});
+
+    assertTrue(store.section(0, 0, 0).isOccludingLocal(1, 2, 3),
+        "不带快照的旧入口不做补丁比较，保持整列覆盖语义");
+  }
+
+  /**
+   * 整列被 {@link OcclusionStore#removeColumn} 摘除（区块卸载）后，即便手里的快照是旧的，
+   * 也必须照常发布：空戳意味着「不是补丁」，不能跳过，否则该段退回「缺数据 = 遮挡」，
+   * 把玩家眼前的矿永久藏住。
+   */
+  @Test
+  void clearedColumnIsPublishedEvenWithStaleSnapshot() {
+    OcclusionStore store = new OcclusionStore();
+    long[] stamps = store.patchStamps(0, 0, 0, 1);
+    store.setBlockOccluding(1, 2, 3, true);
+    store.removeColumn(0, 0);
+
+    int skipped = store.restoreColumn(0, 0, 0,
+        new SectionOcclusion[] {SolidOcclusion.INSTANCE}, stamps);
+
+    assertEquals(0, skipped, "整列被摘除后必须恢复数据");
+    assertSame(SolidOcclusion.INSTANCE, store.section(0, 0, 0));
+  }
+
+  /**
+   * <b>P2 回归：活表里本来没有该段时不得跳过覆盖</b>。
+   *
+   * <p>「打断」类补丁在无数据段上不会建条目（{@code applyCellLocked} 早退），但会记戳。若发布时只看
+   * 「戳变了」就跳过，这轮整列发布结束后该段依然为空 → 显形侧按「缺数据 = 遮挡」判定 → 该段内的矿
+   * 永不显形。跳过条件必须同时要求「活表确有该段数据」。
+   */
+  @Test
+  void patchOnAbsentSectionDoesNotBlockColumnPublish() {
+    OcclusionStore store = new OcclusionStore();
+    long[] stamps = store.patchStamps(0, 0, 0, 1);
+
+    // 窗口内打断一格：该段此前没有数据 → 不建条目，但记戳
+    store.setBlockOccluding(1, 2, 3, false);
+    assertEquals(0, store.loadedSectionCount(), "前置：打断类补丁在无数据段上不建条目");
+
+    int skipped = store.restoreColumn(0, 0, 0,
+        new SectionOcclusion[] {SolidOcclusion.INSTANCE}, stamps);
+
+    assertEquals(0, skipped, "活表没有该段数据时不得跳过覆盖（否则整段永久留空）");
+    assertSame(SolidOcclusion.INSTANCE, store.section(0, 0, 0), "该段必须被发布出来");
+  }
+
+  // ---------------------------------------------------------- 只补缺失段（缓存命中路径）
+
+  /**
+   * 活表只有一段时：{@code restoreMissingColumn} 只补其余缺段，已有段一格都不动。
+   *
+   * <p>已有段可能含更晚的方块补丁；用旧负载覆盖会把补丁抹掉（该显示却多藏）。也不能用「首段存在
+   * ⇒ 整列存在」的列级探针（补丁只建出单段时会把整列误判为已存在 → 其余段永久缺失）。
+   */
+  @Test
+  void restoreMissingColumnFillsOnlyMissingSections() {
+    OcclusionStore store = new OcclusionStore();
+    store.replaceSection(0, 1, 0, SolidOcclusion.INSTANCE); // 活表只有 sectionY=1
+
+    SectionOcclusion[] column = {
+        SolidOcclusion.INSTANCE,   // sectionY=0：缺失 → 应补
+        EmptyOcclusion.INSTANCE,   // sectionY=1：已有 → 不得覆盖
+        SolidOcclusion.INSTANCE    // sectionY=2：缺失 → 应补
+    };
+    int filled = store.restoreMissingColumn(0, 0, 0, column);
+
+    assertEquals(2, filled, "只补两个缺失段");
+    assertSame(SolidOcclusion.INSTANCE, store.section(0, 0, 0), "缺失段被补");
+    assertSame(SolidOcclusion.INSTANCE, store.section(0, 1, 0), "已有段必须保持原样（不得被旧负载覆盖）");
+    assertSame(SolidOcclusion.INSTANCE, store.section(0, 2, 0), "缺失段被补");
+  }
+
+  /** 已有段里的方块补丁必须原样保留（旧负载不得回退它）。 */
+  @Test
+  void restoreMissingColumnLeavesPatchedSectionUntouched() {
+    OcclusionStore store = new OcclusionStore();
+    store.replaceSection(0, 0, 0, SolidOcclusion.INSTANCE);
+    store.setBlockOccluding(1, 2, 3, false); // 该段被补丁改过（挖开一格）
+
+    SectionOcclusion[] column = {SolidOcclusion.INSTANCE, EmptyOcclusion.INSTANCE};
+    int filled = store.restoreMissingColumn(0, 0, 0, column);
+
+    assertEquals(1, filled, "只补缺失的 sectionY=1");
+    SectionOcclusion live = store.section(0, 0, 0);
+    assertNotNull(live);
+    assertFalse(live.isOccludingLocal(1, 2, 3), "已有段里的补丁不得被旧负载覆盖");
+    assertSame(EmptyOcclusion.INSTANCE, store.section(0, 1, 0), "缺失段被补");
+  }
+
+  /** 整列都已存在时不做任何改动（返回 0），命中路径可据此判断是否需要后续工作。 */
+  @Test
+  void restoreMissingColumnIsNoOpWhenNothingMissing() {
+    OcclusionStore store = new OcclusionStore();
+    store.replaceSection(0, 0, 0, EmptyOcclusion.INSTANCE);
+    store.replaceSection(0, 1, 0, SolidOcclusion.INSTANCE);
+
+    int filled = store.restoreMissingColumn(0, 0, 0,
+        new SectionOcclusion[] {SolidOcclusion.INSTANCE, SolidOcclusion.INSTANCE});
+
+    assertEquals(0, filled);
+    assertSame(EmptyOcclusion.INSTANCE, store.section(0, 0, 0), "已有段不被覆盖");
+  }
 }

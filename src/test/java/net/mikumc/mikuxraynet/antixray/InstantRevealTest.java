@@ -4,7 +4,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -13,8 +16,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
+import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
+import org.bukkit.Location;
+import org.bukkit.World;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -27,6 +34,8 @@ import org.junit.jupiter.api.Test;
 class InstantRevealTest {
 
   private static final String WORLD = "world";
+  /** 主世界最低 section 的绝对 Y（与生产 antixray.yml 一致）：区块内局部坐标打包用。 */
+  private static final int MIN_HEIGHT = -64;
 
   /** 默认配置构造显形器（事件显形默认开启）；离线构造只需纯数据依赖，Bukkit 组件传 null。 */
   private ProximityRevealer revealer() {
@@ -298,5 +307,284 @@ class InstantRevealTest {
     ProximityRevealer.TickQuota quota = new ProximityRevealer.TickQuota();
     UUID player = UUID.randomUUID();
     assertEquals(0, quota.claim(player, 7L, 0, 0), "限额为 0：本 tick 没有可用额度");
+  }
+
+  /**
+   * 工作池无容量时「本轮跳过」、绝不在玩家线程同步算完（周期巡检的退化路径修复）。
+   *
+   * <p>判定入口被抽成纯函数就是为了能离线钉住这个方向：null / 无空位 → 不得进入同步计算分支，
+   * 否则服务器最忙时主线程 / 区域线程会被塞进整轮射线 CPU。
+   *
+   * <p>后半段驱动真实 {@code reveal()}（而不是只测谓词）：无工作池时必须走到
+   * {@code skipPassBecauseNoCapacity()}（计入统计）并直接返回。若将来把「同步算完」的退化路径加回来，
+   * 这里会通过 {@code revealsFrustumCulled/revealsRayCulled} 的非零或异常暴露出来。
+   */
+  @Test
+  void planningRequiresWorkPoolWithCapacity() {
+    assertFalse(ProximityRevealer.canOffloadPlanning(null),
+        "未装配工作池时不得退回玩家线程同步计算");
+    net.mikumc.mikuxraynet.concurrency.MikuWorkPool pool =
+        new net.mikumc.mikuxraynet.concurrency.MikuWorkPool(1, 4);
+    try {
+      assertTrue(ProximityRevealer.canOffloadPlanning(pool), "有空位时必须走工作线程");
+    } finally {
+      pool.close();
+    }
+
+    ProximityStats stats = new ProximityStats();
+    ObfuscatedChunkIndex index = new ObfuscatedChunkIndex(100_000, 300);
+    // 玩家 (0.5,64,0.5) 身边一个候选：确保 reveal 能取到候选、走到「是否能 offload」这道门闸
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
+    ProximityRevealer revealer = new ProximityRevealer(null, config(), index,
+        new RevealedSet(100_000, 300), stats, null, null, null);
+
+    invokeReveal(revealer, playerProxy());
+
+    assertEquals(1L, stats.passesSkippedNoCapacity.sum(),
+        "无工作池时必须走「本轮跳过」分支并计数（候选仍在索引里，下个周期重试）");
+    assertEquals(0L, stats.revealsSent.sum(), "跳过分支不得发包");
+    assertEquals(0L, stats.revealsFrustumCulled.sum(),
+        "不得在玩家线程 / 测试线程同步计算候选筛选（视锥剔除计数必须保持 0）");
+    assertEquals(0L, stats.revealsRayCulled.sum(),
+        "不得在玩家线程 / 测试线程同步计算候选筛选（射线剔除计数必须保持 0）");
+  }
+
+  /**
+   * 单周期实际发包上限 = min(配置, 候选窗口)：默认 512 必须完整生效（旧实现的 256 评估上限会把它
+   * 静默砍半），配置超过窗口时按窗口钳制（启动时另有一次 WARN，绝不静默改配置）。
+   */
+  @Test
+  void revealCeilingIsCandidateWindowAndNeverTruncatesConfiguredValueBelowIt() {
+    assertEquals(ProximityRevealer.MAX_CANDIDATES,
+        ProximityRevealer.effectiveRevealCeiling(ProximityRevealer.MAX_CANDIDATES),
+        "配置等于窗口时完整生效");
+    assertEquals(1, ProximityRevealer.effectiveRevealCeiling(1), "下限仍为 1");
+    assertEquals(ProximityRevealer.MAX_CANDIDATES,
+        ProximityRevealer.effectiveRevealCeiling(100_000),
+        "超过窗口时钳制到窗口（不为一个过大的配置放大取候选/评估量）");
+    assertEquals(256, ProximityRevealer.effectiveRevealCeiling(256),
+        "≤ 窗口的配置值必须原样生效（不得再被 256 的旧评估上限截断）");
+  }
+
+  /** 回显记号的周期清理只删「已过窗口」的项：仍在窗口内的有效记号必须保留（否则在途显形包被误判为真实变更）。 */
+  @Test
+  void pruneExpiredEchoesKeepsMarksStillInsideTheWindow() {
+    java.util.concurrent.ConcurrentHashMap<ProximityRevealer.EchoKey, Long> marks =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    marks.put(new ProximityRevealer.EchoKey(WORLD, 1, 64, 1), 100L);
+    marks.put(new ProximityRevealer.EchoKey(WORLD, 2, 64, 1), 300L);
+
+    ProximityRevealer.pruneExpiredEchoes(marks, 200L);
+
+    assertEquals(1, marks.size(), "只删过期项");
+    assertTrue(marks.containsKey(new ProximityRevealer.EchoKey(WORLD, 2, 64, 1)),
+        "仍在窗口内的有效记号必须保留");
+    assertFalse(marks.containsKey(new ProximityRevealer.EchoKey(WORLD, 1, 64, 1)),
+        "已过窗口的记号必须被清掉（否则会长期滞留）");
+  }
+
+  /**
+   * 入口门闸<b>只排除黑名单世界、不读反矿透总开关</b>（第 10 轮 P1 修复）。
+   *
+   * <p>总开关关闭后索引与巡检仍要保留：服务端不会重发已加载的区块，客户端手里仍是伪装后的假矿，
+   * 只有邻近显形能把它们还原，否则玩家要等区块重发才看得到真方块（「该显形不显形」是硬红线）。
+   * 候选本就只来自「我们写过伪装索引」的区块，总开关关闭的世界里索引为空，天然零发包。
+   *
+   * <p>三条入口（周期巡检 / 事件逐坐标 / 事件 section）共用 {@link ProximityRevealer#shouldRevealInWorld}；
+   * 本类另用离线 Player/World 替身驱动了 reveal() 的「无工作池跳过」分支（见
+   * {@link #planningRequiresWorkPoolWithCapacity}），此处只针对共用门闸做断言
+   * （判定为假即该路径在入口直接 return、不发包）。
+   */
+  @Test
+  void revealGateExcludesOnlyBlacklistedWorldsNotTheAntiXraySwitch() {
+    assertTrue(revealer().shouldRevealInWorld(WORLD), "默认（未拉黑）世界：允许显形");
+
+    // 总开关关闭（proximity 段仍启用）：门闸不得因此拒绝——它已不再读 config.antiXrayAppliesTo()
+    ProximityRevealer antiXrayOff = new ProximityRevealer(null,
+        AntiXrayConfig.from(yaml("enabled: false\n")), new ObfuscatedChunkIndex(1, 300),
+        new RevealedSet(1024, 300), new ProximityStats(), null, null, null);
+    assertTrue(antiXrayOff.shouldRevealInWorld(WORLD),
+        "反矿透总开关关闭时仍须允许显形：已下发的假矿要靠邻近显形还原");
+
+    // 黑名单世界一律不显形；名单是进程级静态状态，用例结束必须复位（与 WorldBlacklistTest 同口径）
+    try {
+      WorldBlacklistConfig.publish(WorldBlacklistConfig.fromPatterns(List.of(WORLD)));
+      assertFalse(antiXrayOff.shouldRevealInWorld(WORLD), "黑名单世界必须不显形");
+      assertTrue(antiXrayOff.shouldRevealInWorld("world_nether"), "名单外的其它世界不受影响");
+    } finally {
+      WorldBlacklistConfig.publish(WorldBlacklistConfig.fromPatterns(List.of()));
+    }
+    assertTrue(antiXrayOff.shouldRevealInWorld(WORLD), "名单复位后重新允许显形");
+    assertFalse(antiXrayOff.shouldRevealInWorld(null), "世界名未知时保守不显形");
+  }
+
+  /**
+   * <b>重算：真实评估循环必须评估全部候选</b>（第 10 轮 P2 补测）。
+   *
+   * <p>为什么必须驱动真实方法：{@link #revealCeilingIsCandidateWindowAndNeverTruncatesConfiguredValueBelowIt}
+   * 只断言了纯函数 {@code effectiveRevealCeiling}；而「评估预算 = 取到的候选数（去掉旧 256 上限）」
+   * 的真实实现在 {@code ProximityRevealer#computePlan}。若把那里的循环改回
+   * {@code limit = Math.min(count, 256)}，只测纯函数的用例仍然全绿，真机却会静默砍半
+   * {@code max-reveals-per-tick}（窗口后一半候选取出即丢、玩家显形延迟/漏显）。
+   *
+   * <p>驱动方式：用本类已有的离线 {@code revealer()} 构造（frustum / raycast 都关闭，
+   * {@code computePlan} 只做「逐条拷贝」）＋反射调用 private {@code computePlan}；
+   * 断言计划条数恒等于候选条数，因此任何评估上限的回归都会在此判红。
+   */
+  @Test
+  void computePlanEvaluatesEveryCandidateUpToTheCandidateWindow() throws Exception {
+    ProximityRevealer revealer = planRevealer();
+
+    assertEquals(ProximityRevealer.MAX_CANDIDATES,
+        planCount(revealer, candidates(ProximityRevealer.MAX_CANDIDATES)),
+        "512 条候选必须全部评估（旧的 256 评估上限不得回来）");
+    assertEquals(300, planCount(revealer, candidates(300)), "300 条候选必须全部评估");
+    assertEquals(255, planCount(revealer, candidates(255)),
+        "低于旧上限的候选数必须原样保留");
+    assertEquals(1, planCount(revealer, candidates(1)), "单候选也不得被过滤掉");
+  }
+
+  // ---------------------------------------------------------- computePlan 反射驱动
+
+  private static final Method COMPUTE_PLAN = computePlanMethod();
+  private static final Method PLAN_COUNT = planCountMethod();
+
+  private static Method computePlanMethod() {
+    try {
+      Method method = ProximityRevealer.class.getDeclaredMethod("computePlan",
+          ProximitySelector.Eye.class, int[].class, String.class, boolean.class);
+      method.setAccessible(true);
+      return method;
+    } catch (ReflectiveOperationException failure) {
+      throw new ExceptionInInitializerError(
+          "无法定位 ProximityRevealer#computePlan（签名已变？）：" + failure);
+    }
+  }
+
+  private static Method planCountMethod() {
+    try {
+      Method method = Class.forName("net.mikumc.mikuxraynet.antixray.ProximityRevealer$Plan")
+          .getDeclaredMethod("count");
+      method.setAccessible(true);
+      return method;
+    } catch (ReflectiveOperationException failure) {
+      throw new ExceptionInInitializerError(
+          "无法定位 ProximityRevealer.Plan#count（结构已变？）：" + failure);
+    }
+  }
+
+  /** frustum / raycast 均关闭的显形器：computePlan 只做逐条拷贝，条数差异只可能来自评估上限。 */
+  private static ProximityRevealer planRevealer() {
+    // 与文件内其它用例同风格：单行字面量加转义换行拼接，不使用跨行普通字符串。
+    AntiXrayConfig planConfig = AntiXrayConfig.from(yaml("enabled: true\n"
+        + "proximity:\n"
+        + "  frustum:\n"
+        + "    enabled: false\n"
+        + "  raycast:\n"
+        + "    enabled: false\n"));
+    return new ProximityRevealer(null, planConfig, new ObfuscatedChunkIndex(1_000_000, 300),
+        new RevealedSet(1_000_000, 300), new ProximityStats(), null, null, null);
+  }
+
+  /** 构造 {@code count} 条互不相同的候选（值本身无意义，computePlan 在本用例里不做任何过滤）。 */
+  private static int[] candidates(int count) {
+    int[] coordinates = new int[count * 3];
+    for (int i = 0; i < count; i++) {
+      coordinates[i * 3] = i;
+      coordinates[i * 3 + 1] = 64;
+      coordinates[i * 3 + 2] = 0;
+    }
+    return coordinates;
+  }
+
+  private static int planCount(ProximityRevealer revealer, int[] coordinates) {
+    try {
+      Object plan = COMPUTE_PLAN.invoke(revealer,
+          ProximitySelector.eye(0.5D, 65.62D, 0.5D, 0.0D, 0.0D, 1.0D), coordinates, WORLD, false);
+      return (Integer) PLAN_COUNT.invoke(plan);
+    } catch (ReflectiveOperationException failure) {
+      throw new AssertionError("驱动 ProximityRevealer#computePlan 失败：" + failure, failure);
+    }
+  }
+
+  private static void invokeReveal(ProximityRevealer revealer, Player player) {
+    try {
+      Method reveal = ProximityRevealer.class.getDeclaredMethod("reveal", Player.class,
+          ProximityRevealer.Budget.class, int.class);
+      reveal.setAccessible(true);
+      reveal.invoke(revealer, player, new ProximityRevealer.Budget(64), 0);
+    } catch (ReflectiveOperationException failure) {
+      Throwable cause = failure.getCause() == null ? failure : failure.getCause();
+      throw new AssertionError("无工作池时 reveal 必须直接跳过，绝不同步计算：" + cause, cause);
+    }
+  }
+
+  /** 离线 Player 替身：只打桩 reveal 在「取候选 → 判定门闸」这一段真正会读的方法。 */
+  private static Player playerProxy() {
+    World world = (World) Proxy.newProxyInstance(World.class.getClassLoader(),
+        new Class<?>[] {World.class}, (proxy, method, args) -> switch (method.getName()) {
+          case "getName" -> WORLD;
+          case "hashCode" -> System.identityHashCode(proxy);
+          case "equals" -> proxy == args[0];
+          case "toString" -> "InstantRevealStub-World";
+          default -> defaultValue(method.getReturnType());
+        });
+    Location location = new Location(world, 0.5D, 64.0D, 0.5D, 0.0F, 0.0F);
+    Location eye = new Location(world, 0.5D, 65.62D, 0.5D, 0.0F, 0.0F);
+    UUID playerId = UUID.randomUUID();
+    return (Player) Proxy.newProxyInstance(Player.class.getClassLoader(),
+        new Class<?>[] {Player.class}, (proxy, method, args) -> switch (method.getName()) {
+          case "getUniqueId" -> playerId;
+          case "isOnline" -> true;
+          case "getWorld" -> world;
+          case "getLocation" -> location;
+          case "getEyeLocation" -> eye;
+          case "getX" -> location.getX();
+          case "getY" -> location.getY();
+          case "getZ" -> location.getZ();
+          case "getYaw" -> location.getYaw();
+          case "getPitch" -> location.getPitch();
+          case "getEyeHeight" -> 1.62D;
+          case "hashCode" -> System.identityHashCode(proxy);
+          case "equals" -> proxy == args[0];
+          case "toString" -> "InstantRevealStub-Player";
+          default -> defaultValue(method.getReturnType());
+        });
+  }
+
+  private static Object defaultValue(Class<?> type) {
+    if (!type.isPrimitive()) {
+      return null;
+    }
+    if (type == boolean.class) {
+      return false;
+    }
+    if (type == char.class) {
+      return (char) 0;
+    }
+    if (type == byte.class) {
+      return (byte) 0;
+    }
+    if (type == short.class) {
+      return (short) 0;
+    }
+    if (type == int.class) {
+      return 0;
+    }
+    if (type == long.class) {
+      return 0L;
+    }
+    if (type == float.class) {
+      return 0F;
+    }
+    if (type == double.class) {
+      return 0D;
+    }
+    return null;
+  }
+
+  /** 区块内局部坐标打包（section 内序号）：{@code y<<8 | z<<4 | x} 的绝对 Y 版本。 */
+  private static int local(int x, int y, int z) {
+    return ((y - MIN_HEIGHT) << 8) | ((z & 15) << 4) | (x & 15);
   }
 }

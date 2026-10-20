@@ -258,7 +258,7 @@ public final class BufferedLinearV3Format {
     return (chunkX & 31) + ((chunkZ & 31) << 5);
   }
 
-  /** 槽位序号 → 所属 bucket（0..15）。 */
+  /** 槽位序号 → 所属 bucket（0..{@code BUCKET_COUNT - 1}，当前布局 {@code BUCKET_SHIFT=0} 即 0..1023）。 */
   public static int bucketIndex(int chunkIndex) {
     return chunkIndex >>> BUCKET_SHIFT;
   }

@@ -188,7 +188,12 @@ public final class LatencyMonitor implements Listener {
     long now = System.currentTimeMillis();
 
     if (state.shouldReduce(ping, now, config.thresholdMillis(), sustainMillis)) {
-      reduce(player);
+      // 只有降级<b>真正生效</b>才向状态机回报「已降级」（B1）：shouldReduce 不再预置标记，
+      // 因此被下限钳制／写失败／停用回滚等「没降成」的情形会在下一次采样自然重试，
+      // 而不会把 reduced 永久钉成 true、让该玩家整段会话再也降不下来。
+      if (reduce(player)) {
+        state.markReduced();
+      }
     } else if (state.shouldRestore(ping, config.thresholdMillis())) {
       // 只有还原<b>成功</b>才回报「已还原」：失败时状态机继续保持「已降级」，下一次采样继续重试
       // （旧实现由 shouldRestore 自己先清标记，一次瞬时异常就会让玩家永久卡在降级视距）。
@@ -198,11 +203,22 @@ public final class LatencyMonitor implements Listener {
     }
   }
 
-  private void reduce(Player player) {
+  /**
+   * 尝试降低视距。
+   *
+   * @return {@code true} 表示本次<b>确实</b>下调并保留了原始视距记录（调用方据此向 {@link PingState}
+   *         回报「已降级」）；{@code false} 表示没有下调——已在生效下限、目标无法再降、
+   *         停用中／停用竞态回滚、读取或写入失败；返回 {@code false} 时下一次采样会自然重试
+   */
+  private boolean reduce(Player player) {
     if (stopping) {
       // 停用已开始：绝不再下调视距（否则会把刚被 restoreAll 还原的视距又降回去）
-      return;
+      return false;
     }
+    // 记录「本次是否由我们新建了原始视距条目」及其值：写视距失败时要把自己刚加的那条撤掉，
+    // 否则 stop() 会把一条并不存在的降级当成真的降级去「还原」。
+    boolean recordedByUs = false;
+    int recordedRaw = -1;
     try {
       // 读 send 视距并保留原始值 raw：未单独设置过的玩家返回 -1（= 服端默认），此时必须以「生效视距」
       // getViewDistance() 作降级基线，否则 -1 会命中下面的 floor 比较而永不降级（见类注释）。
@@ -212,7 +228,7 @@ public final class LatencyMonitor implements Listener {
       // 必须与 API 硬下限取并集，绝不能因为某次钳制被击穿。
       int floor = Math.max(2, config.minViewDistance());
       if (current <= floor) {
-        return;
+        return false;
       }
       int target = Math.max(floor, current - Math.max(1, config.reduceViewDistance()));
       // setSendViewDistance 要求目标 ≤ 玩家当前 view-distance 且落在 [2,32]：按 API 上限收敛，
@@ -222,7 +238,7 @@ public final class LatencyMonitor implements Listener {
       // 收敛后若仍不低于当前值（无实际降低），或已被压到生效下限之下（服务端 view-distance 比下限还小，
       // 属异常状态），则放弃本次降级——宁可不动，也绝不把视距降到配置下限以下。
       if (target >= current || target < floor) {
-        return;
+        return false;
       }
       // 记录原始 raw（可能为 -1）：还原时原样回写，API 才会把 send 视距还原为服端默认（见类注释）。
       //
@@ -231,7 +247,8 @@ public final class LatencyMonitor implements Listener {
       // 只能把玩家还原到那个降级值——视距被永久压低，直到重新登录。重复进入 reduce 时
       // （PingState.reduced 因 Folia 区域迁移等读到陈旧值）必须保留最早记录的那份原始值。
       Integer previous = originalViewDistance.putIfAbsent(player.getUniqueId(), raw);
-      boolean recordedByUs = previous == null;
+      recordedByUs = previous == null;
+      recordedRaw = raw;
       player.setSendViewDistance(target);
       // 停用竞态收口（Folia：stop() 可能在另一条区域线程上并发执行）：<b>写入之后再读一次</b> volatile
       // stopping。这样保证「本次读到 false ⇒ stop() 尚未置位 ⇒ 其 restoreAll 必然发生在本次写入之后、
@@ -249,12 +266,18 @@ public final class LatencyMonitor implements Listener {
         } catch (Throwable throwable) {
           plugin.getLogger().fine("停用竞态回滚视距失败：" + throwable.getMessage());
         }
-        return;
+        return false;
       }
       stats.viewDistanceReduced.increment();
+      return true;
     } catch (Throwable throwable) {
+      if (recordedByUs) {
+        // 本次新建的原值记录随「写入失败」一起作废：降级没生效，绝不能留一条记录让 stop() 去还原
+        originalViewDistance.remove(player.getUniqueId(), recordedRaw);
+      }
       // 视距调整失败不影响其它功能
       plugin.getLogger().fine("降低视距失败：" + throwable.getMessage());
+      return false;
     }
   }
 

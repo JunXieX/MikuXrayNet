@@ -6,6 +6,7 @@ import com.comphenix.protocol.ProtocolManager;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
+import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
@@ -52,14 +53,42 @@ public final class ThrottlePipeline {
    * {@link #start()} 对变更合并显式停用，零位移取消 / AFK 则靠 {@link #register} 捕获构造/启动期异常兜底停用。
    */
   public static ModulePlan plan(BandwidthConfig config) {
+    return plan(config, isFoliaSafe());
+  }
+
+  /**
+   * 当前平台是否 Folia 系；判定不可用时按 Paper 处理（离线单测没有服务端实例；且 Paper 分支是
+   * 「全部功能可用」的保守方向，绝不因探测失败把模块静默关掉）。
+   */
+  private static boolean isFoliaSafe() {
+    try {
+      return PlatformSupport.isFolia();
+    } catch (Throwable ignored) {
+      return false;
+    }
+  }
+
+  /**
+   * 依配置 + 显式平台推导注册决策（平台由调用方给出，便于离线单测覆盖 Folia 分支）。
+   *
+   * <p><b>Folia + 非空白名单时零位移取消不注册</b>：{@code EntityPacketFilter} 依赖「实体 id → 类型」
+   * 索引判定白名单，而 Folia 上无法安全枚举全服实体、索引建不起来；索引为空时取消零位移包会让
+   * 盔甲架 / 展示实体的姿态卡住。因此这里直接判「不注册」，让启动日志与诊断口径与真实注册状态一致，
+   * 而不是构造一个在 {@code start()} 里自我停用的空壳。不要为此实现不安全的 Folia 实体枚举路径。
+   */
+  static ModulePlan plan(BandwidthConfig config, boolean folia) {
     boolean master = config.enabled();
     // 实体剔除：射线遮挡与视锥剔除共用同一套「追踪登记 + 周期复检」骨架，任一开启就必须注册；
     // 两者都关时完全不注册（零开销）。
     boolean entityCulling = config.entityCulling().enabled()
         && (config.entityCulling().raycast()
             || (config.entityCulling().frustum() != null && config.entityCulling().frustum().enabled()));
+    // 白名单为空时不需要类型索引（Folia 上仍可注册，所有实体按「非白名单」处理，是既定语义）
+    boolean whitelistConfigured = config.entityPackets().whitelist() != null
+        && !config.entityPackets().whitelist().isEmpty();
     return new ModulePlan(
-        master && config.entityPackets().enabled() && config.entityPackets().skipZeroMovement(),
+        master && config.entityPackets().enabled() && config.entityPackets().skipZeroMovement()
+            && !(folia && whitelistConfigured),
         master && config.blockChanges().enabled() && config.blockChanges().merge(),
         master && entityCulling,
         // AFK 模块只看总开关：即使两个 drop-* 行为开关全为 false，它仍会注册以跟踪并统计 AFK 状态
@@ -212,6 +241,14 @@ public final class ThrottlePipeline {
             () -> new EntityPacketFilter(plugin, manager, config.entityPackets(), stats),
             EntityPacketFilter::start, EntityPacketFilter::stop);
       }
+    } else if (isFoliaSafe() && config.entityPackets().enabled()
+        && config.entityPackets().skipZeroMovement()) {
+      // 走到这里只可能是「Folia + 非空白名单」：白名单索引在 Folia 上建不起来（无法安全枚举实体），
+      // 取消零位移包会让盔甲架 / 展示实体姿态卡住，故整项不注册。这里按平台原因直说，
+      // 避免落进 logDisabled 的「按配置键说 false」文案（配置其实是 true）。
+      plugin.getLogger().warning("带宽模块：零位移实体包取消在 Folia 上整项不注册"
+          + "（无法安全枚举实体、白名单索引不可用；取消零位移包会让盔甲架/展示实体姿态卡住）。"
+          + "其余带宽功能不受影响");
     } else {
       logDisabled("零位移实体包取消", config.entityPackets().enabled()
           ? "entity-packets.skip-zero-movement" : "entity-packets.enabled");

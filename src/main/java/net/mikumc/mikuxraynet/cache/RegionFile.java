@@ -115,6 +115,17 @@ final class RegionFile implements AutoCloseable {
           AntiXrayConfig.DISK_CACHE_MAX_FILE_SIZE_MB_MAX * 1024L * 1024L
               + MAX_COMPACT_TOTAL_RAW_MARGIN));
 
+  /**
+   * 单次 {@link #flushDirty(int)} 最多落盘的记录条数（落盘分批预算）。
+   *
+   * <p><b>为什么要有预算</b>：一条记录 = 整条 bucket 重编码 + zstd 压缩 + append，量级 0.1~0.5 ms；
+   * 维护周期（默认 30 s）之间累积的脏记录可达数百~上千条（BUCKET_SIZE=1 时每个被改写区块一条），
+   * 一次性写完会把唯一的磁盘线程占住 100~500 ms，而读取预算只有 50 ms——期间所有磁盘读取都会超时
+   * 记未命中，上层回退整块重写（最贵路径），表现为周期性命中率骤降与 CPU 抖动。取 32 约合 3~16 ms，
+   * 给读预算留足余量；余量由调用方续排（见 {@code DiskCacheStore#flushHandle}）。
+   */
+  static final int FLUSH_BATCH_RECORDS = 32;
+
   /** 条目的保留判定（用于压缩回收时丢弃过期/旧代次条目）。 */
   @FunctionalInterface
   interface EntryFilter {
@@ -127,6 +138,10 @@ final class RegionFile implements AutoCloseable {
    * <p><b>与 {@link #slots} 的关系</b>：一个桶要么是「已整桶解码」（{@code slots[bucket] != null}），
    * 要么是「只解析了槽位表」的 {@code LazyBucket}，二者互斥；需要整桶时（写 / 压缩回收）由
    * {@link #ensureLoaded} 把 LazyBucket 一次性解码并转入 {@code slots}。
+   *
+   * <p><b>当前布局（{@code BUCKET_SIZE==1}）不使用本表示</b>：一条记录只承载一个槽位，懒加载没有
+   * 「少解码其余槽位」的收益，却会让解压后的整条记录与 payload 副本同时常驻，故 {@link #readSlot}
+   * 改为直接物化。仅当布局恢复为「一桶多槽」时才会重新启用。
    */
   private static final class LazyBucket {
 
@@ -163,6 +178,9 @@ final class RegionFile implements AutoCloseable {
   /**
    * 读路径懒加载的桶（与 {@link #slots} 互斥，见 {@link LazyBucket}）：只解析槽位表、按需解码单个槽位。
    * 写 / 压缩需要整桶时由 {@link #ensureLoaded} 一次性解码并转入 {@link #slots}。
+   *
+   * <p><b>当前布局下恒为全 null</b>：{@code BUCKET_SIZE==1} 时懒加载收益为 0 且会让解压记录与 payload
+   * 双份常驻，{@link #readSlot} 直接物化（见其说明）；只有多槽位布局（{@code BUCKET_SIZE>1}）才会用到它。
    */
   private final LazyBucket[] lazyBuckets = new LazyBucket[BufferedLinearV3Format.BUCKET_COUNT];
 
@@ -469,11 +487,16 @@ final class RegionFile implements AutoCloseable {
    * 读取一个区块的条目；不存在、损坏、或该文件已被其它进程占用时为 {@code null}。
    *
    * <p><b>读路径不再整桶解码</b>：桶未在内存时只解析槽位表、只解码本次请求的那一个槽位（见
-   * {@link #readSlot}）。因此返回的条目在「桶已整桶解码」时与内部缓存共享同一实例、在懒加载时是本次
-   * 新解出的实例；两种情况下调用方都必须<b>只读</b>对待它，或在使用前自行复制。若要跨后续的
-   * {@code put}/{@code clear}/{@code compact} 长期持有该 payload，应先复制。实际安全由上层保证：
+   * {@link #readSlot}）。因此返回的条目在「桶已整桶解码」时与内部缓存共享同一实例，只在多槽位布局的
+   * 懒加载下才是本次新解出的实例；两种情况下调用方都必须<b>只读</b>对待它，或在使用前自行复制。若要跨
+   * 后续的 {@code put}/{@code clear}/{@code compact} 长期持有该 payload，应先复制。实际安全由上层保证：
    * {@code DiskPayload.decode} 解码时已把 payload 复制成独立的字节数组，因此正常读写路径不会就地改写
    * 本方法返回的字节。
+   *
+   * <p><b>当前布局（{@code BUCKET_SIZE==1}）不走懒加载</b>：一条记录只承载一个槽位，读命中在
+   * {@link #readSlot} 里直接物化（只保留 payload 一份，避免「解压后的整条记录 + payload 副本」双份常驻），
+   * 因此本方法返回的条目<b>恒为</b>内部缓存共享的同一实例。懒加载表示只保留给多槽位布局
+   * （{@code BUCKET_SIZE>1}）——那时「一桶多槽、只解一个」才有收益。
    */
   BufferedLinearV3Format.Entry get(int chunkIndex) {
     if (lockUnavailable) {
@@ -514,19 +537,31 @@ final class RegionFile implements AutoCloseable {
   }
 
   /**
-   * 读取一个槽位：桶已在内存（整桶已解码）时直接返回该槽位；否则走懒加载——只解析槽位表、只解码本次
-   * 请求的那一个槽位。
+   * 读取一个槽位：桶已在内存（整桶已解码）时直接返回该槽位；否则按布局选路径——{@code BUCKET_SIZE==1}
+   * 时<b>直接物化</b>（见下），多槽位布局（{@code BUCKET_SIZE>1}）才走懒加载（只解析槽位表、只解码本次
+   * 请求的那一个槽位）。
    *
    * <p><b>为什么要懒解码</b>：旧实现每次读取都 {@link #ensureLoaded} 整桶（旧布局一桶 64 个槽位，逐槽分配 payload、
    * 复制、XXHash 校验），单次区块读取要付出最多 64 个区块的工作量；而读取只有 50ms 预算，常常跑不完
-   * 而被记未命中，上层于是回退整块重写，磁盘缓存几乎失效。现在只解码被请求的槽位，其余槽位的校验/复制
-   * 都推迟到真正需要（写、压缩回收）时。
+   * 而被记未命中，上层于是回退整块重写，磁盘缓存几乎失效。懒加载布局下只解码被请求的槽位，其余槽位的
+   * 校验/复制都推迟到真正需要（写、压缩回收）时。
+   *
+   * <p><b>当前布局（{@code BUCKET_SIZE==1}）不走懒加载</b>：一条记录只承载一个槽位，懒加载「只解被请求
+   * 槽位」的收益恒为 0，却会让解压后的整条记录与 payload 副本同时常驻（每个命中区块凭空多占约一份
+   * payload 的内存）；故这里直接 {@code ensureLoaded} 物化，LazyBucket 表示只在多槽位布局下启用。
    */
   private BufferedLinearV3Format.Entry readSlot(int bucket, int slot) {
     BufferedLinearV3Format.Entry[] bucketSlots = slots[bucket];
     if (bucketSlots != null) {
       loaded.get(bucket);
       return bucketSlots[slot];
+    }
+    // 当前布局（BUCKET_SHIFT=0 → BUCKET_SIZE=1）一条记录只承载一个槽位：懒加载「只解码被请求的槽位」
+    // 的收益恒为 0，却会让「解压后的整条记录」（LazyBucket.raw）与「解码出的 payload 副本」同时常驻
+    // ——每个命中区块凭空多占约一份 payload 的内存（直到被 LRU 驱逐）。故直接物化进 slots，只保留
+    // payload 一份。多槽位布局（BUCKET_SIZE>1）仍保留懒路径：那时「一桶多槽、只解一个」才是真收益。
+    if (BufferedLinearV3Format.BUCKET_SIZE == 1) {
+      return ensureLoaded(bucket)[slot];
     }
     LazyBucket lazy = lazyBuckets[bucket];
     if (lazy == null) {
@@ -740,7 +775,8 @@ final class RegionFile implements AutoCloseable {
    * <p><b>三种桶状态</b>：
    * <ul>
    *   <li>已整桶解码（{@code slots[bucket] != null}）→ 直接就地清空槽位并置 {@code dirty}（轻量）；</li>
-   *   <li>懒加载过（{@link #readSlot} 只物化了 {@code lazyBuckets}）→ <b>先物化整桶再清</b>。物化只
+   *   <li>懒加载过（{@link #readSlot} 只物化了 {@code lazyBuckets}）→ <b>先物化整桶再清</b>
+   *       <i>（当前布局 {@code BUCKET_SIZE==1} 下读命中已直接物化，本分支不再出现；仅多槽位布局可达）</i>。物化只
    *       解已在内存的 {@code lazy.raw}（<b>无磁盘 IO</b>），且只在「确实要删」这条罕见路径发生
    *       （条目过期 / 换配置）；若不物化，陈旧条目会滞留并在此后<b>每次读取都重复单槽解码</b>
    *       （直到 put 覆盖或维护压缩），且 clear 必须返回 {@code true} 才能让调用方的条目计数
@@ -787,22 +823,39 @@ final class RegionFile implements AutoCloseable {
 
   /** 把所有脏 bucket 追加写入文件并回填偏移表；返回是否真的写过。 */
   boolean flushDirty() throws IOException {
+    return flushDirty(Integer.MAX_VALUE) > 0;
+  }
+
+  /**
+   * 落盘至多 {@code maxRecords} 条脏记录，返回<b>实际写入的记录数</b>（{@link #flushDirty()} 的分批版）。
+   *
+   * <p>分批只是把「一条长任务」切成多条短任务：调用方（{@code DiskCacheStore#flushHandle}）在返回后
+   * 若 {@link #hasDirtySlots()} 仍为真，就把余下部分重新排到磁盘线程队尾，让中间到达的读取先被服务。
+   * 「先写偏移表 + force、再清 dirty」的顺序在每批末尾照旧执行，因此每一批自身都是「偏移表与数据一致」的
+   * 完整提交点（进程在批与批之间崩溃也不会出现「偏移表指过去、数据却没写」的半截状态）。代价是整次落盘
+   * 会多出若干次偏移表重写（8 KiB 顺序写）与 fsync；相对「一次写完让读取全部超时、上层回退整块重写」
+   * 这笔代价可以忽略。
+   */
+  int flushDirty(int maxRecords) throws IOException {
     if (lockUnavailable) {
-      return false; // 该文件归其它进程所有：跳过落盘（不报错）
+      return 0; // 该文件归其它进程所有：跳过落盘（不报错）
     }
     if (compacting) {
       // 整文件重写进行中：落盘要读槽位数组并写偏移表，而压缩线程正在整体重建它们，必须避让。
-      // 返回 false 表示「本次没写」；压缩完成后文件已是内存态的最新快照，无需补写。
-      return false;
+      // 返回 0 表示「本次没写」；压缩完成后文件已是内存态的最新快照，无需补写。
+      return 0;
     }
+    int limit = Math.max(1, maxRecords);
     boolean wrote = false;
+    int written = 0;
     // 记录本轮真正追加落盘的桶，等偏移表也写成功后再统一清 dirty（见方法说明）。
     boolean[] flushed = new boolean[BufferedLinearV3Format.BUCKET_COUNT];
-    for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
+    for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT && written < limit; bucket++) {
       if (dirty[bucket] && slots[bucket] != null) {
         if (flushBucket(bucket)) {
           wrote = true;
           flushed[bucket] = true;
+          written++;
         }
       }
     }
@@ -819,7 +872,25 @@ final class RegionFile implements AutoCloseable {
       }
       garbageBytes = Math.max(0L, fileSize - BufferedLinearV3Format.DATA_AREA_OFFSET - liveBytes);
     }
-    return wrote;
+    return written;
+  }
+
+  /**
+   * 是否仍有「已标脏且可落盘」的记录（供分批落盘的续排判定，见 {@link #flushDirty(int)}）。
+   *
+   * <p>只读 {@code dirty}/{@code slots}，不做任何 IO。压缩独占期间返回 {@code false}：那时这两个数组
+   * 正被压缩线程整体重建，磁盘线程不得读它们（与 {@link #isDirty()} 同一纪律）。
+   */
+  boolean hasDirtySlots() {
+    if (compacting) {
+      return false;
+    }
+    for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
+      if (dirty[bucket] && slots[bucket] != null) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

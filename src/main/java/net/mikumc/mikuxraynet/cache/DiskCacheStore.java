@@ -156,13 +156,30 @@ public final class DiskCacheStore implements AutoCloseable {
      * 本次 payload 长度累加进 {@link #pendingBytes}，严重低估了实际会写入文件的字节数——文件早已冲破
      * {@code max-file-size-mb}，上限判定却迟迟不触发、压缩回收也被一并推迟。改为：每次写入把「该桶整桶
      * 编码长度」相对上次的增量并入 {@link #pendingBytes}，使上限判定反映真正会被 append 的数据量。
+     *
+     * <p><b>按需分配</b>：只读句柄（重启后命中读路径是缓存的常态）从不写入，因此永远不需要这张
+     * 1024 项 / 8 KB 的 long 表。改为首次写入时才分配，省下每个只读句柄的这部分常驻内存
+     * （{@code max-region-files} 较大时按句柄数线性叠加）。
      */
-    private final long[] pendingBucketBytes = new long[BufferedLinearV3Format.BUCKET_COUNT];
+    private long[] pendingBucketBytes;
+
+    /** per-bucket 待落盘记账表；首次写入时分配（见字段说明）。 */
+    private long[] pendingBucketBytes() {
+      long[] table = this.pendingBucketBytes;
+      if (table == null) {
+        table = new long[BufferedLinearV3Format.BUCKET_COUNT];
+        this.pendingBucketBytes = table;
+      }
+      return table;
+    }
 
     /** 待落盘记账清零（该文件的整桶数据已随 flush / 压缩完整落到文件）。 */
     private void clearPending() {
       pendingBytes = 0L;
-      Arrays.fill(pendingBucketBytes, 0L);
+      long[] table = this.pendingBucketBytes;
+      if (table != null) {
+        Arrays.fill(table, 0L);
+      }
     }
 
     /**
@@ -613,13 +630,16 @@ public final class DiskCacheStore implements AutoCloseable {
     }
     int chunkIndex = BufferedLinearV3Format.chunkIndex(chunkX, chunkZ);
     int bucket = BufferedLinearV3Format.bucketIndex(chunkIndex);
+    // per-bucket 待落盘记账表按需分配：只读句柄从不需要它（见 Handle#pendingBucketBytes 字段说明）。
+    // 这里取一次局部引用，下面的判定与记账共用同一张表。
+    long[] pendingBucketBytes = handle.pendingBucketBytes();
     // 单文件上限：既看已落盘字节，也看尚未 append 的待落盘字节，并<b>把本次写入会引起的该桶编码增量
     // 一并投影进去</b>。bucket 是整块追加的，若只看「写入之前的待落盘字节」（旧实现），本次写入可新增
     // 整整一个桶的字节，于是上限随时可能被顶破（默认 16 MiB 上限下实测可到数十 MB）。
     // 投影口径与下方记账用的 encodedBucketSizeEstimate 完全一致，故判定与记账不会漂移。
     long projectedBucketBytes = handle.file.encodedBucketSizeEstimateAfterPut(chunkIndex, payload.length);
     long projectedFileBytes = handle.file.sizeBytes() + handle.pendingBytes
-        - handle.pendingBucketBytes[bucket] + projectedBucketBytes;
+        - pendingBucketBytes[bucket] + projectedBucketBytes;
     if (projectedFileBytes >= maxFileSizeBytes) {
       stats.rejectedBySize.increment();
       return;
@@ -642,8 +662,8 @@ public final class DiskCacheStore implements AutoCloseable {
     // 而不是只加本次 payload 长度——bucket 是整块追加的，后者会严重低估上限判定所需的数据量。
     // 桶重写产生的旧副本计入垃圾，由压缩回收。
     long bucketBytes = handle.file.encodedBucketSizeEstimate(bucket);
-    handle.pendingBytes += bucketBytes - handle.pendingBucketBytes[bucket];
-    handle.pendingBucketBytes[bucket] = bucketBytes;
+    handle.pendingBytes += bucketBytes - pendingBucketBytes[bucket];
+    pendingBucketBytes[bucket] = bucketBytes;
   }
 
   /** 维护任务：落盘 → 压缩回收 → 关闭闲置句柄（全部在磁盘线程执行）。 */
@@ -660,28 +680,56 @@ public final class DiskCacheStore implements AutoCloseable {
     }
   }
 
+  /**
+   * 把所有已打开句柄的脏记录落盘（维护周期 / 显式 flush / 关闭都会调用）。
+   *
+   * <p>每个句柄单次只写 {@link RegionFile#FLUSH_BATCH_RECORDS} 条：一次写完整批之前，磁盘线程被这条
+   * 任务独占，而读取预算只有 50 ms（量化见 {@link RegionFile#FLUSH_BATCH_RECORDS}）。未写完的余量由
+   * {@link #flushHandle} 排到队尾续写，中间到达的读取因此能被优先服务。
+   */
   private void flushAll() {
     for (Map.Entry<RegionKey, Handle> entry : open.entrySet()) {
-      Handle handle = entry.getValue();
-      try {
-        if (handle.file.isDirty()) {
-          handle.file.flushDirty();
+      flushHandle(entry.getKey(), entry.getValue());
+    }
+  }
+
+  /**
+   * 【磁盘线程】分批落盘单个句柄；本批写满且仍有脏记录时自链式续排（把磁盘线程让给读取）。
+   *
+   * <p>续排失败（已关闭 / 队列积压）不丢数据：脏标记原样保留——关闭路径由 {@code close()} 排空任务里的
+   * 全量 {@link RegionFile#flushDirty()} 兜底，运行期由下一轮维护重试。
+   */
+  private void flushHandle(RegionKey key, Handle handle) {
+    if (open.get(key) != handle) {
+      return; // 句柄已被关闭/替换：其脏数据由 close() 的全量落盘或重建路径处理
+    }
+    try {
+      if (handle.file.isDirty()) {
+        int written = handle.file.flushDirty(RegionFile.FLUSH_BATCH_RECORDS);
+        if (written > 0 && handle.file.hasDirtySlots()) {
+          // 本批已写满预算且仍有脏记录：把余下部分排到队尾再写，让中间到达的读取先被服务
+          execute(() -> flushHandle(key, handle));
+          return; // 尚未全部落盘：不清零待落盘记账
         }
+      }
+      // 走到这里有三种情形：(a) 没有脏数据；(b) 本批已把能写的都写完；(c) 一条都写不出去（编码失败等，
+      // 脏标记仍在）。(c) 必须保留待落盘记账，否则上限判定会低估，故只在确实没有脏记录时清零。
+      if (!handle.file.hasDirtySlots()) {
         // 无论是否真的写过，此刻内存里的负载都已（随 bucket 整块）落到文件：待落盘记账清零
         handle.clearPending();
-      } catch (Throwable throwable) {
-        if (!handle.file.channelOpen()) {
-          // 通道已永久失效（FileChannel 一旦被线程中断或外部关闭就无法再用）。此时句柄留在表里、
-          // 脏标记还在，旧实现会「每轮维护都抛一次同样的异常」——真机上表现为每 30 秒一条
-          // ClosedChannelException。这里直接丢弃句柄并只提示一次，下次访问自动重建（fail-open）。
-          removeAndClose(entry.getKey(), handle);
-          stats.errors.increment();
-          logger.warning("磁盘缓存区域文件通道已失效，已丢弃句柄（下次访问自动重建）："
-              + handle.file.path() + "（原因：" + throwable + "）");
-          continue;
-        }
-        fail("磁盘缓存落盘失败（该区域文件将在下次维护重试）", throwable);
       }
+    } catch (Throwable throwable) {
+      if (!handle.file.channelOpen()) {
+        // 通道已永久失效（FileChannel 一旦被线程中断或外部关闭就无法再用）。此时句柄留在表里、
+        // 脏标记还在，旧实现会「每轮维护都抛一次同样的异常」——真机上表现为每 30 秒一条
+        // ClosedChannelException。这里直接丢弃句柄并只提示一次，下次访问自动重建（fail-open）。
+        removeAndClose(key, handle);
+        stats.errors.increment();
+        logger.warning("磁盘缓存区域文件通道已失效，已丢弃句柄（下次访问自动重建）："
+            + handle.file.path() + "（原因：" + throwable + "）");
+        return;
+      }
+      fail("磁盘缓存落盘失败（该区域文件将在下次维护重试）", throwable);
     }
   }
 
@@ -706,6 +754,12 @@ public final class DiskCacheStore implements AutoCloseable {
       List<RegionKey> candidates = new ArrayList<>();
       for (Map.Entry<RegionKey, Handle> entry : open.entrySet()) {
         Handle handle = entry.getValue();
+        if (handle.file.isCompacting()) {
+          // 该文件正被压缩线程独占：它的 fileSize/garbageBytes 正在被整体重写，此刻读到的是中间值；
+          // 且它本来也不该再作为本轮压缩候选（压缩会话本就单文件串行）。直接跳过，避免无 happens-before
+          // 的跨线程读（与 closeIdleHandles / evictRegionFilesIfNeeded 同口径）。
+          continue;
+        }
         // 数据区总字节 = 活数据 + 垃圾；据此反推真正的活数据字节。
         // 旧实现把「数据区总字节」当成活数据当分母，等价于判据「垃圾 > 活数据」（阈值 0.5 时），
         // 与常量/注释声明的「垃圾 > 活数据的一半」差了一倍，压缩迟迟不触发。

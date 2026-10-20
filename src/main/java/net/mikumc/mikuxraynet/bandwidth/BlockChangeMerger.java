@@ -26,6 +26,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
@@ -36,6 +37,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
@@ -271,12 +273,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     handler = asynchronousManager.registerAsyncHandler(this);
     handler.start();
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
-    // immediate-radius <= 0 时近身判定恒为 false（见 shouldPassThroughImmediately），快照完全用不到，
-    // 此时不为任何玩家起「每 tick 刷新位置」的任务——否则是纯调度开销。
-    if (config.immediateRadius() > 0) {
-      for (Player player : plugin.getServer().getOnlinePlayers()) {
-        schedulePositionRefresh(player);
-      }
+    // 位置快照任务「始终登记」：它不只服务近身判定，还承载「玩家当前世界」，而跨世界守卫必须靠它
+    // 才能发现「玩家已切维」（见 refreshPosition / isCrossWorld）。immediate-radius=0 时快照只用于
+    // 世界判定：静止玩家的每 tick 开销仅为一次 CHM 读（方块坐标与世界都未变时不发布快照），可忽略。
+    for (Player player : plugin.getServer().getOnlinePlayers()) {
+      schedulePositionRefresh(player);
     }
     plugin.getLogger().fine("带宽模块已启用：方块变更合并（时间窗 " + config.mergeWindowMillis()
         + "ms，邻域半径 " + config.mergeRadius() + "，立即放行半径 " + config.immediateRadius()
@@ -311,9 +312,33 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
   @EventHandler(ignoreCancelled = true)
   public void onJoin(PlayerJoinEvent event) {
-    if (config.immediateRadius() > 0) {
-      schedulePositionRefresh(event.getPlayer());
-    }
+    // 与 start() 一致：位置快照同时承担跨世界检测，必须始终登记（见 start() 的说明）。
+    schedulePositionRefresh(event.getPlayer());
+  }
+
+  /**
+   * 切维丢弃（主路径）：世界已经切换的那一刻，由<b>玩家所属线程</b>同步丢弃旧世界的待发缓冲。
+   *
+   * <p><b>为什么用事件，而不是在冲刷线程里补判世界</b>：合并冲刷跑在普通异步线程
+   * （{@code MikuXrayNet-BlockMerge}）上，Folia 下它读 {@code player.getWorld()} 属于跨区域读实体状态
+   * （会先打 ERROR 再抛），而同一窗口内位置快照本身也是陈旧的（快照由玩家线程每 tick 刷新，切维瞬间
+   * 仍停在旧世界）——冲刷侧没有任何可靠的世界来源可判。{@code PlayerChangedWorldEvent} 在
+   * {@code ServerPlayer#changeDimension} 里、{@code setServerLevel(newLevel)} <b>之后</b>同步触发，
+   * 因此事件到来时玩家世界已是新世界、而缓冲里的坐标必然全部属于旧世界：此刻丢弃既准确又及时，
+   * 把「合并窗口定时器按墙钟触发」那条路径的窗口归零。
+   *
+   * <p>这是三道兜底的<b>主路径</b>：
+   * <ol>
+   *   <li>本事件（零窗口，覆盖传送门 / 跨世界传送等一切经由 {@code changeDimension} 的切维；若某条
+   *       实现路径不触发本事件，下面两道兜底仍然生效，只是窗口退化回「≤1 tick」）；</li>
+   *   <li>{@link #refreshPosition} 的每 tick 快照比对（覆盖「漏接本事件」的实现差异）；</li>
+   *   <li>封包线程的 {@code isCrossWorld} 守卫（覆盖「切维后仍有旧世界旧包到达」）。</li>
+   * </ol>
+   * 命中本事件后，旧世界封包会被第 3 道守卫按「直通 + 丢弃」处理，不会重新入缓冲。
+   */
+  @EventHandler(ignoreCancelled = true)
+  public void onChangedWorld(PlayerChangedWorldEvent event) {
+    discardPending(event.getPlayer().getUniqueId());
   }
 
   @EventHandler(ignoreCancelled = true)
@@ -364,8 +389,14 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     try {
       // 世界名必须与坐标在同一线程（拥有该玩家的线程）读取后一起写进快照：封包线程只读快照，
       // 绝不自己调 player.getWorld()（Folia 上那是跨区域读实体状态）。
-      positions.refresh(playerId, player.getWorld().getName(), player.getX(), player.getY(),
+      String worldName = player.getWorld().getName();
+      String previousWorld = positions.refresh(playerId, worldName, player.getX(), player.getY(),
           player.getZ());
+      // 跨世界切换：立即丢弃旧世界的待发缓冲。只靠封包路径的跨世界守卫会漏掉「切维之后不再有旧世界
+      // 方块包到达」的情形——那种情形下窗口定时器到期仍会把旧世界坐标发进新世界（鬼影方块）。
+      if (previousWorld != null && !previousWorld.equals(worldName)) {
+        discardPending(playerId);
+      }
     } catch (Throwable throwable) {
       positions.discard(playerId);
       noticeSnapshotFailOpen(throwable);
@@ -473,7 +504,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   }
 
   /**
-   * 立即冲刷该玩家的合并缓冲（玩家退出 / 跨世界切换时使用）。
+   * 立即冲刷该玩家的合并缓冲（仅在「玩家退出」时使用）。
    *
    * <p>绝不能像 {@link #flushInternal} 那样内联在本（封包）线程跑：聚簇 + 构包 + 发送会阻塞所有玩家的
    * 出站封包。这里只是把「提前到期」交给唯一的冲刷线程；执行器已关闭（停用中）时退回内联，
@@ -488,6 +519,94 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       flusher.execute(() -> flush(target));
     } catch (Throwable rejected) {
       flush(target);
+    }
+  }
+
+  /**
+   * 丢弃某玩家当前的待发缓冲（没有缓冲时无操作）。三条入口（切维事件 / 位置快照比对 / 封包守卫）
+   * 都只做一行转发，语义完全一致。
+   *
+   * @return 是否确有缓冲被丢弃
+   */
+  boolean discardPending(UUID playerId) {
+    return discardPendingFor(pending, playerId, this::discard);
+  }
+
+  /**
+   * 「按玩家丢弃待发缓冲」的<b>纯逻辑</b>：取出该玩家的缓冲并交给 {@code disposer}。
+   *
+   * <p><b>为什么抽成包级静态方法</b>：离线单测不构造本类（避免初始化 ProtocolLib 的 {@code PacketType}、
+   * 起冲刷线程、伪造 {@code PacketEvent}/{@code AsyncMarker}），只驱动这条路由逻辑——按 uuid <b>精确</b>
+   * 取到该玩家的缓冲、交给丢弃回调、其它玩家不受影响、重复调用幂等。事件处理器只做一行转发，
+   * 因此这里测到的就是切维丢弃的全部判定逻辑。
+   *
+   * <p>签名用泛型而不出现 {@code Pending}：单测可用任意值类型驱动，不必为了测一行路由把私有缓冲类型
+   * 暴露出去；生产调用点传的就是 {@code Pending}。另外本方法<b>没有任何发包入口</b>（不收
+   * ProtocolManager/Player），因此「切维时绝不发送合并包」由签名本身保证。
+   *
+   * @param buffers  待发缓冲表（生产为 {@link #pending}）
+   * @param playerId 玩家
+   * @param disposer 真正的丢弃动作（生产为 {@link #discard(Pending)}）
+   * @return 是否确有缓冲被丢弃
+   */
+  static <B> boolean discardPendingFor(Map<UUID, B> buffers, UUID playerId, Consumer<B> disposer) {
+    if (buffers == null || playerId == null || disposer == null) {
+      return false;
+    }
+    B buffer = buffers.get(playerId);
+    if (buffer == null) {
+      return false;
+    }
+    disposer.accept(buffer);
+    return true;
+  }
+
+  /**
+   * 丢弃某玩家当前缓冲：取消全部被延迟的原包，但<b>不发送任何合并包</b>。
+   *
+   * <p><b>为什么不能用 {@link #flushNow} 冲刷</b>：跨世界切换 / 进入黑名单世界时，缓冲里的方块坐标都
+   * 属于<b>旧世界</b>，而合并包（{@code BLOCK_CHANGE} / {@code MULTI_BLOCK_CHANGE}）不含世界标识。
+   * 这些原包在发送流中的位置本在切维包之前，被扣下后无论怎样重发都只会落在切维包之后——客户端会把
+   * 旧世界坐标按新世界解释（鬼影方块）。玩家离开该世界后区块会整列重建，丢弃这批旧态不构成丢更新。
+   *
+   * <p><b>为什么在调用线程内联执行</b>：它不聚簇、不构包、不发送，只做「取消原包 + 恰好放行一次」，
+   * 没有 {@link #flushInternal} 那种阻塞封包线程的风险；而内联才能保证取消发生在任何定时冲刷之前
+   * （异步投递会重新打开「旧世界数据落在切维包之后」的窗口）。
+   */
+  private void discard(Pending target) {
+    List<Held> held = List.of();
+    ScheduledFuture<?> timer = null;
+    try {
+      synchronized (target) {
+        // 与 flush 共用同一个「恰好处理一次」闸：谁先拿到 flushed 谁负责，另一方成 no-op
+        if (!target.flushed.compareAndSet(false, true)) {
+          return;
+        }
+        pending.remove(target.uuid, target);
+        timer = target.timer;
+        target.timer = null;
+        held = new ArrayList<>(target.held);
+        target.held.clear();
+        target.batch.clear();
+        target.passed.clear();
+      }
+      if (timer != null) {
+        timer.cancel(false);
+      }
+      if (held.isEmpty()) {
+        return;
+      }
+      // 取消 = 丢弃：这些坐标属于玩家已离开的世界，绝不能按新世界下发。release 负责「恰好放行一次」。
+      for (Held entry : held) {
+        entry.event.setCancelled(true);
+      }
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    } finally {
+      // 兜底：任何未放行过的原包都必须放行（release 为一次性，重复调用无副作用）
+      for (Held entry : held) {
+        release(entry);
+      }
     }
   }
 
@@ -549,15 +668,19 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       return;
     }
     if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
+      // 黑名单世界不做任何带宽优化；同时丢弃可能来自「上一个非黑名单世界」的待发缓冲——
+      // 否则窗口到期会把旧世界坐标发进黑名单世界（同样是鬼影方块）。
+      discardPending(player.getUniqueId());
       return;
     }
-    // 跨世界守卫：封包里的方块坐标<b>不含世界标识</b>，若本包属于「玩家已经离开的世界」（合并窗口内
-    // 传送门 / /tp 跨世界），把它照常合并、甚至只入缓冲等窗口到期，都会在客户端按<b>新世界</b>的坐标
+    // 跨世界守卫：封包里的方块坐标<b>不含世界标识</b>。若玩家已经离开该包所属的世界（合并窗口内
+    // 传送门 / /tp 跨世界），把该包照常合并、或只入缓冲等窗口到期，都会在客户端按<b>新世界</b>坐标
     // 解释这些变更 → 新世界对应位置出现「鬼影方块」，直到该区块被重新下发。
-    // 此处改为：本包立即原样放行（客户端此时仍在旧世界，语义正确），并<b>立刻冲刷</b>该玩家在旧世界
-    // 攒下的缓冲，绝不把它们留给新世界。世界名取自玩家所属线程写入的快照，不在封包线程读实体状态。
+    // 因此：本包立即原样放行（它此刻仍在旧世界的发送流里，语义正确），并把该玩家在旧世界攒下的缓冲
+    // <b>整体丢弃</b>（不发送、不重编码）——玩家离开后旧世界区块会整列重建，丢弃不构成丢更新。
+    // 世界名取自玩家所属线程写入的快照，不在封包线程读实体状态。
     if (isCrossWorld(player.getUniqueId(), worldName)) {
-      flushNow(player.getUniqueId());
+      discardPending(player.getUniqueId());
       stats.blockChangesPassed.increment();
       return;
     }
@@ -996,9 +1119,16 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       Update<WrappedBlockData> only = blocks.get(0);
       BlockPosition position = new BlockPosition(only.x(), only.y(), only.z());
       packet = new PacketContainer(PacketType.Play.Server.BLOCK_CHANGE);
+      // writeSafely 的返回值是 StructureModifier（可链式调用），**不是**「是否写成功」——
+      // 访问器映射失效（字段类型/布局变化导致该 modifier 为空）时它同样静默 no-op 而不抛异常。
+      // 因此这里不能用返回值判断，必须回读：位置与方块数据都要读回比对，缺一不可。只校验位置的话，
+      // 合并包会带一个默认/空方块状态发出，而原包已被取消——客户端看到一块被改成空气或错误方块的方块，
+      // 且 verified 会被置 true、此后不再保留原包。多条路径的长度回读能挡住同类问题，单条路径必须自己校验。
       packet.getBlockPositionModifier().writeSafely(0, position);
       packet.getBlockData().writeSafely(0, only.value());
-      if (!position.equals(packet.getBlockPositionModifier().readSafely(0))) {
+      BlockPosition readPosition = packet.getBlockPositionModifier().readSafely(0);
+      if (readPosition == null || !readPosition.equals(position)
+          || packet.getBlockData().readSafely(0) == null) {
         return false;
       }
     } else {

@@ -50,7 +50,12 @@ final class ProximityScanner {
     int chunksSkipped;
     /** 属于其它分片、本周期不看的区块数（下一个周期轮到它们）。 */
     int chunksDeferred;
-    /** 逐坐标评估（距离筛选）的次数，即「每周期候选评估量」。 */
+    /**
+     * 通过距离筛选、真正进入候选选择的坐标数，即「每周期候选评估量」。
+     *
+     * <p>口径只计「距离 ≤ maxDistance」的坐标（半径外扩读到的区块内坐标不计入）：诊断日志据此判断
+     * 「窗口是否被占满 / 扫描量是否异常」，混入半径外坐标会让这个数字系统性偏大。
+     */
     int positionsEvaluated;
   }
 
@@ -137,9 +142,6 @@ final class ProximityScanner {
         int[] locals = entry.locals();
         int minHeight = entry.minHeight();
         for (int local : locals) {
-          if (tally != null) {
-            tally.positionsEvaluated++;
-          }
           int blockX = (chunkX << 4) | (local & 15);
           int blockZ = (chunkZ << 4) | (local >> 4 & 15);
           int blockY = minHeight + (local >> 8);
@@ -147,6 +149,10 @@ final class ProximityScanner {
           long distanceSq = distanceSquared(blockX, blockY, blockZ, x, y, z);
           if (distanceSq > maxDistanceSquared) {
             continue;
+          }
+          if (tally != null) {
+            // 只在通过距离筛选后计数：口径见 Tally#positionsEvaluated 的注释
+            tally.positionsEvaluated++;
           }
           if (revealed.contains(playerId, worldName, chunkX, chunkZ, blockX, blockY, blockZ)) {
             continue;

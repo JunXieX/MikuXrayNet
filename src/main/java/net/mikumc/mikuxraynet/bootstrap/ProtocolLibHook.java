@@ -152,7 +152,12 @@ public final class ProtocolLibHook {
     }
   }
 
-  /** 整体失效改写缓存、邻块快照与显形记录（配置热重载时调用）。 */
+  /**
+   * 整体失效<b>派生缓存</b>（改写缓存 + 邻块快照；配置热重载时调用）。
+   *
+   * <p><b>伪装索引 / 已显形集合刻意保留</b>——见 {@link ProtocolLibAsyncListener#invalidateAll}
+   * 里「为什么绝不能同时清」的说明：热重载不会让客户端重收已加载区块，清掉会让已下发的假矿无法还原。
+   */
   public void invalidateAll() {
     ProtocolLibAsyncListener current = listener;
     if (current != null) {
@@ -182,5 +187,11 @@ public final class ProtocolLibHook {
   public int cacheSize() {
     ProtocolLibAsyncListener current = listener;
     return current == null ? 0 : current.cacheSize();
+  }
+
+  /** 缓存当前占用的近似字节数（诊断用；与 {@code cache.maximum-bytes} 对照即可看出预算是否吃紧）。 */
+  public long cacheBytes() {
+    ProtocolLibAsyncListener current = listener;
+    return current == null ? 0L : current.cacheBytes();
   }
 }

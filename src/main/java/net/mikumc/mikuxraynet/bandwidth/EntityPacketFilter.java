@@ -59,10 +59,16 @@ import org.bukkit.plugin.Plugin;
  *       （{@link #INDEX_REBUILD_TICKS} 周期触发，每次最多 {@link #REBUILD_CHUNK_BUDGET} 个区块）
  *       补齐万一漏接的事件。启动时先做一次不限额的全量建索引，让插件启用前就已存在的实体立即生效。
  *       世界卸载（{@link WorldUnloadEvent}）时整表摘除该世界的外层条目，避免动态世界反复装卸后无界增长。</li>
- *   <li><b>Folia 系</b>：不做索引（无法跨区域安全枚举全服实体，且该平台是否为所有实体触发上述事件
- *       未经核实）。因此白名单在此平台<b>实际不生效</b>：{@code isWhitelisted} 恒为 false，盔甲架 /
- *       展示框等「机制上不移动」的实体的零位移包也会被取消（见 {@code MovePacketFields} 对 onGround
- *       取舍的说明）。这只影响观感保守性、不影响正确性，但在面板上表现为「取消数偏高」属预期。</li>
+ *   <li><b>Folia 系</b>：无法跨区域安全枚举全服实体（也无法确认该平台是否为所有实体触发上述事件），
+ *       因此<b>建不起类型索引</b>。于是分两种情况：
+ *       <ul>
+ *         <li>白名单<b>非空</b>（含默认配置）：本模块在 Folia 上<b>整项不注册</b>——没有索引就无从判断
+ *             「这个零位移包属于盔甲架 / 展示实体」，照常取消会让它们的姿态卡住；
+ *             {@code ThrottlePipeline.plan} 直接判 false，启动日志按平台原因说明，绝不构造自我停用的空壳。</li>
+ *         <li>白名单<b>为空</b>：不需要索引，本模块照常注册（所有实体按「非白名单」处理，语义与 Paper 一致）。</li>
+ *       </ul>
+ *       即：本模块的「白名单」语义<b>仅在 Paper 系生效</b>；Folia 上要么整项关（有白名单），要么无白名单可用。
+ *   </li>
  * </ul>
  */
 public final class EntityPacketFilter extends PacketAdapter implements Listener {
@@ -347,7 +353,17 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     // 世界黑名单：命中世界的玩家不做任何带宽优化（零位移取消一并跳过）。
     // 名单为空（默认）时 isBlacklistedNow 直接早退，热路径近乎零开销。
     // 世界名同时用于「实体类型索引」的世界维度（entityId 按世界各自计数，必须带上世界才能避免撞号）。
-    String worldName = packetPlayer.getWorld().getName();
+    //
+    // 封包线程读 player.getWorld() 属跨线程读取（Folia 上是跨区域读实体状态）：与同包另两个模块
+    // （BlockChangeMerger / AfkTracker）保持同一纪律——取不到世界名就按「不做任何优化」直通，
+    // 绝不让一次读取失败把包扣住、也不让异常逃出封包监听器。
+    String worldName;
+    try {
+      worldName = packetPlayer.getWorld().getName();
+    } catch (Throwable ignored) {
+      pass();
+      return;
+    }
     if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       return;
     }

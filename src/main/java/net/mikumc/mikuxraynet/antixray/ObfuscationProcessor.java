@@ -7,7 +7,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.IntPredicate;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.codec.Chunk;
 import net.mikumc.mikuxraynet.codec.ChunkCodec;
@@ -18,7 +20,6 @@ import net.mikumc.mikuxraynet.occlusion.EmptyOcclusion;
 import net.mikumc.mikuxraynet.occlusion.OcclusionPayload;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
-import net.mikumc.mikuxraynet.occlusion.SectionKey;
 import net.mikumc.mikuxraynet.occlusion.SectionOcclusion;
 import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
 import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
@@ -75,6 +76,11 @@ public final class ObfuscationProcessor {
 
   private static final int SECTION_VOLUME = 4096;
   private static final int[] NO_POSITIONS = new int[0];
+
+  /** 建表失败的一次性中文提示闸门：建表对每个区块都跑，异常一旦成片会刷屏淹没真日志。 */
+  private static final AtomicBoolean CAPTURE_FAILURE_WARNED = new AtomicBoolean();
+  /** 与包内其它类同名的日志通道（本类不持有插件实例，只借同名 logger 输出一次性提示）。 */
+  private static final Logger LOGGER = Logger.getLogger("MikuXrayNet");
 
   /** 调色板选项：压缩收缩 + 自检 + 位宽预算封顶（含单值/低位宽降级）。 */
   public record PaletteOptions(boolean strictVerify, boolean widthBudget) {
@@ -395,33 +401,14 @@ public final class ObfuscationProcessor {
   private final OcclusionStores occlusionStores;
 
   /**
-   * 上一次成功恢复的遮挡负载（<b>按数组引用</b>判等，用于幂等短路）。
+   * 改写统计容器（由封包监听器装配时经 {@link #bindStats} 注入）。
    *
-   * <p><b>为什么需要它</b>：同一区块会被同一批玩家反复命中（每个玩家各发一次区块包），而命中路径
-   * 每次都把整列负载 decode 成约 10 KB 的短命数组、再持 {@code OcclusionStore.writeMutex} 逐段回灌。
-   * 这些写入与上一次逐字节相同，属于纯重复劳动；引用判等是零成本的一步比较，可直接跳过。
-   *
-   * <p><b>为什么只能用数组引用做键</b>：缓存条目的内容会随区块改写而更新（同坐标换新负载），
-   * 用「世界 + 坐标」做键会把新负载误判成「已恢复过」而漏灌。引用相同 ⇒ 同一 CachedChunk 实例
-   * ⇒ 内容必然相同（缓存从不复制该数组），因此引用判等既不会误判也不会漏判。
-   *
-   * <p><b>为什么必须连同「目标仓库」一起记</b>：光比数组引用还不够。区块/世界卸载会调
-   * {@code OcclusionStore#removeColumn}/{@code OcclusionStores#removeWorld} 把整列位图摘掉，
-   * 而改写缓存条目（以及它持有的这个数组）仍在内存里：玩家走远再回来时命中的还是<b>同一个数组</b>，
-   * 只比引用就会跳过回灌，于是该区块「已伪装但无位图」——显形侧按「缺数据 = 遮挡」判定，
-   * 玩家挖到的矿会一直显示假方块。把仓库实例一并记下，并在恢复后校验「该列首个 section 仍在」
-   * 作为存活探针，即可在整列被摘掉后自动重灌一次（见 {@link #restoreOcclusion}）。
-   *
-   * <p><b>为什么允许判错</b>：这只是性能提示，不做精确同步。并发下最坏情况是「另一线程刚恢复了别的
-   * 负载，本线程多恢复一次」——语义仍是幂等的整列覆盖写，正确性不受影响。
+   * <p>{@code null} = 未接线（离线单测），此时计数与限流日志都退化为空操作、不影响任何行为。
+   * <b>为什么要注入</b>：统计容器归封包链路所有（面板读的是那一个实例），而「建表失败」「发布时跳过
+   * 被补丁过的段」这两类事件只发生在处理器内部——不注入的话这两条静默路径在面板上永远看不到。
    */
-  private volatile byte[] lastRestoredOcclusion;
-  /** 与 {@link #lastRestoredOcclusion} 配对的「已灌入的目标仓库」；仅在该引用判等命中时用于存活校验。 */
-  private volatile OcclusionStore lastRestoredStore;
-  /** 上次写入的整列中首个可表示 section 的打包键（整列存活探针）。 */
-  private volatile long lastRestoredProbeKey;
-  /** 该列是否真有可探测的 section（全部越界时为 false，此时不做存活校验，按已恢复处理）。 */
-  private volatile boolean lastRestoredProbeValid;
+  private volatile RewriteStats stats;
+
   /**
    * <b>实体遮挡口径</b>的判定表：只供 {@link #captureOcclusion} 建位图使用。
    *
@@ -661,6 +648,44 @@ public final class ObfuscationProcessor {
     return occlusionStores != null;
   }
 
+  /**
+   * 绑定改写统计容器（由封包监听器在装配时调用一次）。
+   *
+   * <p>未绑定时本类的计数退化为空操作——离线单测与「只做改写、不接封包链路」的场景照常工作。
+   */
+  public void bindStats(RewriteStats stats) {
+    this.stats = stats;
+  }
+
+  /**
+   * 在<b>持包线程</b>上取「该区块整列的遮挡补丁戳快照」，供 worker 建表发布时判断哪些段期间被补丁改过。
+   *
+   * <p><b>为什么必须在持包线程取</b>：快照取得越晚，保护窗口的起点越靠后。若等 worker 解码完再取
+   * （{@code captureOcclusion} 内部当前行为），「封包生成 → 解码」这段（排队 + 区域线程 hop + 解码，
+   * 常态 1~10 ms）里落库的补丁会被快照一并读入，随后发布时被「解码时刻的旧几何」覆盖
+   * （该显示却多藏）。在持包路径取快照后窗口只剩「封包生成 → 持包线程」的亚毫秒级。
+   *
+   * <p>成本：一次 {@code long[sectionCount]} 分配 + sectionCount 次 CHM 读（主世界 24 次），
+   * 只在启用异步遮挡时调用（未启用直接返回 {@code null}，零开销）。
+   *
+   * @return 长度 {@code sectionCount} 的数组；该世界尚无位图表时返回全 0（等价于「没有任何补丁」）；
+   *         未启用遮挡建表或 {@code sectionCount <= 0} 时返回 {@code null}（worker 侧不做戳比较）
+   */
+  public long[] capturePatchStamps(String worldName, int chunkX, int chunkZ, int minSectionY,
+      int sectionCount) {
+    OcclusionStores stores = this.occlusionStores;
+    if (stores == null || sectionCount <= 0) {
+      return null;
+    }
+    OcclusionStore store = stores.lookup(worldName);
+    if (store == null) {
+      // 该世界还没有位图表（尚未捕获过任何区块）→ 不可能有补丁戳；全 0 与「无戳」等价，
+      // 但仍返回等长数组，让发布侧走同一条比较路径（语义更单一）。
+      return new long[sectionCount];
+    }
+    return store.patchStamps(chunkX, minSectionY, chunkZ, sectionCount);
+  }
+
   public boolean isActive() {
     for (WorldProfile profile : dimensionProfiles) {
       if (profile.active()) {
@@ -743,6 +768,19 @@ public final class ObfuscationProcessor {
    */
   public Result rewrite(byte[] source, int sectionCount, long seed, NeighborEdges neighbors,
       String worldName, AntiXrayConfig.Dimension dimension, int worldMinY, int chunkX, int chunkZ) {
+    return rewrite(source, sectionCount, seed, neighbors, worldName, dimension, worldMinY, chunkX,
+        chunkZ, null);
+  }
+
+  /**
+   * 改写一个区块（完整入口 + 持包时刻的补丁戳快照）。
+   *
+   * @param occlusionStamps 持包线程取的整列补丁戳快照（见 {@link #capturePatchStamps}）；
+   *                        {@code null} = 由 worker 在建表前自行取快照（旧行为，窗口更长）
+   */
+  public Result rewrite(byte[] source, int sectionCount, long seed, NeighborEdges neighbors,
+      String worldName, AntiXrayConfig.Dimension dimension, int worldMinY, int chunkX, int chunkZ,
+      long[] occlusionStamps) {
     if (!isActive() || sectionCount <= 0 || source.length == 0) {
       return new Result(source, NO_POSITIONS, null, null, null);
     }
@@ -771,7 +809,7 @@ public final class ObfuscationProcessor {
 
     try {
       // 异步实体遮挡建表（在改写之前，位图反映真实世界几何）：未启用该功能时 occlusionStore 为 null，零开销。
-      occlusion = captureOcclusion(chunk, worldName, chunkX, chunkZ, worldMinY);
+      occlusion = captureOcclusion(chunk, worldName, chunkX, chunkZ, worldMinY, occlusionStamps);
       boolean rangeLimited = profile.minY != Integer.MIN_VALUE || profile.maxY != Integer.MAX_VALUE;
       boolean bandDriven = profile.bandMinY.length > 0;
       // section 级预筛（封包侧判空）：全空气（封包头 blockCount==0）与本段调色板里没有目标方块的
@@ -965,18 +1003,28 @@ public final class ObfuscationProcessor {
    *
    * <p><b>快路径</b>：全空气 section 直接写 {@code null}（同时清掉该段旧条目）；单值调色板段只判一次。
    *
-   * <p><b>失败语义</b>：任何异常都被吞掉——建表失败只意味着少一份遮挡数据（安全方向），
-   * 绝不允许影响反矿透改写本身。
+   * <p><b>失败语义</b>：建表失败只意味着少一份遮挡数据（安全方向），绝不允许影响反矿透改写本身；
+   * 但<b>绝不允许静默</b>：位图缺失会让显形侧按「缺数据 = 遮挡」永久藏住玩家眼前的矿，且失败结果
+   * 不进缓存（每次重发都要重算），因此失败会计入 {@link RewriteStats#occlusionCaptureFailures}
+   * 并打一次限流中文提示。
    */
   private byte[] captureOcclusion(Chunk chunk, String worldName, int chunkX, int chunkZ,
-      int worldMinY) {
+      int worldMinY, long[] packetThreadStamps) {
     OcclusionStores stores = this.occlusionStores;
     if (stores == null) {
       return null;
     }
+    RewriteStats statsRef = this.stats;
     try {
       int minSectionY = worldMinY >> 4;
       int sectionCount = chunk.getSectionCount();
+      OcclusionStore store = stores.of(worldName);
+      // 补丁戳快照优先用「持包线程」取的那份（见 capturePatchStamps）：它的窗口起点最早，
+      // 只覆盖「封包生成 → 持包」的亚毫秒级；缺失或长度不符时才退回本线程现取（旧行为，窗口更长）。
+      // 快照必须在建位图之前确定，否则建表期间落库的补丁会被快照一并读入、发布时被旧几何覆盖。
+      long[] stamps = packetThreadStamps != null && packetThreadStamps.length >= sectionCount
+          ? packetThreadStamps
+          : store.patchStamps(chunkX, minSectionY, chunkZ, sectionCount);
       SectionOcclusion[] column = new SectionOcclusion[sectionCount];
       for (int sectionIndex = 0; sectionIndex < sectionCount; sectionIndex++) {
         ChunkSection section = chunk.getSection(sectionIndex);
@@ -998,21 +1046,41 @@ public final class ObfuscationProcessor {
       // 时把陈旧遮挡位写回活表，方向是「该显示却多藏」）。编码时 column 仍是本线程私有对象，
       // 任何其它线程都碰不到，竞争窗口结构上消失，且零额外开销。
       byte[] payload = OcclusionPayload.encode(column);
-      stores.of(worldName).restoreColumn(chunkX, minSectionY, chunkZ, column);
+      int skipped = store.restoreColumn(chunkX, minSectionY, chunkZ, column, stamps);
+      if (skipped > 0 && statsRef != null) {
+        // 跳过段数持续偏高 = 建表期间方块变更很频繁（补丁被保住，方向安全，但说明发布窗口值得关注）
+        statsRef.occlusionPublishSkipped.add(skipped);
+      }
       // 同时返回编码后的负载：调用方把它随改写结果一并缓存，使缓存命中路径也能恢复遮挡数据
       return payload;
-    } catch (Throwable ignored) {
-      // 建表失败不影响反矿透改写（fail-open）
+    } catch (RuntimeException | LinkageError failure) {
+      // 建表失败不影响反矿透改写（fail-open），但必须留痕（见方法注释的「失败语义」）：
+      // 只吞 RuntimeException 与 LinkageError（类/链接层面的不兼容），不吞 OOM 等真正的 Error。
+      if (statsRef != null) {
+        statsRef.occlusionCaptureFailures.increment();
+      }
+      if (CAPTURE_FAILURE_WARNED.compareAndSet(false, true)) {
+        LOGGER.log(Level.WARNING, "遮挡建表失败（该区块没有位图：显形侧按「缺数据 = 遮挡」判定，"
+            + "玩家挖到的矿可能一直显示假方块；且失败结果不进缓存、每次重发都会重算）。"
+            + "本条只提示一次，此后请以 /mikuxraynet status 的「遮挡建表失败」计数为准", failure);
+      }
       return null;
     }
   }
 
   /**
-   * 从缓存负载恢复整列遮挡数据（<b>缓存命中路径</b>调用）。
+   * 从缓存负载恢复整列遮挡数据（<b>缓存命中路径</b>调用）：<b>只补活表里缺失的段</b>。
    *
    * <p>方案 b 的关键：遮挡位图只在解码时生成，而内存/磁盘缓存命中不会解码 → 若不随负载持久化，
-   * 命中区块就永远没有遮挡数据（实体不再被隐藏）。这里把负载解回整列并写进 {@link OcclusionStores}
-   * 中该世界那一张表。
+   * 命中区块就永远没有遮挡数据（实体不再被隐藏）。这里把负载解回整列，并把活表里缺失的段补进去。
+   *
+   * <p><b>只补缺失、绝不覆盖已有段</b>：
+   * <ul>
+   *   <li>已有段可能已被更晚的方块补丁原地改写过，用旧负载覆盖会把补丁抹掉（该显示却多藏）；</li>
+   *   <li>也不能用「首个 section 存在 ⇒ 整列存在」这种列级探针：补丁只建出单段时会把整列误判为
+   *       已存在，其余段永久缺失（显形侧「缺数据 = 遮挡」→ 该区块的矿永不显形）。</li>
+   * </ul>
+   * 逐段判断既不需要任何快照/探针，也自然解决上面两种失真。
    *
    * <p>任何异常 / 畸形负载 / 未启用该功能都静默跳过（fail-open：拿不到位图 = 不遮挡 = 少藏不多藏）。
    *
@@ -1028,91 +1096,16 @@ public final class ObfuscationProcessor {
     if (stores == null || occlusion == null) {
       return;
     }
-    // 幂等短路：同一份负载被多个玩家命中时，此前每次都重新 decode 整列（约 10 KB 短命数组）并持
-    // OcclusionStore.writeMutex 逐段回灌——完全相同的写入重复 N 次。
-    // 判据用「数组引用相同」而不是「世界+坐标」：同一坐标的负载会随区块改写而更新，
-    // 而引用相同 ⇒ 来自同一个 CachedChunk 实例 ⇒ 内容必然相同（缓存不会复制该数组）。
-    // 只在命中同一引用时跳过；一旦换成新负载（新对象）就照常恢复。
-    //
-    // 但引用判等必须配一道存活校验：区块/世界卸载会把整列位图摘掉，而改写缓存条目连同这个数组
-    // 仍在内存里。此时只比引用就会跳过回灌，该区块从此「已伪装但无位图」——显形侧按「缺数据 =
-    // 遮挡」判定，玩家挖到的矿会一直显示假方块（比多一次 decode 严重得多）。因此额外确认
-    // 「同一仓库、且该列首个 section 仍在表里」；任一不满足都照常重灌一次。
-    if (occlusion == lastRestoredOcclusion && stillRestored(stores, worldName, chunkX, minSectionY,
-        chunkZ)) {
-      return;
-    }
     try {
       SectionOcclusion[] column = OcclusionPayload.decode(occlusion);
       if (column == null) {
         return;
       }
-      OcclusionStore store = stores.of(worldName);
-      store.restoreColumn(chunkX, minSectionY, chunkZ, column);
-      // 记下「这次灌进了哪张表、哪一列」，供下一次引用判等时做存活校验（见上面的说明）。
-      int probeY = probeSectionY(minSectionY, column.length);
-      lastRestoredProbeValid = probeY != NO_PROBE_SECTION_Y;
-      lastRestoredProbeKey = lastRestoredProbeValid
-          ? SectionKey.packSection(chunkX, probeY, chunkZ) : 0L;
-      lastRestoredStore = store;
-      lastRestoredOcclusion = occlusion;
-    } catch (Throwable ignored) {
-      // fail-open：恢复失败只意味着少一份遮挡数据
+      stores.of(worldName).restoreMissingColumn(chunkX, minSectionY, chunkZ, column);
+    } catch (RuntimeException | LinkageError ignored) {
+      // fail-open：恢复失败只意味着少一份遮挡数据。
+      // 只吞 RuntimeException / LinkageError，不吞 OOM 等 Error（与 captureOcclusion 同口径）。
     }
-  }
-
-  /**
-   * 上一次恢复的整列位图是否仍在表里（幂等短路的存活校验）。
-   *
-   * <p>只做一次乐观读查询，不取任何锁：命中即认为整列没被卸载摘掉。判定口径刻意保守——世界名解析
-   * 出的仓库不是同一实例、或首个 section 已查不到，都返回 {@code false}（宁可多灌一次，不可漏灌）。
-   */
-  private boolean stillRestored(OcclusionStores stores, String worldName, int chunkX,
-      int minSectionY, int chunkZ) {
-    if (!lastRestoredProbeValid) {
-      // 该列没有任何可表示的 section（整列越界）：没有探针可查，按「仍在」处理（本来也没写进去）
-      return true;
-    }
-    // 先确认「本次要恢复的就是上次那一列」：同一数组只应属于同一 CachedChunk，但这里不依赖该前提，
-    // 坐标对不上就当作未恢复（多灌一次永远安全，漏灌才会让显形侧永久显示假方块）。
-    long currentProbeKey;
-    try {
-      currentProbeKey = SectionKey.packSection(chunkX,
-          Math.max(minSectionY, SectionKey.SECTION_Y_MIN), chunkZ);
-    } catch (IllegalArgumentException outOfRange) {
-      // 水平坐标超出可表示范围：restoreColumn 本来也会跳过，这里按未恢复处理即可
-      return false;
-    }
-    if (currentProbeKey != lastRestoredProbeKey) {
-      return false;
-    }
-    OcclusionStore store = stores.lookup(worldName);
-    if (store == null || store != lastRestoredStore) {
-      // 世界被卸载后重建（或从未建过表）：新表里不可能有上次那列，必须重灌
-      return false;
-    }
-    return store.section(lastRestoredProbeKey) != null;
-  }
-
-  /** 「该列没有任何可表示 section」的哨兵（越界值，与任何真实 sectionY 都不相等）。 */
-  private static final int NO_PROBE_SECTION_Y = Integer.MIN_VALUE;
-
-  /**
-   * 取「整列首个可表示 section」的序号，作为该列是否仍在表里的探针。
-   *
-   * <p>用首个 section 而不是全部：整列摘除（{@code removeColumn}）与整表清空（{@code clear}）都会把它
-   * 一并抹掉；而方块补丁只改单格、不会删条目，故单段存在即可代表「这次恢复还没被撤销」。
-   *
-   * @return section 序号；整列全部越出 {@code SectionKey} 可表示范围时返回 {@link #NO_PROBE_SECTION_Y}
-   */
-  private static int probeSectionY(int minSectionY, int sectionCount) {
-    for (int i = 0; i < sectionCount; i++) {
-      int sectionY = minSectionY + i;
-      if (sectionY >= SectionKey.SECTION_Y_MIN && sectionY <= SectionKey.SECTION_Y_MAX) {
-        return sectionY;
-      }
-    }
-    return NO_PROBE_SECTION_Y;
   }
 
   /**

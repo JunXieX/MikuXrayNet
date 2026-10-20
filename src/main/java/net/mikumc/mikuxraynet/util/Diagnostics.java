@@ -3,7 +3,9 @@ package net.mikumc.mikuxraynet.util;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -123,16 +125,41 @@ public final class Diagnostics {
      * 应看有效命中率 {@code (cacheHits - cacheContentRejected) / (cacheHits + cacheMisses)}
      * （分母即全部查询次数，因为作废的命中是 {@code cacheHits} 的子集）。
      * 另外 {@code cacheMisses + cacheContentRejected = 磁盘查询次数}，可用来和磁盘缓存一行的分母对账。
+     *
+     * <p>{@code indexSkippedOnWriteBackFailure} 是「写回未确认生效 → 连旧索引登记一起作废」的次数
+     * （{@code writeBackFailures} 的子集）；{@code occlusionCaptureFailures} /
+     * {@code occlusionPublishSkipped} 是遮挡建表的失败与「因期间有方块补丁而跳过覆盖的段数」——
+     * 三者都是此前完全静默、却直接决定「矿能不能被还原」的路径。
      */
-    public record Rewrite(long cacheHits, long cacheMisses, int cacheEntries,
+    public record Rewrite(long cacheHits, long cacheMisses, int cacheEntries, long cacheBytes,
         long cacheContentRejected,
         long chunksRewritten, long blocksReplaced, long chunksSkipped, long chunksFailed,
         long writeBackFailures, long chunksTimedOut, long chunksSkippedQueueFull,
-        long bytesOriginal, long bytesOutput, long bytesSaved, String paletteBitsSummary) {
+        long bytesOriginal, long bytesOutput, long bytesSaved, String paletteBitsSummary,
+        long indexSkippedOnWriteBackFailure, long occlusionCaptureFailures,
+        long occlusionPublishSkipped) {
+
+      /**
+       * 兼容构造（不含三项新增的「静默路径」计数，等价于全 0）。
+       *
+       * <p>保留它是为了不破坏既有调用点与单测：新增字段只在对应异常/竞态实际发生时才非 0，
+       * 其余场景与旧快照逐字段一致。
+       */
+      public Rewrite(long cacheHits, long cacheMisses, int cacheEntries,
+          long cacheContentRejected,
+          long chunksRewritten, long blocksReplaced, long chunksSkipped, long chunksFailed,
+          long writeBackFailures, long chunksTimedOut, long chunksSkippedQueueFull,
+          long bytesOriginal, long bytesOutput, long bytesSaved, String paletteBitsSummary) {
+        this(cacheHits, cacheMisses, cacheEntries, 0L, cacheContentRejected, chunksRewritten,
+            blocksReplaced, chunksSkipped, chunksFailed, writeBackFailures, chunksTimedOut,
+            chunksSkippedQueueFull, bytesOriginal, bytesOutput, bytesSaved, paletteBitsSummary,
+            0L, 0L, 0L);
+      }
 
       /** 反矿透未启用时的零值兜底。 */
       public static final Rewrite EMPTY =
-          new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, "无采样");
+          new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, "无采样",
+              0L, 0L, 0L);
 
       /** 真正用上的命中数（键命中且内容指纹一致）；被 {@code cacheContentRejected} 作废的不计入。 */
       public long effectiveCacheHits() {
@@ -341,8 +368,7 @@ public final class Diagnostics {
     if (!folder.isDirectory() && !folder.mkdirs() && !folder.isDirectory()) {
       throw new IOException("无法创建数据目录：" + folder.getAbsolutePath());
     }
-    File file = newDumpFile(folder, stamp);
-    Files.writeString(file.toPath(), dumpText(stamp), StandardCharsets.UTF_8);
+    File file = writeNewDump(folder, stamp, dumpText(stamp));
     int removed = pruneOldDumps(folder, MAX_DUMP_FILES);
     if (removed > 0) {
       // 只做一次 INFO：清理是正常行为，不需要 WARN 级别的噪音
@@ -356,6 +382,35 @@ public final class Diagnostics {
    *
    * <p>同名已存在时追加 {@code -1}、{@code -2}… 直到不冲突：毫秒戳已基本消除同秒撞名，这里是兜底，
    * 保证任何情况下都<b>不会覆盖</b>已有转储。
+   */
+  /**
+   * 以「独占创建」写出一份新转储：同名已存在就换下一个序号，绝不覆盖已有转储。
+   *
+   * <p><b>为什么不用 {@link #newDumpFile} 的「先查后写」</b>：检查与写入之间存在竞态——同一毫秒内
+   * 并发两次转储（或系统时钟回拨）可能都判定「不冲突」，后写的一方把先写的那份覆盖掉。这里改用
+   * {@code CREATE_NEW} 让文件系统保证独占，撞名只重试下一序号。
+   */
+  private static File writeNewDump(File folder, String stamp, String text) throws IOException {
+    for (int suffix = 0; suffix < 1000; suffix++) {
+      File file = new File(folder,
+          suffix == 0 ? "dump-" + stamp + ".txt" : "dump-" + stamp + "-" + suffix + ".txt");
+      try {
+        Files.writeString(file.toPath(), text, StandardCharsets.UTF_8,
+            StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        return file;
+      } catch (FileAlreadyExistsException collision) {
+        // 同毫秒并发转储撞名：换下一个序号（绝不覆盖已有转储）
+      }
+    }
+    throw new IOException("无法分配唯一的转储文件名：" + stamp);
+  }
+
+  /**
+   * 只算出「本次不该冲突的文件名」，不落盘。
+   *
+   * <p><b>生产路径已不再使用</b>：{@code writeDump()} 改走 {@link #writeNewDump}（{@code CREATE_NEW}
+   * 原子占名）。本方法保留仅供单测验证命名规则与序号回退，不要在新的写盘路径里调用它
+   * （先查后写存在竞态，同毫秒并发会互相覆盖）。
    */
   static File newDumpFile(File folder, String stamp) {
     File file = new File(folder, "dump-" + stamp + ".txt");
@@ -410,13 +465,16 @@ public final class Diagnostics {
     RewriteStats rewriteStats = hook == null ? null : hook.stats();
     Snapshot.Rewrite rewrite = rewriteStats == null ? Snapshot.Rewrite.EMPTY
         : new Snapshot.Rewrite(hook.cacheHits(), hook.cacheMisses(), hook.cacheSize(),
-            rewriteStats.cacheContentRejected.sum(),
+            hook.cacheBytes(), rewriteStats.cacheContentRejected.sum(),
             rewriteStats.chunksRewritten.sum(), rewriteStats.blocksReplaced.sum(),
             rewriteStats.chunksSkipped.sum(), rewriteStats.chunksFailed.sum(),
             rewriteStats.writeBackFailures.sum(), rewriteStats.chunksTimedOut.sum(),
             rewriteStats.chunksSkippedQueueFull.sum(),
             rewriteStats.bytesOriginal.sum(), rewriteStats.bytesOutput.sum(),
-            rewriteStats.bytesSaved.sum(), rewriteStats.paletteBitsSummary());
+            rewriteStats.bytesSaved.sum(), rewriteStats.paletteBitsSummary(),
+            rewriteStats.indexSkippedOnWriteBackFailure.sum(),
+            rewriteStats.occlusionCaptureFailures.sum(),
+            rewriteStats.occlusionPublishSkipped.sum());
     Snapshot.Proximity proximity = proximityStats == null ? Snapshot.Proximity.EMPTY
         : new Snapshot.Proximity(proximityStats.revealsSent.sum(), proximityStats.revealsSkipped.sum(),
             proximityStats.unregistered.sum(), proximityStats.revealsFrustumCulled.sum(),
@@ -471,7 +529,7 @@ public final class Diagnostics {
         rewrite,
         proximity,
         index,
-        occlusionSnapshot(pipeline, occlusionStats),
+        occlusionSnapshot(pipeline, occlusionStats, runtime),
         throttle,
         poolSnapshot,
         diskCacheSnapshot,
@@ -495,24 +553,46 @@ public final class Diagnostics {
   }
 
   /**
-   * 组装遮挡判定域快照：未接线（管线未建 / 引擎未起）时直接复用零值组。
+   * 组装遮挡判定域快照。
    *
-   * <p>{@code active} 取自「引擎已起 + 数据源可用」这一真实接线状态：正常情况下恒为 true，
-   * 为 false 表示引擎启动失败等罕见故障（此时射线遮挡判定整体跳过、仅做视锥剔除），回显如实反映。
+   * <p>{@code active} 取自「引擎已起 + 数据源可用」这一真实接线状态：引擎属于带宽管线，管线未建成时
+   * 必然为 false（此时射线遮挡判定整体跳过、仅做视锥剔除），回显如实反映。
+   *
+   * <p><b>但计数与位图驻留量不能跟着回落 0</b>：{@code OcclusionStats} 与位图表由反矿透侧持有
+   * （插件级唯一实例、跨热重载复用），{@code OcclusionPatchListener} 随反矿透装配，带宽管线装配失败时
+   * 它仍在持续写入。旧实现「pipeline == null 即整组 EMPTY」会把「位图补丁正常工作」显示成
+   * 「未接线、补丁 0 格」，恰好在排查带宽装配失败时给出相反结论，故计数改从反矿透侧兜底取。
    */
   private static Snapshot.Occlusion occlusionSnapshot(ThrottlePipeline pipeline,
-      OcclusionStats stats) {
-    if (pipeline == null || stats == null) {
-      return Snapshot.Occlusion.EMPTY;
+      OcclusionStats pipelineStats, AntiXrayRuntime runtime) {
+    OcclusionStats stats = pipelineStats;
+    if (stats == null && runtime != null) {
+      stats = runtime.occlusionStats();
     }
-    return new Snapshot.Occlusion(pipeline.asyncOcclusionActive(),
-        pipeline.occlusionSectionsResident(), pipeline.occlusionQueueDepth(), stats.submitted.sum(),
+    boolean active = pipeline != null && pipeline.asyncOcclusionActive();
+    int sectionsResident = pipeline != null
+        ? pipeline.occlusionSectionsResident()
+        : (runtime == null ? 0 : runtime.occlusionSectionsResident());
+    int queueDepth = pipeline == null ? 0 : pipeline.occlusionQueueDepth();
+    if (stats == null) {
+      return new Snapshot.Occlusion(active, sectionsResident, queueDepth,
+          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+    }
+    return new Snapshot.Occlusion(active, sectionsResident, queueDepth, stats.submitted.sum(),
         stats.computed.sum(), stats.timeoutDiscarded.sum(), stats.rejectedQueueFull.sum(),
         stats.computeFailures.sum(), stats.unknownSection.sum(), stats.nanosTotal.sum(),
         stats.patched.sum(), stats.patchFailures.sum(), stats.stateIdFallbacks.sum());
   }
 
-  /** 状态面板格式化（纯函数）。 */
+  /**
+   * 状态面板格式化。
+   *
+   * <p><b>并非严格纯函数</b>：文本里有三处读进程级静态状态——①「世界黑名单」一行读活动名单
+   * （{@link WorldBlacklistConfig#current()}），同一份 {@link Snapshot} 在名单发布前后会格式化出不同结果；
+   * ②「带宽开关」一行经 {@code ThrottlePipeline.plan()} 读平台判定（{@link PlatformSupport#isFolia()}）；
+   * ③ 同上，缺 ProtocolLib 的判定读 {@link DependencyGuard}。要让本方法真正纯，需把这些都放进
+   * {@code Snapshot}（会连带改 {@code DiagnosticsTest} 的构造点），故此处只先把描述改准。
+   */
   public static List<String> formatStatus(Snapshot s) {
     List<String> lines = new ArrayList<>();
     lines.add("==== MikuXrayNet 运行状态"
@@ -539,9 +619,26 @@ public final class Diagnostics {
         + "，有效命中率 " + hitRate(s.rewrite().effectiveCacheHits(),
             s.rewrite().cacheMisses() + s.rewrite().cacheContentRejected())
         + "，条目 " + s.rewrite().cacheEntries()
+        // 字节预算是「条目数」之外的第二个上限：不显示占用时，管理员只能看到条目数远没到顶、
+        // 却已经在按字节淘汰（缓存命中率莫名下降），这条给出决定性的对照值。
+        + "，字节 " + bytesHuman(s.rewrite().cacheBytes())
+        // 上限是**启动期固化**的（RewriteCache 只在 startAntiXray 里构造一次），reload 改
+        // cache.maximum-bytes 只改配置不改这里；标注「重启生效」避免管理员被实时配置值误导。
+        + (s.antiXray() == null ? ""
+            : " / 上限 " + bytesHuman(s.antiXray().cacheMaximumBytes()) + "（重启生效）")
         + "，磁盘查询 " + (s.rewrite().cacheMisses() + s.rewrite().cacheContentRejected()));
     lines.add("区块改写：改写 " + s.rewrite().chunksRewritten() + "，替换方块 " + s.rewrite().blocksReplaced()
-        + "，写回失败 " + s.rewrite().writeBackFailures());
+        // 「写回失败」后面跟的括号是它的子集：写回未生效时，旧的伪装索引会被整条作废（否则会一直
+        // 为「客户端根本没收到伪装」的坐标发冗余显形包）。两者口径不同，必须写清归属关系。
+        + "，写回失败 " + s.rewrite().writeBackFailures()
+        + "（其中作废旧索引 " + s.rewrite().indexSkippedOnWriteBackFailure() + "）");
+    // 遮挡建表的两条静默路径必须可见：① 建表失败 → 该区块没有位图，显形侧按「缺数据 = 遮挡」
+    // 永久藏住玩家眼前的矿，且失败结果不进缓存（每次重发重算）；② 发布时跳过 → 说明这期间有方块
+    // 补丁落库、必须保留活位图（正确性要求，但偏高说明建表窗口内变更很频繁）。
+    lines.add("遮挡建表：失败 " + s.rewrite().occlusionCaptureFailures()
+        + " 次（该区块无位图：矿可能一直显示假方块，且每次重发都要重算）"
+        + "，发布跳过 " + s.rewrite().occlusionPublishSkipped()
+        + " 段（期间有方块补丁，保留活位图）");
     // 「未改写」按原始计数器分列，并写明各自的归属关系：chunksSkipped 是「已处理但原包放行」的<b>总量</b>，
     // chunksFailed 是它的子集；而「队列满」与「超时放行」都在各自的提前返回分支里计数、并不计入
     // chunksSkipped。任何用减法（如 跳过 − 异常）去推算「本来就无需改写」的写法都会漏掉这两条路径，
@@ -705,6 +802,27 @@ public final class Diagnostics {
    * 字节口径行（P0-1）：「区块字节：原始 X → 输出 Y（省 Z 字节 / P.P%）」。
    * 无采样（尚无改写区块）与零/负节省（升位或扩容）都有明确的中文表述，避免被误读成统计失效。
    */
+  /**
+   * 人类可读的字节数（诊断用，只求量级可比）：{@code B / KB / MB / GB}，一位到两位小数。
+   *
+   * <p>固定 {@link Locale#ROOT}：状态面板会被写进日志与转储，不能因服务器的默认区域设置
+   * 出现「1234,5 KB」这类小数点随 Locale 变化的输出（与本类其它格式化同一纪律）。
+   */
+  private static String bytesHuman(long bytes) {
+    if (bytes < 1024L) {
+      return bytes + " B";
+    }
+    double kilobytes = bytes / 1024.0D;
+    if (kilobytes < 1024.0D) {
+      return String.format(Locale.ROOT, "%.1f KB", kilobytes);
+    }
+    double megabytes = kilobytes / 1024.0D;
+    if (megabytes < 1024.0D) {
+      return String.format(Locale.ROOT, "%.1f MB", megabytes);
+    }
+    return String.format(Locale.ROOT, "%.2f GB", megabytes / 1024.0D);
+  }
+
   private static String bytesLine(Snapshot.Rewrite rewrite) {
     if (rewrite.bytesOriginal() <= 0L) {
       return "区块字节：无采样（尚无改写区块）";
@@ -726,7 +844,7 @@ public final class Diagnostics {
     if (c == null) {
       return "带宽开关：配置未加载";
     }
-    return "带宽开关：总开关 " + c.enabled()
+    String configured = "带宽开关：总开关 " + c.enabled()
         // 零位移取消必须同时回显「行为开关」：只打模块总开关时，把 skip-zero-movement 配成 false
         // 会显示成「零位移取消 true」，而实际一个包都不会取消（且「放行」计数也不再增长，
         // 因为提前返回不做计数）——正是「看起来在生效但毫无效果」的经典误读场景。
@@ -738,6 +856,52 @@ public final class Diagnostics {
         + "｜实体剔除 " + entityCullingSwitch(c.entityCulling())
         + "｜AFK 降级 " + afkSwitch(c.afk())
         + "｜高延迟降视距 " + c.latency().enabled();
+    // 上面是「配置怎么写」，下面补「实际是否注册」：两者不是一回事——Folia + 非空白名单时零位移取消
+    // 整项不注册，只按配置键回显会把一个永不生效的模块显示成已启用（正是本类注释点名要避免的误读）。
+    // 无差异时不加后缀，避免正常服务器多出一段噪声。
+    ThrottlePipeline.ModulePlan plan = ThrottlePipeline.plan(c);
+    List<String> notRegistered = new ArrayList<>();
+    if (c.entityPackets().enabled() && !plan.entityPackets()) {
+      notRegistered.add("零位移取消");
+    }
+    if (c.blockChanges().enabled() && !plan.blockChanges()) {
+      notRegistered.add("变更合并");
+    }
+    if (c.entityCulling().enabled() && !plan.entityCulling()) {
+      notRegistered.add("实体剔除");
+    }
+    if (c.afk().enabled() && !plan.afk()) {
+      notRegistered.add("AFK 降级");
+    }
+    if (c.latency().enabled() && !plan.latency()) {
+      notRegistered.add("高延迟降视距");
+    }
+    // plan() 只按配置与平台推导，不判依赖可用性：缺 ProtocolLib 时 ThrottlePipeline.startLocked
+    // 的 manager==null 分支会让所有子模块都不注册，此时整行必须以「未接线」收尾，
+    // 否则面板会显示「全部启用」而实际一个模块都没工作。
+    //
+    // 探测本身要兜底：离线单测没有 Bukkit 服务端实例（Bukkit.server == null），
+    // DependencyGuard 内部会读 PluginManager 而抛 NPE——这里按「依赖可用」处理（与
+    // ThrottlePipeline.isFoliaSafe 同一保守方向：探测失败绝不把模块显示成未注册）。
+    if (protocolLibMissing()) {
+      return configured + "｜实际未注册：全部子模块（缺少 ProtocolLib）";
+    }
+    return notRegistered.isEmpty() ? configured
+        : configured + "｜实际未注册：" + String.join("/", notRegistered) + "（原因见启动日志）";
+  }
+
+  /**
+   * ProtocolLib 是否缺失（探测失败按「不缺失」处理，见 {@code bandwidthSwitches} 的说明）。
+   *
+   * <p>只在 command/dump 路径调用，不在热路径上；一次异常不会影响其它诊断字段。
+   */
+  private static boolean protocolLibMissing() {
+    try {
+      return !DependencyGuard.isProtocolLibPresent();
+    } catch (Throwable ignored) {
+      // 离线单测 / 服务端尚未初始化：无法判定时按「存在」处理，避免误报「全部未注册」
+      return false;
+    }
   }
 
   /**
@@ -936,7 +1100,11 @@ public final class Diagnostics {
         .append("，timeout-seconds=").append(c.diskCache().zstdTimeoutSeconds())
         .append("，zstd-sha256=").append(c.diskCache().zstdSha256().isEmpty() ? "未配置（不校验）" : "已配置")
         .append('\n');
+    // 内存改写缓存是「条目数 + 字节数」双上限：只回显条目数时，改大 maximum-bytes 或观察大区块占满
+    // 字节预算都无从判断。字节占用本身需要经封包链路转发（ProtocolLibHook 目前只转发条目数），
+    // 这里先回显两个上限的生效值。
     sb.append("cache.maximum-size=").append(c.cacheMaximumSize())
+        .append("，maximum-bytes=").append(c.cacheMaximumBytes())
         .append("，expire-after-access-seconds=").append(c.cacheExpireAfterAccessSeconds()).append('\n');
     sb.append("advanced.platform=").append(c.platform())
         .append("，threads=").append(c.threads())

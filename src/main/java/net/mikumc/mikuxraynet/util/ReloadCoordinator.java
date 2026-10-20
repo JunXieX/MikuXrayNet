@@ -34,7 +34,13 @@ public final class ReloadCoordinator {
     /** 重新读取全部配置文件（antixray.yml / bandwidth.yml / blacklist.yml）。 */
     void reloadConfiguration();
 
-    /** 使改写缓存、邻块快照与显形索引立即失效。 */
+    /**
+     * 使<b>派生缓存</b>（改写缓存 + 邻块快照）立即失效；<b>伪装索引与已显形集合刻意保留</b>。
+     *
+     * <p><b>为什么保留</b>：热重载不会让客户端重收已加载区块，那些区块在客户端里仍是假矿；清掉索引后
+     * 邻近显形就不知道「哪里是假矿」，玩家挖到也永远无法还原（要等区块走远/重登被重发）。详见
+     * {@code ProtocolLibAsyncListener#invalidateAll} 的说明。
+     */
     void invalidateCaches();
 
     /** 按新配置重建/重启周期任务（邻近显形、AFK、延迟巡检）。 */
@@ -75,7 +81,7 @@ public final class ReloadCoordinator {
    * 被再次启用（例如 {@code /reload confirm}、或其它插件动态启停本插件）。若不复位，重新启用后
    * 所有热重载都会被判定为「插件正在停用」而直接取消——管理员会看到「重载被取消」却找不到原因。
    */
-  public void resetShutdownState() {
+  private void resetShutdownState() {
     shuttingDown = false;
   }
 
@@ -92,7 +98,9 @@ public final class ReloadCoordinator {
    */
   public void runExclusivelyOnEnable(Runnable action) {
     synchronized (reloadLock) {
-      shuttingDown = false;
+      // 复用 resetShutdownState()：复位语义只有一处实现，避免「内联一份 + 另留一个公开方法」
+      // 两份实现日后漂移；本方法仍是唯一的调用点（公开出去会让外部在锁外复位，重新引入这里论证过的竞态）。
+      resetShutdownState();
       action.run();
     }
   }
@@ -111,15 +119,24 @@ public final class ReloadCoordinator {
       "平台判定（advanced.platform，会重新判定并按新分支重建周期任务）",
       // diagnostics.interval-seconds 参与带宽侧指纹，且 restartPeriodicTasks 会重建摘要任务（0 = 关闭）。
       "周期诊断摘要间隔（diagnostics.interval-seconds，0 = 关闭）",
+      // neighbors.enabled 是**单向**热生效的：关闭后下一次区块改写即停止抓取（ProtocolLibAsyncListener
+      // 的 neighborsNeeded 实时读 live().neighbors().enabled()）；但「启动时为 false」时 NeighborChunkProvider
+      // 根本没创建，本进程内改成 true 也不会再抓取——该方向的说明放 RESTART_REQUIRED，避免误报。
+      "邻块快照开关关闭（neighbors.enabled=false 立即停止边界抓取）",
       "全部配置文件的读取值");
 
   /** 需要重启服务端才生效的配置项（在启动期已固化的部分）。 */
   public static final List<String> RESTART_REQUIRED = List.of(
       "隐藏方块表与伪装权重",
       "层状混淆 / 方块实体剔除开关",
-      "邻块快照开关/缺失策略/容量",
+      // 只有「关闭」是热生效的（见 APPLIED）：启动时 neighbors.enabled=false 时提供者为 null，
+      // 本进程内不再抓取；missing-policy 与 cache-maximum-size 在启动期固化进 NeighborChunkProvider。
+      "邻块快照启用 / 缺失策略 / 容量（neighbors.enabled 启动时为 false 则本进程内不再抓取；"
+          + "missing-policy / cache-maximum-size）",
       "反矿透工作线程数与队列容量",
-      "区块改写超时与改写缓存容量/过期",
+      // cache.maximum-bytes 与 cache.maximum-size 同属「启动期固化的改写缓存预算」：RewriteCache
+      // 只在 startAntiXray 里构造一次，reload 不重建它，故字节上限改了也只有重启才生效。
+      "区块改写超时与改写缓存容量/字节上限/过期（cache.maximum-size / cache.maximum-bytes）",
       // 调色板两键在启动期被固化为编码链路的 PaletteOptions（见 AntiXrayRuntime.startAntiXray），
       // reload 只重启显形/带宽任务、不重建编码器，故这两键改了必须重启（含 width-budget / strict-verify）。
       "调色板压缩 / 位宽预算封顶 / 严格自检（palette.width-budget / strict-verify）",
@@ -210,7 +227,9 @@ public final class ReloadCoordinator {
         changes.add("带宽侧（" + bandwidthBefore + " → " + bandwidthAfter + "）");
       }
       lines.add("配置指纹变化：" + String.join("、", changes)
-          + (invalidated ? "，改写缓存与显形索引已失效" : ""));
+          // 只宣告真正失效的东西：伪装索引 / 已显形集合在热重载时是**刻意保留**的（见 invalidateAll）。
+          // 旧文案写「显形索引已失效」与实现相反，会让管理员误以为显形数据被清掉。
+          + (invalidated ? "，改写缓存与邻块快照已失效（伪装索引 / 已显形集合刻意保留）" : ""));
     } else {
       lines.add("两侧配置指纹均未变化（反矿透 " + antiAfter + "，带宽 " + bandwidthAfter + "）"
           + (invalidated ? "，缓存已按安全起见刷新" : ""));

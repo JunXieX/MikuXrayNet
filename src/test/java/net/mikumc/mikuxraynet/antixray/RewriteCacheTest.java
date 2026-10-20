@@ -26,6 +26,12 @@ class RewriteCacheTest {
     return new RewriteCache<>(maximumSize, expireAfterAccessNanos, () -> clock[0]);
   }
 
+  /** 带字节上限的缓存（体积 = value.length()，便于精确断言）。 */
+  private RewriteCache<String> byteCappedCache(long maximumBytes, long expireAfterAccessNanos) {
+    return new RewriteCache<>(1 << 20, maximumBytes, expireAfterAccessNanos, () -> clock[0],
+        value -> value.length());
+  }
+
   @Test
   void putAndGetTrackHitsAndMisses() {
     RewriteCache<String> cache = cache(8, 60 * SECOND_NANOS);
@@ -250,5 +256,98 @@ class RewriteCacheTest {
     for (int v = 0; v < threads * perThread; v++) {
       assertEquals("v" + v, cache.get("world", v, 0, 1), "键 z=" + v);
     }
+  }
+
+  // ---------------------------------------------------------- 字节上限（cache.maximum-bytes）
+
+  /**
+   * 条目数没顶满、但字节预算顶满时必须继续按 CLOCK 顺序淘汰：只按条目数封顶会让默认 40960 条
+   * （每条 30~60 KB）在大服上吃掉 GB 级堆。
+   */
+  @Test
+  void byteBudgetEvictsInClockOrderWhenEntryCountIsNotFull() {
+    // 每条 100 字节，预算 250 字节 ⇒ 至多 2 条；第 3 条入驻时淘汰最久未使用的 1 条
+    RewriteCache<String> cache = new RewriteCache<>(100, 250L, 60 * SECOND_NANOS, () -> clock[0],
+        value -> 100L);
+    cache.put("world", 0, 0, 1, "a");
+    cache.put("world", 1, 0, 1, "b");
+    assertEquals(200L, cache.bytes(), "两条各 100 字节");
+
+    cache.put("world", 2, 0, 1, "c");
+
+    assertEquals(2, cache.rawSize(), "字节预算顶满后必须淘汰到预算内");
+    assertEquals(200L, cache.bytes(), "淘汰后字节账必须与驻留条目一致");
+    assertNull(cache.get("world", 0, 0, 1), "最久未使用的条目先被淘汰");
+    assertEquals("b", cache.get("world", 1, 0, 1));
+    assertEquals("c", cache.get("world", 2, 0, 1));
+  }
+
+  /** 同键覆盖不得新增条目，且字节账要按差值更新（否则预算会被重复累加、提前触发淘汰）。 */
+  @Test
+  void overwriteUpdatesByteAccountingInPlace() {
+    RewriteCache<String> cache = byteCappedCache(1024L, 60 * SECOND_NANOS);
+    cache.put("world", 0, 0, 1, "abc");
+    assertEquals(3L, cache.bytes());
+
+    cache.put("world", 0, 0, 1, "abcdefgh");
+
+    assertEquals(8L, cache.bytes(), "同键覆盖必须按差值更新字节账");
+    assertEquals(1, cache.rawSize(), "同键覆盖不得新增条目");
+    assertEquals("abcdefgh", cache.get("world", 0, 0, 1));
+  }
+
+  /** 单条就超过总预算的条目不应入缓存：否则它一入驻就会自我淘汰，并把之前的条目全部挤掉。 */
+  @Test
+  void oversizedEntryIsNotCached() {
+    RewriteCache<String> cache = byteCappedCache(4L, 60 * SECOND_NANOS);
+    cache.put("world", 0, 0, 1, "12345"); // 5 字节 > 预算 4 字节
+
+    assertNull(cache.get("world", 0, 0, 1), "超过总预算的单条必须直接放弃缓存");
+    assertEquals(0L, cache.bytes());
+    assertEquals(0, cache.rawSize());
+  }
+
+  /** 过期条目被移除时必须同步扣账，否则字节预算会被已释放的条目永久占用。 */
+  @Test
+  void expiredEntryReleasesItsBytes() {
+    RewriteCache<String> cache = new RewriteCache<>(8, 1024L, 10 * SECOND_NANOS, () -> clock[0],
+        value -> 100L);
+    cache.put("world", 0, 0, 1, "a");
+    assertEquals(100L, cache.bytes());
+
+    clock[0] = 11 * SECOND_NANOS;
+    assertNull(cache.get("world", 0, 0, 1), "距上次访问 11 秒已过期");
+
+    assertEquals(0L, cache.bytes(), "过期移除必须同步扣账");
+    assertEquals(0, cache.rawSize());
+  }
+
+  /** 整体失效必须把字节账清零，否则换代后新条目会莫名其妙立刻被淘汰。 */
+  @Test
+  void invalidateAllResetsByteAccounting() {
+    RewriteCache<String> cache = byteCappedCache(1024L, 60 * SECOND_NANOS);
+    cache.put("world", 0, 0, 1, "abcd");
+    cache.put("nether", 0, 0, 1, "efgh");
+    assertEquals(8L, cache.bytes());
+
+    cache.invalidateAll();
+
+    assertEquals(0L, cache.bytes());
+    assertEquals(0, cache.rawSize());
+  }
+
+  /** 按世界失效后字节账必须只剩其它世界的占用（removeIf 不回报被删条目，必须重算）。 */
+  @Test
+  void invalidateWorldRecomputesByteAccounting() {
+    RewriteCache<String> cache = byteCappedCache(1024L, 60 * SECOND_NANOS);
+    cache.put("world", 0, 0, 1, "abc");
+    cache.put("nether", 0, 0, 1, "de");
+    assertEquals(5L, cache.bytes());
+
+    cache.invalidateWorld("world");
+
+    assertEquals(2L, cache.bytes(), "只应剩下其它世界的字节占用");
+    assertNull(cache.get("world", 0, 0, 1));
+    assertEquals("de", cache.get("nether", 0, 0, 1));
   }
 }

@@ -54,7 +54,14 @@ class RegionFileLockTest {
       assertFalse(assertDoesNotThrow(() -> region.put(index, entry(1))),
           "锁被占用时写必须被跳过（返回 false）");
       assertFalse(region.isDirty(), "被跳过的写不得留下脏标记");
-      assertFalse(assertDoesNotThrow(region::flushDirty), "锁被占用时不落盘、不抛异常");
+      // 显式取值再断言：assertDoesNotThrow 同时有 (Executable) 与 (ThrowingSupplier<T>) 两个重载，
+      // 而 flushDirty() 返回 boolean —— 方法引用对「void 函数类型」同样兼容，编译器会判为调用歧义。
+      // 用「带 return 的块 lambda」把返回值固定成唯一可匹配的 ThrowingSupplier<Boolean>
+      // （表达式的语句 lambda 同时是 void 兼容与值兼容，仍会歧义），语义与原意一致：必须返回 false 且不抛异常。
+      boolean flushed = assertDoesNotThrow(() -> {
+        return region.flushDirty();
+      });
+      assertFalse(flushed, "锁被占用时不落盘、不抛异常");
       int dropped = assertDoesNotThrow(() -> region.compact((chunk, value) -> true));
       assertEquals(0, dropped, "锁被占用时压缩回收必须跳过");
       assertEquals(0, region.countEntriesOnDisk(), "锁被占用时不读取对方文件的内容");

@@ -9,6 +9,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.sun.management.ThreadMXBean;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -38,7 +40,7 @@ import org.junit.jupiter.api.Test;
  *   <li>每形态一行：中位耗时、最小/最大、分配量、<b>实际被替换的方块数</b>、<b>实际重编码的 section 数</b>、输出字节；</li>
  *   <li>外推：按每区块中位耗时推算「1000 个区块的流水线 CPU 时间」与「每玩家每秒发送 5 个区块时的单核占用」；</li>
  *   <li>邻块贴边快照（{@link NeighborEdges} 的构造）发生在主线程 / 区域线程，<b>不在 worker 热路径</b>，
- *       因此单独一列测量，不混入每区块耗时；</li>
+ *       因此单独成节；<b>耗时无法离线测量</b>（原因见 4.3），只校验生产实现的逐位等价性；</li>
  *   <li>断言只覆盖「语义正确 + 数值被成功采集」，不断言「谁更快」。</li>
  * </ul>
  */
@@ -58,7 +60,6 @@ class ProductionPathBenchmarkTest {
   private static final int MEASURE_ROUNDS = 60;
   private static final int MIN_MEASURE_ROUNDS = 5;
   private static final long TIME_BUDGET_NANOS = 8_000_000_000L;
-  private static final int SNAPSHOT_ROUNDS = 200;
 
   /** 伪装随机种子：固定值，保证同输入同结果（便于缓存与对拍）。 */
   private static final long SEED = 20240924L;
@@ -72,11 +73,6 @@ class ProductionPathBenchmarkTest {
   /** 一行生产路径测量结果。 */
   private record PipelineRow(String shape, long medianNanos, long minNanos, long maxNanos,
       long allocatedBytes, int replacedBlocks, int reencodedSections, int outputBytes) {
-  }
-
-  /** 邻块快照构造的测量结果。 */
-  private record SnapshotRow(long medianNanos, long minNanos, long maxNanos, long allocatedBytes,
-      int planeBytes) {
   }
 
   @Test
@@ -122,11 +118,11 @@ class ProductionPathBenchmarkTest {
       assertArrayEquals(pristine, shape.bytes(), "生产路径不得改写输入字节（" + shape.name() + "）");
     }
 
-    // 4) 邻块快照单独测量（主线程 / 区域线程侧，不属于 worker 热路径）
-    SnapshotRow snapshot = measureNeighborSnapshot(allocationBean);
+    // 4) 邻块快照：只做「生产实现 vs 独立参照实现」的逐位校验，不做耗时测量（原因见 4.3）
+    int neighborPlaneBytes = verifyNeighborSnapshot();
 
     // 5) 报告：追加为「第 4 节」，并打印到标准输出
-    String section = buildSection(rows, snapshot, rounds, allocationBean != null,
+    String section = buildSection(rows, neighborPlaneBytes, rounds, allocationBean != null,
         System.nanoTime() - startedAt);
     appendReport(section);
     System.out.println(section);
@@ -141,9 +137,9 @@ class ProductionPathBenchmarkTest {
         assertTrue(row.allocatedBytes() > 0, "分配量未成功采集：" + row);
       }
     }
-    assertTrue(snapshot.medianNanos() > 0
-        && snapshot.planeBytes() == 4L * NeighborEdges.planeLongCount(NEIGHBOR_HEIGHT) * 8L,
-        "邻块快照未成功采集：" + snapshot);
+    // 邻块快照的字节口径是确定性的：4 个侧平面 × 位打包长度 × 8 字节/long
+    assertEquals(4L * NeighborEdges.planeLongCount(NEIGHBOR_HEIGHT) * 8L, neighborPlaneBytes,
+        "邻块快照总字节数必须等于 4 平面 × 位打包长度");
   }
 
   /** 用真实配置语义装配处理器：隐藏集合 = 矿，伪装权重 stone:10 / deepslate:8，层状关闭，缺失策略 hide。 */
@@ -308,56 +304,105 @@ class ProductionPathBenchmarkTest {
   }
 
   /**
-   * 单独测量「构造一次 4 邻块贴边快照」的耗时与分配。
+   * 邻块贴边快照：<b>不做耗时测量</b>，只校验生产实现的逐位等价性。
    *
-   * <p>真实抓取由 {@code NeighborChunkProvider#capture} 完成，发生在主线程 / Folia 区域线程，
-   * 并用 {@code world.getBlockData(...).isOccluding()} 读方块——离线不可用（需要 Bukkit 世界）。
-   * 因此这里用<b>纯计算的布尔平面模拟</b>：以确定性的纯函数代替「读方块是否遮挡」与
-   * 「列高度上界查询」，但保持与 {@code capturePlane} 相同的循环形状（4 侧 × 16 列，
-   * 每列只读到该列的模拟上界为止，每侧写出 height×16 bit），并用真实的 {@link NeighborEdges} 承载结果。
-   * 该模拟是真实抓取耗时的下界（不含缓存查找、加载检查与 Bukkit 读块）。
+   * <p><b>为什么耗时不可测</b>：真实抓取走 {@code NeighborChunkProvider#capture}，需要
+   * {@code World#getBlockData(...)} / {@code ChunkSnapshot}（离线没有 Bukkit 世界）。唯一可注入查询的
+   * 纯逻辑入口 {@code capturePlane(int,int,Side,int,int,OcclusionQuery,ColumnTopQuery)} 是包内可见的，
+   * 参数是包内可见的函数式接口；从本包（bench）调用它只能走「反射 + 动态代理」，而代理转发每个查询
+   * 约数十纳秒、一次快照约一万次查询，会彻底盖住生产循环本身（微秒级）——那样量到的是代理开销，
+   * 属于假数据。旧实现因此改为在测试里复刻一份循环，但那同样测不到生产代码。
+   * 所以本节如实标注「耗时不可测」，改用一次反射调用驱动<b>真实</b>生产 {@code capturePlane}，
+   * 与独立参照实现逐位对拍（这才是离线能确定给出的结论）。
+   *
+   * @return 4 个侧平面的总字节数（确定性口径）
    */
-  private static SnapshotRow measureNeighborSnapshot(ThreadMXBean allocationBean) {
-    long threadId = Thread.currentThread().getId();
-    long[] durations = new long[SNAPSHOT_ROUNDS];
-    long[] allocations = new long[SNAPSHOT_ROUNDS];
-    int planeBytes = 0;
-    NeighborEdges last = null;
-
-    for (int i = 0; i < SNAPSHOT_ROUNDS; i++) {
-      long allocatedBefore = allocationBean == null ? 0L : allocationBean.getThreadAllocatedBytes(threadId);
-      long start = System.nanoTime();
-      NeighborEdges edges = buildSnapshot(NEIGHBOR_HEIGHT);
-      durations[i] = System.nanoTime() - start;
-      allocations[i] = allocationBean == null ? 0L
-          : allocationBean.getThreadAllocatedBytes(threadId) - allocatedBefore;
-      planeBytes = NeighborEdges.planeLongCount(edges.height()) << 3;
-      last = edges;
+  private static int verifyNeighborSnapshot() {
+    for (NeighborEdges.Side side : NeighborEdges.Side.values()) {
+      long[] production = productionCapturePlane(NEIGHBOR_HEIGHT, side);
+      long[] reference = referencePlane(NEIGHBOR_HEIGHT, side);
+      assertEquals(NeighborEdges.planeLongCount(NEIGHBOR_HEIGHT), production.length,
+          "生产 capturePlane 的平面长度必须等于 planeLongCount(height)：side=" + side);
+      assertArrayEquals(reference, production,
+          "生产 NeighborChunkProvider#capturePlane 必须与独立参照实现逐位一致：side=" + side);
     }
-
-    assertTrue(last != null && last.height() == NEIGHBOR_HEIGHT && last.has(NeighborEdges.Side.X_PLUS),
-        "邻块快照应构造成功");
-    Arrays.sort(durations);
-    Arrays.sort(allocations);
-    return new SnapshotRow(durations[SNAPSHOT_ROUNDS / 2], durations[0], durations[SNAPSHOT_ROUNDS - 1],
-        allocations[SNAPSHOT_ROUNDS / 2], planeBytes * 4);
+    return 4 * (NeighborEdges.planeLongCount(NEIGHBOR_HEIGHT) << 3);
   }
 
-  /** 构造一次 4 邻块贴边快照（纯计算模拟，见 {@link #measureNeighborSnapshot}）。 */
-  private static NeighborEdges buildSnapshot(int height) {
-    return new NeighborEdges(height,
-        buildPlane(height, NeighborEdges.Side.X_MINUS),
-        buildPlane(height, NeighborEdges.Side.X_PLUS),
-        buildPlane(height, NeighborEdges.Side.Z_MINUS),
-        buildPlane(height, NeighborEdges.Side.Z_PLUS));
+  /** 生产 {@code capturePlane} 的两个包内可见函数式接口（反射 + 动态代理见 {@link #productionCapturePlane}）。 */
+  private static final Class<?> OCCLUSION_QUERY = nestedInterface("OcclusionQuery");
+  private static final Class<?> COLUMN_TOP_QUERY = nestedInterface("ColumnTopQuery");
+  private static final Method CAPTURE_PLANE = capturePlaneMethod();
+
+  private static Class<?> nestedInterface(String simpleName) {
+    try {
+      return Class.forName("net.mikumc.mikuxraynet.antixray.NeighborChunkProvider$" + simpleName);
+    } catch (ClassNotFoundException failure) {
+      throw new ExceptionInInitializerError(
+          "找不到 NeighborChunkProvider." + simpleName + "（生产接口已改名？）" + failure);
+    }
   }
 
-  /** 单个侧面的贴边层：位下标为 {@code y << 4 | localOther}，与 {@code NeighborChunkProvider#capturePlane} 一致。 */
-  private static long[] buildPlane(int height, NeighborEdges.Side side) {
+  private static Method capturePlaneMethod() {
+    try {
+      Method method = Class.forName("net.mikumc.mikuxraynet.antixray.NeighborChunkProvider")
+          .getDeclaredMethod("capturePlane", int.class, int.class, NeighborEdges.Side.class,
+              int.class, int.class, OCCLUSION_QUERY, COLUMN_TOP_QUERY);
+      method.setAccessible(true);
+      return method;
+    } catch (ReflectiveOperationException failure) {
+      throw new ExceptionInInitializerError(
+          "无法定位生产 NeighborChunkProvider#capturePlane（签名已变？）：" + failure);
+    }
+  }
+
+  /** 以「确定性纯函数」为查询源，反射调用真实的生产 {@code capturePlane}（一次调用，开销无关紧要）。 */
+  private static long[] productionCapturePlane(int height, NeighborEdges.Side side) {
+    Object query = Proxy.newProxyInstance(OCCLUSION_QUERY.getClassLoader(),
+        new Class<?>[] {OCCLUSION_QUERY}, (proxy, method, args) -> {
+          if (!"isOccluding".equals(method.getName())) {
+            throw new UnsupportedOperationException(method.getName());
+          }
+          return simulatedOccludingAt((Integer) args[0], (Integer) args[1], (Integer) args[2]);
+        });
+    Object columnTop = Proxy.newProxyInstance(COLUMN_TOP_QUERY.getClassLoader(),
+        new Class<?>[] {COLUMN_TOP_QUERY}, (proxy, method, args) -> {
+          if (!"topNonAirY".equals(method.getName())) {
+            throw new UnsupportedOperationException(method.getName());
+          }
+          return simulatedColumnTopAt((Integer) args[0], (Integer) args[1]);
+        });
+    try {
+      return (long[]) CAPTURE_PLANE.invoke(null, 0, height, side, 0, 0, query, columnTop);
+    } catch (ReflectiveOperationException failure) {
+      Throwable cause = failure.getCause() == null ? failure : failure.getCause();
+      throw new AssertionError("调用生产 NeighborChunkProvider#capturePlane 失败：" + cause, cause);
+    }
+  }
+
+  /**
+   * 独立参照实现：与 {@code capturePlane} 同语义（坐标换算 + 列上界裁剪 + 位打包）。
+   *
+   * <p>坐标换算取自生产契约（{@code worldPosition}）：X_PLUS 读邻块 localX=0、X_MINUS 读 localX=15、
+   * Z_PLUS 读 localZ=0、Z_MINUS 读 localZ=15；基准里请求方区块固定为 (0,0)。
+   */
+  private static long[] referencePlane(int height, NeighborEdges.Side side) {
     long[] plane = new long[NeighborEdges.planeLongCount(height)];
     for (int local = 0; local < 16; local++) {
-      for (int y = 0; y <= simulatedColumnTop(height, side, local); y++) {
-        if (simulatedOccluding(side, local, y)) {
+      int worldX = switch (side) {
+        case X_MINUS -> -16 + 15;
+        case X_PLUS -> 16;
+        default -> local;
+      };
+      int worldZ = switch (side) {
+        case Z_MINUS -> -16 + 15;
+        case Z_PLUS -> 16;
+        default -> local;
+      };
+      int top = simulatedColumnTopAt(worldX, worldZ);
+      top = top >= height - 1 ? height - 1 : Math.max(top, -1);
+      for (int y = 0; y <= top; y++) {
+        if (simulatedOccludingAt(worldX, y, worldZ)) {
           NeighborEdges.setOccluding(plane, y << 4 | local);
         }
       }
@@ -365,17 +410,16 @@ class ProductionPathBenchmarkTest {
     return plane;
   }
 
-  /**
-   * 代替 {@code World#getHighestBlockYAt(...)} 的确定性「列高度上界」模拟：地表放在世界高度的 2/5 处
-   * （模拟主世界「只有下半部分有方块」），逐列略起伏；与真实抓取一样，上界之上一位都不读。
-   */
-  private static int simulatedColumnTop(int height, NeighborEdges.Side side, int local) {
-    return Math.min(height - 1, height * 2 / 5 + local % 3 + side.ordinal());
+  /** 代替 {@code World#getHighestBlockYAt(...)} / 快照高度图的确定性列上界（世界坐标）。 */
+  private static int simulatedColumnTopAt(int x, int z) {
+    int mixed = x * 31 + z * 17;
+    mixed ^= mixed >>> 13;
+    return Math.max(0, (NEIGHBOR_HEIGHT * 2) / 5 + (mixed & 3));
   }
 
   /** 代替 {@code world.getBlockData(...).isOccluding()} 的确定性纯计算谓词（约 7/8 遮挡）。 */
-  private static boolean simulatedOccluding(NeighborEdges.Side side, int local, int y) {
-    int mixed = y * 31 + local * 17 + side.ordinal() * 7;
+  private static boolean simulatedOccludingAt(int x, int y, int z) {
+    int mixed = y * 31 + x * 17 + z * 7;
     mixed ^= mixed >>> 13;
     return (mixed & 7) != 0;
   }
@@ -408,7 +452,7 @@ class ProductionPathBenchmarkTest {
     Files.writeString(REPORT_PATH, base + section, StandardCharsets.UTF_8);
   }
 
-  private static String buildSection(List<PipelineRow> rows, SnapshotRow snapshot, int rounds,
+  private static String buildSection(List<PipelineRow> rows, int neighborPlaneBytes, int rounds,
       boolean allocationsSupported, long elapsedNanos) {
     StringBuilder report = new StringBuilder();
 
@@ -466,21 +510,19 @@ class ProductionPathBenchmarkTest {
     report.append("\n> 「每玩家每秒 5 区块」按 `5 × 每区块耗时 ÷ 1 秒` 折算为单核占用百分比"
         + "（单一玩家、不叠加多玩家；仅描述该流水线本身占用，不含网络与压缩）。\n");
 
-    report.append("\n### 4.3 邻块贴边快照（单独测量，不计入每区块热路径）\n\n");
-    report.append("- 抓取发生在主线程 / Folia 区域线程，**不在** worker 热路径，故单独成列\n");
-    report.append("- 真实抓取读 Bukkit 世界（离线不可用），这里用**纯计算的布尔平面模拟**："
-        + "以确定性纯函数代替 `world.getBlockData(...).isOccluding()` 与列高度上界查询，"
-        + "循环形状与 `NeighborChunkProvider#capturePlane` 一致（4 侧 × 16 列，每列读到该列模拟上界为止，"
-        + "每侧写出 height×16 bit），结果用真实 `NeighborEdges` 承载；"
-        + "是真实耗时的**下界**（不含缓存查找、加载检查与 Bukkit 读块）\n");
+    report.append("\n### 4.3 邻块贴边快照（耗时**不可测**，只做生产实现的逐位校验）\n\n");
+    report.append("- 抓取发生在主线程 / Folia 区域线程，**不在** worker 热路径\n");
+    report.append("- **不可测原因**：真实抓取 `NeighborChunkProvider#capture` 需要 Bukkit 世界"
+        + "（`World#getBlockData` / `ChunkSnapshot`），离线不可用；唯一可注入查询的纯逻辑入口"
+        + " `capturePlane(...)` 是包内可见、参数是包内可见函数式接口，从 bench 包只能用"
+        + "「反射 + 动态代理」调用，而代理转发开销（约 1 万次/快照 × 数十纳秒）会远超生产循环本身，"
+        + "量出来的是代理开销而不是生产实现\n");
+    report.append("- 因此**不给出耗时/分配数字**（宁可不测，也不留假数据）；改为用一次反射调用驱动真实生产"
+        + " `capturePlane`，与独立参照实现逐位对拍：4 侧 × 16 列、位下标 `y<<4|localOther` 全部一致\n");
     report.append("| 指标 | 值 |\n| --- | --- |\n");
-    report.append("| 构造一次 4 邻块快照中位耗时(ms) | ").append(millis(snapshot.medianNanos())).append(" |\n");
-    report.append("| 最小/最大(ms) | ").append(millis(snapshot.minNanos())).append(" / ")
-        .append(millis(snapshot.maxNanos())).append(" |\n");
-    report.append("| 分配(KB) | ").append(String.format(Locale.ROOT, "%.1f", snapshot.allocatedBytes() / 1024.0))
-        .append(" |\n");
+    report.append("| 生产 capturePlane 逐位校验 | 4 / 4 侧通过 |\n");
     report.append("| 快照总字节（4 平面，height=").append(NEIGHBOR_HEIGHT).append("） | ")
-        .append(snapshot.planeBytes()).append(" |\n");
+        .append(neighborPlaneBytes).append(" |\n");
     report.append("> 该快照每区块只抓取一次并缓存；世界卸载时整体失效。\n");
 
     report.append("\n### 4.4 「全实心 section 快路径」对照\n\n");

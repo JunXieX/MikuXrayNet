@@ -152,6 +152,49 @@ class OcclusionCaptureTest {
     }
   }
 
+  /**
+   * P1 回归（保护窗口提前到持包时刻）：快照在「封包到达」时取（此时窗口内的补丁还没落库），
+   * 之后落库的方块补丁必须在建表发布时被保住——发布用持包时刻的快照比较并跳过该段覆盖。
+   *
+   * <p>若仍由 worker 解码后自行取快照（旧行为），这次补丁的戳会被快照一并读入 → 发布覆盖 → 补丁丢失。
+   */
+  @Test
+  void patchAfterPacketThreadSnapshotSurvivesCapturePublish() {
+    OcclusionStores stores = new OcclusionStores();
+    ObfuscationProcessor processor = processor(stores);
+    // 前置：该段已有活数据（模拟「该区块此前已下发过」），并已挖开一格
+    OcclusionStore store = stores.of("world");
+    store.replaceSection(5, 0, 6, SolidOcclusion.INSTANCE);
+    store.setBlockOccluding((5 << 4) + 1, 2, (6 << 4) + 3, false);
+
+    // 持包时刻：取整列补丁戳快照（此刻还没有下面那次补丁）
+    long[] stamps = processor.capturePatchStamps("world", 5, 6, 0, 1);
+    assertNotNull(stamps, "启用遮挡建表时必须能取到快照");
+    // 快照之后、worker 发布之前：又落一次补丁（模拟 [持包, 发布] 窗口内的方块变更）
+    store.setBlockOccluding((5 << 4) + 4, 5, (6 << 4) + 6, false);
+
+    ObfuscationProcessor.Result result = processor.rewrite(singleValue(STONE, 4096), 1, 42L, null,
+        "world", net.mikumc.mikuxraynet.config.AntiXrayConfig.Dimension.NORMAL, 0, 5, 6, stamps);
+
+    assertFalse(result.failed(), "建表路径不得让改写失败：" + result.failure());
+    assertNotNull(result.occlusion(), "启用建表时结果必须携带遮挡负载");
+    SectionOcclusion live = stores.of("world").section(5, 0, 6);
+    assertNotNull(live, "跳过覆盖后必须保留活位图");
+    assertFalse(live.isOccludingLocal(4, 5, 6), "快照之后落库的补丁不得被发布覆盖（该显示却多藏）");
+    assertFalse(live.isOccludingLocal(1, 2, 3), "快照之前落库的补丁同样必须保留");
+  }
+
+  /** 外部快照为空（未启用建表 / 长度不符）时退回内部取快照，行为与旧路径一致。 */
+  @Test
+  void nullExternalStampsFallBackToWorkerSideSnapshot() {
+    OcclusionStores stores = new OcclusionStores();
+    ObfuscationProcessor processor = processor(stores);
+    ObfuscationProcessor.Result result = processor.rewrite(singleValue(STONE, 4096), 1, 42L, null,
+        "world", net.mikumc.mikuxraynet.config.AntiXrayConfig.Dimension.NORMAL, 0, 5, 6, null);
+    assertFalse(result.failed());
+    assertSame(SolidOcclusion.INSTANCE, stores.of("world").section(5, 0, 6));
+  }
+
   @Test
   void restoringMalformedPayloadIsFailOpen() {
     OcclusionStores stores = new OcclusionStores();

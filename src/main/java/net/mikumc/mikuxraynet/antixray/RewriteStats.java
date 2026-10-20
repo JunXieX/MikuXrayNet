@@ -78,6 +78,25 @@ public final class RewriteStats {
   public final LongAdder diskPayloadRejected = new LongAdder();
 
   /**
+   * 遮挡建表（{@code captureOcclusion}）失败次数：该区块的遮挡位图没有生成出来。
+   *
+   * <p><b>为什么必须单列</b>：位图缺失时显形侧按「缺数据 = 遮挡」判定，玩家挖到的矿会一直显示假方块；
+   * 同时失败结果不允许进缓存（见 {@code resultCacheable}），于是该区块每次重发都要重算一遍完整改写。
+   * 这条链路此前完全静默——计数持续增长即说明建表遇到异常输入（注册表/负载编码不匹配等），
+   * 必须能从面板与日志看出来，否则只能看到「玩家说矿挖不掉」而无从归因。
+   */
+  public final LongAdder occlusionCaptureFailures = new LongAdder();
+
+  /**
+   * 整列位图发布时因「该 section 期间被方块补丁写过」而跳过覆盖的段数。
+   *
+   * <p><b>为什么需要它</b>：建表用的是解码时刻的几何，而方块补丁会把更新后的状态写进活表；
+   * 若无条件覆盖，落在「解码 → 发布」窗口内的补丁会被吞掉（该显示却多藏）。跳过的段保留含补丁的活位图，
+   * 是正确性要求，但持续偏高说明建表期间变更很频繁，可据此评估建表耗时/发布窗口是否值得优化。
+   */
+  public final LongAdder occlusionPublishSkipped = new LongAdder();
+
+  /**
    * 累计被替换（伪装）的方块个数——即「实际匹配到目标矿并完成替换」的方块总数。
    *
    * <p><b>为什么必须有这个计数器</b>：原先只有「区块数」维度的计数（改写/跳过），

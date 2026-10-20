@@ -65,6 +65,26 @@ public class Chunk implements AutoCloseable {
 
       this.trailingOffset = this.inputBuffer.readerIndex();
       this.trailingLength = this.inputBuffer.readableBytes();
+
+      // 1.18+（每个 section 尾部内联自己的生物群系容器）的区块数据数组由「恰好若干个 section」组成：
+      // 段与段之间没有填充、末尾也没有独立段，故解析完最后一个 section 必须正好把字节用完。
+      // 若仍有剩余字节，说明本次布局与 codec 的假设不符（版本漂移 / 第三方改写），而此前每个 section
+      // 都已按错误边界解析过——此时绝不能把剩余字节当「尾部原样搬运」拼回去：那会产出一份既非原字节、
+      // 也非合法布局的区块字节，而且全程不抛异常（chunksFailed 恒为 0、日志无异常、玩家侧只是画面异常），
+      // 正是本 codec 反复强调的「最不可观测的失效模式」（同 §Chunk#skipBiomePalettedContainer 的拒绝理由）。
+      // 故与 blockCount / bitsPerBlock / 调色板重复值等其它非法编码同口径：显式拒绝，交由上层 fail-open
+      // （放行原包、不改写）。1.18 之前的格式（群系段位于所有 section 之后）允许尾部字节，按标志位区分。
+      //
+      // 【行为变化】该闸门触发时本区块走 fail-open：原包字节原样下发、不再尝试重编码，并由上层
+      // ObfuscationProcessor.rewrite 的 catch (RuntimeException) 计入 chunksFailed。也就是说「布局漂移」
+      // 的代价从旧实现的「重编码出一份既非原字节也非合法布局的字节」变成「该区块不做改写、且可观测」——
+      // 方向是安全的一侧（玩家最多看到原包，不会被错位字节搞坏画面）。校验口径已离线复核：真实负载
+      // real-chunk-payload.bin 在 24 节时恰好消费完（trailing==0），TestChunkBuilder 生成的合成夹具同理，
+      // 因此正常负载不会被这道闸门误伤。
+      if (codec.versionFlags().hasBiomePalettedContainer() && this.trailingLength != 0) {
+        throw new IllegalArgumentException("区块数据未被 section 恰好消费完（剩余 "
+            + trailingLength + " 字节）：疑似区块布局漂移，放弃改写");
+      }
     } catch (RuntimeException | Error throwable) {
       // 构造中途失败（典型：损坏区块在 read/skip 时抛 IndexOutOfBoundsException）：对象不会交付给调用方，
       // close() 永远不会被调到，因此必须在此自行收尾——否则连续损坏区块会把按线程复用的空闲池打空

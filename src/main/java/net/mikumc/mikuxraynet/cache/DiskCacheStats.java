@@ -37,12 +37,17 @@ public final class DiskCacheStats {
   public final LongAdder rejectedBySize = new LongAdder();
 
   /**
-   * 因磁盘线程积压（{@code pendingOps >= queue-capacity}）而被拒绝的读写次数。
+   * 因磁盘线程积压（{@code pendingOps >= queue-capacity}）而被拒绝的工作次数。
    *
    * <p><b>为什么要单列</b>：此前该路径静默返回（既不计数也不记日志），表现为「缓存命中率莫名偏低」
    * 却无从归因。本计数直接指出「磁盘线程跟不上」：若它持续增长，说明压缩/落盘已成为瓶颈，
    * 应调大 {@code disk-cache.maintenance-interval-seconds} 之外的预算（如缩小 max-entries、
    * 减少单文件条目数）或降低区块改写吞吐。
+   *
+   * <p><b>口径</b>：除被拒绝的读取与写入外，<b>分批落盘的续排被拒</b>也计入本字段——
+   * {@code DiskCacheStore#flushHandle} 把本批未写完的脏记录重新入队时，若队列已满则放弃本次续排
+   * （脏标记保留、下一轮维护重试）。两者都表示「磁盘线程队列已满、这一次工作被跳过」，
+   * 因此读日志时不要把本计数只理解为「读请求被拒」。
    */
   public final LongAdder rejectedByBacklog = new LongAdder();
 

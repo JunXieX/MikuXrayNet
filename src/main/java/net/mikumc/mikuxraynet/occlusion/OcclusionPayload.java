@@ -71,7 +71,12 @@ public final class OcclusionPayload {
     return out;
   }
 
-  /** {@link #encode} 的输出长度（供上层做容量预判，避免被拒时白编码）。 */
+  /**
+   * {@link #encode} 的输出长度（纯计算，不分配输出数组）。
+   *
+   * <p>当前无生产调用者：打包成磁盘负载时上层用的是 {@code cache.DiskPayload#encodedLength}
+   * （它要连同被伪装坐标与区块字节一起算）。本方法保留给单测与将来的容量预判。
+   */
   public static int encodedLength(SectionOcclusion[] column) {
     checkColumnLength(column);
     int bitmapCount = 0;

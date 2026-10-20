@@ -302,13 +302,17 @@ public final class BlockStateRegistry implements RegistryAccessor {
    * 多状态方块（箱子 24 态、楼梯、含水方块等）只会藏住默认态，其余状态照旧下发给客户端。
    *
    * <p>名称容忍 {@code namespace:} 前缀与大小写差异，归一化口径与 {@link OcclusionRules#normalize} 一致。
+   *
+   * <p><b>返回的是副本</b>：内部表是启动期构建一次、全生命周期共享的只读结构，若把内部数组直接交出去，
+   * 调用方一次就地排序/去重/截断就会永久污染后续所有 {@code hide-blocks} 解析（且没有任何防御）。
+   * 本方法只在启动期按「配置里的方块种数」调用，复制开销可忽略。
    */
   public int[] allStateIds(String name) {
     if (name == null || name.isBlank()) {
       return EMPTY_IDS;
     }
     int[] ids = stateIdsByBlock.get(OcclusionRules.normalize(name));
-    return ids == null ? EMPTY_IDS : ids;
+    return ids == null ? EMPTY_IDS : ids.clone();
   }
 
   @Override

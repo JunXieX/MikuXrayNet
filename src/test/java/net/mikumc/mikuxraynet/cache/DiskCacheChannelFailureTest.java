@@ -4,12 +4,16 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import org.junit.jupiter.api.Test;
@@ -124,23 +128,61 @@ class DiskCacheChannelFailureTest {
   /**
    * 读取超时<b>不得打断磁盘线程</b>：一旦打断，FileChannel 会永久关闭，
    * 此后每次落盘都抛 {@code ClosedChannelException}（真机根因的第一步）。
+   *
+   * <p><b>确定性编排（不依赖 CI 机器快慢）</b>：先用 latch 占住唯一的磁盘线程，再以 1ms 读预算发起读取——
+   * 任务必然排在预算之外 ⇒ 必然超时，被守护的 {@code TimeoutException → cancel(false)} 路径一定被执行。
+   * 旧写法（先灌 32 个 put 再连读）在快机器上可能一次都不超时，等于什么都没测。
+   *
+   * <p>三条断言：① 超时确实发生（errors 按次递增）；② 磁盘线程未被中断（通道仍打开、句柄未被丢弃、
+   * 随后的落盘不产生任何新错误）；③ 释放线程后落盘正常收尾。
    */
   @Test
   void readTimeoutDoesNotInterruptTheDiskThread(@TempDir Path dir) throws Exception {
-    // 读取预算 1ms：写入队列压满时必然超时。
-    // 但 flush 预算必须给足——本用例要先确认「句柄已建立」，而 put 与 flush 共用同一条磁盘线程队列：
-    // 若 flush 也只等 1ms，它会在 32 个 put 尚未执行时就超时返回，于是下面取不到任何已打开句柄而偶发失败
-    // （CI 上曾复现：断言 open 非空失败）。给足 flush 预算后，flush 会等到全部 put 跑完，断言才有确定性。
     try (DiskCacheStore store = new DiskCacheStore(dir, config(600), LOGGER, 1L, 10_000L)) {
-      for (int chunkX = 0; chunkX < 32; chunkX++) {
-        store.put(WORLD, chunkX, 0, 1, payload(64 * 1024, chunkX));
-      }
-      for (int chunkX = 0; chunkX < 32; chunkX++) {
-        store.get(WORLD, chunkX, 0, 1); // 大量 1ms 超时（旧实现每次都 cancel(true)）
-      }
+      byte[] data = payload(64 * 1024, 1);
+      store.put(WORLD, 0, 0, 1, data);
+      // flush 预算 10s：等到 put 真正落盘、句柄建立（否则下面取不到句柄）
       store.flush();
-      assertTrue(firstOpenRegionFile(store).channelOpen(),
+      RegionFile region = firstOpenRegionFile(store);
+      long errorsBefore = store.stats().errors.sum();
+
+      // 占住唯一的磁盘线程（直接投给执行器，不经过 pendingOps 记账），使后续读必然超时
+      CountDownLatch blocked = new CountDownLatch(1);
+      CountDownLatch release = new CountDownLatch(1);
+      diskThreadExecutor(store).execute(() -> {
+        blocked.countDown();
+        try {
+          release.await();
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+        }
+      });
+      assertTrue(blocked.await(5, TimeUnit.SECONDS), "占位任务必须已在磁盘线程上开始执行");
+
+      int attempts = 8;
+      try {
+        for (int attempt = 0; attempt < attempts; attempt++) {
+          assertNull(store.get(WORLD, 0, 0, 1), "排队超过 1ms 预算的读取必须按未命中降级（fail-open）");
+        }
+      } finally {
+        release.countDown();
+      }
+
+      assertEquals(errorsBefore + attempts, store.stats().errors.sum(),
+          "每次读超时都必须被计数；计数没涨说明本用例根本没走到被守护的超时路径（旧写法在快机器上就是如此）");
+      assertEquals(1, store.openRegionFiles(), "超时不得导致句柄被丢弃（那是通道真的坏掉的表现）");
+      store.flush();
+      assertEquals(errorsBefore + attempts, store.stats().errors.sum(),
+          "磁盘线程恢复后的落盘不得再产生任何错误：说明通道没有被超时打断");
+      assertTrue(region.channelOpen(),
           "读超时不得打断磁盘线程：FileChannel 被中断即永久关闭，之后每次落盘都会失败");
     }
+  }
+
+  /** 反射取磁盘线程的执行器：用于占住它，让读超时确定性发生（不依赖 CI 磁盘速度）。 */
+  private static ScheduledExecutorService diskThreadExecutor(DiskCacheStore store) throws Exception {
+    Field field = DiskCacheStore.class.getDeclaredField("executor");
+    field.setAccessible(true);
+    return (ScheduledExecutorService) field.get(store);
   }
 }

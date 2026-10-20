@@ -180,6 +180,68 @@ class OcclusionPatchListenerTest {
         "状态 id 拿不到时交回 UNRESOLVED，由调用方回落 Material 级（并计入「状态id回落」计数）");
   }
 
+  // ---------------------------------------------------------- 按接收者去重（同一 NMS 包广播）
+
+  /**
+   * 服务端对一个方块变更只构造<b>一个</b> NMS 包实例、对每个追踪玩家各发一次；监听器按发送事件回调，
+   * 因此必须按「包实例身份 + 世界名」去重，否则同一份坐标会被解析并写位图 N 次（N = 视野内玩家数）。
+   */
+  @Test
+  void recentPacketWindowDeduplicatesSamePacketInstancePerWorld() {
+    OcclusionPatchListener.RecentPackets window = new OcclusionPatchListener.RecentPackets();
+    Object packet = new Object();
+
+    assertFalse(window.contains(packet, "world"), "未登记时不得跳过");
+    window.record(packet, "world");
+    assertTrue(window.contains(packet, "world"), "同一实例 + 同一世界：后续接收者必须跳过");
+    assertFalse(window.contains(packet, "nether"), "同一实例被不同世界复用时必须分别应用（键含世界名）");
+    assertFalse(window.contains(new Object(), "world"), "不同实例（不同的方块变更）不得被跳过");
+    assertFalse(window.contains(null, "world"), "拿不到实例身份时按未见过处理（宁可重复应用，不得漏补丁）");
+  }
+
+  /** 窗口有界：被挤出的旧实例会被当成新包重新应用（幂等，只是多一次写入，绝不会漏补丁）。 */
+  @Test
+  void recentPacketWindowIsBounded() {
+    OcclusionPatchListener.RecentPackets window = new OcclusionPatchListener.RecentPackets();
+    Object first = new Object();
+    window.record(first, "world");
+    for (int i = 0; i < OcclusionPatchListener.RecentPackets.CAPACITY; i++) {
+      window.record(new Object(), "world");
+    }
+    assertFalse(window.contains(first, "world"),
+        "容量外的旧实例必须视为新包（最多重复应用一次，不会漏补丁）");
+  }
+
+  /**
+   * 「先查、成功后再登记」的顺序保证：即使登记缺失（例如首个接收者解析抛异常、没有走到 record），
+   * 后续接收者仍会重新尝试应用，而不是被永久跳过。
+   */
+  @Test
+  void unrecordedPacketIsNotTreatedAsApplied() {
+    OcclusionPatchListener.RecentPackets window = new OcclusionPatchListener.RecentPackets();
+    Object packet = new Object();
+    assertFalse(window.contains(packet, "world"), "从未登记的包必须重新应用（不能让一次失败吞掉整包补丁）");
+    window.record(null, "world");
+    assertFalse(window.contains(null, "world"), "null 登记必须被忽略");
+  }
+
+  /**
+   * 统计口径按「判定归因」而不是按底层写入动作：对已全遮挡的段再打一次「遮挡」补丁，底层无需写位，
+   * 但该格确实已与变更一致 → 计入 patched；未解析格与越界格则只计入 patchFailures。
+   */
+  @Test
+  void patchStatisticsAttributeByVerdictNotByUnderlyingWrites() {
+    OcclusionStore store = new OcclusionStore();
+    OcclusionStats stats = new OcclusionStats();
+    store.replaceSection(CHUNK, 0, CHUNK, SolidOcclusion.INSTANCE);
+
+    OcclusionPatchListener.applyPatches(store, new int[] {1, 1, 1},
+        new byte[] {OcclusionPatchListener.OCCLUDING}, stats);
+
+    assertEquals(1L, stats.patched.sum(), "有明确口径的格计入 patched（不依赖底层是否真的写位）");
+    assertEquals(0L, stats.patchFailures.sum());
+  }
+
   /** 桩用的两个状态 id（取值无关紧要，只要不同且能命中/未命中上表）。 */
   private static final int DOUBLE_SLAB_ID = 31;
   private static final int BOTTOM_SLAB_ID = 8;

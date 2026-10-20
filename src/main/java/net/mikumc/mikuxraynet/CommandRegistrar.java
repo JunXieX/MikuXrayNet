@@ -59,9 +59,11 @@ final class CommandRegistrar {
         plugin.getLogger().fine("管理命令 /" + COMMAND_NAME + " 已按 paper-plugin.yml 现代方式注册");
         return;
       }
-      // 非 Paper 核心（无 getLifecycleManager）：本项目不做 Spigot 兼容，故不存在回退路径
-      plugin.getLogger().warning("注册管理命令失败：当前核心不是 Paper/Folia（无命令生命周期 API），"
-          + "管理命令不可用。");
+      // registerLifecycleCommand 返回 false 时已经把真实异常打进日志（见其 catch），这里只汇总一句；
+      // 不再断言「当前核心不是 Paper/Folia」——本项目只跑 Paper/Folia，那样写会把「生命周期管理器
+      // 已关闭 / 重复注册 / 事件类型不匹配」等真实故障误报成「装错了端」，把排查带偏。
+      plugin.getLogger().warning("注册管理命令失败：命令生命周期 API 不可用或注册被拒"
+          + "（详见上一条异常日志），管理命令不可用。");
     } catch (Throwable throwable) {
       plugin.getLogger().log(Level.WARNING, "注册管理命令失败（管理命令不可用）", throwable);
     }
@@ -70,9 +72,9 @@ final class CommandRegistrar {
   /**
    * 在现代生命周期事件 {@code COMMANDS} 中注册命令（Paper 与 Folia 是同一套 API）。
    *
-   * <p>返回 {@code false} 表示当前核心不是 Paper（{@code Plugin#getLifecycleManager()} 不可用）。
-   * 注意求值顺序：{@code getLifecycleManager()} 先于 lambda 求值，因此非 Paper 核心上根本不会加载
-   * {@link LifecycleEvents} / {@link Commands} / {@link BasicCommand} 等类。
+   * <p>返回 {@code false} 表示注册失败（已被吞掉的异常在返回前打进 WARNING 日志——**必须**留下真实
+   * 原因，否则调用方只能猜，过去就出现过把「生命周期管理器已关闭 / 重复注册」误报成「核心不是
+   * Paper/Folia」的情况）。另注意求值顺序：{@code getLifecycleManager()} 先于 lambda 求值。
    */
   private boolean registerLifecycleCommand(MikuCommand executor) {
     try {
@@ -83,7 +85,10 @@ final class CommandRegistrar {
       });
       return true;
     } catch (Throwable throwable) {
-      // 纯 Bukkit/Spigot：Plugin#getLifecycleManager 不存在（NoSuchMethodError）→ 无可用注册路径
+      // 真实故障（生命周期管理器已关闭、重复注册、事件类型不匹配…）必须带堆栈留档：
+      // 只返回 false 会让上层只剩一句「注册失败」，管理员与后续排查者都拿不到原因。
+      plugin.getLogger().log(Level.WARNING,
+          "命令生命周期注册失败（/ " + COMMAND_NAME + " 将不可用）", throwable);
       return false;
     }
   }

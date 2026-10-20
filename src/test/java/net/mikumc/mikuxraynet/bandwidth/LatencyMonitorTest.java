@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Field;
@@ -126,6 +127,13 @@ class LatencyMonitorTest {
     method.invoke(monitor, player);
   }
 
+  /** 取 {@code reduce} 的返回值（它现在是「降级是否真的生效」的唯一判据）。 */
+  private static boolean invokeReduce(LatencyMonitor monitor, Player player) throws Exception {
+    Method method = LatencyMonitor.class.getDeclaredMethod("reduce", Player.class);
+    method.setAccessible(true);
+    return (Boolean) method.invoke(monitor, player);
+  }
+
   /** 降级与还原都只调用 setSendViewDistance，绝不触碰 setViewDistance。 */
   @Test
   void reduceAndRestoreOnlyTouchSendViewDistance() throws Exception {
@@ -184,6 +192,29 @@ class LatencyMonitorTest {
     invoke(monitor, "reduce", player);
     assertEquals(List.of("6"), state.sendSets, "目标超过 view-distance 时必须钳到合法范围");
     assertTrue(state.viewSets.isEmpty(), "钳制路径同样不得触碰 view-distance");
+  }
+
+  /**
+   * B1 契约：{@code reduce} 的返回值是「降级是否真的生效」的唯一判据——调用方据此决定是否向
+   * {@link PingState} 回报「已降级」。没下调成功就必须返回 false，否则状态机会被永久卡在已降级
+   * （没有原始视距记录、还原路径也拒绝清标记），该玩家整段会话再也降不下来。
+   */
+  @Test
+  void reduceReportsWhetherItActuallyApplied() throws Exception {
+    LatencyMonitor monitor = new LatencyMonitor(stubPlugin(), config(2, 4), new ThrottleStats());
+
+    PlayerState applied = new PlayerState();
+    applied.send = 12;
+    applied.view = 12;
+    assertTrue(invokeReduce(monitor, stubPlayer(applied)), "真正下调视距时必须回报 true");
+    assertEquals(List.of("10"), applied.sendSets);
+
+    PlayerState atMinimum = new PlayerState();
+    atMinimum.send = 4;
+    atMinimum.view = 12;
+    assertFalse(invokeReduce(monitor, stubPlayer(atMinimum)),
+        "已在安全下限、没有下调时必须回报 false（调用方据此允许下次重试）");
+    assertTrue(atMinimum.sendSets.isEmpty());
   }
 
   /** 已在最小视距时不降级（无任何 setter 调用）。 */

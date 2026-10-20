@@ -188,9 +188,12 @@ class ObfuscationProcessorWorldBandTest {
       for (int value : palette) {
         ByteBufUtil.writeVarInt(buffer, value);
       }
-      long[] data = new long[1024];
+      // 4 位打包 = 每个 long 装 16 个格 → 4096 格恰好 256 个 long。
+      // （此前误写成 1024 个 long，多出的 768 个 long 被旧实现当成「尾部字节」原样搬走；
+      //   新加的「section 必须恰好消费完」校验正好把这份非法夹具暴露出来。）
+      long[] data = new long[256];
       for (int i = 0; i < 4096; i++) {
-        data[i / 64] |= ((long) indices[i] & 15L) << ((i & 63) * 4);
+        data[i / 16] |= ((long) indices[i] & 15L) << ((i % 16) * 4);
       }
       for (long entry : data) {
         buffer.writeLong(entry);

@@ -108,6 +108,25 @@ class ThrottlePipelineTest {
   }
 
   /**
+   * B3 口径回归：Folia 上白名单索引建不起来（无法跨区域安全枚举实体），因此「白名单非空」时零位移
+   * 取消必须<b>整项不注册</b>——而不是构造一个在 {@code start()} 里自我停用的空壳（那会让启动日志与
+   * 诊断显示为「已启用」，与真实注册状态矛盾）。白名单为空时不需要索引，Folia 上仍可注册。
+   */
+  @Test
+  void foliaWithNonEmptyWhitelistDoesNotRegisterZeroMovementCancel() {
+    String withWhitelist = "entity-packets:\n  whitelist:\n    - armor_stand\n";
+
+    assertFalse(ThrottlePipeline.plan(config(withWhitelist), true).entityPackets(),
+        "Folia + 非空白名单：白名单索引不可用 → 整项不注册（否则盔甲架/展示实体姿态会卡住）");
+    assertTrue(ThrottlePipeline.plan(config(withWhitelist), false).entityPackets(),
+        "Paper 上照常注册（白名单索引可用）");
+    assertTrue(ThrottlePipeline.plan(config("enabled: true\n"), true).entityPackets(),
+        "Folia + 空名单不需要索引 → 仍可注册（所有实体按非白名单处理）");
+    assertTrue(ThrottlePipeline.plan(config(withWhitelist), true).blockChanges(),
+        "平台差异只影响零位移取消，其它模块照常注册");
+  }
+
+  /**
    * 回归：「已在运行」的判定必须是 {@code startLocked()} 的<b>第一条</b>语句。
    *
    * <p>为什么这条顺序如此重要：紧跟在判定之后的是 {@code retryFailedCloses()}——它会注销字段里的模块

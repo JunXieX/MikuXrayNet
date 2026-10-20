@@ -99,6 +99,27 @@ class PlayerPositionSnapshotsTest {
         "新方块距变更 9 格 → 判定必须随位置更新为「远」");
   }
 
+  /**
+   * B2 回归：{@code refresh} 必须回报「刷新前的世界名」，调用方（BlockChangeMerger）据此在跨世界切换时
+   * 丢弃旧世界的待发缓冲。若世界未变却回报了旧名字，就会把正常合并在同世界内的缓冲误丢弃。
+   */
+  @Test
+  @DisplayName("refresh 返回刷新前的世界名：只有真的跨世界才与当前世界名不同")
+  void refreshReportsPreviousWorld() {
+    PlayerPositionSnapshots snapshots = new PlayerPositionSnapshots();
+    UUID player = UUID.randomUUID();
+
+    assertNull(snapshots.refresh(player, "world", 0.5D, 64.0D, 0.5D), "首次快照没有「上一个世界」");
+    assertEquals("world", snapshots.refresh(player, "world", 0.5D, 64.0D, 0.5D),
+        "世界未变（且同一方块、不发布）时返回当前世界名，调用方不得据此误判跨世界");
+    assertEquals("world", snapshots.refresh(player, "world", 3.5D, 64.0D, 0.5D),
+        "同世界内跨入新方块：仍返回同一世界名");
+    assertEquals("world", snapshots.refresh(player, "world_nether", 0.5D, 64.0D, 0.5D),
+        "跨世界：必须返回旧世界名，供调用方丢弃旧世界缓冲");
+    assertEquals("world_nether", snapshots.refresh(player, "world_nether", 0.5D, 64.0D, 0.5D));
+    assertEquals("world_nether", snapshots.get(player).world());
+  }
+
   @Test
   @DisplayName("负数坐标按 floor 语义取方块（绝非截断），跨负数方块边界时判定随之更新")
   void negativeCoordinatesUseFloorAndReclassifyOnBlockChange() {

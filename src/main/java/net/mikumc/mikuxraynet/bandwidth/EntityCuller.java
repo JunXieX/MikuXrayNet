@@ -14,6 +14,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.antixray.ProximitySelector;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
@@ -171,6 +172,27 @@ public final class EntityCuller implements Listener {
    */
   private final ConcurrentHashMap<UUID, ConcurrentHashMap<Integer, VerdictStreak>> streaks =
       new ConcurrentHashMap<>();
+  /**
+   * 玩家 → (实体 id → 已应用的判定提交序号)。用于丢弃「后完成但更旧」的异步结果。
+   *
+   * <p><b>为什么需要它</b>：{@code occlusion-threads ≥ 2} 时专用池并发处理同一实体的多份判定，结果按
+   * <b>完成顺序</b>回投——先提交的旧结论可能后完成。旧结论若照常应用，会把新结论已经写好的显示状态
+   * 覆盖回去（典型表现：刚判定为可见而恢复的实体又被打回隐藏，违反「实体绝不能被误隐藏」）。
+   * 提交序号单调递增，{@link #publishAsync} 只应用不小于已应用序号的结论，旧结论整条丢弃
+   * （不改变显示状态，与超时丢弃 / 拒收同一语义）。
+   *
+   * <p>条目随 untrack / 失效 / 退出 / 停用清理，不会无界增长。
+   */
+  private final ConcurrentHashMap<UUID, ConcurrentHashMap<Integer, Long>> appliedSeq =
+      new ConcurrentHashMap<>();
+  /** 判定提交序号计数器（唯一用途见 {@link #appliedSeq}）。 */
+  private final AtomicLong submitSeqCounter = new AtomicLong();
+  /**
+   * 「无序号」哨兵：仅供单测直接驱动回投的兼容入口使用（不做序判定、也不写序号账本）。
+   *
+   * <p>生产路径一律走带 {@code submitSeq} 的重载，否则乱序保护失效。
+   */
+  private static final long NO_SUBMIT_SEQ = Long.MIN_VALUE;
 
   /** 防抖账本条目：最近一次判定结论与已连续一致的周期数（只在玩家/实体所属线程上读写）。 */
   private static final class VerdictStreak {
@@ -410,6 +432,7 @@ public final class EntityCuller implements Listener {
     restoreAll();
     rotations.clear();
     streaks.clear();
+    appliedSeq.clear();
     closeEngine();
   }
 
@@ -489,8 +512,9 @@ public final class EntityCuller implements Listener {
     // 判定只清账本、不产生恢复计数」一致（见 evaluate 的失效/离线分支）。
     hidden.remove(player.getUniqueId());
     rotations.remove(player.getUniqueId());
-    // 防抖账本随退出整体丢弃（玩家已离线，任何判定结果都不可能再用于切换显示状态）
+    // 防抖账本与提交序账本随退出整体丢弃（玩家已离线，任何判定结果都不可能再用于切换显示状态）
     streaks.remove(player.getUniqueId());
+    appliedSeq.remove(player.getUniqueId());
   }
 
   /**
@@ -665,7 +689,7 @@ public final class EntityCuller implements Listener {
       if (removedId < 0) {
         return;
       }
-      removeStreak(playerId, removedId);
+      removeEntityState(playerId, removedId);
       // 关键：该实体仍在本玩家的「已隐藏」账本里时，必须把它留在轮转队列中。
       //
       // 为什么：hideEntity 的隐藏状态跨 untrack 仍然生效（服务端不再给它发追踪包，但客户端那边仍是隐藏的）。
@@ -840,7 +864,7 @@ public final class EntityCuller implements Listener {
       }
       if (!entity.isValid()) {
         rotation.remove(entity.getEntityId());
-        removeStreak(playerId, entity.getEntityId());
+        removeEntityState(playerId, entity.getEntityId());
         continue;
       }
       // 去重：本周期已被通道①计过的实体（既已隐藏又在轮转队列）不再重复计数，避免「复检提交」虚增。
@@ -880,15 +904,12 @@ public final class EntityCuller implements Listener {
         return;
       }
       // 超出强制可见距离：
-      //  ① RESTORE_ONLY：不提交判定（远距离账本条目可能长期滞留，每周期判定会让成本随会话无界增长）。
-      //     账本条目保留——Paper 的 hideEntity 状态跨 untrack 仍生效，账本是「重新进入强制可见距离时
-      //     该不该 showEntity」的唯一依据；实体一旦回到近处，上面的 showIfHidden 分支即恢复它。
-      //     视锥隐藏条目的「回到视野锥内即恢复」由 recheck 通道①的纯数学复判负责（见那里的注释）。
+      //  ① RESTORE_ONLY：在调用点（recheck 通道①）就已跳过远距离条目，走不到这里——账本条目可能长期
+      //     滞留，每周期判定会让成本随会话无界增长。账本条目仍保留：Paper 的 hideEntity 状态跨 untrack
+      //     仍生效，账本是「重新进入强制可见距离时该不该 showEntity」的唯一依据；实体一旦回到近处，
+      //     上面的 showIfHidden 分支即恢复它。视锥隐藏条目的「回到视野锥内即恢复」由通道①的纯数学复判负责。
       //  ② ROTATION：提交全部追踪实体，成本由专用池的时间预算封顶（超预算者顺延，不丢判定）。
       //  ③ INITIAL：入场首评不受距离闸门限制，远距离实体照常剔除（既有行为不变）。
-      if (mode == RecheckMode.RESTORE_ONLY) {
-        return;
-      }
       // 视锥剔除优先：锥外 + 超距的实体根本看不到，直接隐藏，连射线都省下（判定成本仅一次视锥数学）。
       if (frustumCullable(player, entity)) {
         evaluate(player, entity, true, mode != RecheckMode.INITIAL, true);
@@ -957,12 +978,16 @@ public final class EntityCuller implements Listener {
       // 截止时刻：超过 timeoutCycles 个提交周期仍未回投的判定由引擎丢弃（不改变显示状态），
       // 避免用陈旧几何去隐藏实体（见 OcclusionEngine 的截止时间说明）。
       long deadline = System.nanoTime() + timeoutNanos;
+      // 提交序号：回投时据此丢弃「后完成但更旧」的结论（见 appliedSeq）。序号取自本类的单调计数器，
+      // 不放进 Request（引擎不关心它），由回投闭包携带，因此不需要改引擎契约。
+      long submitSeq = submitSeqCounter.incrementAndGet();
       OcclusionEngine.Request request = new OcclusionEngine.Request(player.getUniqueId(),
           entity.getEntityId(), worldName, deadline, eyeX, eyeY, eyeZ, vertices,
           (result, occluded) ->
               // 回投发生在专用池线程：先跳回玩家/实体所属线程，再触碰任何 Bukkit API
               Schedulers.onEntity(plugin, player,
-                  () -> publishAsync(player, entity, worldName, result, occluded, fromRecheck)));
+                  () -> publishAsync(player, entity, worldName, result, occluded, fromRecheck,
+                      submitSeq)));
       // 拒收（队列满）不改变显示状态，由引擎计入 rejectedQueueFull 供真机观测（见诊断面板）。
       current.submit(request);
     } catch (Throwable throwable) {
@@ -985,11 +1010,29 @@ public final class EntityCuller implements Listener {
    */
   void publishAsync(Player player, Entity entity, String worldName,
       OcclusionEngine.Request request, boolean occluded, boolean fromRecheck) {
+    // 兼容入口（仅单测直接驱动回投时使用）：不做提交序判定，其余校验与正式入口完全一致。
+    publishAsync(player, entity, worldName, request, occluded, fromRecheck, NO_SUBMIT_SEQ);
+  }
+
+  /**
+   * 异步射线路径的<b>发布侧</b>正式入口：在做各项状态校验之前先做「结论新旧」判定（玩家在线之后）。
+   *
+   * @param submitSeq 该判定的提交序号（单调递增）；比已应用的序号更旧的结果会被丢弃
+   */
+  void publishAsync(Player player, Entity entity, String worldName,
+      OcclusionEngine.Request request, boolean occluded, boolean fromRecheck, long submitSeq) {
     if (stopping || !active()) {
       return;
     }
     if (!player.isOnline()) {
       return; // 退出已清账本；玩家已看不到该实体，无需（也不该）再动可见性
+    }
+    // 乱序保护（放在「玩家在线」之后：离线玩家的迟到结果不会为它建序号账本，避免退出后再长出
+    // 无人回收的条目）：多工作线程下同一实体的两份判定可能按完成顺序回投，旧结论若照常应用会把
+    // 新结论写好的状态覆盖回去（把已可见实体重新藏起）。更旧者整条丢弃，不改显示状态——
+    // 与超时丢弃 / 队列满拒收同一语义。
+    if (!acceptSubmitSeq(player.getUniqueId(), request.entityId(), submitSeq)) {
+      return;
     }
     if (!owns(entity)) {
       return; // 跨区域（Folia）：读它的状态会先打 ERROR 再抛，直接放弃本轮结果
@@ -1001,7 +1044,7 @@ public final class EntityCuller implements Listener {
     }
     if (!entity.isValid()) {
       removeLedgerEntry(player.getUniqueId(), entity);
-      removeStreak(player.getUniqueId(), request.entityId());
+      removeEntityState(player.getUniqueId(), request.entityId());
       return;
     }
     // 迟到结果的距离闸门：提交判定时实体还在强制可见距离之外，回投前玩家可能已经走近到该距离以内
@@ -1016,6 +1059,37 @@ public final class EntityCuller implements Listener {
       return; // 判据尚未连续够次数：维持现状，压住「刚好被挡 / 刚好可见」的抖动
     }
     evaluate(player, entity, occluded, fromRecheck);
+  }
+
+  /**
+   * 提交序闸门：把该实体的「已应用序号」推进到 {@code submitSeq}，返回本次结论是否仍然有效。
+   *
+   * <p>只在玩家所属线程（回投调度目标）调用，因此同一实体的「比较 + 写入」天然串行，无需额外同步；
+   * 序号更小的结论一律判为过期（返回 false，调用方不得改变显示状态）。序号在<b>状态校验之前</b>推进：
+   * 即使该结论随后被在线/归属/世界/有效性校验丢弃，下一次复检也会用更新的判定补上，不会影响收敛，
+   * 反倒避免了「旧结论在中间插队」。
+   *
+   * <p>{@code NO_SUBMIT_SEQ} 是兼容入口的哨兵：既不比较也不写账本。
+   *
+   * <p><b>已知的微量残留（刻意不额外清理）</b>：若某实体已被 untrack（{@link #removeEntityState}
+   * 已清过它的账本）之后仍有在途判定回投，这里会为它重新建一条序号条目，而该实体已不在轮转队列、
+   * 不会再被 {@code removeEntityState} 清到，于是这条条目要留到玩家退出 / 插件停用才释放。这与既有
+   * {@code streaks} 的同类残留一致：每条只是一个 {@code Integer → Long} 条目，有界（≤ 该玩家追踪过的
+   * 实体数）且随退出整体释放。额外清理需要额外记录「刚摘除的 id」并引入新的竞态窗口，成本大于收益，
+   * 故不做。
+   */
+  private boolean acceptSubmitSeq(UUID playerId, int entityId, long submitSeq) {
+    if (submitSeq == NO_SUBMIT_SEQ) {
+      return true;
+    }
+    ConcurrentHashMap<Integer, Long> applied =
+        appliedSeq.computeIfAbsent(playerId, uuid -> new ConcurrentHashMap<>());
+    Long previous = applied.get(entityId);
+    if (previous != null && submitSeq <= previous) {
+      return false;
+    }
+    applied.put(entityId, submitSeq);
+    return true;
   }
 
   /**
@@ -1037,11 +1111,20 @@ public final class EntityCuller implements Listener {
     return streak.record(verdict, required);
   }
 
-  /** 摘除某实体在防抖账本里的条目（失效 / 解除追踪时调用；无该条目则 no-op）。 */
-  private void removeStreak(UUID playerId, int entityId) {
+  /**
+   * 摘除某实体的全部「按实体」辅助状态：防抖账本 + 提交序账本（失效 / 解除追踪 / 退出时调用）。
+   *
+   * <p>两本账都必须清：只清防抖而留下提交序，会让 entityId 被复用后新实体的序号永远小于旧条目、
+   * 判定被永久丢弃（该实体再也无法被隐藏/恢复）；反之只清提交序而留下防抖则会残留陈旧连线计数。
+   */
+  private void removeEntityState(UUID playerId, int entityId) {
     ConcurrentHashMap<Integer, VerdictStreak> map = streaks.get(playerId);
     if (map != null) {
       map.remove(entityId);
+    }
+    ConcurrentHashMap<Integer, Long> applied = appliedSeq.get(playerId);
+    if (applied != null) {
+      applied.remove(entityId);
     }
   }
 
@@ -1243,7 +1326,7 @@ public final class EntityCuller implements Listener {
       boolean frustumCulled) {
     if (!entity.isValid() || !player.isOnline()) {
       removeLedgerEntry(player.getUniqueId(), entity);
-      removeStreak(player.getUniqueId(), entity.getEntityId());
+      removeEntityState(player.getUniqueId(), entity.getEntityId());
       return;
     }
 
@@ -1251,7 +1334,7 @@ public final class EntityCuller implements Listener {
     // 看起来悬空骑行；隐藏「本身是乘客的实体」会让载具看起来无人。因此只要该实体与任何乘客/载具存在
     // 关系，就把 allBlocked 视为无效 → 走 showIfHidden 保持/恢复可见（fail-open 的确定性规则）。
     if (allBlocked && !hasVehicleRelation(entity)) {
-      if (hide(player, entity, frustumCulled)) {
+      if (hide(player, entity, frustumCulled, fromRecheck)) {
         if (fromRecheck) {
           stats.recheckHidden.increment();
         }
@@ -1292,8 +1375,13 @@ public final class EntityCuller implements Listener {
     }
   }
 
-  /** @return 是否真的新登记并执行了 hideEntity（已隐藏 / 失败时为 false）。 */
-  private boolean hide(Player player, Entity entity, boolean frustumCulled) {
+  /**
+   * 隐藏该实体（必要时只升级账本标记）。
+   *
+   * @param fromRecheck 本次是否来自周期复检：仅用于把「标记升级」也正确归入「复检致隐藏」口径
+   * @return 是否真的新登记并执行了 hideEntity（已隐藏 / 失败时为 false）
+   */
+  private boolean hide(Player player, Entity entity, boolean frustumCulled, boolean fromRecheck) {
     if (stopping) {
       // 停用已开始：绝不再新登记隐藏（否则会把刚被 restoreAll 恢复的实体重新藏回）
       return false;
@@ -1312,6 +1400,11 @@ public final class EntityCuller implements Listener {
         // 保护的 frustumHidden 不会递增；而该条目此后会被通道①按视锥条目恢复并计 frustumShown。
         // 不补这一笔，/mxnet status 的「视锥剔除 隐藏/恢复」会出现「恢复 > 隐藏」的自相矛盾。
         stats.frustumHidden.increment();
+        if (fromRecheck) {
+          // 同一次「标记升级」也属于复检发现的新遮挡（此前该实体被当作射线隐藏、远距离不复检），
+          // 因此「复检致隐藏」必须同步 +1，否则该口径系统性偏低（恢复侧不会漏计）。
+          stats.recheckHidden.increment();
+        }
       }
       return false;
     }

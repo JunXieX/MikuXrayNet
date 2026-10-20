@@ -99,6 +99,23 @@ class BlockChangeBatchTest {
     assertTrue(batch.drainClusters(2).isEmpty());
   }
 
+  /** B2 支撑：跨世界时必须能「不聚簇地」丢掉整批待发条目（既不发送、也不再构造簇）。 */
+  @Test
+  @DisplayName("clear() 丢弃全部待发条目（不聚簇、不留残余）")
+  void clearDropsAllPendingEntries() {
+    BlockChangeBatch<Integer> batch = new BlockChangeBatch<>(8);
+    batch.add(0, 64, 0, 1);
+    batch.add(1, 64, 0, 2);
+    assertEquals(2, batch.size());
+
+    batch.clear();
+
+    assertTrue(batch.isEmpty(), "clear() 后缓冲必须为空");
+    assertEquals(0, batch.size());
+    assertTrue(batch.drainClusters(2).isEmpty(), "clear() 后不得再聚出任何簇");
+    assertFalse(batch.add(0, 64, 0, 3), "clear() 之后仍可继续接收新条目");
+  }
+
   @Test
   @DisplayName("合并后各簇的条目集合与写入内容完全一致")
   void clusterContentsMatchInsertedUpdates() {

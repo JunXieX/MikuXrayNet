@@ -492,4 +492,27 @@ class ProximityScannerTest {
     }
     assertEquals(0, ProximityScanner.shardOf(-3, 7, 1), "shards<=1 等价于不分片");
   }
+
+  /**
+   * 「坐标评估」只统计通过距离筛选的候选：半径外扩读到的区块内坐标不得计入。
+   *
+   * <p>诊断日志（{@code logFirstRevealDiagnostic}）用这个数判断「候选窗口是否被占满」，口径混入半径外
+   * 坐标会系统性偏大、把正常扫描误判成异常。
+   */
+  @Test
+  void positionsEvaluatedCountsOnlyInRangeCandidates() {
+    ObfuscatedChunkIndex index = index();
+    RevealedSet revealed = revealed();
+    // 同一区块两个坐标：一个正好在 maxDistance=8 内（距离 0），一个明显在外（距离 9）
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT,
+        new int[] {local(8, 64, 8), local(8, 73, 8)});
+
+    ProximityScanner.Tally tally = new ProximityScanner.Tally();
+    List<ObfuscatedChunkIndex.Position> found = scan(index, revealed, PLAYER, 8.0D, 64, tally);
+
+    assertEquals(List.of(new ObfuscatedChunkIndex.Position(8, 64, 8)), found,
+        "只应取到距离内的坐标");
+    assertEquals(1, tally.positionsEvaluated,
+        "超过 maxDistance 的坐标不得计入「坐标评估」");
+  }
 }

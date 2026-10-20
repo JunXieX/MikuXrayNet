@@ -149,9 +149,16 @@ class ConfigDefaultsTest {
         "打包 yml 的 proximity.raycast.samples 必须等于代码回落值");
     assertEquals(fallback.proximity().instantReveal(), packed.proximity().instantReveal(),
         "打包 yml 的 instant-reveal 三键必须等于代码回落值");
+    assertEquals(fallback.cacheMaximumBytes(), packed.cacheMaximumBytes(),
+        "打包 yml 的 cache.maximum-bytes 必须等于代码回落值");
     assertTrue(packed.floorAdjustments().isEmpty(),
         "打包默认值不得触发安全下限抬升（否则每个服主开服都会看到一条误导性 WARN）："
             + packed.floorAdjustments());
+    // 同理：打包 yml 里的布尔/枚举/权重写法必须全部被解析器理解——否则每个服主开服都会吃到一条
+    // 「写法无法识别」WARN（例如把 mode 写成 all_v2、或权重被引号化）。
+    assertTrue(packed.typeAdjustments().isEmpty(),
+        "打包默认值不得产生「写法无法识别」明细："
+            + packed.typeAdjustments() + "（检查 antixray.yml 的布尔/枚举/权重写法）");
   }
 
   /** 用真实解析器读随插件打包的 {@code antixray.yml}（断言默认值文本与代码回落一致）。 */
@@ -427,10 +434,13 @@ class ConfigDefaultsTest {
     assertEquals(AntiXrayConfig.ObfuscationMode.ALL,
         AntiXrayConfig.from(yaml("dimensions:\n  normal:\n    mode: all\n"))
             .dimensionEffective(AntiXrayConfig.Dimension.NORMAL).mode());
+    AntiXrayConfig invalid =
+        AntiXrayConfig.from(yaml("dimensions:\n  normal:\n    mode: nonsense\n"));
     assertEquals(AntiXrayConfig.ObfuscationMode.ALL,
-        AntiXrayConfig.from(yaml("dimensions:\n  normal:\n    mode: nonsense\n"))
-            .dimensionEffective(AntiXrayConfig.Dimension.NORMAL).mode(),
+        invalid.dimensionEffective(AntiXrayConfig.Dimension.NORMAL).mode(),
         "非法取值一律回落为最安全的 all");
+    assertTrue(String.join("、", invalid.typeAdjustments()).contains("dimensions.normal.mode="),
+        "非法枚举值必须留痕（否则写错的 mode 会被静默按 all 生效）：" + invalid.typeAdjustments());
   }
 
   @Test
@@ -609,10 +619,14 @@ class ConfigDefaultsTest {
     assertEquals("", config.diskCache().zstdSha256(),
         "zstd 下载校验哈希默认空串（不校验；缺键也不得抛异常）");
 
-    // cache 两键（改写结果的内存缓存）
+    // cache 三键（改写结果的内存缓存：条目数 + 字节数双上限）
+    // 注意：默认 512 MB 的字节上限会先封顶（30~50 KB/条约 1.0~1.7 万条），40960 这个条目上限在默认
+    // 配置下实际不可达；这里仍断言 40960，锁的是「配置值」而不是「实际驻留条数」（后者由两者共同决定）。
     assertEquals(40960, config.cacheMaximumSize(),
-        "改写缓存条目上限默认 40960（约 0.8~1 GB 上限；条目只在真遇到新区块时增长）");
+        "改写缓存条目上限默认 40960（与 max-size 共同封顶；默认实际由 512 MB 的字节上限先到顶）");
     assertEquals(600, config.cacheExpireAfterAccessSeconds(), "改写缓存访问后过期默认 600 秒");
+    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_BYTES_DEFAULT, config.cacheMaximumBytes(),
+        "改写缓存按字节硬上限默认 512 MB（条目上限管不住「单条负载偏大」，字节上限才与堆占用挂钩）");
 
     // advanced 三键
     assertEquals(0, config.threads(), "工作线程数默认 0 = 按 CPU 自动推算（上限 4）");
@@ -681,6 +695,56 @@ class ConfigDefaultsTest {
         """));
     assertEquals(1, floored.neighbors().cacheMaximumSize(), "邻块缓存下限为 1");
     assertEquals(1, floored.cacheMaximumSize(), "改写缓存下限为 1");
+  }
+
+  /**
+   * {@code cache.maximum-bytes}：两端留痕的「按字节」硬上限。
+   *
+   * <p>要点：① 缺键时默认 512 MB 落在区间内、不产生明细；② 超上限（手滑多打一位数）按上限生效并留痕；
+   * ③ 低于下限（会把缓存配成事实关闭、反而更耗 CPU）按下限抬升并留痕；④ 4 GB 这个合法边界必须能原样
+   * 表达——用 {@code getInt} 解析会把它溢出成默认值，所以本键必须是 long。
+   */
+  @Test
+  void cacheMaximumBytesClampsAtBothEndsAndReports() {
+    AntiXrayConfig defaults = AntiXrayConfig.from(yaml("enabled: true\n"));
+    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_BYTES_DEFAULT, defaults.cacheMaximumBytes(),
+        "缺键时按字节上限默认 512 MB");
+    assertTrue(defaults.floorAdjustments().isEmpty(), defaults.floorAdjustments().toString());
+    assertTrue(defaults.ceilingAdjustments().isEmpty(), defaults.ceilingAdjustments().toString());
+
+    AntiXrayConfig inRange = AntiXrayConfig.from(yaml("""
+        cache:
+          maximum-bytes: 1073741824
+        """));
+    assertEquals(1073741824L, inRange.cacheMaximumBytes(), "区间内（1 GB）原样生效");
+    assertTrue(inRange.floorAdjustments().isEmpty(), inRange.floorAdjustments().toString());
+    assertTrue(inRange.ceilingAdjustments().isEmpty(), inRange.ceilingAdjustments().toString());
+
+    AntiXrayConfig tooBig = AntiXrayConfig.from(yaml("""
+        cache:
+          maximum-bytes: 53687091200
+        """));
+    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_BYTES_MAX, tooBig.cacheMaximumBytes(),
+        "超过 4 GB 上限按上限生效（拦住手滑多打一位数）");
+    assertTrue(String.join("、", tooBig.ceilingAdjustments()).contains("cache.maximum-bytes=53687091200"),
+        tooBig.ceilingAdjustments().toString());
+
+    AntiXrayConfig tooSmall = AntiXrayConfig.from(yaml("""
+        cache:
+          maximum-bytes: 1048576
+        """));
+    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_BYTES_MIN, tooSmall.cacheMaximumBytes(),
+        "低于 64 MB 下限按下限抬升（否则缓存事实关闭，每个区块都重写、更耗 CPU）");
+    assertTrue(String.join("、", tooSmall.floorAdjustments()).contains("cache.maximum-bytes=1048576"),
+        tooSmall.floorAdjustments().toString());
+
+    AntiXrayConfig atMax = AntiXrayConfig.from(yaml("""
+        cache:
+          maximum-bytes: 4294967296
+        """));
+    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_BYTES_MAX, atMax.cacheMaximumBytes(),
+        "4 GB 是合法边界，必须能原样表达（int 解析会溢出成默认值）");
+    assertTrue(atMax.ceilingAdjustments().isEmpty(), atMax.ceilingAdjustments().toString());
   }
 
   /**

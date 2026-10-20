@@ -81,11 +81,14 @@ public final class MikuConfig {
     BandwidthConfig loadedBandwidth = loadBandwidth();
     WorldBlacklistConfig loadedBlacklist = loadBlacklist();
 
-    // 成对发布：一次 volatile 写替换整个 holder，读者永远看到同一代的一组配置
-    this.loaded = new Loaded(loadedAntiXray, loadedBandwidth, loadedBlacklist);
-    // 世界黑名单另有「封包线程无锁读取」的静态入口（带宽模块与反矿透监听器都在封包热路径上查它）。
-    // 必须在发布 holder 之后立即刷新，保证封包线程读到的名单与本代配置一致。
+    // 世界黑名单另有「封包线程无锁读取」的静态入口（带宽模块与反矿透监听器都在封包热路径上查它），
+    // 它与下面的 holder 无法合并成一次原子写：封包线程会先用世界名查 holder、再查静态名单，两次读之间
+    // 仍可能跨代。因此把静态名单的发布放在 holder 写<b>之前</b>——落在窗口里的封包看到的是
+    // 「新名单 + 旧配置」，而旧配置本身就该被这次重载替换掉，不会出现「新配置按旧名单放行/拦截」
+    // 这种更难解释的组合；下一次封包即自愈（匹配是幂等纯函数，无副作用）。
     WorldBlacklistConfig.publish(loadedBlacklist);
+    // 成对发布：一次 volatile 写替换整个 holder —— holder 内的三份配置必然同代。
+    this.loaded = new Loaded(loadedAntiXray, loadedBandwidth, loadedBlacklist);
 
     // 常规加载结果一律 FINE（默认不可见）：开服日志只保留插件的「已启用」一行。
     // 需要核对各项生效值时看 /mikuxraynet status 或 dump；解析失败仍会打 WARNING（下方 warnFallbackOnce）。

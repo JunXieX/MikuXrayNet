@@ -298,10 +298,17 @@ public final class BandwidthConfig {
    * 被「安全上限 / 下限」钳制过的配置键明细（空列表 = 未钳制）；加载时由 {@link #warnIfClampApplied} 一次性 WARN。
    */
   private final List<String> clampAdjustments;
+  /**
+   * 布尔键类型不符（如 {@code enabled: "false"} 之外的非布尔写法）的明细；空列表 = 未发生。
+   *
+   * <p>加载时由 {@link #warnIfClampApplied} 一次性 WARN——类型化 {@code getBoolean} 会把这类取值
+   * 静默当作默认值，而默认值多半是 {@code true}，于是「写下的关闭」会变成「仍然开启」且不留痕。
+   */
+  private final List<String> typeAdjustments;
 
   private BandwidthConfig(boolean enabled, EntityPackets entityPackets, BlockChanges blockChanges, Palette palette,
       EntityCulling entityCulling, Afk afk, Latency latency,
-      Diagnostics diagnostics, List<String> clampAdjustments) {
+      Diagnostics diagnostics, List<String> clampAdjustments, List<String> typeAdjustments) {
     this.enabled = enabled;
     this.entityPackets = entityPackets;
     this.blockChanges = blockChanges;
@@ -311,6 +318,7 @@ public final class BandwidthConfig {
     this.latency = latency;
     this.diagnostics = diagnostics;
     this.clampAdjustments = clampAdjustments == null ? List.of() : List.copyOf(clampAdjustments);
+    this.typeAdjustments = typeAdjustments == null ? List.of() : List.copyOf(typeAdjustments);
   }
 
   /**
@@ -323,16 +331,18 @@ public final class BandwidthConfig {
    */
   public static BandwidthConfig from(ConfigurationSection root) {
     List<String> clampAdjustments = new ArrayList<>();
+    // 布尔键类型不符的明细（见字段说明）；由 warnIfClampApplied 与本轮钳制明细一起一次性 WARN。
+    List<String> typeAdjustments = new ArrayList<>(2);
     return new BandwidthConfig(
-        root.getBoolean("enabled", true),
+        lenientBoolean(root, "enabled", true, typeAdjustments),
         new EntityPackets(
             // 各模块总开关均默认 true：新增开关不得改变既有行为（原样保持「全部启用」）
-            root.getBoolean("entity-packets.enabled", true),
-            root.getBoolean("entity-packets.skip-zero-movement", true),
+            lenientBoolean(root, "entity-packets.enabled", true, typeAdjustments),
+            lenientBoolean(root, "entity-packets.skip-zero-movement", true, typeAdjustments),
             Set.copyOf(nonNullStrings(root.getStringList("entity-packets.whitelist")))),
         new BlockChanges(
-            root.getBoolean("block-changes.enabled", true),
-            root.getBoolean("block-changes.merge", true),
+            lenientBoolean(root, "block-changes.enabled", true, typeAdjustments),
+            lenientBoolean(root, "block-changes.merge", true, typeAdjustments),
             // 默认 4（性能优先）：合并更多远处变更，交互半径内不受影响（见 BlockChangeMerger）。
             // 下限 1：0 是纯负收益（仍入缓冲延迟却几乎拼不出可合并簇），要关合并请用 merge=false。
             clampUpper(clampLower(root.getInt("block-changes.merge-radius", 4),
@@ -341,7 +351,7 @@ public final class BandwidthConfig {
             clampUpper(clampLower(root.getInt("block-changes.max-per-packet", 4096),
                 1, "block-changes.max-per-packet", clampAdjustments),
                 MAX_PER_PACKET_LIMIT, "block-changes.max-per-packet", clampAdjustments),
-            root.getBoolean("block-changes.resend-on-overflow", true),
+            lenientBoolean(root, "block-changes.resend-on-overflow", true, typeAdjustments),
             // 默认 40（性能优先）：更长时间窗合并更多变更、更省包；玩家挖/放方块的实时手感由
             // immediate-radius（默认 8 格内原包立即放行）兜底，因此窗口略长也不会出现「顿感」。
             clampUpper(clampLower(root.getInt("block-changes.merge-window-millis", 40),
@@ -354,13 +364,13 @@ public final class BandwidthConfig {
                 0, "block-changes.immediate-radius", clampAdjustments),
                 MAX_IMMEDIATE_RADIUS, "block-changes.immediate-radius", clampAdjustments)),
         new Palette(
-            root.getBoolean("palette.enabled", true),
-            root.getBoolean("palette.strict-verify", false),
+            lenientBoolean(root, "palette.enabled", true, typeAdjustments),
+            lenientBoolean(root, "palette.strict-verify", false, typeAdjustments),
             // P0-1 位宽预算封顶，默认 true：修「调色板写满后替换升位 → 包体膨胀」并拿降位宽/单值降级收益
-            root.getBoolean("palette.width-budget", true)),
+            lenientBoolean(root, "palette.width-budget", true, typeAdjustments)),
         new EntityCulling(
-            root.getBoolean("entity-culling.enabled", true),
-            root.getBoolean("entity-culling.raycast", true),
+            lenientBoolean(root, "entity-culling.enabled", true, typeAdjustments),
+            lenientBoolean(root, "entity-culling.raycast", true, typeAdjustments),
             // 默认 32（性能优先，回落到设计兜底值）：剔除更多远处实体以省包；近身/视野中心的实体
             // 仍在强制可见范围内放行，玩家不易察觉剔除在发生。
             // 两端都钳（单趟 clampRange，保证每键至多一条明细）：上限防手滑多打 0，下限
@@ -378,7 +388,7 @@ public final class BandwidthConfig {
             clampRange(root.getInt("entity-culling.ray-samples", MAX_RAY_SAMPLES),
                 1, MAX_RAY_SAMPLES, "entity-culling.ray-samples", clampAdjustments),
             new EntityCulling.Frustum(
-                root.getBoolean("entity-culling.frustum.enabled", true),
+                lenientBoolean(root, "entity-culling.frustum.enabled", true, typeAdjustments),
                 // FOV 默认 110（客户端可设置的最大值）：取最大保证「玩家把 FOV 拉满也看不到被剔除的实体」，
                 // 属安全优先的默认。两端都要钳（过窄会剔掉屏内实体、过宽等于不做视锥剔除），
                 // 用单趟 clampRange 而非串联上下限钳制，避免负值被记两条明细。
@@ -414,7 +424,7 @@ public final class BandwidthConfig {
                     MAX_OCCLUSION_HYSTERESIS_CYCLES, "entity-culling.occlusion-hysteresis-cycles",
                     clampAdjustments))),
         new Afk(
-            root.getBoolean("afk.enabled", true),
+            lenientBoolean(root, "afk.enabled", true, typeAdjustments),
             clampUpper(clampLower(root.getInt("afk.seconds", 300),
                 1, "afk.seconds", clampAdjustments),
                 MAX_AFK_SECONDS, "afk.seconds", clampAdjustments),
@@ -422,12 +432,12 @@ public final class BandwidthConfig {
             // 下限防 0/负数把「只看远处包」变成「全部低价值包一律丢弃」（见 MIN_AFK_DISTANCE 说明）。
             clampRange(root.getDouble("afk.distance", 16.0D),
                 16.0D, MIN_AFK_DISTANCE, MAX_AFK_DISTANCE, "afk.distance", clampAdjustments),
-            root.getBoolean("afk.drop-particles", true),
+            lenientBoolean(root, "afk.drop-particles", true, typeAdjustments),
             // 默认 true（性能优先）：破坏动画包数量可观，丢弃可省带宽；玩家体验由「AFK 判定只看真实操作」
             // 兜底——只要玩家还在交互/移动/聊天就不会被判定为 AFK，因此真在操作的人看不到动画中断。
-            root.getBoolean("afk.drop-block-break-animation", true)),
+            lenientBoolean(root, "afk.drop-block-break-animation", true, typeAdjustments)),
         new Latency(
-            root.getBoolean("latency.enabled", true),
+            lenientBoolean(root, "latency.enabled", true, typeAdjustments),
             // 默认 400（性能优先）：更早发现卡顿并介入；仅有明显持续卡顿才会触发（见 sustain-seconds）。
             clampUpper(clampLower(root.getInt("latency.threshold-millis", 400),
                 1, "latency.threshold-millis", clampAdjustments),
@@ -451,7 +461,50 @@ public final class BandwidthConfig {
             clampUpper(clampLower(root.getInt("diagnostics.interval-seconds", 0),
                 0, "diagnostics.interval-seconds", clampAdjustments),
                 MAX_DIAGNOSTICS_INTERVAL_SECONDS, "diagnostics.interval-seconds", clampAdjustments)),
-        clampAdjustments);
+        clampAdjustments,
+        typeAdjustments);
+  }
+
+  /**
+   * 宽松解析布尔开关（带默认值）。
+   *
+   * <p><b>为什么不用 {@code ConfigurationSection#getBoolean}</b>：它的实现是「取值不是 Boolean 就返回
+   * 默认值」，因此 yml 里写成带引号的 {@code enabled: "false"}（YAML 里合法的字符串）会拿到默认
+   * {@code true}——管理员明确写下的「关闭」被静默反转成「仍然开启」，而配置里与日志里都看不出异常。
+   * 本方法把 {@link Boolean} 原样接受、{@code "true"}/{@code "false"}（大小写不敏感、去首尾空白）按
+   * 布尔解析，其它取值回落默认值并记进 {@code typeAdjustments}（加载时一次性 WARN，绝不静默改配置）。
+   *
+   * <p>合法配置的语义不变：真实布尔值照原样、缺键仍是默认值——宽松解析只在写法不被理解时介入。
+   */
+  private static boolean lenientBoolean(ConfigurationSection root, String path, boolean defaultValue,
+      List<String> typeAdjustments) {
+    Object raw = root.get(path);
+    if (raw == null) {
+      return defaultValue;
+    }
+    Boolean value = lenientBooleanValue(raw);
+    if (value == null) {
+      typeAdjustments.add(path + "=" + raw + "（不是布尔值，已按默认值 " + defaultValue + " 生效）");
+      return defaultValue;
+    }
+    return value;
+  }
+
+  /** 布尔值的宽松转换：{@link Boolean} 原样，{@code "true"}/{@code "false"} 字符串解析，其余返回 null。 */
+  private static Boolean lenientBooleanValue(Object raw) {
+    if (raw instanceof Boolean value) {
+      return value;
+    }
+    if (raw instanceof String text) {
+      String trimmed = text.trim();
+      if ("true".equalsIgnoreCase(trimmed)) {
+        return Boolean.TRUE;
+      }
+      if ("false".equalsIgnoreCase(trimmed)) {
+        return Boolean.FALSE;
+      }
+    }
+    return null;
   }
 
   /** 整数上限钳制：超过上限则取上限并记录明细（供一次性 WARN）。 */
@@ -567,13 +620,26 @@ public final class BandwidthConfig {
   }
 
   /**
-   * 被安全上限钳制或非有限值回落默认时的一次性中文 WARN。
+   * 「被安全上限 / 下限钳制」或「布尔键写法不被理解」时的一次性中文 WARN。
    *
-   * <p>钳制不改变默认行为（默认值都在区间内），只在管理员写了失控值时触发；用进程级一次性闸门避免
-   * 反复 reload 重复刷屏。两条明细都写清了「原值 → 生效值」与原因。
+   * <p>钳制不改变默认行为（默认值都在区间内），只在管理员写了失控值时触发；布尔键的宽松解析同理
+   * ——真实布尔值与缺键的语义都不变，只在写法不被理解时介入。用进程级一次性闸门避免反复 reload 刷屏。
+   * 两类明细都写清了「原值 → 生效值」与原因，绝不静默改用户配置。
    */
   public void warnIfClampApplied(Logger logger, AtomicBoolean once) {
-    if (clampAdjustments.isEmpty() || logger == null || !once.compareAndSet(false, true)) {
+    if (logger == null || (clampAdjustments.isEmpty() && typeAdjustments.isEmpty())) {
+      return;
+    }
+    if (!once.compareAndSet(false, true)) {
+      return;
+    }
+    if (!typeAdjustments.isEmpty()) {
+      logger.warning("bandwidth.yml 的 " + String.join("、", typeAdjustments)
+          + " 不是布尔值，已按各自的默认值生效。"
+          + "类型化 getBoolean 会把这类写法静默当成默认值（多半是 true），使「写下的关闭」变成"
+          + "「仍然开启」；请改成不带引号的 true / false。");
+    }
+    if (clampAdjustments.isEmpty()) {
       return;
     }
     logger.warning("bandwidth.yml 的 " + String.join("、", clampAdjustments)
@@ -585,6 +651,16 @@ public final class BandwidthConfig {
   /** 被安全上限 / 下限钳制过的配置键明细（空列表 = 未钳制）；供诊断回显。 */
   public List<String> clampAdjustments() {
     return clampAdjustments;
+  }
+
+  /**
+   * 布尔键写法不被理解、已按默认值生效的明细（空列表 = 未发生）。
+   *
+   * <p>供加载期一次性提示（{@link #warnIfClampApplied}）与单测使用；{@code /mxnet dump} 当前尚未输出
+   * 该明细（{@code util/Diagnostics} 属另一模块，需要时在那里补一行即可，与 AntiXrayConfig 同类明细一致）。
+   */
+  public List<String> typeAdjustments() {
+    return typeAdjustments;
   }
 
   /**

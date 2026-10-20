@@ -266,4 +266,28 @@ class RevealMarkOrderingTest {
     assertEquals(0, secondClaim.length, "已显形坐标不得再次进入批量发包集合");
     assertEquals(1, sends[0], "同一坐标跨两条路径合计只真正发包一次");
   }
+
+  /**
+   * <b>回显不产生新的观察事件</b>：整段都是回显的多方块变更不得派发事件即时显形；同一坐标按真实变更
+   * 处理时必须恰好派发一次。
+   *
+   * <p>这条语义此前只在多方块路径成立（{@code processSection} 过滤回显后不派发）；单方块路径漏了同样的
+   * 过滤，导致每发一个单包显形都在 netty 线程上白扫邻域、并消耗该 tick 的即时额度去显形自己的邻居。
+   * 现在两条路径共用「回显 → 只摘索引、不派发」的口径，本用例钉住派发闸门的两个分支。
+   */
+  @Test
+  void echoChangeDispatchesNoInstantRevealWhileRealChangeDispatchesOnce() {
+    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
+    int[] dispatched = {0};
+
+    BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1}, 1, index, revealed,
+        new ProximityStats(), (coordinates, count) -> dispatched[0]++,
+        (world, x, y, z) -> true);
+    assertEquals(0, dispatched[0], "回显不得触发事件即时显形");
+
+    BlockChangeRevealListener.processChanges(WORLD, new int[] {2, 64, 1}, 1, index, revealed,
+        new ProximityStats(), (coordinates, count) -> dispatched[0]++,
+        (world, x, y, z) -> false);
+    assertEquals(1, dispatched[0], "真实变更必须照常派发邻域显形（不得把正常观察一起过滤掉）");
+  }
 }

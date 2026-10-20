@@ -21,6 +21,16 @@ public final class ProximityStats {
   /** 因服务端自行下发方块变更而从索引注销的坐标数。 */
   public final LongAdder unregistered = new LongAdder();
 
+  /**
+   * 因工作线程池队列无容量而<b>整轮跳过</b>的巡检次数（显形只延迟、不丢失）。
+   *
+   * <p>为什么不退化到调用线程同步算完：候选筛选（视锥 + 遮挡位图射线）是本功能最重的 CPU，
+   * 本模块刻意把它搬到工作线程；队列满时若在玩家线程（Paper 主线程 / Folia 区域线程）照跑满额，
+   * 恰恰会在服务器最忙（区块集中下发把改写队列塞满）的时刻制造主线程毛刺。宁可本轮不显形：
+   * 坐标仍留在伪装索引里，下一巡检周期（分片轮转）会重新取到。
+   */
+  public final LongAdder passesSkippedNoCapacity = new LongAdder();
+
   /** 被视锥剔除的候选坐标数（不在玩家视野锥内）。 */
   public final LongAdder revealsFrustumCulled = new LongAdder();
 

@@ -11,6 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.sun.net.httpserver.HttpServer;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -19,6 +20,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -29,6 +32,7 @@ import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
@@ -408,19 +412,71 @@ class ZstdSupportTest {
     }
   }
 
-  /** 超时：总等待必须有硬上限（绝不超过 timeout-seconds），失败同样 fail-open。 */
+  /**
+   * 超时：必须由「本地服务连上却<b>不响应</b>」确定性触发，失败同样 fail-open。
+   *
+   * <p>旧写法连不可路由地址（10.255.255.1）再断言 {@code elapsed < 5s}：既依赖外网/路由/防火墙行为，
+   * 又可能「秒拒」通过而根本没走到超时路径，且在慢 CI 上还会因 wall clock 误红。现在改为：
+   * 本地 {@link HttpServer} 接受连接后 <b>不写响应头</b>并阻塞在 latch 上（不 sleep），
+   * 客户端只能等读到超时；断言的是<b>语义</b>——失败原因是超时、不是连接被拒/404/校验失败。
+   * 用例本身的挂死由 {@link Timeout} 兜底（不是含义模糊的耗时阈值断言）。
+   */
   @Test
-  void downloadTimeoutIsBoundedAndFailsOpen(@TempDir Path libDir) {
-    long startedAt = System.nanoTime();
+  @Timeout(20)
+  void downloadTimeoutIsBoundedAndFailsOpen(@TempDir Path libDir) throws Exception {
+    CountDownLatch requestReceived = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    HttpServer server = serveStalling(requestReceived, release);
+    try {
+      ZstdSupport.Codec result = ZstdSupport.downloadCodec(libDir, baseUrlOf(server), 1);
 
-    // 不可路由地址：连接会一直挂到连接超时，用来验证「总等待上限」生效
-    ZstdSupport.Codec result =
-        ZstdSupport.downloadCodec(libDir, "http://10.255.255.1:81", 1);
+      assertTrue(requestReceived.await(5, TimeUnit.SECONDS),
+          "前置：本地服务必须真的接到请求（否则测到的是连接失败，而不是「连上不响应」）");
+      assertNull(result, "超时必须返回 null（fail-open），交由上层回退内置 Deflater");
+      String reason = lastDownloadError();
+      assertTrue(reason.contains("超时") || reason.contains("SocketTimeoutException")
+              || reason.contains("timed out"),
+          "失败原因必须指向「超时」（而不是连接被拒/404/校验失败）：实际=" + reason);
+      // 只断言「不得留下成品 jar」：.tmp 的清理是尽力而为（生产注释明确说明残留无害、下次启动不认领），
+      // 在 Windows 上「读取线程尚持有句柄时删除」可能失败，把 .tmp 也断言为零会产生平台相关的假红。
+      try (var entries = Files.list(libDir)) {
+        java.util.List<String> leftovers = entries.map(entry -> entry.getFileName().toString()).toList();
+        assertTrue(leftovers.stream().noneMatch(name -> name.endsWith(".jar")),
+            "超时后不得留下任何成品 jar（半截下载只能存在于 .tmp 且不会被加载）：" + leftovers);
+      }
+    } finally {
+      release.countDown();
+      server.stop(0);
+    }
+  }
 
-    long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
-    assertNull(result, "超时必须返回 null（fail-open）");
-    assertTrue(elapsedMillis < 5_000L,
-        "等待时间必须有硬上限（1 秒超时 + 少量余量），实际 " + elapsedMillis + " ms");
+  /** 接受连接但永不写响应头的本地服务：客户端只能一直等到读超时（不依赖 sleep 或外网）。 */
+  private static HttpServer serveStalling(CountDownLatch requestReceived, CountDownLatch release)
+      throws IOException {
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext("/", exchange -> {
+      requestReceived.countDown();
+      try {
+        release.await();
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+      } finally {
+        exchange.close();
+      }
+    });
+    server.start();
+    return server;
+  }
+
+  /** 读出 {@link ZstdSupport} 记录的最近一次失败原因（私有静态字段）：用于断言「超时」语义而非耗时。 */
+  private static String lastDownloadError() {
+    try {
+      Field field = ZstdSupport.class.getDeclaredField("lastError");
+      field.setAccessible(true);
+      return String.valueOf(field.get(null));
+    } catch (ReflectiveOperationException failure) {
+      throw new AssertionError("无法读取 ZstdSupport.lastError（字段已改名？）", failure);
+    }
   }
 
   /**

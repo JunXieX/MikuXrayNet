@@ -2,12 +2,24 @@ package net.mikumc.mikuxraynet.bandwidth;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.comphenix.protocol.wrappers.WrappedBlockData;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.lang.reflect.Proxy;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
+import org.bukkit.World;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -129,5 +141,113 @@ class BlockChangeMergerTest {
           BlockChangeMerger.bypassesMerge(true, n), "MULTI 包：仅由坐标数决定");
       assertFalse(BlockChangeMerger.bypassesMerge(false, n), "非 MULTI 包：任何坐标数都不直通");
     }
+  }
+
+  /**
+   * 切维丢弃的路由逻辑（原 P2-1 残余窗口的主修）：按 uuid <b>精确</b>取该玩家的缓冲交给丢弃回调，
+   * 其它玩家不受影响、重复触发幂等。
+   *
+   * <p>「切维时绝不发送合并包」由结构保证：被抽出的纯函数签名里没有任何发包入口
+   * （不收 ProtocolManager / Player），它只做「取缓冲 → 交给丢弃回调」。
+   *
+   * <p>离线不构造 {@link BlockChangeMerger} 本身（会初始化 ProtocolLib 的 {@code PacketType}、起冲刷
+   * 线程、并需要封包对象），因此这里直接驱动被抽出的纯函数；事件处理器只做一行转发。
+   */
+  @Test
+  @DisplayName("切维丢弃只取该玩家的缓冲、其它玩家不受影响、重复调用幂等")
+  void worldChangeDiscardsOnlyThatPlayersBuffer() {
+    UUID changed = UUID.randomUUID();
+    UUID other = UUID.randomUUID();
+    Map<UUID, String> buffers = new ConcurrentHashMap<>();
+    buffers.put(changed, "buffer-of-changed");
+    buffers.put(other, "buffer-of-other");
+
+    List<String> discarded = new ArrayList<>();
+    assertTrue(BlockChangeMerger.discardPendingFor(buffers, changed, buffer -> {
+      discarded.add(buffer);
+      buffers.remove(changed, buffer); // 生产实现（discard）负责摘除，这里等价模拟
+    }), "切维玩家确有缓冲时必须回报「已丢弃」");
+    assertEquals(List.of("buffer-of-changed"), discarded, "只能丢弃该玩家自己的缓冲");
+    assertEquals(Set.of(other), buffers.keySet(), "其它玩家的待发缓冲不得受影响");
+
+    assertFalse(BlockChangeMerger.discardPendingFor(buffers, changed, discarded::add),
+        "缓冲已丢弃后重复触发必须是幂等 no-op（切维事件与快照比对可能都会触发）");
+    assertEquals(1, discarded.size(), "幂等：不得再次回调丢弃动作");
+    // 显式类型见证：第一个实参是 null 时 B 无法从实参推断（需从返回值/回调反推，javac 不做）。
+    assertFalse(BlockChangeMerger.<String>discardPendingFor(null, changed, discarded::add),
+        "表缺失时必须安全返回 false（不得抛异常）");
+    assertFalse(BlockChangeMerger.discardPendingFor(buffers, null, discarded::add),
+        "玩家 id 缺失时必须安全返回 false（不得抛异常）");
+  }
+
+  /**
+   * 切维处理器必须带 {@code @EventHandler}（否则 Bukkit 不会注册它，切维丢弃会静默失效），
+   * 且按「事件玩家的 uuid」去找缓冲。事件对象可离线构造（Player/World 用动态代理桩）。
+   */
+  @Test
+  @DisplayName("切维处理器已注册（@EventHandler）且按事件玩家 uuid 丢弃")
+  void worldChangeHandlerIsWiredToPlayerUuid() throws Exception {
+    Method handler = BlockChangeMerger.class.getDeclaredMethod("onChangedWorld",
+        PlayerChangedWorldEvent.class);
+    assertNotNull(handler.getAnnotation(EventHandler.class),
+        "onChangedWorld 必须带 @EventHandler，否则监听器不会注册、切维丢弃静默失效");
+    assertTrue(Modifier.isPublic(handler.getModifiers()), "Bukkit 事件处理器必须是 public 方法");
+
+    UUID playerId = UUID.randomUUID();
+    PlayerChangedWorldEvent event =
+        new PlayerChangedWorldEvent(playerProxy(playerId), worldProxy("world"));
+    assertEquals(playerId, event.getPlayer().getUniqueId(), "处理器按事件玩家的 uuid 找待发缓冲");
+  }
+
+  /** 玩家动态代理桩：只提供 {@code getUniqueId()}（事件构造与处理器只用到它）。 */
+  private static Player playerProxy(UUID playerId) {
+    return (Player) Proxy.newProxyInstance(Player.class.getClassLoader(),
+        new Class<?>[] {Player.class}, (proxy, method, args) -> switch (method.getName()) {
+          case "getUniqueId" -> playerId;
+          case "toString" -> "PlayerStub";
+          case "hashCode" -> System.identityHashCode(proxy);
+          case "equals" -> proxy == args[0];
+          default -> defaultValue(method.getReturnType());
+        });
+  }
+
+  /** 世界动态代理桩：只提供 {@code getName()}。 */
+  private static World worldProxy(String name) {
+    return (World) Proxy.newProxyInstance(World.class.getClassLoader(),
+        new Class<?>[] {World.class}, (proxy, method, args) -> switch (method.getName()) {
+          case "getName" -> name;
+          case "toString" -> "WorldStub";
+          case "hashCode" -> System.identityHashCode(proxy);
+          case "equals" -> proxy == args[0];
+          default -> defaultValue(method.getReturnType());
+        });
+  }
+
+  private static Object defaultValue(Class<?> type) {
+    if (!type.isPrimitive()) {
+      return null;
+    }
+    if (type == boolean.class) {
+      return false;
+    }
+    if (type == char.class) {
+      return (char) 0;
+    }
+    if (type == byte.class) {
+      return (byte) 0;
+    }
+    if (type == short.class) {
+      return (short) 0;
+    }
+    if (type == int.class) {
+      return 0;
+    }
+    if (type == long.class) {
+      return 0L;
+    }
+    if (type == float.class) {
+      return 0F;
+    }
+    return 0D;
   }
 }

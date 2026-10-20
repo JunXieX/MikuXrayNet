@@ -364,6 +364,34 @@ public final class AntiXrayConfig {
   public static final int CACHE_MAXIMUM_SIZE_MAX = 65536;
 
   /**
+   * {@code cache.maximum-bytes}（改写结果内存缓存的<b>按字节</b>硬上限）的默认值：512 MB。
+   *
+   * <p><b>为什么在「条目上限」之外还要一个字节上限</b>：条目上限只管「最多多少条」，管不住
+   * 「单条负载偏大」——同一个区块，普通地形约 20~25 KB，但直接调色板 / 高熵地形可以到几百 KB，
+   * 于是「条数没超、内存却超」完全可能发生。条目上限因此只是近似约束，真正与堆占用挂钩的是字节数。
+   *
+   * <p>默认 512 MB 对应约 2 万条「普通体积」条目，与 {@code cache.maximum-size} 的默认 40960
+   * 同量级但更保守：先撞到的通常是字节上限，管理员据此调小即可精确控制这块内存。
+   */
+  public static final long CACHE_MAXIMUM_BYTES_DEFAULT = 536_870_912L;
+
+  /**
+   * {@code cache.maximum-bytes} 的<b>安全下限</b>（64 MB）。
+   *
+   * <p>低于它连「一个视距内的改写结果」都装不下（2048 条普通体积条目 ≈ 50 MB），缓存等于关闭，
+   * 反而让每个区块都重新改写——与「调小以省内存」的初衷相反。因此低于下限会被抬升并留痕。
+   */
+  public static final long CACHE_MAXIMUM_BYTES_MIN = 67_108_864L;
+
+  /**
+   * {@code cache.maximum-bytes} 的<b>安全上限</b>（4 GB）。
+   *
+   * <p>条目上限 {@link #CACHE_MAXIMUM_SIZE_MAX}（65536）在不改它的情况下，按 20~25 KB/条约合
+   * 1.3~1.6 GB；本上限留出足够余量，只拦「手滑多打一位数」（如 53687091200）把堆一次吃光。
+   */
+  public static final long CACHE_MAXIMUM_BYTES_MAX = 4_294_967_296L;
+
+  /**
    * {@code advanced.threads}（反矿透改写工作线程数）的安全上限。
    *
    * <p>每个 worker 线程各持一份按线程复用的编解码 scratch（调色板反查表 + 位打包数组 + 输出缓冲，
@@ -713,6 +741,8 @@ public final class AntiXrayConfig {
   private final DiskCache diskCache;
   private final PlatformSupport.Mode platform;
   private final int cacheMaximumSize;
+  /** 改写结果内存缓存的按字节硬上限（与条目上限同时生效，谁先到顶以谁为准）。 */
+  private final long cacheMaximumBytes;
   private final int cacheExpireAfterAccessSeconds;
   private final int threads;
   private final int timeoutMillis;
@@ -744,7 +774,8 @@ public final class AntiXrayConfig {
       boolean[] dimensionEnabled, boolean dimensionsMissing, boolean layerObfuscation,
       boolean removeBlockEntities, Neighbors neighbors, Occlusion occlusion, Proximity proximity,
       DiskCache diskCache, PlatformSupport.Mode platform, int cacheMaximumSize,
-      int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis, int queueCapacity,
+      long cacheMaximumBytes, int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis,
+      int queueCapacity,
       Set<String> unresolvedTags, List<WorldOverride> worldOverrides,
       List<String> floorAdjustments, List<String> ceilingAdjustments,
       List<String> typeAdjustments) {
@@ -760,6 +791,9 @@ public final class AntiXrayConfig {
     this.diskCache = diskCache;
     this.platform = platform == null ? PlatformSupport.Mode.AUTO : platform;
     this.cacheMaximumSize = Math.max(1, cacheMaximumSize);
+    // 解析侧已按 [CACHE_MAXIMUM_BYTES_MIN, CACHE_MAXIMUM_BYTES_MAX] 钳制并留痕；这里只兜底非正数，
+    // 避免「配置项缺省/被写成 0」时把字节上限变成 0 而让缓存永久不可写（与 cacheMaximumSize 同口径）。
+    this.cacheMaximumBytes = Math.max(1L, cacheMaximumBytes);
     this.cacheExpireAfterAccessSeconds = Math.max(1, cacheExpireAfterAccessSeconds);
     this.threads = Math.max(0, threads);
     this.timeoutMillis = Math.max(100, timeoutMillis);
@@ -923,8 +957,9 @@ public final class AntiXrayConfig {
         continue;
       }
       anyDimensionSection = true;
-      dimensionEnabled[dimension.ordinal()] =
-          section.getBoolean("enabled", Boolean.TRUE.equals(DEFAULT_ENABLED.get(dimension)));
+      // 维度开关同样走宽松解析：enabled: "false" 被 getBoolean 当成默认值 true，会静默反转「关闭」意图
+      dimensionEnabled[dimension.ordinal()] = lenientBoolean(section, "enabled",
+          Boolean.TRUE.equals(DEFAULT_ENABLED.get(dimension)), typeAdjustments);
       effectives[dimension.ordinal()] = parseDimensionSection(section, fallback, unknownTags,
           typeAdjustments, "dimensions." + dimension.key());
     }
@@ -940,15 +975,18 @@ public final class AntiXrayConfig {
     List<String> ceilingAdjustments = new ArrayList<>(4);
 
     return new AntiXrayConfig(
-        root.getBoolean("enabled", true),
+        // 布尔键统一走宽松解析：getBoolean 对 "false"（带引号）这类写法会返回默认值 true，
+        // 于是「明确写下的关闭」被静默反转成「保持开启」。见 lenientBoolean(...) 说明。
+        lenientBoolean(root, "enabled", true, typeAdjustments),
         effectives,
         dimensionEnabled,
         !anyDimensionSection,
-        root.getBoolean("obfuscation.layer-obfuscation", false),
-        root.getBoolean("obfuscation.remove-block-entities", true),
+        lenientBoolean(root, "obfuscation.layer-obfuscation", false, typeAdjustments),
+        lenientBoolean(root, "obfuscation.remove-block-entities", true, typeAdjustments),
         new Neighbors(
-            root.getBoolean("neighbors.enabled", true),
-            missingPolicy(root.getString("neighbors.missing-policy", "hide")),
+            lenientBoolean(root, "neighbors.enabled", true, typeAdjustments),
+            // 枚举类字符串键同样走宽松解析：非法值回落默认并留痕（见 missingPolicy 的说明）
+            missingPolicy(root.get("neighbors.missing-policy"), typeAdjustments),
             // 默认 2048（原为 512）：快照已按位打包（每格 1 bit，主世界 384 高度约 3 KB/条），
             // 2048 条约 6 MB；512 条时缓存接近饱和、抓取次数随玩家移动抖动
             //（单次抓取实测约 0.776 ms，现按列高度上界裁剪后更少）。
@@ -960,7 +998,7 @@ public final class AntiXrayConfig {
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-occluding")),
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding"))),
         new Proximity(
-            root.getBoolean("proximity.enabled", true),
+            lenientBoolean(root, "proximity.enabled", true, typeAdjustments),
             // 默认 96（原 64）：真机反馈「64 格仍然偏近」。显形只在射线通畅时才还原，
             // 因此放大距离不会隔着墙泄露——它只是把「本来就看得到的矿」更早、更远地还给玩家。
             // 但扫描量随半径平方增长，故设有安全上限（见 PROXIMITY_DISTANCE_MAX）。
@@ -985,7 +1023,7 @@ public final class AntiXrayConfig {
             clampCeiling(root.getInt("proximity.max-positions-per-player", 524288), 1,
                 PROXIMITY_MAX_POSITIONS_PER_PLAYER_MAX, "proximity.max-positions-per-player",
                 floorAdjustments, ceilingAdjustments),
-            root.getBoolean("proximity.frustum.enabled", true),
+            lenientBoolean(root, "proximity.frustum.enabled", true, typeAdjustments),
             // 视锥两键都有安全下限（见 FRUSTUM_FOV_FLOOR / FRUSTUM_MIN_DISTANCE_FLOOR）：
             // 配得比客户端可视范围更窄会让「玩家看得见的方块」保持伪装，因此低于下限时按下限生效，
             // 并把被抬升的键记进 floorAdjustments，由加载时一次性 WARN 显式告知（绝不静默改配置）。
@@ -994,14 +1032,14 @@ public final class AntiXrayConfig {
             frustumMinDistance(
                 root.getDouble("proximity.frustum.min-distance", FRUSTUM_MIN_DISTANCE_DEFAULT),
                 floorAdjustments),
-            root.getBoolean("proximity.raycast.enabled", true),
+            lenientBoolean(root, "proximity.raycast.enabled", true, typeAdjustments),
             // 本键表示「每方块最多尝试的候选点数」。
             // 钳制 1..PROXIMITY_RAY_SAMPLES_MAX（有效上限 = 暴露面上的候选点数），默认即上限 5。
             // 用 clampCeiling 而非裸 Math.min/max：两端钳制都留痕，管理员能看到配置已被改写。
             clampCeiling(root.getInt("proximity.raycast.samples", 5), 1, PROXIMITY_RAY_SAMPLES_MAX,
                 "proximity.raycast.samples", floorAdjustments, ceilingAdjustments),
             new InstantReveal(
-                root.getBoolean("proximity.instant-reveal.enabled", true),
+                lenientBoolean(root, "proximity.instant-reveal.enabled", true, typeAdjustments),
                 // 半径同时受「下限 1」与「上限 8」约束（见 PROXIMITY_INSTANT_RADIUS_MAX）：
                 // 旧实现用裸 Math.min/Math.max 静默钳制，管理员看不出配置已被改写，故改为两端留痕。
                 clampCeiling(root.getInt("proximity.instant-reveal.radius", 4), 1,
@@ -1015,9 +1053,9 @@ public final class AntiXrayConfig {
                 floorAdjustments, ceilingAdjustments),
             // 批量合并显形包（默认开启）：把一个周期内的显形用 Paper 原生多方块变更包一次发出。
             // 关掉即逐坐标发单方块变更包（旧行为），供 A/B 对比与线上回退。
-            root.getBoolean("proximity.batch-reveal-sends", true)),
+            lenientBoolean(root, "proximity.batch-reveal-sends", true, typeAdjustments)),
         new DiskCache(
-            root.getBoolean("disk-cache.enabled", true),
+            lenientBoolean(root, "disk-cache.enabled", true, typeAdjustments),
             // 上限见 DISK_CACHE_MAX_ENTRIES_MAX：条目上限直接决定磁盘占用与启动期扫描量。
             clampCeiling(root.getInt("disk-cache.max-entries", 20000), 1,
                 DISK_CACHE_MAX_ENTRIES_MAX, "disk-cache.max-entries", floorAdjustments,
@@ -1030,7 +1068,9 @@ public final class AntiXrayConfig {
             // 两次启动的间隔还短，条目在重启后必然已过期，磁盘缓存等于白写（真机命中率恒为 0 的根因）。
             diskCacheExpireSeconds(root.getInt("disk-cache.expire-seconds", 7 * 24 * 60 * 60),
                 floorAdjustments),
-            // 上限见 DISK_CACHE_BUCKET_CACHE_SIZE_MAX：区域文件只有 16 个 bucket，配大无收益。
+            // 上限见 DISK_CACHE_BUCKET_CACHE_SIZE_MAX：一个区域文件的记录条数上限是 BUCKET_COUNT=1024
+            // （BufferedLinearV3Format，一槽一条记录），但每文件常驻 64 条已约 6 MB 内存——再往上抬只会
+            // 放大「多文件同时打开」时的驻留内存，故按内存取舍收在 64，而不是格式上限。
             clampCeiling(root.getInt("disk-cache.bucket-cache-size", 8), 1,
                 DISK_CACHE_BUCKET_CACHE_SIZE_MAX, "disk-cache.bucket-cache-size", floorAdjustments,
                 ceilingAdjustments),
@@ -1049,7 +1089,7 @@ public final class AntiXrayConfig {
                 DISK_CACHE_QUEUE_CAPACITY_MAX, "disk-cache.queue-capacity", floorAdjustments,
                 ceilingAdjustments),
             // zstd 前置：服务端自带则直接用；没有则按这几键决定是否自动下载与校验（见 ZstdSupport）
-            root.getBoolean("disk-cache.zstd.auto-download", true),
+            lenientBoolean(root, "disk-cache.zstd.auto-download", true, typeAdjustments),
             zstdDownloadUrl(root),
             // 上限见 DISK_CACHE_ZSTD_TIMEOUT_MAX_SECONDS：该超时在 onEnable 主线程上同步等待下载，
             // 配得过大则网络黑洞时开服可被卡任意久。
@@ -1069,6 +1109,14 @@ public final class AntiXrayConfig {
         // 上限见 CACHE_MAXIMUM_SIZE_MAX：每条约 20~25 KB，饱和时内存占用与条目数成正比。
         clampCeiling(root.getInt("cache.maximum-size", 40960), 1,
             CACHE_MAXIMUM_SIZE_MAX, "cache.maximum-size", floorAdjustments, ceilingAdjustments),
+        // 按字节的硬上限：条目上限管不住「单条负载偏大」（直接调色板 / 高熵地形可到几百 KB/条），
+        // 字节上限才是与堆占用直接挂钩的那一个。两端都留痕：下限防止把缓存配成事实关闭（反而更耗 CPU），
+        // 上限只拦手滑多打一位数（默认 512 MB，正常调优撞不到）。
+        clampCeiling(
+            lenientLongValue(root.get("cache.maximum-bytes"), CACHE_MAXIMUM_BYTES_DEFAULT,
+                "cache.maximum-bytes", typeAdjustments),
+            CACHE_MAXIMUM_BYTES_MIN, CACHE_MAXIMUM_BYTES_MAX, "cache.maximum-bytes",
+            floorAdjustments, ceilingAdjustments),
         clampCeiling(root.getInt("cache.expire-after-access-seconds", 600), 1,
             CACHE_EXPIRE_AFTER_ACCESS_SECONDS_MAX, "cache.expire-after-access-seconds",
             floorAdjustments, ceilingAdjustments),
@@ -1093,15 +1141,6 @@ public final class AntiXrayConfig {
         typeAdjustments);
   }
 
-  /**
-   * 编译世界名通配模式：含 {@code *} 时预编译为正则（{@code *} → 任意字符序列）；不含则返回 {@code null}（走精确名比较）。
-   */
-  private static Pattern compileGlob(String pattern) {
-    return pattern.indexOf('*') >= 0
-        ? Pattern.compile("\\Q" + pattern.replace("*", "\\E.*\\Q") + "\\E")
-        : null;
-  }
-
   /** 解析某个维度段（未出现的键回落该维度的内置默认）。 */
   private static EffectiveObfuscation parseDimensionSection(ConfigurationSection section,
       EffectiveObfuscation fallback, Set<String> unknownTags, List<String> typeAdjustments,
@@ -1121,7 +1160,8 @@ public final class AntiXrayConfig {
       }
     }
     Map<String, Integer> weights = parseWeights(
-        section.getConfigurationSection("replacement-weights"), unknownTags);
+        section.getConfigurationSection("replacement-weights"), unknownTags, typeAdjustments,
+        path + ".replacement-weights");
     if (weights.isEmpty()) {
       weights = fallback.replacementWeights();
     }
@@ -1139,9 +1179,10 @@ public final class AntiXrayConfig {
     Integer minY = lenientYValue(section.get("min-y"), path + ".min-y", typeAdjustments);
     Integer maxY = lenientYValue(section.get("max-y"), path + ".max-y", typeAdjustments);
     ObfuscationMode mode = section.contains("mode")
-        ? obfuscationMode(section.getString("mode")) : fallback.mode();
-    boolean useBlockBelow = section.contains("use-block-below")
-        ? section.getBoolean("use-block-below") : fallback.useBlockBelow();
+        ? obfuscationMode(section.get("mode"), path + ".mode", typeAdjustments) : fallback.mode();
+    // 缺键沿用 fallback；写了但不是布尔值时回落 fallback 并留一条明细（旧实现会静默当成 false）
+    boolean useBlockBelow = lenientBoolean(section, "use-block-below", fallback.useBlockBelow(),
+        typeAdjustments);
     return new EffectiveObfuscation(hideBlocks, weights, bands,
         minY == null ? fallback.minY() : minY, maxY == null ? fallback.maxY() : maxY,
         mode, useBlockBelow);
@@ -1150,19 +1191,30 @@ public final class AntiXrayConfig {
   /**
    * 解析「方块名 → 权重」表（支持 {@code tag(...)}，权重非正的条目被丢弃）。
    *
+   * <p><b>为什么权重必须走宽松解析</b>：旧实现用 {@code section.getInt(key, 0)}，而类型化 getter 只认
+   * YAML 的整数节点——权重写成带引号的 {@code "10"} 或有小数的 {@code 10.0} 时它静默返回 0，条目被当作
+   * 「权重非正」丢弃；若整张表都这么写，{@code weights.isEmpty()} 成立后直接回落内置默认表，最终伪装
+   * 外观与配置毫无关系，控制台却没有任何提示（这类「写了但没生效」正是本项目明令禁止的静默落差）。
+   * 这里与 {@code min-y}/{@code max-y} 用同一套口径：整数/长整数/整值浮点/十进制数字字符串均接受，
+   * 小数四舍五入取整并记入 {@code typeAdjustments}，无法解析的值记入明细后跳过该条。
+   *
+   * @param path 键的完整路径前缀（如 {@code dimensions.normal.replacement-weights}），用于告警定位
    * @return 有序表；无有效条目时为空表
    */
   private static Map<String, Integer> parseWeights(ConfigurationSection section,
-      Set<String> unknownTags) {
+      Set<String> unknownTags, List<String> typeAdjustments, String path) {
     if (section == null) {
       return Map.of();
     }
     Map<String, Integer> weights = new LinkedHashMap<>();
     for (String key : section.getKeys(false)) {
-      int weight = section.getInt(key, 0);
       // 空白键（YAML 里的 "" / ~）归一化后是空名，不可能对应任何方块：留着只会让候选表里多一条
       // 永远解析失败的条目，并让诊断里的「伪装 N 种」虚增。
-      if (weight <= 0 || key == null || key.trim().isEmpty()) {
+      if (key == null || key.trim().isEmpty()) {
+        continue;
+      }
+      Integer weight = lenientWeight(section.get(key), path + "." + key, typeAdjustments);
+      if (weight == null || weight <= 0) {
         continue;
       }
       for (String name : expandTags(List.of(key), unknownTags)) {
@@ -1173,6 +1225,89 @@ public final class AntiXrayConfig {
       }
     }
     return weights;
+  }
+
+  /**
+   * 宽松解析一个伪装权重（正整数）。
+   *
+   * <p>接受：整数类型（Integer/Long/Short/Byte）、整值浮点、以及十进制数字字符串（可带正负号）。
+   * 小数按 {@link Math#round(double)} 四舍五入取整并记入 {@code typeAdjustments}——伪装的<b>分布</b>
+   * 由权重决定，静默把 10.5 截成 10 会让管理员看到的分布与预期不一致，因此必须留痕。
+   * 无法解析时同样记入明细并返回 {@code null}（该条目被跳过）。
+   *
+   * <p><b>非正权重为什么静默丢弃、不告警</b>：yml 注释已写明「须为正整数」，而写 0/负数通常是
+   * 「暂时停用某个伪装候选」的刻意做法；逐条告警会把一次正常调整变成一串 WARN。真正需要告警的是
+   * 「写法根本不被理解」（带引号/浮点/其它类型）——那才是管理员以为生效、实际却没生效的情形。
+   *
+   * @param path 键的完整路径（用于告警定位，如 {@code dimensions.normal.replacement-weights.stone}）
+   * @return 已取整的正权重；缺失、非正或无法解析时返回 {@code null}
+   */
+  private static Integer lenientWeight(Object raw, String path, List<String> typeAdjustments) {
+    if (raw == null) {
+      return null; // 键缺值 / ~：与旧实现一致，按非正权重丢弃，不告警
+    }
+    if (raw instanceof Integer || raw instanceof Long || raw instanceof Short
+        || raw instanceof Byte) {
+      return clampWeight(((Number) raw).longValue(), path, typeAdjustments);
+    }
+    if (raw instanceof Double || raw instanceof Float) {
+      double value = ((Number) raw).doubleValue();
+      if (!Double.isFinite(value)) {
+        typeAdjustments.add(path + "=" + value + "（不是有效权重，已忽略该条目）");
+        return null;
+      }
+      long rounded = Math.round(value);
+      if (rounded != value) {
+        typeAdjustments.add(path + "=" + value + "（权重须为整数，已四舍五入为 " + rounded + "）");
+      }
+      return clampWeight(rounded, path, typeAdjustments);
+    }
+    if (raw instanceof String text) {
+      String trimmed = text.trim();
+      if (trimmed.isEmpty()) {
+        return null;
+      }
+      try {
+        return clampWeight(Long.parseLong(trimmed), path, typeAdjustments);
+      } catch (NumberFormatException notInteger) {
+        // 落到下面按十进制小数再试一次（覆盖带引号的小数，如 "10.5"）
+      }
+      try {
+        double value = Double.parseDouble(trimmed);
+        if (!Double.isFinite(value)) {
+          typeAdjustments.add(path + "=" + describe(raw) + "（不是有效权重，已忽略该条目）");
+          return null;
+        }
+        long rounded = Math.round(value);
+        if (rounded != value) {
+          typeAdjustments.add(path + "=" + describe(raw) + "（权重须为整数，已四舍五入为 "
+              + rounded + "）");
+        }
+        return clampWeight(rounded, path, typeAdjustments);
+      } catch (NumberFormatException notNumber) {
+        typeAdjustments.add(path + "=" + describe(raw) + "（不是数字，已忽略该条目）");
+        return null;
+      }
+    }
+    typeAdjustments.add(path + "=" + describe(raw) + "（不是数字，已忽略该条目）");
+    return null;
+  }
+
+  /**
+   * 权重取值收敛：非正返回 {@code null}（丢弃），超出 int 的饱和到 {@link Integer#MAX_VALUE}。
+   *
+   * <p>饱和而不是丢弃：伪装分布用累计权重实现，超大权重与「饱和后的极大权重」在实际分布上等价
+   * （{@code ObfuscationProcessor.weightedTable} 本身也做饱和累加），保留它比静默删掉一个候选更安全。
+   */
+  private static Integer clampWeight(long value, String path, List<String> typeAdjustments) {
+    if (value <= 0L) {
+      return null;
+    }
+    if (value > Integer.MAX_VALUE) {
+      typeAdjustments.add(path + "=" + value + "（权重过大，已按 " + Integer.MAX_VALUE + " 生效）");
+      return Integer.MAX_VALUE;
+    }
+    return (int) value;
   }
 
   /**
@@ -1208,11 +1343,17 @@ public final class AntiXrayConfig {
       Map<String, Integer> weights = new LinkedHashMap<>();
       if (entry.get("weights") instanceof Map<?, ?> weightMap) {
         for (Map.Entry<?, ?> weightEntry : weightMap.entrySet()) {
-          int weight = weightEntry.getValue() instanceof Number number ? number.intValue() : 0;
           // 键必须是有效方块名：null / 空白（YAML 里的 ~ 或 ""）无法对应任何方块状态，
           // 保留它只会让分区表里多一条永远解析失败的条目，并在诊断回显里显示成 "null"。
           String name = weightEntry.getKey() == null ? "" : String.valueOf(weightEntry.getKey()).trim();
-          if (weight > 0 && !name.isEmpty()) {
+          if (name.isEmpty()) {
+            continue;
+          }
+          // 与 replacement-weights 同口径宽松解析：带引号的数字 / 整值浮点都接受，小数四舍五入并留痕。
+          // 旧实现在这里用 instanceof Number ? intValue() : 0，字符串权重会被静默当成 0 丢掉。
+          Integer weight = lenientWeight(weightEntry.getValue(),
+              bandPath + ".weights." + name, typeAdjustments);
+          if (weight != null && weight > 0) {
             weights.put(OcclusionRules.normalize(name), weight);
           }
         }
@@ -1242,7 +1383,8 @@ public final class AntiXrayConfig {
         continue;
       }
       // 通配模式预编译为正则（'*' → 任意字符序列）；不含 '*' 时走精确名比较，无需匹配器
-      Pattern glob = compileGlob(pattern);
+      // 通配编译与 blacklist.yml 共用同一份实现（WorldGlobs），避免两处语义悄悄分叉
+      Pattern glob = WorldGlobs.compile(pattern);
       // 覆盖键的完整路径（仅用于类型不符时的告警文案，让服主能一眼定位到哪一行）
       String path = "world-overrides." + pattern;
       // enabled：可覆盖所属维度的启用开关；缺省 null = 沿用维度（绝不静默当成 false）
@@ -1263,7 +1405,8 @@ public final class AntiXrayConfig {
       Map<String, Integer> replacementWeights = null;
       if (world.contains("replacement-weights")) {
         Map<String, Integer> parsed = parseWeights(
-            world.getConfigurationSection("replacement-weights"), unknownTags);
+            world.getConfigurationSection("replacement-weights"), unknownTags, typeAdjustments,
+            path + ".replacement-weights");
         if (!parsed.isEmpty()) {
           replacementWeights = parsed; // 空覆盖回落维度值，避免「配了但配错 → 不伪装」的静默失效
         }
@@ -1276,9 +1419,10 @@ public final class AntiXrayConfig {
       Integer minY = lenientYValue(world.get("min-y"), path + ".min-y", typeAdjustments);
       Integer maxY = lenientYValue(world.get("max-y"), path + ".max-y", typeAdjustments);
       ObfuscationMode mode = world.contains("mode")
-          ? obfuscationMode(world.getString("mode")) : null;
-      Boolean useBlockBelow = world.contains("use-block-below")
-          ? world.getBoolean("use-block-below") : null;
+          ? obfuscationMode(world.get("mode"), path + ".mode", typeAdjustments) : null;
+      // 缺键返回 null（沿用所属维度）；不是布尔值时同样返回 null 并留一条明细
+      Boolean useBlockBelow = lenientBoolean(world, "use-block-below",
+          path + ".use-block-below", typeAdjustments);
 
       overrides.add(new WorldOverride(pattern, glob, enabled, hideBlocks, replacementWeights,
           replacementBands, minY, maxY, mode, useBlockBelow));
@@ -1335,17 +1479,39 @@ public final class AntiXrayConfig {
     return null;
   }
 
+  /**
+   * 宽松解析 long 型配置值（当前用于 {@code cache.maximum-bytes} 这类按字节计的容量键）。
+   *
+   * <p>与 {@link #lenientYValue} 同口径：接受整数类型（Integer/Long/Short/Byte）与十进制数字字符串
+   * （可带正负号），其余写法记一条 {@code typeAdjustments} 后回落默认值。刻意不用
+   * {@code ConfigurationSection#getLong}：它对带引号的数字同样静默取默认值，会让「写了却没生效」无声无息
+   * ——而这正是 D1/D2 两处宽松解析要消灭的那类落差。
+   */
+  private static long lenientLongValue(Object raw, long defaultValue, String path,
+      List<String> typeAdjustments) {
+    if (raw == null) {
+      return defaultValue;
+    }
+    Long value = integralValue(raw);
+    if (value == null) {
+      typeAdjustments.add(path + "=" + describe(raw) + "（不是整数，已按默认值 " + defaultValue
+          + " 生效）");
+      return defaultValue;
+    }
+    return value;
+  }
+
   /** 告警里回显原始值的写法（字符串加引号，便于服主看出「多写了一对引号」）。 */
   private static String describe(Object raw) {
     return raw instanceof String text ? "\"" + text + "\"" : String.valueOf(raw);
   }
 
   /**
-   * 宽松解析布尔开关（{@code world-overrides.<世界>.enabled}）。
+   * 宽松解析布尔开关（{@code world-overrides.<世界>.enabled}）：缺键返回 {@code null}（= 沿用所属维度）。
    *
    * <p>接受 YAML 布尔与 {@code "true"} / {@code "false"} 字符串（大小写不敏感、去首尾空白）；
-   * 其它类型返回 null（= 沿用所属维度）并记进 {@code typeAdjustments}。这里刻意不走
-   * {@code getBoolean}：它对类型不符的取值同样静默返回默认值，会让「本想关闭」的世界悄悄保持启用。
+   * 其它类型返回 null 并记进 {@code typeAdjustments}。这里刻意不走 {@code getBoolean}：它对类型不符的
+   * 取值同样静默返回默认值，会让「本想关闭」的世界悄悄保持启用。
    */
   private static Boolean lenientBoolean(ConfigurationSection section, String key, String path,
       List<String> typeAdjustments) {
@@ -1353,6 +1519,48 @@ public final class AntiXrayConfig {
       return null;
     }
     Object raw = section.get(key);
+    if (raw == null) {
+      return null; // 键存在但无值（YAML 里的 "enabled:"）：按「未写」处理，不告警
+    }
+    Boolean value = lenientBooleanValue(raw);
+    if (value == null) {
+      typeAdjustments.add(path + "=" + describe(raw) + "（类型不符，已忽略该覆盖，沿用所属维度）");
+    }
+    return value;
+  }
+
+  /**
+   * 宽松解析<b>带默认值</b>的布尔开关（{@code enabled} / {@code use-block-below} / 各模块开关等）。
+   *
+   * <p><b>为什么不能用 {@code getBoolean}</b>：它的实现是「取值不是 Boolean 就返回默认值」，于是 yml 里
+   * 写成带引号的 {@code enabled: "false"}（YAML 里是完全合法的字符串）会拿到默认 {@code true}——
+   * 「明确写下的关闭」被静默反转成「保持开启」，日志里没有任何痕迹（配置里也看不出异常）。
+   * 这里改为：Boolean 原样、{@code "true"}/{@code "false"}（大小写不敏感、去首尾空白）按布尔解析，
+   * 其余取值回落默认值并记进 {@code typeAdjustments}，由加载路径一次性 WARN。
+   *
+   * <p><b>合法配置的语义不变</b>：{@code enabled: false} 仍是 false、缺键仍是默认值——宽松解析只在
+   * 写法不被理解时才介入，绝不改变真实布尔值的含义。
+   */
+  private static boolean lenientBoolean(ConfigurationSection section, String path,
+      boolean defaultValue, List<String> typeAdjustments) {
+    Object raw = section.get(path);
+    if (raw == null) {
+      return defaultValue;
+    }
+    Boolean value = lenientBooleanValue(raw);
+    if (value == null) {
+      typeAdjustments.add(path + "=" + describe(raw) + "（不是布尔值，已按默认值 " + defaultValue
+          + " 生效）");
+      return defaultValue;
+    }
+    return value;
+  }
+
+  /**
+   * 布尔值的宽松转换：{@link Boolean} 原样，{@code "true"}/{@code "false"} 字符串解析，其它返回
+   * {@code null}（由调用方决定回落策略并留一条明细）。
+   */
+  private static Boolean lenientBooleanValue(Object raw) {
     if (raw instanceof Boolean value) {
       return value;
     }
@@ -1364,9 +1572,6 @@ public final class AntiXrayConfig {
       if ("false".equalsIgnoreCase(trimmed)) {
         return Boolean.FALSE;
       }
-    }
-    if (raw != null) {
-      typeAdjustments.add(path + "=" + describe(raw) + "（类型不符，已忽略该覆盖，沿用所属维度）");
     }
     return null;
   }
@@ -1507,6 +1712,26 @@ public final class AntiXrayConfig {
   }
 
   /**
+   * long 版整数钳制：语义与 {@link #clampCeiling(int, int, int, String, List, List)} 完全一致。
+   *
+   * <p>为什么单独给一个 long 重载：按字节计的容量键（{@code cache.maximum-bytes} 可达 4 GB）
+   * 超出 int 范围，用 {@code getInt} 解析会让 4 GB 这类合法上限被读成默认值；而两端钳制同样要留痕
+   * （下限防「事实关闭缓存」、上限拦「手滑多打一位数」），否则就退回到旧实现那种静默改配置。
+   */
+  private static long clampCeiling(long value, long minimum, long maximum, String key,
+      List<String> floorAdjustments, List<String> ceilingAdjustments) {
+    if (value < minimum) {
+      floorAdjustments.add(key + "=" + value + "（下限 " + minimum + "）");
+      return minimum;
+    }
+    if (value > maximum) {
+      ceilingAdjustments.add(key + "=" + value + "（上限 " + maximum + "）");
+      return maximum;
+    }
+    return value;
+  }
+
+  /**
    * 邻近显形触发距离的生效值：非有限值（NaN / ±Inf）回落默认
    * （{@link #PROXIMITY_DISTANCE_DEFAULT}），负数钳到 0（= 关闭邻近显形触发），
    * 超过 {@link #PROXIMITY_DISTANCE_MAX} 时按上限生效。
@@ -1536,20 +1761,57 @@ public final class AntiXrayConfig {
     return configured;
   }
 
-  /** 解析缺失策略；取值非法时回落到最安全的 {@link MissingPolicy#HIDE}。 */
-  private static MissingPolicy missingPolicy(String value) {
-    if (value == null) {
-      return MissingPolicy.HIDE;
+  /**
+   * 宽松解析缺失策略（{@code neighbors.missing-policy}）。
+   *
+   * <p>接受不区分大小写、首尾可带空白的 {@code hide} / {@code expose}（与旧实现的可接受集合逐字相同）；
+   * 其它取值回落最安全的 {@link MissingPolicy#HIDE}，并记入 {@code typeAdjustments}。
+   *
+   * <p><b>为什么必须留痕</b>：旧实现只做一次相等比较，写错（{@code expse}）会静默按 hide 生效——而 hide
+   * 恰好是最保守的一侧，管理员会以为自己配的 expose 已生效，实际却在「多伪装」，且日志里没有任何提示。
+   * 这与布尔键的类型化 getter 属同一类「写了却没生效」的静默落差。
+   */
+  private static MissingPolicy missingPolicy(Object raw, List<String> typeAdjustments) {
+    if (raw == null) {
+      return MissingPolicy.HIDE; // 键缺失：正常回落，不告警
     }
-    return "expose".equals(value.trim().toLowerCase(Locale.ROOT)) ? MissingPolicy.EXPOSE
-        : MissingPolicy.HIDE;
+    if (raw instanceof String text) {
+      String normalized = text.trim().toLowerCase(Locale.ROOT);
+      if ("expose".equals(normalized)) {
+        return MissingPolicy.EXPOSE;
+      }
+      if ("hide".equals(normalized)) {
+        return MissingPolicy.HIDE;
+      }
+    }
+    typeAdjustments.add("neighbors.missing-policy=" + describe(raw)
+        + "（不是 hide / expose，已按最安全的 " + MissingPolicy.HIDE + " 生效）");
+    return MissingPolicy.HIDE;
   }
 
-  /** 解析伪装模式；只有显式填写 {@code enclosed} 才回到旧行为，其它一律取更安全的 {@link ObfuscationMode#ALL}。 */
-  private static ObfuscationMode obfuscationMode(String value) {
-    if (value != null && "enclosed".equals(value.trim().toLowerCase(Locale.ROOT))) {
-      return ObfuscationMode.ENCLOSED;
+  /**
+   * 宽松解析伪装模式（{@code dimensions.<维度>.mode} / {@code world-overrides.<世界>.mode}）。
+   *
+   * <p>接受不区分大小写、首尾可带空白的 {@code all} / {@code enclosed}（与旧实现的可接受集合逐字相同）；
+   * 其它取值回落更安全的 {@link ObfuscationMode#ALL}，并记入 {@code typeAdjustments}（{@code path} 用于
+   * 点名具体键，如 {@code dimensions.normal.mode}）。
+   *
+   * <p><b>为什么必须留痕</b>：旧实现只在「恰好等于 enclosed」时取 ENCLOSED，写错（{@code enclose}）会
+   * 静默按 ALL 生效——ALL 会把矿洞壁上本可看见的矿也伪装掉，玩家观感与管理员预期相反，却无任何提示。
+   */
+  private static ObfuscationMode obfuscationMode(Object raw, String path,
+      List<String> typeAdjustments) {
+    if (raw instanceof String text) {
+      String normalized = text.trim().toLowerCase(Locale.ROOT);
+      if ("enclosed".equals(normalized)) {
+        return ObfuscationMode.ENCLOSED;
+      }
+      if ("all".equals(normalized)) {
+        return ObfuscationMode.ALL;
+      }
     }
+    typeAdjustments.add(path + "=" + describe(raw)
+        + "（不是 all / enclosed，已按更安全的 " + ObfuscationMode.ALL + " 生效）");
     return ObfuscationMode.ALL;
   }
 
@@ -1608,19 +1870,27 @@ public final class AntiXrayConfig {
     if (!once.compareAndSet(false, true)) {
       return;
     }
-    // 类型不符：getInt/getBoolean 会静默取默认值（0 / false），这里改为一次性点名并说明已按安全默认处理
+    // 写法不被理解（类型不符 / 无法解析）：类型化 getter 会静默取默认值（0 / false / 丢掉条目），
+    // 这里改为一次性点名并说明每类键实际按什么生效——这是权重 / 布尔 / 枚举类键宽松解析的可见出口。
     if (!typeAdjustments.isEmpty()) {
       logger.warning("antixray.yml 的 " + String.join("、", typeAdjustments) + "。"
-          + "类型不符的键已按更安全的默认值处理：高度键不再限制高度（world-overrides 里则回落所属维度），"
-          + "enabled 沿用所属维度。旧实现会把带引号或浮点的高度静默当成 0，"
-          + "使高度范围被收窄成 [0,0]，该世界几乎不再伪装；"
-          + "请写成不带引号的整数，例如 min-y: -64、max-y: 320，开关写成 enabled: false。");
+          + "写法无法识别的键已按更安全的取值处理：伪装权重无法解析时跳过该条（该候选不参与伪装），"
+          + "高度键不再限制高度（world-overrides 里则回落所属维度），布尔开关按默认值生效"
+          + "（world-overrides 的开关则沿用所属维度），枚举类开关（neighbors.missing-policy 与各 mode）"
+          + "也按默认值生效。旧实现会把这些写法静默吞掉：带引号/浮点的高度被当成 0（高度范围收窄成 [0,0]，"
+          + "该世界几乎不再伪装）、带引号/浮点的权重被当成 0（该伪装方块直接消失）、enabled: \"false\" 被当成"
+          + "默认值 true（「写下的关闭」变成「仍然开启」）、missing-policy: expse 或 mode: enclose 这类拼错"
+          + "被当成默认策略（与实际意图相反且无提示）。请把数字写成不带引号的整数（如 min-y: -64、"
+          + "权重 stone: 10）、布尔写成不带引号的 true / false、枚举写成 hide / expose 与 all / enclosed。");
     }
     if (!floorAdjustments.isEmpty()) {
-      logger.warning("antixray.yml 的 " + String.join("、", floorAdjustments) + " 低于安全下限，已按下限生效"
+      // 明细里既有「低于下限被抬升」，也有「取值非法/非有限值回落默认」——两者的共同点是「没有按你写的值
+      // 生效」，因此文案不再一律说成「低于下限」（那会让写了 NaN / 负角度的管理员以为自己配的是合法的过窄值）。
+      logger.warning("antixray.yml 的 " + String.join("、", floorAdjustments)
+          + " 低于安全下限或取值非法，已改按安全值生效"
           + "（当前：proximity.frustum.fov=" + proximity.frustumFov() + "°、min-distance="
           + proximity.frustumMinDistance() + " 格、disk-cache.expire-seconds="
-          + diskCache.expireSeconds() + " 秒）。低于下限的取值会让对应功能静默失效："
+          + diskCache.expireSeconds() + " 秒）。低于下限或非法的取值会让对应功能静默失效："
           + "视锥配窄 → 玩家看得见的方块保持伪装（要点一下才变回来）；"
           + "磁盘缓存过期时间配短 → 条目活不过一次重启，命中率恒为 0。"
           + "限制磁盘占用请调 disk-cache.max-entries / max-file-size-mb，而不是缩短过期时间。");
@@ -1628,7 +1898,8 @@ public final class AntiXrayConfig {
     if (!ceilingAdjustments.isEmpty()) {
       logger.warning("antixray.yml 的 " + String.join("、", ceilingAdjustments) + " 超过安全上限，已按上限生效"
           + "（当前：proximity.distance=" + proximity.distance() + " 格、neighbors.cache-maximum-size="
-          + neighbors.cacheMaximumSize() + "、cache.maximum-size=" + cacheMaximumSize + "）。"
+          + neighbors.cacheMaximumSize() + "、cache.maximum-size=" + cacheMaximumSize
+          + "、cache.maximum-bytes=" + cacheMaximumBytes + "）。"
           + "上限用于防止手滑多打一位数的失控配置：邻近显形距离的扫描量随半径平方增长（O(r²)）会拖住主线程，"
           + "缓存条目上限则直接换算成内存占用。");
     }
@@ -1644,7 +1915,12 @@ public final class AntiXrayConfig {
     return ceilingAdjustments;
   }
 
-  /** 高度键/覆盖开关类型不符、已按安全默认值处理的明细（空列表 = 无）；供诊断回显与单测。 */
+  /**
+   * 写法无法识别、已按安全取值处理的明细（权重条目 / 高度键 / 布尔开关 / 枚举类开关；空列表 = 无）。
+   *
+   * <p>供单测断言「宽松解析是否真的留了痕」；诊断 dump（{@code util/Diagnostics}）当前尚未输出它，
+   * 需要时可在那里补一行（与 floorAdjustments / ceilingAdjustments 同口径）。
+   */
   public List<String> typeAdjustments() {
     return typeAdjustments;
   }
@@ -1810,6 +2086,17 @@ public final class AntiXrayConfig {
 
   public int cacheMaximumSize() {
     return cacheMaximumSize;
+  }
+
+  /**
+   * 改写结果内存缓存的<b>按字节</b>硬上限（{@code cache.maximum-bytes}，默认 512 MB）。
+   *
+   * <p>与 {@link #cacheMaximumSize()}（条目上限）同时生效，谁先到顶以谁为准：条目上限管「最多多少条」，
+   * 本值管「最多占多少内存」，后者才与堆占用直接挂钩（单条负载可达几百 KB）。
+   * 超出后按最近最少使用（LRU）淘汰。
+   */
+  public long cacheMaximumBytes() {
+    return cacheMaximumBytes;
   }
 
   public int cacheExpireAfterAccessSeconds() {

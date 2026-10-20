@@ -7,19 +7,25 @@ import java.util.Locale;
 import java.util.logging.Level;
 import net.kyori.adventure.text.Component;
 import net.mikumc.mikuxraynet.MikuXrayNet;
+import net.mikumc.mikuxraynet.bandwidth.Schedulers;
 import net.mikumc.mikuxraynet.util.Constants;
 import net.mikumc.mikuxraynet.util.Diagnostics;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
+import org.bukkit.entity.Entity;
 
 /**
  * {@code /mikuxraynet <status|dump|reload>} 管理命令（别名 {@code mxnet} / {@code mxr}）。
  *
- * <p>命令本身只做「权限校验 + 调一次聚合/重载 + 回显中文结果」，不做任何重活：
+ * <p>命令本身只做「权限校验 + 提交一次聚合/重载 + 回显中文结果」，不做任何重活：
  * 状态与转储的指标聚合、文件写入都交给 {@link Diagnostics}；热重载交给插件的
  * {@code reloadConfigs()}。任何异常都只记日志并回显一句中文提示，绝不因命令抛异常影响封包主链路。
+ *
+ * <p><b>线程纪律（转储）</b>：命令线程在 Folia 上是发送者所属的<b>区域线程</b>、在 Paper 上是主线程，
+ * 两者都不能做磁盘 IO。因此 {@code dump} 只提交任务，真正的「生成文本 + 写文件 + 清理旧文件」
+ * 跑在异步线程（{@code AsyncScheduler}）上，完成后回到发送者所在线程回显（见 {@link #dump(CommandSender)}）。
  */
 public final class MikuCommand implements CommandExecutor, TabCompleter {
 
@@ -124,18 +130,98 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
     }
   }
 
+  /**
+   * 导出诊断转储：<b>所有重活都不在命令线程上做</b>。
+   *
+   * <p><b>为什么必须异步</b>：一次转储要生成整份文本（拉取全部计数器与配置回显）、写文件、列插件数据
+   * 目录并按保留上限删除旧文件。命令线程在 Folia 上是发送者所属的<b>区域线程</b>（同步 IO 会让该区域
+   * 所有玩家/实体的 tick 停摆），在 Paper 上是主线程（服务器级卡顿）——两类线程都不允许阻塞 IO。
+   *
+   * <p><b>线程编排</b>：命令线程只做权限校验与任务提交 → 异步线程生成/写盘/清理 → 回到<b>发送者所在
+   * 线程</b>回显（玩家走实体调度器、控制台/命令方块走全局区域调度器）：Folia 上绝不能在异步线程直接
+   * 向玩家发包。提交失败与生成失败都必须回显原因，绝不静默。
+   */
   private void dump(CommandSender sender) {
     if (!allowed(sender, "dump")) {
       message(sender, "你没有权限导出诊断");
       return;
     }
-    try {
-      File file = diagnostics.writeDump();
-      message(sender, "诊断转储已写入：" + file.getAbsolutePath());
-    } catch (Throwable throwable) {
-      plugin.getLogger().log(Level.WARNING, "导出诊断转储失败", throwable);
-      message(sender, "导出诊断转储失败，详见服务端日志");
+    if (!submitDump(sender)) {
+      // 提交阶段就失败（插件停用中 / 调度器拒绝）：立刻如实回显，不能让管理员等一个永远不会来的结果
+      message(sender, "诊断转储任务提交失败（调度器不可用），详见服务端日志");
+      return;
     }
+    message(sender, "正在生成诊断转储（后台线程执行，完成后会回显保存路径）…");
+  }
+
+  /**
+   * 把「生成 + 写盘 + 清理旧转储」提交到异步线程。
+   *
+   * @return {@code true} 表示已被调度器受理；{@code false} 表示提交即失败（已记日志，由调用方回显）
+   */
+  private boolean submitDump(CommandSender sender) {
+    try {
+      plugin.getServer().getAsyncScheduler().runNow(plugin, scheduled -> {
+        String resultLine;
+        try {
+          File file = diagnostics.writeDump();
+          resultLine = "诊断转储已写入：" + file.getAbsolutePath();
+        } catch (Throwable throwable) {
+          // 原因既进日志（带堆栈）也进回显（一行）：「不能静默失败」是这条路径的硬要求，
+          // 而管理员在游戏内看不到日志，只回显「失败」而不给原因等于要他自己去翻文件。
+          plugin.getLogger().log(Level.WARNING, "导出诊断转储失败", throwable);
+          resultLine = "导出诊断转储失败：" + describeDumpFailure(throwable) + "（详见服务端日志）";
+        }
+        replyToSender(sender, resultLine);
+      });
+      return true;
+    } catch (Throwable throwable) {
+      plugin.getLogger().log(Level.WARNING, "提交诊断转储任务失败", throwable);
+      return false;
+    }
+  }
+
+  /**
+   * 回到发送者所属线程回显结果。
+   *
+   * <p>玩家是实体，必须经实体调度器回到其区域线程；控制台 / 命令方块走全局区域调度器。
+   * 插件停用导致调度被拒时退化为「尽力直接发一次」——此时已无正确线程可回，回显失败只能吞掉
+   * （{@link #safeMessage} 本身不再抛）。
+   */
+  private void replyToSender(CommandSender sender, String text) {
+    if (sender instanceof Entity entity) {
+      Schedulers.onEntity(plugin, entity, () -> safeMessage(sender, text));
+      return;
+    }
+    try {
+      plugin.getServer().getGlobalRegionScheduler()
+          .run(plugin, scheduled -> safeMessage(sender, text));
+    } catch (Throwable throwable) {
+      safeMessage(sender, text);
+    }
+  }
+
+  /**
+   * 把转储失败压成一行中文回显（不带堆栈、不含换行，避免刷屏）。
+   *
+   * <p>包可见<b>纯函数</b>，便于离线单测：{@code getMessage()} 常为 {@code null}（如
+   * {@code NullPointerException}）或空白，此时回落为异常类名——绝不能让回显出现「失败：null」。
+   *
+   * @param throwable 捕获到的异常；{@code null} 也给出明确文案（防御性）
+   */
+  static String describeDumpFailure(Throwable throwable) {
+    if (throwable == null) {
+      return "未知原因";
+    }
+    String detail = throwable.getMessage();
+    if (detail == null || detail.isBlank()) {
+      detail = throwable.getClass().getSimpleName();
+      if (detail == null || detail.isBlank()) {
+        detail = throwable.getClass().getName();
+      }
+    }
+    // 异常消息可能内嵌换行（例如带路径 + 说明的 IOException）：压成一行，回显只占一行聊天
+    return detail.replace('\n', ' ').replace('\r', ' ').trim();
   }
 
   private void reload(CommandSender sender) {
@@ -213,16 +299,15 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
   /**
    * 子命令补全（纯函数，可离线单测）。
    *
-   * <p><b>为什么要兼容两种调用约定</b>：本命令在 Paper/Folia 上走 Brigadier（{@code BasicCommand#suggest}），
-   * 在纯 Bukkit/Spigot 上走传统 {@link TabCompleter}，两者对「只敲了命令、还没输入任何字符」这一情形的
-   * 入参不同：
-   * <ul>
-   *   <li>Paper：{@code PaperCommands#register(label, description, aliases, basicCommand)} 里
-   *       {@code String[] args = StringUtils.split(suggestionsBuilder.getRemaining())}，
-   *       此时 remaining 为空串 → 传入<b>长度 0 的数组</b>（源码见 paper-server 的 PaperCommands）；</li>
-   *   <li>Bukkit：{@code args} 的最后一项是「正在输入的那一段」，空前缀时即 {@code [""]}，
-   *       且长度始终 ≥ 1（所以下面按「长度 0 或 1 = 正在输入第一个参数」归一化）。</li>
-   * </ul>
+   * <p><b>为什么要同时兼容「空数组」与 {@code [""]} 两种入参形态</b>：本命令在 Paper/Folia 上走
+   * Brigadier（{@code BasicCommand#suggest}，由 {@code CommandRegistrar.PaperCommandBridge} 转调），
+   * 该路径对「只敲了命令、还没输入任何字符」传入的是<b>长度 0 的数组</b>：
+   * {@code PaperCommands#register(label, description, aliases, basicCommand)} 里
+   * {@code String[] args = StringUtils.split(suggestionsBuilder.getRemaining())}，remaining 为空串时
+   * split 结果为空数组。而 {@code TabCompleter} 的历史约定（以及某些包装层）在同一情形传 {@code [""]}，
+   * 且长度恒 ≥ 1。本项目已无传统 Bukkit 注册路径（{@code plugin.yml} 已下线、该回退已随
+   * {@code CommandRegistrar} 一并删除），但两种形态都按「长度 0 或 1 = 正在输入第一个参数」归一化——
+   * 上游形态一旦变化，补全不会静默失效。
    * 真机反馈的「TAB 补全不能用」正是前者：旧实现在长度不为 1 时直接返回空列表，
    * 于是 Paper/Folia 上 {@code /mxnet <TAB>} 一个候选都出不来（输入了首字母反而有）。
    *

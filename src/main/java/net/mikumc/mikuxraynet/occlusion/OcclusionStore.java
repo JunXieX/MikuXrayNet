@@ -1,5 +1,8 @@
 package net.mikumc.mikuxraynet.occlusion;
 
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.IntPredicate;
 
 /**
@@ -26,6 +29,26 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
   private final Object writeMutex = new Object();
 
   private final SwmrLongMap<SectionOcclusion> sections;
+
+  /**
+   * 补丁代次（全局单调递增）：每次方块变更补丁落库 +1。
+   *
+   * <p><b>为什么需要代次而不是时间戳</b>：只需要「有没有在某个时刻之后被补丁写过」这一个二值信息，
+   * 单调计数比较即可，且不受系统时钟回拨影响。
+   */
+  private final AtomicLong patchSequence = new AtomicLong();
+
+  /**
+   * 每 section 最后一次被补丁写过时的代次（键 = 打包的 section 键）。
+   *
+   * <p>只在 {@link #writeMutex} 内写入（与 section 数据的写入同序），读取（建表前的快照）不加锁：
+   * CHM 的写有 release、读有 acquire 语义，读到新代次即保证对应的补丁写入已对本线程可见。
+   * 条目只活到该段下一次整列发布 / 摘除，规模 ≈ 已加载区块里被补丁过的段数。
+   */
+  private final ConcurrentHashMap<Long, Long> patchStamps = new ConcurrentHashMap<>();
+
+  /** 因「该段期间被补丁写过」而跳过发布的段数（诊断用，只增不减）。 */
+  private final LongAdder publishSkippedPatched = new LongAdder();
 
   public OcclusionStore() {
     this(256);
@@ -89,7 +112,11 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    */
   public void setBlockOccluding(int x, int y, int z, boolean occluding) {
     synchronized (writeMutex) {
-      applyCellLocked(x, y, z, occluding);
+      long key = SectionKey.packSection(x >> 4, y >> 4, z >> 4);
+      applyCellLocked(key, x, y, z, occluding);
+      // 即便本次没有实际改动（状态已与目标一致），也必须记戳：随后若有建表把「解码时刻的旧几何」
+      // 发布过来，只有戳能让它跳过这一段，否则这次「置零/置位」的意图会被旧位图吞掉。
+      patchStamps.put(key, patchSequence.incrementAndGet());
     }
   }
 
@@ -113,25 +140,80 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * @return 实际应用的格数；越界坐标被跳过（不写入），由调用方计入失败计数
    */
   public int setBlocksOccluding(int[] xs, int[] ys, int[] zs, boolean[] occluding) {
-    if (xs == null || ys == null || zs == null || occluding == null) {
+    return setBlocksOccluding(xs, ys, zs, occluding, xs == null ? 0 : xs.length);
+  }
+
+  /**
+   * 批量单格补丁（显式给定本次有效格数）。
+   *
+   * <p><b>为什么单独带 {@code count}</b>：补丁热路径改用了线程本地复用的数组（见
+   * {@code OcclusionPatchListener}），数组长度通常大于本次有效格数，不能再拿 {@code xs.length}
+   * 当批量边界——否则会把上一包残留的坐标一起应用（把补丁写到错误的几何上）。
+   *
+   * <p><b>补丁戳</b>：每个「被本批坐标覆盖」的 section 记一次代次（同一段在批内只写一次 CHM），
+   * 使随后到来的整列建表知道这一段期间被补丁改过、不能用更早的几何覆盖它。
+   */
+  public int setBlocksOccluding(int[] xs, int[] ys, int[] zs, boolean[] occluding, int count) {
+    if (xs == null || ys == null || zs == null || occluding == null || count <= 0) {
       return 0;
     }
-    int cells = xs.length;
-    if (ys.length != cells || zs.length != cells || occluding.length != cells) {
+    if (count > xs.length || count > ys.length || count > zs.length || count > occluding.length) {
       return 0;
     }
     int applied = 0;
+    long stamp = 0L;
+    long lastKey = 0L;
+    boolean stamped = false;
     synchronized (writeMutex) {
-      for (int i = 0; i < cells; i++) {
+      for (int i = 0; i < count; i++) {
+        long key;
         try {
-          applyCellLocked(xs[i], ys[i], zs[i], occluding[i]);
-          applied++;
+          key = SectionKey.packSection(xs[i] >> 4, ys[i] >> 4, zs[i] >> 4);
         } catch (IllegalArgumentException outOfRange) {
           // 越界坐标：本格不写入，继续处理后面的格（整批不因一格被拒而回滚）
+          continue;
+        }
+        applyCellLocked(key, xs[i], ys[i], zs[i], occluding[i]);
+        applied++;
+        // 段戳：同一 section 在批内只写一次（MULTI_BLOCK_CHANGE 恒为同一段，故通常只有 1 次 CHM 写）
+        if (stamp == 0L) {
+          stamp = patchSequence.incrementAndGet();
+        }
+        if (!stamped || key != lastKey) {
+          patchStamps.put(key, stamp);
+          lastKey = key;
+          stamped = true;
         }
       }
     }
     return applied;
+  }
+
+  /**
+   * 取整列各 section 的补丁戳快照（{@code 0} = 该段自上次整列发布 / 摘除以来未被补丁写过）。
+   *
+   * <p><b>用途</b>：建表在解码之后还要花 1~3 ms 构建位图，这段时间里方块补丁会把新状态写进活表；
+   * 发布前用它逐段比较，戳变了的段跳过覆盖，避免把更新的补丁状态覆盖成「解码时刻的旧几何」
+   * （那会让刚挖开的墙继续保持遮挡，属于「该显示却多藏」）。
+   *
+   * <p>成本：每列一次 {@code long[sectionCount]} 分配 + sectionCount 次 CHM 读（主世界 24 次），
+   * 只在「区块字节没命中缓存、需要重新建表」时发生，不在缓存命中的热路径上。
+   *
+   * @return 长度 {@code sectionCount} 的数组，下标即 section 偏移
+   */
+  public long[] patchStamps(int chunkX, int minSectionY, int chunkZ, int sectionCount) {
+    int count = Math.max(0, sectionCount);
+    long[] stamps = new long[count];
+    for (int i = 0; i < count; i++) {
+      Long stamp = patchStamps.get(SectionKey.packUnchecked(chunkX, minSectionY + i, chunkZ));
+      stamps[i] = stamp == null ? 0L : stamp;
+    }
+    return stamps;
+  }
+
+  /** 因「该段期间被补丁写过」而跳过整列发布的段数（诊断用；持续偏高说明建表期间方块变更很频繁）。 */
+  public long skippedPatchedSections() {
+    return publishSkippedPatched.sum();
   }
 
   /**
@@ -140,14 +222,11 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * <p>抽出来是为了让单格入口与批量入口共用同一套「取旧值 → 表示升降级 → 写回」逻辑：批量入口要在
    * 一个临界区内连续写多格，不能再逐格加锁。
    *
-   * @throws IllegalArgumentException 坐标超出 {@link SectionKey} 可表示范围；由调用方决定如何计数
+   * <p>键由调用方用带校验的 {@link SectionKey#packSection} 算出（而非射线热路径用的 {@code packBlock}）：
+   * 包里的坐标一旦越出 28 位水平 / 8 位 sectionY 范围，{@code packBlock} 会按位截断成<b>另一个 section
+   * 的键</b>，把补丁静默写到错误的几何上。调用方按「本格被拒」计数并跳过，故显式拒绝是安全方向。
    */
-  private void applyCellLocked(int x, int y, int z, boolean occluding) {
-    // 用带校验的 packSection（而非射线热路径用的 packBlock）：包里的坐标一旦越出 28 位水平 /
-    // 8 位 sectionY 范围，packBlock 会按位截断成<b>另一个 section 的键</b>，把补丁静默写到错误的
-    // 几何上去（该段位图从此与真实世界不符）。补丁调用方按 patchFailures 统计并跳过本格，故此处
-    // 显式拒绝是安全方向。
-    long key = SectionKey.packSection(x >> 4, y >> 4, z >> 4);
+  private void applyCellLocked(long key, int x, int y, int z, boolean occluding) {
     int localX = x & SectionOcclusion.LOCAL_MASK;
     int localY = y & SectionOcclusion.LOCAL_MASK;
     int localZ = z & SectionOcclusion.LOCAL_MASK;
@@ -188,24 +267,49 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     }
   }
 
-  /** 摘除某 section 的遮挡数据。 */
+  /** 摘除某 section 的遮挡数据（连同它的补丁戳）。 */
   public void removeSection(int chunkX, int sectionY, int chunkZ) {
     synchronized (writeMutex) {
-      sections.remove(SectionKey.packSection(chunkX, sectionY, chunkZ));
+      long key = SectionKey.packSection(chunkX, sectionY, chunkZ);
+      sections.remove(key);
+      patchStamps.remove(key);
     }
   }
 
   /**
-   * 整列覆盖写入（按「起始 sectionY + 顺序」给定各 section 的遮挡数据）。
+   * 整列覆盖写入（<b>不做补丁戳比较</b>，等价于旧行为）。
    *
-   * <p>用于「缓存命中时从负载恢复整列遮挡数据」（见 {@link OcclusionPayload}）：一次写完整条列，
-   * 减少与并发建表交错的窗口。数组下标即 section 偏移；元素为 {@code null} 表示该段全不遮挡
-   * （会清掉旧条目，避免留下与本次不同的陈旧位图）。
-   *
-   * <p>越出 {@link SectionKey} 可表示范围的 section 会被跳过（世界高度超过 8 位 sectionY 时不落库——
-   * 实际的 384 高世界只有 24 段，远在范围内）。
+   * <p><b>测试专用豁免</b>：生产路径已不再用它——建表走带戳快照的
+   * {@link #restoreColumn(int, int, int, SectionOcclusion[], long[])}，缓存命中走
+   * {@link #restoreMissingColumn}（只补缺失段）；本重载当前仅单测在用，保留以免破坏测试。
    */
   public void restoreColumn(int chunkX, int minSectionY, int chunkZ, SectionOcclusion[] column) {
+    restoreColumn(chunkX, minSectionY, chunkZ, column, null);
+  }
+
+  /**
+   * 整列覆盖写入（带补丁戳快照，见 {@link #patchStamps}）。
+   *
+   * <p><b>为什么必须比较戳</b>：建表在解码之后、发布之前还有 1~3 ms 的位图构建窗口，这期间落库的
+   * 方块补丁已经把新状态写进活表；若此处无条件覆盖，补丁就会被「解码时刻的几何」吞掉
+   * （刚挖开的墙仍被判遮挡 → 该显示却多藏）。因此逐段比较：该段现有戳非 0 且与快照不同
+   * ⇒ 期间有补丁落库 ⇒ <b>跳过覆盖</b>，保留含补丁的活位图。
+   *
+   * <p><b>戳为空时照常发布</b>：空戳说明该列被 {@link #removeColumn}/{@link #clear} 摘除过（不是补丁），
+   * 此时必须恢复数据，否则该段会退回「缺数据 = 遮挡」，把玩家眼前的矿永久藏住。
+   *
+   * <p><b>只有「活表里确有该段数据」才允许跳过</b>：戳只记录「该段被补丁覆盖过」，而<b>打断</b>类补丁
+   * 在「活表里本无该段」时不会建条目（{@code applyCellLocked} 早退），却仍会记戳。若此时也跳过，
+   * 这轮整列发布结束后该段依然为空 → 显形侧按「缺数据 = 遮挡」判定 → 该段内的矿永不显形。
+   * 因此跳过条件是「戳变了 <b>且</b> 活表有数据」；戳变了但没有数据时照常发布（没有补丁状态可保，
+   * 宁可写入解码时刻的几何，也不能让整段留空）。
+   *
+   * @param stamps 建表前取的戳快照；{@code null} = 不做比较（等价于旧行为）
+   * @return 因期间有补丁而被跳过覆盖的段数（已累加进 {@link #skippedPatchedSections()}）
+   */
+  public int restoreColumn(int chunkX, int minSectionY, int chunkZ, SectionOcclusion[] column,
+      long[] stamps) {
+    int skipped = 0;
     synchronized (writeMutex) {
       for (int i = 0; i < column.length; i++) {
         int sectionY = minSectionY + i;
@@ -213,14 +317,90 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
           continue;
         }
         long key = SectionKey.packSection(chunkX, sectionY, chunkZ);
+        if (stamps != null && i < stamps.length) {
+          Long current = patchStamps.get(key);
+          // 必须同时满足「活表有该段」：打断类补丁在无数据段上不建条目、只留戳；
+          // 若此时也跳过，该段会永久留空（显形侧「缺数据 = 遮挡」→ 整段矿不显形）。
+          if (current != null && current.longValue() != stamps[i] && sections.get(key) != null) {
+            skipped++;
+            continue;
+          }
+        }
         SectionOcclusion data = column[i];
         if (data == null) {
           sections.remove(key);
         } else {
           sections.put(key, data);
         }
+        // 发布成功后该段已是最新几何，旧戳不再需要——不清会让戳表随「补丁过的段」无界增长
+        patchStamps.remove(key);
       }
     }
+    if (skipped > 0) {
+      publishSkippedPatched.add(skipped);
+    }
+    return skipped;
+  }
+
+  /**
+   * <b>只补齐缺失段</b>的整列恢复（缓存命中路径专用）：活表里已存在的段一律不动，只发布缺失段。
+   *
+   * <p><b>为什么只补缺失</b>：
+   * <ul>
+   *   <li>已存在的段可能已被更晚的方块补丁原地改写过，用旧负载覆盖会把补丁抹掉（该显示却多藏）；</li>
+   *   <li>不能用「首个 section 存在 ⇒ 整列存在」这种列级探针：补丁只建出单段时会把整列误判为已存在，
+   *       其余段永久缺失 → 显形侧「缺数据 = 遮挡」→ 矿永不显形。</li>
+   * </ul>
+   *
+   * <p>逐段独立判断既不需要快照、也不依赖列级探针：缺哪段补哪段，已有的段原样保留。
+   *
+   * @param column 已解码的整列遮挡数据（下标 = {@code minSectionY} 起的偏移）
+   * @return 实际补入的段数（0 = 整列都已存在，本次什么都没改）
+   */
+  public int restoreMissingColumn(int chunkX, int minSectionY, int chunkZ,
+      SectionOcclusion[] column) {
+    // 无锁预检：绝大多数缓存命中时整列都已存在，先做一次乐观读扫描，避免每个命中都去抢
+    // writeMutex（该锁同时被整列建表与方块补丁持有，命中路径是高频的）。只有真的发现缺段才进锁；
+    // 预检与加锁之间若恰好有段被摘除，本次会漏补，但下一次命中会补上（方向安全）。
+    if (!hasMissingSection(chunkX, minSectionY, chunkZ, column.length)) {
+      return 0;
+    }
+    int filled = 0;
+    synchronized (writeMutex) {
+      for (int i = 0; i < column.length; i++) {
+        int sectionY = minSectionY + i;
+        if (sectionY < SectionKey.SECTION_Y_MIN || sectionY > SectionKey.SECTION_Y_MAX) {
+          continue;
+        }
+        long key = SectionKey.packSection(chunkX, sectionY, chunkZ);
+        if (sections.get(key) != null) {
+          continue; // 已有活数据：可能含更晚的补丁，绝不覆盖
+        }
+        SectionOcclusion data = column[i];
+        if (data == null) {
+          continue; // 负载里该段「无数据」= 无需补
+        }
+        sections.put(key, data);
+        // 该段此前没有活数据，若有戳只可能来自「打断类补丁」（未建条目）——补完后旧戳不再有意义
+        patchStamps.remove(key);
+        filled++;
+      }
+    }
+    return filled;
+  }
+
+  /** 只读预检：该列是否存在任一缺失段（无锁乐观读，命中路径用它避免无谓加锁）。 */
+  private boolean hasMissingSection(int chunkX, int minSectionY, int chunkZ, int sectionCount) {
+    for (int i = 0; i < sectionCount; i++) {
+      int sectionY = minSectionY + i;
+      if (sectionY < SectionKey.SECTION_Y_MIN || sectionY > SectionKey.SECTION_Y_MAX) {
+        continue;
+      }
+      if (sections.get(SectionKey.packSection(chunkX, sectionY, chunkZ)) == null) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -234,6 +414,11 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     long[] keys = SectionKey.columnKeys(chunkX, chunkZ);
     synchronized (writeMutex) {
       sections.removeAll(keys);
+      // 同列补丁戳一并摘除：只在区块卸载时清，让戳表规模 ≈ 已加载区块里被补丁过的段数。
+      // 复用上面那份 256 键数组，不额外分配、也不遍历整张 CHM。
+      for (long key : keys) {
+        patchStamps.remove(key);
+      }
     }
   }
 
@@ -241,6 +426,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
   public void clear() {
     synchronized (writeMutex) {
       sections.clear();
+      patchStamps.clear();
     }
   }
 

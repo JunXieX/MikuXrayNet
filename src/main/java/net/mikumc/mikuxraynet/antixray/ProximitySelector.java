@@ -1,9 +1,5 @@
 package net.mikumc.mikuxraynet.antixray;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-
 /**
  * 邻近显形的「选择逻辑」：视锥剔除 + 可见性判定的纯计算部分。
  *
@@ -325,6 +321,12 @@ public final class ProximitySelector {
    * 前者让玩家对着假石头挖矿，后者只是少一个伪装方块（代价见 {@code ProximityRevealer} 的说明）。
    * 注意这只作用于<b>异常/歧义</b>，不改变任何确定性的判定结论（见下）。
    *
+   * <p><b>不可重入（与 {@link #visibilityPoints} 共用线程本地 scratch）</b>：本方法先把候选点写进
+   * 线程本地的 {@link Scratch}，再逐点回调 {@link RayProbe#isClear}。若某个探针实现在回调里重入调用
+   * 本方法或 {@link #visibilityPoints}，内层会覆盖外层正在遍历的候选点（结果被静默改错）。
+   * 生产实现（{@code BitmapVisibility.isClear}）只是纯内存步进、<b>不会回调本类</b>，因此现状安全；
+   * 扩展本类时必须遵守「探针回调内不得重入」。
+   *
    * @param query     遮挡查询；为 {@code null} 时视为可见（fail-open）
    * @param maxPoints 每方块最多尝试的候选点数（由配置 {@code proximity.raycast.samples} 提供）；
    *                  <b>有效上限为 {@link #MAX_SAMPLE_POINTS}=5</b>，超出部分会被候选点数截断
@@ -341,13 +343,17 @@ public final class ProximitySelector {
       return false;
     }
 
-    double[][] points = visibilityPoints(eye, blockX, blockY, blockZ, faces);
-    int limit = Math.min(Math.max(1, maxPoints), points.length);
+    // 热路径（每玩家每周期上百个候选 × 每候选一次）：候选点写进线程本地 scratch，不再逐点 new
+    // double[]；可见性结果与 visibilityPoints 逐点一致（二者共用同一套 fillVisibilityPoints）。
+    Scratch scratch = SCRATCH.get();
+    double[] points = scratch.points;
+    int pointCount = fillVisibilityPoints(eye, blockX, blockY, blockZ, faces, scratch);
+    int limit = Math.min(Math.max(1, maxPoints), pointCount);
     for (int i = 0; i < limit; i++) {
-      double[] point = points[i];
+      int base = i * 3;
       boolean clear;
       try {
-        clear = probe.isClear(point[0], point[1], point[2]);
+        clear = probe.isClear(points[base], points[base + 1], points[base + 2]);
       } catch (Throwable throwable) {
         // 探针异常：无法判定 → 按「通畅」处理（偏显形，方向由用户指定：宁可多还原一块，
         // 也不让玩家对着假石头挖矿）。确定性判定不受影响：路径上有遮挡方块仍算「不通畅」。
@@ -366,31 +372,27 @@ public final class ProximitySelector {
    * <p>顺序：① 正对玩家的那个暴露面的中心（按玩家视线方向选面）→ ② 包围盒最近点
    * （仅当它确实落在暴露面上）→ ③ 该暴露面四角中离眼睛最近的至多 3 个。
    *
+   * <p><b>不可重入</b>：与 {@link #isVisible} 共用同一份线程本地 {@link Scratch}；不要在
+   * {@link RayProbe#isClear} 回调里重入调用本方法或 {@link #isVisible}，否则会覆盖外层正在遍历的
+   * 候选点。生产探针不回调本类，故安全（详见 {@link #isVisible} 的说明）。
+   *
    * @param faces {@link #exposedFaces} 的结果；0 时返回空数组（不采样）
    */
   public static double[][] visibilityPoints(Eye eye, int blockX, int blockY, int blockZ, int faces) {
-    List<double[]> points = new ArrayList<>(MAX_SAMPLE_POINTS);
     if (eye == null || faces == 0) {
+      // 不采样：保持旧的「空数组」契约（调用方/单测据此判 0 个候选点）
       return new double[0][];
     }
-
-    int primary = primaryFace(eye, blockX, blockY, blockZ, faces);
-    addPoint(points, faceCenter(blockX, blockY, blockZ, primary));
-
-    double[] nearest = nearestPoint(eye, blockX, blockY, blockZ);
-    if (onExposedFace(nearest, blockX, blockY, blockZ, faces)) {
-      addPoint(points, nearest);
+    // 与 isVisible 共用同一套计算核心：这里只是把线程本地 scratch 拷成精确长度的数组交给外部
+    // （测试/诊断用），因此两条路径的候选点顺序与坐标必然逐点一致。
+    Scratch scratch = SCRATCH.get();
+    int count = fillVisibilityPoints(eye, blockX, blockY, blockZ, faces, scratch);
+    double[][] points = new double[count][];
+    for (int i = 0; i < count; i++) {
+      points[i] = new double[] {
+          scratch.points[i * 3], scratch.points[i * 3 + 1], scratch.points[i * 3 + 2]};
     }
-
-    double[][] corners = faceCorners(blockX, blockY, blockZ, primary);
-    sortByDistanceToEye(corners, eye);
-    for (double[] corner : corners) {
-      if (points.size() >= MAX_SAMPLE_POINTS) {
-        break;
-      }
-      addPoint(points, corner);
-    }
-    return points.toArray(new double[0][]);
+    return points;
   }
 
   /** 选「正对玩家」的暴露面：优先取法线与视线方向最相反者，相同则取更靠近眼睛的那个面。 */
@@ -434,88 +436,167 @@ public final class ProximitySelector {
     return faceAxis == axis ? sign : 0.0D;
   }
 
-  /** 面中心：只改动法线那一轴的坐标。 */
-  private static double[] faceCenter(int blockX, int blockY, int blockZ, int face) {
-    double x = blockX + 0.5D;
-    double y = blockY + 0.5D;
-    double z = blockZ + 0.5D;
-    switch (face) {
-      case FACE_POS_X -> x = blockX + 1.0D;
-      case FACE_NEG_X -> x = blockX;
-      case FACE_POS_Y -> y = blockY + 1.0D;
-      case FACE_NEG_Y -> y = blockY;
-      case FACE_POS_Z -> z = blockZ + 1.0D;
-      default -> z = blockZ;
-    }
-    return new double[] {x, y, z};
+  /**
+   * 线程本地候选点缓冲：{@link #isVisible} 与 {@link #visibilityPoints} 共用的复用容器。
+   *
+   * <p><b>为什么需要</b>：本类是「每玩家每周期上百个候选 × 每候选一次」的热路径，旧实现每次
+   * {@code new ArrayList} + 3~5 个 {@code double[]} + 捕获 {@code eye} 的比较器 lambda + toArray，
+   * 一次判定约 9~10 个短命对象。改成线程本地定长数组后热路径零分配。
+   *
+   * <p><b>线程归属与重入约束</b>：只被 {@link #isVisible} / {@link #visibilityPoints} 同步调用，
+   * 也不把 scratch 交给任何异步任务（{@code ProximityRevealer} 只把候选坐标与眼位快照交给工作线程），
+   * 因此每个线程各持一份是安全的；两次调用之间会被完全重写，不残留上一次的候选点。
+   * <b>禁止在 {@link RayProbe#isClear} 回调里重入 {@link #isVisible} / {@link #visibilityPoints}</b>
+   * ——二者共用同一份 scratch，内层调用会覆盖外层正在遍历的候选点。生产探针
+   * （{@code BitmapVisibility.isClear}）是纯内存步进、不回调本类，因此现状安全。
+   */
+  private static final class Scratch {
+
+    /** 候选点（每点 3 个 double：x,y,z），最多 {@link #MAX_SAMPLE_POINTS} 个。 */
+    private final double[] points = new double[MAX_SAMPLE_POINTS * 3];
+    /** 面四角到眼睛的距离平方（排序键）。 */
+    private final double[] cornerDistances = new double[4];
+    /** 面四角的稳定排序结果（下标 0..3）。 */
+    private final int[] cornerOrder = new int[4];
   }
 
-  /** 面四角（3 维坐标，其中一轴固定在面平面上）。 */
-  private static double[][] faceCorners(int blockX, int blockY, int blockZ, int face) {
-    double x0 = blockX;
-    double y0 = blockY;
-    double z0 = blockZ;
-    double x1 = blockX + 1.0D;
-    double y1 = blockY + 1.0D;
-    double z1 = blockZ + 1.0D;
+  private static final ThreadLocal<Scratch> SCRATCH = ThreadLocal.withInitial(Scratch::new);
+
+  /**
+   * 六个面各自的四个角（相对方块最小角的 {@code dx,dy,dz}），<b>顺序与旧 {@code faceCorners} 完全一致</b>。
+   *
+   * <p>用静态表代替「每个候选点都 new double[4][3]」：表只建一次，热路径按偏移取值即可。行号由
+   * {@link #faceIndex(int)} 给出。
+   */
+  private static final int[][] FACE_CORNER_OFFSETS = {
+      {1, 0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1}, // FACE_POS_X
+      {0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1}, // FACE_NEG_X
+      {0, 1, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1}, // FACE_POS_Y
+      {0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1}, // FACE_NEG_Y
+      {0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1}, // FACE_POS_Z
+      {0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0}  // FACE_NEG_Z
+  };
+
+  /** 面常量 → {@link #FACE_CORNER_OFFSETS} 的行号（{@link #primaryFace} 只返回已置位的六个面之一）。 */
+  private static int faceIndex(int face) {
     return switch (face) {
-      case FACE_POS_X -> new double[][] {
-          {x1, y0, z0}, {x1, y1, z0}, {x1, y0, z1}, {x1, y1, z1}};
-      case FACE_NEG_X -> new double[][] {
-          {x0, y0, z0}, {x0, y1, z0}, {x0, y0, z1}, {x0, y1, z1}};
-      case FACE_POS_Y -> new double[][] {
-          {x0, y1, z0}, {x1, y1, z0}, {x0, y1, z1}, {x1, y1, z1}};
-      case FACE_NEG_Y -> new double[][] {
-          {x0, y0, z0}, {x1, y0, z0}, {x0, y0, z1}, {x1, y0, z1}};
-      case FACE_POS_Z -> new double[][] {
-          {x0, y0, z1}, {x1, y0, z1}, {x0, y1, z1}, {x1, y1, z1}};
-      default -> new double[][] {
-          {x0, y0, z0}, {x1, y0, z0}, {x0, y1, z0}, {x1, y1, z0}};
+      case FACE_POS_X -> 0;
+      case FACE_NEG_X -> 1;
+      case FACE_POS_Y -> 2;
+      case FACE_NEG_Y -> 3;
+      case FACE_POS_Z -> 4;
+      default -> 5;
     };
   }
 
-  /** 包围盒上离眼睛最近的点（把眼睛坐标夹进包围盒）。 */
-  private static double[] nearestPoint(Eye eye, int blockX, int blockY, int blockZ) {
-    return new double[] {
-        clamp(eye.x(), blockX, blockX + 1.0D),
-        clamp(eye.y(), blockY, blockY + 1.0D),
-        clamp(eye.z(), blockZ, blockZ + 1.0D)};
+  /**
+   * 候选点计算的核心：把至多 {@link #MAX_SAMPLE_POINTS} 个点写入线程本地 scratch，返回点数。
+   *
+   * <p>顺序与契约同 {@link #visibilityPoints}：① 正对玩家的暴露面中心 → ② 包围盒最近点（仅当落在
+   * 暴露面上）→ ③ 该面四角中离眼睛最近的至多 3 个。{@link #visibilityPoints} 只是把结果拷成
+   * {@code double[][]} 给外部，{@link #isVisible} 直接按 scratch 取点——两条路径必然逐点一致。
+   */
+  private static int fillVisibilityPoints(Eye eye, int blockX, int blockY, int blockZ, int faces,
+      Scratch scratch) {
+    if (eye == null || faces == 0) {
+      return 0;
+    }
+    int primary = primaryFace(eye, blockX, blockY, blockZ, faces);
+    double[] points = scratch.points;
+    int count = addScratchPoint(points, 0,
+        faceCenterX(blockX, primary), faceCenterY(blockY, primary), faceCenterZ(blockZ, primary));
+
+    double nearestX = clamp(eye.x(), blockX, blockX + 1.0D);
+    double nearestY = clamp(eye.y(), blockY, blockY + 1.0D);
+    double nearestZ = clamp(eye.z(), blockZ, blockZ + 1.0D);
+    if (onExposedFacePoint(nearestX, nearestY, nearestZ, blockX, blockY, blockZ, faces)) {
+      count = addScratchPoint(points, count, nearestX, nearestY, nearestZ);
+    }
+
+    int[] offsets = FACE_CORNER_OFFSETS[faceIndex(primary)];
+    double[] distances = scratch.cornerDistances;
+    int[] order = scratch.cornerOrder;
+    for (int corner = 0; corner < 4; corner++) {
+      order[corner] = corner;
+      double dx = (blockX + offsets[corner * 3]) - eye.x();
+      double dy = (blockY + offsets[corner * 3 + 1]) - eye.y();
+      double dz = (blockZ + offsets[corner * 3 + 2]) - eye.z();
+      distances[corner] = dx * dx + dy * dy + dz * dz;
+    }
+    // 稳定插入排序：与旧实现 Arrays.sort 的稳定性一致（等距时保持 faceCorners 的原始顺序）。
+    // 只有 4 个元素，插入排序既无分配也不会破坏既有候选点顺序。
+    for (int i = 1; i < 4; i++) {
+      int key = order[i];
+      double keyDistance = distances[key];
+      int j = i - 1;
+      while (j >= 0 && distances[order[j]] > keyDistance) {
+        order[j + 1] = order[j];
+        j--;
+      }
+      order[j + 1] = key;
+    }
+    for (int k = 0; k < 4 && count < MAX_SAMPLE_POINTS; k++) {
+      int corner = order[k];
+      count = addScratchPoint(points, count,
+          blockX + offsets[corner * 3],
+          blockY + offsets[corner * 3 + 1],
+          blockZ + offsets[corner * 3 + 2]);
+    }
+    return count;
+  }
+
+  /** 把点写入 scratch（与已有点重合则跳过），返回新的点数（语义同旧 {@code addPoint}）。 */
+  private static int addScratchPoint(double[] points, int count, double x, double y, double z) {
+    for (int i = 0; i < count; i++) {
+      double dx = points[i * 3] - x;
+      double dy = points[i * 3 + 1] - y;
+      double dz = points[i * 3 + 2] - z;
+      if (dx * dx + dy * dy + dz * dz <= DEDUPE_EPSILON_SQUARED) {
+        return count;
+      }
+    }
+    points[count * 3] = x;
+    points[count * 3 + 1] = y;
+    points[count * 3 + 2] = z;
+    return count + 1;
+  }
+
+  /** 面中心的 x 分量（只有 ±X 面固定在面平面上，其余取方块中心）。 */
+  private static double faceCenterX(int blockX, int face) {
+    return switch (face) {
+      case FACE_POS_X -> blockX + 1.0D;
+      case FACE_NEG_X -> blockX;
+      default -> blockX + 0.5D;
+    };
+  }
+
+  /** 面中心的 y 分量（只有 ±Y 面固定在面平面上，其余取方块中心）。 */
+  private static double faceCenterY(int blockY, int face) {
+    return switch (face) {
+      case FACE_POS_Y -> blockY + 1.0D;
+      case FACE_NEG_Y -> blockY;
+      default -> blockY + 0.5D;
+    };
+  }
+
+  /** 面中心的 z 分量（只有 ±Z 面固定在面平面上，其余取方块中心）。 */
+  private static double faceCenterZ(int blockZ, int face) {
+    return switch (face) {
+      case FACE_POS_Z -> blockZ + 1.0D;
+      case FACE_NEG_Z -> blockZ;
+      default -> blockZ + 0.5D;
+    };
   }
 
   /** 该点是否落在某个暴露面上（贴在 min/max 平面上即算；棱/角上只要有一个暴露面命中即可）。 */
-  private static boolean onExposedFace(double[] point, int blockX, int blockY, int blockZ,
-      int faces) {
-    return (point[0] <= blockX + 1.0E-9D && (faces & FACE_NEG_X) != 0)
-        || (point[0] >= blockX + 1.0D - 1.0E-9D && (faces & FACE_POS_X) != 0)
-        || (point[1] <= blockY + 1.0E-9D && (faces & FACE_NEG_Y) != 0)
-        || (point[1] >= blockY + 1.0D - 1.0E-9D && (faces & FACE_POS_Y) != 0)
-        || (point[2] <= blockZ + 1.0E-9D && (faces & FACE_NEG_Z) != 0)
-        || (point[2] >= blockZ + 1.0D - 1.0E-9D && (faces & FACE_POS_Z) != 0);
-  }
-
-  /** 加入候选点，跳过与已有点重合者（避免重复射线）。 */
-  private static void addPoint(List<double[]> points, double[] point) {
-    for (double[] existing : points) {
-      double dx = existing[0] - point[0];
-      double dy = existing[1] - point[1];
-      double dz = existing[2] - point[2];
-      if (dx * dx + dy * dy + dz * dz <= DEDUPE_EPSILON_SQUARED) {
-        return;
-      }
-    }
-    points.add(point);
-  }
-
-  private static void sortByDistanceToEye(double[][] points, Eye eye) {
-    Arrays.sort(points, (left, right) -> Double.compare(
-        squaredDistance(left, eye), squaredDistance(right, eye)));
-  }
-
-  private static double squaredDistance(double[] point, Eye eye) {
-    double dx = point[0] - eye.x();
-    double dy = point[1] - eye.y();
-    double dz = point[2] - eye.z();
-    return dx * dx + dy * dy + dz * dz;
+  private static boolean onExposedFacePoint(double x, double y, double z, int blockX, int blockY,
+      int blockZ, int faces) {
+    return (x <= blockX + 1.0E-9D && (faces & FACE_NEG_X) != 0)
+        || (x >= blockX + 1.0D - 1.0E-9D && (faces & FACE_POS_X) != 0)
+        || (y <= blockY + 1.0E-9D && (faces & FACE_NEG_Y) != 0)
+        || (y >= blockY + 1.0D - 1.0E-9D && (faces & FACE_POS_Y) != 0)
+        || (z <= blockZ + 1.0E-9D && (faces & FACE_NEG_Z) != 0)
+        || (z >= blockZ + 1.0D - 1.0E-9D && (faces & FACE_POS_Z) != 0);
   }
 
   private static double clamp(double value, double min, double max) {

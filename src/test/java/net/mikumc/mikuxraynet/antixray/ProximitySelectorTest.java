@@ -765,4 +765,48 @@ class ProximitySelectorTest {
     assertTrue(ProximitySelector.isVisible(eye, 0, 64, 2, stone, SAMPLES, probe(eye, stone)),
         "墙前面的矿照常显形");
   }
+
+  /**
+   * <b>零分配改造的等价性守门</b>：{@code isVisible} 改走线程本地 scratch 后，实际尝试的候选点必须与
+   * {@link ProximitySelector#visibilityPoints} 逐点一致（顺序与坐标都相同）。
+   *
+   * <p>为什么必须钉住：候选点顺序是「命中概率从高到低」，顺序一旦漂移，「优先试正对玩家的面中心」
+   * 与「有效采样上限 5」的语义就都变了；而 {@code visibilityPoints} 是单测/外部唯一可见的口径。
+   */
+  @Test
+  void probeReceivesExactlyThePointsReportedByVisibilityPoints() {
+    ProximitySelector.Eye[] eyes = {
+        standingEye(),
+        ProximitySelector.eye(1.5D, 66.62D, 5.5D, 0.0D, 0.0D, 1.0D),
+        ProximitySelector.eye(0.5D, 64.5D, -3.5D, 0.0D, 0.0D, 1.0D)};
+    ProximitySelector.RayQuery[] queries = {
+        (x, y, z) -> false,
+        (x, y, z) -> !(x == 0 && (y == 64 || y == 65) && z >= 0 && z <= 45)};
+    int[][] blocks = {{0, 64, 30}, {1, 65, 5}, {1, 64, 30}, {0, 64, 0}};
+
+    for (ProximitySelector.Eye eye : eyes) {
+      for (ProximitySelector.RayQuery query : queries) {
+        for (int[] block : blocks) {
+          int faces = ProximitySelector.exposedFaces(block[0], block[1], block[2], query);
+          double[][] expected =
+              ProximitySelector.visibilityPoints(eye, block[0], block[1], block[2], faces);
+          java.util.List<double[]> probed = new java.util.ArrayList<>();
+          ProximitySelector.RayProbe capture = (x, y, z) -> {
+            probed.add(new double[] {x, y, z});
+            return false; // 全部不通畅 → 会一路试到候选点上限
+          };
+          assertFalse(ProximitySelector.isVisible(eye, block[0], block[1], block[2], query,
+              ProximitySelector.MAX_SAMPLE_POINTS, capture), "全部不通畅时必须判不可见");
+          assertEquals(expected.length, probed.size(),
+              "isVisible 尝试的候选点数必须等于 visibilityPoints 的候选点数");
+          for (int i = 0; i < expected.length; i++) {
+            double[] actual = probed.get(i);
+            assertEquals(expected[i][0], actual[0], 1.0E-12D, "第 " + i + " 个候选点 x 必须一致");
+            assertEquals(expected[i][1], actual[1], 1.0E-12D, "第 " + i + " 个候选点 y 必须一致");
+            assertEquals(expected[i][2], actual[2], 1.0E-12D, "第 " + i + " 个候选点 z 必须一致");
+          }
+        }
+      }
+    }
+  }
 }

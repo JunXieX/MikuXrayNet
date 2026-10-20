@@ -5,6 +5,10 @@ package net.mikumc.mikuxraynet.bandwidth;
  *
  * <p>降级条件：延迟持续不低于阈值达到 {@code sustainMillis}；
  * 恢复正常条件：延迟回落到阈值以下。状态机只负责判定，实际视距调整由调用方在所有者线程执行。
+ *
+ * <p><b>「已降级」标记只在降级真正生效后由调用方回报</b>（{@link #markReduced()}）：
+ * {@link #shouldReduce} 只回答「该不该降」，不预先假设立场，否则「判定要降但没降成」
+ * 会把状态机永久卡在「已降级」而再也降不下来（详见该方法与 markReduced 的说明）。
  */
 public final class PingState {
 
@@ -23,7 +27,16 @@ public final class PingState {
     return reduced;
   }
 
-  /** 记录一次延迟采样，返回是否需要在本次采样执行「降视距」。 */
+  /**
+   * 记录一次延迟采样，返回本次采样是否应该尝试降视距。
+   *
+   * <p><b>这里不置「已降级」标记</b>：该标记代表「视距确实已经被我们下调且原始值已记录」，
+   * 由调用方在 {@code reduce()} 成功后调用 {@link #markReduced()} 回报。若在判定阶段就置位，
+   * 「判定要降但没降成」（被服务端视距/配置下限钳制、写视距抛异常、停用竞态回滚）会让状态机
+   * 一直认为已降级：此后 {@link #shouldReduce} 恒返回 false，而还原路径又因没有原始值记录返回
+   * false、无从清标记——该玩家整段会话内再也降不下来（功能静默失效），且每次采样都白跑一次还原。
+   * 不预置后，未生效的降级会在下一次采样自然重试。
+   */
   public boolean shouldReduce(int ping, long nowMillis, int thresholdMillis, long sustainMillis) {
     if (ping < thresholdMillis) {
       highSinceMillis = NO_TIME;
@@ -36,8 +49,17 @@ public final class PingState {
     if (reduced || nowMillis - highSinceMillis < sustainMillis) {
       return false;
     }
-    reduced = true;
     return true;
+  }
+
+  /**
+   * 由调用方在降视距<b>确实生效</b>（已写入新视距且原始值记录已保留）后回报。
+   *
+   * <p>与「判定」分离是刻意的：见 {@link #shouldReduce} 的说明——把「想降」与「降成了」混为一谈
+   * 会让一次失败尝试把状态机永久钉在已降级。
+   */
+  public void markReduced() {
+    reduced = true;
   }
 
   /** 记录一次延迟采样，返回是否需要在本次采样<b>尝试</b>还原视距。 */

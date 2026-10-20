@@ -1,20 +1,25 @@
 package net.mikumc.mikuxraynet.command;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /**
  * 补全回归：{@code /mxnet <TAB>} 必须给出全部子命令（真机反馈「TAB 补全不能用」即此情形）。
  *
- * <p>两条注册路径的入参约定不同，因此这里按「实际会被传进来的数组形态」逐个断言：
+ * <p>按「实际会被传进来的数组形态」逐个断言（本命令只有 Paper/Folia 的 Brigadier 一条注册路径，
+ * 见 {@code CommandRegistrar}）：
  * <ul>
- *   <li>Paper/Folia（{@code BasicCommand#suggest}，见 paper-server 的 PaperCommands）：什么都没输入时是
- *       <b>空数组</b>，输入了前缀时是 {@code [前缀]}，首个参数后跟空格时是 {@code [首个参数, ""]}；</li>
- *   <li>纯 Bukkit（传统 {@code TabCompleter}）：空前缀是 {@code [""]}，其余同上。</li>
+ *   <li>什么都没输入时可能是<b>空数组</b>（Paper 的 {@code StringUtils.split("")}）或 {@code [""]}
+ *       （{@code TabCompleter} 历史约定），两者都必须补出全部子命令；</li>
+ *   <li>输入了前缀时是 {@code [前缀]}，首个参数后跟空格时是 {@code [首个参数, ""]}。</li>
  * </ul>
+ *
+ * <p>另含转储失败回显的纯函数测试（{@code describeDumpFailure} 必须是单行且永远带原因）。
  */
 class MikuCommandTest {
 
@@ -59,5 +64,32 @@ class MikuCommandTest {
         "sender 为 null 时不得补出任何子命令");
     assertTrue(MikuCommand.suggestSubcommands(null, new String[] {"s"}).isEmpty(),
         "sender 为 null 时也不得按前缀补出子命令");
+  }
+
+  /**
+   * 转储失败的回显必须永远带原因、且只有一个异常类名兜底——绝不能出现「失败：null」。
+   *
+   * <p>回归背景：把转储挪到异步线程后，失败原因只能靠这条回显送到管理员眼前（游戏内看不到日志）。
+   */
+  @Test
+  void dumpFailureAlwaysCarriesReason() {
+    assertEquals("磁盘已满", MikuCommand.describeDumpFailure(new IOException("磁盘已满")),
+        "有 message 时必须原样回显 message");
+    assertEquals("NullPointerException", MikuCommand.describeDumpFailure(new NullPointerException()),
+        "message 为 null 时回落到异常类名，绝不能回显 null");
+    assertEquals("IllegalStateException", MikuCommand.describeDumpFailure(new IllegalStateException("   ")),
+        "message 为空白时同样回落到异常类名");
+    assertEquals("未知原因", MikuCommand.describeDumpFailure(null),
+        "防御性分支：异常本身为 null 时也要给出明确文案");
+  }
+
+  /** 回显必须压成一行：异常消息里的换行不得把聊天框刷成多行，首尾空白要去掉。 */
+  @Test
+  void dumpFailureIsCollapsedToOneLine() {
+    String line = MikuCommand.describeDumpFailure(new IOException("  第一行\n第二行\r\n第三行  "));
+    assertFalse(line.contains("\n"), "回显不得包含换行符");
+    assertFalse(line.contains("\r"), "回显不得包含回车符");
+    assertTrue(line.startsWith("第一行"), "首尾空白必须去掉：" + line);
+    assertTrue(line.endsWith("第三行"), "首尾空白必须去掉：" + line);
   }
 }

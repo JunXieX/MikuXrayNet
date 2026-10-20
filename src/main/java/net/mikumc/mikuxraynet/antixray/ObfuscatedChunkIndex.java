@@ -188,6 +188,9 @@ public final class ObfuscatedChunkIndex {
    * 分配（或让正常记录莫名失败）不划算，故按项目惯例明确接受并在此文档化。
    */
   public boolean mayEvict(int incoming) {
+    // 保守口径：按「新清单全长」预判（调用方拿不到被覆盖条目的旧长度），可能多报一次；多准备的容器
+    // 在真正零淘汰时保持为空、调用方遍历空列表即可，无副作用。与之配套的 recordChunkInternal 用净增量
+    // 预判，因此「这里 true 但实际没淘汰」是允许的，反之（返回 false 却发生淘汰）不会出现。
     return totalPositions.get() + incoming > maxPositions;
   }
 
@@ -200,13 +203,18 @@ public final class ObfuscatedChunkIndex {
     if (worldName == null || localPositions == null || localPositions.length == 0) {
       return null;
     }
-    // 安全阀：正常运营下永不触发；触顶时按「最旧优先」淘汰其它区块来腾位置，仍放不下才放弃本次记录
-    if (!makeRoomFor(localPositions.length, evictedChunksOut)) {
+    // 安全阀：正常运营下永不触发；触顶时按「最旧优先」淘汰其它区块来腾位置，仍放不下才放弃本次记录。
+    // 预判改用「净增量」：本次覆盖会释放该区块旧清单的长度；若按新清单全长预判，覆盖同一区块
+    //（改写确定性重登记）时会在触顶附近把别的区块（甚至本区块自己）无谓淘汰掉——淘汰会连带作废那些
+    // 区块上各玩家的已显形标记，使它们在区块重发前漏显形。并发下这里读到的是近似旧值，只影响安全阀
+    // 的诊断口径（该方法本就只在异常态触发）。
+    ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
+    ChunkEntry existing = chunks.get(key);
+    int capacityDelta = localPositions.length - (existing == null ? 0 : existing.size());
+    if (!makeRoomFor(capacityDelta, evictedChunksOut)) {
       evictedByCapacity.add(localPositions.length);
       return null;
     }
-
-    ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
     ChunkEntry entry = new ChunkEntry(minHeight, localPositions, clock.getAsLong());
     // 用 compute 原子地「取旧值 + 装新值」：旧实现先 put 再另算 delta，同键并发 recordChunk 时
     // 两个线程可能读到同一个旧条目，导致 totalPositions 被重复加减（只影响安全阀诊断口径，
@@ -533,7 +541,9 @@ public final class ObfuscatedChunkIndex {
    *
    * <p>只在越过上限时执行（正常运营永不进入），因此这里的 O(条目数) 扫描不在热路径上。
    *
-   * @return 是否已为 {@code incoming} 个坐标腾出空间
+   * @param incoming 本次记录的<b>净增量</b>（新清单长度 − 被覆盖条目的旧长度，可为负；见
+   *                 {@link #recordChunkInternal}）：负值表示记录后总量下降，通常一次都不用淘汰
+   * @return 是否已为本次记录腾出空间
    */
   private boolean makeRoomFor(int incoming, List<ChunkKey> evictedChunksOut) {
     if (totalPositions.get() + incoming <= maxPositions) {

@@ -145,6 +145,8 @@ public final class ZstdSupport {
   private static final AtomicBoolean UNVERIFIED_WARNING = new AtomicBoolean();
   /** 「下载文件 SHA-256 不符」的 WARN 只打一次（初始化失败后可重试，重试不得刷屏）。 */
   private static final AtomicBoolean HASH_MISMATCH_WARNING = new AtomicBoolean();
+  /** 「lib 目录里已存在的 jar 与配置的 SHA-256 不符」的 WARN 只打一次（与下载路径的提示分开计）。 */
+  private static final AtomicBoolean LOCAL_HASH_MISMATCH_WARNING = new AtomicBoolean();
   /** 「自动下载失败」的 WARN 只打一次（同上）。 */
   private static final AtomicBoolean DOWNLOAD_FAILURE_WARNING = new AtomicBoolean();
   /** 「未启用自动下载」的 WARN 只打一次（同上）。 */
@@ -442,7 +444,9 @@ public final class ZstdSupport {
    *
    * @param expectedSha256 期望的 SHA-256（十六进制，大小写不敏感）；{@code null}/空白表示不校验
    *                       （此时仍会计算并一次性打印下载文件的「实际 SHA-256」供服主复制；
-   *                       非空时下载后即校验，不匹配则该 jar 被拒绝、回退内置压缩并打印中文 WARN）
+   *                       非空时<b>本地已有的 jar 与新下载的 jar 都会校验</b>，不匹配则该 jar 被拒绝
+   *                       ——本地文件被跳过（继续下一个候选或重新下载），下载文件不落盘，
+   *                       最终回退内置压缩并打印中文 WARN）
    */
   public static void initialize(Path libraryDir, boolean autoDownload, String downloadUrl,
       String expectedSha256, int timeoutSeconds, Logger logger) {
@@ -475,6 +479,9 @@ public final class ZstdSupport {
       List<Path> candidates = libraryCandidates(libraryDir);
       for (int i = 0; i < candidates.size(); i++) {
         Path candidate = candidates.get(i);
+        if (!matchesExpectedSha256(candidate, expectedSha256, logger)) {
+          continue; // 本地文件未通过配置的完整性校验：跳过它（③ 会重新下载覆盖，或回退 Deflater）
+        }
         Codec local = loadFromJar(candidate);
         if (local != null) {
           install(local, Source.LOCAL);
@@ -614,6 +621,41 @@ public final class ZstdSupport {
       lastError = throwable.toString();
       return null;
     }
+  }
+
+  /**
+   * 本地已下载的 jar 是否通过<b>配置的</b> SHA-256 校验；未配置期望哈希时恒为 {@code true}（不校验）。
+   *
+   * <p><b>为什么本地文件也要校验</b>：{@code disk-cache.zstd-sha256} 的语义是「只信任摘要相符的那个文件」。
+   * 若只校验新下载的文件，那么「上次以空哈希自动下载下来、之后才把哈希填进配置」的 jar 永远不会被校验，
+   * 被替换/损坏的 jar 也会被当作「来源=本地已下载」直接加载——配置看起来是开着的，实际形同虚设。
+   * 不符时按候选剔除处理（继续下一个候选 / 走 ③ 重新下载覆盖），并只 WARN 一次，绝不静默加载。
+   */
+  static boolean matchesExpectedSha256(Path jar, String expectedSha256, Logger logger) {
+    if (expectedSha256 == null || expectedSha256.isBlank()) {
+      return true;
+    }
+    if (!Files.isRegularFile(jar)) {
+      // 文件不存在（还没下载过）：交给 loadFromJar 静默跳过即可，不能在这里报「摘要不符」误导服主
+      return true;
+    }
+    String actual;
+    try {
+      actual = sha256Hex(jar);
+    } catch (IOException exception) {
+      // 读不出来就不能证明它可信：拒绝该候选，把原因留给失败日志
+      lastError = exception.toString();
+      return false;
+    }
+    if (actual.equalsIgnoreCase(expectedSha256.trim())) {
+      return true;
+    }
+    lastError = "本地 jar SHA-256 不符（期望 " + expectedSha256.trim() + "，实际 " + actual + "）";
+    warnOnce(LOCAL_HASH_MISMATCH_WARNING, logger, detectionLine()
+        + "；lib 目录下已存在的 jar 与 disk-cache.zstd-sha256 不符，已拒绝加载该文件"
+        + "（期望 " + expectedSha256.trim() + "，实际 " + actual + "）；"
+        + "将尝试重新下载覆盖，或请核对 disk-cache.zstd-sha256 与 lib 目录里的文件");
+    return false;
   }
 
   // ------------------------------------------------------------------ 下载
@@ -866,6 +908,7 @@ public final class ZstdSupport {
       hashMismatchDetected = false;
       UNVERIFIED_WARNING.set(false);
       HASH_MISMATCH_WARNING.set(false);
+      LOCAL_HASH_MISMATCH_WARNING.set(false);
       DOWNLOAD_FAILURE_WARNING.set(false);
       AUTODOWNLOAD_DISABLED_WARNING.set(false);
     }

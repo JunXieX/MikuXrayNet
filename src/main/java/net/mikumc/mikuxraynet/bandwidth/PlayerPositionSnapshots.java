@@ -51,20 +51,28 @@ final class PlayerPositionSnapshots {
 
   private final ConcurrentHashMap<UUID, Position> positions = new ConcurrentHashMap<>();
 
-  /** 刷新某玩家快照（必须在拥有该玩家的线程调用）。方块坐标与世界均未变时不发布，见类注释。 */
-  void refresh(UUID playerId, String world, double x, double y, double z) {
+  /**
+   * 刷新某玩家快照（必须在拥有该玩家的线程调用）。方块坐标与世界均未变时不发布，见类注释。
+   *
+   * @return <b>刷新前</b>快照的世界名（原本没有快照时为 {@code null}），未发布时返回当前世界名
+   *         （此时等于入参 {@code world}）。调用方据此检测跨世界切换——旧世界的方块变更缓冲必须丢弃，
+   *         绝不能按新世界坐标下发（见 {@code BlockChangeMerger}）
+   */
+  String refresh(UUID playerId, String world, double x, double y, double z) {
     if (playerId == null) {
-      return;
+      return null;
     }
     Position current = positions.get(playerId);
     if (current != null && Objects.equals(current.world(), world)
         && blockCoordinate(current.x()) == blockCoordinate(x)
         && blockCoordinate(current.y()) == blockCoordinate(y)
         && blockCoordinate(current.z()) == blockCoordinate(z)) {
-      // 仍在同一世界、同一方块：判定结果不可能改变，跳过分配与写入
-      return;
+      // 仍在同一世界、同一方块：判定结果不可能改变，跳过分配与写入。
+      // 返回当前世界名（= world）：调用方只据此判断「世界是否变化」，此处不得触发丢弃。
+      return current.world();
     }
     positions.put(playerId, new Position(world, x, y, z));
+    return current == null ? null : current.world();
   }
 
   /** 只读快照；尚未建立时返回 {@code null}（调用方按 fail-open 处理）。 */

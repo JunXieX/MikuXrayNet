@@ -255,6 +255,8 @@ public final class OcclusionPatchListener extends PacketAdapter {
   /** 状态 id 解析器；见 {@link NmsStateIdResolver}。 */
   private final StateIdResolver idResolver;
   private final AtomicInteger errorCounter = new AtomicInteger();
+  /** 最近已应用的方块变更包（按包实例身份去重，见 {@link RecentPackets}）。 */
+  private final RecentPackets recentPackets = new RecentPackets();
 
   private volatile AsyncListenerHandler handler;
 
@@ -308,11 +310,20 @@ public final class OcclusionPatchListener extends PacketAdapter {
       if (store == null) {
         return;
       }
+      // 同一份方块变更包会按「每个追踪玩家」各回调一次（服务端只构造一个 NMS 包实例广播）：
+      // 补丁是「世界几何真值」，应用一次即可；重复应用纯属 N 倍开销（分配 + 全局写锁竞争）。
+      // 注意「先查、应用成功后再登记」：若首个接收者解析时抛异常，不得让后续接收者一并被跳过。
+      Object handle = event.getPacket().getHandle();
+      if (recentPackets.contains(handle, worldName)) {
+        return;
+      }
       PacketType type = event.getPacketType();
       if (type == PacketType.Play.Server.BLOCK_CHANGE) {
         patchSingle(store, event.getPacket());
+        recentPackets.record(handle, worldName);
       } else if (type == PacketType.Play.Server.MULTI_BLOCK_CHANGE) {
         patchMulti(store, event.getPacket());
+        recentPackets.record(handle, worldName);
       }
     } catch (Throwable throwable) {
       // fail-open：解析失败只跳过本次补丁（该段位图可能短暂陈旧，由区块重载自愈），绝不改包
@@ -345,15 +356,20 @@ public final class OcclusionPatchListener extends PacketAdapter {
     if (section == null || positions == null || data == null || positions.length != data.length) {
       return;
     }
-    int[] coords = new int[positions.length * 3];
+    int cells = positions.length;
+    // 复用线程本地缓冲：一个 4096 格的变更包原来每包要新建约 100 KB 的临时数组（坐标 + 判定 + 批量写入），
+    // 而同一份包还会按接收者重复回调；封包回调只落在少数几个线程上，按线程复用即可把分配降到零。
+    PatchBuffer buffer = PATCH_BUFFER.get();
+    buffer.ensureCells(cells);
+    int[] coords = buffer.coords;
     unpackMultiCoords(section.getX() << 4, section.getY() << 4, section.getZ() << 4, positions, coords);
-    byte[] verdicts = new byte[positions.length];
-    for (int i = 0; i < positions.length; i++) {
+    byte[] verdicts = buffer.verdicts;
+    for (int i = 0; i < cells; i++) {
       // 单个坏元素（缺失 / 解析异常）只让该格记 UNRESOLVED，继续解析后面的坐标：
       // 一个槽位读不出来不该让同包其余坐标一起漏补丁。
       verdicts[i] = resolveOrUnresolved(data[i]);
     }
-    applyPatches(store, coords, verdicts, stats);
+    applyPatches(store, coords, verdicts, cells, stats);
   }
 
   /**
@@ -457,24 +473,40 @@ public final class OcclusionPatchListener extends PacketAdapter {
    * 被置为<b>不遮挡</b>（清掉该格可能陈旧的「遮挡」位），<b>只动这一格、不摘整段</b>——理由见类注释
    * （整段摘除会放大实体侧的「少藏」面，并给显形侧制造 16³ 死区）。
    *
-   * <p>计数口径：{@link OcclusionStats#patched} 只累加「有口径且真正写进去」的格；拿不到口径的格、
-   * 以及越界被 {@code SectionKey} 拒绝的格都计入 {@link OcclusionStats#patchFailures}，每格只计一次。
+   * <p><b>计数口径（按「归因」而不是按底层的写入动作）</b>：
+   * <ul>
+   *   <li>{@link OcclusionStats#patched} 只累加「有明确口径（遮挡 / 不遮挡）、坐标合法」的格——
+   *       无论该格是否本来就已经是目标状态（那只是无需再写，位图确实已与变更一致）；</li>
+   *   <li>{@link OcclusionStats#patchFailures} 累加「拿不到口径（UNRESOLVED）」与「坐标越界被拒」的格，
+   *       每格只计一次。</li>
+   * </ul>
+   * 旧实现用 {@code 写入数 − 未解析且合法数} 反推，但底层的「写入数」包含「状态已一致、只是提前返回」的格，
+   * 两个口径相减后既会虚计也会在越界格上错位；现在直接按判定归因，两个数都有确定含义。
    *
    * @param coords    {@code x,y,z} 连续存放的坐标三元组
    * @param verdicts  每格一个三态判定，长度必须与 {@code coords.length / 3} 相等（否则整体跳过）
    */
   static void applyPatches(OcclusionStore store, int[] coords, byte[] verdicts, OcclusionStats stats) {
-    if (store == null || coords == null || verdicts == null || coords.length != verdicts.length * 3) {
+    applyPatches(store, coords, verdicts, verdicts == null ? 0 : verdicts.length, stats);
+  }
+
+  /**
+   * 应用补丁的核心：{@code cells} 显式给出本批有效格数（数组可能来自线程本地复用、长度大于有效格数）。
+   */
+  private static void applyPatches(OcclusionStore store, int[] coords, byte[] verdicts, int cells,
+      OcclusionStats stats) {
+    if (store == null || coords == null || verdicts == null || cells <= 0
+        || coords.length < cells * 3 || verdicts.length < cells) {
       return;
     }
-    int cells = verdicts.length;
-    int[] xs = new int[cells];
-    int[] ys = new int[cells];
-    int[] zs = new int[cells];
-    boolean[] occluding = new boolean[cells];
-    // 未解析的格也要写成「不遮挡」，但它不属「已按变更改写」：先把这类格从成功数里扣掉，再由下面
-    // 统一记入失败数。只有坐标合法、真正写得进去的才扣——越界的未解析格本就没写进去，计一次即可。
-    int unresolvedPatchable = 0;
+    PatchBuffer buffer = PATCH_BUFFER.get();
+    buffer.ensureCells(cells);
+    int[] xs = buffer.xs;
+    int[] ys = buffer.ys;
+    int[] zs = buffer.zs;
+    boolean[] occluding = buffer.occluding;
+    int resolved = 0;
+    int unresolved = 0;
     for (int i = 0; i < cells; i++) {
       int x = coords[i * 3];
       int y = coords[i * 3 + 1];
@@ -484,13 +516,106 @@ public final class OcclusionPatchListener extends PacketAdapter {
       ys[i] = y;
       zs[i] = z;
       occluding[i] = verdict == OCCLUDING;
-      if (verdict != OCCLUDING && verdict != CLEAR && isPatchable(x, y, z)) {
-        unresolvedPatchable++;
+      if (!isPatchable(x, y, z)) {
+        continue;
+      }
+      if (verdict == OCCLUDING || verdict == CLEAR) {
+        resolved++;
+      } else {
+        unresolved++;
       }
     }
-    int applied = store.setBlocksOccluding(xs, ys, zs, occluding);
-    stats.patched.add(applied - unresolvedPatchable);
-    stats.patchFailures.add(cells - applied + unresolvedPatchable);
+    // 整批一次拿锁（见 OcclusionStore#setBlocksOccluding 的说明）；返回值 = 坐标合法、确实被受理的格数。
+    int applied = store.setBlocksOccluding(xs, ys, zs, occluding, cells);
+    stats.patched.add(resolved);
+    stats.patchFailures.add(unresolved + (cells - applied));
+  }
+
+  /**
+   * 补丁热路径的线程本地缓冲：坐标 / 判定 / 批量写入共 6 个数组，按需扩容后复用。
+   *
+   * <p>为什么要复用：一个 4096 格的 {@code MULTI_BLOCK_CHANGE} 每包要新建约 100 KB 临时数组，
+   * 而封包回调只落在少数几个线程上（异步处理器线程池），按线程复用即可把这条路径的分配降为零。
+   */
+  private static final ThreadLocal<PatchBuffer> PATCH_BUFFER =
+      ThreadLocal.withInitial(PatchBuffer::new);
+
+  private static final class PatchBuffer {
+    private int[] coords = new int[48];
+    private byte[] verdicts = new byte[16];
+    private int[] xs = new int[16];
+    private int[] ys = new int[16];
+    private int[] zs = new int[16];
+    private boolean[] occluding = new boolean[16];
+
+    /** 保证所有数组都容得下 {@code cells} 格（只增不减；摊还成本可忽略）。 */
+    void ensureCells(int cells) {
+      if (verdicts.length < cells) {
+        int grown = Math.max(cells, verdicts.length << 1);
+        verdicts = new byte[grown];
+        xs = new int[grown];
+        ys = new int[grown];
+        zs = new int[grown];
+        occluding = new boolean[grown];
+      }
+      int coordLength = cells * 3;
+      if (coords.length < coordLength) {
+        coords = new int[Math.max(coordLength, coords.length << 1)];
+      }
+    }
+  }
+
+  /**
+   * 最近已应用的方块变更包（按 NMS 包实例身份去重的有界环形窗口）。
+   *
+   * <p><b>为什么要去重</b>：服务端对一个方块变更只构造<b>一个</b> NMS 包实例，然后对每个追踪玩家各发一次；
+   * 本监听器按「发送事件」回调，于是同一份坐标会被完整解析并写位图 N 次（N = 视野内玩家数）——
+   * 全是重复劳动，且每次都在封包线程上做临时分配、并持有 {@link OcclusionStore} 的全局写锁。
+   *
+   * <p><b>为什么用包实例身份而不是内容哈希</b>：实例身份判等是常数级且零误判（内容哈希要遍历坐标）；
+   * 广播给多个玩家时 NMS 包地址必然相同。窗口有界（{@value #CAPACITY} 条引用）：广播人数超过窗口容量时，
+   * 只有少数玩家会重复应用一次（幂等、无害），绝不会漏补丁。
+   *
+   * <p><b>为什么分「查」与「登记」两步</b>：只有真正应用成功才登记。若在应用之前就登记，首个接收者
+   * 解析时抛一次异常（瞬时/罕见）就会让同一包的其余接收者全部被跳过，那格补丁从此缺失；
+   * 应用成功后再登记则最坏只是并发多应用一次（幂等）。
+   *
+   * <p><b>线程安全</b>：回调可能落在多个异步处理线程上，用本对象监视器串行化——临界区只有 64 条引用比较，
+   * 在百纳秒级，不会成为瓶颈。窗口只持有方块变更包的引用（坐标与状态数组），不涉及玩家/区块对象。
+   */
+  static final class RecentPackets {
+    static final int CAPACITY = 64;
+
+    private final Object[] handles = new Object[CAPACITY];
+    private final String[] worlds = new String[CAPACITY];
+    private int cursor;
+
+    /**
+     * @param handle    包实例（{@code PacketContainer#getHandle()}）；{@code null} 表示无法判等，按未见过处理
+     * @param worldName 包所属世界名（同一实例若被不同世界复用，必须分别应用；正常不会发生）
+     * @return {@code true} = 已应用过同一包，本次应跳过
+     */
+    synchronized boolean contains(Object handle, String worldName) {
+      if (handle == null || worldName == null) {
+        return false;
+      }
+      for (int i = 0; i < CAPACITY; i++) {
+        if (handles[i] == handle && worldName.equals(worlds[i])) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    /** 登记「该包已应用」；{@code null} 参数直接忽略（无法判等的包不做去重）。 */
+    synchronized void record(Object handle, String worldName) {
+      if (handle == null || worldName == null) {
+        return;
+      }
+      handles[cursor] = handle;
+      worlds[cursor] = worldName;
+      cursor = (cursor + 1) % CAPACITY;
+    }
   }
 
   /**
