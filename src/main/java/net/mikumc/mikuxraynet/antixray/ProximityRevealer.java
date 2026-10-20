@@ -511,6 +511,12 @@ public final class ProximityRevealer implements Listener {
    * <p>区块重新加载时会被重新编译（并重新进入伪装清单），此时旧清单里的坐标已不可信；
    * 已显形标记同理必须清掉，否则玩家会在「区块重载后早已显示为伪装」的位置漏显形。
    * 本回调在主线程 / Folia 区域线程执行，只做两个索引的失效，不读世界内容、不做任何计算。
+   *
+   * <p><b>与 {@code AntiXrayRuntime#invalidateChunk} 的分工</b>：主类那条监听负责「遮挡位图 + 伪装清单」
+   * （它对清单是否真的被摘除有判断，命中才顺带清已显形标记）；本回调负责「伪装清单 + 已显形标记」这一对，
+   * 且<b>无条件</b>清标记——因为清单即使本来就不存在，标记也必须失效：区块卸载意味着该区块已不在任何玩家
+   * 客户端里，任何残留的「已显形」记录都只会在重载后被当成「这块已经显形过」而漏发显形包。
+   * 两处都做是幂等的（{@code clearChunk} 对不存在的键直接返回），不重复扣减计数。
    */
   @EventHandler(ignoreCancelled = true)
   public void onChunkUnload(ChunkUnloadEvent event) {
@@ -518,7 +524,7 @@ public final class ProximityRevealer implements Listener {
       Chunk chunk = event.getChunk();
       String worldName = chunk.getWorld().getName();
       chunkIndex.invalidateChunk(worldName, chunk.getX(), chunk.getZ());
-      revealedSet.clearChunk(new ChunkKey(worldName, chunk.getX(), chunk.getZ()));
+      revealedSet.clearChunk(worldName, chunk.getX(), chunk.getZ());
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
