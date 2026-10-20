@@ -148,6 +148,23 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     private final int passedLimit;
     private final BlockChangeBatch<WrappedBlockData> batch;
     private ScheduledFuture<?> timer;
+
+    /** {@link #passed} 的条目下限（极小缓冲配置下也不至于每包都触发清空）。 */
+    private static final int MIN_PASSED_LIMIT = 1024;
+
+    /**
+     * 由缓冲条目上限推出「已直通坐标」上限：{@code maxPendingEntries × 4}，并不低于
+     * {@link #MIN_PASSED_LIMIT}。
+     *
+     * <p><b>为什么需要上限</b>：{@link #passed} 是本窗口内「已直通下发」的坐标集合。窗口期内若持续有
+     * 近身直通包或远距离批量直通包（大规模显形、爆炸、流水），它会一直增长——违反「内存有界」不变量。
+     * 超限时整体清空：代价只是窗口到期时可能把某个坐标的<b>旧态</b>再下发一次（客户端短暂回退一格，
+     * 下一次变更即修正），绝不影响正确性；这与 {@code revealEcho} 满即清空是同一策略。
+     */
+    private static int passedLimit(int maxPendingEntries) {
+      long scaled = (long) Math.max(1, maxPendingEntries) * 4L;
+      return (int) Math.min(Integer.MAX_VALUE, Math.max(MIN_PASSED_LIMIT, scaled));
+    }
     private final AtomicBoolean flushed = new AtomicBoolean();
     /**
      * 溢出冲刷是否已排入冲刷线程（只在 {@code synchronized (target)} 内读写）。
@@ -697,6 +714,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       if (target.flushed.get()) {
         // 窗口已冲刷：缓冲内容已定型（本次记录再无处生效），跳过
         return;
+      }
+      // 上限闸：超限即整体清空（只可能让窗口到期时把某个坐标的旧态再下发一次，不影响正确性）。
+      // 放在循环前判断，避免「先涨到上限再多加一批」这种瞬时超额。
+      if (target.passed.size() + updates.size() > target.passedLimit) {
+        target.passed.clear();
       }
       for (Update<WrappedBlockData> update : updates) {
         target.passed.add(new Coord(update.x(), update.y(), update.z()));
