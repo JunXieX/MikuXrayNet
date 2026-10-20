@@ -43,8 +43,13 @@ class ConcurrentPipelineBenchmarkTest {
 
   private static final int SECTION_COUNT = BenchFixtures.SECTION_COUNT;
   private static final long SEED = 20240924L;
-  /** 每个线程处理的区块数：足够长以摊薄线程启动与预热成本。 */
-  private static final int CHUNKS_PER_THREAD = 40;
+  /**
+   * 每个线程处理的区块数。
+   *
+   * <p><b>为什么取 200</b>：洞穴形态约 2.4 ms/区块，单线程 40 区块仅约 96 ms——测量窗口偏短，
+   * 线程启动、JIT 分层与 CI 抖动都会显著污染结果。200 区块约 480 ms/档，4 档合计约 2 秒。
+   */
+  private static final int CHUNKS_PER_THREAD = 200;
   private static final int WARMUP_ROUNDS = 3;
   private static final int INDEX_OPS_PER_THREAD = 20_000;
 

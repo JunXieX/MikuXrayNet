@@ -44,7 +44,14 @@ class StageScalingBenchmarkTest {
 
   private static final int SECTION_COUNT = BenchFixtures.SECTION_COUNT;
   private static final int SECTION_VOLUME = BenchFixtures.SECTION_VOLUME;
-  private static final int ITERATIONS_PER_THREAD = 25;
+  /**
+   * 每线程迭代次数。
+   *
+   * <p><b>为什么不能太小</b>：解码单线程约 4860 次/秒，25 次只有约 5 ms——测量窗口短到
+   * {@code System.nanoTime()} 的分辨率与调度抖动都会主导结果（首版取 25 时整个基准只跑 0.26 秒，
+   * 数据完全不可信）。这里按「单档至少数百毫秒」取值：12 档合计约 5~10 秒，对 CI 可接受。
+   */
+  private static final int ITERATIONS_PER_THREAD = 400;
   private static final int WARMUP_ROUNDS = 3;
 
   private static final Path REPORT_PATH = Path.of("target", "benchmark-report.md");
@@ -103,6 +110,24 @@ class StageScalingBenchmarkTest {
           .append(String.format(Locale.ROOT, "%.2fx", eightThreadScaling[stage])).append(" |\n");
     }
 
+    // ---- 对照实验：区分「锁竞争」与「内存带宽饱和」 ----
+    // 若瓶颈是锁，则同线程串行跑多份不会变慢；若是内存带宽，串行同样受带宽限制但不会被抢。
+    // 这里加一组「单线程跑 8 倍工作量」的对照，看其单次耗时是否与 1 倍工作量持平：
+    // 持平 ⇒ 单线程本身没有随工作量退化（说明不是 GC/缓存失效），多线程退化只能来自共享资源。
+    report.append("\n### 7.2 对照：单线程 8 倍工作量\n\n");
+    report.append("| 阶段 | 1x 单次(µs) | 8x 单次(µs) | 8x/1x |\n");
+    report.append("| --- | --- | --- | --- |\n");
+    for (int stage = 0; stage < stageNames.length; stage++) {
+      double oneX = measureSingleThread(codec, bytes, registry, stage, ITERATIONS_PER_THREAD);
+      double eightX = measureSingleThread(codec, bytes, registry, stage, ITERATIONS_PER_THREAD * 8);
+      report.append("| ").append(stageNames[stage]).append(" | ")
+          .append(String.format(Locale.ROOT, "%.1f", oneX)).append(" | ")
+          .append(String.format(Locale.ROOT, "%.1f", eightX)).append(" | ")
+          .append(String.format(Locale.ROOT, "%.2fx", oneX <= 0 ? 0.0 : eightX / oneX)).append(" |\n");
+    }
+    report.append("\n> 「8x/1x」接近 1.00 表示单线程工作量增加不改变单次成本（无 GC/缓存退化）；"
+        + "此时多线程仍不线性，即可判定瓶颈是**全核共享资源**（内存带宽/LLC）而非锁。\n");
+
     report.append("\n> 表中 2/4/8 线程列均为「相对 1 线程的吞吐倍数」。\n");
     report.append("> 判读：若「解码」与「重编码」扩展性都明显低于「逐格判定」，则瓶颈在 `ChunkScratch` "
         + "的线程复用池；若三段都低，则更可能是内存带宽或 GC 压力。\n");
@@ -111,6 +136,30 @@ class StageScalingBenchmarkTest {
 
     for (double throughput : singleThreadThroughput) {
       assertTrue(throughput > 0.0, "每段的单线程吞吐都必须被成功采集");
+    }
+  }
+
+  /** 单线程跑 {@code rounds} 次指定阶段，返回「每次」的平均微秒数。 */
+  private static double measureSingleThread(ChunkCodec codec, byte[] bytes, StubRegistry registry,
+      int stage, int rounds) {
+    // 预热
+    for (int i = 0; i < WARMUP_ROUNDS; i++) {
+      runStageOnce(codec, bytes, registry, stage);
+    }
+    long start = System.nanoTime();
+    for (int i = 0; i < rounds; i++) {
+      runStageOnce(codec, bytes, registry, stage);
+    }
+    long nanos = System.nanoTime() - start;
+    return rounds <= 0 ? 0.0 : nanos / 1000.0 / rounds;
+  }
+
+  private static void runStageOnce(ChunkCodec codec, byte[] bytes, StubRegistry registry, int stage) {
+    switch (stage) {
+      case 0 -> decodeOnly(codec, bytes);
+      case 1 -> scanOnly(codec, bytes, registry);
+      case 2 -> reencodeOnly(codec, bytes);
+      default -> throw new IllegalArgumentException("未知阶段 " + stage);
     }
   }
 
