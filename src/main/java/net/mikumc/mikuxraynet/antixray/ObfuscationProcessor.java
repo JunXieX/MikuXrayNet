@@ -619,6 +619,17 @@ public final class ObfuscationProcessor {
   }
 
   /** 是否具备生效条件（任一维度档案或任一世界覆盖档案的目标与伪装候选都已解析）。 */
+  /**
+   * 是否启用了异步遮挡（即是否会给区块生成遮挡位图）。
+   *
+   * <p>供封包链路判定「改写结果里的遮挡负载是否必须存在」：启用时若某区块的位图生成失败，
+   * 其结果不得进缓存（否则该区块会长期「已伪装但永远无位图」，显形侧按「缺数据 = 遮挡」判定，
+   * 玩家挖到的矿会一直显示假方块）。
+   */
+  public boolean occlusionEnabled() {
+    return occlusionStores != null;
+  }
+
   public boolean isActive() {
     for (WorldProfile profile : dimensionProfiles) {
       if (profile.active()) {

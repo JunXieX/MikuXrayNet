@@ -612,6 +612,15 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
           cached = loadFromDisk(task, sourceHash, fingerprint);
         }
 
+        if (cached != null && processor.occlusionEnabled() && cached.occlusion() == null) {
+          // 启用了异步遮挡，但这条缓存没有随负载携带遮挡位图（旧版本写下的条目 / 当时功能关闭）。
+          // 直接命中会让该区块长期「已伪装但无位图」：显形侧按「缺数据 = 遮挡」判定，
+          // 玩家挖到这里的矿会一直显示假方块 —— 属于「为了多藏而让玩家漏矿」，必须避免。
+          // 视为未命中、重新改写一次即可重建位图（代价仅一次性）。
+          stats.cacheContentRejected.increment();
+          cached = null;
+        }
+
         if (cached != null) {
           // 缓存命中路径不解码，遮挡位图只能来自随负载一起缓存的副本（方案 b）：
           // 未启用该功能时 occlusion 为 null、restoreOcclusion 为 no-op，零开销。
@@ -723,7 +732,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     logFirstRewriteDiagnostic(task, source, result);
 
-    if (resultCacheable(result)) {
+    // 启用异步遮挡时，位图缺失的结果不入缓存（否则该区块会长期「已伪装但永远无位图」→ 玩家漏矿）。
+    boolean occlusionRequired = processor.occlusionEnabled();
+    if (resultCacheable(result, occlusionRequired)) {
       CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions(),
           result.occlusion());
       cache.put(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint, value);
@@ -754,6 +765,28 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    */
   static boolean resultCacheable(ObfuscationProcessor.Result result) {
     return result != null && !result.failed();
+  }
+
+  /**
+   * 带「遮挡位图必须随负载一起缓存」约束的可缓存判定。
+   *
+   * <p><b>为什么单看 {@code failed()} 不够</b>：显形的可见性判定走遮挡位图，而
+   * {@link BitmapVisibility} 的策略是「缺数据 = 按实心处理 = 不显形」。位图只在改写时由
+   * {@code captureOcclusion} 生成并随结果进缓存；若它生成失败（返回 {@code null}）而结果照常入缓存，
+   * 该区块就会长期处于「已伪装、但永远没有位图」的状态 —— 玩家挖到那里的矿会一直显示假方块，
+   * 直到缓存过期重写。这属于「为了多藏而让玩家漏矿」，是不可接受的方向。
+   *
+   * <p>因此：启用异步遮挡时，位图缺失的结果一律不入缓存，逼下次重新改写重建位图；代价只是故障期间
+   * 该区块每次重发都要重算（故障本身罕见，且已有 {@code captureOcclusion} 的 fail-open 计数可观测）。
+   *
+   * @param result           改写结果
+   * @param occlusionRequired 当前是否启用了异步遮挡（{@code occlusionStores != null}）
+   */
+  static boolean resultCacheable(ObfuscationProcessor.Result result, boolean occlusionRequired) {
+    if (!resultCacheable(result)) {
+      return false;
+    }
+    return !occlusionRequired || result.occlusion() != null;
   }
 
   /**

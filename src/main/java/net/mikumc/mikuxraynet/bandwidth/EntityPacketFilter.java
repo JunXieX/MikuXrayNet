@@ -171,9 +171,17 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
   public void start() {
     if (!whitelist.isEmpty()) {
       if (PlatformSupport.isFolia()) {
-        // 保留平台差异：Folia 下无法从单一线程安全枚举全服实体，因此不做类型索引（白名单退化为对所有实体生效）
-        plugin.getLogger().warning("Folia 下无法安全枚举实体，零位移包白名单暂不生效（不影响其余逻辑）");
-      } else {
+        // Folia 下无法从单一线程安全枚举全服实体，因此建不了类型索引；没有索引就无从判断
+        // 「这个零位移包属于白名单实体（盔甲架 / 展示实体 / 物品展示…）」——而白名单里的实体
+        // 恰恰是「靠持续下发零位移包维持客户端姿态」的那一类。此时若照常取消零位移包，
+        // 玩家会看到这些实体位置/姿态卡住不动（能直接感知的体验问题）。
+        //
+        // 因此：宁可整项停用（少省一点带宽），也不能牺牲玩家可见的体验。
+        plugin.getLogger().warning("Folia 下无法安全枚举实体、白名单索引建不起来："
+            + "已停用「零位移实体包取消」（避免盔甲架/展示实体姿态卡住）；其余带宽功能不受影响");
+        return;
+      }
+      {
         // 增量事件（实体加入/离开世界）由本类作为 Listener 接收；事件在实体所属线程触发，只更新并发索引
         plugin.getServer().getPluginManager().registerEvents(this, plugin);
         // 启动时先做一次「不限额」的全量建索引：让「插件启用前就已存在」的实体立即命中白名单
