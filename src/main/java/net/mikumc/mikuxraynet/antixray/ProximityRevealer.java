@@ -542,7 +542,25 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
-  /** 全服巡检（非 Folia：主线程，遍历在线玩家并共享本次发包额度）。 */
+  /**
+   * 全服巡检（非 Folia：主线程，遍历在线玩家）。
+   *
+   * <p><b>额度是「每个玩家各自独享」的，不是全服共享</b>（旧行为见下方说明）。
+   *
+   * <p><b>为什么必须改成独享</b>：旧实现只在循环外建一个 {@code Budget}，全服共用
+   * {@code max-reveals-per-tick}（默认 512）。50 人在线时每人每周期实际只摊到约 10 个额度，
+   * 且循环里一旦 {@code remaining <= 0} 就 <b>直接 return，把后面还没遍历到的玩家整个跳过</b>——
+   * 他们这一轮一个显形都拿不到。虽然候选按距离排序、分片也在轮转，但「谁排在后面谁吃亏」
+   * 不是硬保证：真机表现就是「同样的矿，有的玩家走近立刻还原，有的要等好几轮」。
+   *
+   * <p>改成每玩家独享后，每个在线玩家每周期都能拿到完整的 {@code max-reveals-per-tick} 额度。
+   * 代价是理论总发包上限随人数线性增长（50 人 × 512 = 25,600/周期），但实际上限由候选数决定：
+   * 单玩家每周期候选已被 {@link #fetchLimit} 截断到至多 {@link #MAX_CANDIDATES}，且只有真正
+   * 通过视锥 + 位图可见性判定的坐标才会发包，绝大多数周期远达不到额度。
+   *
+   * <p>若服主确实需要「全服总量」上限，应通过降低 {@code max-reveals-per-tick} 来实现——
+   * 那是明确的、可预期的旋钮；而旧行为让额度含义随在线人数漂移，反而不可控。
+   */
   private void passAll() {
     if (stopping) {
       return;
@@ -553,13 +571,10 @@ public final class ProximityRevealer implements Listener {
     // 按「巡检轮次」推进，而不是按墙钟时间取模——服务器掉 tick 时墙钟会跑在实际巡检前面，
     // 反而会让一部分分片被整轮跳过。
     int shard = shardFor(globalPasses.incrementAndGet());
-    Budget budget = new Budget(limit());
+    // 每个玩家各自一份额度：不再因「前面的玩家用光了」而跳过后面的玩家。
     for (Player player : Bukkit.getOnlinePlayers()) {
-      if (budget.remaining() <= 0) {
-        return;
-      }
       try {
-        reveal(player, budget, shard);
+        reveal(player, new Budget(limit()), shard);
       } catch (Throwable throwable) {
         logThrottled(throwable);
       }

@@ -101,8 +101,10 @@ final class ProximityScanner {
 
     for (int chunkX = centerX - radius; chunkX <= centerX + radius; chunkX++) {
       for (int chunkZ = centerZ - radius; chunkZ <= centerZ + radius; chunkZ++) {
-        ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
-        ObfuscatedChunkIndex.ChunkEntry entry = index.entry(key);
+        // 用「世界名 + 坐标」的原始分量查询：扫描每周期遍历 13×13 = 169 个区块，
+        // 逐块 new ChunkKey 会产出 169 个短命对象（50 人在线时约 4.2 万个/秒，全在主线程/区域线程）。
+        // 索引与已显形集合都提供按分量查询的重载，热循环因此零分配。
+        ObfuscatedChunkIndex.ChunkEntry entry = index.entry(worldName, chunkX, chunkZ);
         if (entry == null) {
           continue;
         }
@@ -111,7 +113,7 @@ final class ProximityScanner {
         // 同样放在「整块跳过」判定之前：整块已显形的区块不再逐坐标评估，若此时不刷新，它的标记会在
         // expire-seconds 后被过期清掉，导致「整块跳过」周期性失效、同一批坐标被反复重新评估与重复发包
         // （真机上表现为「20 万次判定只换来百余次发送」）。
-        revealed.touch(playerId, key);
+        revealed.touch(playerId, worldName, chunkX, chunkZ);
         // 分片轮转：本周期只处理属于本片的区块，其余留给后面的周期（见类注释「区块分片轮转」）。
         // 放在「整块跳过」判定之前：不属于本片的区块连清单都不读，本片单周期的评估量因此不随
         // 「身边伪装坐标总量」增长——它只与本片的坐标数相关。
@@ -121,7 +123,7 @@ final class ProximityScanner {
           }
           continue;
         }
-        if (revealed.sizeFor(playerId, key) >= entry.size()) {
+        if (revealed.sizeFor(playerId, worldName, chunkX, chunkZ) >= entry.size()) {
           // 整块已全部显形：稳态下每周期只处理「新进入视野的区块」
           if (tally != null) {
             tally.chunksSkipped++;
@@ -146,7 +148,7 @@ final class ProximityScanner {
           if (distanceSq > maxDistanceSquared) {
             continue;
           }
-          if (revealed.contains(playerId, key, blockX, blockY, blockZ)) {
+          if (revealed.contains(playerId, worldName, chunkX, chunkZ, blockX, blockY, blockZ)) {
             continue;
           }
           // 传原始分量而非先构造 Position：堆满之后绝大多数候选注定被淘汰，只有真正入堆时才需要对象

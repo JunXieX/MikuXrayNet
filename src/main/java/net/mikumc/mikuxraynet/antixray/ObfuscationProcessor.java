@@ -903,7 +903,11 @@ public final class ObfuscationProcessor {
 
           if (undoLog != null) {
             // 记下「被替换前的原状态」，供 6 面判定回查（见 isOccluding）。
-            undoLog.record(index, section.getBlockState(index));
+            // 直接复用循环开头读到的 state：此刻 setBlockState 尚未执行，该格仍是原值，
+            // 再调一次 getBlockState 只是重复一次 data.get（整数除法）+ palette.valueFor。
+            // 该路径仅在 enclosed 模式（undoLog != null）且真正替换时才走到，
+            // 但「洞穴」形态单区块可替换近 3000 格，重复读取的量并不小。
+            undoLog.record(index, state);
           }
           section.setBlockState(index, replacement);
           sectionChanged = true;

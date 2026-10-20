@@ -197,6 +197,30 @@ public final class RevealedSet {
   }
 
   /** 该玩家在该区块已显形的坐标数（无记录返回 0）。 */
+  /**
+   * 按「世界名 + 区块坐标」查询已显形坐标数，<b>不分配 {@link ChunkKey}</b>（供扫描热循环使用）。
+   *
+   * <p>用 {@link ChunkKey.Probe} 作查询键：它只用于 {@code ConcurrentHashMap} 查询、绝不入表，
+   * 哈希与相等判定与 record 逐字段一致，语义与 {@link #sizeFor(UUID, ChunkKey)} 完全相同。
+   */
+  int sizeFor(UUID playerId, String worldName, int chunkX, int chunkZ) {
+    if (playerId == null || worldName == null) {
+      return 0;
+    }
+    ConcurrentHashMap<UUID, Marker> players =
+        chunks.get(ChunkKey.Probe.local().set(worldName, chunkX, chunkZ));
+    if (players == null) {
+      return 0;
+    }
+    Marker marker = players.get(playerId);
+    if (marker == null) {
+      return 0;
+    }
+    synchronized (marker) {
+      return marker.size();
+    }
+  }
+
   int sizeFor(UUID playerId, ChunkKey key) {
     Marker marker = markerOf(playerId, key);
     if (marker == null) {
@@ -208,6 +232,26 @@ public final class RevealedSet {
   }
 
   /** 该玩家在该区块的该坐标是否已显形过。 */
+  /** 按「世界名 + 区块坐标」判断某坐标是否已显形，<b>不分配 {@link ChunkKey}</b>（供扫描热循环使用）。 */
+  boolean contains(UUID playerId, String worldName, int chunkX, int chunkZ, int x, int y, int z) {
+    if (playerId == null || worldName == null) {
+      return false;
+    }
+    ConcurrentHashMap<UUID, Marker> players =
+        chunks.get(ChunkKey.Probe.local().set(worldName, chunkX, chunkZ));
+    if (players == null) {
+      return false;
+    }
+    Marker marker = players.get(playerId);
+    if (marker == null) {
+      return false;
+    }
+    long packed = pack(x, y, z);
+    synchronized (marker) {
+      return marker.contains(packed);
+    }
+  }
+
   boolean contains(UUID playerId, ChunkKey key, int x, int y, int z) {
     Marker marker = markerOf(playerId, key);
     if (marker == null) {
@@ -285,6 +329,22 @@ public final class RevealedSet {
   }
 
   /** 刷新该玩家在该区块的活跃时间（扫描到该区块时调用，避免身边的标记被过期清掉）。 */
+  /** 按「世界名 + 区块坐标」刷新活跃时间，<b>不分配 {@link ChunkKey}</b>（供扫描热循环使用）。 */
+  void touch(UUID playerId, String worldName, int chunkX, int chunkZ) {
+    if (playerId == null || worldName == null) {
+      return;
+    }
+    ConcurrentHashMap<UUID, Marker> players =
+        chunks.get(ChunkKey.Probe.local().set(worldName, chunkX, chunkZ));
+    if (players == null) {
+      return;
+    }
+    Marker marker = players.get(playerId);
+    if (marker != null) {
+      marker.updatedAtNanos = clock.getAsLong();
+    }
+  }
+
   void touch(UUID playerId, ChunkKey key) {
     Marker marker = markerOf(playerId, key);
     if (marker != null) {

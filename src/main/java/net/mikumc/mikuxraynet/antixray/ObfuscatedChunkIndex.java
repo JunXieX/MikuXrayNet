@@ -284,6 +284,25 @@ public final class ObfuscatedChunkIndex {
   }
 
   /**
+   * 按「世界名 + 区块坐标」取条目，<b>不分配 {@link ChunkKey}</b>（供邻近显形扫描热循环使用）。
+   *
+   * <p>用 {@link ChunkKey.Probe}（线程本地、字段可变、哈希与相等判定与 record 逐字段一致）作为查询键：
+   * 它只用于 {@code ConcurrentHashMap} 查询，绝不会被存进表里，因此不存在「键内容被改污染结构」的风险。
+   * 语义与 {@link #entry(ChunkKey)} 完全一致（命中即刷新活跃时间）。
+   */
+  ChunkEntry entry(String worldName, int chunkX, int chunkZ) {
+    if (worldName == null) {
+      return null;
+    }
+    ChunkKey.Probe probe = ChunkKey.Probe.local().set(worldName, chunkX, chunkZ);
+    ChunkEntry entry = chunks.get(probe);
+    if (entry != null) {
+      entry.touch(clock.getAsLong());
+    }
+    return entry;
+  }
+
+  /**
    * 注销一个坐标（服务端自行下发了该坐标的方块变更时调用）。
    *
    * <p>只从「该坐标所属区块」的清单里摘除这一个坐标，其它坐标不受影响；清单被摘空时整条移除。
