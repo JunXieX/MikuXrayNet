@@ -93,25 +93,30 @@ public final class MikuXrayNet extends JavaPlugin {
     PlatformSupport.configure(config.antiXray().platform());
     // 开服日志只保留一行「加载成功」：常规启动的全部细节（平台、各模块参数、自检结果）一律降为 FINE
     // （默认不可见，需要排查时打开调试日志即可）；任何功能不可用 / 降级 / 失败都会由各自模块打 WARNING。
-    // 插件可能在同一 JVM 内被重新启用：复位「正在停用」标志，否则重新启用后所有热重载都会被取消。
-    reloadCoordinator.resetShutdownState();
     getLogger().fine("运行平台：" + PlatformSupport.platformDescription());
-    this.runtime = new AntiXrayRuntime(this, occlusionStats);
-    // 反矿透装配失败绝不能让整个插件启用失败：带宽模块与命令与它相互独立，必须照常可用。
-    // 旧实现让异常直接冒出 onEnable —— 此时 ProtocolLib 拦截、线程池、磁盘缓存可能已装配，
-    // 却永远不会执行 stopForDisable()，线程/文件句柄全部泄漏，且 Bukkit 会把整个插件判为启用失败。
-    try {
-      runtime.startBypassRegistry();
-      runtime.startAntiXray();
-    } catch (Throwable throwable) {
-      getLogger().log(Level.WARNING, "反矿透模块装配失败（带宽优化与管理命令仍可用）", throwable);
+    // 整个装配段放进「重载会话锁」并复位 shuttingDown：若只在锁外复位，一个正排队在 reloadLock 上的
+    // 重载可能在复位之后立刻拿到锁，与启用装配并发执行 → 同一次启用里出现两条 ThrottlePipeline，
+    // 其中一条既不在字段里也没人 stop（两套改写器同时生效、旧 EntityCuller 藏起的实体无人恢复）。
+    reloadCoordinator.runExclusivelyOnEnable(() -> {
+      this.runtime = new AntiXrayRuntime(this, occlusionStats);
+      // 反矿透装配失败绝不能让整个插件启用失败：带宽模块与命令与它相互独立，必须照常可用。
+      // 旧实现让异常直接冒出 onEnable —— 此时 ProtocolLib 拦截、线程池、磁盘缓存可能已装配，
+      // 却永远不会执行 stopForDisable()，线程/文件句柄全部泄漏，且 Bukkit 会把整个插件判为启用失败。
       try {
-        runtime.stopForDisable();
-      } catch (Throwable cleanupFailure) {
-        getLogger().log(Level.WARNING, "反矿透模块清理失败（可能残留线程/句柄，建议重启）", cleanupFailure);
+        runtime.startBypassRegistry();
+        runtime.startAntiXray();
+      } catch (Throwable throwable) {
+        getLogger().log(Level.WARNING, "反矿透模块装配失败（带宽优化与管理命令仍可用）", throwable);
+        try {
+          runtime.stopForDisable();
+        } catch (Throwable cleanupFailure) {
+          getLogger().log(Level.WARNING, "反矿透模块清理失败（可能残留线程/句柄，建议重启）", cleanupFailure);
+        }
+        // 装配失败后不再对外发布这个半成品：置空字段，避免诊断把它当成「已启用但全 0」。
+        this.runtime = null;
       }
-    }
-    startBandwidth();
+      startBandwidth();
+    });
     new CommandRegistrar(this).register();
     startDiagnosticsTask();
     getLogger().info("MikuXrayNet " + pluginVersion() + " 已启用（" + PlatformSupport.platformDescription() + "）");

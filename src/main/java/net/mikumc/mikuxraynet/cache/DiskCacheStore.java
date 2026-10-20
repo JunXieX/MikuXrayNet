@@ -936,6 +936,21 @@ public final class DiskCacheStore implements AutoCloseable {
    * <p>只有磁盘线程调用；{@link ConcurrentHashMap#remove(Object, Object)} 返回 false（句柄已被别处移除）时不做任何事。
    */
   private void removeAndClose(RegionKey key, Handle handle) {
+    removeAndClose(key, handle, false);
+  }
+
+  /**
+   * 摘除并关闭句柄；{@code deleteFile} 为真时连磁盘文件一起删除（<b>文件级淘汰</b>专用）。
+   *
+   * <p><b>为什么淘汰必须删文件</b>：{@code max-region-files} 的语义是「磁盘上最多保留多少个区域文件」。
+   * 若淘汰只关句柄不删文件，它实际只约束了「同时打开的句柄数」：被淘汰的文件仍在磁盘上，下次访问直接
+   * 命中并重新计入条目额度，过期条目又只在被读到时才清理 —— 于是再也不会被访问的文件永久滞留，
+   * 磁盘文件数随「访问过的 region 数」单调增长（单文件上限 16 MiB，探索型服务器可涨到数十 GB）。
+   *
+   * <p>删除是安全的：缓存只是可选加速层，丢掉的文件下次访问按未命中重建。只在
+   * {@code !lockUnavailable && !isCompacting} 时删（前者说明文件归别的进程，后者说明压缩线程正独占它）。
+   */
+  private void removeAndClose(RegionKey key, Handle handle, boolean deleteFile) {
     if (handle.file.isCompacting()) {
       // 该文件正被压缩线程独占：绝不能在压缩进行中关闭它的通道（那会让压缩以 ClosedChannelException
       // 失败）。留给下一次维护重试；压缩线程自身的失败路径也会调本方法，那时标志已由 compact 的
@@ -951,15 +966,16 @@ public final class DiskCacheStore implements AutoCloseable {
       approximateEntries.updateAndGet(value -> (int) Math.max(0L, value - accounted));
     }
     entryCounted.remove(key);
-    closeHandleQuietly(handle);
+    closeHandleQuietly(handle, deleteFile);
   }
 
-  /** 落盘 + 关闭，并删掉「空且不脏」的文件，避免磁盘上残留无意义的小文件。 */
-  private void closeHandleQuietly(Handle handle) {
+  /** 落盘 + 关闭；空文件或「淘汰要求删文件」时删除磁盘文件。 */
+  private void closeHandleQuietly(Handle handle, boolean deleteFile) {
     try {
       boolean empty = handle.file.isEmptyFile();
+      boolean deletable = deleteFile && !handle.file.lockUnavailable();
       handle.file.close();
-      if (empty) {
+      if (empty || deletable) {
         Files.deleteIfExists(handle.file.path());
       }
     } catch (Throwable throwable) {
@@ -1092,7 +1108,9 @@ public final class DiskCacheStore implements AutoCloseable {
         if (candidate.file.isCompacting()) {
           continue; // 压缩独占：此时关闭通道会让压缩以 ClosedChannelException 失败
         }
-        if (victim == null || candidate.lastAccessMillis < victim.lastAccessMillis) {
+        // 用单调时钟比较先后：墙钟毫秒会被系统对时/夏令时回拨，且同一毫秒内的多个句柄会退化成
+        // 哈希顺序（可能误淘汰刚用过的热文件）。lastAccessNanos 与「闲置关句柄」用的是同一个时钟。
+        if (victim == null || candidate.lastAccessNanos < victim.lastAccessNanos) {
           victim = candidate;
           victimKey = entry.getKey();
         }
@@ -1101,7 +1119,8 @@ public final class DiskCacheStore implements AutoCloseable {
         // 全部句柄都在压缩中：本轮放弃，等下一次打开或维护周期再试（容量暂时超标可接受）
         return;
       }
-      removeAndClose(victimKey, victim);
+      // deleteFile=true：这才是「真正的磁盘回收」——只关句柄不删文件等于没回收（见 removeAndClose 说明）。
+      removeAndClose(victimKey, victim, true);
       if (open.size() >= before) {
         // 兜底：removeAndClose 未能摘除（句柄已被别处移除等），避免死循环
         return;
@@ -1250,17 +1269,28 @@ public final class DiskCacheStore implements AutoCloseable {
     }
 
     pendingOps.incrementAndGet();
+    // 「本次提交的额度只归还一次」的令牌：超时路径与任务 finally 都靠它做 claim-once。
+    //
+    // 为什么不能用 future.cancel(false) 的返回值判断：FutureTask.cancel 对**正在运行**的任务同样返回
+    // true（运行中状态仍是 NEW，只有 set() 才离开 NEW）。于是「任务在 50ms 内超时、但仍在磁盘线程上
+    // 执行」时，读线程扣一次、任务 finally 再扣一次 → pendingOps 每次 -1 漂移，变负后三处队列上限
+    // （读/写/收尾）永远为假，积压保护彻底失效且 rejectedByBacklog 不再自增。
+    AtomicBoolean settled = new AtomicBoolean();
     Future<T> future;
     try {
       future = executor.submit(() -> {
         try {
           return task.call();
         } finally {
-          pendingOps.decrementAndGet();
+          if (settled.compareAndSet(false, true)) {
+            pendingOps.decrementAndGet();
+          }
         }
       });
     } catch (Throwable throwable) {
-      pendingOps.decrementAndGet();
+      if (settled.compareAndSet(false, true)) {
+        pendingOps.decrementAndGet();
+      }
       fail("磁盘缓存任务提交失败", throwable);
       return null;
     }
@@ -1279,7 +1309,10 @@ public final class DiskCacheStore implements AutoCloseable {
       // 累积到 queueCapacity 后（put 与 submit 都以它为门限）磁盘缓存会静默彻底停用，直到重启。
       // 因此：cancel 返回 true（确认任务未运行、finally 不会执行）时由本线程补一次递减；
       // cancel 返回 false 说明任务已在运行或已完成，其 finally 会（或已经）递减，不得重复扣减。
-      if (future.cancel(false)) {
+      future.cancel(false);
+      if (settled.compareAndSet(false, true)) {
+        // 抢到令牌 ⇒ 任务尚未开始（其 finally 不会执行）⇒ 由本线程归还额度。
+        // 抢不到 ⇒ 任务已开始或已结束，其 finally 已归还，绝不重复扣减。
         pendingOps.decrementAndGet();
       }
       stats.errors.increment();

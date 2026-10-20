@@ -79,6 +79,24 @@ public final class ReloadCoordinator {
     shuttingDown = false;
   }
 
+  /**
+   * 在「重载会话锁」内执行插件启用流程，并先复位 {@link #shuttingDown}。
+   *
+   * <p><b>为什么不能只调 {@link #resetShutdownState()}</b>：复位若发生在锁外，一个正排队在
+   * {@code synchronized (reloadLock)} 上的 reload 可能在复位之后立刻拿到锁，与启用流程的
+   * 「装配带宽管线」并发执行 —— 于是同一次启用里出现两条 {@code ThrottlePipeline}，
+   * 其中一条既不在字段里也没人 stop（两套改写器同时生效、旧 EntityCuller 藏起的实体无人恢复）。
+   * 把「复位 + 装配」整段放进同一把锁即可消除该窗口。
+   *
+   * @param action 启用装配流程
+   */
+  public void runExclusivelyOnEnable(Runnable action) {
+    synchronized (reloadLock) {
+      shuttingDown = false;
+      action.run();
+    }
+  }
+
   /** 本次热重载后已即时生效的配置项。 */
   public static final List<String> APPLIED = List.of(
       "邻近显形（距离/周期/单次上限）",

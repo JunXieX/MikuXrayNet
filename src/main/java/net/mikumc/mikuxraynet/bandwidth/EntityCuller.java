@@ -662,14 +662,51 @@ public final class EntityCuller implements Listener {
       // 按实例摘除：实体此时可能已经离开本区域，读它的 entityId 会触发 Folia 线程校验并刷 ERROR。
       // 摘除动作顺带返回「加入时捕获的 entityId」，供防抖账本清除对应条目——同样无需触碰实体本身。
       int removedId = rotation.remove(event.getEntity());
-      if (removedId >= 0) {
-        removeStreak(playerId, removedId);
+      if (removedId < 0) {
+        return;
+      }
+      removeStreak(playerId, removedId);
+      // 关键：该实体仍在本玩家的「已隐藏」账本里时，必须把它留在轮转队列中。
+      //
+      // 为什么：hideEntity 的隐藏状态跨 untrack 仍然生效（服务端不再给它发追踪包，但客户端那边仍是隐藏的）。
+      // 通道②是「远距离已隐藏实体唯一的再评估入口」——玩家在 40 格外把挡墙挖开后，只有轮转复检能把它
+      // 恢复可见。若这里无条件摘除，该实体就再也进不了通道②，玩家必须走近 32 格才看得见（该显示却仍隐藏）。
+      // 保留的代价是有界的：账本条目在 showIfHidden 成功后即摘除，实体真正失效/玩家退出也会整体清空。
+      Map<Integer, HiddenEntry> hiddenMap = hidden.get(playerId);
+      if (hiddenMap != null && hiddenMap.containsKey(removedId)) {
+        // 重新入队：用「加入时捕获的 removedId」，绝不在此读实体状态（它可能已跨区域）。
+        rotation.add(event.getEntity(), removedId);
       }
     }
   }
 
   private TrackedRotation rotation(UUID playerId) {
     return rotations.computeIfAbsent(playerId, uuid -> new TrackedRotation());
+  }
+
+  /**
+   * 把玩家当前已追踪的实体补种进轮转队列（启用/热重载后调用一次）。
+   *
+   * <p><b>为什么需要</b>：{@link PlayerTrackEntityEvent} 只在「新进入追踪范围」时触发，热重载重建本模块后
+   * 既有实体不会补发事件，于是轮转队列为空——通道②（远距离已隐藏实体唯一的再评估入口）对它们零提交，
+   * 表现为 {@code recheckSubmitted} 长期停在 0、远处遮挡变化不再收敛。
+   *
+   * <p>只在玩家所属线程可安全调用（{@code start()} 在 Paper 主线程 / Folia 各玩家区域线程上执行）；
+   * 任何失败都只降级为「该玩家本轮不补种」，绝不影响其它功能。
+   */
+  private TrackedRotation seedRotationLazily(Player player) {
+    // 用「玩家周围一定半径内的实体」补种，而不是 Player#getTrackedEntities()：后者在当前编译目标
+    // （paper-api 26.2）上不存在。半径取强制可见距离的 8 倍（至少 64 格），覆盖本模块会剔除的范围；
+    // 更远的实体本来也不会被通道②判定（超距只做 RESTORE_ONLY）。
+    // 只在「该玩家尚无轮转队列」时执行一次（热重载后首次复检），因此这是一次性开销。
+    TrackedRotation target = rotation(player.getUniqueId());
+    double radius = Math.max(64.0D, config.forceVisibleDistance() * 8.0D);
+    for (Entity entity : player.getWorld().getNearbyEntities(player.getLocation(), radius, radius, radius)) {
+      if (entity != player) {
+        target.add(entity);
+      }
+    }
+    return target;
   }
 
   /**
@@ -774,7 +811,15 @@ public final class EntityCuller implements Listener {
     //    超预算者顺延到下一周期、不丢判定，故「提交全部」不会让开销无界。
     TrackedRotation rotation = rotations.get(playerId);
     if (rotation == null) {
-      return;
+      // 热重载会重建本模块，而 PlayerTrackEntityEvent 不会为「已追踪实体」补发 —— 队列为空时通道②
+      // 对既有实体零提交（静止实体如盔甲架/展示框永不补入，recheckSubmitted 长期停在 0）。
+      // 这里在玩家所属线程懒补种一次；失败只降级为「本轮不补种」，不影响其它功能。
+      try {
+        rotation = seedRotationLazily(player);
+      } catch (Throwable throwable) {
+        plugin.getLogger().fine("实体剔除：补种轮转队列失败（该玩家本轮跳过）：" + throwable.getMessage());
+        return;
+      }
     }
     // 每周期限量提交：队列容量是固定值（OCCLUSION_QUEUE_CAPACITY），而「提交全部追踪实体」在多人时
     // 必然超过它（按类注释的定容规则，50 人 × 100 追踪即 5000 > 4096）——超出的部分被引擎拒收后
@@ -1489,7 +1534,16 @@ public final class EntityCuller implements Listener {
 
     /** 加入一个被追踪实体（按加入时捕获的 entityId 去重）。 */
     synchronized void add(Entity entity) {
-      int id = entity.getEntityId();
+      add(entity, entity.getEntityId());
+    }
+
+    /**
+     * 加入一个被追踪实体，<b>entityId 由调用方给出</b>。
+     *
+     * <p>用于 untrack 场景：实体此时可能已经离开本区域，读 {@code getEntityId()} 会触发 Folia 线程校验
+     * 并刷 ERROR。调用方手里已有「加入时捕获的 id」，直接传进来即可，完全不碰实体状态。
+     */
+    synchronized void add(Entity entity, int id) {
       for (Tracked tracked : order) {
         if (tracked.id() == id) {
           return;
