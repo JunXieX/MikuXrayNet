@@ -47,7 +47,7 @@ class VarBitBufferAccessBenchmarkTest {
     report.append("- 等价性：两种实现对每个格子必须返回完全相同的值（本测试硬断言）\n");
     report.append("- 预热 ").append(WARMUP).append(" 轮、测量 ").append(ROUNDS).append(" 轮\n\n");
 
-    report.append("| 每方块位宽 | 现有实现(µs/section) | 特化实现(µs/section) | 提速 | 每区块省(µs, 24 段) |\n");
+    report.append("| 每方块位宽 | 现有实现(µs/section, min) | 特化实现(µs/section, min) | 提速 | 每区块省(µs, 24 段) |\n");
     report.append("| --- | --- | --- | --- | --- |\n");
 
     ThreadMXBean allocation = allocationBean();
@@ -72,6 +72,7 @@ class VarBitBufferAccessBenchmarkTest {
             "位宽 " + bits + " 第 " + i + " 格：特化实现必须与现有实现逐格相同");
       }
 
+      // 预热两种实现（交替，使二者的 JIT 编译状态一致）
       for (int i = 0; i < WARMUP; i++) {
         readAllGeneric(packed, entriesPerLong, bits, mask);
         readAllShifted(packed, shift, bits, mask);
@@ -80,22 +81,36 @@ class VarBitBufferAccessBenchmarkTest {
       long[] shiftedNanos = new long[ROUNDS];
       long sink = 0L;
       for (int round = 0; round < ROUNDS; round++) {
-        long start = System.nanoTime();
-        sink += readAllGeneric(packed, entriesPerLong, bits, mask);
-        genericNanos[round] = System.nanoTime() - start;
-        start = System.nanoTime();
-        sink += readAllShifted(packed, shift, bits, mask);
-        shiftedNanos[round] = System.nanoTime() - start;
+        // 每轮**交换先后顺序**：固定「先测 A 后测 B」会让后测者稳定受惠于缓存预热，
+        // 从而系统性地偏向某一方（本基准第一版就因此把位宽 4 测出 0.94x 的假回退）。
+        if ((round & 1) == 0) {
+          long start = System.nanoTime();
+          sink += readAllGeneric(packed, entriesPerLong, bits, mask);
+          genericNanos[round] = System.nanoTime() - start;
+          start = System.nanoTime();
+          sink += readAllShifted(packed, shift, bits, mask);
+          shiftedNanos[round] = System.nanoTime() - start;
+        } else {
+          long start = System.nanoTime();
+          sink += readAllShifted(packed, shift, bits, mask);
+          shiftedNanos[round] = System.nanoTime() - start;
+          start = System.nanoTime();
+          sink += readAllGeneric(packed, entriesPerLong, bits, mask);
+          genericNanos[round] = System.nanoTime() - start;
+        }
       }
       assertTrue(sink != Long.MIN_VALUE, "累加结果必须参与使用，防止 JIT 消除整段循环");
       Arrays.sort(genericNanos);
       Arrays.sort(shiftedNanos);
       double genericMicros = genericNanos[ROUNDS / 2] / 1000.0;
       double shiftedMicros = shiftedNanos[ROUNDS / 2] / 1000.0;
+      double genericMin = genericNanos[0] / 1000.0;
+      double shiftedMin = shiftedNanos[0] / 1000.0;
       double speedup = shiftedMicros <= 0.0 ? 0.0 : genericMicros / shiftedMicros;
       report.append(String.format(Locale.ROOT,
-          "| %d | %.2f | %.2f | %.2fx | %.2f |%n",
-          bits, genericMicros, shiftedMicros, speedup, (genericMicros - shiftedMicros) * 24.0));
+          "| %d | %.2f (min %.2f) | %.2f (min %.2f) | %.2fx | %.2f |%n",
+          bits, genericMicros, genericMin, shiftedMicros, shiftedMin, speedup,
+          (genericMicros - shiftedMicros) * 24.0));
     }
 
     report.append("\n> 「每区块省」按 24 段全为候选段的最坏情形外推（实际多数区块只有部分段含目标）。\n");

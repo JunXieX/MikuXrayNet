@@ -230,11 +230,13 @@ class ConcurrentPipelineBenchmarkTest {
               index.recordChunk(world, chunkX, chunkZ, 0, locals);
               // 查询（读）
               index.containsPosition(world, chunkX << 4, 0, chunkZ << 4);
-              // 已显形标记（写）：该 API 包私有，基准只覆盖索引侧
-              // 摘除（写）：每 4 次摘一个，制造混合读写
-              if ((i & 3) == 0) {
-                index.removePosition(world, chunkX << 4, 0, chunkZ << 4);
-              }
+              // 摘除（写）：<b>每次记录后都整块摘掉</b>，保持索引驻留量恒定。
+              //
+              // 为什么必须这样做：{@code recordChunk} 一次写入 32 个坐标，若只摘 1 个，净增 31；
+              // 8 线程 × 20000 次即 496 万坐标，会越过 maxPositions 触发 makeRoomFor 的 O(n)
+              // 全表淘汰——那是「安全阀」（正常运营永不进入），把它测进来只会得到一个假的
+              // O(n²) 退化数字，与本基准想衡量的「并发争用代价」完全无关。
+              index.invalidateChunk(world, chunkX, chunkZ);
               ops.add(3L);
             }
           } finally {
