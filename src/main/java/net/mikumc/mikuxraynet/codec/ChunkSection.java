@@ -248,6 +248,32 @@ public class ChunkSection {
     for (int i = 0; i < data.length; i++) {
       data[i] = buffer.readLong();
     }
+
+    // 位打包索引必须落在调色板条目范围内：越界只可能来自损坏/非标准数据。旧实现要等到改写主循环
+    // 逐格取方块状态（IndirectPalette.valueFor）时才抛，那时区块已解码完成、前面的 section 甚至已被
+    // 就地改写，异常只能按整块失败处理，且失败点与真正的坏数据相隔很远、无法定位。故与 blockCount、
+    // 调色板重复值等其它非法编码同口径，在解码阶段就逐格校验：越界即显式拒绝，交由上层解码
+    // fail-open（放行原包、不改写），绝不把越界索引带进任何改写路径。
+    //
+    // 只对间接调色板生效：直接调色板（>8 位）的数据值本身就是全局方块状态 id，没有条目表
+    // （size() 恒为 0），按条目数校验会把全部合法数据误判成损坏，必须跳过。单值调色板（bitsPerBlock=0）
+    // 没有位打包数据（ZeroVarBitBuffer 恒读 0、条目数恒为 1），「索引必为 0」由该表示本身保证；
+    // 保留 FAWE 兼容的 1 位档同属间接调色板（条目表容量 2），照样按同一口径校验。
+    //
+    // 空调色板不在此拦：本 codec 对它既有口径是「原样搬运、不改写」（见 downgradePalette 的说明），
+    // 若在此判成越界，等于把一个本可原样搬运的节变成非预期异常，反而扩大 fail-open 的范围。
+    if (this.palette instanceof IndirectPalette) {
+      int entries = this.palette.size();
+      if (entries > 0) {
+        for (int i = 0; i < SECTION_VOLUME; i++) {
+          int paletteIndex = this.data.get(i);
+          if (paletteIndex >= entries) {
+            throw new IndexOutOfBoundsException(
+                "索引 " + paletteIndex + " 越界，调色板 " + entries + " 项（第 " + i + " 项）");
+          }
+        }
+      }
+    }
   }
 
   /** 该 section 是否被外部通过 {@link #setBlockState}（或调色板裁剪/降级）改写。 */

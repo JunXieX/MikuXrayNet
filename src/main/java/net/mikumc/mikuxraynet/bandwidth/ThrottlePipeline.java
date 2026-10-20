@@ -157,6 +157,13 @@ public final class ThrottlePipeline {
 
   /** 装配主体（调用方已持有 {@link #lifecycleLock}）。 */
   private void startLocked() {
+    // 先复位「上次停用有清理失败」标志，再重试——顺序不能反：
+    // 重试失败时 close() 会把它重新置位，复位若放在重试之后就会把这条真实告警抹掉。
+    cleanupIncomplete = false;
+    // 上一次 stop() 里有注销失败的模块（字段被刻意保留以便重试）：先补一次清理，再判开关。
+    // 顺序很重要：即使本次配置把带宽整体关掉了，也必须先把上次残留的监听器/任务清干净，
+    // 否则它们会一直挂到进程退出（旧实现直接 return，连重试机会都没有）。
+    retryFailedCloses();
     if (!config.enabled()) {
       plugin.getLogger().fine("带宽优化已在配置中关闭（bandwidth.yml: enabled=false）");
       return;
@@ -168,7 +175,6 @@ public final class ThrottlePipeline {
     // 用 CAS 而不是 set(true)：重复 start 会再 new 一整套子模块并覆盖字段，旧模块的 PacketAdapter /
     // 异步监听 / 每 tick 任务句柄仍挂在 ProtocolLib 与调度器里，且 stop() 再也拿不到它们——永久泄漏。
     // 当前调用方每次 reload 都新建实例，因此这只是纵深防御；被忽略时明确记一条，避免静默。
-    cleanupIncomplete = false;
     if (!started.compareAndSet(false, true)) {
       plugin.getLogger().fine("带宽优化管线已处于运行状态，忽略重复的 start()（已启动的模块不会被重复注册）");
       return;
@@ -265,19 +271,54 @@ public final class ThrottlePipeline {
 
   /** 拆除主体（调用方已持有 {@link #lifecycleLock}）。 */
   private void stopLocked() {
-    if (!started.compareAndSet(true, false)) {
-      return;
+    started.set(false);
+    // 注销失败的模块<b>保留字段</b>，以便下一次 stop() 重试。
+    //
+    // 旧实现无论成败都在末尾把 5 个字段全部置空：一旦某个模块的 stop() 抛异常（ProtocolLib 注销被拒、
+    // 插件已停用时 HandlerList.unregisterAll 抛 IllegalPluginAccessException 等），它的监听器/任务仍挂在
+    // 已停用的插件上，而管线再也拿不到句柄、无法重试——热重载后新管线会再注册一个同类型 adapter，
+    // 同一批包被两个 adapter 处理（统计计数成倍虚增，且旧 adapter 的索引已被清空 → 白名单恒失效）。
+    // 保留字段 + 重试是唯一能在本类内部收口的做法；同时把 WARNING 文案改成能反映真实后果的说明。
+    if (close("高延迟降视距", latencyMonitor, LatencyMonitor::stop)) {
+      latencyMonitor = null;
     }
-    close("高延迟降视距", latencyMonitor, LatencyMonitor::stop);
-    close("AFK 降级", afkTracker, AfkTracker::stop);
-    close("实体剔除（射线遮挡 / 视锥剔除）", entityCuller, EntityCuller::stop);
-    close("方块变更合并", blockChangeMerger, BlockChangeMerger::stop);
-    close("零位移实体包取消", entityPacketFilter, EntityPacketFilter::stop);
-    latencyMonitor = null;
-    afkTracker = null;
-    entityCuller = null;
-    blockChangeMerger = null;
-    entityPacketFilter = null;
+    if (close("AFK 降级", afkTracker, AfkTracker::stop)) {
+      afkTracker = null;
+    }
+    if (close("实体剔除（射线遮挡 / 视锥剔除）", entityCuller, EntityCuller::stop)) {
+      entityCuller = null;
+    }
+    if (close("方块变更合并", blockChangeMerger, BlockChangeMerger::stop)) {
+      blockChangeMerger = null;
+    }
+    if (close("零位移实体包取消", entityPacketFilter, EntityPacketFilter::stop)) {
+      entityPacketFilter = null;
+    }
+  }
+
+  /**
+   * 重试上一次 {@link #stop()} 中注销失败的模块。
+   *
+   * <p>这些模块的字段被刻意保留（见 {@link #stopLocked()}）：本方法在重新装配之前把它们再注销一次，
+   * 尽最大可能避免「旧监听器 + 新监听器同时生效」。仍然失败时只保留字段与 WARNING（下次还有机会），
+   * 绝不影响新管线的装配。
+   */
+  private void retryFailedCloses() {
+    if (close("高延迟降视距", latencyMonitor, LatencyMonitor::stop)) {
+      latencyMonitor = null;
+    }
+    if (close("AFK 降级", afkTracker, AfkTracker::stop)) {
+      afkTracker = null;
+    }
+    if (close("实体剔除（射线遮挡 / 视锥剔除）", entityCuller, EntityCuller::stop)) {
+      entityCuller = null;
+    }
+    if (close("方块变更合并", blockChangeMerger, BlockChangeMerger::stop)) {
+      blockChangeMerger = null;
+    }
+    if (close("零位移实体包取消", entityPacketFilter, EntityPacketFilter::stop)) {
+      entityPacketFilter = null;
+    }
   }
 
   /** 统计计数（供后续 /mikuxraynet status 读取）。 */
@@ -362,15 +403,25 @@ public final class ThrottlePipeline {
     plugin.getLogger().fine("带宽模块已关闭（配置）：" + name + "（bandwidth.yml: " + reasonKey + "=false）");
   }
 
-  private <T> void close(String name, T module, ModuleStopper<T> stopper) {
+  /**
+   * 注销一个子模块。
+   *
+   * @return {@code true} 表示该模块已不再被引用（成功注销，或本来就没装配）；
+   *         {@code false} 表示注销抛了异常、句柄<b>必须保留</b>以便下次重试
+   */
+  private <T> boolean close(String name, T module, ModuleStopper<T> stopper) {
     if (module == null) {
-      return;
+      return true;
     }
     try {
       stopper.stop(module);
+      return true;
     } catch (Throwable throwable) {
       cleanupIncomplete = true;
-      plugin.getLogger().log(Level.WARNING, "注销带宽子模块「" + name + "」时出现异常", throwable);
+      plugin.getLogger().log(Level.WARNING, "注销带宽子模块「" + name
+          + "」时出现异常：该模块的监听器/任务可能仍挂在已停用的实例上"
+          + "（表现为停用后计数还在涨、或重新启用后同一封包被处理两遍），建议重启服务端", throwable);
+      return false;
     }
   }
 

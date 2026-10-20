@@ -880,11 +880,16 @@ final class RegionFile implements AutoCloseable {
    * 这段时间内磁盘线程对本对象的任何入口都自行避让（见 {@link #isCompacting()}）。
    */
   int compact(EntryFilter keep) throws IOException {
-    if (lockUnavailable) {
-      return 0; // 该文件归其它进程所有：跳过整文件重写（不落盘、不报错）
-    }
+    // 任何 return 都必须经 finally 的 endCompact()：调用方（DiskCacheStore#startCompact）是
+    // 「先 beginCompact()、再提交本任务」的，若这里在置位之前早退，compacting 会永久停在 true ——
+    // 之后 get 恒 null、put/flush/close/countEntries 全部避让、removeAndClose 直接 return（句柄永不关闭），
+    // 且 evictRegionFilesIfNeeded 的「未摘除即放弃」兜底会让后续每次新开文件都不再淘汰别人（open 表无界增长）。
+    // 故先无条件置位（重入无害），早退也走 finally。
     compacting = true;
     try {
+      if (lockUnavailable) {
+        return 0; // 该文件归其它进程所有：跳过整文件重写（不落盘、不报错）
+      }
       BufferedLinearV3Format.Entry[][] all =
           new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_COUNT][];
       // 累计解压字节的记账数组：即使每条记录都过了 rawLength 钳制，全部记录叠加仍可能过大，
@@ -950,7 +955,13 @@ final class RegionFile implements AutoCloseable {
             BufferedLinearV3Format.POS_TABLE_OFFSET);
         out.force(true);
       } catch (IOException exception) {
-        Files.deleteIfExists(temp);
+        deleteQuietly(temp);
+        throw exception;
+      } catch (RuntimeException | Error exception) {
+        // 写盘路径上的 unchecked 异常同样会留下 .tmp 孤儿文件，必须一并清理后原样上抛。
+        // 拆成两个 catch 而不是多捕获：本方法只声明 throws IOException，多捕获里的
+        // `throw exception` 依赖「精确重抛」分析，拆开写语义完全等价且不依赖该规则。
+        deleteQuietly(temp);
         throw exception;
       }
 

@@ -39,7 +39,8 @@ class DiagnosticsTest {
         new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 30L, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
             0L, 0L, 0L, "无采样"),
         new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 1L, 40L, 6L),
-        new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L),
+        // 8 参完整构造：末两项是「累计登记 / 卸载清理」，面板必须把它们与实时驻留量一起显示
+        new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L, 5L, 2L),
         new Diagnostics.Snapshot.Occlusion(true, 4096, 3, 200L, 190L, 2L, 1L, 9L, 55L, 4_200_000L, 88L, 4L,
             6L),
         new Diagnostics.Snapshot.Throttle(20L, 30L, 11L, 4L, 39L, 0L,
@@ -206,7 +207,8 @@ class DiagnosticsTest {
         "位图判定的「缺数据 = 遮挡」子集必须单列，否则「射线剔除很大」无法区分是缺数据还是真实遮挡：" + text);
     assertTrue(text.contains("过度显形（抽样） 6 / 抽样 40"),
         "过度显形量化必须显示「浪费数 / 抽样数」，否则无法评估显形策略是否需要收紧：" + text);
-    assertTrue(text.contains("显形索引：伪装区块 7（坐标 41）｜已显形 坐标 12（当前在线）｜累计登记 108｜安全阀触发 3/2"),
+    assertTrue(text.contains("显形索引：伪装区块 7（当前驻留；累计登记 5，卸载清理 2，坐标 41）"
+        + "｜已显形 坐标 12（当前在线）｜累计登记 108｜安全阀触发 3/2"),
         "状态面板必须分列伪装区块数、伪装坐标数、实时已显形坐标数、累计登记数与安全阀触发数"
             + "（否则「发送 N 但已显形 0」这类口径误读会静默发生）：" + text);
     assertTrue(text.contains("实体隐藏 6/恢复 5（当前隐藏中 4"),
@@ -240,6 +242,19 @@ class DiagnosticsTest {
         "方块变更补丁的格数、失败数与「状态id回落」数必须可见"
             + "（补丁长期为 0 = 位图不会被方块变更刷新；状态id回落 >0 = 补丁退回了 Material 级近似、"
             + "可能与位图对同方块不同状态结论不一致）：" + text);
+    assertFalse(text.contains("上次停用有子模块清理失败"),
+        "清理完整时不得出现「停用清理失败」告警行：" + text);
+    // 停用期子模块注销失败必须显式点名：这类「静默残留」平时完全看不出来，
+    // 表现为「停用后计数还在涨」「重新启用后同一封包被处理两遍」。
+    Diagnostics.Snapshot s = fixed();
+    Diagnostics.Snapshot withCleanupFailure = new Diagnostics.Snapshot(s.env(), s.rewrite(),
+        s.proximity(), s.index(), s.occlusion(),
+        new Diagnostics.Snapshot.Throttle(20L, 30L, 11L, 4L, 39L, 0L, 4L, 40L, 12L, 6L, 5L, 4,
+            40L, 7L, 3L, 11L, 2L, 2, 3L, 8L, 9L, 4L, 5L, 25_000_000L, true),
+        s.pool(), s.diskCache(), s.chunkAccessor(), s.antiXray(), s.bandwidth());
+    String cleanupFailed = String.join("\n", Diagnostics.formatStatus(withCleanupFailure));
+    assertTrue(cleanupFailed.contains("上次停用有子模块清理失败"),
+        "停用期子模块注销失败必须显式点名（否则监听器残留完全静默）：" + cleanupFailed);
     assertTrue(text.contains("带宽"), text);
     assertTrue(text.contains("零位移取消 20（放行 30；到达 纯位移 11／位移+朝向 4／朝向 39，字段形态不符 0）"),
         "零位移必须分列「三种包的到达数」与「字段形态不符」：只给「取消/放行」时，"

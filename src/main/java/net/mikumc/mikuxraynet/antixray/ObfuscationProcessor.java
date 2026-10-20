@@ -16,7 +16,9 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.occlusion.BitmapOcclusion;
 import net.mikumc.mikuxraynet.occlusion.EmptyOcclusion;
 import net.mikumc.mikuxraynet.occlusion.OcclusionPayload;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
+import net.mikumc.mikuxraynet.occlusion.SectionKey;
 import net.mikumc.mikuxraynet.occlusion.SectionOcclusion;
 import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
 import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
@@ -393,13 +395,33 @@ public final class ObfuscationProcessor {
   private final OcclusionStores occlusionStores;
 
   /**
-   * 上一次成功恢复的遮挡负载（<b>按引用</b>判等，用于幂等短路）。
+   * 上一次成功恢复的遮挡负载（<b>按数组引用</b>判等，用于幂等短路）。
    *
-   * <p>同一份负载会被多个玩家反复命中：每次都 decode 整列 + 持写锁逐段回灌是纯重复劳动。
-   * 引用相同即代表「同一个缓存条目」，内容必然一致，可直接跳过。
-   * volatile 只为让跨线程读到「最近一次」而不必精确同步——它只是性能提示，判错最多多恢复一次。
+   * <p><b>为什么需要它</b>：同一区块会被同一批玩家反复命中（每个玩家各发一次区块包），而命中路径
+   * 每次都把整列负载 decode 成约 10 KB 的短命数组、再持 {@code OcclusionStore.writeMutex} 逐段回灌。
+   * 这些写入与上一次逐字节相同，属于纯重复劳动；引用判等是零成本的一步比较，可直接跳过。
+   *
+   * <p><b>为什么只能用数组引用做键</b>：缓存条目的内容会随区块改写而更新（同坐标换新负载），
+   * 用「世界 + 坐标」做键会把新负载误判成「已恢复过」而漏灌。引用相同 ⇒ 同一 CachedChunk 实例
+   * ⇒ 内容必然相同（缓存从不复制该数组），因此引用判等既不会误判也不会漏判。
+   *
+   * <p><b>为什么必须连同「目标仓库」一起记</b>：光比数组引用还不够。区块/世界卸载会调
+   * {@code OcclusionStore#removeColumn}/{@code OcclusionStores#removeWorld} 把整列位图摘掉，
+   * 而改写缓存条目（以及它持有的这个数组）仍在内存里：玩家走远再回来时命中的还是<b>同一个数组</b>，
+   * 只比引用就会跳过回灌，于是该区块「已伪装但无位图」——显形侧按「缺数据 = 遮挡」判定，
+   * 玩家挖到的矿会一直显示假方块。把仓库实例一并记下，并在恢复后校验「该列首个 section 仍在」
+   * 作为存活探针，即可在整列被摘掉后自动重灌一次（见 {@link #restoreOcclusion}）。
+   *
+   * <p><b>为什么允许判错</b>：这只是性能提示，不做精确同步。并发下最坏情况是「另一线程刚恢复了别的
+   * 负载，本线程多恢复一次」——语义仍是幂等的整列覆盖写，正确性不受影响。
    */
   private volatile byte[] lastRestoredOcclusion;
+  /** 与 {@link #lastRestoredOcclusion} 配对的「已灌入的目标仓库」；仅在该引用判等命中时用于存活校验。 */
+  private volatile OcclusionStore lastRestoredStore;
+  /** 上次写入的整列中首个可表示 section 的打包键（整列存活探针）。 */
+  private volatile long lastRestoredProbeKey;
+  /** 该列是否真有可探测的 section（全部越界时为 false，此时不做存活校验，按已恢复处理）。 */
+  private volatile boolean lastRestoredProbeValid;
   /**
    * <b>实体遮挡口径</b>的判定表：只供 {@link #captureOcclusion} 建位图使用。
    *
@@ -1007,7 +1029,13 @@ public final class ObfuscationProcessor {
     // 判据用「数组引用相同」而不是「世界+坐标」：同一坐标的负载会随区块改写而更新，
     // 而引用相同 ⇒ 来自同一个 CachedChunk 实例 ⇒ 内容必然相同（缓存不会复制该数组）。
     // 只在命中同一引用时跳过；一旦换成新负载（新对象）就照常恢复。
-    if (occlusion == lastRestoredOcclusion) {
+    //
+    // 但引用判等必须配一道存活校验：区块/世界卸载会把整列位图摘掉，而改写缓存条目连同这个数组
+    // 仍在内存里。此时只比引用就会跳过回灌，该区块从此「已伪装但无位图」——显形侧按「缺数据 =
+    // 遮挡」判定，玩家挖到的矿会一直显示假方块（比多一次 decode 严重得多）。因此额外确认
+    // 「同一仓库、且该列首个 section 仍在表里」；任一不满足都照常重灌一次。
+    if (occlusion == lastRestoredOcclusion && stillRestored(stores, worldName, chunkX, minSectionY,
+        chunkZ)) {
       return;
     }
     try {
@@ -1015,11 +1043,72 @@ public final class ObfuscationProcessor {
       if (column == null) {
         return;
       }
-      stores.of(worldName).restoreColumn(chunkX, minSectionY, chunkZ, column);
+      OcclusionStore store = stores.of(worldName);
+      store.restoreColumn(chunkX, minSectionY, chunkZ, column);
+      // 记下「这次灌进了哪张表、哪一列」，供下一次引用判等时做存活校验（见上面的说明）。
+      int probeY = probeSectionY(minSectionY, column.length);
+      lastRestoredProbeValid = probeY != NO_PROBE_SECTION_Y;
+      lastRestoredProbeKey = lastRestoredProbeValid
+          ? SectionKey.packSection(chunkX, probeY, chunkZ) : 0L;
+      lastRestoredStore = store;
       lastRestoredOcclusion = occlusion;
     } catch (Throwable ignored) {
       // fail-open：恢复失败只意味着少一份遮挡数据
     }
+  }
+
+  /**
+   * 上一次恢复的整列位图是否仍在表里（幂等短路的存活校验）。
+   *
+   * <p>只做一次乐观读查询，不取任何锁：命中即认为整列没被卸载摘掉。判定口径刻意保守——世界名解析
+   * 出的仓库不是同一实例、或首个 section 已查不到，都返回 {@code false}（宁可多灌一次，不可漏灌）。
+   */
+  private boolean stillRestored(OcclusionStores stores, String worldName, int chunkX,
+      int minSectionY, int chunkZ) {
+    if (!lastRestoredProbeValid) {
+      // 该列没有任何可表示的 section（整列越界）：没有探针可查，按「仍在」处理（本来也没写进去）
+      return true;
+    }
+    // 先确认「本次要恢复的就是上次那一列」：同一数组只应属于同一 CachedChunk，但这里不依赖该前提，
+    // 坐标对不上就当作未恢复（多灌一次永远安全，漏灌才会让显形侧永久显示假方块）。
+    long currentProbeKey;
+    try {
+      currentProbeKey = SectionKey.packSection(chunkX,
+          Math.max(minSectionY, SectionKey.SECTION_Y_MIN), chunkZ);
+    } catch (IllegalArgumentException outOfRange) {
+      // 水平坐标超出可表示范围：restoreColumn 本来也会跳过，这里按未恢复处理即可
+      return false;
+    }
+    if (currentProbeKey != lastRestoredProbeKey) {
+      return false;
+    }
+    OcclusionStore store = stores.lookup(worldName);
+    if (store == null || store != lastRestoredStore) {
+      // 世界被卸载后重建（或从未建过表）：新表里不可能有上次那列，必须重灌
+      return false;
+    }
+    return store.section(lastRestoredProbeKey) != null;
+  }
+
+  /** 「该列没有任何可表示 section」的哨兵（越界值，与任何真实 sectionY 都不相等）。 */
+  private static final int NO_PROBE_SECTION_Y = Integer.MIN_VALUE;
+
+  /**
+   * 取「整列首个可表示 section」的序号，作为该列是否仍在表里的探针。
+   *
+   * <p>用首个 section 而不是全部：整列摘除（{@code removeColumn}）与整表清空（{@code clear}）都会把它
+   * 一并抹掉；而方块补丁只改单格、不会删条目，故单段存在即可代表「这次恢复还没被撤销」。
+   *
+   * @return section 序号；整列全部越出 {@code SectionKey} 可表示范围时返回 {@link #NO_PROBE_SECTION_Y}
+   */
+  private static int probeSectionY(int minSectionY, int sectionCount) {
+    for (int i = 0; i < sectionCount; i++) {
+      int sectionY = minSectionY + i;
+      if (sectionY >= SectionKey.SECTION_Y_MIN && sectionY <= SectionKey.SECTION_Y_MAX) {
+        return sectionY;
+      }
+    }
+    return NO_PROBE_SECTION_Y;
   }
 
   /**

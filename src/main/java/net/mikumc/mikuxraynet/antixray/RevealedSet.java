@@ -438,6 +438,18 @@ public final class RevealedSet {
     }
   }
 
+  /**
+   * 使一个区块的全部玩家的已显形标记失效（区块卸载 / 世界卸载时调用）。
+   *
+   * <p><b>为什么需要这个「按世界名 + 坐标」的公开重载</b>：{@link ChunkKey} 与本类的多数方法是包私有的，
+   * 而区块卸载的失效动作由父包（{@code AntiXrayRuntime}）发起——它拿不到 {@link ChunkKey}。
+   * 与其把 {@link ChunkKey} 提升为 public（等于让「区块键」这一内部表示变成对外契约），不如在这里
+   * 提供唯一一个语义明确的入口：世界名 + 区块坐标。
+   */
+  public void clearChunk(String worldName, int chunkX, int chunkZ) {
+    clearChunk(new ChunkKey(worldName, chunkX, chunkZ));
+  }
+
   /** 使一个区块的全部玩家的已显形标记失效（区块卸载 / 世界卸载时调用）。 */
   void clearChunk(ChunkKey key) {
     ConcurrentHashMap<UUID, Marker> players = chunks.get(key);

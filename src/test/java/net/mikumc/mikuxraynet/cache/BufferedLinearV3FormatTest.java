@@ -120,7 +120,7 @@ class BufferedLinearV3FormatTest {
   }
 
   @Test
-  void truncatedCompressedDataIsRejected() {
+  void truncatedCompressedDataIsRejected() throws IOException {
     byte[] compressed = BufferedLinearV3Format.compress(payload(20_000));
     byte[] truncated = Arrays.copyOf(compressed, compressed.length / 2);
 
@@ -133,7 +133,7 @@ class BufferedLinearV3FormatTest {
    * 的原始长度时，{@code inflate} 会先 {@code new byte[rawLength]} 才失败（旧上限 512 MiB 可让小堆 OOM）。
    */
   @Test
-  void oversizedDeclaredRawLengthIsRejectedBeforeAllocation() {
+  void oversizedDeclaredRawLengthIsRejectedBeforeAllocation() throws IOException {
     byte[] compressed = BufferedLinearV3Format.compress(payload(64));
 
     assertThrows(IOException.class, () -> BufferedLinearV3Format.decompress(compressed,
@@ -426,7 +426,7 @@ class BufferedLinearV3FormatTest {
   }
 
   @Test
-  void compressionSchemeMismatchIsRejected() {
+  void compressionSchemeMismatchIsRejected() throws IOException {
     byte[] raw = payload(8_000);
     byte[] zstd = BufferedLinearV3Format.compress(raw);
     assertThrows(IOException.class, () -> BufferedLinearV3Format.decompress(zstd, raw.length,
@@ -438,7 +438,7 @@ class BufferedLinearV3FormatTest {
    * 不可压缩随机数据做参照，确认 zstd 在「可压缩」样本上不劣于 Deflate。
    */
   @Test
-  void compressionSizeComparisonReport() {
+  void compressionSizeComparisonReport() throws IOException {
     byte[] compressible = new byte[256 * 1024];
     for (int i = 0; i < compressible.length; i++) {
       compressible[i] = (byte) ((i * 31) % 23);

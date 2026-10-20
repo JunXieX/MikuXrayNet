@@ -5,7 +5,6 @@ import java.io.File;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.antixray.BlockChangeRevealListener;
-import net.mikumc.mikuxraynet.antixray.ChunkKey;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
@@ -218,7 +217,8 @@ public final class AntiXrayRuntime {
     // world-unload 监听仍由主类持有（监听器生命周期与插件一致），这里只触发注册；
     // 注册时机（反矿透装配成功后、邻近显形装配前）与拆分前一致。
     plugin.registerWorldUnloadInvalidation();
-    startProximity(antiXray, chunkIndex, revealed, proximityStats);
+    // 启用路径：索引刚建、此刻清空无害（失败即等于「显形未启用」），故允许失败时清空。
+    startProximity(antiXray, chunkIndex, revealed, proximityStats, true);
     startOcclusionPatch(registry);
     logger.fine("反矿透已启用（按维度分段）：" + dimensionSummary(antiXray)
         + "；区块边界邻块快照 " + neighborState(neighborProvider, processor) + "；磁盘缓存 "
@@ -272,7 +272,7 @@ public final class AntiXrayRuntime {
    * 方块变更包在封包线程上白走一遍解析与空判定。
    */
   private void startProximity(AntiXrayConfig antiXray, ObfuscatedChunkIndex chunkIndex,
-      RevealedSet revealed, ProximityStats stats) {
+      RevealedSet revealed, ProximityStats stats, boolean clearOnFailure) {
     ProtocolManager protocolManager = protocolLibHook == null ? null : protocolLibHook.protocolManager();
     if (protocolManager == null) {
       logger.warning("未取得 ProtocolLib 协议管理器，邻近显形停用");
@@ -304,7 +304,12 @@ public final class AntiXrayRuntime {
       revealer.start();
     } catch (Throwable throwable) {
       logger.log(Level.WARNING, "邻近显形装配失败（不影响反矿透主体）", throwable);
-      stopProximity();
+      // 失败清理必须沿用调用方的 clearIndexes 口径：热重载路径传 false。
+      // 旧实现在这里无条件 stopProximity()（= clearIndexes true），会在热重载的失败路径上清空
+      // 「与改写链路共享」的伪装索引与已显形集合——而热重载不会让服务端重发已加载区块，
+      // 这些区块里已记录的伪装坐标就此永久失联：玩家眼前本该被邻近显形还原的矿会一直显示成假方块，
+      // 直到该区块因走远/重登/切维度被重新下发。成功路径守住了这条纪律，失败路径也必须守住。
+      stopProximity(clearOnFailure);
     }
   }
 
@@ -482,7 +487,8 @@ public final class AntiXrayRuntime {
           new RevealedSet(proximity.maxPositionsPerPlayer(), proximity.expireSeconds());
       logger.fine("邻近显形已按热重载配置首次启用（已新建伪装索引与已显形集合）");
     }
-    startProximity(antiXray, obfuscatedChunkIndex, revealedSet, proximityStats);
+    // 热重载路径：失败时<b>绝不</b>清空共享索引（见 startProximity 的 catch 说明）。
+    startProximity(antiXray, obfuscatedChunkIndex, revealedSet, proximityStats, false);
   }
 
   /** 使全部改写缓存、邻块快照、显形结构失效并落盘磁盘缓存（配置热重载时调用）。 */
@@ -500,18 +506,35 @@ public final class AntiXrayRuntime {
 
   /** 世界卸载：整体失效该世界的改写缓存与磁盘缓存句柄（落盘 + 关闭，不留已卸载世界的资源）。 */
   void invalidateWorld(String worldName) {
+    // 三步各自兜底，且把<b>安全相关</b>的那一步（遮挡表摘除）放在最前：
+    //
+    // 遮挡位图的键里没有世界维度（世界分域只在外层 map），所以旧世界的「实心石头」几何会在同名世界
+    // 重新加载后被当成新世界的遮挡数据读走，把<b>本可见</b>的实体误藏——安全方向错误。
+    // 旧实现是一条单链：改写缓存或磁盘缓存任一步抛错（IO 失败、目录被占用），后面的遮挡表摘除就被跳过，
+    // 这个「安全方向错误」随之发生。故拆成独立的三步，且先做最要紧的那一步。
+    OcclusionStores stores = occlusionStores;
+    if (stores != null) {
+      try {
+        stores.removeWorld(worldName);
+      } catch (Throwable throwable) {
+        logger.log(Level.WARNING, "摘除世界遮挡位图时出现异常（已忽略）", throwable);
+      }
+    }
     ProtocolLibHook hook = protocolLibHook;
     if (hook != null) {
-      hook.invalidateWorld(worldName);
+      try {
+        hook.invalidateWorld(worldName);
+      } catch (Throwable throwable) {
+        logger.log(Level.WARNING, "摘除世界改写缓存时出现异常（已忽略）", throwable);
+      }
     }
     DiskCacheStore store = diskCacheStore;
     if (store != null) {
-      store.invalidateWorld(worldName);
-    }
-    // 遮挡位图同样按世界整体摘除：键里没有世界维度，留着它就会在下一次卸载/重载后污染同名区块。
-    OcclusionStores stores = occlusionStores;
-    if (stores != null) {
-      stores.removeWorld(worldName);
+      try {
+        store.invalidateWorld(worldName);
+      } catch (Throwable throwable) {
+        logger.log(Level.WARNING, "摘除世界磁盘缓存时出现异常（已忽略）", throwable);
+      }
     }
   }
 
@@ -551,7 +574,8 @@ public final class AntiXrayRuntime {
           // sizeFor 虚增会让邻近显形的「整块跳过」提前成立，真实坐标被周期跳过（漏显形）。
           RevealedSet revealed = revealedSet;
           if (revealed != null) {
-            revealed.clearChunk(new ChunkKey(worldName, chunkX, chunkZ));
+            // 用「世界名 + 坐标」的公开入口：ChunkKey 是本插件 antixray 包的内部表示，不对外暴露。
+            revealed.clearChunk(worldName, chunkX, chunkZ);
           }
         }
       } catch (Throwable throwable) {

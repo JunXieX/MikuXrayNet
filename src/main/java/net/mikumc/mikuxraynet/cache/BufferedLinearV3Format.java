@@ -379,7 +379,7 @@ public final class BufferedLinearV3Format {
    * {@link #compress(byte[], byte)} 并传入文件声明的方案，绝不能用本方法 —— 否则会写出与头部不符的
    * 数据，读回时整桶丢失。
    */
-  public static byte[] compress(byte[] raw) {
+  public static byte[] compress(byte[] raw) throws IOException {
     if (ZstdSupport.available()) {
       try {
         return ZstdSupport.compress(raw, ZSTD_LEVEL);
@@ -426,7 +426,7 @@ public final class BufferedLinearV3Format {
       ThreadLocal.withInitial(() -> new Deflater(Deflater.BEST_SPEED));
 
   /** JDK Deflater（BEST_SPEED）压缩：历史格式的写入路径，也是 zstd 不可用时的回退路径。 */
-  private static byte[] deflate(byte[] raw) {
+  private static byte[] deflate(byte[] raw) throws IOException {
     Deflater deflater = REUSABLE_DEFLATER.get();
     deflater.reset();
     deflater.setInput(raw);
@@ -439,7 +439,10 @@ public final class BufferedLinearV3Format {
         // 理论上不该发生（finish() 后要么产出、要么 finished()）。若真发生，绝不能像旧实现那样
         // break 后把**半截 zlib 流**当结果返回：那条记录会被落盘，而读回时解压必然失败
         //（槽位被当成损坏/空），既丢数据又没有任何日志。改为显式抛错，由上层按「本条不落盘」处理。
-        throw new IllegalStateException("Deflater 未能继续产出数据（finished=" + deflater.finished()
+        // 必须抛 IOException（不是 unchecked）：调用方一律按 `catch (IOException)` 处理「本条不落盘」，
+        // 而 RegionFile#compact 的临时文件清理也只认 IOException —— unchecked 会穿透它，留下 .tmp 孤儿文件，
+        // 并让「只丢这一条」的语义变成「整次读写失败」。
+        throw new IOException("Deflater 未能继续产出数据（finished=" + deflater.finished()
             + "，已产出 " + out.size() + " 字节）");
       }
       out.write(chunk, 0, produced);
