@@ -405,6 +405,14 @@ public class ChunkSection {
       // 避免把一个「本可原样搬运」的节变成非预期异常。
       return false;
     }
+    if (indirect && this.palette.size() != 1) {
+      // O(1) 早退：本方法只做「多状态 → 单状态」的降级。间接调色板经 compactPalette 之后
+      // 必然满足 distinct == palette.size()（未使用的条目已被 retain 掉），因此 size != 1 时
+      // 下面的 4096 × O(distinct) 收集循环注定以 distinct > 1 收场、返回 false。
+      // 该路径在 width-budget 默认开启时对**每个被改写的 section** 都会走到，
+      // 40~256 项时约 52 万次比较/section、1200 万次/区块，与改写主循环同量级——纯浪费。
+      return false;
+    }
 
     int[] before = verify ? readAllBlockStates() : null;
 

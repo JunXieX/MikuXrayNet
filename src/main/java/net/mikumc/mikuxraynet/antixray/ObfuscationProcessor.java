@@ -738,11 +738,34 @@ public final class ObfuscationProcessor {
       // 会有可观测的变慢（实测「24 个 section 全含目标」的形态从 0.34ms 涨到 0.76ms）。
       boolean[] sectionCandidates = selectCandidateSections(chunk, profile);
 
+      // enclosed 模式的滚动快照：保留「上一段」的改写前状态（y-1 跨段判定要用，见循环内说明）。
+      // mode=all 时恒为 null，零开销。
+      int[] previousOriginalStates = null;
+
       for (int sectionIndex = 0; sectionIndex < chunk.getSectionCount(); sectionIndex++) {
         if (!sectionCandidates[sectionIndex]) {
+          // 该段不会被改写 ⇒ 它的实时状态就是原始状态，下一段的 y-1 直接读实时值即可。
+          // 必须显式清空：否则 previousOriginalStates 会停留在「更早的某个候选段」，
+          // 下一段做 y-1 判定时就会拿错段的快照去查，得到完全错误的遮挡结论。
+          previousOriginalStates = null;
           continue;
         }
         ChunkSection section = chunk.getSection(sectionIndex);
+        // enclosed 模式的 6 面判定必须基于「本趟改写之前」的原始状态。
+        //
+        // 为什么：判定函数 isOccluding 直接读 section.getBlockState(...)，而逐格循环按 index 升序
+        // （y<<8|z<<4|x）推进，因此 y-1 / x-1 / z-1 三个相邻面此刻可能**已经被本趟替换成伪装方块**。
+        // 若伪装方块不遮挡（自定义权重允许配 glass 等非遮挡方块），这些邻面就会被误判成「未遮挡」，
+        // 于是本该伪装的掩埋矿被当作「暴露矿」跳过 —— 真实矿原样下发给透视端，而统计（改写数/替换数）
+        // 一切正常，完全静默。反向（伪装方块遮挡而原矿不遮挡）则会多伪装，同样偏离真实几何。
+        // 只在 enclosed 模式付这份快照成本（每段 16 KB，且仅对含目标的候选段）；mode=all 零开销。
+        //
+        // 注意快照必须<b>滚动保留前一段</b>：6 面判定里的 y-1 会落到「上一段」，而循环按 sectionIndex
+        // 升序推进——上一段此刻已经改写完了。只快照当前段的话，y-1 仍会读到伪装值（漏伪装原样保留）。
+        // y+1 落到「下一段」，尚未开始改写，读实时状态即等于原始状态，无需快照。
+        int[] previousOriginal = previousOriginalStates;
+        int[] originalStates = profile.obfuscateAll ? null : snapshotStates(section);
+        previousOriginalStates = originalStates;
 
         int baseY = sectionIndex << 4;
         int layerY = Integer.MIN_VALUE;
@@ -770,7 +793,9 @@ public final class ObfuscationProcessor {
           }
 
           // mode=all：所有目标矿一律伪装（不看 6 面遮挡）；mode=enclosed：只伪装 6 面全遮挡的掩埋矿。
-          if (!profile.obfuscateAll && !isFullyOccluded(chunk, baseY, index, neighbors)) {
+          if (originalStates != null
+              && !isFullyOccluded(chunk, sectionIndex, originalStates, previousOriginal, baseY, index,
+                  neighbors)) {
             continue;
           }
 
@@ -1269,22 +1294,39 @@ public final class ObfuscationProcessor {
    * @param baseY 该 section 的起始 Y（区块内相对坐标）
    * @param index 该 section 内的元素序号（{@code y << 8 | z << 4 | x}）
    */
-  private boolean isFullyOccluded(Chunk chunk, int baseY, int index, NeighborEdges neighbors) {
+  private boolean isFullyOccluded(Chunk chunk, int sectionIndex, int[] originalStates,
+      int[] previousOriginal, int baseY, int index, NeighborEdges neighbors) {
     int x = index & 15;
     int z = index >> 4 & 15;
     int y = baseY | (index >> 8 & 15);
 
-    boolean above = isOccluding(chunk, y + 1, x, z, neighbors);
+    boolean above = isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y + 1, x, z,
+        neighbors);
     return above
-        && isOccluding(chunk, y - 1, x, z, neighbors)
-        && isOccluding(chunk, y, x + 1, z, neighbors)
-        && isOccluding(chunk, y, x - 1, z, neighbors)
-        && isOccluding(chunk, y, x, z + 1, neighbors)
-        && isOccluding(chunk, y, x, z - 1, neighbors);
+        && isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y - 1, x, z, neighbors)
+        && isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y, x + 1, z, neighbors)
+        && isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y, x - 1, z, neighbors)
+        && isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y, x, z + 1, neighbors)
+        && isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y, x, z - 1, neighbors);
+  }
+
+  /**
+   * 快照一个 section 的原始方块状态（仅 enclosed 模式使用）。
+   *
+   * <p>逐格 {@code getBlockState} 拷进 {@code int[4096]}：既避免 6 面判定读到本趟已改写的邻格
+   * （见 {@code rewrite} 里的说明），也把「读状态」的开销从「每格 6 次查表」压成「一次顺序拷贝」。
+   */
+  private static int[] snapshotStates(ChunkSection section) {
+    int[] states = new int[SECTION_VOLUME];
+    for (int i = 0; i < SECTION_VOLUME; i++) {
+      states[i] = section.getBlockState(i);
+    }
+    return states;
   }
 
   /** 区块内相对坐标处的方块是否遮挡；越出世界上下界视为未遮挡，越出本区块改查邻块贴边快照。 */
-  private boolean isOccluding(Chunk chunk, int y, int x, int z, NeighborEdges neighbors) {
+  private boolean isOccluding(Chunk chunk, int currentSectionIndex, int[] currentOriginal,
+      int[] previousOriginal, int y, int x, int z, NeighborEdges neighbors) {
     if (y < 0) {
       return false;
     }
@@ -1295,11 +1337,24 @@ public final class ObfuscationProcessor {
     }
 
     if (x >= 0 && x <= 15 && z >= 0 && z <= 15) {
+      int localIndex = (y & 15) << 8 | z << 4 | x;
+      // 本段与「上一段」必须读改写前的快照：
+      //  · 本段：y-1 / x-1 / z-1 三面可能已被本趟替换成伪装方块；
+      //  · 上一段：y-1 跨段时落到那里，而循环按 sectionIndex 升序推进 —— 它已经改写完了。
+      // 下一段（y+1 跨段）尚未开始改写，读实时状态即等于原始状态。
+      if (currentOriginal != null) {
+        if (sectionIndex == currentSectionIndex) {
+          return occlusionTable.test(currentOriginal[localIndex]);
+        }
+        if (sectionIndex == currentSectionIndex - 1 && previousOriginal != null) {
+          return occlusionTable.test(previousOriginal[localIndex]);
+        }
+      }
       ChunkSection section = chunk.getSection(sectionIndex);
       if (section == null) {
         return false;
       }
-      return occlusionTable.test(section.getBlockState((y & 15) << 8 | z << 4 | x));
+      return occlusionTable.test(section.getBlockState(localIndex));
     }
 
     return neighborOccluding(neighbors, x, y, z);

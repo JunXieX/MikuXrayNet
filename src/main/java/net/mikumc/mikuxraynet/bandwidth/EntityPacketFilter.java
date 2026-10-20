@@ -111,7 +111,16 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
    * <p><b>为什么用并发容器</b>：增量事件可能在实体所属的区域线程（Folia）或主线程触发，而读取来自
    * 封包线程；{@link ConcurrentHashMap} 保证三者安全，且未命中即 {@code null}（等同旧 volatile 快照）。
    */
-  private final Map<Integer, String> entityTypeIndex = new ConcurrentHashMap<>();
+  /**
+   * 实体类型索引：<b>世界名 → (entityId → 白名单类型键)</b>。
+   *
+   * <p><b>为什么必须带世界维度</b>：Java 版的 entityId 是<b>每个世界各自计数</b>的（每个世界从 1 开始
+   * 分配），因此主世界 id=5 与下界 id=5 是两个完全不同的实体。旧实现只用 entityId 作键，跨世界必然
+   * 撞号：白名单实体（盔甲架、展示实体等）在 A 世界登记后，B 世界同号的普通实体会被误判成白名单而放行
+   * （少省带宽），反之 B 世界的白名单实体会被误判成普通实体、其零位移包被取消（客户端位置不同步）。
+   * 两级索引让不同世界的 id 互不干扰；每级都是无锁并发容器，热路径只是两次哈希查找、零分配。
+   */
+  private final Map<String, Map<Integer, String>> entityTypeIndex = new ConcurrentHashMap<>();
   private ScheduledTask indexTask;
 
   /**
@@ -215,13 +224,15 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
   public void onEntityAddToWorld(EntityAddToWorldEvent event) {
     try {
       Entity entity = event.getEntity();
+      // 事件在实体所属线程触发，此时读它自己的世界名是安全的（不跨区域）。
+      Map<Integer, String> perWorld = typeIndexFor(entity.getWorld().getName());
       String typeKey = typeKeyFor(entity.getType());
       if (typeKey != null) {
-        entityTypeIndex.put(entity.getEntityId(), typeKey);
+        perWorld.put(entity.getEntityId(), typeKey);
       } else {
         // 非白名单实体：必须清掉可能残留的旧映射。实体 id 会被服务端复用，若上一个占用者在白名单里，
         // 残留映射会让这个新实体被误判为白名单（零位移包不再取消）——方向安全但白费带宽。
-        entityTypeIndex.remove(entity.getEntityId());
+        perWorld.remove(entity.getEntityId());
       }
     } catch (Throwable throwable) {
       // fail-open：登记失败最多让该实体走「未命中白名单」（保守侧），绝不影响封包主链路
@@ -233,7 +244,11 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
   @EventHandler
   public void onEntityRemoveFromWorld(EntityRemoveFromWorldEvent event) {
     try {
-      entityTypeIndex.remove(event.getEntity().getEntityId());
+      Entity entity = event.getEntity();
+      Map<Integer, String> perWorld = entityTypeIndex.get(entity.getWorld().getName());
+      if (perWorld != null) {
+        perWorld.remove(entity.getEntityId());
+      }
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
@@ -247,7 +262,9 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     Player packetPlayer = event.getPlayer();
     // 世界黑名单：命中世界的玩家不做任何带宽优化（零位移取消一并跳过）。
     // 名单为空（默认）时 isBlacklistedNow 直接早退，热路径近乎零开销。
-    if (WorldBlacklistConfig.isBlacklistedNow(packetPlayer.getWorld().getName())) {
+    // 世界名同时用于「实体类型索引」的世界维度（entityId 按世界各自计数，必须带上世界才能避免撞号）。
+    String worldName = packetPlayer.getWorld().getName();
+    if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       return;
     }
     // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API
@@ -303,7 +320,7 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
       // 无界状态 / 热路径加负的风险更高。
       boolean redundant = MovePacketFields.isZeroMove(access, handle);
 
-      if (!redundant || isWhitelisted((int) access.entityId().get(handle))) {
+      if (!redundant || isWhitelisted(worldName, (int) access.entityId().get(handle))) {
         pass();
         return;
       }
@@ -321,9 +338,18 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     stats.entityPacketsPassed.increment();
   }
 
-  private boolean isWhitelisted(int entityId) {
-    String typeKey = entityTypeIndex.get(entityId);
+  private boolean isWhitelisted(String worldName, int entityId) {
+    Map<Integer, String> perWorld = entityTypeIndex.get(worldName);
+    if (perWorld == null) {
+      return false;
+    }
+    String typeKey = perWorld.get(entityId);
     return typeKey != null && whitelist.contains(typeKey);
+  }
+
+  /** 取（必要时懒建）某世界的实体类型索引；只由实体所属线程/主线程写入，封包线程只读。 */
+  private Map<Integer, String> typeIndexFor(String worldName) {
+    return entityTypeIndex.computeIfAbsent(worldName, ignored -> new ConcurrentHashMap<>());
   }
 
   /**
@@ -356,24 +382,30 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
           continue;
         }
         int cursor = Math.floorMod(rebuildChunkCursors.getOrDefault(world.getName(), 0), chunks.length);
-        int take = Math.min(remaining, chunks.length);
+        // 本批只处理「从 cursor 到数组末尾」这一段：若按 take = min(remaining, chunks.length) 取，
+        // 当某世界已加载区块数 > 周期预算时 take 永远小于 chunks.length，下面的「世界完成」判定
+        // 就永远为假 —— rebuildWorldCursor 不推进，兜底只覆盖 Bukkit.getWorlds() 的第 0 个世界，
+        // 其余世界（下界/末地）永远拿不到兜底，且「一轮完成」分支也永不执行（静默失效、无计数）。
+        int take = Math.min(remaining, chunks.length - cursor);
         for (int i = 0; i < take; i++) {
-          Chunk chunk = chunks[(cursor + i) % chunks.length];
+          Chunk chunk = chunks[cursor + i];
+          Map<Integer, String> perWorld = typeIndexFor(world.getName());
           for (Entity entity : chunk.getEntities()) {
             int id = entity.getEntityId();
             String typeKey = typeKeyFor(entity.getType());
             if (typeKey != null) {
-              entityTypeIndex.put(id, typeKey);
+              perWorld.put(id, typeKey);
             } else {
               // 非白名单实体：清掉可能残留的陈旧映射（id 被复用时的正确性兜底）
-              entityTypeIndex.remove(id);
+              perWorld.remove(id);
             }
           }
         }
         // 走完整个世界 → 该世界游标归零、轮到下一个世界；否则保留游标，下次继续这个世界的剩余区块
-        rebuildChunkCursors.put(world.getName(), take >= chunks.length ? 0 : (cursor + take) % chunks.length);
+        boolean worldDone = cursor + take >= chunks.length;
+        rebuildChunkCursors.put(world.getName(), worldDone ? 0 : cursor + take);
         remaining -= take;
-        if (take >= chunks.length) {
+        if (worldDone) {
           rebuildWorldCursor++;
         }
       }

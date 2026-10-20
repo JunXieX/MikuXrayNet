@@ -158,6 +158,17 @@ public final class BufferedLinearV3Format {
    */
   static final long MAX_COMPRESSION_RATIO = 8192L;
 
+  /**
+   * zstd 方案允许的压缩比上限（比 Deflate 宽 4 倍）。
+   *
+   * <p><b>为什么两套阈值</b>：zstd 单序列可编码 128 KiB，且对近零熵输入（大量重复方块、全零区块段）
+   * 压缩率显著高于 zlib；16 MiB 的高冗余负载可被压到约 2 KB，压缩比 ≈ 8000——恰好贴着 Deflate 的
+   * 8192 阈值，属于「合法负载被判损坏、永久读不回」的风险区。Deflate 对同样负载只有约 1024:1，
+   * 永不触发。两套阈值消除方案间不对称，同时仍能在分配之前挡住伪造/损坏的桶头（16 MiB 声明至少要
+   * 512 字节压缩数据才被接受，仍远高于任何真实空桶）。
+   */
+  private static final long MAX_COMPRESSION_RATIO_ZSTD = 32768L;
+
   /** 触发 {@link #MAX_COMPRESSION_RATIO} 校验所需的最小声明原始长度（4 MiB；见其说明）。 */
   private static final int COMPRESSION_RATIO_MIN_RAW = 4 << 20;
 
@@ -425,7 +436,11 @@ public final class BufferedLinearV3Format {
     while (!deflater.finished()) {
       int produced = deflater.deflate(chunk);
       if (produced <= 0) {
-        break;
+        // 理论上不该发生（finish() 后要么产出、要么 finished()）。若真发生，绝不能像旧实现那样
+        // break 后把**半截 zlib 流**当结果返回：那条记录会被落盘，而读回时解压必然失败
+        //（槽位被当成损坏/空），既丢数据又没有任何日志。改为显式抛错，由上层按「本条不落盘」处理。
+        throw new IllegalStateException("Deflater 未能继续产出数据（finished=" + deflater.finished()
+            + "，已产出 " + out.size() + " 字节）");
       }
       out.write(chunk, 0, produced);
     }
@@ -461,10 +476,12 @@ public final class BufferedLinearV3Format {
     // 压缩比 sanity：必须在任何分配之前完成（inflate 会先 new byte[rawLength] 才解压）。
     // 声明长度 > 4 MiB 且压缩长度不足其 1/8192 时，只可能来自损坏/伪造的桶头——真实区块负载的
     // 压缩比远达不到该量级（见常量注释），故直接判损坏，交由调用方 fail-open（该桶当空）。
+    long ratioLimit = compression == COMPRESSION_ZSTD ? MAX_COMPRESSION_RATIO_ZSTD
+        : MAX_COMPRESSION_RATIO;
     if (rawLength > COMPRESSION_RATIO_MIN_RAW
-        && (long) compressed.length * MAX_COMPRESSION_RATIO < rawLength) {
+        && (long) compressed.length * ratioLimit < rawLength) {
       throw new IOException("压缩比异常（声明 " + rawLength + " 字节，压缩数据仅 "
-          + compressed.length + " 字节），已按损坏处理");
+          + compressed.length + " 字节，方案 " + compression + "），已按损坏处理");
     }
     if (compression == COMPRESSION_ZSTD) {
       return zstdInflate(compressed, rawLength);
@@ -498,6 +515,7 @@ public final class BufferedLinearV3Format {
     try {
       inflater.setInput(compressed);
       int written = 0;
+      int stalled = 0;
       while (written < rawLength) {
         int produced = inflater.inflate(out, written, rawLength - written);
         if (produced == 0) {
@@ -507,7 +525,16 @@ public final class BufferedLinearV3Format {
           if (inflater.finished()) {
             break;
           }
+          // 「无产出且既不需要输入、也未结束」：Inflater 处于无法推进的状态。旧实现此时 written 不增、
+          // 循环不退，会以 100% CPU 空转（读线程是磁盘线程，一旦空转整个缓存链路停摆）。
+          // 连续两次无进展即判损坏，绝不无限循环。
+          if (++stalled >= 2) {
+            throw new IOException("解压无进展（已解出 " + written + " / " + rawLength
+                + " 字节，Inflater 无法推进）");
+          }
+          continue;
         }
+        stalled = 0;
         written += produced;
       }
       if (written != rawLength) {

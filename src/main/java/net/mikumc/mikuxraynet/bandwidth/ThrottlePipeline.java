@@ -96,6 +96,17 @@ public final class ThrottlePipeline {
    */
   private final AtomicBoolean started = new AtomicBoolean();
 
+  /**
+   * start()/stop() 的串行闸门。
+   *
+   * <p><b>为什么 CAS 不够</b>：CAS 只保证「同一个动作最多执行一次」，不保证两个动作之间不交错。
+   * 热重载路径是「停旧管线 → 建新管线」，而停用/重载可能来自不同线程（命令线程、区域线程、关服线程）：
+   * 若 {@code start()} 正在逐个子模块装配时另一线程执行了 {@code stop()}，stop 会把已装配的字段清空并
+   * 注销它们，随后 start 继续装配剩余模块并写字段 —— 结果是「一半模块被注销、字段却指向它们」，
+   * 既漏清理又可能重复注册监听器。用一把可重入锁把整段装配/拆除串起来即可，且两段都不在封包热路径上。
+   */
+  private final Object lifecycleLock = new Object();
+
   public ThrottlePipeline(Plugin plugin, BandwidthConfig config) {
     this(plugin, config, new ThrottleStats());
   }
@@ -129,6 +140,13 @@ public final class ThrottlePipeline {
 
   /** 装配全部子模块；总开关关闭时不做任何事。 */
   public void start() {
+    synchronized (lifecycleLock) {
+      startLocked();
+    }
+  }
+
+  /** 装配主体（调用方已持有 {@link #lifecycleLock}）。 */
+  private void startLocked() {
     if (!config.enabled()) {
       plugin.getLogger().fine("带宽优化已在配置中关闭（bandwidth.yml: enabled=false）");
       return;
@@ -168,9 +186,16 @@ public final class ThrottlePipeline {
     ModulePlan plan = plan(config);
 
     if (plan.entityPackets()) {
-      entityPacketFilter = register(
-          () -> new EntityPacketFilter(plugin, manager, config.entityPackets(), stats),
-          EntityPacketFilter::start, EntityPacketFilter::stop);
+      // 与方块变更合并同一判空：EntityPacketFilter.start() 会先做一次全服实体索引构建，
+      // 再在 addPacketListener 上因 manager==null 抛 NPE——先扫描后失败既白烧一次尖峰，
+      // 又让日志出现「注册失败 + NPE」这种掩盖真实原因（缺 ProtocolLib）的误导信息。
+      if (manager == null) {
+        plugin.getLogger().warning("零位移实体包取消需要 ProtocolLib，已停用");
+      } else {
+        entityPacketFilter = register(
+            () -> new EntityPacketFilter(plugin, manager, config.entityPackets(), stats),
+            EntityPacketFilter::start, EntityPacketFilter::stop);
+      }
     } else {
       logDisabled("零位移实体包取消", config.entityPackets().enabled()
           ? "entity-packets.skip-zero-movement" : "entity-packets.enabled");
@@ -200,9 +225,14 @@ public final class ThrottlePipeline {
           : "entity-culling.enabled");
     }
     if (plan.afk()) {
-      afkTracker = register(
-          () -> new AfkTracker(plugin, manager, config.afk(), stats),
-          AfkTracker::start, AfkTracker::stop);
+      // 同上：AfkTracker 也依赖 ProtocolLib 的封包监听，缺前置时直接跳过而不是等 start() 抛 NPE
+      if (manager == null) {
+        plugin.getLogger().warning("AFK 降级需要 ProtocolLib，已停用");
+      } else {
+        afkTracker = register(
+            () -> new AfkTracker(plugin, manager, config.afk(), stats),
+            AfkTracker::start, AfkTracker::stop);
+      }
     } else {
       logDisabled("AFK 降级", "afk.enabled");
     }
@@ -217,6 +247,13 @@ public final class ThrottlePipeline {
 
   /** 注销全部子模块；可重复调用，异常安全（并发调用时恰好一个线程执行清理）。 */
   public void stop() {
+    synchronized (lifecycleLock) {
+      stopLocked();
+    }
+  }
+
+  /** 拆除主体（调用方已持有 {@link #lifecycleLock}）。 */
+  private void stopLocked() {
     if (!started.compareAndSet(true, false)) {
       return;
     }

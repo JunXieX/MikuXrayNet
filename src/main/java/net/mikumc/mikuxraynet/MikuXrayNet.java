@@ -93,6 +93,8 @@ public final class MikuXrayNet extends JavaPlugin {
     PlatformSupport.configure(config.antiXray().platform());
     // 开服日志只保留一行「加载成功」：常规启动的全部细节（平台、各模块参数、自检结果）一律降为 FINE
     // （默认不可见，需要排查时打开调试日志即可）；任何功能不可用 / 降级 / 失败都会由各自模块打 WARNING。
+    // 插件可能在同一 JVM 内被重新启用：复位「正在停用」标志，否则重新启用后所有热重载都会被取消。
+    reloadCoordinator.resetShutdownState();
     getLogger().fine("运行平台：" + PlatformSupport.platformDescription());
     this.runtime = new AntiXrayRuntime(this, occlusionStats);
     // 反矿透装配失败绝不能让整个插件启用失败：带宽模块与命令与它相互独立，必须照常可用。
@@ -126,17 +128,37 @@ public final class MikuXrayNet extends JavaPlugin {
 
   @Override
   public void onDisable() {
-    stopDiagnosticsTask();
-    if (throttlePipeline != null) {
-      // 先停带宽管线：它需要偿还延迟中的包、恢复被隐藏的实体与视距
-      throttlePipeline.stop();
+    // 与热重载共用同一把会话锁：否则「停用」与「reload 的停旧建新」会交错，重载可能在停用之后
+    // 又装配出一套监听器/任务，它们挂在已停用的插件上永远不被清理（见 ReloadCoordinator#runExclusively）。
+    reloadCoordinator.runExclusively(() -> {
+      // 逐步兜底：任何一步抛错都不能吞掉后续清理（否则会留下被隐藏的实体/降过的视距/未注销的监听器）。
+      // 顺序本身是纪律（先带宽、后反矿透），所以不用 finally 串联，而是各步独立 try/catch。
+      try {
+        stopDiagnosticsTask();
+      } catch (Throwable throwable) {
+        getLogger().log(Level.WARNING, "停用期取消诊断任务失败（忽略）", throwable);
+      }
+      ThrottlePipeline pipeline = throttlePipeline;
       throttlePipeline = null;
-    }
-    // 反矿透侧按既有纪律停机：注销拦截 → 停显形 → 关缓存 → 关池 → 停巡检（顺序不得调整）
-    if (runtime != null) {
-      runtime.stopForDisable();
+      if (pipeline != null) {
+        // 先停带宽管线：它需要偿还延迟中的包、恢复被隐藏的实体与视距
+        try {
+          pipeline.stop();
+        } catch (Throwable throwable) {
+          getLogger().log(Level.WARNING, "停用期停止带宽管线失败（已置空字段，避免诊断读到半停状态）", throwable);
+        }
+      }
+      // 反矿透侧按既有纪律停机：注销拦截 → 停显形 → 关缓存 → 关池 → 停巡检（顺序不得调整）
+      AntiXrayRuntime current = runtime;
       runtime = null;
-    }
+      if (current != null) {
+        try {
+          current.stopForDisable();
+        } catch (Throwable throwable) {
+          getLogger().log(Level.WARNING, "停用期停止反矿透模块失败（已置空字段）", throwable);
+        }
+      }
+    });
     getLogger().fine("MikuXrayNet 已停用");
   }
 

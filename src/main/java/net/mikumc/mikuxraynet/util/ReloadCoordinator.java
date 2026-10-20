@@ -55,6 +55,30 @@ public final class ReloadCoordinator {
   /** 重载会话互斥锁（串行化「读配置 → 失效缓存 → 重建任务」整段流程）。 */
   private final Object reloadLock = new Object();
 
+  /**
+   * 插件是否已进入停用流程。
+   *
+   * <p><b>为什么光有锁不够</b>：{@code runExclusively} 只保证「停用」与「重载」不交错，不保证
+   * 「停用之后不再重载」。Folia 上命令跑在区域线程、停用跑在全局线程：一个 reload 在锁上排队，
+   * 停用拿到锁、跑完、释放，reload 随即继续执行到 {@code restartPeriodicTasks()} → 在已停用的插件上
+   * 新建并启动一整套管线（{@code ThrottlePipeline} 逐模块注册、失败只停该模块，AfkTracker 等模块
+   * 不会因为插件停用而必然抛错）。这些监听器/任务挂在已停用实例上永不被回收；若插件随后被重新启用，
+   * 同一区块包会被两套改写器处理、旧 EntityCuller 藏起的实体无人恢复 —— 玩家永久隐形实体。
+   * 故停用一开始就置位，重载拿到锁后立刻复查并放弃。
+   */
+  private volatile boolean shuttingDown;
+
+  /**
+   * 复位「正在停用」标志（插件重新启用时调用）。
+   *
+   * <p><b>为什么必须复位</b>：{@link #shuttingDown} 一旦置位就不再自动清除，而插件可能在同一个 JVM 里
+   * 被再次启用（例如 {@code /reload confirm}、或其它插件动态启停本插件）。若不复位，重新启用后
+   * 所有热重载都会被判定为「插件正在停用」而直接取消——管理员会看到「重载被取消」却找不到原因。
+   */
+  public void resetShutdownState() {
+    shuttingDown = false;
+  }
+
   /** 本次热重载后已即时生效的配置项。 */
   public static final List<String> APPLIED = List.of(
       "邻近显形（距离/周期/单次上限）",
@@ -100,7 +124,30 @@ public final class ReloadCoordinator {
     // 管线覆盖掉，旧管线既不在字段里、也不会有人 stop —— 监听器重复注册、被隐藏的实体账本分裂
     // （旧管线藏起的实体新管线不知道，停用时永远不会恢复）。这里用一把可重入锁把整个会话串起来。
     synchronized (reloadLock) {
+      if (shuttingDown) {
+        // 插件正在停用：此时再装配管线只会造出无人回收的监听器/任务（见 shuttingDown 的说明）。
+        return List.of("插件正在停用，本次热重载已取消（请等服务器完成停用/重启后再试）");
+      }
       return reloadLocked(target);
+    }
+  }
+
+  /**
+   * 在「重载会话锁」内执行一段外部流程（目前只用于插件停用）。
+   *
+   * <p><b>为什么停用也要进这把锁</b>：热重载是「停旧管线 → 建新管线 → 重启周期任务」的多步流程，
+   * 而 {@code onDisable} 同样要停管线、关池、注销监听。两者若不互斥，在 Folia 上（命令跑在区域线程、
+   * 停用跑在全局线程）会交错：停用刚把管线字段置空，重载随即又 {@code start()} 出一套新的监听器与
+   * 任务——它们挂在已停用的插件上，永远不会被清理（ProtocolLib 监听器泄漏、实体账本分裂）。
+   * 用同一把锁串起来即可；停用路径本身不在封包热路径上，代价可忽略。
+   *
+   * @param action 需要与重载互斥执行的流程
+   */
+  public void runExclusively(Runnable action) {
+    // 先置位再进锁：这样「已在排队的 reload」拿到锁后必然能看到 shuttingDown。
+    shuttingDown = true;
+    synchronized (reloadLock) {
+      action.run();
     }
   }
 
