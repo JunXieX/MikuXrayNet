@@ -871,12 +871,20 @@ public final class ProximityRevealer implements Listener {
 
     // 可见性判定（事件即时显形等未走 computePlan 的路径）：在当前线程用遮挡位图判定。位图缺失时按
     // 「遮挡」处理（严格方向：不显形），绝不裸发——「无数据 ≠ 通畅」。
-    if (eye != null && proximity.raycastEnabled() && !visibilityInPlan
-        && !BitmapVisibility.local().isVisible(eye, occlusionStores, world.getName(),
-            proximity.raycastSamples(), x, y, z)) {
-      stats.revealsRayCulled.increment();
-      tally.rayCulled++;
-      return;
+    if (eye != null && proximity.raycastEnabled() && !visibilityInPlan) {
+      BitmapVisibility bitmap = BitmapVisibility.local();
+      if (!bitmap.isVisible(eye, occlusionStores, world.getName(), proximity.raycastSamples(),
+          x, y, z)) {
+        stats.revealsRayCulled.increment();
+        // 与周期路径同一归因口径：因「缺数据」而剔除的候选单列一笔。
+        // 事件显形正是「玩家挖开面前方块」那条最该立刻还原的路径，缺数据在此静默剔除的后果
+        // 比周期路径更直接可感（眼前假矿不还原）。只统计不改行为，让面板能自证是否踩到。
+        if (bitmap.missingDataConsulted()) {
+          stats.revealsRayCulledMissingData.increment();
+        }
+        tally.rayCulled++;
+        return;
+      }
     }
 
     // 过度显形量化（P2-6b，只计数不改行为）：发包前按 1/N 抽样，若 RevealedSet 已含该坐标，
