@@ -217,8 +217,8 @@ class DiagnosticsTest {
 
     String dump = Diagnostics.formatDump(withAntiXray(antiXray("enabled: true\n")),
         "20260925-000000");
-    assertTrue(dump.contains("maximum-bytes=" + AntiXrayConfig.CACHE_MAXIMUM_BYTES_DEFAULT),
-        "dump 必须回显内存改写缓存的字节上限（否则调大 cache.maximum-bytes 后无法核对生效值）：" + dump);
+    assertTrue(dump.contains("maximum-mb=" + AntiXrayConfig.CACHE_MAXIMUM_MB_DEFAULT),
+        "dump 必须回显内存改写缓存的 MB 上限（否则调大 cache.maximum-mb 后无法核对生效值）：" + dump);
   }
 
   @Test

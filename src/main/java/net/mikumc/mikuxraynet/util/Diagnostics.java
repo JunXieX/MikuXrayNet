@@ -627,7 +627,7 @@ public final class Diagnostics {
         // 却已经在按字节淘汰（缓存命中率莫名下降），这条给出决定性的对照值。
         + "，字节 " + bytesHuman(s.rewrite().cacheBytes())
         // 上限是**启动期固化**的（RewriteCache 只在 startAntiXray 里构造一次），reload 改
-        // cache.maximum-bytes 只改配置不改这里；标注「重启生效」避免管理员被实时配置值误导。
+        // cache.maximum-mb 只改配置不改这里；标注「重启生效」避免管理员被实时配置值误导。
         + (s.antiXray() == null ? ""
             : " / 上限 " + bytesHuman(s.antiXray().cacheMaximumBytes()) + "（重启生效）")
         + "，磁盘查询 " + (s.rewrite().cacheMisses() + s.rewrite().cacheContentRejected()));
@@ -1138,11 +1138,10 @@ public final class Diagnostics {
         .append("，timeout-seconds=").append(c.diskCache().zstdTimeoutSeconds())
         .append("，zstd-sha256=").append(c.diskCache().zstdSha256().isEmpty() ? "未配置（不校验）" : "已配置")
         .append('\n');
-    // 内存改写缓存是「条目数 + 字节数」双上限：只回显条目数时，改大 maximum-bytes 或观察大区块占满
-    // 字节预算都无从判断。字节占用本身需要经封包链路转发（ProtocolLibHook 目前只转发条目数），
-    // 这里先回显两个上限的生效值。
+    // 内存改写缓存是「条目数 + MB 上限」双上限：只回显条目数时，改大 maximum-mb 或观察大区块占满
+    // 预算都无从判断。这里回显两个上限的生效值（配置侧单位是 MB，内部按字节记账）。
     sb.append("cache.maximum-size=").append(c.cacheMaximumSize())
-        .append("，maximum-bytes=").append(c.cacheMaximumBytes())
+        .append("，maximum-mb=").append(c.cacheMaximumMb())
         .append("，expire-after-access-seconds=").append(c.cacheExpireAfterAccessSeconds()).append('\n');
     sb.append("advanced.platform=").append(c.platform())
         .append("，threads=").append(c.threads())

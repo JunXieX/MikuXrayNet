@@ -134,9 +134,9 @@ public final class ReloadCoordinator {
       "邻块快照启用 / 缺失策略 / 容量（neighbors.enabled 启动时为 false 则本进程内不再抓取；"
           + "missing-policy / cache-maximum-size）",
       "反矿透工作线程数与队列容量",
-      // cache.maximum-bytes 与 cache.maximum-size 同属「启动期固化的改写缓存预算」：RewriteCache
+      // cache.maximum-mb 与 cache.maximum-size 同属「启动期固化的改写缓存预算」：RewriteCache
       // 只在 startAntiXray 里构造一次，reload 不重建它，故字节上限改了也只有重启才生效。
-      "区块改写超时与改写缓存容量/字节上限/过期（cache.maximum-size / cache.maximum-bytes）",
+      "区块改写超时与改写缓存容量/内存上限/过期（cache.maximum-size / cache.maximum-mb）",
       // 调色板两键在启动期被固化为编码链路的 PaletteOptions（见 AntiXrayRuntime.startAntiXray），
       // reload 只重启显形/带宽任务、不重建编码器，故这两键改了必须重启（含 width-budget / strict-verify）。
       "调色板压缩 / 位宽预算封顶 / 严格自检（palette.width-budget / strict-verify）",

@@ -171,8 +171,8 @@ class ConfigDefaultsTest {
         "打包 yml 的 proximity.raycast.samples 必须等于代码回落值");
     assertEquals(fallback.proximity().instantReveal(), packed.proximity().instantReveal(),
         "打包 yml 的 instant-reveal 三键必须等于代码回落值");
-    assertEquals(fallback.cacheMaximumBytes(), packed.cacheMaximumBytes(),
-        "打包 yml 的 cache.maximum-bytes 必须等于代码回落值");
+    assertEquals(fallback.cacheMaximumMb(), packed.cacheMaximumMb(),
+        "打包 yml 的 cache.maximum-mb 必须等于代码回落值");
     assertTrue(packed.floorAdjustments().isEmpty(),
         "打包默认值不得触发安全下限抬升（否则每个服主开服都会看到一条误导性 WARN）："
             + packed.floorAdjustments());
@@ -629,8 +629,8 @@ class ConfigDefaultsTest {
         "条目过期默认 7 天（原 1800 秒：从写入时刻算起，配得比两次启动间隔还短 → 重启后条目全过期、"
             + "命中率恒为 0；实机 70 分钟后重启命中 0／未命中 2096）。内容新鲜度由原始字节指纹判定，"
             + "限制磁盘占用应调 max-entries / max-file-size-mb");
-    assertEquals(8, config.diskCache().bucketCacheSize(),
-        "bucket 缓存默认 8（原 2；真机命中率提升约 16~20 个百分点，依据见 antixray.yml 注释）");
+    assertEquals(32, config.diskCache().bucketCacheSize(),
+        "bucket 缓存默认 32（每文件约 4~8 MB；常驻文件数还受 idle-close-seconds 约束）");
     assertEquals(300, config.diskCache().idleCloseSeconds(), "句柄闲置关闭默认 300 秒");
     assertEquals(30, config.diskCache().maintenanceIntervalSeconds(), "后台维护周期默认 30 秒");
     assertEquals(4, config.diskCache().compactPerPass(), "每轮最多压缩 4 个区域文件");
@@ -643,14 +643,16 @@ class ConfigDefaultsTest {
     assertEquals("", config.diskCache().zstdSha256(),
         "zstd 下载校验哈希默认空串（不校验；缺键也不得抛异常）");
 
-    // cache 三键（改写结果的内存缓存：条目数 + 字节数双上限）
-    // 注意：默认 512 MB 的字节上限会先封顶（30~50 KB/条约 1.0~1.7 万条），40960 这个条目上限在默认
+    // cache 三键（改写结果的内存缓存：条目数 + MB 上限）
+    // 注意：默认 512 MB 的 MB 上限会先封顶（30~50 KB/条约 1.0~1.7 万条），40960 这个条目上限在默认
     // 配置下实际不可达；这里仍断言 40960，锁的是「配置值」而不是「实际驻留条数」（后者由两者共同决定）。
     assertEquals(40960, config.cacheMaximumSize(),
-        "改写缓存条目上限默认 40960（与 max-size 共同封顶；默认实际由 512 MB 的字节上限先到顶）");
+        "改写缓存条目上限默认 40960（与 maximum-mb 共同封顶；默认实际由 512 MB 先到顶）");
     assertEquals(600, config.cacheExpireAfterAccessSeconds(), "改写缓存访问后过期默认 600 秒");
-    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_BYTES_DEFAULT, config.cacheMaximumBytes(),
-        "改写缓存按字节硬上限默认 512 MB（条目上限管不住「单条负载偏大」，字节上限才与堆占用挂钩）");
+    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_MB_DEFAULT, config.cacheMaximumMb(),
+        "改写缓存内存上限默认 512 MB（配置单位 MB；条目上限管不住「单条负载偏大」）");
+    assertEquals(512L * 1024L * 1024L, config.cacheMaximumBytes(),
+        "字节形式由 MB 换算得出（RewriteCache 按字节记账）");
 
     // advanced 三键
     assertEquals(0, config.threads(), "工作线程数默认 0 = 按 CPU 自动推算（上限 4）");
@@ -722,52 +724,53 @@ class ConfigDefaultsTest {
   }
 
   /**
-   * {@code cache.maximum-bytes}：两端留痕的「按字节」硬上限。
+   * {@code cache.maximum-mb}：两端留痕的「按 MB」硬上限。
    *
    * <p>要点：① 缺键时默认 512 MB 落在区间内、不产生明细；② 超上限（手滑多打一位数）按上限生效并留痕；
-   * ③ 低于下限（会把缓存配成事实关闭、反而更耗 CPU）按下限抬升并留痕；④ 4 GB 这个合法边界必须能原样
-   * 表达——用 {@code getInt} 解析会把它溢出成默认值，所以本键必须是 long。
+   * ③ 低于下限（会把缓存配成事实关闭、反而更耗 CPU）按下限抬升并留痕；④ 4096 这个合法边界必须能原样
+   * 表达；⑤ 内部按字节记账的访问器必须是 MB × 1 MiB（RewriteCache 用字节）。
    */
   @Test
-  void cacheMaximumBytesClampsAtBothEndsAndReports() {
+  void cacheMaximumMbClampsAtBothEndsAndReports() {
     AntiXrayConfig defaults = AntiXrayConfig.from(yaml("enabled: true\n"));
-    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_BYTES_DEFAULT, defaults.cacheMaximumBytes(),
-        "缺键时按字节上限默认 512 MB");
+    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_MB_DEFAULT, defaults.cacheMaximumMb(),
+        "缺键时按 MB 上限默认 512");
     assertTrue(defaults.floorAdjustments().isEmpty(), defaults.floorAdjustments().toString());
     assertTrue(defaults.ceilingAdjustments().isEmpty(), defaults.ceilingAdjustments().toString());
 
     AntiXrayConfig inRange = AntiXrayConfig.from(yaml("""
         cache:
-          maximum-bytes: 1073741824
+          maximum-mb: 1024
         """));
-    assertEquals(1073741824L, inRange.cacheMaximumBytes(), "区间内（1 GB）原样生效");
+    assertEquals(1024, inRange.cacheMaximumMb(), "区间内（1024 MB）原样生效");
+    assertEquals(1024L * 1024L * 1024L, inRange.cacheMaximumBytes(), "字节形式 = MB × 1 MiB");
     assertTrue(inRange.floorAdjustments().isEmpty(), inRange.floorAdjustments().toString());
     assertTrue(inRange.ceilingAdjustments().isEmpty(), inRange.ceilingAdjustments().toString());
 
     AntiXrayConfig tooBig = AntiXrayConfig.from(yaml("""
         cache:
-          maximum-bytes: 53687091200
+          maximum-mb: 8192
         """));
-    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_BYTES_MAX, tooBig.cacheMaximumBytes(),
-        "超过 4 GB 上限按上限生效（拦住手滑多打一位数）");
-    assertTrue(String.join("、", tooBig.ceilingAdjustments()).contains("cache.maximum-bytes=53687091200"),
+    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_MB_MAX, tooBig.cacheMaximumMb(),
+        "超过 4096 MB 上限按上限生效（拦住手滑多打一位数）");
+    assertTrue(String.join("、", tooBig.ceilingAdjustments()).contains("cache.maximum-mb=8192"),
         tooBig.ceilingAdjustments().toString());
 
     AntiXrayConfig tooSmall = AntiXrayConfig.from(yaml("""
         cache:
-          maximum-bytes: 1048576
+          maximum-mb: 1
         """));
-    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_BYTES_MIN, tooSmall.cacheMaximumBytes(),
+    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_MB_MIN, tooSmall.cacheMaximumMb(),
         "低于 64 MB 下限按下限抬升（否则缓存事实关闭，每个区块都重写、更耗 CPU）");
-    assertTrue(String.join("、", tooSmall.floorAdjustments()).contains("cache.maximum-bytes=1048576"),
+    assertTrue(String.join("、", tooSmall.floorAdjustments()).contains("cache.maximum-mb=1"),
         tooSmall.floorAdjustments().toString());
 
     AntiXrayConfig atMax = AntiXrayConfig.from(yaml("""
         cache:
-          maximum-bytes: 4294967296
+          maximum-mb: 4096
         """));
-    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_BYTES_MAX, atMax.cacheMaximumBytes(),
-        "4 GB 是合法边界，必须能原样表达（int 解析会溢出成默认值）");
+    assertEquals(AntiXrayConfig.CACHE_MAXIMUM_MB_MAX, atMax.cacheMaximumMb(),
+        "4096 MB 是合法边界，必须能原样表达");
     assertTrue(atMax.ceilingAdjustments().isEmpty(), atMax.ceilingAdjustments().toString());
   }
 

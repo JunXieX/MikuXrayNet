@@ -9,7 +9,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@link RewriteCache} 的<b>字节预算</b>（{@code cache.maximum-bytes}）回归。
+ * {@link RewriteCache} 的<b>字节预算</b>（配置键 {@code cache.maximum-mb}，内部按字节记账）回归。
  *
  * <p><b>为什么必须单独测</b>：条目数上限（{@code maximumSize}）与字节上限是两条独立闸门，
  * 而改写结果同时持有「改写后字节 + 伪装坐标数组 + 整列遮挡负载」——只按条目数封顶时默认 40960 条

@@ -189,7 +189,7 @@ public final class ProtocolLibHook {
     return current == null ? 0 : current.cacheSize();
   }
 
-  /** 缓存当前占用的近似字节数（诊断用；与 {@code cache.maximum-bytes} 对照即可看出预算是否吃紧）。 */
+  /** 缓存当前占用的近似字节数（诊断用；与 {@code cache.maximum-mb} 换算出的字节上限对照即可看出预算是否吃紧）。 */
   public long cacheBytes() {
     ProtocolLibAsyncListener current = listener;
     return current == null ? 0L : current.cacheBytes();

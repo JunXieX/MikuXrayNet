@@ -364,7 +364,7 @@ public final class AntiXrayConfig {
   public static final int CACHE_MAXIMUM_SIZE_MAX = 65536;
 
   /**
-   * {@code cache.maximum-bytes}（改写结果内存缓存的<b>按字节</b>硬上限）的默认值：512 MB。
+   * {@code cache.maximum-mb}（改写结果内存缓存的<b>按 MB</b>硬上限）的默认值：512 MB。
    *
    * <p><b>为什么在「条目上限」之外还要一个字节上限</b>：条目上限只管「最多多少条」，管不住
    * 「单条负载偏大」——同一个区块，普通地形约 20~25 KB，但直接调色板 / 高熵地形可以到几百 KB，
@@ -373,23 +373,23 @@ public final class AntiXrayConfig {
    * <p>默认 512 MB 对应约 2 万条「普通体积」条目，与 {@code cache.maximum-size} 的默认 40960
    * 同量级但更保守：先撞到的通常是字节上限，管理员据此调小即可精确控制这块内存。
    */
-  public static final long CACHE_MAXIMUM_BYTES_DEFAULT = 536_870_912L;
+  public static final int CACHE_MAXIMUM_MB_DEFAULT = 512;
 
   /**
-   * {@code cache.maximum-bytes} 的<b>安全下限</b>（64 MB）。
+   * {@code cache.maximum-mb} 的<b>安全下限</b>（64 MB）。
    *
    * <p>低于它连「一个视距内的改写结果」都装不下（2048 条普通体积条目 ≈ 50 MB），缓存等于关闭，
    * 反而让每个区块都重新改写——与「调小以省内存」的初衷相反。因此低于下限会被抬升并留痕。
    */
-  public static final long CACHE_MAXIMUM_BYTES_MIN = 67_108_864L;
+  public static final int CACHE_MAXIMUM_MB_MIN = 64;
 
   /**
-   * {@code cache.maximum-bytes} 的<b>安全上限</b>（4 GB）。
+   * {@code cache.maximum-mb} 的<b>安全上限</b>（4096 MB ≈ 4 GB）。
    *
    * <p>条目上限 {@link #CACHE_MAXIMUM_SIZE_MAX}（65536）在不改它的情况下，按 20~25 KB/条约合
    * 1.3~1.6 GB；本上限留出足够余量，只拦「手滑多打一位数」（如 53687091200）把堆一次吃光。
    */
-  public static final long CACHE_MAXIMUM_BYTES_MAX = 4_294_967_296L;
+  public static final int CACHE_MAXIMUM_MB_MAX = 4096;
 
   /**
    * {@code advanced.threads}（反矿透改写工作线程数）的安全上限。
@@ -750,8 +750,8 @@ public final class AntiXrayConfig {
   private final DiskCache diskCache;
   private final PlatformSupport.Mode platform;
   private final int cacheMaximumSize;
-  /** 改写结果内存缓存的按字节硬上限（与条目上限同时生效，谁先到顶以谁为准）。 */
-  private final long cacheMaximumBytes;
+  /** 改写结果内存缓存的硬上限，单位 <b>MB</b>（与条目上限同时生效，谁先到顶以谁为准）。 */
+  private final int cacheMaximumMb;
   private final int cacheExpireAfterAccessSeconds;
   private final int threads;
   private final int timeoutMillis;
@@ -783,7 +783,7 @@ public final class AntiXrayConfig {
       boolean[] dimensionEnabled, boolean dimensionsMissing, boolean layerObfuscation,
       boolean removeBlockEntities, Neighbors neighbors, Occlusion occlusion, Proximity proximity,
       DiskCache diskCache, PlatformSupport.Mode platform, int cacheMaximumSize,
-      long cacheMaximumBytes, int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis,
+      int cacheMaximumMb, int cacheExpireAfterAccessSeconds, int threads, int timeoutMillis,
       int queueCapacity,
       Set<String> unresolvedTags, List<WorldOverride> worldOverrides,
       List<String> floorAdjustments, List<String> ceilingAdjustments,
@@ -800,9 +800,9 @@ public final class AntiXrayConfig {
     this.diskCache = diskCache;
     this.platform = platform == null ? PlatformSupport.Mode.AUTO : platform;
     this.cacheMaximumSize = Math.max(1, cacheMaximumSize);
-    // 解析侧已按 [CACHE_MAXIMUM_BYTES_MIN, CACHE_MAXIMUM_BYTES_MAX] 钳制并留痕；这里只兜底非正数，
-    // 避免「配置项缺省/被写成 0」时把字节上限变成 0 而让缓存永久不可写（与 cacheMaximumSize 同口径）。
-    this.cacheMaximumBytes = Math.max(1L, cacheMaximumBytes);
+    // 解析侧已按 [CACHE_MAXIMUM_MB_MIN, CACHE_MAXIMUM_MB_MAX] 钳制并留痕；这里只兜底非正数，
+    // 避免「配置项缺省/被写成 0」时把上限变成 0 而让缓存永久不可写（与 cacheMaximumSize 同口径）。
+    this.cacheMaximumMb = Math.max(1, cacheMaximumMb);
     this.cacheExpireAfterAccessSeconds = Math.max(1, cacheExpireAfterAccessSeconds);
     this.threads = Math.max(0, threads);
     this.timeoutMillis = Math.max(100, timeoutMillis);
@@ -1081,9 +1081,10 @@ public final class AntiXrayConfig {
             diskCacheExpireSeconds(root.getInt("disk-cache.expire-seconds", 7 * 24 * 60 * 60),
                 floorAdjustments),
             // 上限见 DISK_CACHE_BUCKET_CACHE_SIZE_MAX：一个区域文件的记录条数上限是 BUCKET_COUNT=1024
-            // （BufferedLinearV3Format，一槽一条记录），但每文件常驻 64 条已约 6 MB 内存——再往上抬只会
-            // 放大「多文件同时打开」时的驻留内存，故按内存取舍收在 64，而不是格式上限。
-            clampCeiling(root.getInt("disk-cache.bucket-cache-size", 8), 1,
+            // （BufferedLinearV3Format，一槽一条记录），但每文件常驻 64 条已约 8~16 MB 内存——再往上抬只会
+            // 放大「多文件同时打开」时的驻留内存，故按内存取舍收在 64，而不是格式上限。默认 32：
+            // 读命中率与内存的平衡点（每文件约 4~8 MB），常驻文件数还受 idle-close-seconds 约束。
+            clampCeiling(root.getInt("disk-cache.bucket-cache-size", 32), 1,
                 DISK_CACHE_BUCKET_CACHE_SIZE_MAX, "disk-cache.bucket-cache-size", floorAdjustments,
                 ceilingAdjustments),
             clampCeiling(root.getInt("disk-cache.idle-close-seconds", 300), 1,
@@ -1121,13 +1122,14 @@ public final class AntiXrayConfig {
         // 上限见 CACHE_MAXIMUM_SIZE_MAX：每条约 20~25 KB，饱和时内存占用与条目数成正比。
         clampCeiling(root.getInt("cache.maximum-size", 40960), 1,
             CACHE_MAXIMUM_SIZE_MAX, "cache.maximum-size", floorAdjustments, ceilingAdjustments),
-        // 按字节的硬上限：条目上限管不住「单条负载偏大」（直接调色板 / 高熵地形可到几百 KB/条），
-        // 字节上限才是与堆占用直接挂钩的那一个。两端都留痕：下限防止把缓存配成事实关闭（反而更耗 CPU），
+        // 按 MB 的硬上限：条目上限管不住「单条负载偏大」（直接调色板 / 高熵地形可到几百 KB/条），
+        // 这个上限才是与堆占用直接挂钩的那一个。单位是 MB（旧版 key 叫 cache.maximum-bytes、单位字节）。
+        // 两端都留痕：下限防止把缓存配成事实关闭（反而更耗 CPU），
         // 上限只拦手滑多打一位数（默认 512 MB，正常调优撞不到）。
         clampCeiling(
-            lenientLongValue(root.get("cache.maximum-bytes"), CACHE_MAXIMUM_BYTES_DEFAULT,
-                "cache.maximum-bytes", typeAdjustments),
-            CACHE_MAXIMUM_BYTES_MIN, CACHE_MAXIMUM_BYTES_MAX, "cache.maximum-bytes",
+            narrowInt(lenientLongValue(root.get("cache.maximum-mb"), CACHE_MAXIMUM_MB_DEFAULT,
+                "cache.maximum-mb", typeAdjustments)),
+            CACHE_MAXIMUM_MB_MIN, CACHE_MAXIMUM_MB_MAX, "cache.maximum-mb",
             floorAdjustments, ceilingAdjustments),
         clampCeiling(root.getInt("cache.expire-after-access-seconds", 600), 1,
             CACHE_EXPIRE_AFTER_ACCESS_SECONDS_MAX, "cache.expire-after-access-seconds",
@@ -1492,8 +1494,13 @@ public final class AntiXrayConfig {
     return null;
   }
 
+  /** 把宽松解析出的 long 安全收窄为 int（超出 int 范围时饱和，随后由调用方按上下限钳制并留痕）。 */
+  private static int narrowInt(long value) {
+    return (int) Math.max(Integer.MIN_VALUE, Math.min(Integer.MAX_VALUE, value));
+  }
+
   /**
-   * 宽松解析 long 型配置值（当前用于 {@code cache.maximum-bytes} 这类按字节计的容量键）。
+   * 宽松解析 long 型配置值（当前用于 {@code cache.maximum-mb} 这类容量键的中间解析）。
    *
    * <p>与 {@link #lenientYValue} 同口径：接受整数类型（Integer/Long/Short/Byte）与十进制数字字符串
    * （可带正负号），其余写法记一条 {@code typeAdjustments} 后回落默认值。刻意不用
@@ -1727,7 +1734,7 @@ public final class AntiXrayConfig {
   /**
    * long 版整数钳制：语义与 {@link #clampCeiling(int, int, int, String, List, List)} 完全一致。
    *
-   * <p>为什么单独给一个 long 重载：按字节计的容量键（{@code cache.maximum-bytes} 可达 4 GB）
+   * <p>为什么单独给一个 long 重载：容量键（{@code cache.maximum-mb} 可达 4096 MB）
    * 超出 int 范围，用 {@code getInt} 解析会让 4 GB 这类合法上限被读成默认值；而两端钳制同样要留痕
    * （下限防「事实关闭缓存」、上限拦「手滑多打一位数」），否则就退回到旧实现那种静默改配置。
    */
@@ -1913,7 +1920,7 @@ public final class AntiXrayConfig {
       logger.warning("antixray.yml 的 " + String.join("、", ceilingAdjustments) + " 超过安全上限，已按上限生效"
           + "（当前：proximity.distance=" + proximity.distance() + " 格、neighbors.cache-maximum-size="
           + neighbors.cacheMaximumSize() + "、cache.maximum-size=" + cacheMaximumSize
-          + "、cache.maximum-bytes=" + cacheMaximumBytes + "）。"
+          + "、cache.maximum-mb=" + cacheMaximumMb + "）。"
           + "上限用于防止手滑多打一位数的失控配置：邻近显形距离的扫描量随半径平方增长（O(r²)）会拖住主线程，"
           + "缓存条目上限则直接换算成内存占用。");
     }
@@ -2107,14 +2114,22 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 改写结果内存缓存的<b>按字节</b>硬上限（{@code cache.maximum-bytes}，默认 512 MB）。
+   * 改写结果内存缓存的硬上限，单位 <b>MB</b>（{@code cache.maximum-mb}，默认 512）。
    *
    * <p>与 {@link #cacheMaximumSize()}（条目上限）同时生效，谁先到顶以谁为准：条目上限管「最多多少条」，
    * 本值管「最多占多少内存」，后者才与堆占用直接挂钩（单条负载可达几百 KB）。
-   * 超出后按最近最少使用（LRU）淘汰。
+   * 超出后按最近最少使用（LRU）淘汰。修改后需重启（缓存对象在启动期构造）。
+   */
+  public int cacheMaximumMb() {
+    return cacheMaximumMb;
+  }
+
+  /**
+   * 同一上限的<b>字节</b>形式（{@link #cacheMaximumMb()} × 1 MiB）：写给按字节记账的
+   * {@code RewriteCache} 用，配置侧只暴露 MB 单位的键。
    */
   public long cacheMaximumBytes() {
-    return cacheMaximumBytes;
+    return cacheMaximumMb * 1024L * 1024L;
   }
 
   public int cacheExpireAfterAccessSeconds() {

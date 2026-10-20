@@ -271,7 +271,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     this.workPool = workPool;
     this.asynchronousManager = asynchronousManager;
     // 条目数与字节数双上限：区块改写结果同时持有「改写后字节 + 伪装坐标数组 + 整列遮挡负载」，
-    // 只按条目数封顶会让默认 40960 条在大服上吃掉 1~2 GB 堆（见 cache.maximum-bytes 的注释）。
+    // 只按条目数封顶会让默认 40960 条在大服上吃掉 1~2 GB 堆（见 cache.maximum-mb 的注释）。
     this.cache = new RewriteCache<>(config.cacheMaximumSize(), config.cacheMaximumBytes(),
         config.cacheExpireAfterAccessSeconds(), ProtocolLibAsyncListener::cachedChunkBytes);
     this.neighborProvider = neighborProvider;
@@ -1218,7 +1218,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     return cache.size();
   }
 
-  /** 当前缓存条目占用的近似字节数（诊断用；与 {@code cache.maximum-bytes} 对账）。 */
+  /** 当前缓存条目占用的近似字节数（诊断用；与 {@code cache.maximum-mb} 换算出的字节上限对账）。 */
   public long cacheBytes() {
     return cache.bytes();
   }
