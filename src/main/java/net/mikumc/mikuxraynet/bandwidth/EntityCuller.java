@@ -781,8 +781,11 @@ public final class EntityCuller implements Listener {
     // 本周期就再没有机会，通道②的「先可见后被挡收敛」与「遮挡物消失后恢复」会随人数增长而退化。
     // 改为按在线人数分摊配额 + 轮转游标：队列不再溢出，未提交的实体顺延到下一周期（不丢判定）。
     // 代价是远处实体的再评估周期变长（观感上慢几拍），换来的是任何人数下都不再丢判定。
-    int online = Math.max(1, Bukkit.getOnlinePlayers().size());
-    int perCycle = Math.max(8, OCCLUSION_QUEUE_CAPACITY / online);
+    // 用「本类已追踪的玩家数」而不是 Bukkit.getOnlinePlayers()：后者要碰服务端实例，
+    // 离线单测里 Bukkit.server 为 null 会直接 NPE；而 rotations 是本类自己维护的纯内存结构，
+    // 语义上正是「当前参与剔除的玩家数」，与队列容量相除得到每人配额，离线与真机行为一致。
+    int trackedPlayers = Math.max(1, rotations.size());
+    int perCycle = Math.max(8, OCCLUSION_QUEUE_CAPACITY / trackedPlayers);
     for (Entity entity : rotation.nextBatch(perCycle)) {
       if (!owns(entity)) {
         // 跨区域（Folia）：不能触碰实体，也<b>不得摘除轮转条目</b>——通道②是远距离实体唯一的再评估
