@@ -97,6 +97,16 @@ public final class ThrottlePipeline {
   private final AtomicBoolean started = new AtomicBoolean();
 
   /**
+   * 本次停用是否有子模块清理失败。
+   *
+   * <p><b>为什么需要它</b>：{@link #close} 吞掉异常后仍会把字段置空（尽力清理），而日志可能被限流；
+   * 一旦某个子模块的监听器/任务没被真正注销，它就会挂在已停用的插件实例上——诊断面板看不出任何异常，
+   * 表现为「停用后计数还在涨」「重新启用后同一封包被处理两遍」。置位后由 {@code /mxnet status} 显示，
+   * 让这类「静默残留」可被发现。
+   */
+  private volatile boolean cleanupIncomplete;
+
+  /**
    * start()/stop() 的串行闸门。
    *
    * <p><b>为什么 CAS 不够</b>：CAS 只保证「同一个动作最多执行一次」，不保证两个动作之间不交错。
@@ -158,6 +168,7 @@ public final class ThrottlePipeline {
     // 用 CAS 而不是 set(true)：重复 start 会再 new 一整套子模块并覆盖字段，旧模块的 PacketAdapter /
     // 异步监听 / 每 tick 任务句柄仍挂在 ProtocolLib 与调度器里，且 stop() 再也拿不到它们——永久泄漏。
     // 当前调用方每次 reload 都新建实例，因此这只是纵深防御；被忽略时明确记一条，避免静默。
+    cleanupIncomplete = false;
     if (!started.compareAndSet(false, true)) {
       plugin.getLogger().fine("带宽优化管线已处于运行状态，忽略重复的 start()（已启动的模块不会被重复注册）");
       return;
@@ -358,8 +369,14 @@ public final class ThrottlePipeline {
     try {
       stopper.stop(module);
     } catch (Throwable throwable) {
+      cleanupIncomplete = true;
       plugin.getLogger().log(Level.WARNING, "注销带宽子模块「" + name + "」时出现异常", throwable);
     }
+  }
+
+  /** 最近一次停用是否有子模块清理失败（供诊断读取；重新 start 后复位）。 */
+  public boolean cleanupIncomplete() {
+    return cleanupIncomplete;
   }
 
   interface ModuleFactory<T> {

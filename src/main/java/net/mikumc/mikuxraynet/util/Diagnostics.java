@@ -212,11 +212,36 @@ public final class Diagnostics {
         long frustumHidden, long frustumShown,
         int afkPlayers, long afkEntered, long afkPacketsDropped,
         long viewDistanceReduced, long viewDistanceRestored,
-        long blockMergeFlushes, long blockMergeFlushNanos) {
+        long blockMergeFlushes, long blockMergeFlushNanos, boolean cleanupIncomplete) {
+
+      /**
+       * 兼容构造（不含 {@code cleanupIncomplete}，等价于「清理完整」）。
+       *
+       * <p>保留它是为了不破坏既有调用点与单测：新增的可观测字段只在停用失败时才有意义，
+       * 其余场景恒为 {@code false}。
+       */
+      public Throttle(long entityPacketsCancelled, long entityPacketsPassed,
+          long entityMovePackets, long entityMoveRotPackets, long entityLookPackets,
+          long entityMoveShapeMismatch,
+          long blockMergeBatches, long blockChangesMerged, long blockChangesPassed,
+          long entitiesHidden, long entitiesShown, int entitiesHiddenNow,
+          long recheckSubmitted, long recheckHidden, long recheckShown,
+          long frustumHidden, long frustumShown,
+          int afkPlayers, long afkEntered, long afkPacketsDropped,
+          long viewDistanceReduced, long viewDistanceRestored,
+          long blockMergeFlushes, long blockMergeFlushNanos) {
+        this(entityPacketsCancelled, entityPacketsPassed, entityMovePackets, entityMoveRotPackets,
+            entityLookPackets, entityMoveShapeMismatch, blockMergeBatches, blockChangesMerged,
+            blockChangesPassed, entitiesHidden, entitiesShown, entitiesHiddenNow, recheckSubmitted,
+            recheckHidden, recheckShown, frustumHidden, frustumShown, afkPlayers, afkEntered,
+            afkPacketsDropped, viewDistanceReduced, viewDistanceRestored, blockMergeFlushes,
+            blockMergeFlushNanos, false);
+      }
 
       /** 带宽优化未启用时的零值兜底。 */
       public static final Throttle EMPTY = new Throttle(
-          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L);
+          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L,
+          false);
     }
 
     /** 工作线程池域：线程数、活动数与队列占用。 */
@@ -410,7 +435,7 @@ public final class Diagnostics {
             pipeline.afkPlayerCount(), throttleStats.afkEntered.sum(),
             throttleStats.afkPacketsDropped.sum(), throttleStats.viewDistanceReduced.sum(),
             throttleStats.viewDistanceRestored.sum(), throttleStats.blockMergeFlushes.sum(),
-            throttleStats.blockMergeFlushNanos.sum());
+            throttleStats.blockMergeFlushNanos.sum(), pipeline.cleanupIncomplete());
     Snapshot.Pool poolSnapshot = pool == null ? Snapshot.Pool.EMPTY
         : new Snapshot.Pool(pool.poolSize(), pool.activeCount(), pool.queueSize(),
             pool.queueCapacity());
@@ -617,6 +642,11 @@ public final class Diagnostics {
         + "），AFK 丢包 " + s.throttle().afkPacketsDropped() + "，降视距 " + s.throttle().viewDistanceReduced()
         + "/还原 " + s.throttle().viewDistanceRestored());
     lines.add(bandwidthSwitches(s.bandwidth()));
+    if (s.throttle().cleanupIncomplete()) {
+      // 停用期有子模块清理失败：监听器/任务可能仍挂在旧实例上（停用后计数还会涨、重新启用后
+      // 同一封包被处理两遍）。这类「静默残留」平时完全看不出来，必须显式点名。
+      lines.add("带宽：上次停用有子模块清理失败（可能有监听器/任务残留，建议重启服务端）");
+    }
     lines.add("线程池：线程 " + s.pool().threads() + "，活动 " + s.pool().active()
         + "，队列 " + s.pool().queueSize() + "/" + s.pool().queueCapacity());
     return lines;

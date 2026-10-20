@@ -35,6 +35,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
+import org.bukkit.event.world.WorldUnloadEvent;
 import org.bukkit.plugin.Plugin;
 
 /**
@@ -57,7 +58,8 @@ import org.bukkit.plugin.Plugin;
  *       {@link EntityAddToWorldEvent} / {@link EntityRemoveFromWorldEvent} 在实体加入/离开世界时
  *       即时登记/摘除（不再等下一个全量刷新周期），另保留一个<b>低频、按区块分片的兜底重建</b>
  *       （{@link #INDEX_REBUILD_TICKS} 周期触发，每次最多 {@link #REBUILD_CHUNK_BUDGET} 个区块）
- *       补齐万一漏接的事件。启动时先做一次不限额的全量建索引，让插件启用前就已存在的实体立即生效。</li>
+ *       补齐万一漏接的事件。启动时先做一次不限额的全量建索引，让插件启用前就已存在的实体立即生效。
+ *       世界卸载（{@link WorldUnloadEvent}）时整表摘除该世界的外层条目，避免动态世界反复装卸后无界增长。</li>
  *   <li><b>Folia 系</b>：不做索引（无法跨区域安全枚举全服实体，且该平台是否为所有实体触发上述事件
  *       未经核实）。因此白名单在此平台<b>实际不生效</b>：{@code isWhitelisted} 恒为 false，盔甲架 /
  *       展示框等「机制上不移动」的实体的零位移包也会被取消（见 {@code MovePacketFields} 对 onGround
@@ -119,6 +121,12 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
    * 撞号：白名单实体（盔甲架、展示实体等）在 A 世界登记后，B 世界同号的普通实体会被误判成白名单而放行
    * （少省带宽），反之 B 世界的白名单实体会被误判成普通实体、其零位移包被取消（客户端位置不同步）。
    * 两级索引让不同世界的 id 互不干扰；每级都是无锁并发容器，热路径只是两次哈希查找、零分配。
+   *
+   * <p><b>为什么外层条目必须随世界卸载清理</b>：实体事件与兜底重建都只触碰<b>当前已加载</b>的世界
+   * （{@code Bukkit.getWorlds()}），世界一旦卸载，它对应的外层条目就再没有任何读者与写者——若不在卸载时
+   * 摘除，它会连同内层表永久驻留在堆上。动态创建/卸载世界的服务器（模板世界、小游戏房间、副本）每卸载
+   * 一次就沉淀一份，内存随「历史世界总数」无界增长；摘除后外层大小恒等于当前已加载世界数。
+   * 清理本身只是一次 {@link ConcurrentHashMap#remove(Object)}，与封包线程的读取天然并发安全。
    */
   private final Map<String, Map<Integer, String>> entityTypeIndex = new ConcurrentHashMap<>();
   private ScheduledTask indexTask;
@@ -182,7 +190,8 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
         return;
       }
       {
-        // 增量事件（实体加入/离开世界）由本类作为 Listener 接收；事件在实体所属线程触发，只更新并发索引
+        // 增量事件（实体加入/离开世界）与「世界卸载清表」由本类作为 Listener 一并接收；前者在实体所属线程、
+        // 后者在卸载线程触发，两者都只更新并发索引，不触碰 Bukkit 世界对象。
         plugin.getServer().getPluginManager().registerEvents(this, plugin);
         // 启动时先做一次「不限额」的全量建索引：让「插件启用前就已存在」的实体立即命中白名单
         // （一次性启动开销可接受；运行期兜底才走区块分片，避免周期尖峰）
@@ -227,19 +236,30 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
    *
    * <p>事件在实体所属线程触发（Paper 主线程 / Folia 区域线程），此处只读实体自身的 id 与类型，
    * 不触碰其它实体或世界，因此线程安全；登记进并发索引后封包线程立即可读。
+   *
+   * <p><b>为什么先判类型、再建表</b>：绝大多数实体都不在白名单里（普通怪、掉落物、箭矢、经验球…），
+   * 若像旧实现那样先 {@code typeIndexFor} 建表再判类型，那么「世界里只有非白名单实体」时也会凭空留下
+   * 一张空的内层表——外层 map 有界、内层却随「曾出现过实体的世界」增多，等于把泄漏换了个位置；
+   * 而空表对封包线程毫无用处（{@code isWhitelisted} 取不到键照样返回 false）。改为命中白名单才建表，
+   * 内层表只在「真的有白名单实体」的世界里存在，且能随 {@link WorldUnloadEvent} 一次性摘干净。
+   * 非白名单分支只 {@code get} 已有表：没有表就意味着该世界从未登记过白名单实体，此时无需清残留
+   * （没有表就没有残留），直接跳过即可，热路径也少一次容器写。
    */
   @EventHandler
   public void onEntityAddToWorld(EntityAddToWorldEvent event) {
     try {
       Entity entity = event.getEntity();
-      // 事件在实体所属线程触发，此时读它自己的世界名是安全的（不跨区域）。
-      Map<Integer, String> perWorld = typeIndexFor(entity.getWorld().getName());
       String typeKey = typeKeyFor(entity.getType());
       if (typeKey != null) {
-        perWorld.put(entity.getEntityId(), typeKey);
-      } else {
-        // 非白名单实体：必须清掉可能残留的旧映射。实体 id 会被服务端复用，若上一个占用者在白名单里，
-        // 残留映射会让这个新实体被误判为白名单（零位移包不再取消）——方向安全但白费带宽。
+        // 白名单实体：命中才建表（事件在实体所属线程触发，读它自己的世界名安全，不跨区域）
+        typeIndexFor(entity.getWorld().getName()).put(entity.getEntityId(), typeKey);
+        return;
+      }
+      // 非白名单实体：必须清掉可能残留的旧映射。实体 id 会被服务端复用，若上一个占用者在白名单里，
+      // 残留映射会让这个新实体被误判为白名单（零位移包不再取消）——方向安全但白费带宽。
+      // 只取已有表：为 null 说明该世界从未登记过白名单实体，也就没有残留可清，不能顺手建表。
+      Map<Integer, String> perWorld = entityTypeIndex.get(entity.getWorld().getName());
+      if (perWorld != null) {
         perWorld.remove(entity.getEntityId());
       }
     } catch (Throwable throwable) {
@@ -257,6 +277,33 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
       if (perWorld != null) {
         perWorld.remove(entity.getEntityId());
       }
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /**
+   * 世界卸载：整表摘除外层条目，让索引大小恒等于当前已加载世界数。
+   *
+   * <p><b>为什么必须在卸载时清理</b>：实体事件与兜底重建只覆盖 {@code Bukkit.getWorlds()} 里仍加载的世界，
+   * 卸载后这份外层条目既不会再有写入、也不会再被读到，留着就是纯垃圾。动态世界服务器上「卸载」是常态
+   * （小游戏房间、副本、模板世界），不摘除即随历史世界数无界增长。
+   *
+   * <p><b>为什么在这里直接操作并发 map 是安全的</b>：{@link WorldUnloadEvent} 在卸载线程触发，可能不是主线程；
+   * 而本方法只做一次 {@link ConcurrentHashMap#remove(Object)}，不触碰 Bukkit 世界对象、不枚举实体，
+   * 与封包线程的 {@code get} 并发安全。世界卸载后不再有新实体加入，摘表期间也不存在「刚写进去就丢」的
+   * 语义问题；最坏情况是封包线程在摘除前读到旧表，而那批实体已随世界卸载，其包也不会再发往玩家。
+   *
+   * <p>注意只摘外层、不 {@code clear} 内层表：内层表可能正被实体离开世界的事件写入，直接清空会与
+   * 那些线程竞争；丢掉引用后整张内层表随之不可达，交给 GC 回收更简单也更安全。
+   * 同理也不在这里动 {@code rebuildChunkCursors}——它是普通 {@link HashMap}，只允许兜底重建所在的主线程
+   * 读写（见其字段注释），跨线程摘除会与 {@code put}/{@code clear} 竞争；且它每完成一轮覆盖就整体
+   * {@code clear()}，本身不随卸载增长，无需在此处理。
+   */
+  @EventHandler
+  public void onWorldUnload(WorldUnloadEvent event) {
+    try {
+      entityTypeIndex.remove(event.getWorld().getName());
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
@@ -355,7 +402,12 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     return typeKey != null && whitelist.contains(typeKey);
   }
 
-  /** 取（必要时懒建）某世界的实体类型索引；只由实体所属线程/主线程写入，封包线程只读。 */
+  /**
+   * 取（必要时懒建）某世界的实体类型索引；只由实体所属线程/主线程写入，封包线程只读。
+   *
+   * <p>调用方必须先确认实体类型命中白名单再调用：这里会无条件建表，用在不命中的分支上就会留下
+   * 「没有任何条目」的空内层表，让外层有界、内层无界的泄漏重新出现（见 {@code onEntityAddToWorld}）。
+   */
   private Map<Integer, String> typeIndexFor(String worldName) {
     return entityTypeIndex.computeIfAbsent(worldName, ignored -> new ConcurrentHashMap<>());
   }

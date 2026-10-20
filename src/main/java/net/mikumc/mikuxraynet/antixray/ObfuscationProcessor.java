@@ -391,6 +391,15 @@ public final class ObfuscationProcessor {
    * 进而把可见实体隐藏（安全方向错误）。世界名由工作线程现成持有（{@code RewriteTask#worldName}）。
    */
   private final OcclusionStores occlusionStores;
+
+  /**
+   * 上一次成功恢复的遮挡负载（<b>按引用</b>判等，用于幂等短路）。
+   *
+   * <p>同一份负载会被多个玩家反复命中：每次都 decode 整列 + 持写锁逐段回灌是纯重复劳动。
+   * 引用相同即代表「同一个缓存条目」，内容必然一致，可直接跳过。
+   * volatile 只为让跨线程读到「最近一次」而不必精确同步——它只是性能提示，判错最多多恢复一次。
+   */
+  private volatile byte[] lastRestoredOcclusion;
   /**
    * <b>实体遮挡口径</b>的判定表：只供 {@link #captureOcclusion} 建位图使用。
    *
@@ -749,16 +758,16 @@ public final class ObfuscationProcessor {
       // 会有可观测的变慢（实测「24 个 section 全含目标」的形态从 0.34ms 涨到 0.76ms）。
       boolean[] sectionCandidates = selectCandidateSections(chunk, profile);
 
-      // enclosed 模式的滚动快照：保留「上一段」的改写前状态（y-1 跨段判定要用，见循环内说明）。
+      // enclosed 模式的滚动改写日志：保留「上一段」的 undo log（y-1 跨段判定要用，见循环内说明）。
       // mode=all 时恒为 null，零开销。
-      int[] previousOriginalStates = null;
+      UndoLog previousUndoLog = null;
 
       for (int sectionIndex = 0; sectionIndex < chunk.getSectionCount(); sectionIndex++) {
         if (!sectionCandidates[sectionIndex]) {
           // 该段不会被改写 ⇒ 它的实时状态就是原始状态，下一段的 y-1 直接读实时值即可。
-          // 必须显式清空：否则 previousOriginalStates 会停留在「更早的某个候选段」，
+          // 必须显式清空：否则 previousUndoLog 会停留在「更早的某个候选段」，
           // 下一段做 y-1 判定时就会拿错段的快照去查，得到完全错误的遮挡结论。
-          previousOriginalStates = null;
+          previousUndoLog = null;
           continue;
         }
         ChunkSection section = chunk.getSection(sectionIndex);
@@ -774,9 +783,14 @@ public final class ObfuscationProcessor {
         // 注意快照必须<b>滚动保留前一段</b>：6 面判定里的 y-1 会落到「上一段」，而循环按 sectionIndex
         // 升序推进——上一段此刻已经改写完了。只快照当前段的话，y-1 仍会读到伪装值（漏伪装原样保留）。
         // y+1 落到「下一段」，尚未开始改写，读实时状态即等于原始状态，无需快照。
-        int[] previousOriginal = previousOriginalStates;
-        int[] originalStates = profile.obfuscateAll ? null : snapshotStates(section);
-        previousOriginalStates = originalStates;
+        UndoLog previousUndoLogSnapshot = previousUndoLog;
+        // 用「改写日志（undo log）」而不是整段 4096 格快照：只记录本趟真正被替换的格子（下标 → 原状态）。
+        // 快照的代价是每候选段 16 KB、单区块峰值可达 384 KB，且把「读状态」开销翻倍；
+        // 而实际被替换的格子通常只有几十~几百个，undo log 的开销与替换数成正比。
+        // 下标按升序写入，查询用二分；y-1 落到「本段」或「上一段」时先查日志，未命中说明该格没被改写，
+        // 直接读实时状态即可（等价于原始状态）。
+        UndoLog undoLog = profile.obfuscateAll ? null : new UndoLog();
+        previousUndoLog = undoLog;
 
         int baseY = sectionIndex << 4;
         int layerY = Integer.MIN_VALUE;
@@ -804,8 +818,8 @@ public final class ObfuscationProcessor {
           }
 
           // mode=all：所有目标矿一律伪装（不看 6 面遮挡）；mode=enclosed：只伪装 6 面全遮挡的掩埋矿。
-          if (originalStates != null
-              && !isFullyOccluded(chunk, sectionIndex, originalStates, previousOriginal, baseY, index,
+          if (undoLog != null
+              && !isFullyOccluded(chunk, sectionIndex, undoLog, previousUndoLogSnapshot, baseY, index,
                   neighbors)) {
             continue;
           }
@@ -865,6 +879,10 @@ public final class ObfuscationProcessor {
             }
           }
 
+          if (undoLog != null) {
+            // 记下「被替换前的原状态」，供 6 面判定回查（见 isOccluding）。
+            undoLog.record(index, section.getBlockState(index));
+          }
           section.setBlockState(index, replacement);
           sectionChanged = true;
           changed = true;
@@ -984,12 +1002,21 @@ public final class ObfuscationProcessor {
     if (stores == null || occlusion == null) {
       return;
     }
+    // 幂等短路：同一份负载被多个玩家命中时，此前每次都重新 decode 整列（约 10 KB 短命数组）并持
+    // OcclusionStore.writeMutex 逐段回灌——完全相同的写入重复 N 次。
+    // 判据用「数组引用相同」而不是「世界+坐标」：同一坐标的负载会随区块改写而更新，
+    // 而引用相同 ⇒ 来自同一个 CachedChunk 实例 ⇒ 内容必然相同（缓存不会复制该数组）。
+    // 只在命中同一引用时跳过；一旦换成新负载（新对象）就照常恢复。
+    if (occlusion == lastRestoredOcclusion) {
+      return;
+    }
     try {
       SectionOcclusion[] column = OcclusionPayload.decode(occlusion);
       if (column == null) {
         return;
       }
       stores.of(worldName).restoreColumn(chunkX, minSectionY, chunkZ, column);
+      lastRestoredOcclusion = occlusion;
     } catch (Throwable ignored) {
       // fail-open：恢复失败只意味着少一份遮挡数据
     }
@@ -1305,39 +1332,76 @@ public final class ObfuscationProcessor {
    * @param baseY 该 section 的起始 Y（区块内相对坐标）
    * @param index 该 section 内的元素序号（{@code y << 8 | z << 4 | x}）
    */
-  private boolean isFullyOccluded(Chunk chunk, int sectionIndex, int[] originalStates,
-      int[] previousOriginal, int baseY, int index, NeighborEdges neighbors) {
+  private boolean isFullyOccluded(Chunk chunk, int sectionIndex, UndoLog currentLog,
+      UndoLog previousLog, int baseY, int index, NeighborEdges neighbors) {
     int x = index & 15;
     int z = index >> 4 & 15;
     int y = baseY | (index >> 8 & 15);
 
-    boolean above = isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y + 1, x, z,
-        neighbors);
+    boolean above = isOccluding(chunk, sectionIndex, currentLog, previousLog, y + 1, x, z, neighbors);
     return above
-        && isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y - 1, x, z, neighbors)
-        && isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y, x + 1, z, neighbors)
-        && isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y, x - 1, z, neighbors)
-        && isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y, x, z + 1, neighbors)
-        && isOccluding(chunk, sectionIndex, originalStates, previousOriginal, y, x, z - 1, neighbors);
+        && isOccluding(chunk, sectionIndex, currentLog, previousLog, y - 1, x, z, neighbors)
+        && isOccluding(chunk, sectionIndex, currentLog, previousLog, y, x + 1, z, neighbors)
+        && isOccluding(chunk, sectionIndex, currentLog, previousLog, y, x - 1, z, neighbors)
+        && isOccluding(chunk, sectionIndex, currentLog, previousLog, y, x, z + 1, neighbors)
+        && isOccluding(chunk, sectionIndex, currentLog, previousLog, y, x, z - 1, neighbors);
   }
 
   /**
-   * 快照一个 section 的原始方块状态（仅 enclosed 模式使用）。
+   * 一个 section 的「改写日志」：只记录本趟被替换的格子（下标 → 改写前的方块状态）。
    *
-   * <p>逐格 {@code getBlockState} 拷进 {@code int[4096]}：既避免 6 面判定读到本趟已改写的邻格
-   * （见 {@code rewrite} 里的说明），也把「读状态」的开销从「每格 6 次查表」压成「一次顺序拷贝」。
+   * <p><b>为什么不是整段快照</b>：enclosed 模式的 6 面判定需要「改写前的状态」，而整段快照要拷 4096 格
+   * （每候选段 16 KB、单区块峰值可达 384 KB），且把每格的读状态开销翻倍。实际被替换的格子通常只有
+   * 几十到几百个，因此改为只记被改写的那几格：内存与替换数成正比，查询一次二分。
+   *
+   * <p>下标按升序写入（改写循环本身就是 index 升序），因此可用二分查找；未命中即表示该格未被改写，
+   * 调用方直接读实时状态即可（等价于原始状态）。
+   *
+   * <p>线程封闭：只在单个区块的改写流程内使用，不跨线程。
    */
-  private static int[] snapshotStates(ChunkSection section) {
-    int[] states = new int[SECTION_VOLUME];
-    for (int i = 0; i < SECTION_VOLUME; i++) {
-      states[i] = section.getBlockState(i);
+  private static final class UndoLog {
+
+    private int[] indices = new int[16];
+    private int[] states = new int[16];
+    private int size;
+
+    /** 记录「下标 {@code index} 处改写前的状态」；同一格只记第一次（后续改写是连锁，不影响判定）。 */
+    void record(int index, int originalState) {
+      if (size > 0 && indices[size - 1] == index) {
+        return; // 同格重复写：保留最早的原始状态
+      }
+      if (size == indices.length) {
+        int grown = size << 1;
+        indices = java.util.Arrays.copyOf(indices, grown);
+        states = java.util.Arrays.copyOf(states, grown);
+      }
+      indices[size] = index;
+      states[size] = originalState;
+      size++;
     }
-    return states;
+
+    /** 返回该下标改写前的状态；未被记录（未改写）返回 {@code -1}。 */
+    int originalOf(int index) {
+      int low = 0;
+      int high = size - 1;
+      while (low <= high) {
+        int mid = (low + high) >>> 1;
+        int value = indices[mid];
+        if (value < index) {
+          low = mid + 1;
+        } else if (value > index) {
+          high = mid - 1;
+        } else {
+          return states[mid];
+        }
+      }
+      return -1;
+    }
   }
 
   /** 区块内相对坐标处的方块是否遮挡；越出世界上下界视为未遮挡，越出本区块改查邻块贴边快照。 */
-  private boolean isOccluding(Chunk chunk, int currentSectionIndex, int[] currentOriginal,
-      int[] previousOriginal, int y, int x, int z, NeighborEdges neighbors) {
+  private boolean isOccluding(Chunk chunk, int currentSectionIndex, UndoLog currentLog,
+      UndoLog previousLog, int y, int x, int z, NeighborEdges neighbors) {
     if (y < 0) {
       return false;
     }
@@ -1349,16 +1413,20 @@ public final class ObfuscationProcessor {
 
     if (x >= 0 && x <= 15 && z >= 0 && z <= 15) {
       int localIndex = (y & 15) << 8 | z << 4 | x;
-      // 本段与「上一段」必须读改写前的快照：
+      // 本段与「上一段」必须查「改写日志」：
       //  · 本段：y-1 / x-1 / z-1 三面可能已被本趟替换成伪装方块；
       //  · 上一段：y-1 跨段时落到那里，而循环按 sectionIndex 升序推进 —— 它已经改写完了。
       // 下一段（y+1 跨段）尚未开始改写，读实时状态即等于原始状态。
-      if (currentOriginal != null) {
-        if (sectionIndex == currentSectionIndex) {
-          return occlusionTable.test(currentOriginal[localIndex]);
+      // 日志里没有该格 ⇒ 该格未被改写 ⇒ 实时状态就是原始状态（下面直接读）。
+      if (sectionIndex == currentSectionIndex && currentLog != null) {
+        int original = currentLog.originalOf(localIndex);
+        if (original >= 0) {
+          return occlusionTable.test(original);
         }
-        if (sectionIndex == currentSectionIndex - 1 && previousOriginal != null) {
-          return occlusionTable.test(previousOriginal[localIndex]);
+      } else if (sectionIndex == currentSectionIndex - 1 && previousLog != null) {
+        int original = previousLog.originalOf(localIndex);
+        if (original >= 0) {
+          return occlusionTable.test(original);
         }
       }
       ChunkSection section = chunk.getSection(sectionIndex);
