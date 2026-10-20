@@ -106,6 +106,14 @@ final class ChunkKey {
       return LOCAL.get();
     }
 
+    /**
+     * 释放当前线程的复用探针（插件停用 / 热重载时由 {@link ProximityRevealer#clearThreadLocals()} 汇入）：
+     * ThreadLocal 条目随线程存活并钉住旧类加载器，理由同 {@code BitmapVisibility#clearThreadLocals}。
+     */
+    static void clearThreadLocals() {
+      LOCAL.remove();
+    }
+
     /** 指向另一个区块；返回自身以便链式使用。 */
     Probe set(String worldName, int chunkX, int chunkZ) {
       this.worldName = worldName;

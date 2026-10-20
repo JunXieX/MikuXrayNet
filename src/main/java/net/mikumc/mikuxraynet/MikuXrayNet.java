@@ -7,6 +7,7 @@ import net.mikumc.mikuxraynet.bandwidth.ThrottlePipeline;
 import net.mikumc.mikuxraynet.bandwidth.ThrottleStats;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.MikuConfig;
+import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.util.Diagnostics;
@@ -162,6 +163,15 @@ public final class MikuXrayNet extends JavaPlugin {
         } catch (Throwable throwable) {
           getLogger().log(Level.WARNING, "停用期停止反矿透模块失败（已置空字段）", throwable);
         }
+      }
+      // 世界黑名单是**进程级静态实例**（{@code WorldBlacklistConfig#publish} 的一次 volatile 写），
+      // 停用时必须复位：否则插件停了、名单还留着，同一 JVM 里下一次启用（/reload confirm、其它插件
+      // 动态启停本插件）在 onLoad 之前读到的仍是上一份名单；其它读者也会拿到已失效的豁免结论。
+      // publish(null) = 空名单（isBlacklistedNow 恒 false，fail-open），与「未加载」的语义一致。
+      try {
+        WorldBlacklistConfig.publish(null);
+      } catch (Throwable throwable) {
+        getLogger().log(Level.WARNING, "停用期复位世界黑名单失败（忽略）", throwable);
       }
     });
     getLogger().fine("MikuXrayNet 已停用");

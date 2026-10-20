@@ -94,14 +94,57 @@ class OcclusionEngineTest {
     OcclusionEngine engine = engine(stores, 1, 16);
     try {
       engine.beginCycle(Long.MAX_VALUE);
-      // 截止时刻已是过去 → 必须在开工前被丢弃
-      engine.submit(new OcclusionEngine.Request(PLAYER, 1, WORLD, System.nanoTime() - 1_000_000L,
-          2.5, 2.5, 2.5, new double[] {8.5, 2.5, 2.5}, sink));
-      // 再提交一条正常的，确保工作线程已跑起来（顺序保证：先处理过期那条）
+      // 截止时刻已是过去 → 入队前即被拒收（见 submit 的说明），绝不会有回投
+      assertFalse(engine.submit(new OcclusionEngine.Request(PLAYER, 1, WORLD,
+          System.nanoTime() - 1_000_000L, 2.5, 2.5, 2.5, new double[] {8.5, 2.5, 2.5}, sink)),
+          "过期任务必须在入队前被拒收");
+      assertEquals(0, engine.queueDepth(), "过期任务不得占用队列");
+      // 再提交一条正常的：sink 只应收到这一条的回投
       engine.submit(request(2.5, 2.5, 2.5, new double[] {8.5, 2.5, 2.5}, sink));
       assertTrue(sink.await());
+      assertEquals(1, sink.results.size(), "过期任务不得回投");
       assertEquals(1L, engine.stats().timeoutDiscarded.sum(), "过期任务必须被丢弃并计数");
       assertEquals(1L, engine.stats().computed.sum(), "丢弃的任务不算完成");
+    } finally {
+      engine.close();
+    }
+  }
+
+  /**
+   * 过期任务在<b>入队前</b>就被拒收：不进队列、不占容量、不通过 sink 闭包钉住 Player/Entity 引用。
+   *
+   * <p>为什么单独钉住：过期任务即便入队也永远不会被执行（工作线程出队后先比对 deadline 再算射线），
+   * 但在「没有任何玩家开启周期」时引擎可能长时间不消费队列（例如全服只剩世界黑名单里的玩家），
+   * 这些任务会一直留在队列里——既白占 {@code queueCapacity}（可能把真正有效的任务挤成「队列满拒收」），
+   * 又通过 {@link OcclusionEngine.Request#sink()} 闭包钉住 Bukkit 的 Player / Entity。
+   *
+   * <p>用例全离线、确定性：直接构造「已经过去的 deadline」（{@link System#nanoTime()} 单调递增，
+   * {@code now - 1s} 必然已过期），不 sleep、不依赖时钟注入。
+   */
+  @Test
+  void expiredRequestIsRejectedBeforeEnqueue() {
+    OcclusionStores stores = new OcclusionStores();
+    // 队列容量压到 1：顺带验证「过期任务不会占掉那唯一槽位」
+    OcclusionEngine engine = engine(stores, 1, 1);
+    try {
+      RecordingSink expiredSink = new RecordingSink(1);
+      OcclusionEngine.Request expired = new OcclusionEngine.Request(PLAYER, 7, WORLD,
+          System.nanoTime() - 1_000_000_000L, 2.5, 2.5, 2.5, new double[] {8.5, 2.5, 2.5},
+          expiredSink);
+
+      assertFalse(engine.submit(expired), "已过期任务必须在入队前被拒收（返回 false）");
+      assertEquals(1L, engine.stats().timeoutDiscarded.sum(), "过期拒收仍计入 timeoutDiscarded");
+      assertEquals(0L, engine.stats().submitted.sum(),
+          "未入队就不计入 submitted（与「队列满拒收」同口径）");
+      assertEquals(0L, engine.stats().rejectedQueueFull.sum(), "过期不是队列满，不得计入该项");
+      assertEquals(0, engine.queueDepth(), "过期任务不得进入队列");
+
+      // 过期任务没有占用那唯一的队列槽位：随后一条有效任务必须仍能被接收，且只计它一条 submitted
+      RecordingSink validSink = new RecordingSink(0);
+      assertTrue(engine.submit(request(2.5, 2.5, 2.5, new double[] {8.5, 2.5, 2.5}, validSink)),
+          "队列容量不得被过期任务占掉");
+      assertEquals(1, engine.queueDepth(), "有效任务必须入队（未开周期时不会有工作线程消费它）");
+      assertEquals(1L, engine.stats().submitted.sum(), "只有真正入队的任务计入 submitted");
     } finally {
       engine.close();
     }

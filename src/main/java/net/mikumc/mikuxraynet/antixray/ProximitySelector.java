@@ -463,6 +463,16 @@ public final class ProximitySelector {
   private static final ThreadLocal<Scratch> SCRATCH = ThreadLocal.withInitial(Scratch::new);
 
   /**
+   * 释放当前线程的候选点缓冲（插件停用 / 热重载时由 {@link ProximityRevealer#clearThreadLocals()} 汇入）。
+   *
+   * <p>ThreadLocal 条目随线程存活并钉住旧类加载器；本缓冲只有 23 个 double/int，单次泄漏量很小，但项目
+   * 对 ThreadLocal 复用实例有统一清理纪律（见 {@code ChunkScratch#clearThreadLocals}），这里保持一致。
+   */
+  static void clearThreadLocals() {
+    SCRATCH.remove();
+  }
+
+  /**
    * 六个面各自的四个角（相对方块最小角的 {@code dx,dy,dz}），<b>顺序与旧 {@code faceCorners} 完全一致</b>。
    *
    * <p>用静态表代替「每个候选点都 new double[4][3]」：表只建一次，热路径按偏移取值即可。行号由

@@ -179,6 +179,12 @@ public final class ProximityRevealer implements Listener {
    * 多个玩家的异步视锥任务并发持有（{@code workPool.execute} 把后续发包推迟到工作线程 / 玩家线程），
    * 普通 int 字段的读写无同步、会丢失更新，导致 {@code max-reveals-per-tick} 的「全服合计」语义被突破
    * （超发若干显形包）。改为原子计数后，扣减不再丢失，「近的先发」的排序与额度上限保持一致。
+   *
+   * <p><b>为什么没有 refund（归还额度）</b>：批量路径在 {@code sendOne} 里「先预扣、再累积」，确实可能有
+   * 「预扣但最终没发出」的坐标；但所有潜在归还点都在 {@link #flushBatch} 内、即发包循环结束之后，而
+   * {@code Budget} 是每周期新建、用后即弃的临时对象——归还与否不会改变本轮任何后续发包；事件路径的
+   * {@code TickQuota} 撤销用的是「实际发出计数」而非本对象，因此归还属无行为效果的死逻辑，已移除。
+   * 预扣保持「保守占用本周期额度」的原语义。
    */
   static final class Budget {
 
@@ -193,14 +199,9 @@ public final class ProximityRevealer implements Listener {
       return remaining.get();
     }
 
-    /** 扣减一个额度（跨线程安全的原子扣减，不会丢失更新）。 */
+    /** 扣减一个额度（跨线程安全的原子扣减，不会丢失更新；本周期内不归还，见类注释）。 */
     void decrement() {
       remaining.decrementAndGet();
-    }
-
-    /** 归还一个额度（批量显形里「预扣但最终未发出」的坐标；跨线程安全，与 {@link #decrement()} 对称）。 */
-    void refund() {
-      remaining.incrementAndGet();
     }
   }
 
@@ -879,7 +880,7 @@ public final class ProximityRevealer implements Listener {
         sendOne(player, world, position.x(), position.y(), position.z(), eye, budget, tally, batch,
             visibilityInPlan);
       }
-      flushBatch(player, batch, tally, budget);
+      flushBatch(player, batch, tally);
       logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
       return;
     }
@@ -895,7 +896,7 @@ public final class ProximityRevealer implements Listener {
       sendOne(player, world, plan.coordinates[i * 3], plan.coordinates[i * 3 + 1],
           plan.coordinates[i * 3 + 2], eye, budget, tally, batch, visibilityInPlan);
     }
-    flushBatch(player, batch, tally, budget);
+    flushBatch(player, batch, tally);
     logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
   }
 
@@ -1239,11 +1240,11 @@ public final class ProximityRevealer implements Listener {
    * 显形共用本方法）同 tick 仍可能对同一坐标各累积一次。因此发包容纳集合由 {@link #claimForSend} 在
    * 「判重 + 标记」的同一临界区内定夺：已显形者不进入本次发包集合（既不重复发包，也不计入「发送」）。
    *
-   * <p><b>额度归还</b>：批次坐标是在 {@link #sendOne} 里「先预扣额度再累积」的（用于封住单周期上限），
-   * 因此这里对<b>未能发出</b>的坐标（被复核跳过、或退化路径里 {@code sendBlockChange} 失败）逐个
-   * {@link Budget#refund()} 归还额度；成功发出的不归还，维持「每周期上限」语义。
+   * <p><b>额度不归还</b>：批次坐标是在 {@link #sendOne} 里「先预扣额度再累积」的（用于封住单周期上限）；
+   * 「被复核跳过 / 退化路径发包失败」的坐标<b>不</b>归还额度——归还点都在发包循环结束之后，而
+   * {@code Budget} 每周期新建、用后即弃，归还没有任何行为效果（见 {@link Budget} 类注释）。
    */
-  private void flushBatch(Player player, RevealBatch batch, PassTally tally, Budget budget) {
+  private void flushBatch(Player player, RevealBatch batch, PassTally tally) {
     if (batch == null || batch.size() == 0) {
       return;
     }
@@ -1254,11 +1255,8 @@ public final class ProximityRevealer implements Listener {
     int[] fresh = claimForSend(playerId, worldName, batch.positions);
     int skipped = batch.size() - fresh.length;
     if (skipped > 0) {
-      // 已显形者：不计入「发送」，归还 sendOne 里预扣的额度（额度只为真正发出的显形保留）
+      // 已显形者不计入「发送」；它们在 sendOne 里预扣的额度不予归还（归还没有行为效果，见 Budget 类注释）
       stats.revealsSkipped.add(skipped);
-      for (int i = 0; i < skipped; i++) {
-        budget.refund();
-      }
     }
     if (fresh.length == 0) {
       return;
@@ -1267,7 +1265,7 @@ public final class ProximityRevealer implements Listener {
     // 「已显形」标记由 claimForSend 写好；某段的合并包失败时 sendBatchOrRollback 只回滚该段的标记，
     // 该段随后逐坐标重新「复核 + 标记」。段与段互不影响：已发成功的段不重发，失败的段不漏发。
     for (List<Integer> section : groupBySection(batch, fresh).values()) {
-      sendSection(player, batch, playerId, worldName, section, tally, budget);
+      sendSection(player, batch, playerId, worldName, section, tally);
     }
   }
 
@@ -1300,9 +1298,12 @@ public final class ProximityRevealer implements Listener {
    * 只有一个坐标、或合并包构建失败时走逐坐标单发包。两条路径都保持「先标记、后发包、失败回滚」，
    * 且同一个坐标只会被其中一条路径发出：合并成功即返回，失败组的标记已整组回滚，随后由
    * {@link #markThenSend} 重新复核后单发——既不重复发包，也不漏发包。
+   *
+   * <p>本方法不接收 {@link Budget}：发包额度在 {@link #sendOne} 里「先预扣再入批」时就已扣完，
+   * 失败 / 跳过不归还（见 {@link Budget} 类注释），因此这里没有可用的额度语义。
    */
   private void sendSection(Player player, RevealBatch batch, UUID playerId, String worldName,
-      List<Integer> group, PassTally tally, Budget budget) {
+      List<Integer> group, PassTally tally) {
     // 「已显形」标记由 claimForSend 写好；本段合并包失败时 sendBatchOrRollback 只回滚本段的标记，
     // 届时逐坐标重新「复核 + 标记」（见下方 else 分支）。
     boolean revealedMarksWritten = true;
@@ -1370,8 +1371,7 @@ public final class ProximityRevealer implements Listener {
       }
       if (!sent) {
         stats.revealsSkipped.increment();
-        // 未发出：归还先前在 sendOne 里预扣的额度（本周期上限只应计入真正发出的显形）
-        budget.refund();
+        // 未发出：预扣的额度不予归还（归还没有行为效果，见 Budget 类注释）
         continue;
       }
       stats.revealsSent.increment();
@@ -1661,6 +1661,25 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
+   * 释放当前线程上「邻近显形侧」全部线程本地复用实例（插件停用 / 热重载时由
+   * {@code AntiXrayRuntime#stopForDisable} 调用）。
+   *
+   * <p>涉及：本类的 {@link ChunkKeyCache}、{@link ChunkKey.Probe}、{@link BitmapVisibility} 的判定器、
+   * {@link ProximitySelector} 的候选点缓冲、{@link BlockChangeRevealListener} 的去重 / 解析缓冲。
+   * ThreadLocal 条目挂在<b>线程</b>的 ThreadLocalMap 上，而主线程 / Folia 区域线程 / netty 事件循环
+   * 线程都比插件活得久：停用或热重载后旧实例会经这些条目钉住旧类加载器，直到线程下次访问
+   * ThreadLocalMap 才被惰性 expunge。这里只能清「调用线程」这一份（其它线程无法从这里枚举），
+   * 至少保证停用线程自己不再持有旧实例。
+   */
+  public static void clearThreadLocals() {
+    ChunkKeyCache.LOCAL.remove();
+    ChunkKey.Probe.clearThreadLocals();
+    BitmapVisibility.clearThreadLocals();
+    ProximitySelector.clearThreadLocals();
+    BlockChangeRevealListener.clearThreadLocals();
+  }
+
+  /**
    * 单个 section（一组变更坐标）的即时显形入口（由 {@link BlockChangeRevealListener} 在封包线程调用）。
    *
    * <p>语义与 {@link #onBlockChangeObserved} 完全一致（邻域内仍有伪装坐标才调度），但把同一 section 的
@@ -1788,7 +1807,7 @@ public final class ProximityRevealer implements Listener {
         // 事件路径不预先算计划（见 revealImmediately 注释）：false = sendOne 在当前线程用遮挡位图判定
         sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
       }
-      flushBatch(player, batch, tally, budget);
+      flushBatch(player, batch, tally);
       instantQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
     } catch (Throwable throwable) {
       logThrottled(throwable);
@@ -1879,7 +1898,7 @@ public final class ProximityRevealer implements Listener {
           sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
         }
       }
-      flushBatch(player, batch, tally, budget);
+      flushBatch(player, batch, tally);
       instantQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
     } catch (Throwable throwable) {
       logThrottled(throwable);

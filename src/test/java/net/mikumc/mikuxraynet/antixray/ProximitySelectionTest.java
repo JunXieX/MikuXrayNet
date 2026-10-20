@@ -43,7 +43,7 @@ class ProximitySelectionTest {
       ChunkKey key = ChunkKey.ofBlock(WORLD, position.x(), position.z());
       assertFalse(revealed.contains(PLAYER, key, position.x(), position.y(), position.z()),
           "选中前不得已是已显形状态：" + position);
-      revealed.mark(PLAYER, key, position.x(), position.y(), position.z());
+      revealed.markIfAbsent(PLAYER, key, position.x(), position.y(), position.z());
     }
     return selected;
   }
@@ -69,7 +69,7 @@ class ProximitySelectionTest {
       for (int i = 0; i < locals.length; i++) {
         locals[i] = entry.getValue().get(i);
       }
-      index.recordChunk(WORLD, entry.getKey().chunkX(), entry.getKey().chunkZ(), MIN_HEIGHT, locals);
+      index.recordChunkWithRemovals(WORLD, entry.getKey().chunkX(), entry.getKey().chunkZ(), MIN_HEIGHT, locals);
     }
   }
 

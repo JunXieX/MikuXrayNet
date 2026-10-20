@@ -492,16 +492,25 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
         // 就永远为假 —— rebuildWorldCursor 不推进，兜底只覆盖 Bukkit.getWorlds() 的第 0 个世界，
         // 其余世界（下界/末地）永远拿不到兜底，且「一轮完成」分支也永不执行（静默失效、无计数）。
         int take = Math.min(remaining, chunks.length - cursor);
+        // 内层表<b>按需创建</b>、且提到区块循环之外：旧实现把 typeIndexFor(...) 放在区块循环里，
+        // 于是「只要有已加载区块」的世界都会被无条件建一张内层表——即使该世界一个白名单实体都没有。
+        // 这既与本类声明的不变量（「非白名单分支绝不建表，否则留下空内层表」）矛盾，也白做每区块一次
+        // computeIfAbsent。这里先只查不建；本批真的扫到白名单实体时才建表，并在后续区块复用。
+        Map<Integer, String> perWorld = entityTypeIndex.get(world.getName());
         for (int i = 0; i < take; i++) {
           Chunk chunk = chunks[cursor + i];
-          Map<Integer, String> perWorld = typeIndexFor(world.getName());
           for (Entity entity : chunk.getEntities()) {
             int id = entity.getEntityId();
             String typeKey = typeKeyFor(entity.getType());
             if (typeKey != null) {
+              if (perWorld == null) {
+                // 该世界本批第一个白名单实体：此刻才建内层表（与 onEntityAddToWorld 的「命中才建表」一致）
+                perWorld = typeIndexFor(world.getName());
+              }
               perWorld.put(id, typeKey);
-            } else {
-              // 非白名单实体：清掉可能残留的陈旧映射（id 被复用时的正确性兜底）
+            } else if (perWorld != null) {
+              // 非白名单实体：清掉可能残留的陈旧映射（id 被复用时的正确性兜底）。
+              // 表不存在时无需清理（本来就一条条目都没有），因此只在已建表时执行。
               perWorld.remove(id);
             }
           }

@@ -52,15 +52,15 @@ class SectionBatchProcessingTest {
     // section A(y=64..79)：(1,64,1)、(2,64,1)；section B(y=80..95)：(1,80,1)；另加一个不被变更的 (3,70,3)
     int[] locals = {local(1, 64, 1), local(2, 64, 1), local(3, 70, 3), local(1, 80, 1)};
     ObfuscatedChunkIndex index = index();
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, locals);
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, locals);
     RevealedSet revealed = revealed();
     ProximityStats stats = new ProximityStats();
     ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
 
     // 该玩家此前已显形过 (1,64,1)、(1,80,1)（会被本次变更同步摘除）；(3,70,3) 不在变更里，必须保留
-    revealed.mark(PLAYER, key, 1, 64, 1);
-    revealed.mark(PLAYER, key, 1, 80, 1);
-    revealed.mark(PLAYER, key, 3, 70, 3);
+    revealed.markIfAbsent(PLAYER, key, 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, key, 1, 80, 1);
+    revealed.markIfAbsent(PLAYER, key, 3, 70, 3);
 
     // 变更坐标（跨 section A/B）；其中 (9,64,9)、(5,80,5) 不在伪装清单里（测试「索引未命中」路径），
     // (1,64,1) 重复出现一次（测试去重）
@@ -82,7 +82,7 @@ class SectionBatchProcessingTest {
 
     // 结果与「逐坐标 removePosition」等价
     ObfuscatedChunkIndex reference = index();
-    reference.recordChunk(WORLD, 0, 0, MIN_HEIGHT, locals);
+    reference.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, locals);
     reference.removePosition(WORLD, 1, 64, 1);
     reference.removePosition(WORLD, 2, 64, 1);
     reference.removePosition(WORLD, 1, 80, 1);
@@ -108,7 +108,7 @@ class SectionBatchProcessingTest {
     ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
 
     // 制造孤儿：索引里没有该坐标（区块条目都不存在），但已显形标记存在
-    revealed.mark(PLAYER, key, 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, key, 1, 64, 1);
     assertEquals(1, revealed.sizeFor(PLAYER, key));
 
     BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1}, 1, index, revealed,
@@ -147,7 +147,7 @@ class SectionBatchProcessingTest {
   void removePositionsMatchesRepeatedRemovePosition() {
     int[] locals = {local(1, 10, 1), local(2, 10, 1), local(3, 10, 1), local(1, 11, 1)};
     ObfuscatedChunkIndex index = index();
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, locals);
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, locals);
     ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
 
     // 含重复坐标：只应计一次命中
@@ -160,6 +160,45 @@ class SectionBatchProcessingTest {
     assertEquals(2, index.removePositions(WORLD, new int[] {3, 10, 1, 1, 11, 1}, 2));
     assertEquals(0, index.positionCount());
     assertNull(index.entry(key));
+  }
+
+  /**
+   * 解析缓冲改为线程本地复用后，{@code dispatch} 必须拿到<b>独立快照</b>：第一次派发的数组要留着，
+   * 再处理第二批坐标，第一批内容不得被第二次解析覆盖（生产实现会把该数组交给实体调度器、在玩家线程
+   * 延后执行——被覆盖就会把显形发到错误位置）。这里刻意不在桩里拷贝，直接依赖 dispatch 契约。
+   */
+  @Test
+  void dispatchHandsOutIndependentSnapshotsAcrossReusedScratch() {
+    List<int[]> dispatched = new ArrayList<>();
+    BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1, 2, 64, 1}, 2,
+        index(), revealed(), new ProximityStats(),
+        (coords, count) -> dispatched.add(coords));
+    BlockChangeRevealListener.processChanges(WORLD, new int[] {5, 70, 5}, 1,
+        index(), revealed(), new ProximityStats(),
+        (coords, count) -> dispatched.add(coords));
+
+    assertEquals(2, dispatched.size(), "两次调用各派发一次");
+    assertArrayEquals(new int[] {1, 64, 1, 2, 64, 1}, dispatched.get(0),
+        "第一批快照不得被后续解析覆盖（否则排队中的显形会发到错误位置）");
+    assertArrayEquals(new int[] {5, 70, 5}, dispatched.get(1), "第二批内容必须正确");
+  }
+
+  /** 停用清理入口可重复调用，且清理后复用缓冲会重新创建、功能照常。 */
+  @Test
+  void threadLocalCleanupIsIdempotentAndReusable() {
+    ProximityRevealer.clearThreadLocals();
+    ProximityRevealer.clearThreadLocals(); // 幂等：重复调用不抛异常、不留失效状态
+
+    // 清理后同一线程再次处理变更：SeenScratch / ParseScratch 会被重新创建，派发内容仍正确
+    int[] dispatched = new int[3];
+    int[] seen = {0};
+    BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1}, 1, index(), revealed(),
+        new ProximityStats(), (coords, count) -> {
+          System.arraycopy(coords, 0, dispatched, 0, count * 3);
+          seen[0] = count;
+        });
+    assertEquals(1, seen[0], "清理后仍能正常派发");
+    assertArrayEquals(new int[] {1, 64, 1}, dispatched, "清理后解析结果必须正确");
   }
 
   private static long pack(int x, int y, int z) {

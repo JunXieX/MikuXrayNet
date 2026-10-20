@@ -37,25 +37,37 @@ public final class BitmapOcclusion implements SectionOcclusion {
   }
 
   /**
-   * 以既有 long 数组构造（按下标取用，长度为 {@link #WORD_COUNT}；不足处补零，超出部分丢弃）。
+   * 由既有 long 数组<b>复制</b>构造（按下标取用，长度为 {@link #WORD_COUNT}；不足处补零，超出部分丢弃）。
    *
    * <p>构造后本对象持有的是<b>副本</b>，外部数组的后续改动不影响本实例。
+   *
+   * <p><b>为什么是静态工厂而不是构造器</b>：本类还需要一个「接管数组、不复制」的私有构造器
+   * （见 {@link #BitmapOcclusion(long[])}），两者签名都是 {@code (long[])}、无法共存；把复制版做成工厂
+   * 恰好让「接管」这个更危险的语义留在私有侧，外部调用方不可能误用不复制版本。
+   *
+   * <p>解码路径（{@code OcclusionPayload.decode}）必须用它：解码缓冲是逐段复用的，不复制会让相邻
+   * section 共享同一份数组。
    */
-  public BitmapOcclusion(long[] source) {
+  public static BitmapOcclusion copyOf(long[] source) {
     long[] copy = new long[WORD_COUNT];
     System.arraycopy(source, 0, copy, 0, Math.min(source.length, WORD_COUNT));
-    this.words = copy;
+    return new BitmapOcclusion(copy);
   }
 
-  private BitmapOcclusion(long[] source, boolean trusted) {
-    this.words = source;
+  /**
+   * 直接接管 {@code words}（<b>不复制</b>）：调用方必须保证该数组此后不再被外部持有或修改。
+   *
+   * <p>只在类内部使用（{@link #solid()} / {@link #fromStateLookup} 传入的都是刚分配、尚未外泄的数组）。
+   */
+  private BitmapOcclusion(long[] words) {
+    this.words = words;
   }
 
   /** 全遮挡位图（全 1）。一般不用它——全遮挡请直接用 {@link SolidOcclusion#INSTANCE}。 */
   public static BitmapOcclusion solid() {
     long[] filled = new long[WORD_COUNT];
     Arrays.fill(filled, -1L);
-    return new BitmapOcclusion(filled, true);
+    return new BitmapOcclusion(filled);
   }
 
   /**
@@ -110,7 +122,7 @@ public final class BitmapOcclusion implements SectionOcclusion {
     if (occludingCount == BLOCK_COUNT) {
       return SolidOcclusion.INSTANCE;
     }
-    return new BitmapOcclusion(words, true);
+    return new BitmapOcclusion(words);
   }
 
   @Override

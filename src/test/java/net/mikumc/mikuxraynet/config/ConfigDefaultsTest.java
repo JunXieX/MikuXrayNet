@@ -10,6 +10,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Objects;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -123,6 +124,27 @@ class ConfigDefaultsTest {
   /** 把「被抬升的键明细」拼成一行，便于用 contains 断言具体键名。 */
   private static String joinedFloors(AntiXrayConfig config) {
     return String.join("、", config.floorAdjustments());
+  }
+
+  /**
+   * {@code advanced.timeout-millis} 的有效下限 100ms 必须<b>留痕</b>（钳制行为本身不变）。
+   *
+   * <p>旧实现把下限藏在构造器的 {@code Math.max(100, ...)} 里：配置 50 实际按 100 生效，但明细为空、
+   * 控制台没有任何提示——管理员会以为自己写的 50ms 生效了。现在解析期按同一区间钳制并把「配置 50、
+   * 实际 100」记入 {@code floorAdjustments}，与其它下限项同口径。
+   */
+  @Test
+  void advancedTimeoutFloorIsReportedWithoutChangingClamp() {
+    AntiXrayConfig floored = AntiXrayConfig.from(yaml("advanced:\n  timeout-millis: 50\n"));
+    assertEquals(AntiXrayConfig.ADVANCED_TIMEOUT_MILLIS_MIN, floored.timeoutMillis(),
+        "有效值仍是 100ms（钳制行为不变）");
+    assertTrue(joinedFloors(floored).contains("advanced.timeout-millis=50"),
+        "必须把「配置 50、实际按 100 生效」记入明细：" + floored.floorAdjustments());
+
+    AntiXrayConfig kept = AntiXrayConfig.from(yaml("advanced:\n  timeout-millis: 2500\n"));
+    assertEquals(2500, kept.timeoutMillis(), "区间内的值原样生效");
+    assertTrue(kept.floorAdjustments().isEmpty(),
+        "区间内的值不得产生明细（否则每次开服都会刷一条误导性 WARN）：" + kept.floorAdjustments());
   }
 
   /**
@@ -1121,19 +1143,68 @@ class ConfigDefaultsTest {
   }
 
   /**
-   * 带宽配置指纹：跨进程稳定（不混入枚举 identity hash），且随影响行为的带宽项变化——
+   * 带宽配置指纹：<b>参与字段集合与顺序</b>稳定（结构契约），且随影响行为的带宽项变化——
    * 热重载据此判断「带宽侧配置是否变化」，只改 bandwidth.yml 时提示语才不会误导。
+   *
+   * <p><b>已修正的旧缺口</b>：原用例只做「同进程两次解析相等 + 改两项可变」，既没钉住「哪些字段参与、
+   * 以什么顺序参与」，也完全无法发现指纹里混入 {@code identityHashCode} 之类「同进程稳定、跨进程随机」
+   * 的来源（那正是跨进程稳定要防的事）。现在改为结构断言：用公开 record 访问器按文档顺序重算
+   * {@code Objects.hash}，并与 {@code configHash()} 逐位比对。任何「增删参与字段 / 调整顺序 / 换成
+   * 不稳定来源」都会在此判红。
+   *
+   * <p><b>仍存在的已知缺口（不在本批修）</b>：真正的「跨进程 = 同一值」只能靠固定字面量证明；该字面量
+   * 需由 CI 采集一次后钉入（本机禁止跑构建，无法采集，也绝不伪造数字）。上面的结构断言已覆盖「公式被
+   * 改坏」，但若某个子配置的 {@code hashCode} 实现本身在不同 JVM 上不同（例如依赖默认 Locale / 平台
+   * 字符集），结构断言会与生产同值、发现不了——这一层必须等 CI 字面量钉入后才能守住。
    */
   @Test
   void bandwidthConfigHashIsStableAndSensitive() {
     BandwidthConfig base = BandwidthConfig.from(yaml("enabled: true\n"));
+
+    // ⑤ 跨进程字面量（由 CI 采集一次后钉入）：同一份 bandwidth.yml 在任何 JVM / 区域设置下
+    //    都必须得到同一值。若参与哈希的字段换成「枚举 identity hash」或依赖默认 Locale 的字符串，
+    //    这一行会在别的机器/别的 JDK 上直接变红——这正是结构断言（②）发现不了的那一层。
+    assertEquals(403537882, base.configHash(),
+        "带宽配置指纹必须是跨进程稳定的字面量（本值由 CI 采集；若不同环境不同值，说明参与哈希的字段不稳定）");
+
+    // ① 同进程重复解析稳定（原有断言保留：先挡住「每次解析都变」这种最粗糙的回归）
     assertEquals(base.configHash(), BandwidthConfig.from(yaml("enabled: true\n")).configHash(),
         "同一份带宽配置重复解析必须得到同一指纹");
+
+    // ② 结构契约：参与指纹的字段集合与顺序 = 8 个 record 组件按文档顺序的 Objects.hash。
+    //    故意在测试里重抄一遍顺序（而不是从生产反推），这样生产侧任何增删/换序都会与这里不等。
+    assertEquals(Objects.hash(base.enabled(), base.entityPackets(), base.blockChanges(),
+            base.palette(), base.entityCulling(), base.afk(), base.latency(), base.diagnostics()),
+        base.configHash(),
+        "configHash 必须等价于「按文档顺序对 enabled + 7 个子配置求 Objects.hash」"
+            + "（参与字段集合/顺序即跨进程稳定的结构契约）");
+
+    // ③ 敏感性：影响行为的带宽项变化必须改变指纹
     assertNotEquals(base.configHash(),
         BandwidthConfig.from(yaml("afk:\n  seconds: 600\n")).configHash(),
         "影响行为的带宽项变化必须改变指纹");
     assertNotEquals(base.configHash(),
         BandwidthConfig.from(yaml("block-changes:\n  merge-radius: 3\n")).configHash(),
         "每个带宽子模块的取值都应参与指纹");
+
+    // ④ 逐个子配置「确实参与」：改一个该模块独有的键，指纹必须变（与结构断言互为冗余，
+    //    在有人把某模块从 Objects.hash 里删掉时给出更直观的失败信息）
+    assertNotEquals(base.configHash(), BandwidthConfig.from(yaml("enabled: false\n")).configHash(),
+        "总开关 enabled 必须参与指纹");
+    assertNotEquals(base.configHash(),
+        BandwidthConfig.from(yaml("entity-packets:\n  enabled: false\n")).configHash(),
+        "entity-packets 子配置必须参与指纹");
+    assertNotEquals(base.configHash(),
+        BandwidthConfig.from(yaml("palette:\n  enabled: false\n")).configHash(),
+        "palette 子配置必须参与指纹");
+    assertNotEquals(base.configHash(),
+        BandwidthConfig.from(yaml("entity-culling:\n  raycast: false\n")).configHash(),
+        "entity-culling 子配置必须参与指纹");
+    assertNotEquals(base.configHash(),
+        BandwidthConfig.from(yaml("latency:\n  enabled: false\n")).configHash(),
+        "latency 子配置必须参与指纹");
+    assertNotEquals(base.configHash(),
+        BandwidthConfig.from(yaml("diagnostics:\n  interval-seconds: 60\n")).configHash(),
+        "diagnostics 子配置必须参与指纹");
   }
 }

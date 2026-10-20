@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.antixray;
 
 import java.util.ArrayDeque;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -19,7 +20,8 @@ import java.util.function.ToLongFunction;
  * {@code maximumBytes} + {@code expireAfterAccess}。读取走无锁 {@link ConcurrentHashMap}（不再全局同步、
  * 不再每次访问改动链表），写入与淘汰在同步块内串行维护一条 second-chance 环形队列——因此多个工作线程
  * 可并发读取同一缓存，多条区块包的读路径不再被逐个串行化（旧实现是 {@code synchronized get} +
- * accessOrder {@code LinkedHashMap}，每次 get 都独占锁并改动链表、每次新建 {@code Key}）。淘汰语义仍为
+ * accessOrder {@code LinkedHashMap}，每次 get 都独占锁、改动链表并新建 {@code Key}；本实现的热路径改用
+ * 线程本地探针查询，见 {@link Key}）。淘汰语义仍为
  * 「优先淘汰最久未使用」：被访问过的条目获得一次「第二次机会」，未被再次访问即被淘汰。
  *
  * <p><b>为什么除了条目数还要有字节上限</b>：改写结果的单条体积由区块大小决定（改写后字节 +
@@ -39,8 +41,150 @@ import java.util.function.ToLongFunction;
  */
 public final class RewriteCache<V> {
 
-  /** 缓存键：只含基本类型与不可变字符串。 */
-  public record Key(String worldName, int x, int z, int configHash) {
+  /**
+   * 缓存键：只含基本类型与不可变字符串。
+   *
+   * <p><b>为什么是手写 final 类而不是 {@code record}</b>：{@link #get} / {@link #put} 的热路径改用
+   * 线程本地可变探针（{@link Probe}）作为查询键，以消除每条区块包 1~2 次短命 {@code Key} 分配；而
+   * {@code ConcurrentHashMap} 的<b>树化桶</b>会用「存储键的 equals」比较查询键
+   * （{@code TreeNode.find} → {@code Key.equals(Probe)}）。{@code record} 自动生成的 equals 形如
+   * {@code if (!(o instanceof Key)) return false;}，届时探针永远查不到已存在的条目——且只在桶内条目数
+   * 超过树化阈值时才复现，属极难排查的隐性故障。手写 equals 双向识别 {@link Probe} 后该路径才安全
+   * （与 {@code ChunkKey}/{@code ChunkKey.Probe} 同一范式）。
+   *
+   * <p>字段全部 final、无 setter，因此仍满足「不可变、可安全作为 Map 键」的语义。
+   */
+  public static final class Key {
+
+    private final String worldName;
+    private final int x;
+    private final int z;
+    private final int configHash;
+
+    Key(String worldName, int x, int z, int configHash) {
+      this.worldName = worldName;
+      this.x = x;
+      this.z = z;
+      this.configHash = configHash;
+    }
+
+    public String worldName() {
+      return worldName;
+    }
+
+    public int x() {
+      return x;
+    }
+
+    public int z() {
+      return z;
+    }
+
+    public int configHash() {
+      return configHash;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      if (this == other) {
+        return true;
+      }
+      // 必须同时识别 Probe：CHM 树化后会用「存储键的 equals」比较查询键（见类注释）
+      if (other instanceof Probe probe) {
+        return this.x == probe.x && this.z == probe.z && this.configHash == probe.configHash
+            && Objects.equals(this.worldName, probe.worldName);
+      }
+      if (other instanceof Key key) {
+        return this.x == key.x && this.z == key.z && this.configHash == key.configHash
+            && Objects.equals(this.worldName, key.worldName);
+      }
+      return false;
+    }
+
+    @Override
+    public int hashCode() {
+      // 与 Probe.hashCode 必须逐字段一致，否则 CHM 查不到（见 Probe 的说明）
+      int result = Objects.hashCode(worldName);
+      result = 31 * result + x;
+      result = 31 * result + z;
+      result = 31 * result + configHash;
+      return result;
+    }
+
+    @Override
+    public String toString() {
+      return "Key[" + worldName + ", " + x + ", " + z + ", configHash=" + configHash + "]";
+    }
+
+    /**
+     * <b>可复用的查询探针</b>：与 {@link Key} 语义完全一致（逐字段 equals/hashCode），但字段可变。
+     *
+     * <p><b>为什么需要它</b>：{@link #get} 每条区块包都要查一次缓存，{@link #put} 的「是否已存在」也要
+     * 查一次；每次 {@code new Key(...)} 都是一个短命对象。探针按线程复用后这两处查询零分配——只有真正
+     * 新建条目时才需要 new 一个不可变的 {@link Key} 存进 Map。
+     *
+     * <p><b>为什么安全</b>：探针只作为 {@code ConcurrentHashMap} 的<b>查询键</b>传入，绝不会被存进任何
+     * Map（存进去的永远是真正不可变的 {@link Key}），因此「键内容被改」不可能污染任何持久结构。
+     * hashCode 与相等判定与 {@link Key} 逐字段一致，且两边 equals 都互相识别（见 {@link Key} 的类注释）。
+     * 线程封闭（{@link ThreadLocal} 持有），无需同步。
+     */
+    static final class Probe {
+
+      private static final ThreadLocal<Probe> LOCAL = ThreadLocal.withInitial(Probe::new);
+
+      private String worldName;
+      private int x;
+      private int z;
+      private int configHash;
+
+      private Probe() {
+      }
+
+      /** 取当前线程的复用探针（线程封闭，无需同步）。 */
+      static Probe local() {
+        return LOCAL.get();
+      }
+
+      /** 指向另一个缓存键；返回自身以便链式使用。 */
+      Probe set(String worldName, int x, int z, int configHash) {
+        this.worldName = worldName;
+        this.x = x;
+        this.z = z;
+        this.configHash = configHash;
+        return this;
+      }
+
+      @Override
+      public boolean equals(Object other) {
+        if (this == other) {
+          return true;
+        }
+        if (other instanceof Key key) {
+          return this.x == key.x && this.z == key.z && this.configHash == key.configHash
+              && Objects.equals(this.worldName, key.worldName);
+        }
+        if (other instanceof Probe probe) {
+          return this.x == probe.x && this.z == probe.z && this.configHash == probe.configHash
+              && Objects.equals(this.worldName, probe.worldName);
+        }
+        return false;
+      }
+
+      @Override
+      public int hashCode() {
+        // 与 Key.hashCode 必须逐字段一致，否则 CHM 查不到（见类注释）
+        int result = Objects.hashCode(worldName);
+        result = 31 * result + x;
+        result = 31 * result + z;
+        result = 31 * result + configHash;
+        return result;
+      }
+
+      @Override
+      public String toString() {
+        return "Key[" + worldName + ", " + x + ", " + z + ", configHash=" + configHash + "]";
+      }
+    }
   }
 
   /**
@@ -138,7 +282,8 @@ public final class RewriteCache<V> {
 
   /** 读取；未命中或已过期返回 {@code null}（过期条目会被立即移除）。 */
   public V get(String worldName, int x, int z, int configHash) {
-    CacheEntry<V> entry = entries.get(new Key(worldName, x, z, configHash));
+    // 热路径：用线程本地探针查询，不新建 Key（探针只作查询键，绝不会被存进 Map）
+    CacheEntry<V> entry = entries.get(Key.Probe.local().set(worldName, x, z, configHash));
     long now = clock.getAsLong();
 
     if (entry == null) {
@@ -181,7 +326,6 @@ public final class RewriteCache<V> {
 
   /** 写入（覆盖同键旧值）。同键覆盖与 {@code entries} 插入不加全局锁，仅新建条目时才同步维护 CLOCK 队列。 */
   public void put(String worldName, int x, int z, int configHash, V value) {
-    Key key = new Key(worldName, x, z, configHash);
     long now = clock.getAsLong();
     long sizeBytes = weigher == null ? 0L : Math.max(0L, weigher.applyAsLong(value));
     if (weigher != null && sizeBytes > maximumBytes) {
@@ -189,12 +333,15 @@ public final class RewriteCache<V> {
       // 表现为「缓存命中率莫名其妙归零」；调用方按未命中处理即可（只多算一次改写）。
       return;
     }
-    CacheEntry<V> existing = entries.get(key);
+    // 同键覆盖（热路径）：用线程本地探针查询，不新建 Key
+    CacheEntry<V> existing = entries.get(Key.Probe.local().set(worldName, x, z, configHash));
     if (existing != null) {
       overwrite(existing, value, sizeBytes, now);
       return;
     }
 
+    // 只有真正新建条目才需要不可变的 Key（它会被 Map 长期持有）
+    Key key = new Key(worldName, x, z, configHash);
     CacheEntry<V> entry = new CacheEntry<>(key, value, sizeBytes, now);
     CacheEntry<V> previous = entries.putIfAbsent(key, entry);
     if (previous != null) {

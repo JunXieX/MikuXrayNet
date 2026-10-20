@@ -169,8 +169,10 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     int baseY = section.getY() << 4;
     int baseZ = section.getZ() << 4;
 
-    // 坐标去重由 processChanges/SectionBuffer 统一完成（同一 section 内坐标编码唯一）
-    int[] coordinates = new int[positions.length * 3];
+    // 坐标去重由 processChanges/SectionBuffer 统一完成（同一 section 内坐标编码唯一）。
+    // 绝对坐标缓冲从线程本地 scratch 取（netty 线程固定、长生存）：满载包每包最多约 48KB，复用可避免
+    // 短命大数组；只写满前 positions.length*3 个单元，读取以该长度为准，不残留上一次数据。
+    int[] coordinates = ParseScratch.current().coordinates(positions.length * 3);
     for (int i = 0; i < positions.length; i++) {
       short packed = positions[i];
       coordinates[i * 3] = baseX + (packed >> 8 & 15);
@@ -196,7 +198,12 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   @FunctionalInterface
   interface SectionDispatch {
 
-    /** 一个 section 的全部变更坐标（已去重，扁平三元组，前 {@code count} 个有效）。 */
+    /**
+     * 一个 section 的全部变更坐标（已去重，扁平三元组，前 {@code count} 个有效）。
+     *
+     * <p>数组是<b>本次调用的独立快照</b>，实现方可以安全持有或投递到其它线程（见 {@code processSection}
+     * 里的拷贝说明）。
+     */
     void dispatch(int[] coordinates, int count);
   }
 
@@ -215,17 +222,25 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   /** 单个 section 收集到的变更坐标（可增长的扁平三元组缓冲，并按 section 内编码去重）。 */
   private static final class SectionBuffer {
 
-    private final long key;
+    private long key;
     /** 本 section 专属的去重代次（见 {@link SeenScratch}）；同一线程内每个 section 都不同。 */
-    private final int generation;
+    private int generation;
     private final SeenScratch scratch;
     private int[] data = new int[48];
     private int count;
 
-    private SectionBuffer(long key, int generation, SeenScratch scratch) {
+    private SectionBuffer(SeenScratch scratch) {
+      this.scratch = scratch;
+    }
+
+    /**
+     * 复用前重置：换 section 键与去重代次，有效计数清零；{@code data} <b>保留已扩容的容量</b>
+     * （读取一律以 {@code count} 为界，残留旧值不会被读到）。
+     */
+    private void reset(long key, int generation) {
       this.key = key;
       this.generation = generation;
-      this.scratch = scratch;
+      this.count = 0;
     }
 
     private void add(int x, int y, int z) {
@@ -260,6 +275,10 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       return LOCAL.get();
     }
 
+    private static void clearThreadLocals() {
+      LOCAL.remove();
+    }
+
     /** 取得本 section 专属的新代次；代次回绕到 0 时整表清零重来（实际不可能到达）。 */
     private int nextGeneration() {
       if (++generation == 0) {
@@ -277,6 +296,78 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       stamp[slot] = generation;
       return true;
     }
+  }
+
+  /**
+   * 多方块变更解析的线程本地复用缓冲（netty 事件循环线程固定且长生存）。
+   *
+   * <p><b>为什么可以复用</b>：本类只在出站回调线程上<b>同步</b>使用——解析一个包期间不会重入（监听器
+   * 自身不发包：显形调度只是 {@code Schedulers.onEntity} 投递，回显判定是纯 map 查询），同一线程的多个
+   * 包串行处理。因此每个线程各持一份即可，省掉每包最多约 48KB（绝对坐标）+ 48KB（section 数据）的
+   * 短命分配。<b>若将来在回调里同步发出会回到本监听器的包，必须先把本缓冲改成不可重入或改用独立缓冲</b>
+   * （否则内层会覆盖外层正在解析的数据）。
+   *
+   * <p>每次使用只重置「有效区间」的计数（{@code bufferCount} 与各 buffer 的 {@code count}），
+   * <b>不清零整段数组</b>：所有读取都以计数为界，残留旧值不会被读到；容量则保留，避免反复扩容拷贝。
+   *
+   * <p><b>复用数组的生命周期</b>：{@code SectionBuffer.data} 只在本次 {@code processChanges} 调用内
+   * 有效（下一包会覆盖），因此派发处必须交出独立快照（见 {@code processSection}）——这正是
+   * {@code dispatch} 契约里「独立快照」的由来，也是本缓冲能安全复用的前提。
+   */
+  private static final class ParseScratch {
+
+    private static final ThreadLocal<ParseScratch> LOCAL = ThreadLocal.withInitial(ParseScratch::new);
+
+    private final java.util.ArrayList<SectionBuffer> buffers = new java.util.ArrayList<>();
+    private int[] coordinates = new int[48];
+    private int bufferCount;
+
+    private static ParseScratch current() {
+      return LOCAL.get();
+    }
+
+    private static void clearThreadLocals() {
+      LOCAL.remove();
+    }
+
+    /** 取得容量 ≥ {@code required} 的绝对坐标缓冲（保留扩容后的容量）。 */
+    private int[] coordinates(int required) {
+      if (coordinates.length < required) {
+        coordinates = new int[required];
+      }
+      return coordinates;
+    }
+
+    /** 开始解析新包：section 有效计数归零（buffer 实例与 data 容量保留）。 */
+    private void beginSections() {
+      bufferCount = 0;
+    }
+
+    /** 取得第 {@code bufferCount} 个 section 的可复用缓冲，并重置为本次的 section 键与去重代次。 */
+    private SectionBuffer nextSection(long key, int generation) {
+      while (buffers.size() <= bufferCount) {
+        buffers.add(new SectionBuffer(SeenScratch.current()));
+      }
+      SectionBuffer buffer = buffers.get(bufferCount++);
+      buffer.reset(key, generation);
+      return buffer;
+    }
+
+    private SectionBuffer bufferAt(int index) {
+      return buffers.get(index);
+    }
+  }
+
+  /**
+   * 释放当前线程上的两处复用缓冲（{@link SeenScratch} 的去重戳表与 {@link ParseScratch} 的解析缓冲）。
+   *
+   * <p>ThreadLocal 条目挂在 netty 事件循环线程上，而线程比插件活得久：停用 / 热重载时不清理会让旧实例
+   * 钉住旧类加载器（{@code SeenScratch} 的 {@code int[4096]} 每个线程 16KB）。只能清调用线程这一份，
+   * 其余线程靠 ThreadLocalMap 的惰性 expunge。由 {@link ProximityRevealer#clearThreadLocals()} 汇入。
+   */
+  static void clearThreadLocals() {
+    SeenScratch.clearThreadLocals();
+    ParseScratch.clearThreadLocals();
   }
 
   /**
@@ -309,29 +400,33 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       return;
     }
 
-    java.util.List<SectionBuffer> sections = new java.util.ArrayList<>();
-    SeenScratch scratch = SeenScratch.current();
+    SeenScratch seen = SeenScratch.current();
+    ParseScratch parse = ParseScratch.current();
+    parse.beginSections();
+    int sectionCount = 0;
     for (int i = 0; i < count; i++) {
       int x = coordinates[i * 3];
       int y = coordinates[i * 3 + 1];
       int z = coordinates[i * 3 + 2];
       long key = sectionKey(x, y, z);
       SectionBuffer buffer = null;
-      for (int s = 0; s < sections.size(); s++) {
-        if (sections.get(s).key == key) {
-          buffer = sections.get(s);
+      for (int s = 0; s < sectionCount; s++) {
+        SectionBuffer candidate = parse.bufferAt(s);
+        if (candidate.key == key) {
+          buffer = candidate;
           break;
         }
       }
       if (buffer == null) {
-        buffer = new SectionBuffer(key, scratch.nextGeneration(), scratch);
-        sections.add(buffer);
+        // 复用线程本地缓冲（见 ParseScratch）：生产路径一个包只有一个 section，因此稳态下零分配
+        buffer = parse.nextSection(key, seen.nextGeneration());
+        sectionCount++;
       }
       buffer.add(x, y, z);
     }
 
-    for (int s = 0; s < sections.size(); s++) {
-      processSection(worldName, sections.get(s), obfuscatedChunkIndex, revealedSet, stats, dispatch,
+    for (int s = 0; s < sectionCount; s++) {
+      processSection(worldName, parse.bufferAt(s), obfuscatedChunkIndex, revealedSet, stats, dispatch,
           echoCheck);
     }
   }
@@ -378,7 +473,11 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       stats.unregistered.add(removed);
     }
     if (dispatch != null) {
-      dispatch.dispatch(section.data, section.count);
+      // <b>必须交出独立快照</b>：生产实现（{@link ProximityRevealer#onSectionChangeObserved}）会把坐标
+      // 数组交给实体调度器、在玩家线程上延后执行，而 {@link SectionBuffer} 的 data 已改为线程本地复用
+      // （见 {@link ParseScratch}）——若直接交出复用数组，下一个包解析时会把仍在排队的坐标覆盖掉，
+      // 显形就会发到错误位置。快照按精确长度拷贝，活跃路径每包仍比「不复用」少一次等长数组分配。
+      dispatch.dispatch(java.util.Arrays.copyOf(section.data, section.count * 3), section.count);
     }
   }
 

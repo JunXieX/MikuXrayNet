@@ -510,6 +510,15 @@ public final class AntiXrayConfig {
   public static final int DISK_CACHE_QUEUE_CAPACITY_MAX = 65_536;
   /** {@code cache.expire-after-access-seconds} 上限（秒，1 天）：再长等于改写缓存条目永不淘汰。 */
   public static final int CACHE_EXPIRE_AFTER_ACCESS_SECONDS_MAX = 86_400;
+  /**
+   * {@code advanced.timeout-millis} 的<b>有效下限</b>（毫秒，100）。
+   *
+   * <p>解析侧显式把配置值钳到该下限（见 {@code from()} 里的 clampCeiling）——注意这不是新语义：
+   * 构造器的 {@code Math.max(100, timeoutMillis)} 一直把 <100 的取值按 100 生效，只是过去<b>不留痕</b>、
+   * 管理员看不到配置已被抬高。现在改为在解析期钳制并计入 {@code floorAdjustments}，加载时一次性提示。
+   */
+  public static final int ADVANCED_TIMEOUT_MILLIS_MIN = 100;
+
   /** {@code advanced.timeout-millis} 上限（毫秒，60 秒）：改写超时，配大等于放弃「超时放行」兜底。 */
   public static final int ADVANCED_TIMEOUT_MILLIS_MAX = 60_000;
 
@@ -1124,10 +1133,11 @@ public final class AntiXrayConfig {
         // 手滑多打一位数会同时放大线程数与这部分常驻内存。
         clampCeiling(root.getInt("advanced.threads", 0), 0, ADVANCED_THREADS_MAX,
             "advanced.threads", floorAdjustments, ceilingAdjustments),
-        // advanced.timeout-millis：原实现不带下限（有效下限由构造器的 Math.max(100, ...) 统一兜住），
-        // 此处只补上限（15 项修复回归：不得凭空抬高管理员 <100 的配置值）。
-        // 上限见 ADVANCED_TIMEOUT_MILLIS_MAX：超时上限直接决定单任务能挂住一条工作线程多久。
-        clampCeiling(root.getInt("advanced.timeout-millis", 2500), Integer.MIN_VALUE,
+        // advanced.timeout-millis：有效区间 [ADVANCED_TIMEOUT_MILLIS_MIN, ADVANCED_TIMEOUT_MILLIS_MAX]。
+        // 下限不是新行为——构造器的 Math.max(100, ...) 一直把 <100 的取值按 100 生效，只是过去不留痕；
+        // 这里显式按同一区间钳制，让「配置 50、实际 100」也进入 floorAdjustments（绝不静默抬高配置值）。
+        // 上限直接决定单任务能挂住一条工作线程多久，见 ADVANCED_TIMEOUT_MILLIS_MAX。
+        clampCeiling(root.getInt("advanced.timeout-millis", 2500), ADVANCED_TIMEOUT_MILLIS_MIN,
             ADVANCED_TIMEOUT_MILLIS_MAX, "advanced.timeout-millis",
             floorAdjustments, ceilingAdjustments),
         // 上限见 ADVANCED_QUEUE_CAPACITY_MAX：每个排队项都钉着一个区块封包，
@@ -1890,7 +1900,8 @@ public final class AntiXrayConfig {
           + " 低于安全下限或取值非法，已改按安全值生效"
           + "（当前：proximity.frustum.fov=" + proximity.frustumFov() + "°、min-distance="
           + proximity.frustumMinDistance() + " 格、disk-cache.expire-seconds="
-          + diskCache.expireSeconds() + " 秒）。低于下限或非法的取值会让对应功能静默失效："
+          + diskCache.expireSeconds() + " 秒、advanced.timeout-millis=" + timeoutMillis
+          + " 毫秒）。低于下限或非法的取值会让对应功能静默失效："
           + "视锥配窄 → 玩家看得见的方块保持伪装（要点一下才变回来）；"
           + "磁盘缓存过期时间配短 → 条目活不过一次重启，命中率恒为 0。"
           + "限制磁盘占用请调 disk-cache.max-entries / max-file-size-mb，而不是缩短过期时间。");
@@ -1918,8 +1929,12 @@ public final class AntiXrayConfig {
   /**
    * 写法无法识别、已按安全取值处理的明细（权重条目 / 高度键 / 布尔开关 / 枚举类开关；空列表 = 无）。
    *
-   * <p>供单测断言「宽松解析是否真的留了痕」；诊断 dump（{@code util/Diagnostics}）当前尚未输出它，
-   * 需要时可在那里补一行（与 floorAdjustments / ceilingAdjustments 同口径）。
+   * <p>唯一的生产消费点是 {@link #warnIfConfigAdjusted}（加载期一次性 WARN，内部直接读字段）；
+   * 本访问器本身只被单测使用，诊断 dump（{@code util/Diagnostics}）当前尚未输出它，需要时可在那里补一行
+   * （与 floorAdjustments / ceilingAdjustments 同口径）。
+   *
+   * @implNote 保留为 public 的原因：单测用它逐类断言「宽松解析是否真的留了痕」（权重四舍五入/被跳过、
+   *     高度键回落、布尔与枚举键按默认值生效）。若把断言改为读日志会引入对日志格式的耦合，故保留访问器。
    */
   public List<String> typeAdjustments() {
     return typeAdjustments;

@@ -211,7 +211,7 @@ public final class AntiXrayRuntime {
     MikuWorkPool pool = new MikuWorkPool(antiXray.threads(), antiXray.queueCapacity());
     ProtocolLibHook hook = new ProtocolLibHook(plugin);
     // 先把索引/已显形集合落到运行时字段，再以「可变引用」传给改写链路：热重载关闭 proximity 时
-    // restartProximity 会把这两个字段置空，改写链路随即读到 null（跳过 recordChunk），
+    // restartProximity 会把这两个字段置空，改写链路随即读到 null（跳过 recordChunkWithRemovals），
     // 从而真正做到「关闭即零开销」，且与面板读到的字段一致。提前赋值还可避免启动瞬间的读取竞态。
     this.obfuscatedChunkIndex = chunkIndex;
     this.revealedSet = revealed;
@@ -455,6 +455,15 @@ public final class AntiXrayRuntime {
     // 只在停用 / 热重载时调用——ThreadLocal 条目不会随工作池重建自行消失，放进热路径会
     // 丢掉空闲池、让下一次编解码重新分配几百 KB 数组，反而抵消复用收益。
     ChunkScratch.clearThreadLocals();
+    // 邻近显形侧的线程本地复用实例（位图判定器 / 区块键探针 / 候选点缓冲 / netty 解析缓冲）同理：
+    // 条目随线程存活并钉住旧类加载器，停用 / 热重载时必须显式清掉当前线程这一份。
+    // 其它线程（netty 事件循环 / Folia 区域线程）的条目无法从这里枚举，会在其下次访问
+    // ThreadLocalMap 时被惰性 expunge——这正是这里只清调用线程的原因。
+    try {
+      ProximityRevealer.clearThreadLocals();
+    } catch (Throwable throwable) {
+      logger.log(Level.WARNING, "清理邻近显形线程本地缓存失败（忽略）", throwable);
+    }
     if (bypassRegistry != null) {
       bypassRegistry.stop();
       bypassRegistry = null;

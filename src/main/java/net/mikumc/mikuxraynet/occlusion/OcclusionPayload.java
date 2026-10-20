@@ -75,7 +75,10 @@ public final class OcclusionPayload {
    * {@link #encode} 的输出长度（纯计算，不分配输出数组）。
    *
    * <p>当前无生产调用者：打包成磁盘负载时上层用的是 {@code cache.DiskPayload#encodedLength}
-   * （它要连同被伪装坐标与区块字节一起算）。本方法保留给单测与将来的容量预判。
+   * （它要连同被伪装坐标与区块字节一起算）。
+   *
+   * @implNote 保留原因：{@code OcclusionPayloadTest} 用它断言「{@code encode} 的实际字节数等于预测长度」
+   *     这一格式契约——删掉它会把该断言削弱成「只比长度不自证」。生产路径不需要它，故不纳入任何热路径。
    */
   public static int encodedLength(SectionOcclusion[] column) {
     checkColumnLength(column);
@@ -157,7 +160,8 @@ public final class OcclusionPayload {
           for (int w = 0; w < words.length; w++) {
             words[w] = buffer.getLong();
           }
-          column[i] = new BitmapOcclusion(words);
+          // 复制而不是接管：words 是逐段复用的解码缓冲，直接接管会让相邻 section 共享同一份数组
+          column[i] = BitmapOcclusion.copyOf(words);
         }
       }
       return column;

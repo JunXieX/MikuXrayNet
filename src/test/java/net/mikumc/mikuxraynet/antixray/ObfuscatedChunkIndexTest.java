@@ -72,7 +72,8 @@ class ObfuscatedChunkIndexTest {
 
     // 模拟 100 个玩家先后收到同一区块（改写结果按区块共享，因此每次传入的是同一份坐标）
     for (int i = 0; i < 100; i++) {
-      assertEquals(locals.length, index.recordChunk(WORLD, 2, 3, MIN_HEIGHT, locals));
+      assertEquals(0, index.recordChunkWithRemovals(WORLD, 2, 3, MIN_HEIGHT, locals).length,
+          "重复覆盖同一份清单：无移除差集");
     }
 
     assertEquals(1, index.chunkCount(), "同一区块只保留一条条目");
@@ -85,23 +86,23 @@ class ObfuscatedChunkIndexTest {
   void recordingSameChunkAgainReplacesItsPositions() {
     ObfuscatedChunkIndex index = index(1_000_000, 60 * SECOND_NANOS);
 
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, positions(3));
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, positions(3));
     assertEquals(3, index.positionCount());
 
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, positions(5));
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, positions(5));
     assertEquals(1, index.chunkCount());
     assertEquals(5, index.positionCount(), "重新下发以新清单为准（覆盖而非追加）");
 
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[0]);
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[0]);
     assertEquals(5, index.positionCount(), "空清单不建条目，也不清空既有条目");
   }
 
   @Test
   void keyedByWorldAndChunkCoordinates() {
     ObfuscatedChunkIndex index = index(1_000_000, 60 * SECOND_NANOS);
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, positions(2));
-    index.recordChunk("world_nether", 0, 0, MIN_HEIGHT, positions(2));
-    index.recordChunk(WORLD, 1, 0, MIN_HEIGHT, positions(2));
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, positions(2));
+    index.recordChunkWithRemovals("world_nether", 0, 0, MIN_HEIGHT, positions(2));
+    index.recordChunkWithRemovals(WORLD, 1, 0, MIN_HEIGHT, positions(2));
 
     assertEquals(3, index.chunkCount(), "不同世界 / 不同区块互不覆盖");
     assertEquals(6, index.positionCount());
@@ -169,7 +170,7 @@ class ObfuscatedChunkIndexTest {
     int b = local(MIN_HEIGHT, 2, 64, 1);
     int c = local(MIN_HEIGHT, 3, 64, 1);
 
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {a, b, c});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {a, b, c});
     assertTrue(index.removePosition(WORLD, 1, 64, 1), "前置：摘除 a");
 
     // 覆盖为 {b, d}：旧清单是 {b, c}（a 已被摘除）→ 差集 = 旧有而新无 = {c}；d 是新增不得入差集
@@ -198,7 +199,7 @@ class ObfuscatedChunkIndexTest {
     ObfuscatedChunkIndex index = index(2, 60 * SECOND_NANOS);
     int a = local(MIN_HEIGHT, 1, 64, 1);
     int b = local(MIN_HEIGHT, 2, 64, 1);
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {a, b});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {a, b});
 
     assertTrue(index.mayEvict(2), "前置：本次登记会越过安全阀上限（调用方据此准备收集容器）");
 
@@ -222,9 +223,9 @@ class ObfuscatedChunkIndexTest {
   void reRecordingExistingChunkAtCapacityDoesNotEvictOthers() {
     ObfuscatedChunkIndex index = index(10, 60 * SECOND_NANOS);
     clock[0] = 1;
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, positions(5));
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, positions(5));
     clock[0] = 2;
-    index.recordChunk(WORLD, 1, 0, MIN_HEIGHT, positions(5));
+    index.recordChunkWithRemovals(WORLD, 1, 0, MIN_HEIGHT, positions(5));
     assertEquals(10, index.positionCount(), "前置：总量恰好触顶");
 
     clock[0] = 3;
@@ -246,7 +247,7 @@ class ObfuscatedChunkIndexTest {
         local(MIN_HEIGHT, 1, 10, 1),
         local(MIN_HEIGHT, 2, 10, 1),
         local(MIN_HEIGHT, 1, 11, 1)};
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, locals);
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, locals);
 
     assertTrue(index.removePosition(WORLD, 2, 10, 1), "方块变更：命中并摘除该坐标");
     assertFalse(index.removePosition(WORLD, 2, 10, 1), "重复摘除必须返回 false");
@@ -259,7 +260,7 @@ class ObfuscatedChunkIndexTest {
   @Test
   void removingLastCoordinateDropsChunkEntry() {
     ObfuscatedChunkIndex index = index(1_000_000, 60 * SECOND_NANOS);
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(MIN_HEIGHT, 1, 10, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(MIN_HEIGHT, 1, 10, 1)});
 
     assertTrue(index.removePosition(WORLD, 1, 10, 1));
     assertEquals(0, index.positionCount());
@@ -270,9 +271,9 @@ class ObfuscatedChunkIndexTest {
   @Test
   void invalidateChunkAndWorldDropEntries() {
     ObfuscatedChunkIndex index = index(1_000_000, 60 * SECOND_NANOS);
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, positions(2));
-    index.recordChunk(WORLD, 1, 0, MIN_HEIGHT, positions(2));
-    index.recordChunk("world_nether", 0, 0, MIN_HEIGHT, positions(2));
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, positions(2));
+    index.recordChunkWithRemovals(WORLD, 1, 0, MIN_HEIGHT, positions(2));
+    index.recordChunkWithRemovals("world_nether", 0, 0, MIN_HEIGHT, positions(2));
 
     assertTrue(index.invalidateChunk(WORLD, 1, 0), "区块卸载：命中并移除");
     assertFalse(index.invalidateChunk(WORLD, 1, 0), "重复失效返回 false");
@@ -292,7 +293,7 @@ class ObfuscatedChunkIndexTest {
   void entriesExpireAfterWindowUnlessScanned() {
     long window = 10 * SECOND_NANOS;
     ObfuscatedChunkIndex index = index(1_000_000, window);
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, positions(2));
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, positions(2));
 
     clock[0] = 9 * SECOND_NANOS;
     index.expire();
@@ -326,7 +327,7 @@ class ObfuscatedChunkIndexTest {
     int perChunk = 404;
 
     for (int i = 0; i < chunks; i++) {
-      index.recordChunk(WORLD, i % 40, i / 40, MIN_HEIGHT, positions(perChunk));
+      index.recordChunkWithRemovals(WORLD, i % 40, i / 40, MIN_HEIGHT, positions(perChunk));
     }
 
     assertEquals(chunks, index.chunkCount());
@@ -340,9 +341,9 @@ class ObfuscatedChunkIndexTest {
     ObfuscatedChunkIndex index = index(12, 60 * SECOND_NANOS);
 
     clock[0] = 1;
-    assertEquals(10, index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, positions(10)));
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, positions(10));
     clock[0] = 2;
-    assertEquals(10, index.recordChunk(WORLD, 1, 0, MIN_HEIGHT, positions(10)));
+    index.recordChunkWithRemovals(WORLD, 1, 0, MIN_HEIGHT, positions(10));
 
     assertEquals(1, index.chunkCount(), "放不下时必须淘汰，保证新记录可写入");
     assertNull(index.entry(new ChunkKey(WORLD, 0, 0)), "被淘汰的是最旧的区块");

@@ -47,6 +47,19 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
   private static final ThreadLocal<BitmapVisibility> LOCAL =
       ThreadLocal.withInitial(BitmapVisibility::new);
 
+  /**
+   * 释放当前线程的判定器实例（插件停用 / 热重载时由 {@link ProximityRevealer#clearThreadLocals()} 汇入，
+   * 最终由 {@code AntiXrayRuntime#stopForDisable} 调用）。
+   *
+   * <p><b>为什么必须清</b>：{@link #LOCAL} 的条目挂在<b>线程</b>的 ThreadLocalMap 上，而主线程 / Folia
+   * 区域线程 / 工作线程都比插件活得久；插件停用或热重载后，旧实例会经该表项钉住旧类加载器，直到线程
+   * 下次访问 ThreadLocalMap 才被惰性 expunge。这里只能清「调用线程」这一份（其它线程无法从这里枚举），
+   * 其余线程靠上述惰性回收。
+   */
+  static void clearThreadLocals() {
+    LOCAL.remove();
+  }
+
   private final OcclusionRay ray = new OcclusionRay();
   /** 步进射线的严格查询（缺数据按遮挡，见类注释）；线程封闭，随实例复用。 */
   private final OcclusionRay.Lookup strictLookup = this::strictSection;

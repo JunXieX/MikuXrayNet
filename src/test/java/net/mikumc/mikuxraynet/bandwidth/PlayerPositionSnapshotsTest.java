@@ -120,6 +120,48 @@ class PlayerPositionSnapshotsTest {
     assertEquals("world_nether", snapshots.get(player).world());
   }
 
+  /**
+   * P3 回归：黑名单世界只维护「当前世界」、<b>跳过坐标捕获</b>（省掉每 tick 三次 getter）。
+   *
+   * <p>要钉住三件事：① 世界切换仍要回报旧世界名（跨世界丢弃靠它）；② 坐标被标记为未知时近身判定必须
+   * fail-open（按近身立即放行），绝不能拿与当前世界无关的旧坐标算距离；③ 切出黑名单世界、恢复正常刷新后
+   * 必须重新按真实距离判定（positionKnown 不能一直停在 false）。
+   */
+  @Test
+  @DisplayName("refreshWorldOnly 只更新世界并让近身判定 fail-open；恢复正常刷新后回到按距离判定")
+  void worldOnlyRefreshKeepsWorldForCrossWorldDetectionAndFailsOpen() {
+    PlayerPositionSnapshots snapshots = new PlayerPositionSnapshots();
+    UUID player = UUID.randomUUID();
+    List<Update<Integer>> far = List.of(new Update<>(200, 64, 200, 1));
+
+    // 正常世界：精确坐标 → 远处的变更不立即放行
+    assertNull(snapshots.refresh(player, "world", 0.5D, 64.0D, 0.5D), "首次刷新没有「上一个世界」");
+    assertFalse(PlayerPositionSnapshots.immediatePass(snapshots.get(player), far, 8),
+        "坐标已知时按距离判定（远处不立即放行）");
+
+    // 进入黑名单世界：只写世界名、不读坐标
+    assertEquals("world", snapshots.refreshWorldOnly(player, "world_blacklisted"),
+        "世界切换必须回报旧世界名（供跨世界丢弃）");
+    assertEquals("world_blacklisted", snapshots.get(player).world());
+    assertTrue(PlayerPositionSnapshots.immediatePass(snapshots.get(player), far, 8),
+        "坐标未知时必须 fail-open（按近身立即放行，绝不用旧世界坐标算距离）");
+
+    // 仍在黑名单世界：重复调用不发布新快照（零分配、零写入）
+    PlayerPositionSnapshots.Position inBlacklist = snapshots.get(player);
+    assertEquals("world_blacklisted", snapshots.refreshWorldOnly(player, "world_blacklisted"));
+    assertSame(inBlacklist, snapshots.get(player), "世界未变且坐标已未知时不得重复发布");
+
+    // 切出黑名单世界：恢复正常刷新 → 坐标重新可信，判定回到按距离
+    assertEquals("world_blacklisted", snapshots.refresh(player, "world", 0.5D, 64.0D, 0.5D),
+        "切出黑名单世界同样必须回报旧世界名");
+    assertFalse(PlayerPositionSnapshots.immediatePass(snapshots.get(player), far, 8),
+        "恢复正常刷新后必须回到按距离判定");
+
+    // 没有快照时直接进入黑名单世界：不能误报「上一个世界」
+    assertNull(snapshots.refreshWorldOnly(UUID.randomUUID(), "world_blacklisted"),
+        "首次调用没有「上一个世界」");
+  }
+
   @Test
   @DisplayName("负数坐标按 floor 语义取方块（绝非截断），跨负数方块边界时判定随之更新")
   void negativeCoordinatesUseFloorAndReclassifyOnBlockChange() {

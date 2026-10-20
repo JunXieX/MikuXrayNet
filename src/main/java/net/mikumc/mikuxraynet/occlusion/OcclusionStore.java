@@ -68,7 +68,14 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     return sections.get(SectionKey.packSection(chunkX, sectionY, chunkZ));
   }
 
-  /** 直接以打包键查询（射线遍历用，避免每步重复打包）。 */
+  /**
+   * 直接以打包键查询（省掉一次打包运算）。
+   *
+   * <p><b>当前无任何调用者（含单测）</b>：保留为「以打包键读」的对称入口，与
+   * {@link #section(int, int, int)} 并存。射线遍历当前走三参重载并在跨段边界时才查表
+   * （{@code OcclusionRay} 按 section 缓存视图），故不需要本重载；将来若有热循环每步都要
+   * 重复打包，可直接用它省掉打包成本。
+   */
   public SectionOcclusion section(long key) {
     return sections.get(key);
   }
@@ -196,8 +203,12 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * 发布前用它逐段比较，戳变了的段跳过覆盖，避免把更新的补丁状态覆盖成「解码时刻的旧几何」
    * （那会让刚挖开的墙继续保持遮挡，属于「该显示却多藏」）。
    *
-   * <p>成本：每列一次 {@code long[sectionCount]} 分配 + sectionCount 次 CHM 读（主世界 24 次），
-   * 只在「区块字节没命中缓存、需要重新建表」时发生，不在缓存命中的热路径上。
+   * <p>成本：每列一次 {@code long[sectionCount]} 分配 + sectionCount 次 CHM 读（主世界 24 次）。
+   * 它现在由封包链路在<b>持包线程</b>为每个待改写区块包取一次（见
+   * {@code ObfuscationProcessor#capturePatchStamps}），因此「命中缓存、不需要建表」的包也会白取一次——
+   * 这是刻意取舍：快照只有取得足够早，才能把「封包生成 → worker 解码」这段（排队 + 区域线程 hop，
+   * 常态 1~10 ms）里落库的方块补丁挡在发布覆盖之外；白付的只是 24 次 CHM 读 + 约 192 B 短命数组，
+   * 相比「补丁被解码时刻的旧几何吞掉」（该显示却多藏）的代价可以忽略。
    *
    * @return 长度 {@code sectionCount} 的数组，下标即 section 偏移
    */
@@ -267,7 +278,12 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     }
   }
 
-  /** 摘除某 section 的遮挡数据（连同它的补丁戳）。 */
+  /**
+   * 摘除某 section 的遮挡数据（连同它的补丁戳）。
+   *
+   * <p><b>测试专用豁免</b>：生产上的摘除都是整列/整表粒度——区块卸载走 {@link #removeColumn}、
+   * 世界卸载与停用走 {@link #clear}；本方法当前仅单测在用，保留以免破坏测试。
+   */
   public void removeSection(int chunkX, int sectionY, int chunkZ) {
     synchronized (writeMutex) {
       long key = SectionKey.packSection(chunkX, sectionY, chunkZ);

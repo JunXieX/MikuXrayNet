@@ -7,7 +7,12 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Proxy;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import org.bukkit.configuration.InvalidConfigurationException;
@@ -127,43 +132,165 @@ class ThrottlePipelineTest {
   }
 
   /**
-   * 回归：「已在运行」的判定必须是 {@code startLocked()} 的<b>第一条</b>语句。
+   * 回归：「已在运行」的判定必须是 {@code startLocked()} 的<b>第一条</b>语句（先于
+   * {@code cleanupIncomplete = false} 与 {@code retryFailedCloses()}）。
    *
-   * <p>为什么这条顺序如此重要：紧跟在判定之后的是 {@code retryFailedCloses()}——它会注销字段里的模块
-   * （那是为「上一次 stop() 注销失败、刻意保留的句柄」准备的）。一旦把重试排在运行态判定之前，
-   * 重复 start() 就会把<b>当前正在运行</b>的模块全部关掉，随后又因 started 已为 true 而返回，
-   * 留下「started=true 但模块全被注销」的半死状态：监听器没了，诊断却仍报已启用，玩家侧的
-   * 实体剔除/省包全部静默失效。
+   * <p>为什么这条顺序如此重要：紧随判定之后的 {@code retryFailedCloses()} 会注销字段里的模块——那是为
+   * 「上一次 stop() 注销失败、刻意保留的句柄」准备的。一旦把重试排在运行态判定之前，重复 start() 就会把
+   * <b>当前正在运行</b>的模块全部关掉，随后又因 started 已为 true 而返回，留下「started=true 但模块全被
+   * 注销」的半死状态：监听器没了，诊断却仍报已启用，玩家侧的实体剔除/省包全部静默失效。
    *
-   * <p>本测试用反射把 {@code started} 预置为 true 再调 {@code start()}：若判定确实在最前，方法会立刻返回、
-   * 完全不触碰 Bukkit（离线环境可用）；若判定被挪到后面，执行流就会走到依赖 Bukkit 的装配段并抛
-   * {@code NullPointerException}（离线无服务端实例），测试随即失败——正是我们要钉住的回归。
+   * <p>本测试把 {@code started} 与 {@code cleanupIncomplete} 都预置为 true 再连续 start() 两次，
+   * 用三个可观测断言钉住「判定在最前且完全没触碰状态」：① {@code cleanupIncomplete} 必须保持 true
+   * （判定先于复位）；② 五个模块字段必须保持 null（没有注册、也没有被 retryFailedCloses 注销）；
+   * ③ 日志只出现两次「已处于运行状态」的短路消息、零 WARNING（判定若被挪到依赖探测之后会打出
+   * 「未检测到 ProtocolLib」等 WARNING）。
    */
   @Test
   void startReturnsImmediatelyWhenAlreadyRunning() throws Exception {
-    ThrottlePipeline pipeline = new ThrottlePipeline(pluginStub(), config("enabled: true\n"));
-    java.lang.reflect.Field started = ThrottlePipeline.class.getDeclaredField("started");
-    started.setAccessible(true);
-    ((AtomicBoolean) started.get(pipeline)).set(true);
+    RecordingLogger logger = new RecordingLogger();
+    ThrottlePipeline pipeline = new ThrottlePipeline(pluginStub(logger), config("enabled: true\n"));
+    setStarted(pipeline, true);
+    setCleanupIncomplete(pipeline, true);
 
-    // 已在运行：必须立刻返回，绝不进入任何需要 Bukkit 的装配路径
     pipeline.start();
+    pipeline.start();
+
+    assertTrue(started(pipeline), "已在运行时 started 必须保持 true（不得被重复 start 改写）");
+    assertTrue(cleanupIncomplete(pipeline),
+        "判定必须在 cleanupIncomplete 复位之前：任何状态都没被触碰");
+    assertNoModulesRegistered(pipeline);
+    assertEquals(2L, logger.countContaining("已处于运行状态"),
+        "两次 start() 都必须命中「已运行」短路分支（日志：" + logger.records() + "）");
+    assertEquals(0, logger.warningCount(),
+        "已在运行时不得进入依赖探测/装配段（否则会出现 WARNING）：" + logger.records());
   }
 
-  /** {@code stop()} 可重复调用：首次清理后字段已置空，再次调用必须是纯 no-op（不抛异常）。 */
+  /**
+   * {@code stop()} 可重复调用且不得留下半清理状态：首次 stop() 复位 started、保持
+   * {@code cleanupIncomplete=false}；第二次 stop() 是纯 no-op（不抛异常、不产生 WARNING）。
+   *
+   * <p>用「总开关关闭」的配置：{@code start()} 在触碰任何 Bukkit API 之前返回，因此离线可跑；
+   * 同时断言 {@link ThrottlePipeline#plan(BandwidthConfig)} 全为 false 时五个模块字段必须全为 null
+   * ——这正是「关闭即不注册」的端到端口径（plan 与注册状态一致）。
+   */
   @Test
-  void stopIsIdempotent() {
-    ThrottlePipeline pipeline = new ThrottlePipeline(pluginStub(), config("enabled: false\n"));
-    // 总开关关闭时 start() 在触碰 Bukkit 之前就返回（离线可跑），stop() 自然也没有模块可清理
+  void stopIsIdempotent() throws Exception {
+    RecordingLogger logger = new RecordingLogger();
+    ThrottlePipeline pipeline = new ThrottlePipeline(pluginStub(logger), config("enabled: false\n"));
+
+    ThrottlePipeline.ModulePlan plan = ThrottlePipeline.plan(config("enabled: false\n"));
+    assertFalse(plan.entityPackets(), "总开关关闭：plan 必须不注册零位移实体包取消");
+    assertFalse(plan.blockChanges(), "总开关关闭：plan 必须不注册方块变更合并");
+    assertFalse(plan.entityCulling(), "总开关关闭：plan 必须不注册实体剔除");
+    assertFalse(plan.afk(), "总开关关闭：plan 必须不注册 AFK 降级");
+    assertFalse(plan.latency(), "总开关关闭：plan 必须不注册高延迟降视距");
+
     pipeline.start();
     pipeline.start();
+    assertNoModulesRegistered(pipeline); // plan 全 false 与「字段全 null」一致
+
     pipeline.stop();
+    assertFalse(started(pipeline), "第一次 stop() 必须复位 started");
+    assertNoModulesRegistered(pipeline); // 没有模块可注销 → 字段仍全 null
+    assertFalse(cleanupIncomplete(pipeline), "没有模块可注销时不得标记「清理不完整」");
+
     pipeline.stop();
+    assertFalse(started(pipeline), "重复 stop() 后 started 仍必须为 false");
+    assertNoModulesRegistered(pipeline);
+    assertFalse(cleanupIncomplete(pipeline), "重复 stop() 必须是纯 no-op，不得产生清理失败标记");
+    assertEquals(0, logger.warningCount(),
+        "重复 stop() 不得产生 WARNING：" + logger.records());
+  }
+
+  // ---------------------------------------------------------- 反射观测 / 替身
+
+  private static final String[] MODULE_FIELDS = {
+      "entityPacketFilter", "blockChangeMerger", "entityCuller", "afkTracker", "latencyMonitor"};
+
+  private static Object field(ThrottlePipeline pipeline, String name) throws Exception {
+    java.lang.reflect.Field field = ThrottlePipeline.class.getDeclaredField(name);
+    field.setAccessible(true);
+    return field.get(pipeline);
+  }
+
+  private static boolean started(ThrottlePipeline pipeline) throws Exception {
+    return ((AtomicBoolean) field(pipeline, "started")).get();
+  }
+
+  private static void setStarted(ThrottlePipeline pipeline, boolean value) throws Exception {
+    ((AtomicBoolean) field(pipeline, "started")).set(value);
+  }
+
+  private static void setCleanupIncomplete(ThrottlePipeline pipeline, boolean value) throws Exception {
+    java.lang.reflect.Field field = ThrottlePipeline.class.getDeclaredField("cleanupIncomplete");
+    field.setAccessible(true);
+    field.setBoolean(pipeline, value);
+  }
+
+  private static boolean cleanupIncomplete(ThrottlePipeline pipeline) throws Exception {
+    java.lang.reflect.Field field = ThrottlePipeline.class.getDeclaredField("cleanupIncomplete");
+    field.setAccessible(true);
+    return field.getBoolean(pipeline);
+  }
+
+  /** 五个模块字段必须全为 null：既没注册，也没被 retryFailedCloses 注销成「半死」状态。 */
+  private static void assertNoModulesRegistered(ThrottlePipeline pipeline) throws Exception {
+    for (String name : MODULE_FIELDS) {
+      assertNull(field(pipeline, name), "模块字段 " + name + " 必须为 null（未注册/未残留）");
+    }
+  }
+
+  /** 只记录、不外发的 Logger：用于断言 start()/stop() 实际走了哪条分支（短路消息、WARNING 数）。 */
+  private static final class RecordingLogger extends Logger {
+
+    private final List<String> records = new ArrayList<>();
+
+    RecordingLogger() {
+      super("ThrottlePipelineTest", null);
+      setLevel(Level.ALL);
+      setUseParentHandlers(false);
+      // 用 Handler 捕获而不是重写 log(LogRecord)：FINE 级消息由 Logger.doLog 直接分发给 Handler，
+      // 重写 log(LogRecord) 在部分 JDK 上捕不到；Handler 是 JDK 保证的最终分发点。
+      Handler handler = new Handler() {
+        @Override
+        public void publish(LogRecord record) {
+          records.add(record.getLevel().getName() + "|" + record.getMessage());
+        }
+
+        @Override
+        public void flush() {
+        }
+
+        @Override
+        public void close() {
+        }
+      };
+      handler.setLevel(Level.ALL);
+      addHandler(handler);
+    }
+
+    List<String> records() {
+      return records;
+    }
+
+    long countContaining(String fragment) {
+      return records.stream().filter(record -> record.contains(fragment)).count();
+    }
+
+    long warningCount() {
+      return records.stream()
+          .filter(record -> record.startsWith(Level.WARNING.getName() + "|"))
+          .count();
+    }
   }
 
   /** 仅用于 register 单测：getLogger() 之外的调用不被触发，故其余方法一律返回 null 即可。 */
   private static Plugin pluginStub() {
-    Logger logger = Logger.getLogger("ThrottlePipelineTest");
+    return pluginStub(Logger.getLogger("ThrottlePipelineTest"));
+  }
+
+  private static Plugin pluginStub(Logger logger) {
     return (Plugin) Proxy.newProxyInstance(Plugin.class.getClassLoader(),
         new Class<?>[] {Plugin.class},
         (proxy, method, args) -> method.getName().equals("getLogger") ? logger : null);

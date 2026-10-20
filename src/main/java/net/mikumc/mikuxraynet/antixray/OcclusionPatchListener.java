@@ -13,6 +13,7 @@ import com.comphenix.protocol.wrappers.WrappedBlockData;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -576,17 +577,23 @@ public final class OcclusionPatchListener extends PacketAdapter {
    * 广播给多个玩家时 NMS 包地址必然相同。窗口有界（{@value #CAPACITY} 条引用）：广播人数超过窗口容量时，
    * 只有少数玩家会重复应用一次（幂等、无害），绝不会漏补丁。
    *
+   * <p><b>为什么槽位存弱引用</b>：一个 MULTI_BLOCK_CHANGE 包最多携带 4096 格（坐标 {@code short[]} +
+   * 状态数组，可达数十 KB），而它只是服务端广播用的临时对象。强引用窗口会把最多 {@value #CAPACITY} 个
+   * 这样的包人为钉在堆上；弱引用不阻止回收，被回收的槽位读出来就是 {@code null}，按「未见过」处理——
+   * 代价只是同一包的后续接收者可能再应用一次补丁（幂等，只多花一次位图写锁），方向安全。
+   *
    * <p><b>为什么分「查」与「登记」两步</b>：只有真正应用成功才登记。若在应用之前就登记，首个接收者
    * 解析时抛一次异常（瞬时/罕见）就会让同一包的其余接收者全部被跳过，那格补丁从此缺失；
    * 应用成功后再登记则最坏只是并发多应用一次（幂等）。
    *
    * <p><b>线程安全</b>：回调可能落在多个异步处理线程上，用本对象监视器串行化——临界区只有 64 条引用比较，
-   * 在百纳秒级，不会成为瓶颈。窗口只持有方块变更包的引用（坐标与状态数组），不涉及玩家/区块对象。
+   * 在百纳秒级，不会成为瓶颈。窗口只持有方块变更包的<b>弱引用</b>（也不涉及玩家/区块对象）。
    */
   static final class RecentPackets {
     static final int CAPACITY = 64;
 
-    private final Object[] handles = new Object[CAPACITY];
+    /** 槽位存包实例的弱引用（见类注释的取舍说明）；空槽为 {@code null}。 */
+    private final WeakReference<?>[] handles = new WeakReference<?>[CAPACITY];
     private final String[] worlds = new String[CAPACITY];
     private int cursor;
 
@@ -600,7 +607,9 @@ public final class OcclusionPatchListener extends PacketAdapter {
         return false;
       }
       for (int i = 0; i < CAPACITY; i++) {
-        if (handles[i] == handle && worldName.equals(worlds[i])) {
+        WeakReference<?> ref = handles[i];
+        // ref == null：空槽；ref.get() == null：该包已被 GC 回收（等价于「未见过」，重复应用幂等）
+        if (ref != null && ref.get() == handle && worldName.equals(worlds[i])) {
           return true;
         }
       }
@@ -612,7 +621,7 @@ public final class OcclusionPatchListener extends PacketAdapter {
       if (handle == null || worldName == null) {
         return;
       }
-      handles[cursor] = handle;
+      handles[cursor] = new WeakReference<>(handle);
       worlds[cursor] = worldName;
       cursor = (cursor + 1) % CAPACITY;
     }

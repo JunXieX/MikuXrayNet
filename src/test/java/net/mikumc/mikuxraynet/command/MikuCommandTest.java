@@ -6,6 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.util.List;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.TabCompleter;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -91,5 +93,20 @@ class MikuCommandTest {
     assertFalse(line.contains("\r"), "回显不得包含回车符");
     assertTrue(line.startsWith("第一行"), "首尾空白必须去掉：" + line);
     assertTrue(line.endsWith("第三行"), "首尾空白必须去掉：" + line);
+  }
+
+  /**
+   * 结构性自证：命令类不得再声称自己是 Bukkit 的 {@link CommandExecutor} / {@link TabCompleter}。
+   *
+   * <p>本项目只有 Paper/Folia 的 Brigadier 一条注册路径（{@code CommandRegistrar.PaperCommandBridge}
+   * 直接转调 {@code onCommand} / {@code onTabComplete}）。保留那对接口只会让后来者误以为还存在传统
+   * {@code plugin.yml} 注册路径（历史实现曾有，已随 plugin.yml 一并删除）。
+   */
+  @Test
+  void isNotALegacyBukkitCommandExecutor() {
+    assertFalse(CommandExecutor.class.isAssignableFrom(MikuCommand.class),
+        "MikuCommand 不得再 implements CommandExecutor（唯一注册路径是 Paper 桥接）");
+    assertFalse(TabCompleter.class.isAssignableFrom(MikuCommand.class),
+        "MikuCommand 不得再 implements TabCompleter（唯一补全路径是 Paper 桥接）");
   }
 }

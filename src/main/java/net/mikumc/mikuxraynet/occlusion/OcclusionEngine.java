@@ -15,12 +15,14 @@ import java.util.UUID;
  * {@link #beginCycle(long)} 给出本周期的时间预算；工作线程在预算耗尽后<b>停止处理并等待下一周期</b>，
  * 队列里的任务顺延（不丢判定）。单条任务超预算时最多超出「一条任务」的成本，因此上界可控。
  *
- * <p><b>截止时间（超时丢弃）</b>：{@link Request#deadlineNanos()} 之前未开工的任务直接丢弃并计数——
- * 避免用陈旧几何去隐藏实体。丢弃<b>不改变实体当前显示状态</b>（不会新隐藏，也不会强制显示）；
- * 已隐藏实体的恢复由调用方的「每周期全量复检」兜底。
+ * <p><b>截止时间（超时丢弃）</b>：{@link Request#deadlineNanos()} 已过的任务在<b>入队前</b>就被拒收并计数
+ * （见 {@link #submit}），避免它白占队列槽位、也避免在队列里钉住 sink 闭包捕获的 Player/Entity；
+ * 入队之后、开工之前才到期的任务仍由工作线程在出队时丢弃（第二道防线）。两种丢弃都<b>不改变实体
+ * 当前显示状态</b>（不会新隐藏，也不会强制显示）；已隐藏实体的恢复由调用方的「每周期全量复检」兜底。
  *
- * <p><b>fail-open</b>：队列满即拒收；无顶点按「可见」；查不到位图按「不遮挡」。<b>被丢弃 / 被拒收的任务
- * 都不改变实体当前显示状态</b>（既不会新隐藏，也不会强制显示）——当前状态由此前一次<b>成功</b>判定决定，
+ * <p><b>fail-open</b>：队列满或任务已过期即拒收；无顶点按「可见」；查不到位图按「不遮挡」。
+ * <b>被丢弃 / 被拒收的任务都不改变实体当前显示状态</b>（既不会新隐藏，也不会强制显示）——当前状态
+ * 由此前一次<b>成功</b>判定决定，
  * 而「该恢复却仍隐藏」由调用方的每周期全量复检兜底（见 {@code EntityCuller#recheck}）。这样可避免
  * 「一次取不到判定就把已隐藏实体强行显示」与「通道②的隐藏判定」反复争夺而闪烁。
  */
@@ -117,11 +119,27 @@ public final class OcclusionEngine implements AutoCloseable {
   /**
    * 提交一个判定任务。
    *
-   * @return {@code false} 表示队列已满、任务被拒收（调用方应按「可见」处理，fail-open）
+   * <p><b>入队前先判过期</b>：截止时刻已过的任务即便入队，也<b>永远不会被执行</b>——工作线程出队后
+   * 第一件事就是比对 deadline（见 {@link #workerLoop}），过期即丢弃、不回投。把这个判定提前到入队之前，
+   * 换来两点：① 不让它白占 {@link #queueCapacity} 的槽位（否则可能把真正还有效的任务挤成「队列满拒收」）；
+   * ② 不在队列里钉住 {@link Request#sink()} 闭包捕获的 Player / Entity 引用——引擎在「没有任何玩家
+   * 开启周期」时可能长时间不消费队列（见类注释的 fail-open 说明），过期任务留在队列里属于无意义的持有。
+   *
+   * <p><b>计数与返回值口径</b>：过期拒收只计入 {@link OcclusionStats#timeoutDiscarded}，<b>不</b>计入
+   * {@code submitted}（与「队列满拒收只计 rejectedQueueFull、不计 submitted」同口径），也不改变实体
+   * 当前显示状态（与 worker 侧的超时丢弃语义一致）。
+   *
+   * @return {@code false} 表示任务未被接收（已过期 / 队列已满 / 引擎已关闭）；调用方按「不变更显示状态」
+   *     或「按可见处理」的 fail-open 语义处理
    */
   public boolean submit(Request request) {
     synchronized (lock) {
       if (closed) {
+        return false;
+      }
+      long deadline = request.deadlineNanos();
+      if (deadline != 0L && System.nanoTime() > deadline) {
+        stats.timeoutDiscarded.increment();
         return false;
       }
       if (queue.size() >= queueCapacity) {

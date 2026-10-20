@@ -41,8 +41,8 @@ class RevealedSetTest {
     RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
     ChunkKey key = chunk(0, 0);
 
-    revealed.mark(PLAYER, key, 1, 64, 1);
-    revealed.mark(PLAYER, key, 2, 64, 1);
+    revealed.markIfAbsent(PLAYER, key, 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, key, 2, 64, 1);
 
     assertTrue(revealed.contains(PLAYER, key, 1, 64, 1));
     assertEquals(2, revealed.sizeFor(PLAYER, key));
@@ -55,8 +55,8 @@ class RevealedSetTest {
   void marksAreScopedByChunk() {
     RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
 
-    revealed.mark(PLAYER, chunk(0, 0), 1, 64, 1);
-    revealed.mark(PLAYER, chunk(1, 0), 17, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(1, 0), 17, 64, 1);
 
     assertEquals(1, revealed.sizeFor(PLAYER, chunk(0, 0)));
     assertEquals(1, revealed.sizeFor(PLAYER, chunk(1, 0)));
@@ -68,8 +68,8 @@ class RevealedSetTest {
     RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
     ChunkKey key = chunk(0, 0);
 
-    revealed.mark(PLAYER, key, 7, 33, 7);
-    revealed.mark(PLAYER, key, 7, 33, 7);
+    revealed.markIfAbsent(PLAYER, key, 7, 33, 7);
+    revealed.markIfAbsent(PLAYER, key, 7, 33, 7);
 
     assertEquals(1, revealed.sizeFor(PLAYER, key));
   }
@@ -78,9 +78,9 @@ class RevealedSetTest {
   void removePositionDropsOnlyThatMark() {
     RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
     ChunkKey key = chunk(0, 0);
-    revealed.mark(PLAYER, key, 1, 64, 1);
-    revealed.mark(PLAYER, key, 2, 64, 1);
-    revealed.mark(OTHER_PLAYER, key, 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, key, 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, key, 2, 64, 1);
+    revealed.markIfAbsent(OTHER_PLAYER, key, 1, 64, 1);
 
     revealed.removePosition(WORLD, 1, 64, 1);
 
@@ -95,12 +95,12 @@ class RevealedSetTest {
   void removePositionsDropsBatchAndKeepsCountConsistent() {
     RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
     ChunkKey key = chunk(0, 0);
-    revealed.mark(PLAYER, key, 1, 64, 1);
-    revealed.mark(PLAYER, key, 2, 64, 1);
-    revealed.mark(PLAYER, key, 3, 64, 1);
-    revealed.mark(OTHER_PLAYER, key, 1, 64, 1);
-    revealed.mark(OTHER_PLAYER, key, 2, 64, 1);
-    revealed.mark(OTHER_PLAYER, key, 3, 64, 1);
+    revealed.markIfAbsent(PLAYER, key, 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, key, 2, 64, 1);
+    revealed.markIfAbsent(PLAYER, key, 3, 64, 1);
+    revealed.markIfAbsent(OTHER_PLAYER, key, 1, 64, 1);
+    revealed.markIfAbsent(OTHER_PLAYER, key, 2, 64, 1);
+    revealed.markIfAbsent(OTHER_PLAYER, key, 3, 64, 1);
 
     // 含一个不在集合里的坐标（9,64,9）：不得影响计数
     int[] batch = {1, 64, 1, 2, 64, 1, 9, 64, 9};
@@ -120,9 +120,9 @@ class RevealedSetTest {
   @Test
   void clearChunkClearsEveryPlayerOfThatChunk() {
     RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
-    revealed.mark(PLAYER, chunk(0, 0), 1, 64, 1);
-    revealed.mark(OTHER_PLAYER, chunk(0, 0), 1, 64, 1);
-    revealed.mark(PLAYER, chunk(1, 0), 17, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 1, 64, 1);
+    revealed.markIfAbsent(OTHER_PLAYER, chunk(0, 0), 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(1, 0), 17, 64, 1);
 
     revealed.clearChunk(chunk(0, 0));
 
@@ -135,11 +135,11 @@ class RevealedSetTest {
   @Test
   void clearPlayerAndWorldAreScoped() {
     RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
-    revealed.mark(PLAYER, chunk(0, 0), 1, 64, 1);
-    revealed.mark(OTHER_PLAYER, chunk(0, 0), 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 1, 64, 1);
+    revealed.markIfAbsent(OTHER_PLAYER, chunk(0, 0), 1, 64, 1);
     // 其它世界的存活标记必须记在「不会被 clearPlayer 清掉」的玩家上，否则下面的世界作用域断言无意义：
     // clearPlayer(PLAYER) 会按契约清掉 PLAYER 在所有世界的标记（含 world_nether）。
-    revealed.mark(OTHER_PLAYER, new ChunkKey("world_nether", 0, 0), 1, 64, 1);
+    revealed.markIfAbsent(OTHER_PLAYER, new ChunkKey("world_nether", 0, 0), 1, 64, 1);
 
     revealed.clearPlayer(PLAYER);
     assertEquals(0, revealed.sizeFor(PLAYER, chunk(0, 0)), "只清理该玩家");
@@ -158,8 +158,8 @@ class RevealedSetTest {
   void markersExpireUnlessTouched() {
     long window = 10 * SECOND_NANOS;
     RevealedSet revealed = revealed(1024, window);
-    revealed.mark(PLAYER, chunk(0, 0), 1, 64, 1);
-    revealed.mark(PLAYER, chunk(1, 0), 17, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(1, 0), 17, 64, 1);
 
     clock[0] = 9 * SECOND_NANOS;
     revealed.expire();
@@ -183,14 +183,14 @@ class RevealedSetTest {
   void clearChunkResetsPlayerTotalForSafetyValve() {
     RevealedSet revealed = revealed(2, 60 * SECOND_NANOS);
 
-    revealed.mark(PLAYER, chunk(0, 0), 1, 64, 1);
-    revealed.mark(PLAYER, chunk(0, 0), 2, 64, 1);
-    revealed.mark(PLAYER, chunk(0, 0), 3, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 2, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 3, 64, 1);
     assertEquals(1L, revealed.droppedByCapacity(), "单玩家安全阀触发必须可诊断");
     assertEquals(2, revealed.sizeFor(PLAYER, chunk(0, 0)));
 
     revealed.clearChunk(chunk(0, 0));
-    revealed.mark(PLAYER, chunk(0, 0), 3, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 3, 64, 1);
     assertEquals(1, revealed.sizeFor(PLAYER, chunk(0, 0)), "清理后计数归零，可以重新标记");
   }
 
@@ -204,9 +204,9 @@ class RevealedSetTest {
     RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
     ChunkKey key = chunk(0, 0);
 
-    revealed.mark(PLAYER, key, 1, 64, 1);
-    revealed.mark(PLAYER, key, 2, 64, 1);
-    revealed.mark(PLAYER, key, 2, 64, 1); // 重复标记不计入累计登记
+    revealed.markIfAbsent(PLAYER, key, 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, key, 2, 64, 1);
+    revealed.markIfAbsent(PLAYER, key, 2, 64, 1); // 重复标记不计入累计登记
 
     assertEquals(2L, revealed.registeredTotal(), "只统计真正新登记的坐标（去重不重复计数）");
     assertEquals(2, revealed.positionCount(), "实时坐标数与累计登记一致（尚未清理）");
@@ -221,8 +221,8 @@ class RevealedSetTest {
   void registeredTotalIgnoresCapacityDropsAndChunkInvalidation() {
     RevealedSet revealed = revealed(1, 60 * SECOND_NANOS);
 
-    revealed.mark(PLAYER, chunk(0, 0), 1, 64, 1);
-    revealed.mark(PLAYER, chunk(0, 0), 2, 64, 1); // 触发安全阀，未登记
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 2, 64, 1); // 触发安全阀，未登记
 
     assertEquals(1L, revealed.droppedByCapacity());
     assertEquals(1L, revealed.registeredTotal(), "被安全阀放弃的坐标不得计入累计登记");
@@ -238,7 +238,7 @@ class RevealedSetTest {
     RevealedSet revealed = revealed(524288, 300 * SECOND_NANOS);
     for (int chunk = 0; chunk < 49; chunk++) {
       for (int i = 0; i < 404; i++) {
-        revealed.mark(PLAYER, chunk(chunk % 7, chunk / 7), i & 15, 64 + (i >> 8), i >> 4 & 15);
+        revealed.markIfAbsent(PLAYER, chunk(chunk % 7, chunk / 7), i & 15, 64 + (i >> 8), i >> 4 & 15);
       }
     }
 
@@ -256,7 +256,7 @@ class RevealedSetTest {
     ChunkKey key = chunk(0, 0);
     int count = 1500;
     for (int i = 0; i < count; i++) {
-      revealed.mark(PLAYER, key, i & 15, i >> 4, i % 7);
+      revealed.markIfAbsent(PLAYER, key, i & 15, i >> 4, i % 7);
     }
     assertEquals(count, revealed.sizeFor(PLAYER, key), "扩容后不得丢条目");
 
@@ -293,7 +293,7 @@ class RevealedSetTest {
             start.await();
             for (int i = 0; i < perThread; i++) {
               int v = base + i;
-              revealed.mark(PLAYER, key, v & 15, v >> 4, 0);
+              revealed.markIfAbsent(PLAYER, key, v & 15, v >> 4, 0);
               assertTrue(revealed.contains(PLAYER, key, v & 15, v >> 4, 0),
                   "同线程内标记后必须立即可见：v=" + v);
             }
@@ -344,7 +344,7 @@ class RevealedSetTest {
           try {
             for (int i = 0; i < perThread; i++) {
               int v = base + i;
-              revealed.mark(PLAYER, chunk(v % keys, 0), v & 15, v >> 4 & 15, v & 7);
+              revealed.markIfAbsent(PLAYER, chunk(v % keys, 0), v & 15, v >> 4 & 15, v & 7);
             }
           } catch (Throwable throwable) {
             failure.compareAndSet(null, throwable);
@@ -414,7 +414,7 @@ class RevealedSetTest {
               int x = (v & 31) - 16;
               int z = (v >> 5 & 31) - 16;
               int y = (v >> 10) & 255;
-              revealed.mark(PLAYER, ChunkKey.ofBlock(WORLD, x, z), x, y, z);
+              revealed.markIfAbsent(PLAYER, ChunkKey.ofBlock(WORLD, x, z), x, y, z);
             }
           } catch (Throwable throwable) {
             failure.compareAndSet(null, throwable);

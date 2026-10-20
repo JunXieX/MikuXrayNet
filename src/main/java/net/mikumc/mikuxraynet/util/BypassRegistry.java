@@ -66,8 +66,10 @@ public final class BypassRegistry implements Listener {
    *
    * <p><b>幂等且清理前一实例</b>：注册成功后，先停用「当前活动实例」（若不同）再接管，最后做一次性快照。
    * 若当前活动实例正是本实例（重复 {@code start()}），直接返回，避免重复注册监听。
-   * （当前装配在每次插件启用时只 {@code new + start} 一次，生产路径不会命中「换实例接管」分支；
-   * 该分支保留是因为 {@code start()} 的公开契约允许复用，且已有单测覆盖其清理语义。）
+   * （当前装配在每次插件启用时只 {@code new + start} 一次，<b>生产路径不会命中</b>「换实例接管」分支；
+   * 保留该分支是因为其语义仍由两条单测守门——{@code startCleansUpPreviousInstance}（换实例必须清理前
+   * 一实例的名单与监听）与 {@code failedRegistrationKeepsPreviousActiveInsteadOfFailClosed}
+   * （注册失败不得把可用名单打成 fail-closed）；删掉会丢失这份契约。）
    *
    * @return {@code true} 表示本实例已注册监听并成为活动名单（可继续用于直通判定）；
    *         {@code false} 表示注册失败、本实例未接管（此时 {@code active} 仍是原实例或为 null）。

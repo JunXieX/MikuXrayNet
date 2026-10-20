@@ -32,6 +32,13 @@ import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
  * 这样静止玩家（占绝大多数）每 tick 只剩一次 CHM 读，省下每秒每玩家一次记录分配与写操作。
  * 判据是<b>同一枚</b> {@link #blockCoordinate} 纯函数同时供写入侧（是否重发）与判定侧（算距离）使用，
  * 两侧不可能漂移。
+ *
+ * <p><b>黑名单世界的坐标捕获</b>：黑名单世界不做任何带宽优化，因此
+ * {@link #refreshWorldOnly} 只维护「当前世界」而<b>跳过坐标读取</b>（省掉每 tick 三次 getter 与三次
+ * floor 比较）。该分支下坐标被标记为未知（{@link Position#positionKnown()} = false），
+ * {@link #immediatePass} 据此 fail-open（按近身立即放行），绝不拿一个与当前世界无关的旧坐标去算距离。
+ * 「当前世界」仍每 tick 维护，因为跨世界丢弃（切维事件 / 位置快照比对 / 封包线程守卫）全靠它判定。
+ * 切出黑名单世界后调用方改回 {@link #refresh}，下一次刷新即恢复精确坐标。
  */
 final class PlayerPositionSnapshots {
 
@@ -45,8 +52,12 @@ final class PlayerPositionSnapshots {
    *
    * <p>世界名由<b>拥有该玩家的线程</b>读取后写入，封包线程只读这份快照——与坐标同一纪律，绝不跨线程读
    * {@code Player#getWorld()}。
+   *
+   * <p><b>{@code positionKnown}</b>：坐标是否可信。黑名单世界里坐标捕获被有意跳过
+   * （见 {@link #refreshWorldOnly}），此时该字段为 {@code false}、三个坐标字段无意义；读取侧必须按
+   * fail-open 处理（按近身立即放行），绝不能拿它算距离。
    */
-  record Position(String world, double x, double y, double z) {
+  record Position(String world, double x, double y, double z, boolean positionKnown) {
   }
 
   private final ConcurrentHashMap<UUID, Position> positions = new ConcurrentHashMap<>();
@@ -63,7 +74,9 @@ final class PlayerPositionSnapshots {
       return null;
     }
     Position current = positions.get(playerId);
-    if (current != null && Objects.equals(current.world(), world)
+    // positionKnown 必须一起判：黑名单世界留下的「世界名相同但坐标未知」快照不能被当成「坐标未变」而
+    // 跳过发布，否则切出黑名单世界后坐标会一直是未知、近身判定永远 fail-open。
+    if (current != null && current.positionKnown() && Objects.equals(current.world(), world)
         && blockCoordinate(current.x()) == blockCoordinate(x)
         && blockCoordinate(current.y()) == blockCoordinate(y)
         && blockCoordinate(current.z()) == blockCoordinate(z)) {
@@ -71,7 +84,27 @@ final class PlayerPositionSnapshots {
       // 返回当前世界名（= world）：调用方只据此判断「世界是否变化」，此处不得触发丢弃。
       return current.world();
     }
-    positions.put(playerId, new Position(world, x, y, z));
+    positions.put(playerId, new Position(world, x, y, z, true));
+    return current == null ? null : current.world();
+  }
+
+  /**
+   * 只刷新「当前世界」、<b>不读取也不更新坐标</b>（黑名单世界专用，见类注释）。
+   *
+   * <p>世界未变且坐标本已标记为未知时不发布（每 tick 零分配、零写入）；世界变化、或坐标由「已知」
+   * 转「未知」时发布一次。调用方在离开黑名单世界后改回 {@link #refresh}，即可恢复精确坐标。
+   *
+   * @return <b>刷新前</b>快照的世界名（原本没有快照时为 {@code null}），与 {@link #refresh} 语义一致
+   */
+  String refreshWorldOnly(UUID playerId, String world) {
+    if (playerId == null) {
+      return null;
+    }
+    Position current = positions.get(playerId);
+    if (current != null && !current.positionKnown() && Objects.equals(current.world(), world)) {
+      return current.world();
+    }
+    positions.put(playerId, new Position(world, 0.0D, 0.0D, 0.0D, false));
     return current == null ? null : current.world();
   }
 
@@ -121,6 +154,11 @@ final class PlayerPositionSnapshots {
     }
     if (snapshot == null) {
       // fail-open：无快照 → 按近身处理（宁可少合并，绝不制造延迟）
+      return true;
+    }
+    if (!snapshot.positionKnown()) {
+      // 坐标未知（该玩家此前处于黑名单世界、坐标捕获被有意跳过）：与「无快照」同一 fail-open 方向。
+      // 绝不拿一个与当前世界无关的旧坐标去算距离（那会把近身变更误判为远、白吃一个合并窗口的延迟）。
       return true;
     }
     return BlockChangeBatch.anyWithinRadius(updates, blockCoordinate(snapshot.x()),

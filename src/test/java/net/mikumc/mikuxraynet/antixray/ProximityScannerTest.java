@@ -48,7 +48,7 @@ class ProximityScannerTest {
   private static void revealAll(List<ObfuscatedChunkIndex.Position> candidates, RevealedSet revealed,
       UUID player) {
     for (ObfuscatedChunkIndex.Position position : candidates) {
-      revealed.mark(player, ChunkKey.ofBlock(WORLD, position.x(), position.z()),
+      revealed.markIfAbsent(player, ChunkKey.ofBlock(WORLD, position.x(), position.z()),
           position.x(), position.y(), position.z());
     }
   }
@@ -73,8 +73,8 @@ class ProximityScannerTest {
     ObfuscatedChunkIndex index = index();
     RevealedSet revealed = revealed();
     // 玩家在 (8,64,8)（区块 0,0），distance=16 → 半径 1（只应有区块 -1..1）
-    index.recordChunk(WORLD, 1, 0, MIN_HEIGHT, new int[] {local(16, 64, 8)});
-    index.recordChunk(WORLD, 2, 0, MIN_HEIGHT, new int[] {local(32, 64, 8)});
+    index.recordChunkWithRemovals(WORLD, 1, 0, MIN_HEIGHT, new int[] {local(16, 64, 8)});
+    index.recordChunkWithRemovals(WORLD, 2, 0, MIN_HEIGHT, new int[] {local(32, 64, 8)});
 
     ProximityScanner.Tally tally = new ProximityScanner.Tally();
     List<ObfuscatedChunkIndex.Position> found = scan(index, revealed, PLAYER, 16.0D, 64, tally);
@@ -90,8 +90,8 @@ class ProximityScannerTest {
     ObfuscatedChunkIndex index = index();
     RevealedSet revealed = revealed();
     // 48 格 → 半径 3：区块 3 在半径内、区块 4 在半径外
-    index.recordChunk(WORLD, 3, 0, MIN_HEIGHT, new int[] {local(48, 64, 8)});
-    index.recordChunk(WORLD, 4, 0, MIN_HEIGHT, new int[] {local(64, 64, 8)});
+    index.recordChunkWithRemovals(WORLD, 3, 0, MIN_HEIGHT, new int[] {local(48, 64, 8)});
+    index.recordChunkWithRemovals(WORLD, 4, 0, MIN_HEIGHT, new int[] {local(64, 64, 8)});
 
     ProximityScanner.Tally tally = new ProximityScanner.Tally();
     List<ObfuscatedChunkIndex.Position> found = scan(index, revealed, PLAYER, 48.0D, 64, tally);
@@ -105,7 +105,7 @@ class ProximityScannerTest {
   void distanceBoundaryIsInclusive() {
     ObfuscatedChunkIndex index = index();
     RevealedSet revealed = revealed();
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {
         local(8, 64, 8),   // 距离 0
         local(8, 72, 8),   // 距离恰好 8（含等于必须命中）
         local(8, 73, 8)});  // 距离 9（必须排除）；注意仍落在区块 0 内，用于验证「含等号」而非半径
@@ -123,7 +123,7 @@ class ProximityScannerTest {
   void wholeRevealedChunkIsSkipped() {
     ObfuscatedChunkIndex index = index();
     RevealedSet revealed = revealed();
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
 
     ProximityScanner.Tally first = new ProximityScanner.Tally();
     List<ObfuscatedChunkIndex.Position> candidates = scan(index, revealed, PLAYER, 16.0D, 64, first);
@@ -144,7 +144,7 @@ class ProximityScannerTest {
   void partiallyRevealedChunkStillYieldsTheRest() {
     ObfuscatedChunkIndex index = index();
     RevealedSet revealed = revealed();
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT,
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT,
         new int[] {local(1, 64, 1), local(2, 64, 1), local(3, 64, 1)});
 
     List<ObfuscatedChunkIndex.Position> first = scan(index, revealed, PLAYER, 16.0D, 2, null);
@@ -167,7 +167,7 @@ class ProximityScannerTest {
     ObfuscatedChunkIndex index = index();
     RevealedSet revealed = revealed();
     ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT,
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT,
         new int[] {local(1, 64, 1), local(2, 64, 1), local(3, 64, 1)});
 
     int sent = 0;
@@ -197,7 +197,7 @@ class ProximityScannerTest {
     long window = 10 * SECOND_NANOS;
     ObfuscatedChunkIndex index = new ObfuscatedChunkIndex(1_000_000, 300 * SECOND_NANOS, () -> clock[0]);
     RevealedSet revealed = new RevealedSet(1_000_000, window, () -> clock[0]);
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
 
     // t=0 显形；t=9s（窗口内）再巡检一次 → 该区块已被整块跳过，但活跃时间必须同时被刷新
     revealAll(scan(index, revealed, PLAYER, 16.0D, 64, null), revealed, PLAYER);
@@ -229,7 +229,7 @@ class ProximityScannerTest {
     ObfuscatedChunkIndex index = index();
     RevealedSet revealed = revealed();
     ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT,
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT,
         new int[] {local(1, 64, 1), local(2, 64, 1), local(3, 64, 1)});
     revealAll(scan(index, revealed, PLAYER, 16.0D, 64, null), revealed, PLAYER);
     assertEquals(index.entry(key).size(), revealed.sizeFor(PLAYER, key), "开始前必须整块显形");
@@ -240,7 +240,7 @@ class ProximityScannerTest {
     assertEquals(index.entry(key).size(), revealed.sizeFor(PLAYER, key));
 
     // 维护点②：ProtocolLibAsyncListener#writeBack 的真实顺序（先 recordChunk，再 clearChunk）
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(2, 64, 1), local(3, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(2, 64, 1), local(3, 64, 1)});
     revealed.clearChunk(key);
     assertTrue(revealed.sizeFor(PLAYER, key) <= index.entry(key).size(),
         "已显形坐标不得多于区块清单");
@@ -273,7 +273,7 @@ class ProximityScannerTest {
     int d = local(4, 64, 1);
 
     // 旧清单 {A,B,C}，另一玩家（非接收者）已整块显形
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {a, b, c});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {a, b, c});
     revealAll(scan(index, revealed, OTHER_PLAYER, 16.0D, 64, null), revealed, OTHER_PLAYER);
     assertEquals(3, revealed.sizeFor(OTHER_PLAYER, key), "前置：另一玩家整块显形");
 
@@ -334,8 +334,8 @@ class ProximityScannerTest {
           assertEquals(local, reencoded, "绝对→局部重编码必须还原原值");
 
           // 端到端：登记 → 转换 → 摘除，标记必须被命中
-          index.recordChunk(WORLD, chunkX, chunkZ, MIN_HEIGHT, new int[] {local});
-          revealed.mark(OTHER_PLAYER, ChunkKey.ofBlock(WORLD, absX, absZ), absX, absY, absZ);
+          index.recordChunkWithRemovals(WORLD, chunkX, chunkZ, MIN_HEIGHT, new int[] {local});
+          revealed.markIfAbsent(OTHER_PLAYER, ChunkKey.ofBlock(WORLD, absX, absZ), absX, absY, absZ);
           int[] converted = ProtocolLibAsyncListener.toAbsoluteCoordinates(
               chunkX, chunkZ, MIN_HEIGHT, new int[] {local});
           revealed.removePositions(WORLD, converted, 1);
@@ -353,7 +353,7 @@ class ProximityScannerTest {
   void revealedCoordinatesAreNotSharedAcrossPlayers() {
     ObfuscatedChunkIndex index = index();
     RevealedSet revealed = revealed();
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
 
     revealAll(scan(index, revealed, PLAYER, 16.0D, 64, null), revealed, PLAYER);
 
@@ -367,7 +367,7 @@ class ProximityScannerTest {
   void nearestCoordinatesComeFirst() {
     ObfuscatedChunkIndex index = index();
     RevealedSet revealed = revealed();
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT,
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT,
         new int[] {local(8, 64, 11), local(8, 64, 9), local(8, 64, 12)});
 
     List<ObfuscatedChunkIndex.Position> found = scan(index, revealed, PLAYER, 16.0D, 64, null);
@@ -409,7 +409,7 @@ class ProximityScannerTest {
     RevealedSet revealed = revealed();
     Set<ObfuscatedChunkIndex.Position> expected = new HashSet<>();
     for (int[] block : chunkOfShard.values()) {
-      index.recordChunk(WORLD, block[0] >> 4, block[1] >> 4, MIN_HEIGHT,
+      index.recordChunkWithRemovals(WORLD, block[0] >> 4, block[1] >> 4, MIN_HEIGHT,
           new int[] {local(block[0], 64, block[1])});
       expected.add(new ObfuscatedChunkIndex.Position(block[0], 64, block[1]));
     }
@@ -431,7 +431,7 @@ class ProximityScannerTest {
     Set<ObfuscatedChunkIndex.Position> all = new HashSet<>();
     for (int chunkX = -1; chunkX <= 1; chunkX++) {
       for (int chunkZ = -1; chunkZ <= 1; chunkZ++) {
-        index.recordChunk(WORLD, chunkX, chunkZ, MIN_HEIGHT,
+        index.recordChunkWithRemovals(WORLD, chunkX, chunkZ, MIN_HEIGHT,
             new int[] {local((chunkX << 4) + 1, 64, (chunkZ << 4) + 1),
                 local((chunkX << 4) + 2, 64, (chunkZ << 4) + 1)});
         all.add(new ObfuscatedChunkIndex.Position((chunkX << 4) + 1, 64, (chunkZ << 4) + 1));
@@ -504,7 +504,7 @@ class ProximityScannerTest {
     ObfuscatedChunkIndex index = index();
     RevealedSet revealed = revealed();
     // 同一区块两个坐标：一个正好在 maxDistance=8 内（距离 0），一个明显在外（距离 9）
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT,
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT,
         new int[] {local(8, 64, 8), local(8, 73, 8)});
 
     ProximityScanner.Tally tally = new ProximityScanner.Tally();

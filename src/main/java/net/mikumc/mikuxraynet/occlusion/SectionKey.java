@@ -106,6 +106,21 @@ public final class SectionKey {
   }
 
   /**
+   * 每线程复用的列键缓冲（{@link #SECTION_Y_COUNT} 个 long，共 2 KB）。
+   *
+   * <p><b>为什么复用而不是每次分配</b>：{@link #columnKeys} 的唯一生产调用方是
+   * {@code OcclusionStore#removeColumn}（区块卸载，跑在主线程 / Folia 区域线程上）；玩家高速移动时
+   * 每秒可达数十次卸载，每次 {@code new long[256]} 就是 2 KB 纯可避免的短命分配。缓冲内容每次都会被
+   * 完整覆盖（循环写满 256 个槽位），因此复用不会残留上一次调用的旧值。
+   *
+   * <p><b>为什么必须是线程本地</b>：卸载可能在主线程与多个区域线程上并发发生，共享一个缓冲会互相覆盖；
+   * 反过来，一个线程的缓冲也<b>不得</b>交给另一个线程使用（见 {@link #columnKeys} 的返回约定）。
+   * 2 KB/线程 的常驻成本可忽略，故不需要额外的清理入口（对比 {@code ChunkScratch} 的 MB 级缓冲才需要）。
+   */
+  private static final ThreadLocal<long[]> COLUMN_KEYS =
+      ThreadLocal.withInitial(() -> new long[SECTION_Y_COUNT]);
+
+  /**
    * 生成某水平列上全部 section 的键，用于整列摘除（区块卸载）。
    *
    * <p><b>为什么从 sectionY = 0 起步而不是 {@link #SECTION_Y_MIN}</b>：键的 sectionY 字段只有 8 位，
@@ -115,11 +130,15 @@ public final class SectionKey {
    *
    * <p>因此返回的数组<b>顺序是 0,1,…,127,-128,…,−1</b>（不是按 sectionY 数值升序），
    * 元素本身互不相同、且并集恰好是全部 256 个可表示 sectionY。
+   *
+   * @implNote 返回的是<b>当前线程复用的缓冲</b>（不是新数组）：下一次在本线程调用本方法会覆盖其内容，
+   *     因此调用方必须<b>立即消费</b>、不得保存引用或跨线程传递。当前唯一生产调用方在方法体内同步消费，
+   *     单测若需保留旧结果请先 {@code clone()}。
    */
   public static long[] columnKeys(int chunkX, int chunkZ) {
     checkHorizontal(chunkX, "chunkX");
     checkHorizontal(chunkZ, "chunkZ");
-    long[] keys = new long[SECTION_Y_COUNT];
+    long[] keys = COLUMN_KEYS.get();
     long key = packUnchecked(chunkX, 0, chunkZ);
     for (int i = 0; i < SECTION_Y_COUNT; i++) {
       keys[i] = key;

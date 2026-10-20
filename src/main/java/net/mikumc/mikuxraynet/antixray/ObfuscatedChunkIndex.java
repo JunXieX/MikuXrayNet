@@ -21,7 +21,7 @@ import java.util.function.LongSupplier;
  * 由 {@code ChunkUnloadEvent} 驱动，<b>这是唯一的回收路径</b>——{@link #expire} 仍保留但生产路径
  * 已不再调用，见其说明）；③ 该区块观测到方块变更
  * （{@link #removePosition}，出站方块变更封包路径，只摘除变更的那一个坐标，与既有行为一致）；
- * ④ 区块被重新下发（{@link #recordChunk} 直接覆盖该区块条目）。
+ * ④ 区块被重新下发（{@link #recordChunkWithRemovals} 直接覆盖该区块条目）。
  *
  * <p><b>共享索引的影响面（既有设计，非 bug）</b>：本索引按区块共享一份，而「方块变更 → 摘除该坐标」
  * 也发生在这一份上。因此<b>显形即摘除对其它玩家也有影响</b>——玩家 A 挖开某矿（或邻近显形把某坐标
@@ -116,26 +116,6 @@ public final class ObfuscatedChunkIndex {
   private static final int[] NO_REMOVALS = new int[0];
 
   /**
-   * 记录/覆盖一个区块的被伪装坐标（区块封包改写路径，工作线程调用）。
-   *
-   * <p>无论哪个玩家触发的改写，都只是覆盖这一条——同一区块只存一份，内存不随玩家数增长。
-   * 传入数组是改写结果里的数组（此后不再被修改），直接共享、不复制。
-   *
-   * <p>覆盖会改变清单内容，因此<b>需要同步维护各玩家已显形标记</b>的调用方应改用
-   * {@link #recordChunkWithRemovals}（见其说明）；本方法保持原语义，仅供「不关心移除差集」的
-   * 调用方与单测使用。
-   *
-   * @param minHeight      该世界最低建筑高度
-   * @param localPositions 区块内相对坐标，编码为 {@code 区块内相对Y << 8 | z << 4 | x}
-   * @return 真正记录下来的坐标数（空清单返回 0，不建条目）
-   */
-  public int recordChunk(String worldName, int chunkX, int chunkZ, int minHeight,
-      int[] localPositions) {
-    int[] removed = recordChunkInternal(worldName, chunkX, chunkZ, minHeight, localPositions, null);
-    return removed == null ? 0 : localPositions.length;
-  }
-
-  /**
    * 记录/覆盖，并返回「本次覆盖<b>移除掉</b>的旧坐标」（同为区块内相对坐标编码）。
    *
    * <p><b>为什么需要移除差集</b>：覆盖共享索引条目后，其它玩家在「已被移出清单的坐标」上的已显形
@@ -216,7 +196,7 @@ public final class ObfuscatedChunkIndex {
       return null;
     }
     ChunkEntry entry = new ChunkEntry(minHeight, localPositions, clock.getAsLong());
-    // 用 compute 原子地「取旧值 + 装新值」：旧实现先 put 再另算 delta，同键并发 recordChunk 时
+    // 用 compute 原子地「取旧值 + 装新值」：旧实现先 put 再另算 delta，同键并发 recordChunkInternal 时
     // 两个线程可能读到同一个旧条目，导致 totalPositions 被重复加减（只影响安全阀诊断口径，
     // 且已夹在 0 以上；这里改为原子口径，与 RevealedSet 的计数纪律对齐）。
     // 移除差集同样在 compute 内算：与覆盖原子生效，并发覆盖不会拿到过期的旧清单去算差集。
@@ -330,7 +310,7 @@ public final class ObfuscatedChunkIndex {
       // 唯一的生产写入方 ObfuscationProcessor#rewrite 按「section 升序 → 段内 index 升序」逐个登记，
       // 编码 {@code 相对Y << 8 | z << 4 | x} 随遍历严格递增；摘除一个元素（保持其余相对顺序）
       // 与重新 recordChunk（整表替换）都不破坏有序性。原线性查找 O(n) 改为二分 O(log n)。
-      // 注意：recordChunk 是公开 API、不校验顺序——若有外部调用方传入无序数组，二分可能漏摘
+      // 注意：recordChunkWithRemovals 是公开 API、不校验顺序——若有外部调用方传入无序数组，二分可能漏摘
       // （返回 false，即「未命中」），本项目内不存在这样的调用方。
       int found = Arrays.binarySearch(locals, local);
       if (found < 0) {

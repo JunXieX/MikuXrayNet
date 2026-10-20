@@ -384,14 +384,21 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * <p>刻意不用 {@code getLocation()}——那会每 tick 每玩家 new 一个 {@code Location}。
    * 读取或写入异常只丢弃该玩家的快照（读取侧随即 fail-open，下一 tick 自动重建），
    * 任务句柄仍保留以便退出/停用时正常取消，且绝不把异常抛回调度器。
+   *
+   * <p><b>黑名单世界只维护世界名</b>：黑名单世界不做任何带宽优化，连坐标都不必读；但「当前世界」必须
+   * 继续每 tick 写进快照，否则跨世界丢弃（切维事件 / 本方法比对 / 封包线程守卫）全部失效。因此该分支走
+   * {@link PlayerPositionSnapshots#refreshWorldOnly}（坐标标记为未知、近身判定 fail-open）；切出黑名单
+   * 世界后自动回到下面的正常分支，下一次刷新即恢复坐标捕获。
    */
   private void refreshPosition(Player player, UUID playerId) {
     try {
       // 世界名必须与坐标在同一线程（拥有该玩家的线程）读取后一起写进快照：封包线程只读快照，
       // 绝不自己调 player.getWorld()（Folia 上那是跨区域读实体状态）。
       String worldName = player.getWorld().getName();
-      String previousWorld = positions.refresh(playerId, worldName, player.getX(), player.getY(),
-          player.getZ());
+      // 黑名单世界跳过坐标读取（省掉每 tick 三次 getter + 三次 floor 比较），只更新世界名。
+      String previousWorld = WorldBlacklistConfig.isBlacklistedNow(worldName)
+          ? positions.refreshWorldOnly(playerId, worldName)
+          : positions.refresh(playerId, worldName, player.getX(), player.getY(), player.getZ());
       // 跨世界切换：立即丢弃旧世界的待发缓冲。只靠封包路径的跨世界守卫会漏掉「切维之后不再有旧世界
       // 方块包到达」的情形——那种情形下窗口定时器到期仍会把旧世界坐标发进新世界（鬼影方块）。
       if (previousWorld != null && !previousWorld.equals(worldName)) {
@@ -593,6 +600,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       if (timer != null) {
         timer.cancel(false);
       }
+      // 口径：这次被<b>整批丢弃</b>的原包数（切维 / 黑名单切换）。本方法结构上没有任何发包入口，
+      // 因此 CAS 成功时拿到多少个 Held，就是「既未下发、也未合并」的多少个原包。
+      stats.blockChangesDiscarded.add(held.size());
       if (held.isEmpty()) {
         return;
       }

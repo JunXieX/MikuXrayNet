@@ -76,7 +76,7 @@ class OverRevealSamplingTest {
     int z = 10;
 
     assertFalse(revealed.contains(player, key, x, y, z), "未显形过：显形包不算浪费");
-    revealed.mark(player, key, x, y, z);
+    revealed.markIfAbsent(player, key, x, y, z);
     assertTrue(revealed.contains(player, key, x, y, z),
         "已显形（未注销）时再发包 = 过度显形（抽样计数口径）");
     revealed.removePosition(world, x, y, z);

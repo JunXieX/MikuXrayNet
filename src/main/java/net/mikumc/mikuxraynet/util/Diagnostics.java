@@ -41,8 +41,10 @@ import org.bukkit.Bukkit;
  * 被执行、以及周期运行摘要（{@link #summaryLine()}）定时触发时做一次拉取与字符串拼接，
  * 不在封包热路径上做任何统计工作。
  *
- * <p><b>可测</b>：状态/转储的格式化是纯函数 {@link #formatStatus(Snapshot)} /
- * {@link #formatDump(Snapshot, String)}，可给定固定计数直接断言输出；实例方法只负责拉取实时快照。
+ * <p><b>可测</b>：状态/转储的格式化是<b>静态方法</b>（{@link #formatStatus(Snapshot)} /
+ * {@link #formatDump(Snapshot, String)}），可给定固定 {@link Snapshot} 直接断言输出；实例方法只负责
+ * 拉取实时快照。注意它们会读少量<b>进程级静态状态</b>（活动黑名单、平台判定、依赖存在性），
+ * 因此对同一份 {@code Snapshot} 的输出并非严格确定——不是纯函数，详见各自 javadoc。
  */
 public final class Diagnostics {
 
@@ -243,6 +245,7 @@ public final class Diagnostics {
         long entityMovePackets, long entityMoveRotPackets, long entityLookPackets,
         long entityMoveShapeMismatch,
         long blockMergeBatches, long blockChangesMerged, long blockChangesPassed,
+        long blockChangesDiscarded,
         long entitiesHidden, long entitiesShown, int entitiesHiddenNow,
         long recheckSubmitted, long recheckHidden, long recheckShown,
         long frustumHidden, long frustumShown,
@@ -268,7 +271,7 @@ public final class Diagnostics {
           long blockMergeFlushes, long blockMergeFlushNanos) {
         this(entityPacketsCancelled, entityPacketsPassed, entityMovePackets, entityMoveRotPackets,
             entityLookPackets, entityMoveShapeMismatch, blockMergeBatches, blockChangesMerged,
-            blockChangesPassed, entitiesHidden, entitiesShown, entitiesHiddenNow, recheckSubmitted,
+            blockChangesPassed, 0L, entitiesHidden, entitiesShown, entitiesHiddenNow, recheckSubmitted,
             recheckHidden, recheckShown, frustumHidden, frustumShown, afkPlayers, afkEntered,
             afkPacketsDropped, viewDistanceReduced, viewDistanceRestored, blockMergeFlushes,
             blockMergeFlushNanos, false);
@@ -276,8 +279,8 @@ public final class Diagnostics {
 
       /** 带宽优化未启用时的零值兜底。 */
       public static final Throttle EMPTY = new Throttle(
-          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L,
-          false);
+          0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0,
+          0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, false);
     }
 
     /** 工作线程池域：线程数、活动数与队列占用。 */
@@ -497,6 +500,7 @@ public final class Diagnostics {
             throttleStats.entityLookPackets.sum(), throttleStats.entityMoveShapeMismatch.sum(),
             throttleStats.blockMergeBatches.sum(),
             throttleStats.blockChangesMerged.sum(), throttleStats.blockChangesPassed.sum(),
+            throttleStats.blockChangesDiscarded.sum(),
             throttleStats.entitiesHidden.sum(), throttleStats.entitiesShown.sum(),
             pipeline.hiddenEntityCount(), throttleStats.recheckSubmitted.sum(),
             throttleStats.recheckHidden.sum(), throttleStats.recheckShown.sum(),
@@ -684,7 +688,10 @@ public final class Diagnostics {
     // 写入被拒 > 0 说明容量/单文件上限在拦（新区块没进缓存），异常 > 0 见日志。
     // 「命中」写的是「读到条目」，与「有效命中」分列：被负载被拒掉的那些其实等于未命中（会回退重写），
     // 只报命中率会把「读到但全废」的磁盘缓存显示成 1.5% 而非 0%，从而被误判为「缓存基本正常」。
-    lines.add("磁盘缓存：" + (s.diskCache().openFiles() > 0 || s.diskCache().entries() > 0 ? "已启用" : "无数据")
+    // 「无数据」与「未启用」必须分开：前者是空缓存（首次启动、或刚被配置指纹整体清理），
+    // 后者是管理员关掉了 disk-cache.enabled——旧文案把两者混成一个词，排查命中率时无法区分
+    // 「功能正常但还没积累」与「功能压根没开」。
+    lines.add("磁盘缓存：" + diskCacheState(s)
         + "｜命中 " + s.diskCache().hits() + "（有效 " + s.diskCache().effectiveHits() + "）"
         + "，未命中 " + s.diskCache().misses()
         + "，命中率 " + hitRate(s.diskCache().hits(), s.diskCache().misses())
@@ -715,7 +722,10 @@ public final class Diagnostics {
         // 「个原包」而非「条」：blockChangesMerged 计的是被合并掉的<b>原始封包数</b>（add(held.size())），
         // 与「合并后发出的包数」（= 合并批次）不是一回事，写「条」极易被读成合并结果的条数。
         + "（合并 " + s.throttle().blockChangesMerged() + " 个原包，放行 "
-        + s.throttle().blockChangesPassed() + "）"
+        + s.throttle().blockChangesPassed()
+        // 丢弃单列：切维 / 进黑名单世界时整批原包被刻意丢弃（既不合并也不放行，客户端暂时收不到
+        // 那几次变更）。不计数就等于「这些包从未存在」，排查「切维后方块不更新」时没有依据。
+        + "，丢弃（切维/黑名单）" + s.throttle().blockChangesDiscarded() + "）"
         // 单线程冲刷的「次数 + 累计耗时」：极端配置下的延迟瓶颈靠它观测（累计/次数 = 平均一次的成本）
         + "；单线程冲刷 " + s.throttle().blockMergeFlushes() + " 次（累计 "
         + formatMillis(s.throttle().blockMergeFlushNanos()) + " ms，平均 "
@@ -785,7 +795,12 @@ public final class Diagnostics {
     }
   }
 
-  /** 世界黑名单回显（中文，纯函数；status 与 dump 共用）。空列表明确写「未配置」。 */
+  /**
+   * 世界黑名单回显（中文；status 与 dump 共用）。空列表明确写「未配置」。
+   *
+   * <p><b>注意不是纯函数</b>：读的是进程级活动名单（{@link WorldBlacklistConfig#current()}），
+   * 同一份 {@link Snapshot} 在名单发布前后会格式化成不同文本。
+   */
   private static String worldBlacklistSummary() {
     WorldBlacklistConfig current = WorldBlacklistConfig.current();
     if (current == null) {
@@ -837,6 +852,22 @@ public final class Diagnostics {
         + "（无节省" + (rewrite.bytesSaved() < 0L
             ? "，增加 " + (-rewrite.bytesSaved()) + " 字节（升位/扩容）" : "")
         + "）";
+  }
+
+  /**
+   * 磁盘缓存当前状态的中文短语：配置未加载 / 配置关闭 / 已启用（尚无数据）/ 已启用。
+   *
+   * <p>「尚无数据」与「配置关闭」必须分开：前者是空缓存（首启或被整体清理），后者是功能没开；
+   * 命中率排查时这两者的处置完全不同（前者等积累，后者去开配置）。
+   */
+  private static String diskCacheState(Snapshot s) {
+    if (s.antiXray() == null) {
+      return "配置未加载";
+    }
+    if (!s.antiXray().diskCache().enabled()) {
+      return "未启用（disk-cache.enabled=false）";
+    }
+    return s.diskCache().openFiles() > 0 || s.diskCache().entries() > 0 ? "已启用" : "已启用（尚无数据）";
   }
 
   /** 带宽各模块开关回显（一行，供 status/dump 看出每个开关的实际取值）。 */
@@ -991,7 +1022,12 @@ public final class Diagnostics {
     return "启用（丢弃 " + String.join("、", dropped) + "）";
   }
 
-  /** 转储文本格式化（纯函数）：状态面板 + 环境信息 + 配置项有效值。 */
+  /**
+   * 转储文本格式化：状态面板 + 环境信息 + 配置项有效值。
+   *
+   * <p>与 {@link #formatStatus(Snapshot)} 一样<b>并非严格纯函数</b>（内含状态面板，会读进程级活动名单与
+   * 平台 / 依赖判定），详见后者的 javadoc。
+   */
   public static String formatDump(Snapshot s, String timestamp) {
     StringBuilder sb = new StringBuilder();
     sb.append("MikuXrayNet 诊断转储\n");

@@ -83,10 +83,10 @@ class RevealMarkOrderingTest {
   @Test
   void echoCoordinatesAreNotRemovedFromTheSharedIndex() {
     // 两个坐标同属区块 (0,0)：摘掉其中一个后该区块条目仍存在，便于用 size 断言
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
     ChunkKey chunk = ChunkKey.ofBlock(WORLD, 1, 1);
-    revealed.mark(PLAYER, chunk, 1, 64, 1);
-    revealed.mark(PLAYER, chunk, 2, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk, 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk, 2, 64, 1);
     assertEquals(2, index.entry(chunk).size(), "前置：两个坐标都在伪装清单里");
 
     int[] coordinates = {1, 64, 1, 2, 64, 1};
@@ -106,9 +106,9 @@ class RevealMarkOrderingTest {
    */
   @Test
   void sectionConsistingEntirelyOfEchoesIsLeftUntouched() {
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(3, 64, 3)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(3, 64, 3)});
     ChunkKey chunk = ChunkKey.ofBlock(WORLD, 3, 3);
-    revealed.mark(PLAYER, chunk, 3, 64, 3);
+    revealed.markIfAbsent(PLAYER, chunk, 3, 64, 3);
 
     BlockChangeRevealListener.processChanges(WORLD, new int[] {3, 64, 3}, 1, index, revealed,
         new ProximityStats(), null, (world, x, y, z) -> true);
@@ -123,7 +123,7 @@ class RevealMarkOrderingTest {
    */
   @Test
   void listenerRemovingDuringSendLeavesNoOrphanMark() {
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
     ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
     assertEquals(1, index.entry(key).size(), "前置：该坐标在伪装清单里");
 
@@ -147,7 +147,7 @@ class RevealMarkOrderingTest {
   /** 发送失败必须回滚标记：坐标仍在伪装清单里，后续周期仍会选出重试（不因标记而永久跳过）。 */
   @Test
   void failedSendRollsBackMarkSoCoordinateIsRetried() {
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
     ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
 
     boolean sent = revealer.markThenSend(PLAYER, WORLD, 1, 64, 1, () -> false);
@@ -164,7 +164,7 @@ class RevealMarkOrderingTest {
   /** 批量合并包：原子复核 + 标记整批，再发一个合并包；失败整批回滚、成功整批保留。 */
   @Test
   void batchClaimsOnceMarksBeforeSendAndRollsBackAllOnFailure() {
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
     ChunkKey key = ChunkKey.ofBlock(WORLD, 1, 1);
     List<int[]> positions = List.of(new int[] {1, 64, 1}, new int[] {2, 64, 1});
 
@@ -195,7 +195,7 @@ class RevealMarkOrderingTest {
    */
   @Test
   void batchEchoMarkerIsWrittenBeforeSendAndRolledBackOnFailure() {
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
     List<int[]> positions = List.of(new int[] {1, 64, 1});
 
     int[] fresh = revealer.claimForSend(PLAYER, WORLD, positions);
@@ -214,7 +214,7 @@ class RevealMarkOrderingTest {
   /** 发包失败时必须撤销预写的回显记号，否则随后同坐标的真实变更会被误判为回显。 */
   @Test
   void failedBatchSendRemovesThePreWrittenEchoMarker() {
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
     List<int[]> positions = List.of(new int[] {1, 64, 1});
 
     int[] fresh = revealer.claimForSend(PLAYER, WORLD, positions);
@@ -277,7 +277,7 @@ class RevealMarkOrderingTest {
    */
   @Test
   void echoChangeDispatchesNoInstantRevealWhileRealChangeDispatchesOnce() {
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
     int[] dispatched = {0};
 
     BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1}, 1, index, revealed,

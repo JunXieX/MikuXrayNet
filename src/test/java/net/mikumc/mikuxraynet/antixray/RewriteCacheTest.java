@@ -1,10 +1,14 @@
 package net.mikumc.mikuxraynet.antixray;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -107,20 +111,63 @@ class RewriteCacheTest {
     assertEquals("c", cache.get("world", 2, 0, 1));
   }
 
-  /** 结构断言：键只由基本类型与不可变字符串组成，不可能间接钉住世界/区块/玩家/封包对象。 */
+  /**
+   * 结构断言 + 探针等价性。
+   *
+   * <p>结构：键只由基本类型与不可变字符串组成，不可能间接钉住世界/区块/玩家/封包对象。
+   *
+   * <p>等价性：{@code get}/{@code put} 的热路径用线程本地可变探针做查询键，探针<b>必须</b>与不可变
+   * {@code Key} 语义完全一致（hashCode 逐字段一致、equals 双向识别）。否则 {@code ConcurrentHashMap}
+   * 树化桶会用「存储键的 equals」比较探针，表现为「条目明明写进去了却永远命中不了」——只在桶内条目数
+   * 超过树化阈值时才复现，属极难排查的隐性故障。
+   */
   @Test
-  void keyHoldsOnlyPrimitivesAndStrings() {
+  void keyHoldsOnlyPrimitivesAndStringsAndProbeIsSemanticallyEquivalent() {
     Class<?> keyType = RewriteCache.Key.class;
-    assertTrue(keyType.isRecord(), "键应为不可变 record");
-
     Field[] fields = keyType.getDeclaredFields();
     assertEquals(4, fields.length, "键字段应恰为 worldName/x/z/configHash");
 
     for (Field field : fields) {
+      assertTrue(Modifier.isFinal(field.getModifiers()), "键字段必须 final：" + field.getName());
       Class<?> fieldType = field.getType();
       assertTrue(fieldType.isPrimitive() || fieldType == String.class,
           "键字段只允许基本类型或 String，实际为：" + fieldType.getName());
     }
+
+    // 覆盖负数/零/极值/空世界名：世界坐标可以任意大，负坐标最常见
+    String[] worlds = {"world", "", "a-very-long-world-name-with-suffix"};
+    int[][] args = {
+        {0, 0, 0}, {1, -1, 7}, {-2_000_000, 1_999_999, Integer.MIN_VALUE},
+        {Integer.MAX_VALUE, Integer.MIN_VALUE, 42},
+    };
+    for (String world : worlds) {
+      for (int[] a : args) {
+        RewriteCache.Key key = new RewriteCache.Key(world, a[0], a[1], a[2]);
+        RewriteCache.Key.Probe probe = RewriteCache.Key.Probe.local().set(world, a[0], a[1], a[2]);
+        assertEquals(key.hashCode(), probe.hashCode(),
+            "探针 hashCode 必须与 Key 逐字段一致：" + world + "/" + a[0] + "/" + a[1] + "/" + a[2]);
+        assertEquals(key, probe, "Key.equals(Probe) 必须为真（树化桶用存储键的 equals）");
+        assertEquals(probe, key, "Probe.equals(Key) 必须为真");
+      }
+    }
+
+    RewriteCache.Key.Probe probe = RewriteCache.Key.Probe.local().set("world", 1, 2, 3);
+    assertNotEquals(probe, new RewriteCache.Key("world", 1, 2, 4), "配置指纹不同必须判不等");
+    assertNotEquals(probe, new RewriteCache.Key("world", 2, 1, 3), "区块坐标不同必须判不等");
+    assertNotEquals(probe, new RewriteCache.Key("other", 1, 2, 3), "世界名不同必须判不等");
+    assertNotEquals(probe, null);
+    assertNotEquals(probe, "world/1/2/3");
+  }
+
+  /** 探针作为查询键必须能查到以不可变 Key 写入的条目（与 CHM 正/树化桶的查找路径同构）。 */
+  @Test
+  void probeLooksUpExistingKeyInHashMap() {
+    Map<RewriteCache.Key, String> map = new HashMap<>();
+    map.put(new RewriteCache.Key("world", 5, 6, 7), "hit");
+    assertEquals("hit", map.get(RewriteCache.Key.Probe.local().set("world", 5, 6, 7)),
+        "用探针必须能查到以不可变 Key 写入的条目");
+    assertNull(map.get(RewriteCache.Key.Probe.local().set("world", 5, 6, 8)),
+        "配置指纹不同不得误命中");
   }
 
   /** 未被再访问的过期条目不得计入 size()：旧实现按 entries.size() 统计会「虚高」。 */

@@ -30,6 +30,12 @@ import org.junit.jupiter.api.Test;
  *
  * <p>显形链路本身（射线、发包、标记）复用既有 {@link ProximityRevealer#sendOne}，由真机验证；
  * 这里验证的是「触发时机」新增逻辑的判定正确性：命中触发、超半径不触发、限额生效、与周期不重复。
+ *
+ * <p><b>测试口径（已知边界，刻意如此）</b>：周期巡检入口 {@code reveal} 可用离线 Player/World 替身
+ * 直接驱动（见 {@link #planningRequiresWorkPoolWithCapacity}）；两条事件即时入口
+ * （{@code revealImmediately} / {@code revealSectionImmediately}）在门闸之后会调用
+ * {@code Bukkit.getCurrentTick()} 与实体调度器，离线环境无法构造，因此只对三者共用的门闸
+ * {@link ProximityRevealer#shouldRevealInWorld} 做断言，不逐一驱动这两个入口。
  */
 class InstantRevealTest {
 
@@ -112,7 +118,7 @@ class InstantRevealTest {
   void triggerFiresOnlyWhenDisguisedPositionWithinRadius() {
     ObfuscatedChunkIndex index = new ObfuscatedChunkIndex(1024, 300);
     // 伪装坐标 (10, 64, 10)（minHeight=0 → 相对 y = 64）
-    index.recordChunk(WORLD, 0, 0, 0, new int[] {64 << 8 | 10 << 4 | 10});
+    index.recordChunkWithRemovals(WORLD, 0, 0, 0, new int[] {64 << 8 | 10 << 4 | 10});
 
     assertTrue(ProximityRevealer.hasDisguisedNearby(index, WORLD, 10, 66, 10, 2),
         "变更 (10,66,10) 与伪装坐标曼哈顿距离 2 ≤ 半径：必须命中");
@@ -134,7 +140,7 @@ class InstantRevealTest {
   void candidateRequiresDisguisedAndNotYetRevealed() {
     ObfuscatedChunkIndex index = new ObfuscatedChunkIndex(1024, 300);
     RevealedSet revealed = new RevealedSet(1024, 300);
-    index.recordChunk(WORLD, 0, 0, 0, new int[] {64 << 8 | 10 << 4 | 10});
+    index.recordChunkWithRemovals(WORLD, 0, 0, 0, new int[] {64 << 8 | 10 << 4 | 10});
 
     UUID player = UUID.randomUUID();
     ProximityRevealer revealer = new ProximityRevealer(null, config(), index, revealed,
@@ -143,7 +149,7 @@ class InstantRevealTest {
     assertTrue(revealer.isInstantCandidate(player, WORLD, 10, 64, 10),
         "已伪装且未显形：是即时显形候选");
 
-    revealed.mark(player, ChunkKey.ofBlock(WORLD, 10, 10), 10, 64, 10);
+    revealed.markIfAbsent(player, ChunkKey.ofBlock(WORLD, 10, 10), 10, 64, 10);
     assertFalse(revealer.isInstantCandidate(player, WORLD, 10, 64, 10),
         "该玩家已显形过：不得重复（与周期显形不重复的保证）");
 
@@ -255,27 +261,6 @@ class InstantRevealTest {
   }
 
   /**
-   * 显形额度「预扣 + 归还」对称：批量显形在 {@code sendOne} 里先预扣额度封住单周期上限，
-   * 若该批最终未能发出（退化路径发包失败），由 {@code flushBatch} 逐坐标 {@link ProximityRevealer.Budget#refund()}
-   * 归还，避免发包失败无谓吃掉本周期预算（见 P3 打磨项）。
-   *
-   * <p>注：{@code flushBatch} 的集成路径需要 Bukkit {@code Player}/{@code World}，离线无法构造，
-   * 故此处只钉死它依赖的额度归还语义；实际发包失败分支由真机日志验证。
-   */
-  @Test
-  void budgetRefundRestoresReservedButUnsentQuota() {
-    ProximityRevealer.Budget budget = new ProximityRevealer.Budget(2);
-    assertEquals(2, budget.remaining(), "初始额度");
-    budget.decrement();
-    budget.decrement();
-    assertEquals(0, budget.remaining(), "两次预扣后额度耗尽（本周期上限生效）");
-    budget.refund();
-    assertEquals(1, budget.remaining(), "未发出的坐标必须归还一个额度");
-    budget.refund();
-    assertEquals(2, budget.remaining(), "全部归还后恢复初始额度");
-  }
-
-  /**
    * 预扣后「一个包都没发」可以撤销（{@link ProximityRevealer.TickQuota#release}）：路过但没发包的事件
    * 不应白占一个 tick 的份额；已发出的部分不退还；tick 推进后不得把上一 tick 的剩余加回去。
    */
@@ -334,7 +319,7 @@ class InstantRevealTest {
     ProximityStats stats = new ProximityStats();
     ObfuscatedChunkIndex index = new ObfuscatedChunkIndex(100_000, 300);
     // 玩家 (0.5,64,0.5) 身边一个候选：确保 reveal 能取到候选、走到「是否能 offload」这道门闸
-    index.recordChunk(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1)});
     ProximityRevealer revealer = new ProximityRevealer(null, config(), index,
         new RevealedSet(100_000, 300), stats, null, null, null);
 

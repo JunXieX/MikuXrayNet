@@ -33,7 +33,7 @@ public final class RevealedSet {
   /**
    * 单个玩家在一个区块内已显形的坐标（打包为 long）；读写都在条目锁内进行。
    *
-   * <p><b>为什么是「long 开放寻址哈希集」而不是数组线性扫描</b>：{@link #contains} / {@link #mark} 是显形
+   * <p><b>为什么是「long 开放寻址哈希集」而不是数组线性扫描</b>：{@link #contains} / {@link #markIfAbsent} 是显形
    * 热路径上最重的纯内存操作，原先每格都要在数组里持锁线性扫描（真机单区块可达数百个坐标）。改成
    * 均摊 O(1) 的哈希集后，判重与命中都不再与坐标数线性相关；对外语义（大小、判重、注销、去重）与
    * 并发纪律（读写一律在 {@link RevealedSet} 的条目锁内）完全不变，且天然无装箱、无额外对象。
@@ -264,24 +264,14 @@ public final class RevealedSet {
   }
 
   /**
-   * 标记一个坐标已显形（发包成功后调用）。
-   *
-   * <p>单玩家已显形坐标越界（安全阀）时放弃本次标记：最坏结果是该坐标下次被重复显形一次，
-   * 功能不降级、更不会漏显形。
-   */
-  void mark(UUID playerId, ChunkKey key, int x, int y, int z) {
-    markIfAbsent(playerId, key, x, y, z);
-  }
-
-  /**
    * 原子「复核 + 标记」：在同一临界区内判断该坐标是否已登记，未登记才写入。
    *
    * <p><b>为什么需要它</b>：显形发包前必须复核「本坐标是否已被（同 tick 的另一条路径）显形过」——
-   * 若先 {@link #contains} 再 {@link #mark}，两个动作之间有窗口，跨路径同 tick 竞争时会重复发包
+   * 若先 {@link #contains} 再 {@link #markIfAbsent}，两个动作之间有窗口，跨路径同 tick 竞争时会重复发包
    * （客户端无感但纯属浪费）。把「判重 + 写入」并进同一把条目锁，发送侧即可依据返回值做到「恰好一次」：
    * 返回 {@code false} 表示已被别人登记，本次不应再发。
    *
-   * <p>锁序与 {@link #mark} 完全一致（{@code chunks} 映射监视器 → 条目锁），不引入新的加锁顺序，
+   * <p>锁序与 {@link #markIfAbsent} 完全一致（{@code chunks} 映射监视器 → 条目锁），不引入新的加锁顺序，
    * 因此不会与 {@code expire} / {@code clearChunk} / {@code removePositions} 形成死锁。
    *
    * @return {@code true} = 本次真正新登记（或安全阀放弃登记 / 无玩家标识，按「可发送」处理，fail-open）；
@@ -412,7 +402,7 @@ public final class RevealedSet {
    * 一次遍历、逐个 marker 内成批摘除，与 {@link ObfuscatedChunkIndex#removePositions} 的批量口径对称。
    *
    * <p><b>判活同构</b>：进入遍历前先持「逐区块映射监视器」并校验 {@code chunks.get(key) == players}
-   * （与 {@link #mark} / {@link #expire} / {@link #clearChunk} 完全同一判据）。这样「判活 + 摘标记 +
+   * （与 {@link #markIfAbsent} / {@link #expire} / {@link #clearChunk} 完全同一判据）。这样「判活 + 摘标记 +
    * 扣减」与 {@link #clearChunk} 的「整图摘除 + 按 {@code marker.size()} 扣减」严格互斥——
    * 否则并发（区块卸载 vs 同区块变更包）时，同一坐标会在 {@code removePosition} 里被摘一次（扣 1），
    * 又被 {@code clearChunk} 按旧 {@code size} 计一次，导致 {@code playerTotals} 被多扣（低估）。
@@ -463,7 +453,7 @@ public final class RevealedSet {
    * 但区块封包通常只重发给一个玩家——其余玩家的客户端仍保留我们此前发回的真实方块，把它们一并作废
    * 只会让它们在下一个巡检周期里把同样的坐标<b>重复显形</b>一遍（纯浪费带宽与主线程开销）。
    *
-   * <p>锁序与 {@link #mark} / {@link #clearChunk} 完全一致（区块映射监视器 → 条目锁），
+   * <p>锁序与 {@link #markIfAbsent} / {@link #clearChunk} 完全一致（区块映射监视器 → 条目锁），
    * 并复用同一套判活与计数扣减口径（见 {@link #clearPlayer}）。
    */
   void clearChunk(ChunkKey key, UUID playerId) {

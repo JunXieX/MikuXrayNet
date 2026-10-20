@@ -44,6 +44,17 @@ public final class ThrottleStats {
   public final LongAdder blockChangesPassed = new LongAdder();
 
   /**
+   * 方块变更：因<b>跨世界切换 / 进入黑名单世界</b>被整批丢弃的原始封包数
+   * （既未下发、也未合并——这些坐标属于玩家已离开的世界，下发只会造成「鬼影方块」）。
+   *
+   * <p><b>为什么单列</b>：丢弃路径刻意<em>不</em>发包，所以它们既不会进 {@link #blockChangesMerged}
+   * 也不会进 {@link #blockChangesPassed}；不单独计数的话，一次切维丢掉的一批原包在面板上完全不可见，
+   * 排查「切维前后方块更新短暂缺失」时无从判断是「包被丢弃」还是「压根没产生」。
+   * 该计数只增不减，属纯观测，不影响任何行为。
+   */
+  public final LongAdder blockChangesDiscarded = new LongAdder();
+
+  /**
    * 方块变更合并的<b>冲刷诊断</b>：冲刷次数与累计冲刷耗时（纳秒）。
    *
    * <p><b>为什么单列</b>：合并冲刷跑在单线程 {@code MikuXrayNet-BlockMerge} 上，极端配置（大时间窗 +

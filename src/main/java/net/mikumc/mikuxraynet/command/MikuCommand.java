@@ -11,9 +11,7 @@ import net.mikumc.mikuxraynet.bandwidth.Schedulers;
 import net.mikumc.mikuxraynet.util.Constants;
 import net.mikumc.mikuxraynet.util.Diagnostics;
 import org.bukkit.command.Command;
-import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
-import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Entity;
 
 /**
@@ -26,8 +24,14 @@ import org.bukkit.entity.Entity;
  * <p><b>线程纪律（转储）</b>：命令线程在 Folia 上是发送者所属的<b>区域线程</b>、在 Paper 上是主线程，
  * 两者都不能做磁盘 IO。因此 {@code dump} 只提交任务，真正的「生成文本 + 写文件 + 清理旧文件」
  * 跑在异步线程（{@code AsyncScheduler}）上，完成后回到发送者所在线程回显（见 {@link #dump(CommandSender)}）。
+ *
+ * <p><b>不是 Bukkit 的 PluginCommand 执行器 / 补全器</b>：本类<b>不</b> implements
+ * {@code CommandExecutor} / {@code TabCompleter}——唯一的调用方是 {@code CommandRegistrar.PaperCommandBridge}
+ * （直接转调 {@link #onCommand} / {@link #onTabComplete}），项目已无 {@code plugin.yml} 传统注册路径。
+ * 这两个方法仍保留为 public，是因为桥接需要「命令逻辑 / 补全语义各有单一入口」；不要据此以为还存在
+ * 第二条注册路径（历史实现曾有，已随 plugin.yml 一并删除）。
  */
-public final class MikuCommand implements CommandExecutor, TabCompleter {
+public final class MikuCommand {
 
   /**
    * 三个子命令的权限节点统一取自 {@link Constants}（唯一出处）。
@@ -50,7 +54,6 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
     this.diagnostics = new Diagnostics(plugin);
   }
 
-  @Override
   public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
     // 整段包在 try 内：usage 提示此前在任何保护之外，一旦回显失败（例如在不支持 Adventure 的核心上）
     // 会从命令分发器二次抛出。现在任何异常都只记日志并尽力回显一句中文提示，绝不外抛。
@@ -266,7 +269,6 @@ public final class MikuCommand implements CommandExecutor, TabCompleter {
     }
   }
 
-  @Override
   public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
     return suggestSubcommands(sender, args);
   }

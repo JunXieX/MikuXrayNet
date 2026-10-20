@@ -99,16 +99,6 @@ public final class SwmrLongMap<V> {
   }
 
   /**
-   * 键是否存在（乐观读）。
-   *
-   * <p>当前无任何调用者（含单测）：保留为公开 API 的对称性入口，等价于
-   * {@code get(key) != null}。若将来要用，注意值类型不允许为 {@code null}。
-   */
-  public boolean containsKey(long key) {
-    return get(key) != null;
-  }
-
-  /**
    * 写入（独占）。同键覆盖时仅替换值，不改变 {@link #size}.
    *
    * @return 该键此前的值；此前不存在返回 {@code null}

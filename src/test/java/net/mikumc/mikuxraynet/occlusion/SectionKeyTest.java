@@ -1,7 +1,9 @@
 package net.mikumc.mikuxraynet.occlusion;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -84,6 +86,38 @@ class SectionKeyTest {
       assertTrue(coveredSectionY.contains(y), "缺少 sectionY=" + y);
     }
     assertEquals(SectionKey.SECTION_Y_COUNT, uniqueKeys.size());
+  }
+
+  /**
+   * {@link SectionKey#columnKeys} 使用线程本地复用缓冲：两次调用之间不得残留上一次的键，且同线程
+   * 重复调用复用同一数组。
+   *
+   * <p>背景：该方法被区块卸载路径调用（主线程 / Folia 区域线程），此前每次 {@code new long[256]}
+   * 是 2 KB 的可避免短命分配。复用的前提是「每次调用都<b>完整覆盖</b> 256 个槽位」——本用例正是钉住
+   * 这一点：先取 (5,-9) 的键并克隆保存，再用 (7,3) 调用，逐槽校验结果全部属于 (7,3)（不残留旧键），
+   * 最后再取 (5,-9)，校验与第一次的克隆逐元素一致（确定性）。
+   */
+  @Test
+  void columnKeysReusesThreadLocalBufferWithoutLeakingOldValues() {
+    long[] firstSnapshot = SectionKey.columnKeys(5, -9).clone();
+    long[] second = SectionKey.columnKeys(7, 3);
+
+    // (1) 复用不残留：第二次调用的每个键都必须属于 (7,3)，且覆盖全部 256 个 sectionY
+    Set<Integer> secondSectionYs = new HashSet<>();
+    for (long key : second) {
+      assertEquals(7, SectionKey.chunkX(key), "第二次调用不得残留上一次的 chunkX");
+      assertEquals(3, SectionKey.chunkZ(key), "第二次调用不得残留上一次的 chunkZ");
+      secondSectionYs.add(SectionKey.sectionY(key));
+    }
+    assertEquals(SectionKey.SECTION_Y_COUNT, secondSectionYs.size(),
+        "第二次调用必须完整覆盖全部 sectionY（不得只覆盖一部分）");
+
+    // (2) 确实是复用（同线程返回同一数组），而不是退化成每次分配
+    assertSame(second, SectionKey.columnKeys(7, 3), "同线程重复调用应返回同一复用缓冲");
+
+    // (3) 确定性：再次以 (5,-9) 调用，结果必须与第一次的克隆逐元素相同
+    long[] again = SectionKey.columnKeys(5, -9);
+    assertArrayEquals(firstSnapshot, again, "同一坐标重复调用结果必须一致（无残留、无顺序漂移）");
   }
 
   @Test

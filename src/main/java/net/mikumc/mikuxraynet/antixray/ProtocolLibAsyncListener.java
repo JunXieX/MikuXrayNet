@@ -194,7 +194,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    *
    * <p><b>为什么用引用而非实例</b>：本监听器不随热重载重建，而邻近显形可在 reload 时被关闭——
    * 关闭时调用方（{@code AntiXrayRuntime}）把该引用置为 {@code null}。若这里存的是构造期实例，
-   * 关闭后改写链路仍会继续往旧索引里 recordChunk：索引仍在增长（违背「关闭即零开销」），
+   * 关闭后改写链路仍会继续往旧索引里 recordChunkWithRemovals：索引仍在增长（违背「关闭即零开销」），
    * 而面板读的是已置空的运行时字段（显示 0），两边不一致。取可变引用后，关闭即为真正的零开销且与面板一致。
    */
   private final Supplier<ObfuscatedChunkIndex> obfuscatedChunkIndex;

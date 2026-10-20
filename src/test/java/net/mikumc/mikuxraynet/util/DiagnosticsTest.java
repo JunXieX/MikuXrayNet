@@ -293,7 +293,7 @@ class DiagnosticsTest {
     Diagnostics.Snapshot s = fixed();
     Diagnostics.Snapshot withCleanupFailure = new Diagnostics.Snapshot(s.env(), s.rewrite(),
         s.proximity(), s.index(), s.occlusion(),
-        new Diagnostics.Snapshot.Throttle(20L, 30L, 11L, 4L, 39L, 0L, 4L, 40L, 12L, 6L, 5L, 4,
+        new Diagnostics.Snapshot.Throttle(20L, 30L, 11L, 4L, 39L, 0L, 4L, 40L, 12L, 0L, 6L, 5L, 4,
             40L, 7L, 3L, 11L, 2L, 2, 3L, 8L, 9L, 4L, 5L, 25_000_000L, true),
         s.pool(), s.diskCache(), s.chunkAccessor(), s.antiXray(), s.bandwidth());
     String cleanupFailed = String.join("\n", Diagnostics.formatStatus(withCleanupFailure));
