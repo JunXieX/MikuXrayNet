@@ -6,16 +6,24 @@ import java.util.List;
 import java.util.Locale;
 import java.util.logging.Level;
 import net.kyori.adventure.text.Component;
+import net.mikumc.mikuxraynet.AntiXrayRuntime;
 import net.mikumc.mikuxraynet.MikuXrayNet;
+import net.mikumc.mikuxraynet.antixray.ProximitySelector;
+import net.mikumc.mikuxraynet.antixray.RevealProbe;
 import net.mikumc.mikuxraynet.bandwidth.Schedulers;
+import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.util.Constants;
 import net.mikumc.mikuxraynet.util.Diagnostics;
+import org.bukkit.Location;
+import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.Player;
+import org.bukkit.util.Vector;
 
 /**
- * {@code /mikuxraynet <status|dump|reload>} 管理命令（别名 {@code mxnet} / {@code mxr}）。
+ * {@code /mikuxraynet <status|dump|probe|reload>} 管理命令（别名 {@code mxnet} / {@code mxr}）。
  *
  * <p>命令本身只做「权限校验 + 提交一次聚合/重载 + 回显中文结果」，不做任何重活：
  * 状态与转储的指标聚合、文件写入都交给 {@link Diagnostics}；热重载交给插件的
@@ -42,7 +50,7 @@ public final class MikuCommand {
   private static final String PERMISSION_STATUS = Constants.STATUS_PERMISSION;
   private static final String PERMISSION_DUMP = Constants.DUMP_PERMISSION;
   private static final String PERMISSION_RELOAD = Constants.RELOAD_PERMISSION;
-  private static final List<String> SUBCOMMANDS = List.of("status", "dump", "reload");
+  private static final List<String> SUBCOMMANDS = List.of("status", "dump", "probe", "reload");
   /** 无任何子命令权限时的统一回显（等价于命令描述里声明的 permission-message）。 */
   private static final String NO_PERMISSION_MESSAGE = "你没有权限使用该命令";
 
@@ -73,6 +81,7 @@ public final class MikuCommand {
       switch (args[0].toLowerCase(Locale.ROOT)) {
         case "status" -> status(sender);
         case "dump" -> dump(sender);
+        case "probe" -> probe(sender, label, args);
         case "reload" -> reload(sender);
         default -> usage(sender, label);
       }
@@ -97,6 +106,8 @@ public final class MikuCommand {
     return switch (subcommand) {
       case "status" -> PERMISSION_STATUS;
       case "dump" -> PERMISSION_DUMP;
+      // 探针是只读诊断（不写索引/位图、不发包），沿用 status 的权限节点，不额外扩权。
+      case "probe" -> PERMISSION_STATUS;
       case "reload" -> PERMISSION_RELOAD;
       default -> null;
     };
@@ -242,9 +253,72 @@ public final class MikuCommand {
     }
   }
 
+  /**
+   * 显形探针：把「某个坐标为什么没有被还原」的五层判定（显形索引 / 已显形标记 / 遮挡位图 /
+   * 暴露面 / 射线）逐层打印出来。
+   *
+   * <p><b>只读</b>：不写索引、不写已显形集合、不写位图、不发包；权限沿用 {@code status} 节点，
+   * 因为它是纯诊断、不改变任何运行状态。
+   *
+   * <p><b>为什么必须由玩家执行</b>：判定要用「眼睛位置 + 视线方向」，控制台没有这两者，
+   * 给不出与真实显形一致的结论。坐标可选：不填时取视线指向的方块（8 格内）。
+   */
+  private void probe(CommandSender sender, String label, String[] args) {
+    if (!allowed(sender, "probe")) {
+      message(sender, "你没有权限使用显形探针");
+      return;
+    }
+    if (!(sender instanceof Player player)) {
+      message(sender, "显形探针需要由玩家执行（需要眼睛位置与视线方向）；用法：/" + label
+          + " probe <x> <y> <z>");
+      return;
+    }
+    AntiXrayRuntime runtime = plugin.antiXrayRuntime();
+    if (runtime == null) {
+      message(sender, "反矿透未启用：没有可探测的显形链路");
+      return;
+    }
+    int x;
+    int y;
+    int z;
+    if (args.length >= 4) {
+      try {
+        x = Integer.parseInt(args[1]);
+        y = Integer.parseInt(args[2]);
+        z = Integer.parseInt(args[3]);
+      } catch (NumberFormatException notANumber) {
+        message(sender, "坐标必须是整数：/" + label + " probe <x> <y> <z>");
+        return;
+      }
+    } else {
+      Block target = player.getTargetBlockExact(8);
+      if (target == null) {
+        message(sender, "请看向 8 格内的一个方块，或显式给出坐标：/" + label + " probe <x> <y> <z>");
+        return;
+      }
+      x = target.getX();
+      y = target.getY();
+      z = target.getZ();
+    }
+    AntiXrayConfig config = plugin.mikuConfig() == null ? null : plugin.mikuConfig().antiXray();
+    int samples = config == null
+        ? ProximitySelector.MAX_SAMPLE_POINTS : config.proximity().raycastSamples();
+    Location eye = player.getEyeLocation();
+    Vector direction = eye.getDirection();
+    List<String> lines = RevealProbe.probe(player.getWorld().getName(), player.getUniqueId(),
+        ProximitySelector.eye(eye.getX(), eye.getY(), eye.getZ(),
+            direction.getX(), direction.getY(), direction.getZ()),
+        x, y, z, runtime.obfuscatedChunkIndex(), runtime.revealedSet(),
+        runtime.occlusionStores(), samples);
+    for (String line : lines) {
+      message(sender, line);
+    }
+  }
+
   private void usage(CommandSender sender, String label) {
-    message(sender, "用法：/" + label + " <status|dump|reload>");
+    message(sender, "用法：/" + label + " <status|dump|probe|reload>");
     message(sender, "status 查看运行状态｜dump 导出诊断文件｜reload 热重载配置");
+    message(sender, "probe [x y z] 诊断某个坐标为什么没有被还原（不填坐标 = 视线指向的方块，8 格内）");
   }
 
   /**

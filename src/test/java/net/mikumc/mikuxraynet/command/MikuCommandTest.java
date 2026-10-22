@@ -27,11 +27,13 @@ class MikuCommandTest {
 
   @Test
   void emptyArgsFromPaperYieldsAllSubcommands() {
-    assertEquals(List.of("status", "dump", "reload"), MikuCommand.suggestSubcommands(new String[0]),
+    assertEquals(List.of("status", "dump", "probe", "reload"),
+        MikuCommand.suggestSubcommands(new String[0]),
         "Paper 在「只敲了 /mxnet」时传空数组，必须给出全部子命令");
-    assertEquals(List.of("status", "dump", "reload"), MikuCommand.suggestSubcommands(new String[] {""}),
+    assertEquals(List.of("status", "dump", "probe", "reload"),
+        MikuCommand.suggestSubcommands(new String[] {""}),
         "Bukkit 在同一情形传 [\"\"]，同样必须给出全部子命令");
-    assertEquals(List.of("status", "dump", "reload"), MikuCommand.suggestSubcommands(null),
+    assertEquals(List.of("status", "dump", "probe", "reload"), MikuCommand.suggestSubcommands(null),
         "入参为 null 时不应抛异常（保守给出全部子命令）");
   }
 
@@ -41,6 +43,8 @@ class MikuCommandTest {
     assertEquals(List.of("status"), MikuCommand.suggestSubcommands(new String[] {"ST"}),
         "客户端可能保留大写，补全必须大小写不敏感");
     assertEquals(List.of("dump"), MikuCommand.suggestSubcommands(new String[] {"d"}));
+    assertEquals(List.of("probe"), MikuCommand.suggestSubcommands(new String[] {"pr"}),
+        "探针子命令同样要能被前缀补全");
     assertEquals(List.of("reload"), MikuCommand.suggestSubcommands(new String[] {"re"}));
     assertTrue(MikuCommand.suggestSubcommands(new String[] {"xyz"}).isEmpty(), "无匹配时必须返回空列表");
   }
@@ -55,8 +59,9 @@ class MikuCommandTest {
   /** 补全列表必须与命令用法一致（usage 文案里的 status|dump|reload），否则会出现「补不出来但能执行」。 */
   @Test
   void completionsMatchTheDocumentedUsage() {
-    assertEquals(List.of("status", "dump", "reload"), MikuCommand.suggestSubcommands(new String[0]),
-        "补全项必须与 /mikuxraynet <status|dump|reload> 的用法逐项一致");
+    assertEquals(List.of("status", "dump", "probe", "reload"),
+        MikuCommand.suggestSubcommands(new String[0]),
+        "补全项必须与 /mikuxraynet <status|dump|probe|reload> 的用法逐项一致");
   }
 
   /** 取不到发送者时无法判定权限：必须一个都不补，绝不能把管理命令暴露给无权限来源。 */
