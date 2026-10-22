@@ -338,6 +338,8 @@ public final class ProximityRevealer implements Listener {
   private final TickQuota instantQuota = new TickQuota();
   /** 视野变化增量巡检的每玩家每 tick 发包限额（与事件显形分开，避免互相挤占）。 */
   private final TickQuota viewChangeQuota = new TickQuota();
+  /** 区块下发即显形的每玩家每 tick 发包限额（与事件显形分开，避免区块集中下发吃光即时显形额度）。 */
+  private final TickQuota chunkDeliveryQuota = new TickQuota();
   /** 视野变化触发状态（按玩家；只在其所属线程读写，退出/停用时整体清理）。 */
   private final ConcurrentHashMap<UUID, ViewMark> viewMarks = new ConcurrentHashMap<>();
   /**
@@ -504,6 +506,7 @@ public final class ProximityRevealer implements Listener {
     entityScans.clear();
     digMarks.clear();
     viewMarks.clear();
+    pendingChunkReveals.clear();
     HandlerList.unregisterAll(this);
     if (clearIndexes) {
       chunkIndex.clear();
@@ -567,9 +570,11 @@ public final class ProximityRevealer implements Listener {
     }
     revealedSet.clearPlayer(event.getPlayer().getUniqueId());
     instantQuota.clear(event.getPlayer().getUniqueId());
+    chunkDeliveryQuota.clear(event.getPlayer().getUniqueId());
     digMarks.remove(event.getPlayer().getUniqueId());
     viewChangeQuota.clear(event.getPlayer().getUniqueId());
     viewMarks.remove(event.getPlayer().getUniqueId());
+    pendingChunkReveals.remove(event.getPlayer().getUniqueId());
     // 离线玩家的回显记号一并释放（否则会滞留到窗口过期，白白占内存）
     revealEcho.remove(event.getPlayer().getUniqueId());
   }
@@ -1994,16 +1999,51 @@ public final class ProximityRevealer implements Listener {
    * 交给下一轮周期巡检（仍会被还原，只是最坏晚一个巡检周期），不会漏。
    */
   private static final int MAX_CHUNK_DELIVERY_EVALUATIONS = 96;
+  /**
+   * 区块下发即显形：每玩家每 tick 的<b>总</b>评估上限（跨所有刚下发的区块合并计算）。
+   *
+   * <p><b>为什么需要总上限</b>：一次传送 / 首次进服会连续下发上百个区块。若每个区块各排一个区域任务、
+   * 各自做满 96 次评估，单 tick 会在玩家线程上跑上万次判定（数毫秒毛刺）。合并成「每 tick 一次、共享
+   * 128 次评估」后，最坏开销被钉死，落下的区块交给下一 tick 或周期巡检，不会漏。
+   */
+  private static final int MAX_CHUNK_DELIVERY_EVALUATIONS_PER_TICK = 128;
+  /**
+   * 区块下发即显形：每玩家每 tick 的发包上限。
+   *
+   * <p>与事件显形（挖掘/变更触发的即时显形）<b>分开计量</b>：那条路径是「客户端已经渲染出来才补发」，
+   * 时间窗只有一个 tick；若与本路径共用额度，一次区块集中下发就会把当 tick 的即时显形额度吃光，
+   * 反而放大「挖开看到假方块」的窗口。两条路径各 16 个/ tick，互不挤占。
+   */
+  private static final int MAX_CHUNK_DELIVERY_SENDS_PER_TICK = 16;
+  /** 待处理区块键的合并上限（防止极端情况下无界堆积；超出部分由周期巡检兜底）。 */
+  private static final int MAX_PENDING_CHUNK_REVEALS = 256;
+
+  /**
+   * 「区块下发即显形」的待处理队列（按玩家合并，每 tick 只处理一次）。
+   *
+   * <p><b>为什么合并</b>：见 {@link #MAX_CHUNK_DELIVERY_EVALUATIONS_PER_TICK}；此外合并后每 tick 只调度
+   * 一个区域任务，避免传送时上百个任务排队。
+   */
+  static final class PendingChunkReveals {
+
+    private String worldName;
+    private final java.util.LinkedHashSet<Long> chunkKeys = new java.util.LinkedHashSet<>();
+    private boolean scheduled;
+    private boolean draining;
+  }
+
+  private final ConcurrentHashMap<UUID, PendingChunkReveals> pendingChunkReveals =
+      new ConcurrentHashMap<>();
 
   /**
    * 区块包<b>放行之后</b>的回调（由 {@code ProtocolLibAsyncListener} 的放行动作调用，可能运行在工作线程上）：
-   * 把「该区块中玩家当前看得见」的伪装坐标立即显形。
+   * 把「该区块中玩家当前看得见」的伪装坐标尽快显形。
    *
    * <p><b>为什么需要</b>：区块包是共享的伪装版本，玩家收到后先看到石头/伪装方块，要等下一轮巡检
    * （最坏约 0.8 秒）才被还原——这就是「矿石/箱子凭空出现」的来源。区块包放行后立刻补发一个小批量显形包，
    * 客户端通常在同一 tick 内先后应用，这个窗口基本消失。
    *
-   * <p><b>为什么只调度、不在这里判定</b>：本方法可能运行在封包工作线程上，而判定要读玩家眼睛、读真实方块
+   * <p><b>为什么只入队、不在这里判定</b>：本方法可能运行在封包工作线程上，而判定要读玩家眼睛、读真实方块
    * 状态、发包，全部必须在玩家所属线程完成；这里只做纯内存门闸（不发包、不读 Bukkit 世界数据）。
    *
    * <p>受 {@code proximity.instant-reveal} 的总开关与每 tick 限额约束：即时显形整体关闭时本路径也关闭。
@@ -2016,38 +2056,102 @@ public final class ProximityRevealer implements Listener {
     if (chunkIndex == null || revealedSet == null || WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       return;
     }
-    Schedulers.onEntity(plugin, player, () -> revealChunkImmediately(player, chunkX, chunkZ));
+    UUID playerId = player.getUniqueId();
+    PendingChunkReveals pending = pendingChunkReveals.computeIfAbsent(playerId,
+        ignored -> new PendingChunkReveals());
+    boolean schedule = false;
+    synchronized (pending) {
+      if (!worldName.equals(pending.worldName)) {
+        // 切世界：旧世界的区块键作废（同一玩家不可能同时收两个世界的区块）
+        pending.chunkKeys.clear();
+        pending.worldName = worldName;
+      }
+      if (pending.chunkKeys.size() < MAX_PENDING_CHUNK_REVEALS) {
+        pending.chunkKeys.add(packChunkKey(chunkX, chunkZ));
+      }
+      if (!pending.scheduled && !pending.draining) {
+        pending.scheduled = true;
+        schedule = true;
+      }
+    }
+    if (schedule) {
+      Schedulers.onEntity(plugin, player, () -> drainChunkReveals(player));
+    }
+  }
+
+  /** 区块键打包（区块坐标 → long；仅用于合并队列去重）。 */
+  private static long packChunkKey(int chunkX, int chunkZ) {
+    return ((long) chunkX << 32) | (chunkZ & 0xFFFFFFFFL);
   }
 
   /**
-   * 玩家所属线程：把刚下发的那个区块里「当前可见」的伪装坐标显形（见 {@link #onChunkDelivered}）。
+   * 玩家所属线程：排空「区块下发即显形」队列（见 {@link #onChunkDelivered}）。
+   *
+   * <p>每 tick 合并处理一次，并共享同一份评估预算（{@link #MAX_CHUNK_DELIVERY_EVALUATIONS_PER_TICK}）；
+   * 队列里还有剩余时顺延到下一 tick，避免传送时的集中开销。
+   */
+  private void drainChunkReveals(Player player) {
+    try {
+      if (stopping || !player.isOnline()) {
+        return;
+      }
+      PendingChunkReveals pending = pendingChunkReveals.get(player.getUniqueId());
+      if (pending == null) {
+        return;
+      }
+      java.util.List<Long> batch;
+      String worldName;
+      synchronized (pending) {
+        pending.scheduled = false;
+        if (pending.chunkKeys.isEmpty()) {
+          return;
+        }
+        pending.draining = true;
+        batch = new java.util.ArrayList<>(pending.chunkKeys);
+        pending.chunkKeys.clear();
+        worldName = pending.worldName;
+      }
+      try {
+        revealChunks(player, worldName, batch);
+      } finally {
+        boolean reschedule = false;
+        synchronized (pending) {
+          pending.draining = false;
+          if (!pending.chunkKeys.isEmpty() && !pending.scheduled) {
+            pending.scheduled = true;
+            reschedule = true;
+          }
+        }
+        if (reschedule) {
+          Schedulers.onEntity(plugin, player, () -> drainChunkReveals(player));
+        }
+      }
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /**
+   * 玩家所属线程：把一批刚下发的区块里「当前可见」的伪装坐标显形。
    *
    * <p>判定口径与周期巡检一致：仍在伪装清单、该玩家尚未显形、视锥内、位图射线通畅（{@code sendOne} 判定）。
-   * 评估量有硬上限（{@link #MAX_CHUNK_DELIVERY_EVALUATIONS}），超出部分交给周期巡检。
+   * 硬上限：每区块 {@link #MAX_CHUNK_DELIVERY_EVALUATIONS}、整批
+   * {@link #MAX_CHUNK_DELIVERY_EVALUATIONS_PER_TICK}、发包受 {@code instant-reveal.max-per-tick} 限额。
    */
-  private void revealChunkImmediately(Player player, int chunkX, int chunkZ) {
+  private void revealChunks(Player player, String worldName, java.util.List<Long> chunkKeys) {
     try {
       if (stopping || !player.isOnline()
           || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
         return;
       }
       World world = player.getWorld();
-      String worldName = world.getName();
-      if (!shouldRevealInWorld(worldName)) {
+      if (!world.getName().equals(worldName) || !shouldRevealInWorld(worldName)) {
         return;
       }
-      ObfuscatedChunkIndex.ChunkEntry entry = chunkIndex.entry(worldName, chunkX, chunkZ);
-      if (entry == null || entry.size() == 0) {
-        return;
-      }
-      int[] locals = entry.locals();
-      int minHeight = entry.minHeight();
       UUID playerId = player.getUniqueId();
       long tick = Bukkit.getCurrentTick();
-      int maxPerTick = Math.max(1, instant.maxPerTick());
-      int wanted = Math.min(locals.length, MAX_CHUNK_DELIVERY_EVALUATIONS);
-      // 与事件显形共用同一份每 tick 限额：区块连续下发时也不会绕开防爆刷上限。
-      int granted = instantQuota.claim(playerId, tick, maxPerTick, wanted);
+      int granted = chunkDeliveryQuota.claim(playerId, tick, MAX_CHUNK_DELIVERY_SENDS_PER_TICK,
+          MAX_CHUNK_DELIVERY_SENDS_PER_TICK);
       Budget budget = new Budget(granted);
       if (budget.remaining() <= 0) {
         return;
@@ -2059,25 +2163,42 @@ public final class ProximityRevealer implements Listener {
       ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
       keys.begin(worldName);
       int evaluated = 0;
-      for (int local : locals) {
-        if (budget.remaining() <= 0 || evaluated >= MAX_CHUNK_DELIVERY_EVALUATIONS) {
+      for (Long packedKey : chunkKeys) {
+        if (budget.remaining() <= 0 || evaluated >= MAX_CHUNK_DELIVERY_EVALUATIONS_PER_TICK) {
           break;
         }
-        int x = (chunkX << 4) | (local & 15);
-        int z = (chunkZ << 4) | ((local >> 4) & 15);
-        int y = minHeight + (local >> 8);
-        evaluated++;
-        if (!isInstantCandidate(keys, playerId, worldName, x, y, z)) {
+        int chunkX = (int) (packedKey >> 32);
+        int chunkZ = (int) (long) packedKey;
+        ObfuscatedChunkIndex.ChunkEntry entry = chunkIndex.entry(worldName, chunkX, chunkZ);
+        if (entry == null || entry.size() == 0) {
           continue;
         }
-        if (frustum && !ProximitySelector.withinFrustum(eye, x, y, z,
-            proximity.frustumMinDistance(), proximity.frustumFov())) {
-          continue;
+        int[] locals = entry.locals();
+        int minHeight = entry.minHeight();
+        int perChunk = 0;
+        for (int local : locals) {
+          if (budget.remaining() <= 0 || evaluated >= MAX_CHUNK_DELIVERY_EVALUATIONS_PER_TICK
+              || perChunk >= MAX_CHUNK_DELIVERY_EVALUATIONS) {
+            break;
+          }
+          int x = (chunkX << 4) | (local & 15);
+          int z = (chunkZ << 4) | ((local >> 4) & 15);
+          int y = minHeight + (local >> 8);
+          evaluated++;
+          perChunk++;
+          if (!isInstantCandidate(keys, playerId, worldName, x, y, z)) {
+            continue;
+          }
+          if (frustum && !ProximitySelector.withinFrustum(eye, x, y, z,
+              proximity.frustumMinDistance(), proximity.frustumFov())) {
+            continue;
+          }
+          sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
         }
-        sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
       }
       flushBatch(player, batch, tally);
-      instantQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
+      chunkDeliveryQuota.release(playerId, tick, MAX_CHUNK_DELIVERY_SENDS_PER_TICK, granted,
+          tally.sent);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
@@ -2348,17 +2469,18 @@ public final class ProximityRevealer implements Listener {
    * 「本轮少补几个」：坐标仍在伪装索引里，周期巡检会兜底。
    */
   private void runViewChangeScan(Player player, AntiXrayConfig.ViewChange viewChange) {
+    // 先做门闸再计时：门闸失败的调用不算一次「扫描」，否则面板里的平均耗时会被大量空调用稀释
+    if (stopping || !player.isOnline() || chunkIndex == null || revealedSet == null) {
+      return;
+    }
+    World world = player.getWorld();
+    String worldName = world.getName();
+    if (!shouldRevealInWorld(worldName)) {
+      return;
+    }
     long start = System.nanoTime();
     int sent = 0;
     try {
-      if (stopping || !player.isOnline() || chunkIndex == null || revealedSet == null) {
-        return;
-      }
-      World world = player.getWorld();
-      String worldName = world.getName();
-      if (!shouldRevealInWorld(worldName)) {
-        return;
-      }
       long deadline = start + (long) (viewChange.budgetMs() * 1_000_000.0D);
       Location eyeLocation = player.getEyeLocation();
       ProximityScanner.Tally scanTally = new ProximityScanner.Tally();
