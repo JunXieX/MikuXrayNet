@@ -169,6 +169,21 @@ class ConfigDefaultsTest {
         "打包 yml 的 proximity.reveal-on-chunk-send 必须等于代码回落值");
     assertEquals(fallback.proximity().preRevealOnDig(), packed.proximity().preRevealOnDig(),
         "打包 yml 的 proximity.instant-reveal.pre-reveal-on-dig 必须等于代码回落值");
+    assertTrue(fallback.proximity().viewChange().enabled(), "视野变化增量巡检默认开启");
+    assertEquals(AntiXrayConfig.VIEW_CHANGE_BUDGET_MS_DEFAULT,
+        fallback.proximity().viewChange().budgetMs(), 1.0E-9D, "视野增量默认预算 0.15 ms");
+    assertEquals(AntiXrayConfig.VIEW_CHANGE_COOLDOWN_TICKS_DEFAULT,
+        fallback.proximity().viewChange().cooldownTicks(), "视野增量默认冷却 2 tick");
+    assertEquals(AntiXrayConfig.VIEW_CHANGE_RADIUS_DEFAULT,
+        fallback.proximity().viewChange().radius(), "视野增量默认半径 24 格");
+    assertEquals(fallback.proximity().viewChange().budgetMs(),
+        packed.proximity().viewChange().budgetMs(), 1.0E-9D,
+        "打包 yml 的 proximity.view-change.budget-ms 必须等于代码回落值");
+    assertEquals(fallback.proximity().viewChange().cooldownTicks(),
+        packed.proximity().viewChange().cooldownTicks(),
+        "打包 yml 的 proximity.view-change.cooldown-ticks 必须等于代码回落值");
+    assertEquals(fallback.proximity().viewChange().radius(), packed.proximity().viewChange().radius(),
+        "打包 yml 的 proximity.view-change.radius 必须等于代码回落值");
     assertEquals(fallback.proximity().frustumFov(), packed.proximity().frustumFov(), 1.0E-9D,
         "打包 yml 的 proximity.frustum.fov 必须等于代码回落值");
     assertEquals(fallback.proximity().frustumMinDistance(), packed.proximity().frustumMinDistance(),
@@ -779,6 +794,52 @@ class ConfigDefaultsTest {
     assertEquals(AntiXrayConfig.CACHE_MAXIMUM_MB_MAX, atMax.cacheMaximumMb(),
         "4096 MB 是合法边界，必须能原样表达");
     assertTrue(atMax.ceilingAdjustments().isEmpty(), atMax.ceilingAdjustments().toString());
+  }
+
+  /**
+   * {@code proximity.view-change.*} 的钳制：预算两端钳制并留痕，冷却/半径越界钳制并留痕。
+   *
+   * <p>这条路径成本直接来自玩家行为，配置错误（例如预算填 100 ms）会把事件路径变成主线程负担，
+   * 因此两端都必须显式钳制 + 一次性 WARN，不允许静默生效。
+   */
+  @Test
+  void viewChangeParametersAreClampedAndReported() {
+    AntiXrayConfig low = AntiXrayConfig.from(yaml("""
+        proximity:
+          view-change:
+            budget-ms: 0.0
+            cooldown-ticks: 0
+            radius: 2
+        """));
+    assertEquals(AntiXrayConfig.VIEW_CHANGE_BUDGET_MS_FLOOR, low.proximity().viewChange().budgetMs(),
+        1.0E-9D, "低于下限的预算必须抬升到下限");
+    assertEquals(AntiXrayConfig.VIEW_CHANGE_COOLDOWN_TICKS_FLOOR,
+        low.proximity().viewChange().cooldownTicks(), "冷却 0 必须抬升到下限（否则旋转抖动会打满预算）");
+    assertEquals(AntiXrayConfig.VIEW_CHANGE_RADIUS_FLOOR, low.proximity().viewChange().radius(),
+        "半径低于下限必须抬升");
+    assertTrue(String.join("、", low.floorAdjustments()).contains("proximity.view-change.budget-ms=0.0"),
+        "预算抬升必须留痕：" + low.floorAdjustments());
+    assertTrue(String.join("、", low.floorAdjustments()).contains("proximity.view-change.cooldown-ticks=0"),
+        "冷却抬升必须留痕：" + low.floorAdjustments());
+    assertTrue(String.join("、", low.floorAdjustments()).contains("proximity.view-change.radius=2"),
+        "半径抬升必须留痕：" + low.floorAdjustments());
+
+    AntiXrayConfig high = AntiXrayConfig.from(yaml("""
+        proximity:
+          view-change:
+            budget-ms: 100.0
+            cooldown-ticks: 999
+            radius: 999
+        """));
+    assertEquals(AntiXrayConfig.VIEW_CHANGE_BUDGET_MS_MAX, high.proximity().viewChange().budgetMs(),
+        1.0E-9D, "超过上限的预算必须钳到上限");
+    assertEquals(AntiXrayConfig.VIEW_CHANGE_COOLDOWN_TICKS_MAX,
+        high.proximity().viewChange().cooldownTicks());
+    assertEquals(AntiXrayConfig.VIEW_CHANGE_RADIUS_MAX, high.proximity().viewChange().radius());
+    String details = String.join("、", high.ceilingAdjustments());
+    assertTrue(details.contains("proximity.view-change.budget-ms=100.0"), details);
+    assertTrue(details.contains("proximity.view-change.cooldown-ticks=999"), details);
+    assertTrue(details.contains("proximity.view-change.radius=999"), details);
   }
 
   /**

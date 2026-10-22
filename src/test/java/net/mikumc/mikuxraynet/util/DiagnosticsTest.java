@@ -38,7 +38,7 @@ class DiagnosticsTest {
         new Diagnostics.Snapshot.Env(true, true, false, true, 1, "Paper 1.20.4", "25", "1.2.5"),
         new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 30L, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
             0L, 0L, 0L, "无采样"),
-        new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 1L, 40L, 6L),
+        new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 1L, 40L, 6L, 11L, 2_200_000L, 900_000L, 1L),
         // 8 参完整构造：末两项是「累计登记 / 卸载清理」，面板必须把它们与实时驻留量一起显示
         new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L, 5L, 2L),
         new Diagnostics.Snapshot.Occlusion(true, 4096, 3, 200L, 190L, 2L, 1L, 9L, 55L, 4_200_000L, 88L, 4L,

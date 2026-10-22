@@ -32,6 +32,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
 import org.bukkit.event.world.WorldUnloadEvent;
@@ -335,6 +336,10 @@ public final class ProximityRevealer implements Listener {
   private final AtomicBoolean noCapacityWarned = new AtomicBoolean();
   /** 事件显形的每玩家每 tick 限额（默认 16，防爆刷；见 {@link TickQuota}）。 */
   private final TickQuota instantQuota = new TickQuota();
+  /** 视野变化增量巡检的每玩家每 tick 发包限额（与事件显形分开，避免互相挤占）。 */
+  private final TickQuota viewChangeQuota = new TickQuota();
+  /** 视野变化触发状态（按玩家；只在其所属线程读写，退出/停用时整体清理）。 */
+  private final ConcurrentHashMap<UUID, ViewMark> viewMarks = new ConcurrentHashMap<>();
   /**
    * 开掘预显形的去重记号：{@code long[2] = {坐标打包, tick}}，按玩家保存。
    *
@@ -498,6 +503,7 @@ public final class ProximityRevealer implements Listener {
     }
     entityScans.clear();
     digMarks.clear();
+    viewMarks.clear();
     HandlerList.unregisterAll(this);
     if (clearIndexes) {
       chunkIndex.clear();
@@ -562,6 +568,8 @@ public final class ProximityRevealer implements Listener {
     revealedSet.clearPlayer(event.getPlayer().getUniqueId());
     instantQuota.clear(event.getPlayer().getUniqueId());
     digMarks.remove(event.getPlayer().getUniqueId());
+    viewChangeQuota.clear(event.getPlayer().getUniqueId());
+    viewMarks.remove(event.getPlayer().getUniqueId());
     // 离线玩家的回显记号一并释放（否则会滞留到窗口过期，白白占内存）
     revealEcho.remove(event.getPlayer().getUniqueId());
   }
@@ -2178,6 +2186,237 @@ public final class ProximityRevealer implements Listener {
       instantQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
     } catch (Throwable throwable) {
       logThrottled(throwable);
+    }
+  }
+
+  // ============================== 视野变化增量巡检（M3）==============================
+
+  /** 视野变化增量巡检：单次最多评估的候选数（硬上限；同时也是取候选窗口）。 */
+  private static final int MAX_VIEW_CHANGE_CANDIDATES = 32;
+  /** 视野变化增量巡检：每玩家每 tick 最多发包数（防旋转刷包）。 */
+  private static final int MAX_VIEW_CHANGE_SENDS_PER_TICK = 16;
+  /** 触发阈值：与上次已扫描视点的眼位位移（格²）。 */
+  private static final double VIEW_CHANGE_DISTANCE_SQUARED = 1.0D;
+  /** 触发阈值：与上次已扫描视点的视线夹角（弧度，25°）。 */
+  private static final double VIEW_CHANGE_ANGLE_RADIANS = Math.toRadians(25.0D);
+
+  /** 视野变化触发状态：上一次「已扫描」的视点 + 冷却/待补扫标记。 */
+  static final class ViewMark {
+
+    private double eyeX;
+    private double eyeY;
+    private double eyeZ;
+    private double yaw;
+    private double pitch;
+    /** 上次增量巡检的 tick；初值取远小于当前 tick 的值，保证首帧即可触发。 */
+    private long lastScanTick = -1_000L;
+    /** 因冷却被跳过的待补扫标记（由 retry 链消费）。 */
+    private boolean pending;
+    /** 是否已有一条 retry 链在跑（避免重复调度）。 */
+    private boolean scheduled;
+  }
+
+  /**
+   * 纯函数：视野变化是否达到「值得跑一次增量巡检」的阈值（可离线单测）。
+   *
+   * @param distanceSquared 与上次已扫描视点的眼位位移平方（格²）
+   * @param angleRadians    与上次已扫描视点的视线夹角（弧度）
+   */
+  static boolean viewChangeExceeds(double distanceSquared, double angleRadians) {
+    return distanceSquared >= VIEW_CHANGE_DISTANCE_SQUARED || angleRadians >= VIEW_CHANGE_ANGLE_RADIANS;
+  }
+
+  /** 纯函数：两段视线（yaw/pitch，度）的夹角（弧度，0..π）；yaw 环绕由三角函数自然处理。 */
+  static double viewAngle(double fromYaw, double fromPitch, double toYaw, double toPitch) {
+    double fy = Math.toRadians(fromYaw);
+    double fp = Math.toRadians(fromPitch);
+    double ty = Math.toRadians(toYaw);
+    double tp = Math.toRadians(toPitch);
+    // Minecraft 视线：x = -sin(yaw)·cos(pitch)，y = -sin(pitch)，z = cos(yaw)·cos(pitch)
+    double ax = -Math.sin(fy) * Math.cos(fp);
+    double ay = -Math.sin(fp);
+    double az = Math.cos(fy) * Math.cos(fp);
+    double bx = -Math.sin(ty) * Math.cos(tp);
+    double by = -Math.sin(tp);
+    double bz = Math.cos(ty) * Math.cos(tp);
+    double dot = ax * bx + ay * by + az * bz;
+    return Math.acos(Math.max(-1.0D, Math.min(1.0D, dot)));
+  }
+
+  /**
+   * 视野变化入口（{@link PlayerMoveEvent}，玩家所属线程）：移动/转向超过阈值时，当 tick 对近场做一次
+   * 受限增量巡检。
+   *
+   * <p><b>为什么不新开调度任务</b>：移动事件本来就在玩家所属线程上派发（Paper 主线程 / Folia 区域线程），
+   * 直接复用可省掉一次调度往返并把延迟压到 0；成本由 {@code budget-ms} 硬封顶，不会因事件密集而失控。
+   *
+   * <p><b>与周期巡检的关系</b>：增量巡检只补「刚进入视野」的近场坐标，周期巡检仍是兜底；两者共用
+   * {@code sendOne} 与已显形标记，同一坐标当 tick 只发一次。
+   */
+  @EventHandler(ignoreCancelled = true)
+  public void onPlayerMove(PlayerMoveEvent event) {
+    AntiXrayConfig.ViewChange viewChange = proximity.viewChange();
+    if (stopping || !viewChange.enabled()) {
+      return;
+    }
+    Player player = event.getPlayer();
+    if (player == null || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
+      return;
+    }
+    Location to = event.getTo();
+    if (to == null) {
+      return;
+    }
+    ViewMark mark = viewMarks.computeIfAbsent(player.getUniqueId(), ignored -> new ViewMark());
+    double dx = to.getX() - mark.eyeX;
+    double dy = to.getY() - mark.eyeY;
+    double dz = to.getZ() - mark.eyeZ;
+    double distanceSquared = dx * dx + dy * dy + dz * dz;
+    // 便宜的粗筛：位移不足 1 格且朝向变化不足 15°（yaw+pitch 绝对值之和）时，连三角函数都不算
+    double yawDelta = Math.abs(to.getYaw() - mark.yaw);
+    double pitchDelta = Math.abs(to.getPitch() - mark.pitch);
+    if (distanceSquared < VIEW_CHANGE_DISTANCE_SQUARED && yawDelta + pitchDelta < 15.0D) {
+      return;
+    }
+    if (!viewChangeExceeds(distanceSquared, viewAngle(mark.yaw, mark.pitch, to.getYaw(), to.getPitch()))) {
+      return;
+    }
+    long tick = Bukkit.getCurrentTick();
+    if (tick - mark.lastScanTick < viewChange.cooldownTicks()) {
+      // 冷却中：记下待补扫，由 retry 链在冷却结束时补一次（玩家可能在这之后就停下不动）
+      mark.pending = true;
+      scheduleViewChangeRetry(player, mark);
+      return;
+    }
+    mark.lastScanTick = tick;
+    mark.pending = false;
+    rememberView(mark, to);
+    runViewChangeScan(player, viewChange);
+  }
+
+  /** 记录「已扫描」的视点（之后的变化都以它为基准）。 */
+  private static void rememberView(ViewMark mark, Location location) {
+    mark.eyeX = location.getX();
+    mark.eyeY = location.getY();
+    mark.eyeZ = location.getZ();
+    mark.yaw = location.getYaw();
+    mark.pitch = location.getPitch();
+  }
+
+  /** 冷却期内的补扫链：每 tick 复查一次，冷却结束且仍待补扫时补一次（最多 cooldown 次跳转）。 */
+  private void scheduleViewChangeRetry(Player player, ViewMark mark) {
+    if (mark.scheduled) {
+      return;
+    }
+    mark.scheduled = true;
+    Schedulers.onEntity(plugin, player, () -> retryViewChange(player));
+  }
+
+  private void retryViewChange(Player player) {
+    try {
+      if (stopping || !player.isOnline() || !proximity.viewChange().enabled()) {
+        return;
+      }
+      ViewMark mark = viewMarks.get(player.getUniqueId());
+      if (mark == null) {
+        return;
+      }
+      mark.scheduled = false;
+      if (!mark.pending) {
+        return;
+      }
+      long tick = Bukkit.getCurrentTick();
+      if (tick - mark.lastScanTick < proximity.viewChange().cooldownTicks()) {
+        scheduleViewChangeRetry(player, mark);
+        return;
+      }
+      mark.pending = false;
+      mark.lastScanTick = tick;
+      rememberView(mark, player.getLocation());
+      runViewChangeScan(player, proximity.viewChange());
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /**
+   * 玩家所属线程：近场受限增量巡检（见 {@link #onPlayerMove}）。
+   *
+   * <p><b>成本纪律（三道闸）</b>：① 候选上限 {@value #MAX_VIEW_CHANGE_CANDIDATES}；
+   * ② 时间预算 {@code proximity.view-change.budget-ms}（每判 ≤4 个候选检查一次，超时即停并计入
+   * 「预算耗尽」）；③ 每 tick 发包上限 {@value #MAX_VIEW_CHANGE_SENDS_PER_TICK}。任一闸门触发都只是
+   * 「本轮少补几个」：坐标仍在伪装索引里，周期巡检会兜底。
+   */
+  private void runViewChangeScan(Player player, AntiXrayConfig.ViewChange viewChange) {
+    long start = System.nanoTime();
+    int sent = 0;
+    try {
+      if (stopping || !player.isOnline() || chunkIndex == null || revealedSet == null) {
+        return;
+      }
+      World world = player.getWorld();
+      String worldName = world.getName();
+      if (!shouldRevealInWorld(worldName)) {
+        return;
+      }
+      long deadline = start + (long) (viewChange.budgetMs() * 1_000_000.0D);
+      Location eyeLocation = player.getEyeLocation();
+      ProximityScanner.Tally scanTally = new ProximityScanner.Tally();
+      List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex, revealedSet,
+          player.getUniqueId(), worldName, eyeLocation.getBlockX(), eyeLocation.getBlockY(),
+          eyeLocation.getBlockZ(), viewChange.radius(), MAX_VIEW_CHANGE_CANDIDATES, 0, 1, scanTally);
+      if (candidates.isEmpty()) {
+        return;
+      }
+      if (System.nanoTime() > deadline) {
+        stats.viewChangeBudgetExhausted.increment();
+        return;
+      }
+      UUID playerId = player.getUniqueId();
+      long tick = Bukkit.getCurrentTick();
+      int granted = viewChangeQuota.claim(playerId, tick, MAX_VIEW_CHANGE_SENDS_PER_TICK,
+          MAX_VIEW_CHANGE_SENDS_PER_TICK);
+      Budget budget = new Budget(granted);
+      if (budget.remaining() <= 0) {
+        return;
+      }
+      ProximitySelector.Eye eye = proximity.raycastEnabled() ? eyeOf(player) : null;
+      boolean frustum = proximity.frustumEnabled();
+      PassTally tally = new PassTally();
+      RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
+      int evaluated = 0;
+      boolean exhausted = false;
+      for (ObfuscatedChunkIndex.Position position : candidates) {
+        if (budget.remaining() <= 0) {
+          break;
+        }
+        if ((evaluated & 3) == 0 && System.nanoTime() > deadline) {
+          exhausted = true;
+          break;
+        }
+        evaluated++;
+        if (frustum && !ProximitySelector.withinFrustum(eye, position.x(), position.y(), position.z(),
+            proximity.frustumMinDistance(), proximity.frustumFov())) {
+          continue;
+        }
+        sendOne(player, world, position.x(), position.y(), position.z(), eye, budget, tally, batch, false);
+      }
+      flushBatch(player, batch, tally);
+      sent = tally.sent;
+      viewChangeQuota.release(playerId, tick, MAX_VIEW_CHANGE_SENDS_PER_TICK, granted, sent);
+      if (exhausted) {
+        stats.viewChangeBudgetExhausted.increment();
+      }
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    } finally {
+      long elapsed = System.nanoTime() - start;
+      stats.viewChangeScans.increment();
+      stats.viewChangeNanos.add(elapsed);
+      long current = stats.viewChangeMaxNanos.get();
+      while (elapsed > current && !stats.viewChangeMaxNanos.compareAndSet(current, elapsed)) {
+        current = stats.viewChangeMaxNanos.get();
+      }
     }
   }
 

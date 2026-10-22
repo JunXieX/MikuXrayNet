@@ -2,6 +2,7 @@ package net.mikumc.mikuxraynet.antixray;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
@@ -63,6 +64,24 @@ public final class ProximityStats {
   public final LongAdder overRevealWasted = new LongAdder();
 
   /**
+   * 视野变化增量巡检（{@code proximity.view-change}）：执行次数。
+   *
+   * <p><b>为什么必须可观测</b>：这条路径由玩家移动/转向事件驱动，是唯一「频率取决于玩家行为」的显形路径；
+   * 只看发包数无法知道它是否被高频触发（旋转/抖动会放大调用次数）。次数 + 耗时三者合起来才能判断
+   * 「是否值得保留、预算是否该调」。
+   */
+  public final LongAdder viewChangeScans = new LongAdder();
+
+  /** 视野变化增量巡检累计耗时（纳秒）；与 {@link #viewChangeScans} 相除即平均每次耗时。 */
+  public final LongAdder viewChangeNanos = new LongAdder();
+
+  /** 视野变化增量巡检单次最大耗时（纳秒，CAS 更新）；用于识别毛刺。 */
+  public final AtomicLong viewChangeMaxNanos = new AtomicLong();
+
+  /** 视野变化增量巡检因时间预算耗尽而提前结束的次数（持续偏高说明预算配小或候选过多）。 */
+  public final LongAdder viewChangeBudgetExhausted = new LongAdder();
+
+  /**
    * 生成中文可读快照（顺序稳定，便于命令输出）。
    *
    * <p>测试专用豁免：生产诊断直接逐字段读取（见 {@code Diagnostics}），
@@ -78,6 +97,8 @@ public final class ProximityStats {
     map.put("射线剔除（缺数据）", revealsRayCulledMissingData.sum());
     map.put("过度显形（抽样）", overRevealWasted.sum());
     map.put("过度显形抽样数", overRevealSampled.sum());
+    map.put("视野增量巡检次数", viewChangeScans.sum());
+    map.put("视野增量巡检耗时(ms)", viewChangeNanos.sum() / 1_000_000L);
     return map;
   }
 }

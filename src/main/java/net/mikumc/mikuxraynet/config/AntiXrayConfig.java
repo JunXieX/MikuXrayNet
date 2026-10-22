@@ -334,6 +334,27 @@ public final class AntiXrayConfig {
    */
   public static final int PROXIMITY_DISTANCE_CHUNKS_MAX = 32;
 
+  /** {@code proximity.view-change.budget-ms} 的下限（毫秒）：低于它几乎判不完一个候选，等于功能失效。 */
+  public static final double VIEW_CHANGE_BUDGET_MS_FLOOR = 0.05D;
+  /** {@code proximity.view-change.budget-ms} 的默认值（毫秒）：每玩家每 tick 的硬耗时预算。 */
+  public static final double VIEW_CHANGE_BUDGET_MS_DEFAULT = 0.15D;
+  /** {@code proximity.view-change.budget-ms} 的上限（毫秒）：再大就不是「补漏」而是替代周期巡检了。 */
+  public static final double VIEW_CHANGE_BUDGET_MS_MAX = 2.0D;
+
+  /** {@code proximity.view-change.cooldown-ticks} 的下限（tick）：0 会让旋转抖动把预算打满。 */
+  public static final int VIEW_CHANGE_COOLDOWN_TICKS_FLOOR = 1;
+  /** {@code proximity.view-change.cooldown-ticks} 的默认值（tick）：2 tick = 100 ms 的最坏补发延迟。 */
+  public static final int VIEW_CHANGE_COOLDOWN_TICKS_DEFAULT = 2;
+  /** {@code proximity.view-change.cooldown-ticks} 的上限（tick）。 */
+  public static final int VIEW_CHANGE_COOLDOWN_TICKS_MAX = 20;
+
+  /** {@code proximity.view-change.radius} 的下限（格）：小于它不如直接等周期巡检。 */
+  public static final int VIEW_CHANGE_RADIUS_FLOOR = 8;
+  /** {@code proximity.view-change.radius} 的默认值（格）：近场 1.5 个区块，覆盖「贴脸看到」的范围。 */
+  public static final int VIEW_CHANGE_RADIUS_DEFAULT = 24;
+  /** {@code proximity.view-change.radius} 的上限（格）：再大会把取候选本身也做成开销。 */
+  public static final int VIEW_CHANGE_RADIUS_MAX = 64;
+
   /**
    * {@code proximity.raycast.samples}（每方块最多尝试的候选点数）的有效上限。
    *
@@ -561,13 +582,15 @@ public final class AntiXrayConfig {
    * @param preRevealOnDig        玩家开始挖某个方块时，预先显形其 6 邻中「挖开后会看见」的伪装坐标
    *                              （默认开启）。客户端对挖掘有本地预测，等方块破坏后再显形必然晚一个 RTT；
    *                              改为开掘即显形，正常挖掘速度下显形包先于方块破坏到达，玩家看不到假方块。
+   * @param viewChange            视野变化增量巡检（移动/转向触发，见 {@link ViewChange}）：把周期巡检
+   *                              分片轮转最坏 0.8 秒的补发窗口压到 ≤ 冷却+1 tick
    */
   public record Proximity(boolean enabled, int distanceChunks, int intervalTicks, int maxRevealsPerTick,
       int expireSeconds, int maxPositions, int maxPositionsPerPlayer,
       boolean frustumEnabled, double frustumFov, double frustumMinDistance,
       boolean raycastEnabled, int raycastSamples,
       InstantReveal instantReveal, int overRevealSampling, boolean batchRevealSends,
-      boolean revealOnChunkSend, boolean preRevealOnDig) {
+      boolean revealOnChunkSend, boolean preRevealOnDig, ViewChange viewChange) {
   }
 
   /**
@@ -579,6 +602,26 @@ public final class AntiXrayConfig {
    * @param maxPerTick 每玩家每 tick 事件显形限额（防爆刷；默认 16，0 表示关闭事件显形）
    */
   public record InstantReveal(boolean enabled, int radius, int maxPerTick) {
+  }
+
+  /**
+   * 视野变化增量巡检：玩家移动/转向超过阈值时，在<b>当 tick</b> 对近场做一次受限增量扫描，
+   * 把「刚进入视野」的伪装坐标补发下去（周期巡检的分片轮转最坏要 4 个周期 ≈ 0.8 秒才轮到）。
+   *
+   * <p><b>为什么需要它</b>：周期巡检按分片轮转，玩家「转身/绕过拐角」看到的新区域可能要等 0.8 秒
+   * 才被还原——这期间看到的是合理的假方块（石头），虽不致泄漏，但会有「矿凭空出现」的观感。
+   *
+   * <p><b>成本纪律</b>：这条路径由玩家行为驱动，必须硬性封顶：每玩家每 tick 时间预算
+   * （{@code budget-ms}）+ 冷却（{@code cooldown-ticks}）+ 单次候选上限（代码常量 32）+
+   * 每 tick 发包上限（代码常量 16）。超预算即停，剩余候选交给周期巡检兜底。
+   *
+   * @param enabled       总开关（默认开启）
+   * @param budgetMs      每玩家每 tick 的耗时预算（毫秒）；低于 {@link #VIEW_CHANGE_BUDGET_MS_FLOOR}
+   *                      抬升到下限、高于 {@link #VIEW_CHANGE_BUDGET_MS_MAX} 钳到上限，均留痕
+   * @param cooldownTicks 同一玩家两次增量巡检的最小间隔（tick）；钳制 1..{@link #VIEW_CHANGE_COOLDOWN_TICKS_MAX}
+   * @param radius        扫描半径（格）；钳制 {@link #VIEW_CHANGE_RADIUS_FLOOR}..{@link #VIEW_CHANGE_RADIUS_MAX}
+   */
+  public record ViewChange(boolean enabled, double budgetMs, int cooldownTicks, int radius) {
   }
 
   /**
@@ -1081,7 +1124,21 @@ public final class AntiXrayConfig {
             lenientBoolean(root, "proximity.reveal-on-chunk-send", true, typeAdjustments),
             // 开掘即预显形（默认开启）：客户端对挖掘有本地预测，等方块破坏后再显形必然晚一个 RTT；
             // 提前到「开始挖」时把 6 邻中挖开后会看见的坐标发下去（见 ProximityRevealer#onBlockDamage）。
-            lenientBoolean(root, "proximity.instant-reveal.pre-reveal-on-dig", true, typeAdjustments)),
+            lenientBoolean(root, "proximity.instant-reveal.pre-reveal-on-dig", true, typeAdjustments),
+            // 视野变化增量巡检（默认开启）：移动/转向超阈值时当 tick 对近场补一次受限增量扫描，
+            // 把周期巡检分片轮转的最坏 0.8 秒窗口压到 ≤ 冷却+1 tick（见 ProximityRevealer#onPlayerMove）。
+            new ViewChange(
+                lenientBoolean(root, "proximity.view-change.enabled", true, typeAdjustments),
+                viewChangeBudgetMs(
+                    root.getDouble("proximity.view-change.budget-ms", VIEW_CHANGE_BUDGET_MS_DEFAULT),
+                    floorAdjustments, ceilingAdjustments),
+                clampCeiling(root.getInt("proximity.view-change.cooldown-ticks",
+                        VIEW_CHANGE_COOLDOWN_TICKS_DEFAULT), VIEW_CHANGE_COOLDOWN_TICKS_FLOOR,
+                    VIEW_CHANGE_COOLDOWN_TICKS_MAX, "proximity.view-change.cooldown-ticks",
+                    floorAdjustments, ceilingAdjustments),
+                clampCeiling(root.getInt("proximity.view-change.radius", VIEW_CHANGE_RADIUS_DEFAULT),
+                    VIEW_CHANGE_RADIUS_FLOOR, VIEW_CHANGE_RADIUS_MAX, "proximity.view-change.radius",
+                    floorAdjustments, ceilingAdjustments))),
         new DiskCache(
             lenientBoolean(root, "disk-cache.enabled", true, typeAdjustments),
             // 上限见 DISK_CACHE_MAX_ENTRIES_MAX：条目上限直接决定磁盘占用与启动期扫描量。
@@ -1711,6 +1768,32 @@ public final class AntiXrayConfig {
     floorAdjustments.add("proximity.frustum.min-distance=" + value
         + "（下限 " + FRUSTUM_MIN_DISTANCE_FLOOR + " 格）");
     return FRUSTUM_MIN_DISTANCE_FLOOR;
+  }
+
+  /**
+   * 视野变化增量巡检的时间预算（毫秒）：非有限值回落默认、越界两端钳制并留痕（与视锥参数同一口径）。
+   *
+   * <p>该值是「每玩家每 tick 的硬耗时上限」，配得过大等于把周期巡检的成本搬家到事件路径上；
+   * 配得过小则一次都判不完（功能静默失效）。两端都必须显式告知，绝不静默改配置。
+   */
+  private static double viewChangeBudgetMs(double configured, List<String> floorAdjustments,
+      List<String> ceilingAdjustments) {
+    if (!Double.isFinite(configured)) {
+      ceilingAdjustments.add("proximity.view-change.budget-ms=" + configured + "（非有限值，回落默认 "
+          + VIEW_CHANGE_BUDGET_MS_DEFAULT + " ms）");
+      return VIEW_CHANGE_BUDGET_MS_DEFAULT;
+    }
+    if (configured < VIEW_CHANGE_BUDGET_MS_FLOOR) {
+      floorAdjustments.add("proximity.view-change.budget-ms=" + configured
+          + "（下限 " + VIEW_CHANGE_BUDGET_MS_FLOOR + " ms）");
+      return VIEW_CHANGE_BUDGET_MS_FLOOR;
+    }
+    if (configured > VIEW_CHANGE_BUDGET_MS_MAX) {
+      ceilingAdjustments.add("proximity.view-change.budget-ms=" + configured
+          + "（上限 " + VIEW_CHANGE_BUDGET_MS_MAX + " ms）");
+      return VIEW_CHANGE_BUDGET_MS_MAX;
+    }
+    return configured;
   }
 
   /**
