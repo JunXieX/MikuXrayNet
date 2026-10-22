@@ -1103,7 +1103,7 @@ public final class Diagnostics {
     sb.append("proximity.over-reveal-sampling=").append(c.proximity().overRevealSampling())
         .append("，batch-reveal-sends=").append(c.proximity().batchRevealSends()).append('\n');
     sb.append("proximity.enabled=").append(c.proximity().enabled())
-        .append("，distance=").append(c.proximity().distance())
+        .append("，distance-chunks=").append(c.proximity().distanceChunks())
         .append("，interval-ticks=").append(c.proximity().intervalTicks())
         .append("，max-reveals-per-tick=").append(c.proximity().maxRevealsPerTick())
         .append("，expire-seconds=").append(c.proximity().expireSeconds()).append('\n');

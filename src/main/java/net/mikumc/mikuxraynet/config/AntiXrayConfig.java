@@ -314,22 +314,25 @@ public final class AntiXrayConfig {
   public static final int DISK_CACHE_EXPIRE_FLOOR_SECONDS = 86400;
 
   /**
-   * 邻近显形触发距离的<b>默认值</b>（格）：96（= 6 个区块半径，扫描 13×13 = 169 个区块）。
+   * 邻近显形半径的<b>默认值</b>（区块 = 视距单位）：<b>0 = 跟随服务器视距</b>。
    *
-   * <p>取在旧默认 64 之上：显形只在射线通畅且方块有暴露面时还原，因此放大距离不会隔着墙泄露，
-   * 只是把「本来就看得到的矿」更早、更远地还给玩家。代价是单周期候选扫描量随半径平方增长
-   * （64 → 96 约 3.5 倍），故仍有安全上限（见 {@link #PROXIMITY_DISTANCE_MAX}）。
+   * <p><b>为什么默认「跟随视距」而不是写死数值</b>：显形包只有在客户端<b>已加载该区块</b>时才生效，
+   * 超出视距的显形包会被客户端直接丢弃（既浪费带宽，又可能留下「已显形」标记）。跟随服务器
+   * view-distance（{@code server.properties}；若某世界在 world 级配置里覆盖过，则取该世界的生效值）
+   * 能保证「发出去的显形包客户端一定收得到」，同时把扫描量收在玩家真实可见范围内。
+   *
+   * <p>配置正数时表示「最多向外显形几个区块」，仍会被钳制到该玩家的有效视距（服务器视距与
+   * 客户端自报视距取小），因此不会越界。
    */
-  public static final double PROXIMITY_DISTANCE_DEFAULT = 96.0D;
+  public static final int PROXIMITY_DISTANCE_CHUNKS_DEFAULT = 0;
 
   /**
-   * 邻近显形触发距离的<b>安全上限</b>（格）。
+   * {@code proximity.distance-chunks} 的安全上限（区块）：32（Minecraft 允许的最大视距）。
    *
-   * <p><b>为什么设上限</b>：每个巡检周期要对玩家周围该半径内的区块做候选扫描，扫描量随半径<b>平方增长</b>
-   * （O(r²)）。手滑把 64 多打一位成 640（甚至几千）会让每周期扫描的区块数暴涨几十倍，直接把主线程拖住。
-   * 128 格已远大于一个视距，再大也只是提前把远处矿物亮给玩家，故上限取 128。
+   * <p>实际半径永远被玩家视距钳制（≤ 32），因此这里只是拦住「手滑多打一位数」的配置值；
+   * 扫描量随半径平方增长（O(r²)）的顾虑由「钳到真实视距」本身化解。
    */
-  public static final double PROXIMITY_DISTANCE_MAX = 128.0D;
+  public static final int PROXIMITY_DISTANCE_CHUNKS_MAX = 32;
 
   /**
    * {@code proximity.raycast.samples}（每方块最多尝试的候选点数）的有效上限。
@@ -525,10 +528,11 @@ public final class AntiXrayConfig {
   /**
    * 邻近显形：玩家靠近曾被伪装的坐标时，主动把该坐标的真实方块发回客户端。
    *
-   * @param distance              触发显形的距离（格，三维欧氏距离，等于阈值也算命中）；默认
-   *                              {@link #PROXIMITY_DISTANCE_DEFAULT}；
-   *                              <b>不高于 {@link #PROXIMITY_DISTANCE_MAX}</b>（超过上限会被钳制并 WARN，
-   *                              因为扫描量随半径平方增长）
+   * @param distanceChunks        显形半径（<b>区块 = 视距单位</b>）；0（默认）表示跟随服务器视距
+   *                              （{@code server.properties} 的 view-distance，world 级覆盖时取该世界值），
+   *                              正数表示最多向外几个区块。运行时一律再与「该玩家的有效视距」
+   *                              （服务器视距与客户端自报视距取小）取小值，因此不会给客户端还没加载的
+   *                              区块发显形包；配置超过 {@link #PROXIMITY_DISTANCE_CHUNKS_MAX} 会被钳制并 WARN
    * @param intervalTicks         巡检周期（tick）
    * @param maxRevealsPerTick     单次巡检的发包上限（普通服务端为全服合计，Folia 为每玩家）
    * @param expireSeconds         显形索引条目的过期秒数（区块卸载未触发时的兜底）
@@ -552,7 +556,7 @@ public final class AntiXrayConfig {
    *                              （{@code Player#sendMultiBlockChange}）发出；关闭时逐坐标
    *                              用 {@code Player#sendBlockChange} 发出（默认开启，供 A/B 与回退用）
    */
-  public record Proximity(boolean enabled, double distance, int intervalTicks, int maxRevealsPerTick,
+  public record Proximity(boolean enabled, int distanceChunks, int intervalTicks, int maxRevealsPerTick,
       int expireSeconds, int maxPositions, int maxPositionsPerPlayer,
       boolean frustumEnabled, double frustumFov, double frustumMinDistance,
       boolean raycastEnabled, int raycastSamples,
@@ -737,7 +741,7 @@ public final class AntiXrayConfig {
    */
   private final List<String> floorAdjustments;
   /**
-   * 被安全上限（{@link #PROXIMITY_DISTANCE_MAX} / {@link #NEIGHBORS_CACHE_MAXIMUM_MAX} /
+   * 被安全上限（{@link #PROXIMITY_DISTANCE_CHUNKS_MAX} / {@link #NEIGHBORS_CACHE_MAXIMUM_MAX} /
    * {@link #CACHE_MAXIMUM_SIZE_MAX}）回落过的配置键明细；空列表表示未回落。
    * 加载时由 {@link #warnIfConfigAdjusted} 一次性 WARN。
    */
@@ -1008,15 +1012,17 @@ public final class AntiXrayConfig {
             OcclusionRules.normalizeAll(root.getStringList("occlusion.extra-non-occluding"))),
         new Proximity(
             lenientBoolean(root, "proximity.enabled", true, typeAdjustments),
-            // 默认 96（原 64）：真机反馈「64 格仍然偏近」。显形只在射线通畅时才还原，
-            // 因此放大距离不会隔着墙泄露——它只是把「本来就看得到的矿」更早、更远地还给玩家。
-            // 但扫描量随半径平方增长，故设有安全上限（见 PROXIMITY_DISTANCE_MAX）。
-            proximityDistance(root.getDouble("proximity.distance", PROXIMITY_DISTANCE_DEFAULT),
+            // 单位是「区块」（= 视距单位）。0（默认）= 跟随服务器 view-distance：
+            // 显形包只在客户端已加载该区块时生效，超出视距的包会被客户端丢弃，因此半径没有理由越界。
+            // 正数也一律与玩家有效视距取小（见 ProximityRevealer#effectiveRevealChunks）。
+            proximityDistanceChunks(
+                narrowInt(lenientLongValue(root.get("proximity.distance-chunks"),
+                    PROXIMITY_DISTANCE_CHUNKS_DEFAULT, "proximity.distance-chunks", typeAdjustments)),
                 floorAdjustments, ceilingAdjustments),
             // 默认 4（原为 5）：显形周期越短，「石头还没变回来」的窗口越小。
             clampCeiling(root.getInt("proximity.interval-ticks", 4), 1, PROXIMITY_INTERVAL_TICKS_MAX,
                 "proximity.interval-ticks", floorAdjustments, ceilingAdjustments),
-            // 默认 512（原 256）：配合扩大到 96 格的距离与放宽的视锥，单周期通过筛选的坐标更多，
+            // 默认 512（原 256）：配合按视距的显形半径与放宽的视锥，单周期通过筛选的坐标更多，
             // 单次额度也要相应放大，避免「近处的矿排队等到下一周期才还原」。
             clampCeiling(root.getInt("proximity.max-reveals-per-tick", 512), 1,
                 PROXIMITY_MAX_REVEALS_PER_TICK_MAX, "proximity.max-reveals-per-tick",
@@ -1752,31 +1758,23 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 邻近显形触发距离的生效值：非有限值（NaN / ±Inf）回落默认
-   * （{@link #PROXIMITY_DISTANCE_DEFAULT}），负数钳到 0（= 关闭邻近显形触发），
-   * 超过 {@link #PROXIMITY_DISTANCE_MAX} 时按上限生效。
+   * 邻近显形半径的生效值（区块）：0 = 跟随服务器视距；正数原样保留（运行时再与玩家有效视距取小），
+   * 超过 {@link #PROXIMITY_DISTANCE_CHUNKS_MAX} 时按上限生效；负数钳到 0 并留痕。
    *
-   * <p>三种情况都记入明细、由加载路径一次性 WARN（绝不静默改用户配置）：负数是「低于下限（0）」，
-   * 记入 {@code floorAdjustments}；非有限值与超上限记入 {@code ceilingAdjustments}。
-   *
-   * <p>之所以要显式拦非有限值：{@code Math.max(0.0, NaN)} 仍是 NaN，NaN 会污染距离比较
-   * （所有比较恒 false）并进入配置指纹，导致磁盘缓存整体失效；因此一律回落默认。
+   * <p>三种情况都记入明细、由加载路径一次性 WARN（绝不静默改用户配置）：负数记 {@code floorAdjustments}，
+   * 超上限记 {@code ceilingAdjustments}。
    */
-  private static double proximityDistance(double configured, List<String> floorAdjustments,
+  private static int proximityDistanceChunks(int configured, List<String> floorAdjustments,
       List<String> ceilingAdjustments) {
-    if (!Double.isFinite(configured)) {
-      ceilingAdjustments.add("proximity.distance=" + configured + "（非有限值，回落默认 "
-          + PROXIMITY_DISTANCE_DEFAULT + " 格）");
-      return PROXIMITY_DISTANCE_DEFAULT;
+    if (configured < 0) {
+      // 负数钳到 0（= 跟随服务器视距）：旧实现直接 Math.max 静默归零、不留痕，管理员会以为负数已生效
+      floorAdjustments.add("proximity.distance-chunks=" + configured + "（负值，按 0 处理 = 跟随服务器视距）");
+      return PROXIMITY_DISTANCE_CHUNKS_DEFAULT;
     }
-    if (configured < 0.0D) {
-      // 负数钳到 0：旧实现直接 Math.max(0, value) 静默归 0、不留痕，管理员会以为负数已生效
-      floorAdjustments.add("proximity.distance=" + configured + "（负值，按 0 处理 = 不触发邻近显形）");
-      return 0.0D;
-    }
-    if (configured > PROXIMITY_DISTANCE_MAX) {
-      ceilingAdjustments.add("proximity.distance=" + configured + "（上限 " + PROXIMITY_DISTANCE_MAX + " 格）");
-      return PROXIMITY_DISTANCE_MAX;
+    if (configured > PROXIMITY_DISTANCE_CHUNKS_MAX) {
+      ceilingAdjustments.add("proximity.distance-chunks=" + configured
+          + "（上限 " + PROXIMITY_DISTANCE_CHUNKS_MAX + " 区块，实际还会被玩家视距钳制）");
+      return PROXIMITY_DISTANCE_CHUNKS_MAX;
     }
     return configured;
   }
@@ -1918,7 +1916,7 @@ public final class AntiXrayConfig {
     }
     if (!ceilingAdjustments.isEmpty()) {
       logger.warning("antixray.yml 的 " + String.join("、", ceilingAdjustments) + " 超过安全上限，已按上限生效"
-          + "（当前：proximity.distance=" + proximity.distance() + " 格、neighbors.cache-maximum-size="
+          + "（当前：proximity.distance-chunks=" + proximity.distanceChunks() + "、neighbors.cache-maximum-size="
           + neighbors.cacheMaximumSize() + "、cache.maximum-size=" + cacheMaximumSize
           + "、cache.maximum-mb=" + cacheMaximumMb + "）。"
           + "上限用于防止手滑多打一位数的失控配置：邻近显形距离的扫描量随半径平方增长（O(r²)）会拖住主线程，"

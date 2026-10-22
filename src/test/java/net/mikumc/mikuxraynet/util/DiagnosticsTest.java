@@ -166,15 +166,15 @@ class DiagnosticsTest {
     // 安全上限回落同样要显式回显（邻近显形距离 / 缓存容量）
     String capped = Diagnostics.formatDump(withAntiXray(antiXray("""
         proximity:
-          distance: 4096.0
+          distance-chunks: 4096
         cache:
           maximum-size: 409600
         """)), "20260925-000000");
-    assertTrue(capped.contains("配置安全上限已回落：proximity.distance=4096.0"),
+    assertTrue(capped.contains("配置安全上限已回落：proximity.distance-chunks=4096"),
         "dump 必须回显被回落的安全上限键：" + capped);
     assertTrue(capped.contains("cache.maximum-size=409600"), capped);
-    assertTrue(capped.contains("distance=128.0"),
-        "dump 的有效值必须是被回落后的上限（128 格）：" + capped);
+    assertTrue(capped.contains("distance-chunks=32"),
+        "dump 的有效值必须是被回落后的上限（32 区块）：" + capped);
   }
 
   /**

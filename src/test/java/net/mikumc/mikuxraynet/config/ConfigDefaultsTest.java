@@ -44,11 +44,11 @@ class ConfigDefaultsTest {
     assertEquals(AntiXrayConfig.ObfuscationMode.ALL,
         config.dimensionEffective(AntiXrayConfig.Dimension.NORMAL).mode(),
         "默认模式必须是 all（透视不得直接看到裸露在矿洞中的矿）");
-    assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_DEFAULT, config.proximity().distance(), 1.0E-9D,
-        "显形距离默认 96 格（64 仍偏近；显形只在视线通畅且方块有暴露面时还原，放大距离不会隔墙泄露；"
-            + "扫描半径 ceil(96/16)=6 即 13×13 区块）");
+    assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_CHUNKS_DEFAULT, config.proximity().distanceChunks(),
+        "显形半径默认 0 = 跟随服务器视距（server.properties 的 view-distance，运行时再与客户端自报视距取小）："
+            + "显形包只在客户端已加载该区块时才生效，越界的包会被客户端直接丢弃");
     assertEquals(512, config.proximity().maxRevealsPerTick(),
-        "单次显形额度默认 512（原 256；配合 96 格距离与放宽的视锥，候选更多，额度需相应放大）");
+        "单次显形额度默认 512（原 256；配合按视距的显形半径与放宽的视锥，候选更多，额度需相应放大）");
     assertEquals(4, config.proximity().intervalTicks(), "巡检周期收紧为 4 tick（0.2 秒一次，显形更及时）");
     assertTrue(config.proximity().raycastEnabled(), "可见性判定默认开启（隔着墙不显形）");
     assertEquals(AntiXrayConfig.FRUSTUM_MIN_DISTANCE_DEFAULT, config.proximity().frustumMinDistance(),
@@ -159,8 +159,8 @@ class ConfigDefaultsTest {
     AntiXrayConfig fallback = AntiXrayConfig.from(yaml("enabled: true\n"));
     AntiXrayConfig packed = AntiXrayConfig.from(loadPackedAntiXrayYml());
 
-    assertEquals(fallback.proximity().distance(), packed.proximity().distance(), 1.0E-9D,
-        "打包 yml 的 proximity.distance 必须等于代码回落值");
+    assertEquals(fallback.proximity().distanceChunks(), packed.proximity().distanceChunks(),
+        "打包 yml 的 proximity.distance-chunks 必须等于代码回落值");
     assertEquals(fallback.proximity().maxRevealsPerTick(), packed.proximity().maxRevealsPerTick(),
         "打包 yml 的 proximity.max-reveals-per-tick 必须等于代码回落值");
     assertEquals(fallback.proximity().frustumFov(), packed.proximity().frustumFov(), 1.0E-9D,
@@ -214,7 +214,7 @@ class ConfigDefaultsTest {
   }
 
   /**
-   * 任务3：{@code proximity.frustum.min-distance} 的 NaN、以及 {@code proximity.distance} 的负值
+   * 任务3：{@code proximity.frustum.min-distance} 的 NaN、以及 {@code proximity.distance-chunks} 的负值
    * 都不得静默回落/归零——必须与 frustumFov 口径一致，进入一次性 WARN 明细。
    */
   @Test
@@ -225,10 +225,11 @@ class ConfigDefaultsTest {
     assertTrue(joinedFloors(nan).contains("proximity.frustum.min-distance=NaN"),
         "NaN 的 min-distance 必须纳入一次性 WARN 明细（不再静默）：" + nan.floorAdjustments());
 
-    AntiXrayConfig negative = AntiXrayConfig.from(yaml("proximity:\n  distance: -5.0\n"));
-    assertEquals(0.0D, negative.proximity().distance(), 1.0E-9D, "负值的显形距离必须按 0 处理");
-    assertTrue(joinedFloors(negative).contains("proximity.distance=-5.0"),
-        "负值的 proximity.distance 必须留痕（不再静默归 0）：" + negative.floorAdjustments());
+    AntiXrayConfig negative = AntiXrayConfig.from(yaml("proximity:\n  distance-chunks: -5\n"));
+    assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_CHUNKS_DEFAULT, negative.proximity().distanceChunks(),
+        "负值的显形半径必须回到默认（0 = 跟随服务器视距）");
+    assertTrue(joinedFloors(negative).contains("proximity.distance-chunks=-5"),
+        "负值的 proximity.distance-chunks 必须留痕（不再静默归 0）：" + negative.floorAdjustments());
   }
 
   /**
@@ -671,7 +672,7 @@ class ConfigDefaultsTest {
   void antixrayCeilingsClampAndReport() {
     AntiXrayConfig config = AntiXrayConfig.from(yaml("""
         proximity:
-          distance: 4096.0
+          distance-chunks: 4096
           raycast:
             samples: 8
         neighbors:
@@ -680,8 +681,8 @@ class ConfigDefaultsTest {
           maximum-size: 409600
         """));
 
-    assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_MAX, config.proximity().distance(), 1.0E-9D,
-        "邻近显形距离超过上限必须钳制到 128 格（扫描量 O(r²)，防止把主线程拖住）");
+    assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_CHUNKS_MAX, config.proximity().distanceChunks(),
+        "邻近显形半径超过上限必须钳制到 32 区块（Minecraft 允许的最大视距；实际还会被玩家视距钳制）");
     assertEquals(AntiXrayConfig.PROXIMITY_RAY_SAMPLES_MAX, config.proximity().raycastSamples(),
         "候选点数超过有效上限必须钳制到 5（暴露面上至多 5 个候选点）");
     assertEquals(AntiXrayConfig.NEIGHBORS_CACHE_MAXIMUM_MAX, config.neighbors().cacheMaximumSize(),
@@ -690,14 +691,14 @@ class ConfigDefaultsTest {
         "改写缓存条目超过上限必须钳制到 65536");
 
     String details = String.join("、", config.ceilingAdjustments());
-    assertTrue(details.contains("proximity.distance=4096.0"), details);
+    assertTrue(details.contains("proximity.distance-chunks=4096"), details);
     assertTrue(details.contains("neighbors.cache-maximum-size=1000000"), details);
     assertTrue(details.contains("cache.maximum-size=409600"), details);
 
     // 上限以内的显式值原样生效、不产生明细
     AntiXrayConfig inRange = AntiXrayConfig.from(yaml("""
         proximity:
-          distance: 128.0
+          distance-chunks: 32
           raycast:
             samples: 5
         neighbors:
@@ -705,7 +706,7 @@ class ConfigDefaultsTest {
         cache:
           maximum-size: 50000
         """));
-    assertEquals(128.0D, inRange.proximity().distance(), 1.0E-9D);
+    assertEquals(32, inRange.proximity().distanceChunks(), "32 是有效上限，应原样生效");
     assertEquals(5, inRange.proximity().raycastSamples(), "samples=5 是有效上限，应原样生效");
     assertEquals(4096, inRange.neighbors().cacheMaximumSize());
     assertEquals(50000, inRange.cacheMaximumSize());
@@ -775,23 +776,21 @@ class ConfigDefaultsTest {
   }
 
   /**
-   * {@code proximity.distance} 的非有限值（NaN / ±Inf）必须回落默认 96，不得原样穿过钳制。
+   * {@code proximity.distance-chunks} 是整型键：非整数写法（NaN / ±Inf / 浮点 / 带引号的非数字）
+   * 必须回落默认 0（= 跟随服务器视距）<b>并留痕</b>，不得静默取默认值。
    *
-   * <p>NaN 会污染距离比较（所有比较恒 false）并进入配置指纹，导致磁盘缓存整体失效。
+   * <p>与旧的 {@code proximity.distance}（浮点、毫秒级距离）不同，这里用 {@code lenientLongValue} 解析：
+   * 类型不符时写入 {@code typeAdjustments}，从而保证「写了却没生效」仍能在启动日志里看到。
    */
   @Test
-  void proximityDistanceNonFiniteFallsBackToDefault() {
-    AntiXrayConfig nan = AntiXrayConfig.from(yaml("proximity:\n  distance: .nan\n"));
-    assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_DEFAULT, nan.proximity().distance(), 1.0E-9D,
-        "NaN 必须回落默认 96");
-    assertTrue(String.join("、", nan.ceilingAdjustments()).contains("proximity.distance=NaN"),
-        "非有限值回落必须留痕：" + nan.ceilingAdjustments());
-
-    AntiXrayConfig inf = AntiXrayConfig.from(yaml("proximity:\n  distance: .inf\n"));
-    assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_DEFAULT, inf.proximity().distance(), 1.0E-9D,
-        "+Inf 属于非有限值，同样回落默认 96（而不是被当成超大值）");
-    assertTrue(String.join("、", inf.ceilingAdjustments()).contains("proximity.distance=Infinity"),
-        "非有限值回落必须留痕：" + inf.ceilingAdjustments());
+  void proximityDistanceChunksNonIntegerFallsBackToDefaultAndReports() {
+    for (String raw : new String[] {".nan", ".inf", "1.5", "\"abc\""}) {
+      AntiXrayConfig config = AntiXrayConfig.from(yaml("proximity:\n  distance-chunks: " + raw + "\n"));
+      assertEquals(AntiXrayConfig.PROXIMITY_DISTANCE_CHUNKS_DEFAULT, config.proximity().distanceChunks(),
+          "非整数写法必须回落默认 0（跟随服务器视距）：" + raw);
+      assertTrue(String.join("、", config.typeAdjustments()).contains("proximity.distance-chunks"),
+          "非整数写法必须留痕（不得静默取默认值）：" + raw + " → " + config.typeAdjustments());
+    }
   }
 
   // ------------------------------------------------------------ 缺省键全覆盖（bandwidth）

@@ -162,6 +162,14 @@ public final class ProximityRevealer implements Listener {
   private static final int SCAN_SHARDS = 4;
 
   /**
+   * 读取玩家视距失败时的兜底（区块）：取原版默认 view-distance 10。
+   *
+   * <p>视距读取本身是纯 Bukkit 读（玩家所属线程上），失败只可能是平台异常；此时按「常见默认值」兜底，
+   * 比退化成 0（完全不显形）安全——最多多发几个本可省略的显形包。
+   */
+  private static final int FALLBACK_VIEW_DISTANCE_CHUNKS = 10;
+
+  /**
    * 显形回显的判定窗口（纳秒，2 秒）。
    *
    * <p>只需覆盖「显形包发出 → 本插件出站监听器看到该包」的极短延迟；取得过长会把「玩家紧接着挖掉
@@ -432,7 +440,9 @@ public final class ProximityRevealer implements Listener {
           + " 超过候选窗口上限 " + MAX_CANDIDATES + "，单周期实际按 " + effectiveReveals
           + " 生效（窗口 = min(上限, 额度 × " + CANDIDATE_OVERSAMPLE + ")）");
     }
-    plugin.getLogger().fine("邻近显形已启用：距离 " + proximity.distance() + " 格，周期 " + interval
+    plugin.getLogger().fine("邻近显形已启用：半径 " + (proximity.distanceChunks() <= 0
+        ? "跟随服务器视距" : proximity.distanceChunks() + " 区块")
+        + "（运行时再按玩家有效视距钳制），周期 " + interval
         + " tick，单次上限 " + effectiveReveals + " 个（配置 " + configuredReveals + "）；视锥 "
         + (proximity.frustumEnabled() ? proximity.frustumFov() + "°（最小距离 "
             + proximity.frustumMinDistance() + " 格内豁免）" : "已关闭")
@@ -707,9 +717,14 @@ public final class ProximityRevealer implements Listener {
 
     Location location = player.getLocation();
     ProximityScanner.Tally scanTally = new ProximityScanner.Tally();
+    // 显形半径按「区块」计，并钳到该玩家的有效视距（服务器视距与客户端自报视距取小）：
+    // 显形包只在客户端已加载该区块时才会被应用，越界的包会被客户端丢弃。见 {@link #effectiveRevealChunks}。
+    int revealChunks = effectiveRevealChunks(proximity.distanceChunks(),
+        playerViewDistance(player), playerClientViewDistance(player));
+    double maxDistance = revealChunks * 16.0D;
     List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex,
         revealedSet, player.getUniqueId(), worldName, location.getBlockX(), location.getBlockY(),
-        location.getBlockZ(), proximity.distance(), fetchLimit(budget.remaining()), shard,
+        location.getBlockZ(), maxDistance, fetchLimit(budget.remaining()), shard,
         SCAN_SHARDS, scanTally);
     if (candidates.isEmpty()) {
       return;
@@ -926,8 +941,8 @@ public final class ProximityRevealer implements Listener {
    */
   private void sendOne(Player player, World world, int x, int y, int z, ProximitySelector.Eye eye,
       Budget budget, PassTally tally, RevealBatch batch, boolean visibilityInPlan) {
-    // Folia 线程纪律：本方法运行在<b>玩家所属</b> region 线程上，但候选坐标可能远至
-    // proximity.distance（默认 96 格 = 6 个区块）——那些区块可能属于另一个 region。跨 region 调
+    // Folia 线程纪律：本方法运行在<b>玩家所属</b> region 线程上，但候选坐标可能远至显形半径
+    // （默认跟随服务器视距，最多 32 区块）——那些区块可能属于另一个 region。跨 region 调
     // world.isChunkLoaded / world.getBlockData 会触发 Folia 的 TickThread 校验（先打一条 ERROR 日志
     // 再抛异常）：异常虽会被下面的 catch 吞掉，但后果是「玩家看得见的假方块永远不会被还原」
     // （少显形 = 安全方向错误），且每次抓取刷一条 ERROR。与 NeighborChunkProvider 同一处理口径：
@@ -1533,6 +1548,43 @@ public final class ProximityRevealer implements Listener {
    */
   static int effectiveRevealCeiling(int configured) {
     return Math.max(1, Math.min(configured, MAX_CANDIDATES));
+  }
+
+  /**
+   * 有效显形半径（区块）：配置 0（默认）= 跟随玩家视距；正数也不超过玩家视距。
+   *
+   * <p><b>为什么必须钳到视距</b>：显形包只有在客户端<b>已加载该区块</b>时才会被应用，超出视距的包会被
+   * 客户端直接丢弃——既浪费带宽，又可能让「已显形」标记落在一个客户端根本没见过的坐标上。
+   * 服务器视距与客户端自报视距取小：客户端可以把自己的视距调得比服务器小
+   * （{@code Player#getClientViewDistance()}，未知时返回 -1）。
+   *
+   * @param configuredChunks   配置值（区块）；≤0 表示跟随视距
+   * @param serverViewDistance 服务器侧对该玩家的生效视距（{@code Player#getViewDistance()}；≤0 视为无效）
+   * @param clientViewDistance 客户端自报视距；≤0 表示未知（此时只看服务器视距）
+   */
+  static int effectiveRevealChunks(int configuredChunks, int serverViewDistance, int clientViewDistance) {
+    int server = serverViewDistance > 0 ? serverViewDistance : FALLBACK_VIEW_DISTANCE_CHUNKS;
+    int limit = clientViewDistance > 0 ? Math.min(server, clientViewDistance) : server;
+    int chunks = configuredChunks <= 0 ? limit : Math.min(configuredChunks, limit);
+    return Math.max(1, chunks);
+  }
+
+  /** 服务器侧对该玩家的生效视距（跟随 server.properties 的 view-distance；world 级覆盖时取该世界值）。 */
+  private static int playerViewDistance(Player player) {
+    try {
+      return player.getViewDistance();
+    } catch (Throwable fallbackFailure) {
+      return FALLBACK_VIEW_DISTANCE_CHUNKS;
+    }
+  }
+
+  /** 客户端自报视距；未知（-1）或读取失败时返回 -1（调用方按「未知」处理，只看服务器视距）。 */
+  private static int playerClientViewDistance(Player player) {
+    try {
+      return player.getClientViewDistance();
+    } catch (Throwable fallbackFailure) {
+      return -1;
+    }
   }
 
   /** 取候选时按额度的若干倍取（视锥/射线会剔除一部分），并限制总量避免单次扫描过重。 */
