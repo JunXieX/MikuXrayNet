@@ -489,6 +489,22 @@ public final class RevealedSet {
   }
 
   /**
+   * 只清<b>某个玩家</b>在指定区块的已显形标记（世界名 + 区块坐标版本）。
+   *
+   * <p>与 {@link #clearChunk(ChunkKey, UUID)} 同一实现；单独开「按世界名 + 坐标」的入口，是为了让封包链路
+   * （{@code ProtocolLibAsyncListener}）不必持有 {@link ChunkKey} 这一包内表示。
+   *
+   * <p>调用时机见 {@code ProtocolLibAsyncListener#clearRevealedOnDelivery}：必须在该区块封包<b>放行之后</b>
+   * 调用，否则会与「周期显形抢跑」形成「显形包被丢弃、标记却留下」的竞态。
+   */
+  void clearChunk(String worldName, int chunkX, int chunkZ, UUID playerId) {
+    if (worldName == null) {
+      return;
+    }
+    clearChunk(new ChunkKey(worldName, chunkX, chunkZ), playerId);
+  }
+
+  /**
    * 使一个区块的全部玩家的已显形标记失效（区块卸载 / 世界卸载时调用）。
    *
    * <p><b>为什么需要这个「按世界名 + 坐标」的公开重载</b>：{@link ChunkKey} 与本类的多数方法是包私有的，

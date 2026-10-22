@@ -434,14 +434,27 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 这段（排队 + 区域线程 hop + 解码，常态 1~10 ms）内落库的方块补丁一并收编，随后建表发布时
       // 用「解码时刻的旧几何」把它们覆盖掉（该显示却多藏）。持包时刻取快照后只剩亚毫秒级窗口。
       // 未启用遮挡建表时返回 null（零开销），worker 侧会退化为自行取快照。
+      // 放行动作：先归还批次计数 → 再放行封包 → **最后**才作废「本接收者在该区块的已显形标记」。
+      //
+      // 为什么标记作废必须排在「放行封包」之后（旧实现放在 worker 的 writeBack 里，即放行之前）：
+      // 区块封包在异步管线里是被扣住的，真正写入由这里的 signalPacketTransmission 触发；而周期显形在
+      // 区域线程上独立跑。若在放行之前就清标记，那么「清完之后、封包真正写出之前」落下的一次显形会把
+      // 标记重新写上，而该显形包排在区块包之前 → 客户端按「区块未加载」丢弃它、标记却留着 → 该坐标直到
+      // 区块重发 / 标记过期都不会再显形（偶发、数分钟后自愈的假方块，与「写着告示牌的箱子不还原」一致）。
+      // 挪到放行之后再清：落在放行之前的显形标记会在这一步被作废，下一轮巡检立即补发。
+      UUID releasePlayerId = player.getUniqueId();
+      String releaseWorld = world.getName();
+      int releaseChunkX = accessor.chunkX();
+      int releaseChunkZ = accessor.chunkZ();
+      Runnable release = () -> {
+        if (gate != null) {
+          gate.chunkDone();
+        }
+        asynchronousManager.signalPacketTransmission(event);
+        clearRevealedOnDelivery(releaseWorld, releaseChunkX, releaseChunkZ, releasePlayerId);
+      };
       task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
-          world.getName(), dimension, minHeight, sectionCount, timeoutMillis,
-          gate == null
-              ? () -> asynchronousManager.signalPacketTransmission(event)
-              : () -> {
-                gate.chunkDone();
-                asynchronousManager.signalPacketTransmission(event);
-              },
+          world.getName(), dimension, minHeight, sectionCount, timeoutMillis, release,
           processor.capturePatchStamps(world.getName(), accessor.chunkX(), accessor.chunkZ(),
               minHeight >> 4, sectionCount));
     } catch (Throwable throwable) {
@@ -483,14 +496,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // （写入权仍在看门狗手里，抓取期间超时照样会放行原包）
     // 只在真的需要时才抓：mode=all 的世界改写不做 6 面遮挡判定（见 ObfuscationProcessor#rewrite），
     // 邻块数据用不到，抓取与随之而来的区域线程调度都是纯开销。
-    UUID playerId = player.getUniqueId();
     // 这三个调用都可能抛 Throwable（实时配置读取、邻块缓存查询、区域调度器受理）。此刻延迟已登记、
     // 看门狗已注册，异常一旦漏出去，本封包就只能干等看门狗（默认 2500 ms）才被放行——违反「失败立即
     // fail-open」。故与下面 workPool.execute 的失败分支保持一致：取消看门狗 + 立刻放行原包。
     try {
       if (neighborsNeeded(world.getName(), dimension)
           && neighborProvider.cached(world.getName(), accessor.chunkX(), accessor.chunkZ()) == null
-          && scheduleCaptureThenRewrite(task, accessor, world, timeout, playerId)) {
+          && scheduleCaptureThenRewrite(task, accessor, world, timeout)) {
         return;
       }
     } catch (Throwable throwable) {
@@ -503,7 +515,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
 
     try {
-      workPool.execute(task, () -> handleAsync(task, accessor, timeout, playerId));
+      workPool.execute(task, () -> handleAsync(task, accessor, timeout));
     } catch (Throwable throwable) {
       // 已登记延迟却没能入队：必须立即放行，否则该封包永久卡住
       logThrottled("区块改写任务入队失败，已按原包放行", throwable);
@@ -578,8 +590,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   }
 
   /** 工作线程：缓存命中 → 直接回填；未命中 → 解码/判定/重编码（邻块快照此时已就绪或按缺失策略处理）。 */
-  private void handleAsync(RewriteTask task, ChunkPacketAccessor accessor, ScheduledFuture<?> timeout,
-      UUID playerId) {
+  private void handleAsync(RewriteTask task, ChunkPacketAccessor accessor,
+      ScheduledFuture<?> timeout) {
     if (!task.tryBeginWrite()) {
       // 已被看门狗超时放行：原包已发出，绝不能再改写
       timeout.cancel(false);
@@ -591,7 +603,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 之后，任何一步抛异常（live() 取配置、logThrottled、cancel）都不允许跳过放行，否则该区块封包
     // 永久卡住（客户端卡在加载界面）。这与 MikuWorkPool 声明的「payload 必须自行保证恰好放行一次」一致。
     try {
-      rewriteOnWorker(task, accessor, playerId);
+      rewriteOnWorker(task, accessor);
     } finally {
       cancelQuietly(timeout);
       task.signalOnce();
@@ -605,7 +617,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * <p>异常一律 fail-open（记日志后按原包放行）；<b>放行由调用方在 {@code finally} 中完成</b>，
    * 本方法不自行放行，也不允许把异常抛给调用方之外的任何路径。
    */
-  private void rewriteOnWorker(RewriteTask task, ChunkPacketAccessor accessor, UUID playerId) {
+  private void rewriteOnWorker(RewriteTask task, ChunkPacketAccessor accessor) {
     // 实时读「当前」配置并固定在本轮改写内使用：配置指纹 / remove-block-entities 必须随 reload 生效
     // （本监听器不随热重载重建），且同一轮里 cache.get 与 cache.put 必须用同一份指纹——
     // 若每处各读一次、reload 恰好发生在中途，读写键会不一致，导致刚写的条目立刻读不到。
@@ -649,9 +661,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
           // 未启用该功能时 occlusion 为 null、restoreOcclusion 为 no-op，零开销。
           processor.restoreOcclusion(cached.occlusion(), task.worldName(), task.chunkX(),
               task.minHeight() >> 4, task.chunkZ());
-          writeBack(accessor, task, cached.data(), cached.positions(), current, playerId);
+          writeBack(accessor, task, cached.data(), cached.positions(), current);
         } else {
-          rewrite(task, accessor, source, sourceHash, neighbors, fingerprint, current, playerId);
+          rewrite(task, accessor, source, sourceHash, neighbors, fingerprint, current);
         }
       }
     } catch (Throwable throwable) {
@@ -708,7 +720,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    *                    与 {@link #rewriteOnWorker} 的读取侧同源，保证读写键一致
    */
   private void rewrite(RewriteTask task, ChunkPacketAccessor accessor, byte[] source, long sourceHash,
-      NeighborEdges neighbors, int fingerprint, AntiXrayConfig current, UUID playerId) {
+      NeighborEdges neighbors, int fingerprint, AntiXrayConfig current) {
     // 世界名 + 维度 + 最低 Y 一并传入：world-overrides（按世界名）优先于 dimensions.<维度>，
     // min-y/max-y 过滤与分区伪装表需要把 section 内相对 Y 换算成绝对 Y。
     ObfuscationProcessor.Result result = processor.rewrite(source, task.sectionCount(),
@@ -774,7 +786,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       }
     }
     // 失败结果：data == source 且伪装位置为空 → writeBack 直接返回，原包照常下发（fail-open 语义不变）。
-    writeBack(accessor, task, result.data(), result.obfuscatedPositions(), current, playerId);
+    writeBack(accessor, task, result.data(), result.obfuscatedPositions(), current);
   }
 
   /**
@@ -862,7 +874,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    *         继续（停用竞态下本方法可能已直接放行该任务，{@link RewriteTask#signalOnce()} 幂等，重复放行无害）
    */
   private boolean scheduleCaptureThenRewrite(RewriteTask task, ChunkPacketAccessor accessor, World world,
-      ScheduledFuture<?> timeout, UUID playerId) {
+      ScheduledFuture<?> timeout) {
     if (world == null) {
       return false;
     }
@@ -910,7 +922,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       }
 
       try {
-        workPool.execute(task, () -> handleAsync(task, accessor, timeout, playerId));
+        workPool.execute(task, () -> handleAsync(task, accessor, timeout));
       } catch (Throwable throwable) {
         // 任何意外都必须归还这次延迟，否则该封包永久卡住（signalOnce 保证恰好放行一次）
         logThrottled("邻区块抓取后的改写调度失败，已按原包放行", throwable);
@@ -948,11 +960,12 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /**
    * 回填改写结果到封包，并维护显形索引。
    *
-   * @param playerId 本次区块封包的接收者；用于只作废<b>该玩家</b>在该区块的已显形标记
-   *                 （区块重发通常只发给一个玩家，作废其它玩家的标记只会让它们重复显形）
+   * <p>本接收者在该区块的已显形标记<b>不在</b>这里作废：区块封包此刻还没真正放行（见 {@code handleChunk}
+   * 的放行动作），提前作废会留下「放行之前落下的显形标记」被永久保留的竞态（显形包排在区块包之前被
+   * 客户端丢弃、标记却留着 → 该坐标不再显形）。作废改在封包放行之后执行，见 {@link #clearRevealedOnDelivery}。
    */
   private void writeBack(ChunkPacketAccessor accessor, RewriteTask task, byte[] data, int[] positions,
-      AntiXrayConfig current, UUID playerId) {
+      AntiXrayConfig current) {
     if (positions.length == 0) {
       // 本次改写结果「一个坐标都没伪装」（无目标方块 / 矿已被挖空 / 配置变更后不再匹配）：
       // 既不能写回封包，也不能就此返回——该区块若此前登记过坐标，其索引条目与各玩家的已显形标记
@@ -1005,11 +1018,40 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
               removedLocals);
           revealed.removePositions(task.worldName(), absolute, removedLocals.length);
         }
-        // 本包接收者的客户端又拿回了伪装结果，其在该区块的标记全部作废（重新记录后会再次显形）。
-        // 只作废该玩家：其它玩家的客户端仍显示我们此前发回的真实方块，把它们一并清掉只会让
-        // 它们下个周期重复显形一遍（纯浪费带宽与主线程开销）。
-        revealed.clearChunk(new ChunkKey(task.worldName(), task.chunkX(), task.chunkZ()), playerId);
+        // 本接收者的标记作废已挪到「封包放行之后」（见 handleChunk 的放行动作与 clearRevealedOnDelivery）：
+        // 在放行之前清，会与「周期显形在区域线程上抢跑」形成竞态——显形包排在区块包之前被客户端丢弃，
+        // 标记却留了下来，该坐标直到区块重发 / 标记过期都不会再显形。
+        // 只作废该玩家：其它玩家的客户端仍显示我们此前发回的真实方块，把它们一并清掉只会让它们下个周期
+        // 重复显形一遍（纯浪费带宽与主线程开销）。
       }
+    }
+  }
+
+  /**
+   * 区块封包<b>真正放行之后</b>，作废「该接收者在这个区块」的已显形标记。
+   *
+   * <p><b>为什么必须等放行之后</b>：区块包在异步管线里被扣住，放行前的显形包会排在它前面、被客户端按
+   * 「区块未加载」丢弃；若此时标记已写下且不被清掉，该坐标就会一直不显形（直到区块重发或标记过期）。
+   * 把作废放在放行动作里，任何在放行前落下的显形标记都会被清掉，下一轮巡检（≤1 个周期）立即补发。
+   *
+   * <p><b>只作废该玩家</b>：其它玩家的客户端仍显示我们此前发回的真实方块，把它们一并清掉只会让它们
+   * 下个周期重复显形一遍（纯浪费带宽与主线程开销）。
+   *
+   * <p><b>异常必须吞</b>：本方法在封包放行动作里执行，动作一旦抛出就会干扰 {@code signalOnce} 的
+   * 恰好一次语义；而清理失败只会让个别坐标多藏一个周期（下次区块重发会再清），属安全方向。
+   */
+  private void clearRevealedOnDelivery(String worldName, int chunkX, int chunkZ, UUID playerId) {
+    if (worldName == null || playerId == null) {
+      return;
+    }
+    try {
+      RevealedSet revealed = revealed();
+      if (revealed != null) {
+        revealed.clearChunk(worldName, chunkX, chunkZ, playerId);
+      }
+    } catch (Throwable throwable) {
+      // 清理失败只会让个别坐标多藏一个周期（区块重发/标记过期会再清），属安全方向；但必须留痕。
+      logThrottled("区块封包放行后作废已显形标记失败（下一轮巡检会重试）", throwable);
     }
   }
 

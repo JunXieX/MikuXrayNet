@@ -154,6 +154,26 @@ class RevealedSetTest {
     assertEquals(0, revealed.markerCount());
   }
 
+  /**
+   * 「世界名 + 区块坐标 + 玩家」的清入口（区块封包放行动作使用）：只清该玩家在该区块的标记，
+   * 且与 {@link ChunkKey} 版本同一实现——两个入口不得漂移，否则「放行后清标记」会误伤其它玩家/区块。
+   */
+  @Test
+  void clearChunkByWorldAndCoordinatesOnlyAffectsThatPlayer() {
+    RevealedSet revealed = revealed(1024, 60 * SECOND_NANOS);
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(0, 0), 2, 64, 1);
+    revealed.markIfAbsent(OTHER_PLAYER, chunk(0, 0), 1, 64, 1);
+    revealed.markIfAbsent(PLAYER, chunk(1, 0), 17, 64, 1);
+
+    revealed.clearChunk(WORLD, 0, 0, PLAYER);
+
+    assertEquals(0, revealed.sizeFor(PLAYER, chunk(0, 0)), "只清该玩家在该区块的标记");
+    assertEquals(1, revealed.sizeFor(OTHER_PLAYER, chunk(0, 0)), "其它玩家不受影响");
+    assertEquals(1, revealed.sizeFor(PLAYER, chunk(1, 0)), "其它区块不受影响");
+    assertEquals(2, revealed.positionCount(), "实时坐标数必须与存活集合一致");
+  }
+
   @Test
   void markersExpireUnlessTouched() {
     long window = 10 * SECOND_NANOS;
