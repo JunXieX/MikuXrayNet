@@ -163,6 +163,12 @@ class ConfigDefaultsTest {
         "打包 yml 的 proximity.distance-chunks 必须等于代码回落值");
     assertEquals(fallback.proximity().maxRevealsPerTick(), packed.proximity().maxRevealsPerTick(),
         "打包 yml 的 proximity.max-reveals-per-tick 必须等于代码回落值");
+    assertTrue(fallback.proximity().revealOnChunkSend(), "区块下发即显形默认开启（M2）");
+    assertTrue(fallback.proximity().preRevealOnDig(), "开掘即预显形默认开启（M1a）");
+    assertEquals(fallback.proximity().revealOnChunkSend(), packed.proximity().revealOnChunkSend(),
+        "打包 yml 的 proximity.reveal-on-chunk-send 必须等于代码回落值");
+    assertEquals(fallback.proximity().preRevealOnDig(), packed.proximity().preRevealOnDig(),
+        "打包 yml 的 proximity.instant-reveal.pre-reveal-on-dig 必须等于代码回落值");
     assertEquals(fallback.proximity().frustumFov(), packed.proximity().frustumFov(), 1.0E-9D,
         "打包 yml 的 proximity.frustum.fov 必须等于代码回落值");
     assertEquals(fallback.proximity().frustumMinDistance(), packed.proximity().frustumMinDistance(),

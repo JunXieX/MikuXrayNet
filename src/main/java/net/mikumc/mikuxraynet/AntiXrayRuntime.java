@@ -321,6 +321,14 @@ public final class AntiXrayRuntime {
       this.blockChangeRevealListener = listener;
       listener.start();
       revealer.start();
+      // 区块包放行后立即显形（M2）：把「该区块中玩家当前可见」的坐标紧随区块包补发，
+      // 消掉「区块先伪装、等巡检才还原」的凭空出现窗口。失败只关这一项，周期巡检不受影响。
+      try {
+        protocolLibHook.setChunkDeliveryHook(revealer::onChunkDelivered);
+      } catch (Throwable throwable) {
+        protocolLibHook.setChunkDeliveryHook(null);
+        logger.log(Level.WARNING, "区块下发即显形装配失败（不影响周期巡检）", throwable);
+      }
     } catch (Throwable throwable) {
       logger.log(Level.WARNING, "邻近显形装配失败（不影响反矿透主体）", throwable);
       // 失败清理必须沿用调用方的 clearIndexes 口径：热重载路径传 false。
@@ -403,6 +411,15 @@ public final class AntiXrayRuntime {
    *                     索引只在区块下发时写入，清空会让已加载区块的伪装坐标永久失联）。
    */
   private void stopProximity(boolean clearIndexes) {
+    // 先摘「区块包放行后」回调：它持有 revealer 的实例引用，必须早于 revealer 停用清掉，
+    // 否则停用后仍可能有在途区块包的回调把已停用的 revealer 唤醒（stop() 的闸门虽能兜住，但没必要留引用）。
+    if (protocolLibHook != null) {
+      try {
+        protocolLibHook.setChunkDeliveryHook(null);
+      } catch (Throwable throwable) {
+        logger.log(Level.FINE, "卸下区块下发即显形回调失败（已忽略）", throwable);
+      }
+    }
     if (blockChangeRevealListener != null) {
       blockChangeRevealListener.stop();
       blockChangeRevealListener = null;

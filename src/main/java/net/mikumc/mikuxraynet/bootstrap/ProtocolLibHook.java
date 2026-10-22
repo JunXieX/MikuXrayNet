@@ -117,6 +117,18 @@ public final class ProtocolLibHook {
     return protocolManager;
   }
 
+  /**
+   * 装配/卸下「区块包放行后」回调（邻近显形侧的区块下发即显形）；{@code hook == null} 表示停用。
+   *
+   * <p>未接入改写链路（{@code listener == null}）时为空操作：此时没有区块包经过本插件，回调也无从触发。
+   */
+  public void setChunkDeliveryHook(ProtocolLibAsyncListener.ChunkDeliveryHook hook) {
+    ProtocolLibAsyncListener current = listener;
+    if (current != null) {
+      current.setChunkDeliveryHook(hook);
+    }
+  }
+
   /** 注销拦截；可重复调用，异常安全。 */
   public void unregister() {
     ProtocolLibAsyncListener current = listener;

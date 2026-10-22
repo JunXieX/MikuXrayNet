@@ -1099,11 +1099,13 @@ public final class Diagnostics {
         .append("，cache-maximum-size=").append(c.neighbors().cacheMaximumSize()).append('\n');
     sb.append("proximity.instant-reveal.enabled=").append(c.proximity().instantReveal().enabled())
         .append("，radius=").append(c.proximity().instantReveal().radius())
-        .append("，max-per-tick=").append(c.proximity().instantReveal().maxPerTick()).append('\n');
+        .append("，max-per-tick=").append(c.proximity().instantReveal().maxPerTick())
+        .append("，pre-reveal-on-dig=").append(c.proximity().preRevealOnDig()).append('\n');
     sb.append("proximity.over-reveal-sampling=").append(c.proximity().overRevealSampling())
         .append("，batch-reveal-sends=").append(c.proximity().batchRevealSends()).append('\n');
     sb.append("proximity.enabled=").append(c.proximity().enabled())
         .append("，distance-chunks=").append(c.proximity().distanceChunks())
+        .append("，reveal-on-chunk-send=").append(c.proximity().revealOnChunkSend())
         .append("，interval-ticks=").append(c.proximity().intervalTicks())
         .append("，max-reveals-per-tick=").append(c.proximity().maxRevealsPerTick())
         .append("，expire-seconds=").append(c.proximity().expireSeconds()).append('\n');

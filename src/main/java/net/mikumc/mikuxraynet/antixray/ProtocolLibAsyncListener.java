@@ -241,6 +241,28 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private volatile boolean stopping;
 
   /**
+   * 区块包<b>放行之后</b>的回调（邻近显形侧装配：区块下发即显形；{@code null} = 未启用）。
+   *
+   * <p><b>为什么在这里回调</b>：区块包在异步管线里被扣住，只有本监听器知道它何时真正写出；
+   * 放行前发出的显形包会排在区块包之前被客户端丢弃（见 {@link #clearRevealedOnDelivery} 的说明）。
+   * 回调实现（{@code ProximityRevealer#onChunkDelivered}）只做纯内存门闸 + 调度到玩家所属线程，
+   * 本线程不读世界、不发包。
+   */
+  private volatile ChunkDeliveryHook chunkDeliveryHook;
+
+  /** 区块包放行后的回调：接收者 + 世界名 + 区块坐标。由 {@code AntiXrayRuntime} 装配/卸下。 */
+  @FunctionalInterface
+  public interface ChunkDeliveryHook {
+
+    void onChunkDelivered(Player player, String worldName, int chunkX, int chunkZ);
+  }
+
+  /** 装配/卸下「区块包放行后」回调（传 {@code null} 表示停用；由 {@code AntiXrayRuntime} 调用）。 */
+  public void setChunkDeliveryHook(ChunkDeliveryHook hook) {
+    this.chunkDeliveryHook = hook;
+  }
+
+  /**
    * 已交给区域调度器、但尚未进入工作池的抓取任务（{@link #scheduleCaptureThenRewrite} 登记）。
    *
    * <p><b>为什么需要它</b>：这类任务既不在 {@code MikuWorkPool.pending} 里（还没入池），其超时看门狗
@@ -452,6 +474,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         }
         asynchronousManager.signalPacketTransmission(event);
         clearRevealedOnDelivery(releaseWorld, releaseChunkX, releaseChunkZ, releasePlayerId);
+        // 区块包已写出：紧接着把「该区块中玩家当前可见」的坐标显形（区块下发即显形）。
+        // 必须排在放行之后：客户端会按顺序应用，显形包跟着区块包落到同一次收包批次里。
+        try {
+          ChunkDeliveryHook hook = chunkDeliveryHook;
+          if (hook != null) {
+            hook.onChunkDelivered(player, releaseWorld, releaseChunkX, releaseChunkZ);
+          }
+        } catch (Throwable throwable) {
+          // 本回调只是优化项：失败只影响「更早显形」，周期巡检仍会兜底，绝不影响封包放行
+          logThrottled("区块下发后立即显形调度失败（已忽略，周期巡检仍会兜底）", throwable);
+        }
       };
       task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
           world.getName(), dimension, minHeight, sectionCount, timeoutMillis, release,

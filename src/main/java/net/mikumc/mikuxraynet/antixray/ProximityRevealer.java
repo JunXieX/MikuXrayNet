@@ -24,8 +24,10 @@ import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.block.Block;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
+import org.bukkit.event.block.BlockDamageEvent;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
@@ -333,6 +335,13 @@ public final class ProximityRevealer implements Listener {
   private final AtomicBoolean noCapacityWarned = new AtomicBoolean();
   /** 事件显形的每玩家每 tick 限额（默认 16，防爆刷；见 {@link TickQuota}）。 */
   private final TickQuota instantQuota = new TickQuota();
+  /**
+   * 开掘预显形的去重记号：{@code long[2] = {坐标打包, tick}}，按玩家保存。
+   *
+   * <p>{@code BlockDamageEvent} 在持续挖掘同一格时会重复触发；不去重就会每 tick 重复做一遍
+   * 「6 邻索引查询 + 射线判定」。窗口 {@value #DIG_DEDUP_TICKS} tick 内同一格只放行一次。
+   */
+  private final ConcurrentHashMap<UUID, long[]> digMarks = new ConcurrentHashMap<>();
   /** 过度显形抽样器（1/N，只计数不改行为；N=0 关闭）。 */
   private final OverRevealSampler overRevealSampler;
 
@@ -488,6 +497,7 @@ public final class ProximityRevealer implements Listener {
       cancelQuietly(scan.task());
     }
     entityScans.clear();
+    digMarks.clear();
     HandlerList.unregisterAll(this);
     if (clearIndexes) {
       chunkIndex.clear();
@@ -551,6 +561,7 @@ public final class ProximityRevealer implements Listener {
     }
     revealedSet.clearPlayer(event.getPlayer().getUniqueId());
     instantQuota.clear(event.getPlayer().getUniqueId());
+    digMarks.remove(event.getPlayer().getUniqueId());
     // 离线玩家的回显记号一并释放（否则会滞留到窗口过期，白白占内存）
     revealEcho.remove(event.getPlayer().getUniqueId());
   }
@@ -1949,6 +1960,219 @@ public final class ProximityRevealer implements Listener {
           // 事件路径不预先算计划（见 revealImmediately 注释）：false = sendOne 在当前线程用遮挡位图判定
           sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
         }
+      }
+      flushBatch(player, batch, tally);
+      instantQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  // ============================== 区块下发即显形 / 开掘预显形 ==============================
+
+  /** 6 邻偏移（开掘预显形：只关心「挖开这一格之后会露出来的 6 个面」）。 */
+  private static final int[] DIG_DX = {1, -1, 0, 0, 0, 0};
+  private static final int[] DIG_DY = {0, 0, 1, -1, 0, 0};
+  private static final int[] DIG_DZ = {0, 0, 0, 0, 1, -1};
+  /** 开掘预显形最多评估的邻接数（固定 6 邻，留常量只为可读性）。 */
+  private static final int DIG_NEIGHBOUR_COUNT = 6;
+  /** 开掘去重窗口（tick）：同一格在该窗口内只预显形一次。 */
+  private static final long DIG_DEDUP_TICKS = 10L;
+  /**
+   * 区块下发即显形：每个区块最多评估的伪装坐标数（硬上限）。
+   *
+   * <p>该路径在玩家区域线程上执行（要读真实方块状态、要发包），一个区块的伪装坐标通常只有个位数到
+   * 几十个；矿洞密集区块可能上百，逐一做「暴露面 + 射线」会明显加重区域线程。取 96 作上限，超出部分
+   * 交给下一轮周期巡检（仍会被还原，只是最坏晚一个巡检周期），不会漏。
+   */
+  private static final int MAX_CHUNK_DELIVERY_EVALUATIONS = 96;
+
+  /**
+   * 区块包<b>放行之后</b>的回调（由 {@code ProtocolLibAsyncListener} 的放行动作调用，可能运行在工作线程上）：
+   * 把「该区块中玩家当前看得见」的伪装坐标立即显形。
+   *
+   * <p><b>为什么需要</b>：区块包是共享的伪装版本，玩家收到后先看到石头/伪装方块，要等下一轮巡检
+   * （最坏约 0.8 秒）才被还原——这就是「矿石/箱子凭空出现」的来源。区块包放行后立刻补发一个小批量显形包，
+   * 客户端通常在同一 tick 内先后应用，这个窗口基本消失。
+   *
+   * <p><b>为什么只调度、不在这里判定</b>：本方法可能运行在封包工作线程上，而判定要读玩家眼睛、读真实方块
+   * 状态、发包，全部必须在玩家所属线程完成；这里只做纯内存门闸（不发包、不读 Bukkit 世界数据）。
+   *
+   * <p>受 {@code proximity.instant-reveal} 的总开关与每 tick 限额约束：即时显形整体关闭时本路径也关闭。
+   */
+  public void onChunkDelivered(Player player, String worldName, int chunkX, int chunkZ) {
+    if (player == null || worldName == null || stopping || !proximity.revealOnChunkSend()
+        || !instant.enabled() || instant.maxPerTick() <= 0) {
+      return;
+    }
+    if (chunkIndex == null || revealedSet == null || WorldBlacklistConfig.isBlacklistedNow(worldName)) {
+      return;
+    }
+    Schedulers.onEntity(plugin, player, () -> revealChunkImmediately(player, chunkX, chunkZ));
+  }
+
+  /**
+   * 玩家所属线程：把刚下发的那个区块里「当前可见」的伪装坐标显形（见 {@link #onChunkDelivered}）。
+   *
+   * <p>判定口径与周期巡检一致：仍在伪装清单、该玩家尚未显形、视锥内、位图射线通畅（{@code sendOne} 判定）。
+   * 评估量有硬上限（{@link #MAX_CHUNK_DELIVERY_EVALUATIONS}），超出部分交给周期巡检。
+   */
+  private void revealChunkImmediately(Player player, int chunkX, int chunkZ) {
+    try {
+      if (stopping || !player.isOnline()
+          || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
+        return;
+      }
+      World world = player.getWorld();
+      String worldName = world.getName();
+      if (!shouldRevealInWorld(worldName)) {
+        return;
+      }
+      ObfuscatedChunkIndex.ChunkEntry entry = chunkIndex.entry(worldName, chunkX, chunkZ);
+      if (entry == null || entry.size() == 0) {
+        return;
+      }
+      int[] locals = entry.locals();
+      int minHeight = entry.minHeight();
+      UUID playerId = player.getUniqueId();
+      long tick = Bukkit.getCurrentTick();
+      int maxPerTick = Math.max(1, instant.maxPerTick());
+      int wanted = Math.min(locals.length, MAX_CHUNK_DELIVERY_EVALUATIONS);
+      // 与事件显形共用同一份每 tick 限额：区块连续下发时也不会绕开防爆刷上限。
+      int granted = instantQuota.claim(playerId, tick, maxPerTick, wanted);
+      Budget budget = new Budget(granted);
+      if (budget.remaining() <= 0) {
+        return;
+      }
+      ProximitySelector.Eye eye = proximity.raycastEnabled() ? eyeOf(player) : null;
+      boolean frustum = proximity.frustumEnabled();
+      PassTally tally = new PassTally();
+      RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
+      ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
+      keys.begin(worldName);
+      int evaluated = 0;
+      for (int local : locals) {
+        if (budget.remaining() <= 0 || evaluated >= MAX_CHUNK_DELIVERY_EVALUATIONS) {
+          break;
+        }
+        int x = (chunkX << 4) | (local & 15);
+        int z = (chunkZ << 4) | ((local >> 4) & 15);
+        int y = minHeight + (local >> 8);
+        evaluated++;
+        if (!isInstantCandidate(keys, playerId, worldName, x, y, z)) {
+          continue;
+        }
+        if (frustum && !ProximitySelector.withinFrustum(eye, x, y, z,
+            proximity.frustumMinDistance(), proximity.frustumFov())) {
+          continue;
+        }
+        sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
+      }
+      flushBatch(player, batch, tally);
+      instantQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /**
+   * 开掘预显形入口（{@link BlockDamageEvent}，玩家所属线程）：玩家开始挖某个方块时，把该方块 6 邻中
+   * 「挖开后会看见」的伪装坐标提前显形。
+   *
+   * <p><b>为什么必须提前</b>：客户端对挖掘有本地预测——方块一破，客户端立刻用本地状态渲染邻接方块。
+   * 服务端若等「方块被破坏」后再补发显形，必然晚一个网络往返，那一瞬玩家会看到邻接的伪装方块。
+   * 提前到「开始挖」发送，正常挖掘速度（≥ 0.2 秒）下显形包会先于破坏到达客户端。
+   *
+   * <p>同一格在 {@value #DIG_DEDUP_TICKS} tick 内只处理一次（该事件在持续挖掘时会重复触发）。
+   * 仅在射线判定开启时生效：否则「挖开后会看见」无从判定，等于把 6 邻全部裸发（会过度显形）。
+   */
+  @EventHandler(ignoreCancelled = true)
+  public void onBlockDamage(BlockDamageEvent event) {
+    if (stopping || !proximity.preRevealOnDig() || !proximity.raycastEnabled()
+        || !instant.enabled() || instant.maxPerTick() <= 0) {
+      return;
+    }
+    Player player = event.getPlayer();
+    if (player == null
+        || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
+      return;
+    }
+    try {
+      Block block = event.getBlock();
+      int x = block.getX();
+      int y = block.getY();
+      int z = block.getZ();
+      if (!digDedupAllows(player.getUniqueId(), x, y, z, Bukkit.getCurrentTick())) {
+        return;
+      }
+      revealAfterDig(player, x, y, z);
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /** 开掘去重（纯逻辑，可离线单测）：同一格在窗口内只放行一次；窗口外的旧记号直接覆盖。 */
+  boolean digDedupAllows(UUID playerId, int x, int y, int z, long tick) {
+    long packed = packCoordinate(x, y, z);
+    long[] mark = digMarks.computeIfAbsent(playerId, ignored -> new long[2]);
+    synchronized (mark) {
+      if (mark[1] != 0L && mark[0] == packed && tick >= mark[1]
+          && tick - mark[1] < DIG_DEDUP_TICKS) {
+        return false;
+      }
+      mark[0] = packed;
+      mark[1] = tick;
+      return true;
+    }
+  }
+
+  /**
+   * 玩家所属线程：把「正在挖的那一格」6 邻中挖开后会看见的伪装坐标显形（见 {@link #onBlockDamage}）。
+   *
+   * <p><b>判定口径</b>：把正在挖的那一格按空气处理（{@link BitmapVisibility#beginIgnoring}），于是
+   * 朝向它的那个面成为暴露面、步进射线也不再被它挡住；其余仍是严格口径（缺数据 = 遮挡、不显形）。
+   * 这样只会提前还原「挖开之后真能看见」的坐标，不会隔着墙泄漏。
+   */
+  private void revealAfterDig(Player player, int bx, int by, int bz) {
+    try {
+      if (stopping || !player.isOnline()) {
+        return;
+      }
+      World world = player.getWorld();
+      String worldName = world.getName();
+      if (!shouldRevealInWorld(worldName)) {
+        return;
+      }
+      UUID playerId = player.getUniqueId();
+      long tick = Bukkit.getCurrentTick();
+      int maxPerTick = Math.max(1, instant.maxPerTick());
+      int granted = instantQuota.claim(playerId, tick, maxPerTick, DIG_NEIGHBOUR_COUNT);
+      Budget budget = new Budget(granted);
+      if (budget.remaining() <= 0) {
+        return;
+      }
+      ProximitySelector.Eye eye = eyeOf(player);
+      PassTally tally = new PassTally();
+      RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
+      BitmapVisibility bitmap = BitmapVisibility.local();
+      bitmap.beginIgnoring(bx, by, bz);
+      try {
+        ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
+        keys.begin(worldName);
+        for (int i = 0; i < DIG_NEIGHBOUR_COUNT; i++) {
+          if (budget.remaining() <= 0) {
+            break;
+          }
+          int x = bx + DIG_DX[i];
+          int y = by + DIG_DY[i];
+          int z = bz + DIG_DZ[i];
+          if (!isInstantCandidate(keys, playerId, worldName, x, y, z)) {
+            continue;
+          }
+          sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
+        }
+      } finally {
+        bitmap.endIgnoring();
       }
       flushBatch(player, batch, tally);
       instantQuota.release(playerId, tick, maxPerTick, granted, tally.sent);

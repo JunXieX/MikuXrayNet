@@ -555,12 +555,19 @@ public final class AntiXrayConfig {
    * @param batchRevealSends      是否把同一个周期内的显形合并成 Paper 原生多方块变更包
    *                              （{@code Player#sendMultiBlockChange}）发出；关闭时逐坐标
    *                              用 {@code Player#sendBlockChange} 发出（默认开启，供 A/B 与回退用）
+   * @param revealOnChunkSend     区块包下发后立即把「该区块中当前可见」的伪装坐标显形（默认开启）。
+   *                              目的是消掉「区块先以伪装状态下发、等巡检才还原」造成的矿石/箱子凭空出现；
+   *                              显形包紧随区块包发出，客户端通常在同一 tick 内一并应用。
+   * @param preRevealOnDig        玩家开始挖某个方块时，预先显形其 6 邻中「挖开后会看见」的伪装坐标
+   *                              （默认开启）。客户端对挖掘有本地预测，等方块破坏后再显形必然晚一个 RTT；
+   *                              改为开掘即显形，正常挖掘速度下显形包先于方块破坏到达，玩家看不到假方块。
    */
   public record Proximity(boolean enabled, int distanceChunks, int intervalTicks, int maxRevealsPerTick,
       int expireSeconds, int maxPositions, int maxPositionsPerPlayer,
       boolean frustumEnabled, double frustumFov, double frustumMinDistance,
       boolean raycastEnabled, int raycastSamples,
-      InstantReveal instantReveal, int overRevealSampling, boolean batchRevealSends) {
+      InstantReveal instantReveal, int overRevealSampling, boolean batchRevealSends,
+      boolean revealOnChunkSend, boolean preRevealOnDig) {
   }
 
   /**
@@ -1068,7 +1075,13 @@ public final class AntiXrayConfig {
                 floorAdjustments, ceilingAdjustments),
             // 批量合并显形包（默认开启）：把一个周期内的显形用 Paper 原生多方块变更包一次发出。
             // 关掉即逐坐标发单方块变更包（旧行为），供 A/B 对比与线上回退。
-            lenientBoolean(root, "proximity.batch-reveal-sends", true, typeAdjustments)),
+            lenientBoolean(root, "proximity.batch-reveal-sends", true, typeAdjustments),
+            // 区块下发即显形（默认开启）：区块包放行后立即补发「该区块中当前可见」的坐标，
+            // 消掉「区块先伪装、等巡检才还原」的凭空出现窗口（见 ProximityRevealer#onChunkDelivered）。
+            lenientBoolean(root, "proximity.reveal-on-chunk-send", true, typeAdjustments),
+            // 开掘即预显形（默认开启）：客户端对挖掘有本地预测，等方块破坏后再显形必然晚一个 RTT；
+            // 提前到「开始挖」时把 6 邻中挖开后会看见的坐标发下去（见 ProximityRevealer#onBlockDamage）。
+            lenientBoolean(root, "proximity.instant-reveal.pre-reveal-on-dig", true, typeAdjustments)),
         new DiskCache(
             lenientBoolean(root, "disk-cache.enabled", true, typeAdjustments),
             // 上限见 DISK_CACHE_MAX_ENTRIES_MAX：条目上限直接决定磁盘占用与启动期扫描量。

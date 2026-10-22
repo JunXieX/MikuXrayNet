@@ -63,6 +63,23 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
   private final OcclusionRay ray = new OcclusionRay();
   /** 步进射线的严格查询（缺数据按遮挡，见类注释）；线程封闭，随实例复用。 */
   private final OcclusionRay.Lookup strictLookup = this::strictSection;
+  /** 「把某方块视为空气」时的射线查询（复用同一份严格查询，只多包一层 section 视图）。 */
+  private final OcclusionRay.Lookup ignoringLookup = this::ignoringSection;
+  /** 「把某方块视为空气」的 section 视图包装（避免每次判定分配一个包装对象）。 */
+  private final IgnoringView ignoringView = new IgnoringView();
+
+  /**
+   * 本次判定要「视为空气」的方块（挖掘预显形用，见 {@code ProximityRevealer#revealAfterDig}）：
+   * 玩家正在挖的方块此刻还在客户端屏幕上，但马上就会变成空气；判定「挖开之后能不能看到邻接伪装坐标」
+   * 时必须把它按空气处理，否则射线永远被它挡住、预显形一个都不会发生。
+   *
+   * <p><b>只影响本线程的这一次判定</b>：{@link #beginIgnoring} 与 {@link #endIgnoring} 必须成对调用
+   * （异常路径写在 finally），且本实例是线程本地复用，不会影响其它线程/其它判定。
+   */
+  private boolean ignoring;
+  private int ignoringX;
+  private int ignoringY;
+  private int ignoringZ;
 
   /** 本次判定的遮挡仓库；{@code null} = 该世界尚无位图（全部按遮挡处理）。 */
   private OcclusionStore store;
@@ -116,6 +133,25 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
     }
   }
 
+  /**
+   * 开始一次「把该方块视为空气」的可见性判定（挖掘预显形，见 {@code ProximityRevealer#revealAfterDig}）。
+   *
+   * <p>语义：该格在暴露面判定与步进射线上都按「不遮挡」处理（等同于它已经被挖掉），
+   * 判定「挖开之后可见吗」；作用于随后在本线程上的所有 {@link #isVisible} / {@link #isOccluding} /
+   * {@link #isClear} 调用，直到 {@link #endIgnoring}。
+   */
+  void beginIgnoring(int x, int y, int z) {
+    this.ignoring = true;
+    this.ignoringX = x;
+    this.ignoringY = y;
+    this.ignoringZ = z;
+  }
+
+  /** 结束「视为空气」判定（必须与 {@link #beginIgnoring} 成对调用：异常路径写在 finally 里）。 */
+  void endIgnoring() {
+    this.ignoring = false;
+  }
+
   /** 本次判定是否触碰过「无数据」的 section（仅在 {@link #isVisible} 之后读取才有效，见字段说明）。 */
   boolean missingDataConsulted() {
     return missingDataConsulted;
@@ -127,6 +163,10 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
    */
   @Override
   public boolean isOccluding(int x, int y, int z) {
+    if (ignoring && x == ignoringX && y == ignoringY && z == ignoringZ) {
+      // 正在挖的方块按空气处理：否则「朝向它的那个面」永远不会成为暴露面，预显形恒为空
+      return false;
+    }
     SectionOcclusion section = store == null ? null : store.section(x >> 4, y >> 4, z >> 4);
     if (section == null) {
       missingDataConsulted = true;
@@ -142,8 +182,43 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
    */
   @Override
   public boolean isClear(double pointX, double pointY, double pointZ) {
-    return ray.hasLineOfSight(strictLookup, eyeX, eyeY, eyeZ, pointX, pointY, pointZ, 0,
+    return ray.hasLineOfSight(ignoring ? ignoringLookup : strictLookup,
+        eyeX, eyeY, eyeZ, pointX, pointY, pointZ, 0,
         ALWAYS_VISIBLE_RADIUS_SQUARED, Double.MAX_VALUE);
+  }
+
+  /**
+   * 「视为空气」版本的 section 查询：只有「正在被挖的那一格」所在 section 需要包一层，
+   * 其余 section 原样返回（包装对象是实例字段，热路径零分配）。
+   */
+  private SectionOcclusion ignoringSection(int chunkX, int sectionY, int chunkZ) {
+    SectionOcclusion section = strictSection(chunkX, sectionY, chunkZ);
+    if (!ignoring || chunkX != (ignoringX >> 4) || sectionY != (ignoringY >> 4)
+        || chunkZ != (ignoringZ >> 4)) {
+      return section;
+    }
+    return ignoringView.wrap(section,
+        SectionOcclusion.packLocal(ignoringX & 15, ignoringY & 15, ignoringZ & 15));
+  }
+
+  /** 把「某一格视为不遮挡」的只读 section 视图（委托给真实 section，只改写那一格）。 */
+  private static final class IgnoringView implements SectionOcclusion {
+
+    private SectionOcclusion delegate;
+    private int ignoredLocal;
+
+    /** 绑定委托与本轮要忽略的格（局部坐标打包），并返回自身供查询使用。 */
+    IgnoringView wrap(SectionOcclusion delegate, int ignoredLocal) {
+      this.delegate = delegate;
+      this.ignoredLocal = ignoredLocal;
+      return this;
+    }
+
+    @Override
+    public boolean isOccludingLocal(int x, int y, int z) {
+      return SectionOcclusion.packLocal(x, y, z) != ignoredLocal
+          && delegate.isOccludingLocal(x, y, z);
+    }
   }
 
   /** 步进射线的严格 section 查询：缺数据 → 全遮挡单例（{@code null} 会被射线按「不遮挡」处理）。 */
