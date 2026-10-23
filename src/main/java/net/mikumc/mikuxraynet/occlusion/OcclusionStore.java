@@ -47,6 +47,26 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    */
   private final ConcurrentHashMap<Long, Long> patchStamps = new ConcurrentHashMap<>();
 
+  /**
+   * 每段「最近被补丁改过的格」回放表：整列建表 / 缺失段回填之后重放一次，消除「包序列化 → 取补丁戳快照」
+   * 这段窗口（戳比较只能发现快照<b>之后</b>的补丁；落在解码几何与快照之间的补丁戳值相同、会被旧几何覆盖）。
+   *
+   * <p>回放语义：补丁是服务端下发的「该格最新真值」；建表用的是更早的区块包几何。发布后重放最近补丁格，
+   * 无论快照取在何时，结果都等于「解码几何 + 其后所有补丁」——不再依赖戳快照的时点。
+   * 单段最多保留 {@value #MAX_REPLAY_CELLS} 格（正常 1~几格；超出说明该段被高频改写，最旧格让位）。
+   */
+  private final ConcurrentHashMap<Long, PatchReplay> patchReplay = new ConcurrentHashMap<>();
+
+  /** 单段回放表容量（见 {@link #patchReplay}）。 */
+  private static final int MAX_REPLAY_CELLS = 64;
+
+  /** 单段的补丁回放条目（字段可变、由自身监视器保护；条目本身只在 writeMutex 内被重放/移除）。 */
+  private static final class PatchReplay {
+    final long[] coords = new long[MAX_REPLAY_CELLS];
+    final boolean[] occluding = new boolean[MAX_REPLAY_CELLS];
+    int size;
+  }
+
   /** 因「该段期间被补丁写过」而跳过发布的段数（诊断用，只增不减）。 */
   private final LongAdder publishSkippedPatched = new LongAdder();
 
@@ -201,6 +221,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
           continue;
         }
         applyCellLocked(key, xs[i], ys[i], zs[i], occluding[i]);
+        recordReplayCell(key, xs[i], ys[i], zs[i], occluding[i]);
         applied++;
         // 段戳：同一 section 在批内只写一次（MULTI_BLOCK_CHANGE 恒为同一段，故通常只有 1 次 CHM 写）
         if (stamp == 0L) {
@@ -245,6 +266,62 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
   /** 因「该段期间被补丁写过」而跳过整列发布的段数（诊断用；持续偏高说明建表期间方块变更很频繁）。 */
   public long skippedPatchedSections() {
     return publishSkippedPatched.sum();
+  }
+
+  /** 记录一格待回放补丁（见 {@link #patchReplay}）；容量满时丢弃最旧一格。调用方已持 writeMutex。 */
+  private void recordReplayCell(long key, int x, int y, int z, boolean occluding) {
+    PatchReplay replay = patchReplay.computeIfAbsent(key, ignored -> new PatchReplay());
+    long packed = packCoordinate(x, y, z);
+    synchronized (replay) {
+      if (replay.size < MAX_REPLAY_CELLS) {
+        replay.coords[replay.size] = packed;
+        replay.occluding[replay.size] = occluding;
+        replay.size++;
+        return;
+      }
+      System.arraycopy(replay.coords, 1, replay.coords, 0, MAX_REPLAY_CELLS - 1);
+      System.arraycopy(replay.occluding, 1, replay.occluding, 0, MAX_REPLAY_CELLS - 1);
+      replay.coords[MAX_REPLAY_CELLS - 1] = packed;
+      replay.occluding[MAX_REPLAY_CELLS - 1] = occluding;
+    }
+  }
+
+  /**
+   * 把该段最近记录的补丁格重放到活表（<b>必须在整列发布之后、且调用方持 writeMutex</b> 时调用）。
+   *
+   * <p><b>为什么需要</b>：补丁戳只有在「快照之后」又落库补丁时才会变化；而区块包是服务端更早序列化的，
+   * 落在「包序列化 → 取快照」之间的补丁戳值等于快照值、会被判成「期间无变化」→ 用解码时的旧几何整段
+   * 覆盖。回放不依赖快照时点：补丁是服务端下发的该格最新真值，发布后重放最近补丁格，结果等于
+   * 「解码几何 + 其后所有补丁」。
+   *
+   * @return 重放的格数（0 = 该段近期没有补丁）
+   */
+  private int replayPendingCells(long key) {
+    PatchReplay replay = patchReplay.remove(key);
+    if (replay == null) {
+      return 0;
+    }
+    long[] coords;
+    boolean[] occluding;
+    int size;
+    synchronized (replay) {
+      coords = replay.coords;
+      occluding = replay.occluding;
+      size = replay.size;
+    }
+    for (int i = 0; i < size; i++) {
+      long packed = coords[i];
+      int x = (int) (packed >> 38);
+      int y = (int) ((packed >> 26) & 0xFFF);
+      int z = (int) (packed & 0x3FFFFFF);
+      applyCellLocked(key, x, y, z, occluding[i]);
+    }
+    return size;
+  }
+
+  /** 坐标打包（x/z 各 26 位、y 12 位；与射线/显形侧同一编码）。 */
+  private static long packCoordinate(int x, int y, int z) {
+    return ((long) (x & 0x3FFFFFF) << 38) | ((long) (y & 0xFFF) << 26) | (z & 0x3FFFFFF);
   }
 
   /**
@@ -309,6 +386,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
       long key = SectionKey.packSection(chunkX, sectionY, chunkZ);
       sections.remove(key);
       patchStamps.remove(key);
+      patchReplay.remove(key);
     }
   }
 
@@ -362,6 +440,8 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
           // 若此时也跳过，该段会永久留空（显形侧「缺数据 = 遮挡」→ 整段矿不显形）。
           if (current != null && current.longValue() != stamps[i] && sections.get(key) != null) {
             skipped++;
+            // 跳过旧几何覆盖；但「解码 → 取快照」窗口内的补丁不在戳差异里，仍要回放（幂等）。
+            replayPendingCells(key);
             continue;
           }
         }
@@ -373,6 +453,8 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         }
         // 发布成功后该段已是最新几何，旧戳不再需要——不清会让戳表随「补丁过的段」无界增长
         patchStamps.remove(key);
+        // 再回放「解码 → 取快照」窗口内落库的补丁格：戳比较发现不了这段，回放保证其不被旧几何覆盖
+        replayPendingCells(key);
       }
     }
     if (skipped > 0) {
@@ -422,14 +504,11 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         if (data == null) {
           continue; // 负载里该段「无数据」= 无需补
         }
-        if (patchStamps.get(key) != null) {
-          // 该段在「无活数据」期间被补丁改过（打断类补丁不建条目、只留戳）：若此时用缓存里的旧负载
-          // 填充，会把刚挖开的墙重新写回遮挡（该显示却多藏）。保留戳、跳过填充：该段暂时按「缺数据」
-          // 处理（显形侧只会少显示一版，方向安全），下一次完整解码（区块重发）会重建并清掉该戳。
-          continue;
-        }
         sections.put(key, data);
         patchStamps.remove(key);
+        // 缓存负载是更早的几何：回放该段近期补丁格，避免「无活数据期间被补丁改过的格」被旧几何覆盖
+        // （含打断类补丁——不建条目、只留戳的那种）。
+        replayPendingCells(key);
         filled++;
       }
     }
@@ -474,6 +553,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     synchronized (writeMutex) {
       sections.clear();
       patchStamps.clear();
+      patchReplay.clear();
     }
   }
 

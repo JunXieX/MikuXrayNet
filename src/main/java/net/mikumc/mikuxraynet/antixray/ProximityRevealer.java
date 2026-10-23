@@ -1709,7 +1709,7 @@ public final class ProximityRevealer implements Listener {
     ChunkKey.Probe.clearThreadLocals();
     BitmapVisibility.clearThreadLocals();
     ProximitySelector.clearThreadLocals();
-    BlockChangeRevealListener.clearThreadLocals();
+    BlockChangeRevealListener.releasePooledBuffers();
   }
 
   /**

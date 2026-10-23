@@ -172,23 +172,28 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     // 坐标去重由 processChanges/SectionBuffer 统一完成（同一 section 内坐标编码唯一）。
     // 绝对坐标缓冲从线程本地 scratch 取（netty 线程固定、长生存）：满载包每包最多约 48KB，复用可避免
     // 短命大数组；只写满前 positions.length*3 个单元，读取以该长度为准，不残留上一次数据。
-    int[] coordinates = ParseScratch.current().coordinates(positions.length * 3);
-    for (int i = 0; i < positions.length; i++) {
-      short packed = positions[i];
-      coordinates[i * 3] = baseX + (packed >> 8 & 15);
-      coordinates[i * 3 + 1] = baseY + (packed & 15);
-      coordinates[i * 3 + 2] = baseZ + (packed >> 4 & 15);
-    }
+    ParseScratch parse = ParseScratch.acquire();
+    try {
+      int[] coordinates = parse.coordinates(positions.length * 3);
+      for (int i = 0; i < positions.length; i++) {
+        short packed = positions[i];
+        coordinates[i * 3] = baseX + (packed >> 8 & 15);
+        coordinates[i * 3 + 1] = baseY + (packed & 15);
+        coordinates[i * 3 + 2] = baseZ + (packed >> 4 & 15);
+      }
 
-    // 回显判定绑定「本包的接收者」：显形回显只发给了这个玩家，因此也只会在他名下命中
-    RevealEchoCheck echoCheck = instantRevealer == null || player == null
-        ? null : (world, x, y, z) -> isOurRevealEcho(player, world, x, y, z);
-    processChanges(worldName, coordinates, positions.length, obfuscatedChunkIndex, revealedSet, stats,
-        (changed, changedCount) -> {
-          if (instantRevealer != null && changedCount > 0) {
-            instantRevealer.onSectionChangeObserved(player, worldName, changed, changedCount);
-          }
-        }, echoCheck);
+      // 回显判定绑定「本包的接收者」：显形回显只发给了这个玩家，因此也只会在他名下命中
+      RevealEchoCheck echoCheck = instantRevealer == null || player == null
+          ? null : (world, x, y, z) -> isOurRevealEcho(player, world, x, y, z);
+      processChanges(worldName, coordinates, positions.length, obfuscatedChunkIndex, revealedSet,
+          stats, (changed, changedCount) -> {
+            if (instantRevealer != null && changedCount > 0) {
+              instantRevealer.onSectionChangeObserved(player, worldName, changed, changedCount);
+            }
+          }, echoCheck);
+    } finally {
+      ParseScratch.release(parse);
+    }
   }
 
   /**
@@ -266,17 +271,27 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    */
   private static final class SeenScratch {
 
-    private static final ThreadLocal<SeenScratch> LOCAL = ThreadLocal.withInitial(SeenScratch::new);
+    private static final java.util.concurrent.ConcurrentLinkedQueue<SeenScratch> POOL =
+        new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private static final int MAX_POOLED = 8;
 
     private final int[] stamp = new int[4096];
     private int generation;
 
-    private static SeenScratch current() {
-      return LOCAL.get();
+    /** 取一份可复用的去重表（<b>不用 ThreadLocal</b>：条目会被长生存的 netty 线程钉住旧类加载器）。 */
+    private static SeenScratch acquire() {
+      SeenScratch pooled = POOL.poll();
+      return pooled != null ? pooled : new SeenScratch();
     }
 
-    private static void clearThreadLocals() {
-      LOCAL.remove();
+    private static void release(SeenScratch scratch) {
+      if (scratch != null && POOL.size() < MAX_POOLED) {
+        POOL.offer(scratch);
+      }
+    }
+
+    private static void releaseAll() {
+      POOL.clear();
     }
 
     /** 取得本 section 专属的新代次；代次回绕到 0 时整表清零重来（实际不可能到达）。 */
@@ -316,18 +331,28 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    */
   private static final class ParseScratch {
 
-    private static final ThreadLocal<ParseScratch> LOCAL = ThreadLocal.withInitial(ParseScratch::new);
+    private static final java.util.concurrent.ConcurrentLinkedQueue<ParseScratch> POOL =
+        new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private static final int MAX_POOLED = 8;
 
     private final java.util.ArrayList<SectionBuffer> buffers = new java.util.ArrayList<>();
     private int[] coordinates = new int[48];
     private int bufferCount;
 
-    private static ParseScratch current() {
-      return LOCAL.get();
+    /** 取一份可复用的解析缓冲（<b>不用 ThreadLocal</b>，理由见 {@link SeenScratch#acquire()}）。 */
+    private static ParseScratch acquire() {
+      ParseScratch pooled = POOL.poll();
+      return pooled != null ? pooled : new ParseScratch();
     }
 
-    private static void clearThreadLocals() {
-      LOCAL.remove();
+    private static void release(ParseScratch scratch) {
+      if (scratch != null && POOL.size() < MAX_POOLED) {
+        POOL.offer(scratch);
+      }
+    }
+
+    private static void releaseAll() {
+      POOL.clear();
     }
 
     /** 取得容量 ≥ {@code required} 的绝对坐标缓冲（保留扩容后的容量）。 */
@@ -344,9 +369,9 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
 
     /** 取得第 {@code bufferCount} 个 section 的可复用缓冲，并重置为本次的 section 键与去重代次。 */
-    private SectionBuffer nextSection(long key, int generation) {
+    private SectionBuffer nextSection(long key, int generation, SeenScratch seen) {
       while (buffers.size() <= bufferCount) {
-        buffers.add(new SectionBuffer(SeenScratch.current()));
+        buffers.add(new SectionBuffer(seen));
       }
       SectionBuffer buffer = buffers.get(bufferCount++);
       buffer.reset(key, generation);
@@ -359,15 +384,16 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   }
 
   /**
-   * 释放当前线程上的两处复用缓冲（{@link SeenScratch} 的去重戳表与 {@link ParseScratch} 的解析缓冲）。
+   * 释放两处复用缓冲池（{@link SeenScratch} 的去重戳表与 {@link ParseScratch} 的解析缓冲）。
    *
-   * <p>ThreadLocal 条目挂在 netty 事件循环线程上，而线程比插件活得久：停用 / 热重载时不清理会让旧实例
-   * 钉住旧类加载器（{@code SeenScratch} 的 {@code int[4096]} 每个线程 16KB）。只能清调用线程这一份，
-   * 其余线程靠 ThreadLocalMap 的惰性 expunge。由 {@link ProximityRevealer#clearThreadLocals()} 汇入。
+   * <p>两处缓冲已<b>不用 ThreadLocal</b>：改用类静态的有界并发池 + acquire/release 成对使用。
+   * 原因：ThreadLocal 条目挂在长生存的 netty 事件循环线程上，停用/热重载后旧实例会经条目钉住旧类加载器；
+   * 池只被本类的类加载器持有，随插件卸载一起回收，停用时 clear 即可立即释放。
+   * 由 {@link ProximityRevealer#clearThreadLocals()} 汇入。
    */
-  static void clearThreadLocals() {
-    SeenScratch.clearThreadLocals();
-    ParseScratch.clearThreadLocals();
+  static void releasePooledBuffers() {
+    SeenScratch.releaseAll();
+    ParseScratch.releaseAll();
   }
 
   /**
@@ -400,34 +426,39 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       return;
     }
 
-    SeenScratch seen = SeenScratch.current();
-    ParseScratch parse = ParseScratch.current();
-    parse.beginSections();
-    int sectionCount = 0;
-    for (int i = 0; i < count; i++) {
-      int x = coordinates[i * 3];
-      int y = coordinates[i * 3 + 1];
-      int z = coordinates[i * 3 + 2];
-      long key = sectionKey(x, y, z);
-      SectionBuffer buffer = null;
-      for (int s = 0; s < sectionCount; s++) {
-        SectionBuffer candidate = parse.bufferAt(s);
-        if (candidate.key == key) {
-          buffer = candidate;
-          break;
+    SeenScratch seen = SeenScratch.acquire();
+    ParseScratch parse = ParseScratch.acquire();
+    try {
+      parse.beginSections();
+      int sectionCount = 0;
+      for (int i = 0; i < count; i++) {
+        int x = coordinates[i * 3];
+        int y = coordinates[i * 3 + 1];
+        int z = coordinates[i * 3 + 2];
+        long key = sectionKey(x, y, z);
+        SectionBuffer buffer = null;
+        for (int s = 0; s < sectionCount; s++) {
+          SectionBuffer candidate = parse.bufferAt(s);
+          if (candidate.key == key) {
+            buffer = candidate;
+            break;
+          }
         }
+        if (buffer == null) {
+          // 复用池中缓冲（见 ParseScratch）：生产路径一个包只有一个 section，因此稳态下零分配
+          buffer = parse.nextSection(key, seen.nextGeneration(), seen);
+          sectionCount++;
+        }
+        buffer.add(x, y, z);
       }
-      if (buffer == null) {
-        // 复用线程本地缓冲（见 ParseScratch）：生产路径一个包只有一个 section，因此稳态下零分配
-        buffer = parse.nextSection(key, seen.nextGeneration());
-        sectionCount++;
-      }
-      buffer.add(x, y, z);
-    }
 
-    for (int s = 0; s < sectionCount; s++) {
-      processSection(worldName, parse.bufferAt(s), obfuscatedChunkIndex, revealedSet, stats, dispatch,
-          echoCheck);
+      for (int s = 0; s < sectionCount; s++) {
+        processSection(worldName, parse.bufferAt(s), obfuscatedChunkIndex, revealedSet, stats,
+            dispatch, echoCheck);
+      }
+    } finally {
+      ParseScratch.release(parse);
+      SeenScratch.release(seen);
     }
   }
 

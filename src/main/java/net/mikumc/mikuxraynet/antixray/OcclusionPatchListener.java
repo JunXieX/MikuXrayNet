@@ -295,8 +295,9 @@ public final class OcclusionPatchListener extends PacketAdapter {
    * 那份条目仍随线程存活——这是已知的慢性泄漏（每代 reload 一个旧类加载器），根治需要把缓冲改成
    * 非 ThreadLocal 的实例字段或向异步线程投递清理任务，留待后续迭代。
    */
-  public static void clearThreadLocals() {
-    PATCH_BUFFER.remove();
+  /** 释放池中缓冲（插件停用时调用；池本身随类加载器回收）。 */
+  public static void releasePooledBuffers() {
+    PATCH_BUFFERS.clear();
   }
 
   /** 注销监听器；可重复调用，异常安全。 */
@@ -387,17 +388,22 @@ public final class OcclusionPatchListener extends PacketAdapter {
     int cells = positions.length;
     // 复用线程本地缓冲：一个 4096 格的变更包原来每包要新建约 100 KB 的临时数组（坐标 + 判定 + 批量写入），
     // 而同一份包还会按接收者重复回调；封包回调只落在少数几个线程上，按线程复用即可把分配降到零。
-    PatchBuffer buffer = PATCH_BUFFER.get();
-    buffer.ensureCells(cells);
-    int[] coords = buffer.coords;
-    unpackMultiCoords(section.getX() << 4, section.getY() << 4, section.getZ() << 4, positions, coords);
-    byte[] verdicts = buffer.verdicts;
-    for (int i = 0; i < cells; i++) {
-      // 单个坏元素（缺失 / 解析异常）只让该格记 UNRESOLVED，继续解析后面的坐标：
-      // 一个槽位读不出来不该让同包其余坐标一起漏补丁。
-      verdicts[i] = resolveOrUnresolved(data[i]);
+    PatchBuffer buffer = acquirePatchBuffer();
+    try {
+      buffer.ensureCells(cells);
+      int[] coords = buffer.coords;
+      unpackMultiCoords(section.getX() << 4, section.getY() << 4, section.getZ() << 4, positions,
+          coords);
+      byte[] verdicts = buffer.verdicts;
+      for (int i = 0; i < cells; i++) {
+        // 单个坏元素（缺失 / 解析异常）只让该格记 UNRESOLVED，继续解析后面的坐标：
+        // 一个槽位读不出来不该让同包其余坐标一起漏补丁。
+        verdicts[i] = resolveOrUnresolved(data[i]);
+      }
+      applyPatches(store, coords, verdicts, cells, stats);
+    } finally {
+      releasePatchBuffer(buffer);
     }
-    applyPatches(store, coords, verdicts, cells, stats);
   }
 
   /**
@@ -527,7 +533,8 @@ public final class OcclusionPatchListener extends PacketAdapter {
         || coords.length < cells * 3 || verdicts.length < cells) {
       return;
     }
-    PatchBuffer buffer = PATCH_BUFFER.get();
+    PatchBuffer buffer = acquirePatchBuffer();
+    try {
     buffer.ensureCells(cells);
     int[] xs = buffer.xs;
     int[] ys = buffer.ys;
@@ -557,6 +564,9 @@ public final class OcclusionPatchListener extends PacketAdapter {
     int applied = store.setBlocksOccluding(xs, ys, zs, occluding, cells);
     stats.patched.add(resolved);
     stats.patchFailures.add(unresolved + (cells - applied));
+    } finally {
+      releasePatchBuffer(buffer);
+    }
   }
 
   /**
@@ -565,8 +575,31 @@ public final class OcclusionPatchListener extends PacketAdapter {
    * <p>为什么要复用：一个 4096 格的 {@code MULTI_BLOCK_CHANGE} 每包要新建约 100 KB 临时数组，
    * 而封包回调只落在少数几个线程上（异步处理器线程池），按线程复用即可把这条路径的分配降为零。
    */
-  private static final ThreadLocal<PatchBuffer> PATCH_BUFFER =
-      ThreadLocal.withInitial(PatchBuffer::new);
+  private static final java.util.concurrent.ConcurrentLinkedQueue<PatchBuffer> PATCH_BUFFERS =
+      new java.util.concurrent.ConcurrentLinkedQueue<>();
+  /** 池上限：并发回调线程数通常远小于它；池只保留少量实例，其余交给 GC。 */
+  private static final int MAX_POOLED_PATCH_BUFFERS = 8;
+
+  /**
+   * 取一份可复用的补丁缓冲（<b>不再用 ThreadLocal</b>）。
+   *
+   * <p><b>为什么改池</b>：ThreadLocal 条目挂在平台异步线程的 ThreadLocalMap 上，线程比插件活得久，
+   * 插件停用/热重载后旧实例会经条目钉住旧类加载器（每代若干 KB~100 KB），且主线程侧无法清理其它线程
+   * 的那一份。池由本类静态持有（随类加载器一起回收），无外部线程根引用，停用时 clear 即可全部释放。
+   *
+   * <p>线程安全：池用并发队列，缓冲只在「取到 → 用完归还」期间由单次回调独占；补丁解析在单次回调内
+   * 同步完成、不重入，因此同一缓冲不会被并发使用（若有嵌套回调，需改为每层各取一份）。
+   */
+  private static PatchBuffer acquirePatchBuffer() {
+    PatchBuffer pooled = PATCH_BUFFERS.poll();
+    return pooled != null ? pooled : new PatchBuffer();
+  }
+
+  private static void releasePatchBuffer(PatchBuffer buffer) {
+    if (buffer != null && PATCH_BUFFERS.size() < MAX_POOLED_PATCH_BUFFERS) {
+      PATCH_BUFFERS.offer(buffer);
+    }
+  }
 
   private static final class PatchBuffer {
     private int[] coords = new int[48];

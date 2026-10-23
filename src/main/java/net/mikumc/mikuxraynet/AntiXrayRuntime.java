@@ -484,7 +484,7 @@ public final class AntiXrayRuntime {
     try {
       ProximityRevealer.clearThreadLocals();
     // 遮挡补丁缓冲同样按线程复用：调用线程这一份必须清（异步线程那份见 OcclusionPatchListener#clearThreadLocals 的说明）
-    net.mikumc.mikuxraynet.antixray.OcclusionPatchListener.clearThreadLocals();
+    net.mikumc.mikuxraynet.antixray.OcclusionPatchListener.releasePooledBuffers();
     } catch (Throwable throwable) {
       logger.log(Level.WARNING, "清理邻近显形线程本地缓存失败（忽略）", throwable);
     }
