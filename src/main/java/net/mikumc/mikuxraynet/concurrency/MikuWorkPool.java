@@ -27,6 +27,9 @@ public final class MikuWorkPool implements AutoCloseable {
   private final ScheduledExecutorService watchdog;
   private final int queueCapacity;
 
+  /** 非关键任务准入时为区块改写预留的队列比例分母（1/4 ⇒ 最多用 3/4）。 */
+  private static final int REWRITE_RESERVE_DIVISOR = 4;
+
   /**
    * 队列占用的近似计数（锁-free）：提交时 +1、任务「开始执行」时 -1，故它统计的是「已提交但尚未开始
    * 执行」的任务数，≈ {@code ArrayBlockingQueue} 当前长度。
@@ -113,6 +116,23 @@ public final class MikuWorkPool implements AutoCloseable {
    */
   public boolean hasCapacity() {
     return !this.closed && this.queuedTasks.get() < this.queueCapacity;
+  }
+
+  /**
+   * 非关键任务（邻近显形的规划 / 过期清理）的准入：要求队列至少保留 {@value #REWRITE_RESERVE_DIVISOR}
+   * 分之一的空位给区块改写。
+   *
+   * <p><b>为什么需要</b>：本池同时承载「区块改写（反矿透关键路径）」与「显形规划/过期清理（纯展示性）」。
+   * 若非关键任务只按 {@link #hasCapacity()}（有空位即可）准入，一次显形规划峰值就能把队列填满，
+   * 随后的区块改写会在 {@code !hasCapacity()} 分支被直接放行原包——矿物以真实状态下发，反矿透失效。
+   * 这里给关键路径预留 1/4 空位：非关键任务最多用到 3/4 队列，超出即本轮跳过（下周期再规划）。
+   */
+  public boolean hasSpareCapacity() {
+    if (this.closed) {
+      return false;
+    }
+    int reserved = Math.max(1, this.queueCapacity / REWRITE_RESERVE_DIVISOR);
+    return this.queuedTasks.get() < this.queueCapacity - reserved;
   }
 
   /** 提交任务；队列已满会抛 {@link java.util.concurrent.RejectedExecutionException}。 */

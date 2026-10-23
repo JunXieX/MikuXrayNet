@@ -971,6 +971,14 @@ final class RegionFile implements AutoCloseable {
       // 条目过期之后再回收（此时同样只打一次 WARN，见 warnCompactBudgetOnce）。
       long[] compactRawBudget = {0L};
       for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
+        // 先按桶头声明的原始长度做预算预判，再解压：旧实现是「先 ensureLoaded（解压）再判超」，
+        // 一旦超限就已经把 ~1.28 GiB 的 payload 全部常驻内存，压缩被放弃而垃圾一条没回收，
+        // 下一轮维护再来一次（大配置下变成周期性巨量分配）。预判精确到桶头，正常路径零额外成本。
+        long estimate = estimateRawBytes(bucket);
+        if (compactRawBudget[0] + estimate > MAX_COMPACT_TOTAL_RAW) {
+          warnCompactBudgetOnce(compactRawBudget[0] + estimate);
+          return 0;
+        }
         all[bucket] = ensureLoaded(bucket, compactRawBudget);
         if (compactRawBudget[0] > MAX_COMPACT_TOTAL_RAW) {
           warnCompactBudgetOnce(compactRawBudget[0]);
@@ -1158,6 +1166,21 @@ final class RegionFile implements AutoCloseable {
 
   // ------------------------------------------------------------------ 关闭
 
+  /**
+   * 关闭并<b>丢弃</b>未落盘的脏桶（仅用于「文件即将被删除」的淘汰路径）。
+   *
+   * <p>与 {@link #close()} 的区别：不调用 {@code flushDirty()}——文件随后即删除，先整桶重编码 +
+   * 压缩 + fsync 纯属白做（且压缩线程的读预算只有几十毫秒）。压缩中与非关闭态的处理同 close：
+   * 直接返回，由压缩收尾负责关闭。
+   */
+  void closeDiscarding() {
+    if (closed || compacting) {
+      return;
+    }
+    closed = true;
+    closeQuietly();
+  }
+
   @Override
   public void close() throws IOException {
     if (closed) {
@@ -1268,6 +1291,39 @@ final class RegionFile implements AutoCloseable {
 
   private BufferedLinearV3Format.Entry[] ensureLoaded(int bucket) {
     return ensureLoaded(bucket, null);
+  }
+
+  /**
+   * 预估某桶解压后占用的原始字节（只读 8 字节槽位头，<b>不解压</b>），供压缩总量闸在解压<b>之前</b>预判。
+   *
+   * @return 已常驻内存的桶返回 0（不增加新的内存尖峰）；空桶返回 0；桶头不可信时按 0 处理，
+   *         解压后的硬闸仍会在 {@link #compact} 里兜底
+   */
+  private long estimateRawBytes(int bucket) {
+    if (slots[bucket] != null) {
+      return 0L;
+    }
+    LazyBucket lazy = lazyBuckets[bucket];
+    if (lazy != null) {
+      return lazy.raw.length;
+    }
+    if (positions[bucket] <= 0L) {
+      return 0L;
+    }
+    try {
+      byte[] lengths = readAt(channel, positions[bucket], 8);
+      ByteBuffer buffer = ByteBuffer.wrap(lengths);
+      int rawLength = buffer.getInt();
+      int compressedLength = buffer.getInt();
+      if (rawLength > 0 && compressedLength > 0
+          && positions[bucket] + 8L + compressedLength <= fileSize
+          && rawLengthWithinFileBudget(rawLength)) {
+        return rawLength;
+      }
+    } catch (Throwable ignored) {
+      // 预判失败不影响正确性：解压后的硬闸仍会生效
+    }
+    return 0L;
   }
 
   /**

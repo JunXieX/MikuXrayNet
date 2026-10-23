@@ -879,8 +879,12 @@ public final class DiskCacheStore implements AutoCloseable {
       handle.accountedEntries = Math.max(0L, handle.accountedEntries - dropped);
       approximateEntries.updateAndGet(value -> Math.max(0, value - dropped));
     }
-    // 压缩会把内存里的全部槽位（含脏的）整文件重写：待落盘记账随之清零
-    handle.clearPending();
+    // 只有「压缩确实整文件重写并落盘」才清零待落盘记账：compact 的两条早退（锁不可用 / 预算超限）
+    // 并不会重写文件，脏槽位仍在内存——此时若清零，下一批 flush 的 projected 字节会漏算这些脏桶，
+    // 文件可能在「判定未到上限」的情况下被顶破单文件上限。dirty 全空才视为已重写。
+    if (!handle.file.hasDirtySlots()) {
+      handle.clearPending();
+    }
   }
 
   /** 条目保留判定：只按过期时间丢弃（内容新鲜度由负载里的原始字节指纹保证，见类注释）。 */
@@ -1028,7 +1032,12 @@ public final class DiskCacheStore implements AutoCloseable {
     try {
       boolean empty = handle.file.isEmptyFile();
       boolean deletable = deleteFile && !handle.file.lockUnavailable();
-      handle.file.close();
+      if (empty || deletable) {
+        // 文件随后即删除：不落盘（避免整桶重编码 + 压缩 + fsync 的白做），只关通道让删除可行
+        handle.file.closeDiscarding();
+      } else {
+        handle.file.close();
+      }
       if (empty || deletable) {
         Files.deleteIfExists(handle.file.path());
       }

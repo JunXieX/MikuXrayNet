@@ -805,7 +805,8 @@ public final class ProximityRevealer implements Listener {
 
   /** 本轮是否有可用的工作线程来执行纯计算筛选（包级可见，便于离线单测）。 */
   static boolean canOffloadPlanning(MikuWorkPool workPool) {
-    return workPool != null && workPool.hasCapacity();
+    // 用「为改写预留后的余量」准入：显形规划不值得把关键路径挤成原包直发（反矿透失效）
+    return workPool != null && workPool.hasSpareCapacity();
   }
 
   /** 无可用工作线程时跳过本轮巡检：计入统计 + 一次性提示（正常负载下只会是队列瞬时打满）。 */
@@ -1486,8 +1487,8 @@ public final class ProximityRevealer implements Listener {
       expireNow();
       return;
     }
-    if (!workPool.hasCapacity()) {
-      // 队列满 = 区块集中下发、服务器最忙的时刻，恰好是本方法搬进工作池要避开的那种时刻：
+    if (!workPool.hasSpareCapacity()) {
+      // 队列紧张 = 区块集中下发、服务器最忙的时刻，恰好是本方法搬进工作池要避开的那种时刻：
       // 本轮跳过（过期清理只是内存卫生），下个窗口再试，绝不把 O(全服条目) 的全量扫描退回
       // 主线程 / Folia 区域线程。
       return;
