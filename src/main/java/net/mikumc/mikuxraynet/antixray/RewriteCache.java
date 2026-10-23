@@ -349,11 +349,17 @@ public final class RewriteCache<V> {
       overwrite(previous, value, sizeBytes, now);
       return;
     }
-    if (sizeBytes != 0L) {
-      bytes.addAndGet(sizeBytes);
-    }
-    // 只有「真正新建条目」才进入同步块维护环形队列并做淘汰扫描——把串行范围缩到最小。
+    // 字节记账必须与 CLOCK 队列维护在同一把锁内：invalidateAll/invalidateWorld 会在 clockLock 内
+    // 清表并按剩余条目重算字节；若增账在锁外，交错时会出现「条目已被清掉、账却仍被加上」的永久偏高
+    // （该节点随后被当死节点丢弃、永不扣回 → 累积越过上限后缓存被持续挤空，直到重启）。
     synchronized (clockLock) {
+      if (entries.get(key) != entry) {
+        // 并发失效已先一步摘除本条目：不入队、不记账，否则留下永不回收的账目
+        return;
+      }
+      if (sizeBytes != 0L) {
+        bytes.addAndGet(sizeBytes);
+      }
       clockQueue.addLast(entry);
       evictOverflow();
       // 顶满淘汰只在超容量时触发，冷条目的过期回收必须另有着落：每次新建条目顺带巡检少量节点

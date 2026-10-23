@@ -16,6 +16,7 @@ import java.lang.invoke.MethodType;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntPredicate;
@@ -258,6 +259,12 @@ public final class OcclusionPatchListener extends PacketAdapter {
   private final AtomicInteger errorCounter = new AtomicInteger();
   /** 最近已应用的方块变更包（按包实例身份去重，见 {@link RecentPackets}）。 */
   private final RecentPackets recentPackets = new RecentPackets();
+  /**
+   * 每玩家「上次见到的世界名」：跨世界守卫用（方块变更包不含世界标识，坐标按接收者当前世界解释）。
+   * 条目随在线玩家数有界；停用时整体清空（见 {@link #stop()}）。
+   */
+  private final java.util.concurrent.ConcurrentHashMap<UUID, String> lastWorlds =
+      new java.util.concurrent.ConcurrentHashMap<>();
 
   private volatile AsyncListenerHandler handler;
 
@@ -281,9 +288,22 @@ public final class OcclusionPatchListener extends PacketAdapter {
   }
 
   /** 注销监听器；可重复调用，异常安全。 */
+  /**
+   * 释放当前线程的补丁缓冲（插件停用 / 热重载时汇入统一清理入口）。
+   *
+   * <p>注意：本方法只清「调用线程」那一份；ProtocolLib 异步回调跑在平台共享异步线程上，
+   * 那份条目仍随线程存活——这是已知的慢性泄漏（每代 reload 一个旧类加载器），根治需要把缓冲改成
+   * 非 ThreadLocal 的实例字段或向异步线程投递清理任务，留待后续迭代。
+   */
+  public static void clearThreadLocals() {
+    PATCH_BUFFER.remove();
+  }
+
+  /** 注销监听器；可重复调用，异常安全。 */
   public void stop() {
     AsyncListenerHandler current = handler;
     handler = null;
+    lastWorlds.clear();
     if (current == null) {
       return;
     }
@@ -303,6 +323,13 @@ public final class OcclusionPatchListener extends PacketAdapter {
     try {
       String worldName = worldNameOf(player);
       if (worldName == null) {
+        return;
+      }
+      // 跨世界守卫：方块变更包不含世界标识，坐标按「接收者当前世界」解释。玩家切世界瞬间仍在途的
+      // 旧世界变更包若按新世界名写位图，会在新世界的无关坐标上造成单格错误（写 CLEAR 时显形侧
+      // 会把该格当透明，削弱反矿透一格）。与 BlockChangeMerger 同一口径：世界名变化即丢弃本包补丁。
+      String previousWorld = lastWorlds.put(player.getUniqueId(), worldName);
+      if (previousWorld != null && !previousWorld.equals(worldName)) {
         return;
       }
       // 只补「已经建过表」的世界：未建表说明该世界没有位图数据（例如反矿透未覆盖它），

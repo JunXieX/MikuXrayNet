@@ -478,6 +478,8 @@ public final class AntiXrayRuntime {
     // ThreadLocalMap 时被惰性 expunge——这正是这里只清调用线程的原因。
     try {
       ProximityRevealer.clearThreadLocals();
+    // 遮挡补丁缓冲同样按线程复用：调用线程这一份必须清（异步线程那份见 OcclusionPatchListener#clearThreadLocals 的说明）
+    net.mikumc.mikuxraynet.antixray.OcclusionPatchListener.clearThreadLocals();
     } catch (Throwable throwable) {
       logger.log(Level.WARNING, "清理邻近显形线程本地缓存失败（忽略）", throwable);
     }
