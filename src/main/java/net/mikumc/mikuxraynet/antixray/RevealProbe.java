@@ -86,7 +86,15 @@ public final class RevealProbe {
       StringBuilder neighbours = new StringBuilder("   本格=")
           .append(section == null || section.isOccluding(x, y, z) ? "遮挡" : "不遮挡").append("｜邻面：");
       for (int i = 0; i < 6; i++) {
-        boolean occluding = section == null || section.isOccluding(x + DX[i], y + DY[i], z + DZ[i]);
+        // 邻面必须逐格取 section：本格所在 section 的查询会把越界坐标按 &15 折回本段对侧，
+        // 在 section 边界上会读到 16 格之外的另一格（与 ④ 暴露面结论自相矛盾）。
+        int nx = x + DX[i];
+        int ny = y + DY[i];
+        int nz = z + DZ[i];
+        SectionOcclusion neighbourSection = store == null ? null
+            : store.section(nx >> 4, ny >> 4, nz >> 4);
+        boolean occluding = neighbourSection == null
+            || neighbourSection.isOccluding(nx, ny, nz);
         neighbours.append(FACE_NAMES[i]).append(occluding ? "遮挡 " : "通畅 ");
       }
       lines.add(neighbours.toString());

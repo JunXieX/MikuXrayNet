@@ -166,7 +166,8 @@ public class Chunk implements AutoCloseable {
         // 这是既定取舍：稳态下复用数组往往比本次输出略大，于是每个区块要付一次整块复制；换来的是
         // 「交出去的字节长度精确、且完全独立于 scratch」这一强不变式（调用方会长期持有该数组）。
         // 若未来确有需要，可让 scratch 记「上次实际写出长度」并据此定容以减少该复制，此处不做。
-        this.scratch.keepOutputCapacity(out.capacity());
+        // 输出缓冲是 Unpooled.wrappedBuffer(byte[])（maxCapacity == 数组长度），写出过程不会自行扩容，
+        // 容量只由 scratch.growOutput 决定，故此处无需回写容量（原 keepOutputCapacity 是死代码）。
         return Arrays.copyOfRange(array, out.arrayOffset(), out.arrayOffset() + readable);
       } catch (IndexOutOfBoundsException overflow) {
         // 源区间已在入口校验，因此「输出写满」是唯一允许重试的情形。但**不能把所有越界都当成写满**：

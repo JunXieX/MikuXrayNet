@@ -273,18 +273,10 @@ public class ChunkSection {
     //
     // 空调色板不在此拦：本 codec 对它既有口径是「原样搬运、不改写」（见 downgradePalette 的说明），
     // 若在此判成越界，等于把一个本可原样搬运的节变成非预期异常，反而扩大 fail-open 的范围。
-    if (this.palette instanceof IndirectPalette) {
-      int entries = this.palette.size();
-      if (entries > 0) {
-        for (int i = 0; i < SECTION_VOLUME; i++) {
-          int paletteIndex = this.data.get(i);
-          if (paletteIndex >= entries) {
-            throw new IndexOutOfBoundsException(
-                "索引 " + paletteIndex + " 越界，调色板 " + entries + " 项（第 " + i + " 项）");
-          }
-        }
-      }
-    }
+    // 刻意<b>不</b>在这里做「4096 个调色板索引全量校验」：它让每个区块都无条件付一遍全段解码
+    // （按仓库基准约 0.12~0.20 ms/区块，占改写热路径 35%~60%），而收益只是「更早失败」。
+    // 真正越界时改写循环里的 catch (RuntimeException) 会放弃本次改写并按原始字节下发（见
+    // ObfuscationProcessor#rewrite），不存在半改写字节泄漏——防御应放在唯一消费点上，而不是每个区块都扫一遍。
   }
 
   /** 该 section 是否被外部通过 {@link #setBlockState}（或调色板裁剪/降级）改写。 */

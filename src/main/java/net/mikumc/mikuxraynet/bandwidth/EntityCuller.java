@@ -726,9 +726,13 @@ public final class EntityCuller implements Listener {
     TrackedRotation target = rotation(player.getUniqueId());
     double radius = Math.max(64.0D, config.forceVisibleDistance() * 8.0D);
     for (Entity entity : player.getWorld().getNearbyEntities(player.getLocation(), radius, radius, radius)) {
-      if (entity != player) {
-        target.add(entity);
+      // 只补种「本模块会剔除的实体」：其它玩家与烟花在 onTrack / submitRaycast 里被明确排除，
+      // 若把它们补进轮转，通道② 会对其它玩家执行 hideEntity（热重载/启用后玩家短暂消失，PvP 可被利用）；
+      // 玩家自己也要跳过（原实现用 entity != player，漏了其它玩家）。
+      if (entity == player || entity instanceof Player || entity instanceof Firework) {
+        continue;
       }
+      target.add(entity);
     }
     return target;
   }
@@ -890,8 +894,9 @@ public final class EntityCuller implements Listener {
    * 无论哪条通道，处于强制可见距离内的实体一律 {@code showIfHidden}（安全策略：绝不隐藏近处实体）。
    */
   private void submitRaycast(Player player, Entity entity, RecheckMode mode) {
-    // 烟花被隐藏会破坏鞘翅飞行体验，直接跳过
-    if (entity instanceof Firework) {
+    // 不变式守卫（不可依赖调用方）：玩家可见性交给原版与其它插件（PvP），烟花被隐藏会破坏鞘翅飞行。
+    // 补种路径曾经漏掉 Player 过滤，导致其它玩家被轮转队列隐藏；这里再挡一道，防止未来新增入口绕过。
+    if (entity instanceof Player || entity instanceof Firework) {
       return;
     }
     try {

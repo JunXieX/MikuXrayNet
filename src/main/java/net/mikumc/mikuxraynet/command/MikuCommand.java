@@ -281,7 +281,13 @@ public final class MikuCommand {
     int x;
     int y;
     int z;
-    if (args.length >= 4) {
+    if (args.length != 1 && args.length != 4) {
+      // 只接受「不给坐标」或「给满 x y z」两种形态：2/3/5+ 个参数静默改去探测准星方块，
+      // 会让管理员以为在看指定坐标、实际是另一个位置的结论（新功能最易误判的一点）。
+      message(sender, "用法：/" + label + " probe [x y z]（不给坐标 = 探测视线指向的 8 格内方块）");
+      return;
+    }
+    if (args.length == 4) {
       try {
         x = Integer.parseInt(args[1]);
         y = Integer.parseInt(args[2]);

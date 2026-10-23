@@ -57,6 +57,13 @@ final class ProximityScanner {
      * 「窗口是否被占满 / 扫描量是否异常」，混入半径外坐标会让这个数字系统性偏大。
      */
     int positionsEvaluated;
+    /**
+     * 因调用方给的时间预算耗尽而提前结束（只收集到部分候选）。
+     *
+     * <p>与 {@link #chunksDeferred} 区分：后者是「分片轮转本周期不看」，本字段是「本趟被预算截断、
+     * 需要调用方顺延」。视野增量巡检（M3）据此判断是否真的完成了一趟扫描。
+     */
+    boolean deadlineTruncated;
   }
 
   /** 带距离与到达序号的候选（堆选择需要次级键来保持「等距候选先到者在前」的稳定顺序）。 */
@@ -84,6 +91,21 @@ final class ProximityScanner {
   static List<ObfuscatedChunkIndex.Position> candidates(ObfuscatedChunkIndex index,
       RevealedSet revealed, UUID playerId, String worldName, int x, int y, int z,
       double maxDistance, int limit, int shard, int shards, Tally tally) {
+    return candidates(index, revealed, playerId, worldName, x, y, z, maxDistance, limit, shard,
+        shards, tally, Long.MAX_VALUE);
+  }
+
+  /**
+   * 同上，但带<b>时间预算</b>：每进入一个区块前检查一次 {@code System.nanoTime() > deadlineNanos}，
+   * 超时即停止收集（已收集的候选照常返回，{@link Tally#deadlineTruncated} 置位）。
+   *
+   * <p><b>为什么需要</b>：视野变化增量巡检是「玩家行为驱动」的路径，若取候选本身（遍历视距内全部区块、
+   * 对距离内每个坐标加锁查已显形集合）不受预算约束，密集矿区单次扫描就可能吃光 0.15 ms 预算，导致
+   * 后续判定一次都跑不到——功能在唯一有价值的场景失效，而调用方只看到「预算耗尽」。
+   */
+  static List<ObfuscatedChunkIndex.Position> candidates(ObfuscatedChunkIndex index,
+      RevealedSet revealed, UUID playerId, String worldName, int x, int y, int z,
+      double maxDistance, int limit, int shard, int shards, Tally tally, long deadlineNanos) {
     if (index == null || revealed == null || playerId == null || worldName == null
         || limit <= 0 || maxDistance < 0.0D) {
       return List.of();
@@ -102,9 +124,19 @@ final class ProximityScanner {
       int byDistance = Long.compare(right.distanceSquared(), left.distanceSquared());
       return byDistance != 0 ? byDistance : Integer.compare(right.sequence(), left.sequence());
     });
+    // 堆容量略大于最终取用量：先按距离取足量 top-N，再过滤「已显形」——避免为最终会被堆淘汰的
+    // 候选各付一次 RevealedSet 的监视器锁（密集矿区单周期可达上千次加锁）。
+    int heapLimit = limit + Math.max(8, limit / 4);
     int sequence = 0;
 
     for (int chunkX = centerX - radius; chunkX <= centerX + radius; chunkX++) {
+      if (System.nanoTime() > deadlineNanos) {
+        // 时间预算耗尽：停止收集，已收集的候选照常返回（调用方按 deadlineTruncated 判断是否需要顺延）
+        if (tally != null) {
+          tally.deadlineTruncated = true;
+        }
+        break;
+      }
       for (int chunkZ = centerZ - radius; chunkZ <= centerZ + radius; chunkZ++) {
         // 用「世界名 + 坐标」的原始分量查询：扫描每周期遍历 13×13 = 169 个区块，
         // 逐块 new ChunkKey 会产出 169 个短命对象（50 人在线时约 4.2 万个/秒，全在主线程/区域线程）。
@@ -154,11 +186,9 @@ final class ProximityScanner {
             // 只在通过距离筛选后计数：口径见 Tally#positionsEvaluated 的注释
             tally.positionsEvaluated++;
           }
-          if (revealed.contains(playerId, worldName, chunkX, chunkZ, blockX, blockY, blockZ)) {
-            continue;
-          }
-          // 传原始分量而非先构造 Position：堆满之后绝大多数候选注定被淘汰，只有真正入堆时才需要对象
-          offer(worst, blockX, blockY, blockZ, distanceSq, sequence++, limit);
+          // 传原始分量而非先构造 Position：堆满之后绝大多数候选注定被淘汰，只有真正入堆时才需要对象。
+          // 「已显形」过滤放在出堆之后（见方法末），避免为注定淘汰的候选付出监视器锁。
+          offer(worst, blockX, blockY, blockZ, distanceSq, sequence++, heapLimit);
         }
       }
     }
@@ -169,9 +199,18 @@ final class ProximityScanner {
       int byDistance = Long.compare(left.distanceSquared(), right.distanceSquared());
       return byDistance != 0 ? byDistance : Integer.compare(left.sequence(), right.sequence());
     });
-    List<ObfuscatedChunkIndex.Position> result = new ArrayList<>(ordered.length);
+    List<ObfuscatedChunkIndex.Position> result = new ArrayList<>(Math.min(limit, ordered.length));
     for (Scored scored : ordered) {
-      result.add(scored.position());
+      if (result.size() >= limit) {
+        break;
+      }
+      ObfuscatedChunkIndex.Position position = scored.position();
+      if (revealed.contains(playerId, worldName, position.x() >> 4, position.z() >> 4,
+          position.x(), position.y(), position.z())) {
+        // 已显形：跳过并继续用后面的候选补位（窗口大小不因此缩水）
+        continue;
+      }
+      result.add(position);
     }
     return result;
   }

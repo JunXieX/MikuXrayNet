@@ -179,11 +179,11 @@ public final class Diagnostics {
     public record Proximity(long revealsSent, long revealsSkipped, long revealsUnregistered,
         long frustumCulled, long rayCulled, long rayCulledMissingData, long overRevealSampled,
         long overRevealWasted, long viewChangeScans, long viewChangeNanos, long viewChangeMaxNanos,
-        long viewChangeBudgetExhausted) {
+        long viewChangeBudgetExhausted, long passesSkippedNoCapacity) {
 
       /** 邻近显形未启用时的零值兜底。 */
       public static final Proximity EMPTY =
-          new Proximity(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+          new Proximity(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     /** 显形索引域：伪装区块索引（按区块共享）与按玩家的已显形集合的持有量与安全阀计数。 */
@@ -485,7 +485,8 @@ public final class Diagnostics {
             proximityStats.revealsRayCulled.sum(), proximityStats.revealsRayCulledMissingData.sum(),
             proximityStats.overRevealSampled.sum(), proximityStats.overRevealWasted.sum(),
             proximityStats.viewChangeScans.sum(), proximityStats.viewChangeNanos.sum(),
-            proximityStats.viewChangeMaxNanos.get(), proximityStats.viewChangeBudgetExhausted.sum());
+            proximityStats.viewChangeMaxNanos.get(), proximityStats.viewChangeBudgetExhausted.sum(),
+            proximityStats.passesSkippedNoCapacity.sum());
     Snapshot.Index index = chunkIndex == null && revealedSet == null ? Snapshot.Index.EMPTY
         : new Snapshot.Index(
             chunkIndex == null ? 0 : chunkIndex.chunkCount(),
@@ -676,7 +677,9 @@ public final class Diagnostics {
         + "，平均 " + averageFlushMillis(s.proximity().viewChangeScans(),
             s.proximity().viewChangeNanos())
         + " ms，最大 " + formatMillis(s.proximity().viewChangeMaxNanos())
-        + " ms，预算耗尽 " + s.proximity().viewChangeBudgetExhausted() + " 次");
+        + " ms，预算耗尽 " + s.proximity().viewChangeBudgetExhausted() + " 次"
+        // 工作池无容量时周期巡检会整轮跳过（显形完全不发生）；必须可见，否则「什么都不还原」无法归因。
+        + "｜整轮跳过（工作池满） " + s.proximity().passesSkippedNoCapacity());
     // 口径说明：这里刻意分列「实时坐标数」与「累计登记数」——前者随登出 / 过期 / 区块失效归零，
     // 后者只增不减。若只显示实时值，玩家中途重登或走远后被清理时会看到「发送 N 但已显形 0」，
     // 极易被误读成「显形路径没有登记」（实际登记在发包成功后必然发生）。

@@ -146,7 +146,10 @@ public final class ReloadCoordinator {
           + "idle-close-seconds / maintenance-interval-seconds / compact-per-pass / queue-capacity / zstd.*）",
       // occlusion.* 虽参与指纹（改后旧缓存会一次性失效重建），但运行期用于判定的遮挡表由 PacketEventsHook
       // 在启动期一次性构建，reload 不会重建它——改了只有重启才真正生效。
-      "遮挡规则表（occlusion.extra-occluding / extra-non-occluding）");
+      "遮挡规则表（occlusion.extra-occluding / extra-non-occluding）",
+      // ObscuredChunkIndex / RevealedSet 的容量与过期在启动期固化进实例；restartProximity 只在
+      // 实例为 null 时新建（否则会丢已下发假矿），故这三键改了必须重启，不能回显成「已热生效」。
+      "邻近显形安全阀与过期（proximity.max-positions / max-positions-per-player / expire-seconds）");
 
   /**
    * 执行一次热重载。

@@ -449,6 +449,17 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       int sectionCount = (world.getMaxHeight() - minHeight) / 16;
       // 维度由 World#getEnvironment() 判定（不依赖世界名；CUSTOM 归入 normal），决定用哪段 dimensions 配置。
       dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
+      // 维度被关闭的世界（默认 dimensions.the_end.enabled=false）直接放行，不进管线：
+      // 否则每个区块包都要白付一次异步往返 + 工作池排队 + 磁盘缓存查询 + 看门狗注册，而 rewrite 会因
+      // profile 非 active 原样返回、Result.occlusion==null 导致结果永不入缓存（resultCacheable 恒 false），
+      // 包越多亏越多，还会挤占共享队列（队列满时原包直发 = 反矿透失效）。此处尚未登记处理延迟，
+      // 直接 return 由 ProtocolLib 自行放行；但必须归还批次闸门刚登记的 pending。
+      if (!live().enabledForWorld(world.getName(), dimension)) {
+        if (gate != null) {
+          gate.chunkDone();
+        }
+        return;
+      }
       // 超时实时读「当前」配置：reload 改了 advanced.timeout-millis 必须立即生效（本监听器不随 reload 重建）。
       // 同一区块的任务构造与看门狗注册共用这一个值，保证两者一致。
       timeoutMillis = live().timeoutMillis();

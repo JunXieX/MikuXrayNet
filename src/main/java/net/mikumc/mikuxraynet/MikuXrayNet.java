@@ -85,6 +85,11 @@ public final class MikuXrayNet extends JavaPlugin {
   public void onEnable() {
     if (config == null) {
       onLoad();
+    } else {
+      // 同一实例被 disable→enable 时（非 /reload 新建实例），Bukkit 不会再调 onLoad，而 onDisable
+      // 已把静态黑名单清空（publish(null)）——不重新发布就会让 blacklist.yml 静默失效（主城/副本世界
+      // 重新被改写与带宽优化）。这里无条件重发布，幂等且廉价。
+      WorldBlacklistConfig.publish(config.blacklist());
     }
 
     // 平台判定必须最先做：调度已统一走 Paper 调度器（不再分支），但平台判定仍决定

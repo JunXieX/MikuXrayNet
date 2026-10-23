@@ -205,18 +205,4 @@ public final class ChunkScratch {
     this.outputArray = null;
   }
 
-  /**
-   * 记录一次写出实际用到的输出容量（只增不减）。
-   *
-   * <p>正常路径下写出直接用本 scratch 的数组；若底层缓冲区自行扩容（复用的数组偏小），
-   * 这里把真实容量同步回来，使同线程随后的区块一次到位，不再重复扩容。
-   */
-  void keepOutputCapacity(int capacity) {
-    if (this.outputArray != null && this.outputArray.length >= capacity) {
-      return;
-    }
-    int size = Math.max(1, capacity);
-    // 与 growOutput 同口径：超过保留上限的数组不驻留（下次按需重分配），避免大数组永久留在复用池里
-    this.outputArray = size > MAX_RETAINED_OUTPUT_CAPACITY ? null : new byte[size];
-  }
 }

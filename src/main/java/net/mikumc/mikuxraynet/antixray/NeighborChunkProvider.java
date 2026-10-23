@@ -200,6 +200,8 @@ public final class NeighborChunkProvider {
    */
   public NeighborEdges cached(String worldName, int chunkX, int chunkZ) {
     // 无锁读取：不再获取全局 monitor，也不再改动 LRU 链表（改由 volatile second-chance 位近似）。
+    // 注意：本类的 ChunkKey 是私有的 record（仅本缓存使用），与 antixray.ChunkKey 同名但不同类，
+    // 因此不能复用后者的 Probe；逐次 new 是这里的既定成本（每包 1~3 个短命对象，可接受）。
     ChunkKey key = new ChunkKey(worldName, chunkX, chunkZ);
     CacheEntry entry = entries.get(key);
     if (entry == null) {

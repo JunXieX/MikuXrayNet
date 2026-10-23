@@ -148,7 +148,7 @@ permissions:
 commands:
   mikuxraynet:
     description: MikuXrayNet 管理命令
-    usage: /mikuxraynet <status|dump|reload>
+    usage: /mikuxraynet <status|dump|probe|reload>
     aliases:
       - mxnet
       - mxr

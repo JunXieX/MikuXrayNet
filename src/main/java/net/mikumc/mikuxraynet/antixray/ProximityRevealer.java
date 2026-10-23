@@ -173,12 +173,12 @@ public final class ProximityRevealer implements Listener {
   private static final int FALLBACK_VIEW_DISTANCE_CHUNKS = 10;
 
   /**
-   * 显形回显的判定窗口（纳秒，2 秒）。
+   * 显形回显的判定窗口（纳秒，500 毫秒）。
    *
    * <p>只需覆盖「显形包发出 → 本插件出站监听器看到该包」的极短延迟；取得过长会把「玩家紧接着挖掉
    * 刚显形的那块」误判成回显，从而留下一枚陈旧索引条目（可自愈但不必要）。
    */
-  private static final long REVEAL_ECHO_WINDOW_NANOS = 2_000_000_000L;
+  private static final long REVEAL_ECHO_WINDOW_NANOS = 500_000_000L;
 
   /** 每玩家回显标记条数上界：正常只需容纳「一个周期内发出的显形数」，超限整体清空（只少判一次回显）。 */
   private static final int REVEAL_ECHO_MAX_PER_PLAYER = 8192;
@@ -1481,16 +1481,23 @@ public final class ProximityRevealer implements Listener {
     if (now - last < expirePeriodNanos || !lastExpireNanos.compareAndSet(last, now)) {
       return;
     }
-    if (workPool != null && workPool.hasCapacity()) {
-      try {
-        workPool.execute(this::expireNow);
-        return;
-      } catch (Throwable throwable) {
-        // 入队失败（队列刚被填满 / 线程池关闭）：退回当前线程直接清理，绝不丢过期清除
-        logThrottled(throwable);
-      }
+    if (workPool == null) {
+      // 未装配工作池（极少见）：没有可用的异步通道，只能就地清理（语义优先于毛刺）
+      expireNow();
+      return;
     }
-    expireNow();
+    if (!workPool.hasCapacity()) {
+      // 队列满 = 区块集中下发、服务器最忙的时刻，恰好是本方法搬进工作池要避开的那种时刻：
+      // 本轮跳过（过期清理只是内存卫生），下个窗口再试，绝不把 O(全服条目) 的全量扫描退回
+      // 主线程 / Folia 区域线程。
+      return;
+    }
+    try {
+      workPool.execute(this::expireNow);
+    } catch (Throwable throwable) {
+      // 入队失败（队列刚被填满 / 线程池关闭）：同样跳过本轮，下个窗口重试
+      logThrottled(throwable);
+    }
   }
 
   /**
@@ -1964,10 +1971,12 @@ public final class ProximityRevealer implements Listener {
           int y = cy + offsets[o][1];
           int z = cz + offsets[o][2];
           evaluationsLeft--;
-          if (!isInstantCandidate(keys, playerId, liveWorld, x, y, z)) {
+          // 去重必须放在昂贵判定之前：同一绝对坐标会从多个变更坐标的邻域反复到达，
+          // 先做纯位运算去重，可省下重复的「索引查表 + 已显形集合加锁」。
+          if (!evaluated.add(packCoordinate(x, y, z))) {
             continue;
           }
-          if (!evaluated.add(packCoordinate(x, y, z))) {
+          if (!isInstantCandidate(keys, playerId, liveWorld, x, y, z)) {
             continue;
           }
           // 事件路径不预先算计划（见 revealImmediately 注释）：false = sendOne 在当前线程用遮挡位图判定
@@ -2092,11 +2101,14 @@ public final class ProximityRevealer implements Listener {
    */
   private void drainChunkReveals(Player player) {
     try {
-      if (stopping || !player.isOnline()) {
-        return;
-      }
       PendingChunkReveals pending = pendingChunkReveals.get(player.getUniqueId());
       if (pending == null) {
+        return;
+      }
+      if (stopping || !player.isOnline()) {
+        // 离线/停用：直接摘掉条目。若只 return，scheduled 会永远为 true（离线后没有下一次 drain），
+        // 重登时 computeIfAbsent 取到的仍是这条卡死条目 → M2 对该玩家整局失效，且条目泄漏。
+        pendingChunkReveals.remove(player.getUniqueId(), pending);
         return;
       }
       java.util.List<Long> batch;
@@ -2111,12 +2123,17 @@ public final class ProximityRevealer implements Listener {
         pending.chunkKeys.clear();
         worldName = pending.worldName;
       }
+      int consumed = 0;
       try {
-        revealChunks(player, worldName, batch);
+        consumed = revealChunks(player, worldName, batch);
       } finally {
         boolean reschedule = false;
         synchronized (pending) {
           pending.draining = false;
+          if (consumed < batch.size()) {
+            // 预算没判完的区块按原序回填：下一 tick 继续，绝不丢弃（传送/首次进服会一次下发上百个区块）
+            pending.chunkKeys.addAll(batch.subList(consumed, batch.size()));
+          }
           if (!pending.chunkKeys.isEmpty() && !pending.scheduled) {
             pending.scheduled = true;
             reschedule = true;
@@ -2138,15 +2155,15 @@ public final class ProximityRevealer implements Listener {
    * 硬上限：每区块 {@link #MAX_CHUNK_DELIVERY_EVALUATIONS}、整批
    * {@link #MAX_CHUNK_DELIVERY_EVALUATIONS_PER_TICK}、发包受 {@code instant-reveal.max-per-tick} 限额。
    */
-  private void revealChunks(Player player, String worldName, java.util.List<Long> chunkKeys) {
+  private int revealChunks(Player player, String worldName, java.util.List<Long> chunkKeys) {
     try {
       if (stopping || !player.isOnline()
           || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
-        return;
+        return chunkKeys.size();
       }
       World world = player.getWorld();
       if (!world.getName().equals(worldName) || !shouldRevealInWorld(worldName)) {
-        return;
+        return chunkKeys.size();
       }
       UUID playerId = player.getUniqueId();
       long tick = Bukkit.getCurrentTick();
@@ -2154,31 +2171,37 @@ public final class ProximityRevealer implements Listener {
           MAX_CHUNK_DELIVERY_SENDS_PER_TICK);
       Budget budget = new Budget(granted);
       if (budget.remaining() <= 0) {
-        return;
+        return 0;
       }
-      ProximitySelector.Eye eye = proximity.raycastEnabled() ? eyeOf(player) : null;
+      // 视锥与射线解耦：raycast 关闭时眼睛也不能为 null（否则 withinFrustum 恒真 → 过度显形）；
+      // 射线判定由 sendOne 内部按 raycastEnabled 自行门闸。
+      ProximitySelector.Eye eye = eyeOf(player);
       boolean frustum = proximity.frustumEnabled();
       PassTally tally = new PassTally();
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
       ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
       keys.begin(worldName);
       int evaluated = 0;
-      for (Long packedKey : chunkKeys) {
+      int consumed = 0;
+      for (int i = 0; i < chunkKeys.size(); i++) {
         if (budget.remaining() <= 0 || evaluated >= MAX_CHUNK_DELIVERY_EVALUATIONS_PER_TICK) {
           break;
         }
-        int chunkX = (int) (packedKey >> 32);
-        int chunkZ = (int) (long) packedKey;
+        int chunkX = (int) (chunkKeys.get(i) >> 32);
+        int chunkZ = (int) (long) chunkKeys.get(i);
         ObfuscatedChunkIndex.ChunkEntry entry = chunkIndex.entry(worldName, chunkX, chunkZ);
         if (entry == null || entry.size() == 0) {
+          consumed = i + 1;
           continue;
         }
         int[] locals = entry.locals();
         int minHeight = entry.minHeight();
         int perChunk = 0;
+        boolean complete = true;
         for (int local : locals) {
           if (budget.remaining() <= 0 || evaluated >= MAX_CHUNK_DELIVERY_EVALUATIONS_PER_TICK
               || perChunk >= MAX_CHUNK_DELIVERY_EVALUATIONS) {
+            complete = false;
             break;
           }
           int x = (chunkX << 4) | (local & 15);
@@ -2195,12 +2218,19 @@ public final class ProximityRevealer implements Listener {
           }
           sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
         }
+        consumed = complete ? i + 1 : i;
+        if (!complete) {
+          break;
+        }
       }
       flushBatch(player, batch, tally);
       chunkDeliveryQuota.release(playerId, tick, MAX_CHUNK_DELIVERY_SENDS_PER_TICK, granted,
           tally.sent);
+      return consumed;
     } catch (Throwable throwable) {
       logThrottled(throwable);
+      // 异常时视为已消费：避免「每 tick 重排同一批 → 每 tick 抛异常」的热循环，剩余交给周期巡检
+      return chunkKeys.size();
     }
   }
 
@@ -2484,15 +2514,17 @@ public final class ProximityRevealer implements Listener {
       long deadline = start + (long) (viewChange.budgetMs() * 1_000_000.0D);
       Location eyeLocation = player.getEyeLocation();
       ProximityScanner.Tally scanTally = new ProximityScanner.Tally();
+      // 取候选也受同一时间预算约束（deadline 传入）：密集矿区单趟遍历就可能超过预算。
+      // 截断时不再「整轮放弃」——取到多少判多少，只记一次预算耗尽（否则 M3 在矿区反而完全不工作）。
       List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex, revealedSet,
           player.getUniqueId(), worldName, eyeLocation.getBlockX(), eyeLocation.getBlockY(),
-          eyeLocation.getBlockZ(), viewChange.radius(), MAX_VIEW_CHANGE_CANDIDATES, 0, 1, scanTally);
+          eyeLocation.getBlockZ(), viewChange.radius(), MAX_VIEW_CHANGE_CANDIDATES, 0, 1, scanTally,
+          deadline);
       if (candidates.isEmpty()) {
         return;
       }
-      if (System.nanoTime() > deadline) {
+      if (scanTally.deadlineTruncated) {
         stats.viewChangeBudgetExhausted.increment();
-        return;
       }
       UUID playerId = player.getUniqueId();
       long tick = Bukkit.getCurrentTick();
@@ -2502,7 +2534,9 @@ public final class ProximityRevealer implements Listener {
       if (budget.remaining() <= 0) {
         return;
       }
-      ProximitySelector.Eye eye = proximity.raycastEnabled() ? eyeOf(player) : null;
+      // 视锥与射线解耦：raycast 关闭时 eye 也不能为 null（否则 withinFrustum 恒真 → 把玩家背后/墙后
+      // 的真实状态下发，削弱反矿透）；射线判定由 sendOne 内部按 raycastEnabled 自行门闸。
+      ProximitySelector.Eye eye = eyeOf(player);
       boolean frustum = proximity.frustumEnabled();
       PassTally tally = new PassTally();
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
@@ -2512,7 +2546,8 @@ public final class ProximityRevealer implements Listener {
         if (budget.remaining() <= 0) {
           break;
         }
-        if ((evaluated & 3) == 0 && System.nanoTime() > deadline) {
+        // 至少兑现 4 个候选：取候选若已吃掉预算，也不能一个都不判（语义与周期巡检一致）
+        if (evaluated >= 4 && (evaluated & 3) == 0 && System.nanoTime() > deadline) {
           exhausted = true;
           break;
         }

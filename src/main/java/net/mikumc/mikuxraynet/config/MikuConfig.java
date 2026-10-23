@@ -76,7 +76,7 @@ public final class MikuConfig {
    */
   public void load() {
     // 每轮加载先清空上一轮的回退说明：只反映「本次」重载的结果
-    this.fallbackNote = null;
+    noteFallback(null);
     AntiXrayConfig loadedAntiXray = loadAntiXray();
     BandwidthConfig loadedBandwidth = loadBandwidth();
     WorldBlacklistConfig loadedBlacklist = loadBlacklist();
@@ -171,11 +171,11 @@ public final class MikuConfig {
       WorldBlacklistConfig previous = this.loaded.blacklist();
       if (previous != null) {
         warnFallbackOnce(blacklistFallbackWarned, BLACKLIST_FILE, "已保留上一份配置", throwable);
-        this.fallbackNote = BLACKLIST_FILE + " 解析失败，已保留上一份配置";
+        noteFallback(BLACKLIST_FILE + " 解析失败，已保留上一份配置");
         return previous;
       }
       warnFallbackOnce(blacklistFallbackWarned, BLACKLIST_FILE, "已改用空白名单", throwable);
-      this.fallbackNote = BLACKLIST_FILE + " 解析失败，已改用空白名单（所有世界都启用）";
+      noteFallback(BLACKLIST_FILE + " 解析失败，已改用空白名单（所有世界都启用）");
       return WorldBlacklistConfig.fromPatterns(List.of());
     }
   }
@@ -186,6 +186,16 @@ public final class MikuConfig {
    * <p>失败语义：已有上一份有效配置则原样保留；首次加载即失败则回落到「全部键缺失」的内置默认
    * （{@link AntiXrayConfig#from} 传一个空 {@link YamlConfiguration}），绝不返回 {@code null}。
    */
+  /**
+   * 累积一条「本次重载使用了回退值」说明。
+   *
+   * <p>多份配置文件可能同时解析失败（例如 antixray.yml 与 blacklist.yml 一起写坏）；只保留最后一条
+   * 会让管理员以为先失败的那份已生效。拼接后由 {@code configurationFallbackNote()} 一并回显。
+   */
+  private void noteFallback(String note) {
+    this.fallbackNote = this.fallbackNote == null ? note : this.fallbackNote + "；" + note;
+  }
+
   private AntiXrayConfig loadAntiXray() {
     try {
       return AntiXrayConfig.from(read(ANTI_XRAY_FILE));
@@ -193,11 +203,11 @@ public final class MikuConfig {
       AntiXrayConfig previous = this.loaded.antiXray();
       if (previous != null) {
         warnFallbackOnce(antiXrayFallbackWarned, ANTI_XRAY_FILE, "已保留上一份配置", throwable);
-        this.fallbackNote = ANTI_XRAY_FILE + " 解析失败，已保留上一份配置";
+        noteFallback(ANTI_XRAY_FILE + " 解析失败，已保留上一份配置");
         return previous;
       }
       warnFallbackOnce(antiXrayFallbackWarned, ANTI_XRAY_FILE, "已改用内置默认配置", throwable);
-      this.fallbackNote = ANTI_XRAY_FILE + " 解析失败，已改用内置默认配置";
+      noteFallback(ANTI_XRAY_FILE + " 解析失败，已改用内置默认配置");
       return AntiXrayConfig.from(new YamlConfiguration());
     }
   }
@@ -210,11 +220,11 @@ public final class MikuConfig {
       BandwidthConfig previous = this.loaded.bandwidth();
       if (previous != null) {
         warnFallbackOnce(bandwidthFallbackWarned, BANDWIDTH_FILE, "已保留上一份配置", throwable);
-        this.fallbackNote = BANDWIDTH_FILE + " 解析失败，已保留上一份配置";
+        noteFallback(BANDWIDTH_FILE + " 解析失败，已保留上一份配置");
         return previous;
       }
       warnFallbackOnce(bandwidthFallbackWarned, BANDWIDTH_FILE, "已改用内置默认配置", throwable);
-      this.fallbackNote = BANDWIDTH_FILE + " 解析失败，已改用内置默认配置";
+      noteFallback(BANDWIDTH_FILE + " 解析失败，已改用内置默认配置");
       return BandwidthConfig.from(new YamlConfiguration());
     }
   }
