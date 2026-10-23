@@ -742,17 +742,19 @@ public final class AntiXrayRuntime {
     return antiXrayActive;
   }
 
+  /** 超高世界告警的一次性闸门。 */
+  private static final java.util.concurrent.atomic.AtomicBoolean WORLD_HEIGHT_WARNED =
+      new java.util.concurrent.atomic.AtomicBoolean();
+
   /**
    * 超高/超低世界的一次性告警：遮挡位图的 sectionY 只有 8 位（Y ∈ [-2048, 2047]），超出该范围的
    * 世界不会建立位图——显形侧按「缺数据 = 遮挡」会让该区域矿物永不显形、实体侧射线按缺数据降级。
    * 默认 384 高世界不受影响；这里只提示，不做兼容（扩位需要同步改 OcclusionPayload/RevealedSet 布局）。
    */
-  private static final java.util.concurrent.atomic.AtomicBoolean WORLD_HEIGHT_WARNED =
-      new java.util.concurrent.atomic.AtomicBoolean();
-
   private void warnUnsupportedWorldHeight() {
-    // 只提示一次：startAntiXray() 在每次热重载都会执行，重复 WARN 只会变成噪音
-    if (!WORLD_HEIGHT_WARNED.compareAndSet(false, true)) {
+    // 只提示一次（startAntiXray() 每次热重载都会执行）；闸门放在「遍历成功之后」，
+    // 首次因世界列表不可读而失败时不消费这次提示，下次重载还能再试。
+    if (WORLD_HEIGHT_WARNED.get()) {
       return;
     }
     try {
@@ -764,8 +766,9 @@ public final class AntiXrayRuntime {
               + world.getMaxHeight() + "）超出台阶位图支持范围：该世界的遮挡位图与邻近显形不可用");
         }
       }
+      WORLD_HEIGHT_WARNED.set(true);
     } catch (Throwable throwable) {
-      // 告警失败不影响主流程（世界列表不可读时只丢一条提示）
+      // 告警失败不影响主流程（世界列表不可读时只丢一条提示，闸门不置位以便下次重试）
       logger.log(Level.FINE, "检查世界高度范围时出现异常（已忽略）", throwable);
     }
   }

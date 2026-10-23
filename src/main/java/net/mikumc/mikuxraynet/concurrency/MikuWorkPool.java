@@ -131,9 +131,9 @@ public final class MikuWorkPool implements AutoCloseable {
     if (this.closed) {
       return false;
     }
-    // 极小容量（配置允许 queue-capacity=1）时无法既预留又准入：此时不给关键路径预留，
-    // 退化为「队列必须为空才准入非关键任务」。否则阈值为 0 → 恒 false → 规划/清理永久停摆。
-    int reserved = this.queueCapacity <= 1 ? 0 : Math.max(1, this.queueCapacity / REWRITE_RESERVE_DIVISOR);
+    // 配置下限已抬到 4（cap<4 无法既预留又准入：预留 1 会让阈值降到 0 → 规划/清理永久停摆；
+    // 不预留又会让非关键任务占掉唯一改写槽位 → 窗口内区块不伪装）。
+    int reserved = Math.max(1, this.queueCapacity / REWRITE_RESERVE_DIVISOR);
     int threshold = Math.max(1, this.queueCapacity - reserved);
     return this.queuedTasks.get() < threshold;
   }
