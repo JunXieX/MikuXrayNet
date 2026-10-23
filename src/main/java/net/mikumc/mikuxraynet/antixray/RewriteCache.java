@@ -380,10 +380,17 @@ public final class RewriteCache<V> {
       entry.sizeBytes = sizeBytes;
       entry.lastAccessNanos = now;
       entry.referenced = true;
-      // 条目可能刚被并发失效（invalidateWorld/淘汰）摘除：那种情况下它的体积已被移除路径扣过，
-      // 这里再按差值调整就会漂移。仅在它仍是主存储里的当前条目时才记账（一次 CHM 读，只在覆盖路径上）。
-      if (delta != 0L && entries.get(entry.key) == entry) {
-        bytes.addAndGet(delta);
+      // 字节增账必须与 invalidateWorld/invalidateAll 的「清表 + 重算」互斥：它们持 clockLock 改
+      // entries 与 bytes；若这里在锁外「判活 → 加账」，交错时会出现「条目已被清掉、账却仍被加上」的
+      // 永久偏高（该节点随后被当死节点丢弃、永不扣回，淘汰阈值被一路推高，直到 reload 才归零）。
+      // 锁序 entry → clockLock 安全：淘汰/移除路径（removeEntry/evictOverflow）只动 CHM 与 bytes，
+      // 不会再取 entry 监视器，不存在反向加锁。同体积覆盖（delta == 0）不进锁，热路径不变。
+      if (delta != 0L) {
+        synchronized (clockLock) {
+          if (entries.get(entry.key) == entry) {
+            bytes.addAndGet(delta);
+          }
+        }
       }
     }
   }

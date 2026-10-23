@@ -61,6 +61,17 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
   /** 单段回放表容量（见 {@link #patchReplay}）。 */
   private static final int MAX_REPLAY_CELLS = 32;
 
+  /**
+   * 全局回放表条目上限：单段约 32 格（long[32]+boolean[32] ≈ 450 B），无上限时活跃服可达数万段、
+   * 常驻数十 MB。超过上限按「最久未更新」淘汰（下界保护：淘汰后该段丢失回放能力，最坏退化为
+   * 戳比较，方向仍是既有行为，不会更差）。
+   */
+  private static final int MAX_REPLAY_SECTIONS = 8192;
+
+  /** 回放表键的插入顺序（配合 {@link #MAX_REPLAY_SECTIONS} 做 FIFO 淘汰）。 */
+  private final java.util.concurrent.ConcurrentLinkedQueue<Long> replayOrder =
+      new java.util.concurrent.ConcurrentLinkedQueue<>();
+
   /** 单段的补丁回放条目（字段可变、由自身监视器保护；条目本身只在 writeMutex 内被重放/移除）。 */
   private static final class PatchReplay {
     final long[] coords = new long[MAX_REPLAY_CELLS];
@@ -275,7 +286,18 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
 
   /** 记录一格待回放补丁（见 {@link #patchReplay}）；容量满时丢弃最旧一格。调用方已持 writeMutex。 */
   private void recordReplayCell(long key, int x, int y, int z, boolean occluding) {
-    PatchReplay replay = patchReplay.computeIfAbsent(key, ignored -> new PatchReplay());
+    PatchReplay replay = patchReplay.computeIfAbsent(key, ignored -> {
+      replayOrder.add(key);
+      return new PatchReplay();
+    });
+    // 全局上限：FIFO 淘汰最久未更新的段（队列里可能有已移除的键，poll 后 remove 无副作用）
+    while (patchReplay.size() > MAX_REPLAY_SECTIONS) {
+      Long oldest = replayOrder.poll();
+      if (oldest == null) {
+        break;
+      }
+      patchReplay.remove(oldest);
+    }
     long packed = packCoordinate(x, y, z);
     synchronized (replay) {
       // 同一格反复改写（红石/活塞/反复挖放）只保留最新一次：否则 32 次就能把容量占满、置 overflow，
@@ -592,6 +614,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
       sections.clear();
       patchStamps.clear();
       patchReplay.clear();
+      replayOrder.clear();
     }
   }
 

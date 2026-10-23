@@ -219,6 +219,36 @@ class OcclusionPatchPublishRaceTest {
   }
 
   @Test
+  void replayOverflowSkipsPublishInsteadOfPartialReplay() {
+    // 单段补丁格数超过回放容量（32）：回放表不完整，不能「发布旧几何 + 部分回放」，
+    // 必须整段跳过发布（活表已含全部补丁），并在跳过后清掉回放表，避免此后永久跳过（几何冻结）。
+    OcclusionStore store = new OcclusionStore();
+    store.restoreColumn(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, new SectionOcclusion[] {
+        EmptyOcclusion.INSTANCE, SolidOcclusion.INSTANCE, EmptyOcclusion.INSTANCE}, null);
+    int cells = 40;
+    int[] xs = new int[cells];
+    int[] ys = new int[cells];
+    int[] zs = new int[cells];
+    boolean[] occluding = new boolean[cells];
+    for (int i = 0; i < cells; i++) {
+      xs[i] = i & 15;
+      ys[i] = 1 * 16 + (i >> 4);
+      zs[i] = 3;
+      occluding[i] = false;
+    }
+    assertEquals(cells, store.setBlocksOccluding(xs, ys, zs, occluding, cells), "40 格补丁都应生效");
+
+    long[] stamps = store.patchStamps(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, SECTION_COUNT);
+    int skipped = store.restoreColumn(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, new SectionOcclusion[] {
+        EmptyOcclusion.INSTANCE, SolidOcclusion.INSTANCE, EmptyOcclusion.INSTANCE}, stamps);
+
+    assertEquals(1, skipped, "回放表溢出的段必须跳过整列发布（活表已含全部补丁）");
+    SectionOcclusion live = store.section(0, 1, 0);
+    assertNotNull(live);
+    assertFalse(live.isOccludingLocal(0, 0, 3), "溢出的段不得被旧几何覆盖");
+  }
+
+  @Test
   void removeColumnDropsReplayTable() {
     OcclusionStore store = new OcclusionStore();
     store.setBlockOccluding(1, 1 * 16 + 2, 3, false);
