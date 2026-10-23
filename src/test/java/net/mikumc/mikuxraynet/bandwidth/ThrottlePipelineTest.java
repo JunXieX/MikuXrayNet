@@ -132,6 +132,23 @@ class ThrottlePipelineTest {
   }
 
   /**
+   * 显式覆盖「Folia + 白名单留空 → 零位移取消照常注册」：本条是用户可自行切换的行为开关——
+   * 把 {@code entity-packets.whitelist} 清空即以「所有实体都非白名单」的语义启用零位移取消
+   * （代价见 {@code EntityPacketFilter} 类注释：onGround 布尔会被一并丢弃，属低风险观感问题）。
+   */
+  @Test
+  void foliaWithEmptyWhitelistRegistersZeroMovementCancel() {
+    ThrottlePipeline.ModulePlan empty = ThrottlePipeline.plan(
+        config("entity-packets:\n  enabled: true\n  skip-zero-movement: true\n  whitelist: []\n"),
+        true);
+    assertTrue(empty.entityPackets(),
+        "Folia + 空白名单：不需要实体类型索引，零位移取消必须注册");
+    assertFalse(ThrottlePipeline.plan(
+        config("entity-packets:\n  skip-zero-movement: false\n"), true).entityPackets(),
+        "skip-zero-movement=false 时不注册（行为开关优先）");
+  }
+
+  /**
    * 回归：「已在运行」的判定必须是 {@code startLocked()} 的<b>第一条</b>语句（先于
    * {@code cleanupIncomplete = false} 与 {@code retryFailedCloses()}）。
    *

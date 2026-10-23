@@ -100,7 +100,7 @@ final class ProximityScanner {
    * 超时即停止收集（已收集的候选照常返回，{@link Tally#deadlineTruncated} 置位）。
    *
    * <p><b>为什么需要</b>：视野变化增量巡检是「玩家行为驱动」的路径，若取候选本身（遍历视距内全部区块、
-   * 对距离内每个坐标加锁查已显形集合）不受预算约束，密集矿区单次扫描就可能吃光 0.15 ms 预算，导致
+   * 对距离内每个坐标加锁查已显形集合）不受预算约束，密集矿区单次扫描就可能吃光整笔预算（默认 0.3 ms），导致
    * 后续判定一次都跑不到——功能在唯一有价值的场景失效，而调用方只看到「预算耗尽」。
    */
   static List<ObfuscatedChunkIndex.Position> candidates(ObfuscatedChunkIndex index,

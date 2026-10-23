@@ -336,8 +336,15 @@ public final class AntiXrayConfig {
 
   /** {@code proximity.view-change.budget-ms} 的下限（毫秒）：低于它几乎判不完一个候选，等于功能失效。 */
   public static final double VIEW_CHANGE_BUDGET_MS_FLOOR = 0.05D;
-  /** {@code proximity.view-change.budget-ms} 的默认值（毫秒）：每玩家每 tick 的硬耗时预算。 */
-  public static final double VIEW_CHANGE_BUDGET_MS_DEFAULT = 0.15D;
+  /**
+   * {@code proximity.view-change.budget-ms} 的默认值（毫秒）：每玩家每 tick 的硬耗时预算。
+   *
+   * <p><b>为什么是 0.3</b>：实机数据（0.15 ms 默认时）视野增量巡检「预算耗尽」占 17%（751/4338），
+   * 平均耗时 0.09 ms、最大 0.5 ms——密集矿区里取候选+判定会先撞预算，约 1/6 的转身/移动触发只能
+   * 部分补显形。抬到 0.3 ms 后按 10 次/秒/玩家上限估算最坏 3 ms/s/玩家（50 人约 15% 单核，实际触发
+   * 远低于上限），用可接受的峰值换掉「转身时仍看到假方块」的体验缺口。
+   */
+  public static final double VIEW_CHANGE_BUDGET_MS_DEFAULT = 0.3D;
   /** {@code proximity.view-change.budget-ms} 的上限（毫秒）：再大就不是「补漏」而是替代周期巡检了。 */
   public static final double VIEW_CHANGE_BUDGET_MS_MAX = 2.0D;
 

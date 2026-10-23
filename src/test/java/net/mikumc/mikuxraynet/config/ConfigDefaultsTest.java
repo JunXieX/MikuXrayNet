@@ -171,7 +171,7 @@ class ConfigDefaultsTest {
         "打包 yml 的 proximity.instant-reveal.pre-reveal-on-dig 必须等于代码回落值");
     assertTrue(fallback.proximity().viewChange().enabled(), "视野变化增量巡检默认开启");
     assertEquals(AntiXrayConfig.VIEW_CHANGE_BUDGET_MS_DEFAULT,
-        fallback.proximity().viewChange().budgetMs(), 1.0E-9D, "视野增量默认预算 0.15 ms");
+        fallback.proximity().viewChange().budgetMs(), 1.0E-9D, "视野增量默认预算 0.3 ms");
     assertEquals(AntiXrayConfig.VIEW_CHANGE_COOLDOWN_TICKS_DEFAULT,
         fallback.proximity().viewChange().cooldownTicks(), "视野增量默认冷却 2 tick");
     assertEquals(AntiXrayConfig.VIEW_CHANGE_RADIUS_DEFAULT,
