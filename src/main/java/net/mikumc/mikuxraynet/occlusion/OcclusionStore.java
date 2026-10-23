@@ -53,12 +53,13 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    *
    * <p>回放语义：补丁是服务端下发的「该格最新真值」；建表用的是更早的区块包几何。发布后重放最近补丁格，
    * 无论快照取在何时，结果都等于「解码几何 + 其后所有补丁」——不再依赖戳快照的时点。
-   * 单段最多保留 {@value #MAX_REPLAY_CELLS} 格（正常 1~几格；超出说明该段被高频改写，最旧格让位）。
+   * 单段最多保留 {@value #MAX_REPLAY_CELLS} 个<b>不同</b>格（同格重复改写原地更新）；超出说明该段被大面积改写，
+   * 置 {@link PatchReplay#overflow}，该段整列发布改为跳过（活表已含全部补丁）。
    */
   private final ConcurrentHashMap<Long, PatchReplay> patchReplay = new ConcurrentHashMap<>();
 
   /** 单段回放表容量（见 {@link #patchReplay}）。 */
-  private static final int MAX_REPLAY_CELLS = 64;
+  private static final int MAX_REPLAY_CELLS = 32;
 
   /** 单段的补丁回放条目（字段可变、由自身监视器保护；条目本身只在 writeMutex 内被重放/移除）。 */
   private static final class PatchReplay {
@@ -277,6 +278,14 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     PatchReplay replay = patchReplay.computeIfAbsent(key, ignored -> new PatchReplay());
     long packed = packCoordinate(x, y, z);
     synchronized (replay) {
+      // 同一格反复改写（红石/活塞/反复挖放）只保留最新一次：否则 32 次就能把容量占满、置 overflow，
+      // 让该段此后每次发布都被跳过（几何冻结）。查重是 32 次线性比较，补丁路径完全可接受。
+      for (int i = 0; i < replay.size; i++) {
+        if (replay.coords[i] == packed) {
+          replay.occluding[i] = occluding;
+          return;
+        }
+      }
       if (replay.size < MAX_REPLAY_CELLS) {
         replay.coords[replay.size] = packed;
         replay.occluding[replay.size] = occluding;
@@ -441,8 +450,14 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         }
         long key = SectionKey.packSection(chunkX, sectionY, chunkZ);
         PatchReplay pending = patchReplay.get(key);
-        if (pending != null && pending.overflow) {
-          // 该段补丁格超过回放容量：回放表不完整，不能再用旧几何覆盖（活表已含全部补丁）。
+        if (pending != null && pending.overflow && sections.get(key) != null) {
+          // 该段补丁格超过回放容量且活表确有数据：回放表不完整，不能再用旧几何覆盖（活表已含全部补丁）。
+          // 跳过后活表即最新，清空回放表（含 overflow）以免此后永久跳过发布（几何冻结）。
+          synchronized (pending) {
+            pending.size = 0;
+            pending.overflow = false;
+          }
+          patchReplay.remove(key);
           skipped++;
           continue;
         }
@@ -510,8 +525,14 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         }
         long key = SectionKey.packSection(chunkX, sectionY, chunkZ);
         PatchReplay pending = patchReplay.get(key);
-        if (pending != null && pending.overflow) {
-          continue; // 回放表不完整：跳过填充，活表已含全部补丁
+        if (pending != null && pending.overflow && sections.get(key) != null) {
+          // 活表确有数据：回放表不完整不能覆盖；清空该段回放表避免此后永久跳过
+          synchronized (pending) {
+            pending.size = 0;
+            pending.overflow = false;
+          }
+          patchReplay.remove(key);
+          continue;
         }
         if (sections.get(key) != null) {
           continue; // 已有活数据：可能含更晚的补丁，绝不覆盖

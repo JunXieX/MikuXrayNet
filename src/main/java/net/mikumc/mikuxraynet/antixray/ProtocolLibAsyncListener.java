@@ -417,7 +417,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 读维度失败（世界正在卸载等）：按原包放行，绝不阻塞区块加载
       return;
     }
-    if (!live().enabledForWorld(world.getName(), dimension)) {
+    try {
+      if (!live().enabledForWorld(world.getName(), dimension)) {
+        return;
+      }
+    } catch (Throwable throwable) {
+      // 配置供应器/世界黑名单异常：按原包放行并记录，绝不把异常冒出异步监听器
+      logThrottled("维度开关判定失败，已按原包放行", throwable);
       return;
     }
 

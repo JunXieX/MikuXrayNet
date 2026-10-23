@@ -1980,9 +1980,10 @@ public final class ProximityRevealer implements Listener {
     /**
      * 每区块「本趟已评估到第几个 local」游标：大区块（伪装坐标 > 每区块上限）必须跨 tick 续扫，
      * 否则每趟都从 local[0] 重来、已显形项仍占额度 → consumed 恒 0 → 区块永久卡在队头、M2 整局停摆。
-     * 只在玩家线程的 drain 内读写（draining 标志保证同一玩家不会并发 drain），无需加锁。
+     * 用 {@link ConcurrentHashMap}：主写在玩家线程的 drain 内（draining 标志保证同一玩家不会并发 drain），
+     * 但「切世界 / 区块重下发」的清理由包放行动作在工作线程执行，普通 HashMap 会构成数据竞争。
      */
-    private final java.util.HashMap<Long, Integer> localCursors = new java.util.HashMap<>();
+    private final ConcurrentHashMap<Long, Integer> localCursors = new ConcurrentHashMap<>();
   }
 
   private final ConcurrentHashMap<UUID, PendingChunkReveals> pendingChunkReveals =
@@ -2024,7 +2025,11 @@ public final class ProximityRevealer implements Listener {
         pending.worldName = worldName;
       }
       if (pending.chunkKeys.size() < MAX_PENDING_CHUNK_REVEALS) {
-        pending.chunkKeys.add(packChunkKey(chunkX, chunkZ));
+        long packedKey = packChunkKey(chunkX, chunkZ);
+        pending.chunkKeys.add(packedKey);
+        // 区块重下发意味着客户端按新区块数据重新渲染为伪装（放行动作同时作废了已显形标记），
+        // 必须整块重扫：清掉旧游标，否则会从断点续扫、前 N 个坐标不再由 M2 补显形。
+        pending.localCursors.remove(packedKey);
       }
       if (!pending.scheduled && !pending.draining) {
         pending.scheduled = true;

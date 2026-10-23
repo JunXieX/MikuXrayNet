@@ -1223,7 +1223,9 @@ public final class AntiXrayConfig {
             floorAdjustments, ceilingAdjustments),
         // 上限见 ADVANCED_QUEUE_CAPACITY_MAX：每个排队项都钉着一个区块封包，
         // 队列容量直接决定积压时钉住多少内存。
-        clampCeiling(root.getInt("advanced.queue-capacity", 2048), 1, ADVANCED_QUEUE_CAPACITY_MAX,
+        // 下限 4：工作池要为区块改写预留 1/4 队列（见 MikuWorkPool#hasSpareCapacity）。cap<4 时
+      // 要么预留把阈值压到 0 → 规划/清理永久停摆，要么不预留 → 非关键任务占掉唯一改写槽位（窗口内区块不伪装）。
+      clampCeiling(root.getInt("advanced.queue-capacity", 2048), 4, ADVANCED_QUEUE_CAPACITY_MAX,
             "advanced.queue-capacity", floorAdjustments, ceilingAdjustments),
         unknownTags,
         overrides,

@@ -287,7 +287,6 @@ public final class OcclusionPatchListener extends PacketAdapter {
     plugin.getLogger().fine("遮挡位图方块补丁已启用：出站方块变更即时同步进遮挡位图");
   }
 
-  /** 注销监听器；可重复调用，异常安全。 */
   /**
    * 释放池中缓冲（插件停用时调用）。
    *
