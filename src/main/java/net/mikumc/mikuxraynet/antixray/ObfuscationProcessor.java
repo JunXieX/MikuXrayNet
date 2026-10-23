@@ -1019,6 +1019,11 @@ public final class ObfuscationProcessor {
       int minSectionY = worldMinY >> 4;
       int sectionCount = chunk.getSectionCount();
       OcclusionStore store = stores.of(worldName);
+      if (store.isClosed()) {
+        // 世界已卸载：本趟建表作废（closed 会丢弃所有写入），等新世界的区块重新发布；
+        // 返回 null = 「本次没有遮挡负载」，不改写/缓存行为。
+        return null;
+      }
       // 补丁戳快照优先用「持包线程」取的那份（见 capturePatchStamps）：它的窗口起点最早，
       // 只覆盖「封包生成 → 持包」的亚毫秒级；缺失或长度不符时才退回本线程现取（旧行为，窗口更长）。
       // 快照必须在建位图之前确定，否则建表期间落库的补丁会被快照一并读入、发布时被旧几何覆盖。

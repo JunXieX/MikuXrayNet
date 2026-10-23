@@ -59,6 +59,26 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     this.sections = new SwmrLongMap<>(Math.max(16, expectedSections));
   }
 
+  /**
+   * 该仓库是否已随世界卸载被关闭。
+   *
+   * <p><b>为什么需要</b>：世界卸载时 {@link OcclusionStores#removeWorld} 会摘除并清空旧仓库，
+   * 但改写工作线程可能仍持有该仓库引用并在摘除之后继续写入——那张「旧世界的表」会被同名新世界读到，
+   * 旧世界的实心石头被当成新世界几何（该显示却多藏）。关闭后所有写入直接丢弃，等新世界的区块重新发布。
+   */
+  private volatile boolean closed;
+
+  /** 该仓库是否已关闭（见 {@link #closed}）。 */
+  public boolean isClosed() {
+    return closed;
+  }
+
+  /** 关闭并清空：先置关闭标记（阻断在途写入），再释放内容。 */
+  void closeAndClear() {
+    this.closed = true;
+    clear();
+  }
+
   // ------------------------------------------------------------------
   // 读（无锁乐观读）
   // ------------------------------------------------------------------
@@ -161,7 +181,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * 使随后到来的整列建表知道这一段期间被补丁改过、不能用更早的几何覆盖它。
    */
   public int setBlocksOccluding(int[] xs, int[] ys, int[] zs, boolean[] occluding, int count) {
-    if (xs == null || ys == null || zs == null || occluding == null || count <= 0) {
+    if (closed || xs == null || ys == null || zs == null || occluding == null || count <= 0) {
       return 0;
     }
     if (count > xs.length || count > ys.length || count > zs.length || count > occluding.length) {
@@ -325,6 +345,9 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    */
   public int restoreColumn(int chunkX, int minSectionY, int chunkZ, SectionOcclusion[] column,
       long[] stamps) {
+    if (closed) {
+      return 0; // 世界已卸载：丢弃本次发布（见 closed 字段说明）
+    }
     int skipped = 0;
     synchronized (writeMutex) {
       for (int i = 0; i < column.length; i++) {
@@ -375,6 +398,9 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    */
   public int restoreMissingColumn(int chunkX, int minSectionY, int chunkZ,
       SectionOcclusion[] column) {
+    if (closed) {
+      return 0;
+    }
     // 无锁预检：绝大多数缓存命中时整列都已存在，先做一次乐观读扫描，避免每个命中都去抢
     // writeMutex（该锁同时被整列建表与方块补丁持有，命中路径是高频的）。只有真的发现缺段才进锁；
     // 预检与加锁之间若恰好有段被摘除，本次会漏补，但下一次命中会补上（方向安全）。
@@ -396,8 +422,13 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         if (data == null) {
           continue; // 负载里该段「无数据」= 无需补
         }
+        if (patchStamps.get(key) != null) {
+          // 该段在「无活数据」期间被补丁改过（打断类补丁不建条目、只留戳）：若此时用缓存里的旧负载
+          // 填充，会把刚挖开的墙重新写回遮挡（该显示却多藏）。保留戳、跳过填充：该段暂时按「缺数据」
+          // 处理（显形侧只会少显示一版，方向安全），下一次完整解码（区块重发）会重建并清掉该戳。
+          continue;
+        }
         sections.put(key, data);
-        // 该段此前没有活数据，若有戳只可能来自「打断类补丁」（未建条目）——补完后旧戳不再有意义
         patchStamps.remove(key);
         filled++;
       }

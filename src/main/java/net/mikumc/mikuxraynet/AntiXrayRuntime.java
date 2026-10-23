@@ -28,9 +28,11 @@ import net.mikumc.mikuxraynet.config.MikuConfig;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
+import net.mikumc.mikuxraynet.occlusion.SectionKey;
 import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import org.bukkit.Bukkit;
+import org.bukkit.World;
 
 /**
  * 反矿透运行时：持有反矿透侧的全部组件（ProtocolLib 接入点、工作线程池、伪装索引、已显形集合、
@@ -231,6 +233,9 @@ public final class AntiXrayRuntime {
     this.protocolLibHook = hook;
     this.diskCacheStore = diskCache;
     this.occlusionStores = occlusionStores;
+    // 遮挡位图的 sectionY 只有 8 位（Y ∈ [-2048, 2047]）：超高/超低世界不会被建表，
+    // 显形侧按「缺数据 = 遮挡」会让该区域矿物永不显形。启动期一次性告知，绝不静默。
+    warnUnsupportedWorldHeight();
     this.proximityStats = new ProximityStats();
     this.antiXrayActive = true;
     // world-unload 监听仍由主类持有（监听器生命周期与插件一致），这里只触发注册；
@@ -735,6 +740,27 @@ public final class AntiXrayRuntime {
   /** 反矿透主体是否已生效。 */
   public boolean antiXrayActive() {
     return antiXrayActive;
+  }
+
+  /**
+   * 超高/超低世界的一次性告警：遮挡位图的 sectionY 只有 8 位（Y ∈ [-2048, 2047]），超出该范围的
+   * 世界不会建立位图——显形侧按「缺数据 = 遮挡」会让该区域矿物永不显形、实体侧射线按缺数据降级。
+   * 默认 384 高世界不受影响；这里只提示，不做兼容（扩位需要同步改 OcclusionPayload/RevealedSet 布局）。
+   */
+  private void warnUnsupportedWorldHeight() {
+    try {
+      for (World world : Bukkit.getWorlds()) {
+        int minSection = world.getMinHeight() >> 4;
+        int maxSection = (world.getMaxHeight() - 1) >> 4;
+        if (minSection < SectionKey.SECTION_Y_MIN || maxSection > SectionKey.SECTION_Y_MAX) {
+          logger.warning("世界 " + world.getName() + " 的高度范围（" + world.getMinHeight() + ".."
+              + world.getMaxHeight() + "）超出台阶位图支持范围：该世界的遮挡位图与邻近显形不可用");
+        }
+      }
+    } catch (Throwable throwable) {
+      // 告警失败不影响主流程（世界列表不可读时只丢一条提示）
+      logger.log(Level.FINE, "检查世界高度范围时出现异常（已忽略）", throwable);
+    }
   }
 
   /** 按服务端上报的 Minecraft 版本构造区块二进制格式标志；无法识别时回落到本项目的目标版本。 */

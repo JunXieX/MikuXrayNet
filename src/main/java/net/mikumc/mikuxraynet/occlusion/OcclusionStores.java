@@ -47,11 +47,9 @@ public final class OcclusionStores {
     }
     OcclusionStore removed = byWorld.remove(worldName);
     if (removed != null) {
-      // 必须同时清空内容：改写工作线程可能正持有该仓库的引用，并在摘除之后继续写入。
-      // 若不清空，同名世界重新加载时（服务端允许）这张「旧世界的表」会被当成新世界的几何读走——
-      // 旧世界里是实心石头的 section 会被读成「完全遮挡」，把新世界里本可见的实体误藏
-      //（安全方向错误）。清空后最多丢掉一份陈旧数据（射线按缺数据 fail-open，少藏）。
-      removed.clear();
+      // 先置 closed（阻断在途写），再清空内容：改写工作线程可能正持有该仓库引用并在摘除之后继续
+      // 写入；若不清空，同名世界重新加载时这张「旧世界的表」会被当成新世界几何读走（该显示却多藏）。
+      removed.closeAndClear();
     }
   }
 
