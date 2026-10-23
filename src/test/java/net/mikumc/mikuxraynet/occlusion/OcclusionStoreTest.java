@@ -200,9 +200,13 @@ class OcclusionStoreTest {
     assertEquals(1L, store.skippedPatchedSections(), "跳过段数必须计入观测点");
   }
 
-  /** 快照取自补丁之后（补丁早已落库）：此时允许按新几何覆盖，不得误跳过。 */
+  /**
+   * 快照取自补丁之后（补丁早已落库）：戳比较发现不了这次补丁，但「补丁格回放」必须把它修正回来。
+   *
+   * <p>这正是「包序列化 → 取戳快照」窗口：解码几何早于补丁，若只靠戳比较，发布会用旧几何吞掉补丁。
+   */
   @Test
-  void snapshotTakenAfterPatchAllowsOverwrite() {
+  void snapshotTakenAfterPatchReplaysThePatch() {
     OcclusionStore store = new OcclusionStore();
     store.replaceSection(0, 0, 0, SolidOcclusion.INSTANCE);
     store.setBlockOccluding(1, 2, 3, false);
@@ -211,22 +215,24 @@ class OcclusionStoreTest {
     int skipped = store.restoreColumn(0, 0, 0,
         new SectionOcclusion[] {SolidOcclusion.INSTANCE}, stamps);
 
-    assertEquals(0, skipped, "快照已包含该补丁：发布必须照常覆盖");
-    assertTrue(store.section(0, 0, 0).isOccludingLocal(1, 2, 3), "覆盖后按发布的新几何生效");
+    assertEquals(0, skipped, "快照已包含该补丁：不得整段跳过");
+    assertFalse(store.section(0, 0, 0).isOccludingLocal(1, 2, 3),
+        "回放必须把该格修正回不遮挡（否则旧几何吞掉补丁）");
+    assertTrue(store.section(0, 0, 0).isOccludingLocal(2, 2, 4), "其余格按发布几何");
     assertEquals(0L, store.skippedPatchedSections());
   }
 
-  /** 旧入口（不带快照）必须保持原有语义：整列无条件覆盖。 */
+  /** 旧入口（不带快照）仍整列覆盖，但窗口内的补丁格会由回放补回。 */
   @Test
-  void restoreColumnWithoutSnapshotKeepsLegacyOverwriteBehaviour() {
+  void restoreColumnWithoutSnapshotStillReplaysPendingPatches() {
     OcclusionStore store = new OcclusionStore();
     store.replaceSection(0, 0, 0, SolidOcclusion.INSTANCE);
     store.setBlockOccluding(1, 2, 3, false);
 
     store.restoreColumn(0, 0, 0, new SectionOcclusion[] {SolidOcclusion.INSTANCE});
 
-    assertTrue(store.section(0, 0, 0).isOccludingLocal(1, 2, 3),
-        "不带快照的旧入口不做补丁比较，保持整列覆盖语义");
+    assertFalse(store.section(0, 0, 0).isOccludingLocal(1, 2, 3),
+        "不带快照的旧入口不再做戳比较，但补丁格必须回放（方向：不被旧几何吞掉）");
   }
 
   /**
@@ -268,7 +274,10 @@ class OcclusionStoreTest {
         new SectionOcclusion[] {SolidOcclusion.INSTANCE}, stamps);
 
     assertEquals(0, skipped, "活表没有该段数据时不得跳过覆盖（否则整段永久留空）");
-    assertSame(SolidOcclusion.INSTANCE, store.section(0, 0, 0), "该段必须被发布出来");
+    SectionOcclusion published = store.section(0, 0, 0);
+    assertNotNull(published, "该段必须被发布出来");
+    assertFalse(published.isOccludingLocal(1, 2, 3), "窗口内的打断补丁必须由回放补回");
+    assertTrue(published.isOccludingLocal(2, 2, 4), "其余格按发布几何");
   }
 
   // ---------------------------------------------------------- 只补缺失段（缓存命中路径）

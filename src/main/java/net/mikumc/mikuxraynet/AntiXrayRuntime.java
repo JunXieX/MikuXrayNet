@@ -483,8 +483,8 @@ public final class AntiXrayRuntime {
     // ThreadLocalMap 时被惰性 expunge——这正是这里只清调用线程的原因。
     try {
       ProximityRevealer.clearThreadLocals();
-    // 遮挡补丁缓冲同样按线程复用：调用线程这一份必须清（异步线程那份见 OcclusionPatchListener#clearThreadLocals 的说明）
-    net.mikumc.mikuxraynet.antixray.OcclusionPatchListener.releasePooledBuffers();
+      // 遮挡补丁缓冲：静态有界并发池（非 ThreadLocal），clear() 即全部释放
+      OcclusionPatchListener.releasePooledBuffers();
     } catch (Throwable throwable) {
       logger.log(Level.WARNING, "清理邻近显形线程本地缓存失败（忽略）", throwable);
     }
@@ -747,7 +747,14 @@ public final class AntiXrayRuntime {
    * 世界不会建立位图——显形侧按「缺数据 = 遮挡」会让该区域矿物永不显形、实体侧射线按缺数据降级。
    * 默认 384 高世界不受影响；这里只提示，不做兼容（扩位需要同步改 OcclusionPayload/RevealedSet 布局）。
    */
+  private static final java.util.concurrent.atomic.AtomicBoolean WORLD_HEIGHT_WARNED =
+      new java.util.concurrent.atomic.AtomicBoolean();
+
   private void warnUnsupportedWorldHeight() {
+    // 只提示一次：startAntiXray() 在每次热重载都会执行，重复 WARN 只会变成噪音
+    if (!WORLD_HEIGHT_WARNED.compareAndSet(false, true)) {
+      return;
+    }
     try {
       for (World world : Bukkit.getWorlds()) {
         int minSection = world.getMinHeight() >> 4;

@@ -124,9 +124,6 @@ final class ProximityScanner {
       int byDistance = Long.compare(right.distanceSquared(), left.distanceSquared());
       return byDistance != 0 ? byDistance : Integer.compare(right.sequence(), left.sequence());
     });
-    // 堆容量略大于最终取用量：先按距离取足量 top-N，再过滤「已显形」——避免为最终会被堆淘汰的
-    // 候选各付一次 RevealedSet 的监视器锁（密集矿区单周期可达上千次加锁）。
-    int heapLimit = limit + Math.max(8, limit / 4);
     int sequence = 0;
 
     for (int chunkX = centerX - radius; chunkX <= centerX + radius; chunkX++) {
@@ -186,9 +183,20 @@ final class ProximityScanner {
             // 只在通过距离筛选后计数：口径见 Tally#positionsEvaluated 的注释
             tally.positionsEvaluated++;
           }
-          // 传原始分量而非先构造 Position：堆满之后绝大多数候选注定被淘汰，只有真正入堆时才需要对象。
-          // 「已显形」过滤放在出堆之后（见方法末），避免为注定淘汰的候选付出监视器锁。
-          offer(worst, blockX, blockY, blockZ, distanceSq, sequence++, heapLimit);
+          // 「已显形」过滤只在候选<b>确实够格入堆</b>时做（堆未满、或比堆顶更近）：注定淘汰的候选
+          // 不值得付一次 RevealedSet 监视器锁；而先过滤后入堆保证窗口 = 「最近的至多 limit 个未显形」，
+          // 不会像「先入堆再过滤」那样被已显形坐标占满（该显示却轮不到）。
+          if (worst.size() >= limit) {
+            Scored currentWorst = worst.peek();
+            if (Long.compare(distanceSq, currentWorst.distanceSquared()) >= 0) {
+              continue;
+            }
+          }
+          if (revealed.contains(playerId, worldName, chunkX, chunkZ, blockX, blockY, blockZ)) {
+            continue;
+          }
+          // 传原始分量而非先构造 Position：堆满之后绝大多数候选注定被淘汰，只有真正入堆时才需要对象
+          offer(worst, blockX, blockY, blockZ, distanceSq, sequence++, limit);
         }
       }
     }
@@ -199,18 +207,9 @@ final class ProximityScanner {
       int byDistance = Long.compare(left.distanceSquared(), right.distanceSquared());
       return byDistance != 0 ? byDistance : Integer.compare(left.sequence(), right.sequence());
     });
-    List<ObfuscatedChunkIndex.Position> result = new ArrayList<>(Math.min(limit, ordered.length));
+    List<ObfuscatedChunkIndex.Position> result = new ArrayList<>(ordered.length);
     for (Scored scored : ordered) {
-      if (result.size() >= limit) {
-        break;
-      }
-      ObfuscatedChunkIndex.Position position = scored.position();
-      if (revealed.contains(playerId, worldName, position.x() >> 4, position.z() >> 4,
-          position.x(), position.y(), position.z())) {
-        // 已显形：跳过并继续用后面的候选补位（窗口大小不因此缩水）
-        continue;
-      }
-      result.add(position);
+      result.add(scored.position());
     }
     return result;
   }

@@ -102,8 +102,9 @@ class OcclusionPatchPublishRaceTest {
   }
 
   @Test
-  void stampSnapshotTakenAfterPatchPublishesOverIt() {
-    // 快照晚于补丁：戳已经包含本次补丁，发布时不应把它当作「窗口内变更」而跳过（否则该段永远无法收敛）
+  void stampSnapshotTakenAfterPatchStillReplaysIt() {
+    // 快照晚于补丁：戳已经包含本次补丁，戳比较不会跳过；但发布数据为 null 会清掉旧条目，
+    // 因此必须靠「补丁格回放」把该格补回来（否则这次补丁被旧几何吞掉）。
     OcclusionStore store = new OcclusionStore();
     store.setBlockOccluding(1, 1 * 16 + 2, 3, true);
 
@@ -112,7 +113,10 @@ class OcclusionPatchPublishRaceTest {
     int skipped = store.restoreColumn(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, column, stamps);
 
     assertEquals(0, skipped, "快照已包含该补丁，不得再判为「期间变更」");
-    assertNull(store.section(0, 1, 0), "发布数据为 null 时必须清掉旧条目（而非被跳过）");
+    SectionOcclusion replayed = store.section(0, 1, 0);
+    assertNotNull(replayed, "回放必须补回该段（否则补丁被 null 覆盖丢失）");
+    assertTrue(replayed.isOccludingLocal(1, 2, 3), "回放必须恢复补丁格");
+    assertNull(store.section(0, 0, 0), "未被补丁的段保持发布值");
   }
 
   @Test
@@ -166,6 +170,64 @@ class OcclusionPatchPublishRaceTest {
         new SectionOcclusion[] {null, null, null}, null);
 
     assertEquals(0, skipped, "未提供快照时不得跳过任何段");
-    assertNull(store.section(0, 1, 0), "无快照时按旧行为整列覆盖");
+    // 整列按 null 覆盖后，回放会补回窗口内的补丁格（否则该补丁会被旧几何吞掉，方向「该显示却多藏」）；
+    // 未被补丁的段保持发布值（null）。
+    assertNull(store.section(0, 0, 0));
+    assertNull(store.section(0, 2, 0));
+    SectionOcclusion survivor = store.section(0, 1, 0);
+    assertNotNull(survivor, "回放必须补回窗口内被补丁改过的段");
+    assertTrue(survivor.isOccludingLocal(1, 2, 3), "回放必须恢复补丁格");
+  }
+
+  @Test
+  void replayKeepsPatchThatLandedBeforeStampSnapshot() {
+    // 「包序列化 → 取戳快照」窗口：快照已包含本次补丁，戳比较发现不了；必须靠回放修正。
+    OcclusionStore store = new OcclusionStore();
+    store.restoreColumn(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, new SectionOcclusion[] {
+        EmptyOcclusion.INSTANCE, SolidOcclusion.INSTANCE, EmptyOcclusion.INSTANCE}, null);
+    store.setBlockOccluding(1, 1 * 16 + 2, 3, false);
+    SectionOcclusion patched = store.section(0, 1, 0);
+    assertNotNull(patched);
+    assertFalse(patched.isOccludingLocal(1, 2, 3), "前置：补丁把该格改为不遮挡");
+
+    long[] stamps = store.patchStamps(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, SECTION_COUNT);
+    int skipped = store.restoreColumn(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, new SectionOcclusion[] {
+        EmptyOcclusion.INSTANCE, SolidOcclusion.INSTANCE, EmptyOcclusion.INSTANCE}, stamps);
+
+    assertEquals(0, skipped, "快照晚于补丁时戳相同，不应跳过整段");
+    SectionOcclusion survivor = store.section(0, 1, 0);
+    assertNotNull(survivor);
+    assertFalse(survivor.isOccludingLocal(1, 2, 3),
+        "回放必须把该格修正回不遮挡（否则旧几何吞掉补丁）");
+    assertTrue(survivor.isOccludingLocal(2, 2, 4), "其余格按发布几何（实心）");
+  }
+
+  @Test
+  void replayIsIdempotentAcrossConcurrentPublishes() {
+    // 同一份旧字节被两个任务并发捕获：后发布者不得回滚已回放的补丁格。
+    OcclusionStore store = new OcclusionStore();
+    store.setBlockOccluding(1, 1 * 16 + 2, 3, false);
+    long[] stamps = store.patchStamps(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, SECTION_COUNT);
+    SectionOcclusion[] decoded = {EmptyOcclusion.INSTANCE, SolidOcclusion.INSTANCE,
+        EmptyOcclusion.INSTANCE};
+    store.restoreColumn(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, decoded, stamps);
+    store.restoreColumn(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, decoded, stamps);
+
+    SectionOcclusion survivor = store.section(0, 1, 0);
+    assertNotNull(survivor);
+    assertFalse(survivor.isOccludingLocal(1, 2, 3), "第二次发布不得回滚补丁格（回放条目不得一次性消费）");
+  }
+
+  @Test
+  void removeColumnDropsReplayTable() {
+    OcclusionStore store = new OcclusionStore();
+    store.setBlockOccluding(1, 1 * 16 + 2, 3, false);
+    store.removeColumn(CHUNK_X, CHUNK_Z);
+    store.restoreColumn(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, new SectionOcclusion[] {
+        EmptyOcclusion.INSTANCE, SolidOcclusion.INSTANCE, EmptyOcclusion.INSTANCE}, null);
+
+    SectionOcclusion published = store.section(0, 1, 0);
+    assertNotNull(published);
+    assertTrue(published.isOccludingLocal(1, 2, 3), "摘列后回放表必须清空，发布几何原样生效");
   }
 }

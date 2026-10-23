@@ -406,6 +406,21 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return;
     }
 
+    // 维度关闭的世界（默认 dimensions.the_end.enabled=false）必须在构造 accessor / 队列判定 /
+    // 取批次闸门之前放行：accessor 构造会做 ProtocolLib 修饰符解析（getSpecificModifier().read(0)），
+    // 而这些区块永远进不了缓存（profile 非 active），每包都是纯白付。此路径没有取得任何闸门/延迟，
+    // 直接返回由 ProtocolLib 自行放行。
+    AntiXrayConfig.Dimension dimension;
+    try {
+      dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
+    } catch (Throwable throwable) {
+      // 读维度失败（世界正在卸载等）：按原包放行，绝不阻塞区块加载
+      return;
+    }
+    if (!live().enabledForWorld(world.getName(), dimension)) {
+      return;
+    }
+
     AsyncMarker marker = event.getAsyncMarker();
     if (marker == null) {
       return;
@@ -443,23 +458,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     RewriteTask task;
     // 后面还要用（看门狗预算 / 邻块判定），故在 try 外声明。
     long timeoutMillis;
-    AntiXrayConfig.Dimension dimension;
     try {
       int minHeight = world.getMinHeight();
       int sectionCount = (world.getMaxHeight() - minHeight) / 16;
-      // 维度由 World#getEnvironment() 判定（不依赖世界名；CUSTOM 归入 normal），决定用哪段 dimensions 配置。
-      dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
-      // 维度被关闭的世界（默认 dimensions.the_end.enabled=false）直接放行，不进管线：
-      // 否则每个区块包都要白付一次异步往返 + 工作池排队 + 磁盘缓存查询 + 看门狗注册，而 rewrite 会因
-      // profile 非 active 原样返回、Result.occlusion==null 导致结果永不入缓存（resultCacheable 恒 false），
-      // 包越多亏越多，还会挤占共享队列（队列满时原包直发 = 反矿透失效）。此处尚未登记处理延迟，
-      // 直接 return 由 ProtocolLib 自行放行；但必须归还批次闸门刚登记的 pending。
-      if (!live().enabledForWorld(world.getName(), dimension)) {
-        if (gate != null) {
-          gate.chunkDone();
-        }
-        return;
-      }
       // 超时实时读「当前」配置：reload 改了 advanced.timeout-millis 必须立即生效（本监听器不随 reload 重建）。
       // 同一区块的任务构造与看门狗注册共用这一个值，保证两者一致。
       timeoutMillis = live().timeoutMillis();

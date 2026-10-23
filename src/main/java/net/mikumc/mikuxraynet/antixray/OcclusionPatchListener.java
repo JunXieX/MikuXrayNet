@@ -289,13 +289,11 @@ public final class OcclusionPatchListener extends PacketAdapter {
 
   /** 注销监听器；可重复调用，异常安全。 */
   /**
-   * 释放当前线程的补丁缓冲（插件停用 / 热重载时汇入统一清理入口）。
+   * 释放池中缓冲（插件停用时调用）。
    *
-   * <p>注意：本方法只清「调用线程」那一份；ProtocolLib 异步回调跑在平台共享异步线程上，
-   * 那份条目仍随线程存活——这是已知的慢性泄漏（每代 reload 一个旧类加载器），根治需要把缓冲改成
-   * 非 ThreadLocal 的实例字段或向异步线程投递清理任务，留待后续迭代。
+   * <p>缓冲已是<b>类静态有界并发池</b>（不再用 ThreadLocal）：池只被本类加载器持有，随插件卸载回收；
+   * {@code clear()} 即全部释放，不再存在「只能清调用线程那一份」的残留。
    */
-  /** 释放池中缓冲（插件停用时调用；池本身随类加载器回收）。 */
   public static void releasePooledBuffers() {
     PATCH_BUFFERS.clear();
   }
@@ -368,8 +366,17 @@ public final class OcclusionPatchListener extends PacketAdapter {
     if (position == null || data == null) {
       return;
     }
-    applyPatches(store, new int[] {position.getX(), position.getY(), position.getZ()},
-        new byte[] {resolve(data)}, stats);
+    PatchBuffer buffer = acquirePatchBuffer();
+    try {
+      buffer.ensureCells(1);
+      buffer.coords[0] = position.getX();
+      buffer.coords[1] = position.getY();
+      buffer.coords[2] = position.getZ();
+      buffer.verdicts[0] = resolve(data);
+      applyPatches(store, buffer, 1, stats);
+    } finally {
+      releasePatchBuffer(buffer);
+    }
   }
 
   /**
@@ -400,7 +407,7 @@ public final class OcclusionPatchListener extends PacketAdapter {
         // 一个槽位读不出来不该让同包其余坐标一起漏补丁。
         verdicts[i] = resolveOrUnresolved(data[i]);
       }
-      applyPatches(store, coords, verdicts, cells, stats);
+      applyPatches(store, buffer, cells, stats);
     } finally {
       releasePatchBuffer(buffer);
     }
@@ -521,21 +528,36 @@ public final class OcclusionPatchListener extends PacketAdapter {
    * @param verdicts  每格一个三态判定，长度必须与 {@code coords.length / 3} 相等（否则整体跳过）
    */
   static void applyPatches(OcclusionStore store, int[] coords, byte[] verdicts, OcclusionStats stats) {
-    applyPatches(store, coords, verdicts, verdicts == null ? 0 : verdicts.length, stats);
-  }
-
-  /**
-   * 应用补丁的核心：{@code cells} 显式给出本批有效格数（数组可能来自线程本地复用、长度大于有效格数）。
-   */
-  private static void applyPatches(OcclusionStore store, int[] coords, byte[] verdicts, int cells,
-      OcclusionStats stats) {
+    int cells = verdicts == null ? 0 : verdicts.length;
     if (store == null || coords == null || verdicts == null || cells <= 0
-        || coords.length < cells * 3 || verdicts.length < cells) {
+        || coords.length < cells * 3) {
       return;
     }
     PatchBuffer buffer = acquirePatchBuffer();
     try {
+      buffer.ensureCells(cells);
+      System.arraycopy(coords, 0, buffer.coords, 0, cells * 3);
+      System.arraycopy(verdicts, 0, buffer.verdicts, 0, cells);
+      applyPatches(store, buffer, cells, stats);
+    } finally {
+      releasePatchBuffer(buffer);
+    }
+  }
+
+  /**
+   * 应用补丁的核心：调用方已把坐标 / 判定填进 {@code buffer}，本方法只做「批量受理」。
+   *
+   * <p>补丁入口每个包只取<b>一份</b>缓冲（原先 patchMulti 与 applyPatches 各取一份，单包占两份
+   * 4096 格缓冲，并发下更快耗尽池、回落 ~100KB 新分配）。
+   */
+  private static void applyPatches(OcclusionStore store, PatchBuffer buffer, int cells,
+      OcclusionStats stats) {
+    if (store == null || buffer == null || cells <= 0) {
+      return;
+    }
     buffer.ensureCells(cells);
+    int[] coords = buffer.coords;
+    byte[] verdicts = buffer.verdicts;
     int[] xs = buffer.xs;
     int[] ys = buffer.ys;
     int[] zs = buffer.zs;
@@ -564,9 +586,6 @@ public final class OcclusionPatchListener extends PacketAdapter {
     int applied = store.setBlocksOccluding(xs, ys, zs, occluding, cells);
     stats.patched.add(resolved);
     stats.patchFailures.add(unresolved + (cells - applied));
-    } finally {
-      releasePatchBuffer(buffer);
-    }
   }
 
   /**

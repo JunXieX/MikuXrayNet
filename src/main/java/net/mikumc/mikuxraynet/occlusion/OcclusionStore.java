@@ -65,6 +65,11 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     final long[] coords = new long[MAX_REPLAY_CELLS];
     final boolean[] occluding = new boolean[MAX_REPLAY_CELLS];
     int size;
+    /**
+     * 该段补丁格数超过容量：回放表已不完整，不能再拿它修正旧几何。
+     * 置位后该段的整列发布改为<b>跳过</b>（活表已含全部补丁，跳过即正确），避免「发布旧几何 + 部分回放」。
+     */
+    boolean overflow;
   }
 
   /** 因「该段期间被补丁写过」而跳过发布的段数（诊断用，只增不减）。 */
@@ -158,13 +163,12 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * @param occluding 变更后该方块是否遮挡
    */
   public void setBlockOccluding(int x, int y, int z, boolean occluding) {
-    synchronized (writeMutex) {
-      long key = SectionKey.packSection(x >> 4, y >> 4, z >> 4);
-      applyCellLocked(key, x, y, z, occluding);
-      // 即便本次没有实际改动（状态已与目标一致），也必须记戳：随后若有建表把「解码时刻的旧几何」
-      // 发布过来，只有戳能让它跳过这一段，否则这次「置零/置位」的意图会被旧位图吞掉。
-      patchStamps.put(key, patchSequence.incrementAndGet());
-    }
+    // 保持单格入口「显式拒绝越界坐标」的语义（批量入口对越界格是「跳过继续」）：
+    // 先做一次带校验的 pack，越界即抛 IllegalArgumentException。
+    SectionKey.packSection(x >> 4, y >> 4, z >> 4);
+    // 委托批量入口：让单格补丁与批量补丁共用同一条「写活表 + 记戳 + 记录回放格」路径，
+    // 不再出现「单格入口绕过回放」的语义分叉（该重载当前仅单测使用）。
+    setBlocksOccluding(new int[] {x}, new int[] {y}, new int[] {z}, new boolean[] {occluding}, 1);
   }
 
   /**
@@ -279,10 +283,9 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         replay.size++;
         return;
       }
-      System.arraycopy(replay.coords, 1, replay.coords, 0, MAX_REPLAY_CELLS - 1);
-      System.arraycopy(replay.occluding, 1, replay.occluding, 0, MAX_REPLAY_CELLS - 1);
-      replay.coords[MAX_REPLAY_CELLS - 1] = packed;
-      replay.occluding[MAX_REPLAY_CELLS - 1] = occluding;
+      // 超出容量：不再记录（丢弃最旧会留下不完整集合），置溢出标志让整列发布改为跳过，
+      // 由「活表已含全部补丁」保证正确性（见 PatchReplay#overflow）。
+      replay.overflow = true;
     }
   }
 
@@ -297,7 +300,10 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * @return 重放的格数（0 = 该段近期没有补丁）
    */
   private int replayPendingCells(long key) {
-    PatchReplay replay = patchReplay.remove(key);
+    // 不取走条目：回放是幂等的，同源旧字节可能被多个任务并发发布（多玩家同时收到同一区块）。
+    // 若首次回放后就清空，后发布者会用旧几何覆盖已修正的补丁格（该显示却多藏）。
+    // 条目由 removeColumn / clear / removeSection 清理，规模 ≈ 已加载区块里被补丁过的段数。
+    PatchReplay replay = patchReplay.get(key);
     if (replay == null) {
       return 0;
     }
@@ -434,6 +440,12 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
           continue;
         }
         long key = SectionKey.packSection(chunkX, sectionY, chunkZ);
+        PatchReplay pending = patchReplay.get(key);
+        if (pending != null && pending.overflow) {
+          // 该段补丁格超过回放容量：回放表不完整，不能再用旧几何覆盖（活表已含全部补丁）。
+          skipped++;
+          continue;
+        }
         if (stamps != null && i < stamps.length) {
           Long current = patchStamps.get(key);
           // 必须同时满足「活表有该段」：打断类补丁在无数据段上不建条目、只留戳；
@@ -497,6 +509,10 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
           continue;
         }
         long key = SectionKey.packSection(chunkX, sectionY, chunkZ);
+        PatchReplay pending = patchReplay.get(key);
+        if (pending != null && pending.overflow) {
+          continue; // 回放表不完整：跳过填充，活表已含全部补丁
+        }
         if (sections.get(key) != null) {
           continue; // 已有活数据：可能含更晚的补丁，绝不覆盖
         }
@@ -544,6 +560,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
       // 复用上面那份 256 键数组，不额外分配、也不遍历整张 CHM。
       for (long key : keys) {
         patchStamps.remove(key);
+        patchReplay.remove(key);
       }
     }
   }

@@ -230,7 +230,12 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     private long key;
     /** 本 section 专属的去重代次（见 {@link SeenScratch}）；同一线程内每个 section 都不同。 */
     private int generation;
-    private final SeenScratch scratch;
+    /**
+     * 去重表：<b>每次取用都要重绑</b>。池化后 SeenScratch 是跨包复用的共享实例，若只在构造时绑定，
+     * 后续包拿到的可能是另一个实例（甚至已被其它线程取走），去重戳会写进无关数组、generation 编号错位
+     * → 坐标被误判重复而丢弃（漏摘标记、漏显形）。
+     */
+    private SeenScratch scratch;
     private int[] data = new int[48];
     private int count;
 
@@ -242,9 +247,10 @@ public final class BlockChangeRevealListener extends PacketAdapter {
      * 复用前重置：换 section 键与去重代次，有效计数清零；{@code data} <b>保留已扩容的容量</b>
      * （读取一律以 {@code count} 为界，残留旧值不会被读到）。
      */
-    private void reset(long key, int generation) {
+    private void reset(long key, int generation, SeenScratch scratch) {
       this.key = key;
       this.generation = generation;
+      this.scratch = scratch;
       this.count = 0;
     }
 
@@ -374,7 +380,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
         buffers.add(new SectionBuffer(seen));
       }
       SectionBuffer buffer = buffers.get(bufferCount++);
-      buffer.reset(key, generation);
+      buffer.reset(key, generation, seen);
       return buffer;
     }
 

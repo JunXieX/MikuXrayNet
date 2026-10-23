@@ -973,7 +973,7 @@ final class RegionFile implements AutoCloseable {
       for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
         // 先按桶头声明的原始长度做预算预判，再解压：旧实现是「先 ensureLoaded（解压）再判超」，
         // 一旦超限就已经把 ~1.28 GiB 的 payload 全部常驻内存，压缩被放弃而垃圾一条没回收，
-        // 下一轮维护再来一次（大配置下变成周期性巨量分配）。预判精确到桶头，正常路径零额外成本。
+        // 下一轮维护再来一次（大配置下变成周期性巨量分配）。预判只多一次 8 字节桶头读（不触发解压）。
         long estimate = estimateRawBytes(bucket);
         if (compactRawBudget[0] + estimate > MAX_COMPACT_TOTAL_RAW) {
           warnCompactBudgetOnce(compactRawBudget[0] + estimate);
