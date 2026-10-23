@@ -1681,15 +1681,13 @@ public final class ProximityRevealer implements Listener {
    */
   static boolean hasDisguisedNearby(ObfuscatedChunkIndex index, String worldName,
       int x, int y, int z, int radius) {
-    // 邻域偏移是固定的、且只落在至多 4 个区块里：按区块复用 ChunkKey，避免每个偏移都新建一个
+    // 邻域偏移只落在至多 4 个区块里：containsPosition(String,...) 内部复用线程本地 Probe，逐偏移零分配
     // （一个塞满 4096 坐标的 MULTI_BLOCK_CHANGE 默认约 10 万次查找，是封包线程上最大的一笔分配）。
-    ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
-    keys.begin(worldName);
     for (int[] offset : instantOffsets(radius)) {
       int blockX = x + offset[0];
       int blockY = y + offset[1];
       int blockZ = z + offset[2];
-      if (index.containsPosition(keys.keyFor(blockX, blockZ), blockX, blockY, blockZ)) {
+      if (index.containsPosition(worldName, blockX, blockY, blockZ)) {
         return true;
       }
     }
@@ -1697,58 +1695,10 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 邻域初筛的区块键小缓存（线程本地复用，零分配）。
-   *
-   * <p><b>容量覆盖范围（实话口径）</b>：单坐标邻域（{@link #hasDisguisedNearby} /
-   * {@link #revealImmediately}）横向只跨 {@code ±radius} 格，{@code radius ≤ 4}（默认）时至多
-   * {@code 2×2 = 4} 个区块，容量 4 正好覆盖（{@code radius} 上限 8 时跨 17 格，每个轴可能到 3 个区块，
-   * 此时退化为逐次建键）。<b>section 聚合路径</b>（{@link #revealSectionImmediately}）的邻域是
-   * 「整段 16 格变更坐标 × 半径」，每个轴最多 3 个区块（{@code 3×3 = 9}），<b>必然可能超出容量</b>。
-   * 两种超出都只是退化为每次新建键——只影响分配、不影响正确性，语义不依赖容量大小。
-   */
-  private static final class ChunkKeyCache {
-
-    private static final ThreadLocal<ChunkKeyCache> LOCAL =
-        ThreadLocal.withInitial(ChunkKeyCache::new);
-    private static final int CAPACITY = 4;
-
-    private final int[] chunkXs = new int[CAPACITY];
-    private final int[] chunkZs = new int[CAPACITY];
-    private final ChunkKey[] keys = new ChunkKey[CAPACITY];
-    private String worldName;
-    private int size;
-
-    /** 开始一次邻域初筛（重置缓存）。 */
-    void begin(String worldName) {
-      this.worldName = worldName;
-      this.size = 0;
-    }
-
-    /** 取该方块坐标所在区块的键（命中已缓存的区块则复用，避免每次查找都新建）。 */
-    ChunkKey keyFor(int x, int z) {
-      int cx = x >> 4;
-      int cz = z >> 4;
-      for (int i = 0; i < size; i++) {
-        if (chunkXs[i] == cx && chunkZs[i] == cz) {
-          return keys[i];
-        }
-      }
-      ChunkKey key = new ChunkKey(worldName, cx, cz);
-      if (size < CAPACITY) {
-        chunkXs[size] = cx;
-        chunkZs[size] = cz;
-        keys[size] = key;
-        size++;
-      }
-      return key;
-    }
-  }
-
-  /**
    * 释放当前线程上「邻近显形侧」全部线程本地复用实例（插件停用 / 热重载时由
    * {@code AntiXrayRuntime#stopForDisable} 调用）。
    *
-   * <p>涉及：本类的 {@link ChunkKeyCache}、{@link ChunkKey.Probe}、{@link BitmapVisibility} 的判定器、
+   * <p>涉及：{@link ChunkKey.Probe}、{@link BitmapVisibility} 的判定器、
    * {@link ProximitySelector} 的候选点缓冲、{@link BlockChangeRevealListener} 的去重 / 解析缓冲。
    * ThreadLocal 条目挂在<b>线程</b>的 ThreadLocalMap 上，而主线程 / Folia 区域线程 / netty 事件循环
    * 线程都比插件活得久：停用或热重载后旧实例会经这些条目钉住旧类加载器，直到线程下次访问
@@ -1756,7 +1706,6 @@ public final class ProximityRevealer implements Listener {
    * 至少保证停用线程自己不再持有旧实例。
    */
   public static void clearThreadLocals() {
-    ChunkKeyCache.LOCAL.remove();
     ChunkKey.Probe.clearThreadLocals();
     BitmapVisibility.clearThreadLocals();
     ProximitySelector.clearThreadLocals();
@@ -1801,8 +1750,6 @@ public final class ProximityRevealer implements Listener {
    */
   static boolean hasDisguisedNearSection(ObfuscatedChunkIndex index, String worldName,
       int[] coordinates, int count, int radius) {
-    ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
-    keys.begin(worldName);
     int[][] offsets = instantOffsets(radius);
     int probesLeft = MAX_NEARBY_PROBES_PER_PACKET;
     for (int i = 0; i < count; i++) {
@@ -1817,7 +1764,7 @@ public final class ProximityRevealer implements Listener {
         int blockX = x + offsets[o][0];
         int blockY = y + offsets[o][1];
         int blockZ = z + offsets[o][2];
-        if (index.containsPosition(keys.keyFor(blockX, blockZ), blockX, blockY, blockZ)) {
+        if (index.containsPosition(worldName, blockX, blockY, blockZ)) {
           return true;
         }
       }
@@ -1872,12 +1819,6 @@ public final class ProximityRevealer implements Listener {
       PassTally tally = new PassTally();
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
       String liveWorld = world.getName();
-      // 候选判定复用线程本地区块键缓存（键只用于 CHM 查询、绝不入表），避免逐候选 new ChunkKey。
-      // 单坐标邻域横向只跨 ±radius 格：radius ≤ 4（默认）时至多 2×2 个区块、正好落在缓存容量内，
-      // 该路径因此零分配；radius 更大（上限 8，跨 17 格）时可能超出容量，keyFor 退化为逐次建键
-      // （只影响分配，语义不变）。
-      ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
-      keys.begin(liveWorld);
       for (int[] offset : instantOffsets(radius)) {
         if (budget.remaining() <= 0) {
           break;
@@ -1885,7 +1826,7 @@ public final class ProximityRevealer implements Listener {
         int x = cx + offset[0];
         int y = cy + offset[1];
         int z = cz + offset[2];
-        if (!isInstantCandidate(keys, playerId, liveWorld, x, y, z)) {
+        if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
           continue;
         }
         // 事件路径不预先算计划（见 revealImmediately 注释）：false = sendOne 在当前线程用遮挡位图判定
@@ -1931,11 +1872,6 @@ public final class ProximityRevealer implements Listener {
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
       String liveWorld = world.getName();
       // 候选判定复用线程本地区块键缓存（键只用于 CHM 查询、绝不入表），避免逐候选 new ChunkKey。
-      // 注意：section 路径的邻域是「整段 16 格变更坐标 × 半径」，每个轴最多 3 个区块（3×3=9），
-      // 超出 ChunkKeyCache 的容量 4 后 keyFor 会退化为逐次建键——只影响分配、不影响正确性；
-      // 只有单坐标路径（revealImmediately）在默认半径下才是真正零分配。
-      ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
-      keys.begin(liveWorld);
       int[][] offsets = instantOffsets(radius);
       // 去重：同一候选坐标可能同时落在多个变更坐标的邻域里，只评估一次（保证「恰好一次放行」）。
       // 去重集合用 HashSet<Long>，代价是每个候选一次 long 装箱 + 哈希节点分配（一个 section 变更的
@@ -1977,7 +1913,7 @@ public final class ProximityRevealer implements Listener {
           if (!evaluated.add(packCoordinate(x, y, z))) {
             continue;
           }
-          if (!isInstantCandidate(keys, playerId, liveWorld, x, y, z)) {
+          if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
             continue;
           }
           // 事件路径不预先算计划（见 revealImmediately 注释）：false = sendOne 在当前线程用遮挡位图判定
@@ -2180,8 +2116,6 @@ public final class ProximityRevealer implements Listener {
       boolean frustum = proximity.frustumEnabled();
       PassTally tally = new PassTally();
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
-      ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
-      keys.begin(worldName);
       int evaluated = 0;
       int consumed = 0;
       for (int i = 0; i < chunkKeys.size(); i++) {
@@ -2210,7 +2144,7 @@ public final class ProximityRevealer implements Listener {
           int y = minHeight + (local >> 8);
           evaluated++;
           perChunk++;
-          if (!isInstantCandidate(keys, playerId, worldName, x, y, z)) {
+          if (!isInstantCandidate(playerId, worldName, x, y, z)) {
             continue;
           }
           if (frustum && !ProximitySelector.withinFrustum(eye, x, y, z,
@@ -2317,8 +2251,6 @@ public final class ProximityRevealer implements Listener {
       BitmapVisibility bitmap = BitmapVisibility.local();
       bitmap.beginIgnoring(bx, by, bz);
       try {
-        ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
-        keys.begin(worldName);
         for (int i = 0; i < DIG_NEIGHBOUR_COUNT; i++) {
           if (budget.remaining() <= 0) {
             break;
@@ -2326,7 +2258,7 @@ public final class ProximityRevealer implements Listener {
           int x = bx + DIG_DX[i];
           int y = by + DIG_DY[i];
           int z = bz + DIG_DZ[i];
-          if (!isInstantCandidate(keys, playerId, worldName, x, y, z)) {
+          if (!isInstantCandidate(playerId, worldName, x, y, z)) {
             continue;
           }
           sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
@@ -2586,23 +2518,12 @@ public final class ProximityRevealer implements Listener {
   /**
    * 纯数据判定：坐标仍在伪装清单（已伪装）且该玩家尚未显形过（与周期显形不重复、同 tick 不重复）。
    *
-   * <p><b>为什么另有带 {@link ChunkKeyCache} 的重载</b>：事件路径每个候选都要查一次索引（按区块）与一次
-   * 已显形集合（按玩家 × 区块），而这两个结构都提供「按世界名 + 分量查询」的零分配入口
-   * （{@link ObfuscatedChunkIndex#containsPosition(ChunkKey, int, int, int)} 与
-   * {@link RevealedSet#contains(UUID, String, int, int, int, int, int)}）。旧实现每个候选 new 两个
-   * {@link ChunkKey}，一个满载 section 事件可达上千个短命对象，且全部落在玩家所属线程上。本重载由
-   * 调用方在循环外 {@code begin(worldName)} 一次、循环内复用同一份线程本地键。
+   * <p>两条查询都用「世界名 + 分量」的零分配入口：{@link ObfuscatedChunkIndex#containsPosition(String, int, int, int)}
+   * （内部复用 {@link ChunkKey.Probe}）与 {@link RevealedSet#contains(UUID, String, int, int, int, int, int)}。
+   * 旧实现每个候选 new 两个 {@link ChunkKey}（一个满载 section 事件可达上千个短命对象，且全在玩家所属线程）。
    */
   boolean isInstantCandidate(UUID playerId, String worldName, int x, int y, int z) {
-    ChunkKeyCache keys = ChunkKeyCache.LOCAL.get();
-    keys.begin(worldName);
-    return isInstantCandidate(keys, playerId, worldName, x, y, z);
-  }
-
-  /** 同 {@link #isInstantCandidate(UUID, String, int, int, int)}，但复用调用方准备好的区块键缓存。 */
-  private boolean isInstantCandidate(ChunkKeyCache keys, UUID playerId, String worldName,
-      int x, int y, int z) {
-    if (!chunkIndex.containsPosition(keys.keyFor(x, z), x, y, z)) {
+    if (!chunkIndex.containsPosition(worldName, x, y, z)) {
       return false;
     }
     return !revealedSet.contains(playerId, worldName, x >> 4, z >> 4, x, y, z);

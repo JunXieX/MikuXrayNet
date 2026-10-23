@@ -407,7 +407,14 @@ public final class ObfuscatedChunkIndex {
     if (worldName == null) {
       return false;
     }
-    return containsPosition(new ChunkKey(worldName, x >> 4, z >> 4), x, y, z);
+    // 复用线程本地探针：与 entry(String,int,int) 同构，热路径零分配（Probe 只作查询键、绝不入表）。
+    // 注意不能委托给 ChunkKey 重载——Probe 不是 ChunkKey，而 CHM 查询键与存储键的 equals 已互相识别。
+    ChunkEntry entry = chunks.get(ChunkKey.Probe.local().set(worldName, x >> 4, z >> 4));
+    if (entry == null) {
+      return false;
+    }
+    int local = ((y - entry.minHeight()) << 8) | ((z & 15) << 4) | (x & 15);
+    return Arrays.binarySearch(entry.locals(), local) >= 0;
   }
 
   /**
