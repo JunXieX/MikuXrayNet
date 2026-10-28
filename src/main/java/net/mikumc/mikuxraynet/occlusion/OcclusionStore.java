@@ -81,7 +81,12 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    */
   private final java.util.ArrayDeque<PatchReplay> replayOrder = new java.util.ArrayDeque<>();
 
-  /** 单段的补丁回放条目（字段可变、由自身监视器保护；条目本身只在 writeMutex 内被重放/移除）。 */
+  /**
+   * 单段的补丁回放条目。
+   *
+   * <p>字段可变，但<b>所有读写点都在 {@link #writeMutex} 内</b>（补丁、回放、溢出清理、摘除），因此不再
+   * 额外加自身监视器——那只是为「万一某天有人在锁外访问」预留的复杂度，而锁外访问本身就是 bug。
+   */
   private static final class PatchReplay {
     /** 该条目所属的 section 键（淘汰时用于两参 {@code remove(key, entry)} 的身份校验）。 */
     final long key;
@@ -138,18 +143,6 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
   @Override
   public SectionOcclusion section(int chunkX, int sectionY, int chunkZ) {
     return sections.get(SectionKey.packSection(chunkX, sectionY, chunkZ));
-  }
-
-  /**
-   * 直接以打包键查询（省掉一次打包运算）。
-   *
-   * <p><b>当前无任何调用者（含单测）</b>：保留为「以打包键读」的对称入口，与
-   * {@link #section(int, int, int)} 并存。射线遍历当前走三参重载并在跨段边界时才查表
-   * （{@code OcclusionRay} 按 section 缓存视图），故不需要本重载；将来若有热循环每步都要
-   * 重复打包，可直接用它省掉打包成本。
-   */
-  public SectionOcclusion section(long key) {
-    return sections.get(key);
   }
 
   /** 当前驻留的 section 条目数（诊断用，近似值）。 */
@@ -337,25 +330,23 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
   /** 记录一格待回放补丁（见 {@link #patchReplay}）；容量满时置溢出位。调用方已持 writeMutex。 */
   private void recordReplayCell(PatchReplay replay, int x, int y, int z, boolean occluding) {
     long packed = packCoordinate(x, y, z);
-    synchronized (replay) {
-      // 同一格反复改写（红石/活塞/反复挖放）只保留最新一次：否则 32 次就能把容量占满、置 overflow，
-      // 让该段此后每次发布都被跳过（几何冻结）。查重是 32 次线性比较，补丁路径完全可接受。
-      for (int i = 0; i < replay.size; i++) {
-        if (replay.coords[i] == packed) {
-          replay.occluding[i] = occluding;
-          return;
-        }
-      }
-      if (replay.size < MAX_REPLAY_CELLS) {
-        replay.coords[replay.size] = packed;
-        replay.occluding[replay.size] = occluding;
-        replay.size++;
+    // 同一格反复改写（红石/活塞/反复挖放）只保留最新一次：否则 32 次就能把容量占满、置 overflow，
+    // 让该段此后每次发布都被跳过（几何冻结）。查重是 32 次线性比较，补丁路径完全可接受。
+    for (int i = 0; i < replay.size; i++) {
+      if (replay.coords[i] == packed) {
+        replay.occluding[i] = occluding;
         return;
       }
-      // 超出容量：不再记录（丢弃最旧会留下不完整集合），置溢出标志让整列发布改为跳过，
-      // 由「活表已含全部补丁」保证正确性（见 PatchReplay#overflow）。
-      replay.overflow = true;
     }
+    if (replay.size < MAX_REPLAY_CELLS) {
+      replay.coords[replay.size] = packed;
+      replay.occluding[replay.size] = occluding;
+      replay.size++;
+      return;
+    }
+    // 超出容量：不再记录（丢弃最旧会留下不完整集合），置溢出标志让整列发布改为跳过，
+    // 由「活表已含全部补丁」保证正确性（见 PatchReplay#overflow）。
+    replay.overflow = true;
   }
 
   /**
@@ -376,20 +367,13 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     if (replay == null) {
       return 0;
     }
-    long[] coords;
-    boolean[] occluding;
-    int size;
-    synchronized (replay) {
-      coords = replay.coords;
-      occluding = replay.occluding;
-      size = replay.size;
-    }
+    int size = replay.size;
     for (int i = 0; i < size; i++) {
-      long packed = coords[i];
+      long packed = replay.coords[i];
       int x = (int) (packed >> 38);
       int y = (int) ((packed >> 26) & 0xFFF);
       int z = (int) (packed & 0x3FFFFFF);
-      applyCellLocked(key, x, y, z, occluding[i]);
+      applyCellLocked(key, x, y, z, replay.occluding[i]);
     }
     return size;
   }
@@ -513,10 +497,8 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         if (pending != null && pending.overflow && sections.get(key) != null) {
           // 该段补丁格超过回放容量且活表确有数据：回放表不完整，不能再用旧几何覆盖（活表已含全部补丁）。
           // 跳过后活表即最新，清空回放表（含 overflow）以免此后永久跳过发布（几何冻结）。
-          synchronized (pending) {
-            pending.size = 0;
-            pending.overflow = false;
-          }
+          pending.size = 0;
+          pending.overflow = false;
           patchReplay.remove(key);
           skipped++;
           continue;
@@ -587,10 +569,8 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         PatchReplay pending = patchReplay.get(key);
         if (pending != null && pending.overflow && sections.get(key) != null) {
           // 活表确有数据：回放表不完整不能覆盖；清空该段回放表避免此后永久跳过
-          synchronized (pending) {
-            pending.size = 0;
-            pending.overflow = false;
-          }
+          pending.size = 0;
+          pending.overflow = false;
           patchReplay.remove(key);
           continue;
         }

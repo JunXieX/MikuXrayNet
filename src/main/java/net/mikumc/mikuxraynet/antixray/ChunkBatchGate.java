@@ -45,13 +45,10 @@ public final class ChunkBatchGate {
 
   /** 一个区块改写任务已结束（无论成功、异常还是被看门狗放行）。 */
   public void chunkDone() {
-    // 钳位的意义只是「纯防御」：当前每个 chunkDone 都必然对应一次 chunkStarted ——
-    // 「取闸门 + chunkStarted」已在 BatchTable#acquire 里合并为同一次同步操作，且放行动作只挂在
-    // 唯一的 RewriteTask 上（signalOnce 保证恰好一次）。因此正常路径不会出现无配对的 chunkDone。
-    // 保留钳位是为了让「未来若新增调用点却漏配对」时 pending 不变成负数（负数会破坏
-    // 「pending = 未完成数」的不变式，让 maybeRelease 的判断失去意义）；非负区间内
-    // updateAndGet(max(0, n-1)) 与 decrementAndGet 完全等价，对热路径无额外成本。
-    pending.updateAndGet(current -> Math.max(0, current - 1));
+    // 每次 chunkDone 都必然对应一次 chunkStarted：「取闸门 + chunkStarted」已在 BatchTable#acquire
+    // 里合并为同一次同步操作，放行动作也只挂在唯一的 RewriteTask 上（signalOnce 保证恰好一次）。
+    // 因此这里不需要「钳到非负」的防御——真出现无配对的调用那是配对 bug，钳位只会把它藏起来。
+    pending.decrementAndGet();
     maybeRelease();
   }
 

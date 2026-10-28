@@ -95,7 +95,12 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       this.logger = logger;
     }
 
-    /** 取某玩家当前未配对的闸门；无则返回 {@code null}。 */
+    /**
+     * 取某玩家当前未配对的闸门，无则 {@code null}（<b>不影响计数</b>）。
+     *
+     * <p>测试专用豁免：生产路径一律走 {@link #acquire}（取闸门与 chunkStarted 必须原子完成）；
+     * 本方法只供单测观察「重新 open 是否换了新实例」，保留以免破坏测试。
+     */
     synchronized ChunkBatchGate get(UUID playerId) {
       return gates.get(playerId);
     }
