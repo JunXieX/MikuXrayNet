@@ -249,16 +249,10 @@ final class ProximityScanner {
       worst.add(new Scored(new ObfuscatedChunkIndex.Position(x, y, z), distanceSquared, sequence));
       return;
     }
-    Scored currentWorst = worst.peek();
-    // candidate 严格更近才值得挤掉堆顶。距离相同时不替换：sequence 在每个 candidates() 调用内单调递增，
-    // 新候选的到达序号必然大于堆中任何已有元素，而堆顶在等距者中已是「后到者」（见比较器的次级键），
-    // 所以等距时天然保留先到者——下面的等距分支在当前实现下恒为 false，仅为防御性写法。
-    if (Long.compare(distanceSquared, currentWorst.distanceSquared()) < 0
-        || (distanceSquared == currentWorst.distanceSquared()
-            && sequence < currentWorst.sequence())) {
-      worst.poll();
-      worst.add(new Scored(new ObfuscatedChunkIndex.Position(x, y, z), distanceSquared, sequence));
-    }
+    // 调用方已保证：堆满时只有「严格更近」的候选才会走到这里（见 candidates 的距离守卫），
+    // 因此无需再判一次；等距者保留先到者，同样由那条 >= 守卫保证。
+    worst.poll();
+    worst.add(new Scored(new ObfuscatedChunkIndex.Position(x, y, z), distanceSquared, sequence));
   }
 
   private static long distanceSquared(int x, int y, int z, int otherX, int otherY, int otherZ) {

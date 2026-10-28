@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import org.bukkit.Bukkit;
@@ -127,20 +128,42 @@ public final class LatencyMonitor implements Listener {
     }
     ScheduledTask previous = checkTasks.put(player.getUniqueId(), task);
     if (previous != null) {
-      previous.cancel();
+      cancelQuietly(previous);
     }
     // 入账后再读一次 volatile stopping（理由同 EntityCuller.scheduleRecheck）：若 stop() 的取消循环
     // 已经跑完，它看不到这条任务，必须自行取消。
     if (stopping) {
       checkTasks.remove(player.getUniqueId(), task);
-      task.cancel();
+      cancelQuietly(task);
     }
   }
 
+  /** 「热重载时视距还原调度失败」只提示一次（代价：该玩家视距需重登才还原）。 */
+  private final AtomicBoolean restoreScheduleNoticed = new AtomicBoolean();
+  /** 「取消巡检任务失败」只提示一次（每实例；代价仅是该任务空跑到实体退役）。 */
+  private final AtomicBoolean cancelFailureNoticed = new AtomicBoolean();
+
   private void cancelCheckTask(UUID playerId) {
-    ScheduledTask task = checkTasks.remove(playerId);
-    if (task != null) {
+    cancelQuietly(checkTasks.remove(playerId));
+  }
+
+  /**
+   * 取消一个巡检任务；失败只意味着它多空跑一拍（任务本身已随实体/区域退役），绝不能中断批量取消。
+   *
+   * <p>失败打一条 WARNING（每实例一次）：旧行为是让异常冒到 {@code stop()} 由上层记入「清理不完整」，
+   * 就地吞掉会丢掉这个唯一可见信号；逐个玩家刷日志没有必要，故只留首例。
+   */
+  private void cancelQuietly(ScheduledTask task) {
+    if (task == null) {
+      return;
+    }
+    try {
       task.cancel();
+    } catch (Throwable throwable) {
+      if (cancelFailureNoticed.compareAndSet(false, true)) {
+        plugin.getLogger().log(Level.WARNING,
+            "取消延迟巡检任务失败（该任务可能空跑到实体退役；其余同类失败不再重复提示）", throwable);
+      }
     }
   }
 
@@ -153,10 +176,8 @@ public final class LatencyMonitor implements Listener {
    */
   private void cancelCheckTasks() {
     for (UUID playerId : new ArrayList<>(checkTasks.keySet())) {
-      ScheduledTask task = checkTasks.remove(playerId);
-      if (task != null) {
-        task.cancel();
-      }
+      // 单条取消失败不能中断整轮（否则剩余玩家任务漏取消，钉住已停用的旧实例）
+      cancelQuietly(checkTasks.remove(playerId));
     }
   }
 
@@ -324,7 +345,11 @@ public final class LatencyMonitor implements Listener {
         // 热重载路径：回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）。
         // 回调里走 restore()：只有真正写回成功才摘除记录，失败则留表（虽随旧实例丢弃，但至少不会
         // 因为「先清表」而在回调尚未执行时就丢掉原始值）。
-        Schedulers.onEntity(plugin, player, () -> restore(player));
+        if (!Schedulers.onEntity(plugin, player, () -> restore(player))
+            && restoreScheduleNoticed.compareAndSet(false, true)) {
+          plugin.getLogger().warning("热重载时未能调度视距还原："
+              + "个别玩家的视距可能需重新登录后才还原（不会逐次累积下降）。");
+        }
       } else {
         // 停用路径：调度器已不可用，同步还原
         restoreNow(player, playerId);

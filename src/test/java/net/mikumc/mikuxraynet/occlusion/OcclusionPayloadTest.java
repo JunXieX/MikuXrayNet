@@ -14,6 +14,19 @@ import org.junit.jupiter.api.Test;
 class OcclusionPayloadTest {
 
   @Test
+  void sectionCountPeekMatchesEncodedColumn() {
+    SectionOcclusion[] column = {EmptyOcclusion.INSTANCE, SolidOcclusion.INSTANCE,
+        EmptyOcclusion.INSTANCE};
+    assertEquals(column.length, OcclusionPayload.sectionCount(OcclusionPayload.encode(column)),
+        "只读头部探测的段数必须与实际编码一致（命中路径据此跳过整列解码）");
+    assertEquals(0, OcclusionPayload.sectionCount(OcclusionPayload.encode(new SectionOcclusion[0])));
+    assertEquals(-1, OcclusionPayload.sectionCount(null));
+    assertEquals(-1, OcclusionPayload.sectionCount(new byte[] {1, 2, 3}), "长度不足必须判非法");
+    assertEquals(-1, OcclusionPayload.sectionCount(new byte[] {-1, -1, -1, -1}),
+        "段数为负必须判非法");
+  }
+
+  @Test
   void roundTripPreservesAllThreeStates() {
     BitmapOcclusion bitmap = new BitmapOcclusion();
     bitmap.setOccluding(0, 0, 0, true);

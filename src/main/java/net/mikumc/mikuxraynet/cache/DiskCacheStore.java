@@ -1115,15 +1115,9 @@ public final class DiskCacheStore implements AutoCloseable {
       // 异步一次性扫描（逐 bucket 解码计数），不阻塞触发本次打开的读写；此后由
       // put/remove/compact 增量维护。排程与扫描之间恰被落盘的新写入会被重复计入一次——
       // 计数本就是近似值，偏差方向是「提前拒绝新写入」，保守无害。
-      boolean scheduled;
-      try {
-        // execute() 已把「队列满 / 已关闭 / RejectedExecutionException」统一折算成 false 并计入 errors，
-        // 因此正常只看返回值；这里的 try/catch 只是不让任何意外异常穿透 handle()。
-        scheduled = execute(() -> countDiskEntries(key, created));
-      } catch (Throwable throwable) {
-        scheduled = false;
-        fail("磁盘缓存补计任务提交失败", throwable);
-      }
+      // execute() 已把「队列满 / 已关闭 / RejectedExecutionException」统一折算成 false 并计入 errors，
+      // 四个出口都只 return，不会抛——因此直接看返回值。
+      boolean scheduled = execute(() -> countDiskEntries(key, created));
       if (!scheduled) {
         // 提交被拒时不能只清 entryCounted 就返回：句柄此刻已在 open 表里，之后 handle() 会直接命中
         // 这个已有句柄、再也不会走到本分支，注释承诺的「下次打开重试」永远不会发生——该文件的旧条目

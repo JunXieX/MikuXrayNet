@@ -91,8 +91,7 @@ public final class RevealProbe {
         int nx = x + DX[i];
         int ny = y + DY[i];
         int nz = z + DZ[i];
-        SectionOcclusion neighbourSection = store == null ? null
-            : store.section(nx >> 4, ny >> 4, nz >> 4);
+        SectionOcclusion neighbourSection = store.section(nx >> 4, ny >> 4, nz >> 4);
         boolean occluding = neighbourSection == null
             || neighbourSection.isOccluding(nx, ny, nz);
         neighbours.append(FACE_NAMES[i]).append(occluding ? "遮挡 " : "通畅 ");

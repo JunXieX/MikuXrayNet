@@ -19,7 +19,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
-import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
@@ -188,32 +187,25 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     }
   }
 
-  /** 注册监听器；白名单非空时启动实体类型索引的增量维护与低频兜底重建。 */
+  /**
+   * 注册监听器；白名单非空时启动实体类型索引的增量维护与低频兜底重建。
+   *
+   * <p><b>Folia + 非空白名单不会走到这里</b>：那个组合在 {@code ThrottlePipeline.plan} 里已判为「不注册」
+   * （Folia 无法安全枚举全服实体，索引建不起来，取消零位移包会让盔甲架/展示实体姿态卡住）。
+   * 平台校验只在装配入口做一次，这里不再重复判断。
+   */
   public void start() {
     if (!whitelist.isEmpty()) {
-      if (PlatformSupport.isFolia()) {
-        // Folia 下无法从单一线程安全枚举全服实体，因此建不了类型索引；没有索引就无从判断
-        // 「这个零位移包属于白名单实体（盔甲架 / 展示实体 / 物品展示…）」——而白名单里的实体
-        // 恰恰是「靠持续下发零位移包维持客户端姿态」的那一类。此时若照常取消零位移包，
-        // 玩家会看到这些实体位置/姿态卡住不动（能直接感知的体验问题）。
-        //
-        // 因此：宁可整项停用（少省一点带宽），也不能牺牲玩家可见的体验。
-        plugin.getLogger().warning("Folia 下无法安全枚举实体、白名单索引建不起来："
-            + "已停用「零位移实体包取消」（避免盔甲架/展示实体姿态卡住）；其余带宽功能不受影响");
-        return;
-      }
-      {
-        // 增量事件（实体加入/离开世界）与「世界卸载清表」由本类作为 Listener 一并接收；前者在实体所属线程、
-        // 后者在卸载线程触发，两者都只更新并发索引，不触碰 Bukkit 世界对象。
-        plugin.getServer().getPluginManager().registerEvents(this, plugin);
-        // 启动时先做一次「不限额」的全量建索引：让「插件启用前就已存在」的实体立即命中白名单
-        // （一次性启动开销可接受；运行期兜底才走区块分片，避免周期尖峰）
-        refreshEntityTypeIndex(Integer.MAX_VALUE);
-        // GlobalRegionScheduler：Paper 上落在主线程；周期以 tick 计。低频兜底只补漏接的事件，且已分片。
-        indexTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin,
-            scheduled -> refreshEntityTypeIndex(REBUILD_CHUNK_BUDGET), INDEX_REBUILD_TICKS,
-            INDEX_REBUILD_TICKS);
-      }
+      // 增量事件（实体加入/离开世界）与「世界卸载清表」由本类作为 Listener 一并接收；前者在实体所属线程、
+      // 后者在卸载线程触发，两者都只更新并发索引，不触碰 Bukkit 世界对象。
+      plugin.getServer().getPluginManager().registerEvents(this, plugin);
+      // 启动时先做一次「不限额」的全量建索引：让「插件启用前就已存在」的实体立即命中白名单
+      // （一次性启动开销可接受；运行期兜底才走区块分片，避免周期尖峰）
+      refreshEntityTypeIndex(Integer.MAX_VALUE);
+      // GlobalRegionScheduler：Paper 上落在主线程；周期以 tick 计。低频兜底只补漏接的事件，且已分片。
+      indexTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin,
+          scheduled -> refreshEntityTypeIndex(REBUILD_CHUNK_BUDGET), INDEX_REBUILD_TICKS,
+          INDEX_REBUILD_TICKS);
     }
     // 封包监听必须<b>最后</b>注册：白名单判定依赖上面建好的类型索引，而全量建索引在大服上要遍历
     // 所有世界的已加载区块（数百毫秒级）。若先行注册，封包线程会在索引仍为空时就开始判定——
@@ -226,8 +218,15 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
   /** 注销监听器与索引任务。 */
   public void stop() {
     if (indexTask != null) {
-      indexTask.cancel();
-      indexTask = null;
+      // 取消成功才抹句柄：失败时保留句柄，下次 stop() 还能重试（本类会被管线保留以便重试）
+      try {
+        indexTask.cancel();
+        indexTask = null;
+      } catch (Throwable throwable) {
+        // 不能因取消失败跳过下面的注销：否则旧 adapter 残留在 ProtocolLib 里、与重启后的新实例重复处理
+        plugin.getLogger().log(Level.WARNING,
+            "取消实体类型索引任务失败（保留句柄，下次停用重试）", throwable);
+      }
     }
     try {
       HandlerList.unregisterAll(this);

@@ -81,9 +81,14 @@ class DiskPayloadTest {
   }
 
   @Test
-  void emptyChunkBytesAreTreatedAsMiss() {
-    assertNull(DiskPayload.decode(DiskPayload.encode(1L, new int[0], null, null), 1L),
-        "区块字节为空视为未命中（fail-open）");
+  void emptyChunkBytesOnlyValidWithoutPositions() {
+    // 无改写的区块不写字节：命中后只用于「跳过解码」与恢复遮挡数据，writeBack 见空坐标清单直接返回
+    DiskPayload.Decoded unchanged = DiskPayload.decode(
+        DiskPayload.encode(1L, new int[0], null, null), 1L);
+    assertNotNull(unchanged, "0 个坐标的条目允许不带区块字节");
+    assertEquals(0, unchanged.data().length);
+    assertNull(DiskPayload.decode(DiskPayload.encode(1L, new int[] {5}, null, null), 1L),
+        "有伪装坐标却没有区块字节属畸形，必须按未命中处理");
   }
 
   @Test

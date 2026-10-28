@@ -83,9 +83,9 @@ public final class ThrottlePipeline {
     boolean entityCulling = config.entityCulling().enabled()
         && (config.entityCulling().raycast()
             || (config.entityCulling().frustum() != null && config.entityCulling().frustum().enabled()));
-    // 白名单为空时不需要类型索引（Folia 上仍可注册，所有实体按「非白名单」处理，是既定语义）
-    boolean whitelistConfigured = config.entityPackets().whitelist() != null
-        && !config.entityPackets().whitelist().isEmpty();
+    // 白名单为空时不需要类型索引（Folia 上仍可注册，所有实体按「非白名单」处理，是既定语义）。
+    // BandwidthConfig 用 Set.copyOf 构造该集合，恒非 null，故这里只判空。
+    boolean whitelistConfigured = !config.entityPackets().whitelist().isEmpty();
     return new ModulePlan(
         master && config.entityPackets().enabled() && config.entityPackets().skipZeroMovement()
             && !(folia && whitelistConfigured),

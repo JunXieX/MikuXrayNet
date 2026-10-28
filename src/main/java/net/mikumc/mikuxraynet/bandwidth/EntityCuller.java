@@ -615,21 +615,21 @@ public final class EntityCuller implements Listener {
     }
     ScheduledTask previous = recheckTasks.put(player.getUniqueId(), task);
     if (previous != null) {
-      previous.cancel();
+      cancelQuietly(previous);
     }
     // 与 hide() 同一套「入账后再读一次 volatile」收口：若 stop() 的取消循环已在我们入表<b>之前</b>
     // 跑完，它永远看不到这条任务，必须由我们自己取消（否则任务空跑到玩家退出并钉住旧实例）。
     if (stopping) {
       recheckTasks.remove(player.getUniqueId(), task);
-      task.cancel();
+      cancelQuietly(task);
     }
   }
 
+  /** 「取消任务失败」只提示一次（每实例；代价仅是该任务空跑到实体退役，不影响可见性）。 */
+  private final AtomicBoolean cancelFailureNoticed = new AtomicBoolean();
+
   private void cancelRecheckTask(UUID playerId) {
-    ScheduledTask task = recheckTasks.remove(playerId);
-    if (task != null) {
-      task.cancel();
-    }
+    cancelQuietly(recheckTasks.remove(playerId));
   }
 
   /**
@@ -643,10 +643,8 @@ public final class EntityCuller implements Listener {
    */
   private void cancelRecheckTasks() {
     for (UUID playerId : new ArrayList<>(recheckTasks.keySet())) {
-      ScheduledTask task = recheckTasks.remove(playerId);
-      if (task != null) {
-        task.cancel();
-      }
+      // 单条取消失败不能中断整轮：否则后面的玩家任务全部漏取消，钉住整个已停用的旧实例
+      cancelQuietly(recheckTasks.remove(playerId));
     }
   }
 
@@ -745,20 +743,31 @@ public final class EntityCuller implements Listener {
   private TrackedRotation seedRotationLazily(Player player) {
     // 用「玩家周围一定半径内的实体」补种，而不是 Player#getTrackedEntities()：后者在当前编译目标
     // （paper-api 26.2）上不存在。只在「该玩家尚无轮转队列」时执行一次（热重载后首次复检），是一次性开销。
-    TrackedRotation target = rotation(player.getUniqueId());
+    //
     // 半径 = 射线硬上限：模块<b>不可能</b>隐藏比 {@link #MAX_RAY_LENGTH} 更远的实体（超长射线一律 fail-open），
     // 而服务端的实体追踪距离（players/display 128，其它 ≤96）也都在这个半径内——因此它恰好覆盖
     // 「本模块隐藏得了、且客户端真的在渲染」的全部实体。
     // 不能取得更大：追踪范围外的实体永远收不到 untrack 事件，补种进来只会永久占用轮转槽位、稀释配额
     // （旧实现取强制可见距离的 8 倍 = 256 格，其中一半以上永不产生任何事件）。
     double radius = MAX_RAY_LENGTH;
+    List<Entity> seeds = new ArrayList<>();
     for (Entity entity : player.getWorld().getNearbyEntities(player.getLocation(), radius, radius, radius)) {
       // 只补种「本模块会剔除的实体」：其它玩家与烟花在 onTrack / submitRaycast 里被明确排除，
       // 若把它们补进轮转，通道② 会对其它玩家执行 hideEntity（热重载/启用后玩家短暂消失，PvP 可被利用）；
       // 玩家自己也要跳过（原实现用 entity != player，漏了其它玩家）。
-      if (entity == player || entity instanceof Player || entity instanceof Firework) {
+      // 跨区域实体必须跳过：TrackedRotation.add 会读 entity.getEntityId()，而本方法在玩家线程上跑，
+      // 补种半径（128）必然跨越区域切片——读跨区域实体会触发 Folia 线程校验并抛异常，补种就此半途失败，
+      // 队列却已留在 rotations 里、再也不会补种。这些实体本来也无法在本区域判定，跳过即可。
+      if (entity == player || entity instanceof Player || entity instanceof Firework
+          || !owns(entity)) {
         continue;
       }
+      seeds.add(entity);
+    }
+    // 收集完成后才把队列写进 rotations：先入表再遍历，一旦枚举抛异常就会留下一条<b>空队列</b>，
+    // 而 recheck 见到队列非 null 就再也不会补种——通道②对该玩家永久失效（且只是一条 FINE 日志）。
+    TrackedRotation target = rotation(player.getUniqueId());
+    for (Entity entity : seeds) {
       target.add(entity);
     }
     return target;
@@ -1539,8 +1548,14 @@ public final class EntityCuller implements Listener {
       for (HiddenEntry entry : drained.values()) {
         Entity entity = entry.entity();
         if (stillEnabled) {
-          // 热重载路径：回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
-          Schedulers.onEntity(plugin, player, () -> restoreWithRetry(player, entity, 0));
+          // 热重载路径：回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）。
+          // 调度可能失败（实体刚退役 / 停用瞬间被拒）：此时账本已被摘走，该实体不会再被恢复，
+          // 必须留下可见提示，不能静默（否则玩家一直看不到本该可见的实体）。
+          if (!Schedulers.onEntity(plugin, player, () -> restoreWithRetry(player, entity, 0))
+              && restoreFailureNoticed.compareAndSet(false, true)) {
+            plugin.getLogger().warning("热重载时未能调度被隐藏实体的恢复："
+                + "个别实体可能需玩家重新登录后才可见。");
+          }
         } else {
           // 停用路径：调度器已不可用（plugin.isEnabled()=false），同步恢复
           restoreNow(player, entity);
@@ -1681,13 +1696,22 @@ public final class EntityCuller implements Listener {
     }
   }
 
-  /** 取消重试任务；失败只意味着下一拍多看一次同样的状态，不影响语义。 */
-  private static void cancelQuietly(ScheduledTask task) {
-    if (task != null) {
-      try {
-        task.cancel();
-      } catch (Throwable ignored) {
-        // 任务已结束/已取消：忽略
+  /**
+   * 取消一个任务；失败只意味着它多空跑一拍（任务本身已随实体/区域退役），绝不能中断批量取消。
+   *
+   * <p>失败打一条 WARNING（每实例一次）：旧行为是让异常冒到 {@code stop()} 由上层记入「清理不完整」，
+   * 就地吞掉会丢掉这个唯一可见信号；而逐个玩家刷日志没有必要，故只留首例。
+   */
+  private void cancelQuietly(ScheduledTask task) {
+    if (task == null) {
+      return;
+    }
+    try {
+      task.cancel();
+    } catch (Throwable throwable) {
+      if (cancelFailureNoticed.compareAndSet(false, true)) {
+        plugin.getLogger().log(Level.WARNING,
+            "取消实体剔除任务失败（该任务可能空跑到实体退役；其余同类失败不再重复提示）", throwable);
       }
     }
   }

@@ -212,8 +212,10 @@ public final class OcclusionEngine implements AutoCloseable {
             if (closed) {
               return;
             }
-            Thread.currentThread().interrupt();
-            return;
+            // 非关停原因的中断（线程池复用 / 外部 interrupt）不得让工作线程永久退出：线程是 daemon 且
+            // 无人监督，一旦退出队列就再没人消费，默认 threads=1 时整个异步遮挡子系统静默失效。
+            // wait 抛异常时 JVM 已清除中断标志，直接回到等待即可。
+            continue;
           }
         }
         if (closed) {

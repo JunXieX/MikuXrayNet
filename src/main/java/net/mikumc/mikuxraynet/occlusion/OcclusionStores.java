@@ -1,5 +1,6 @@
 package net.mikumc.mikuxraynet.occlusion;
 
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -23,16 +24,39 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class OcclusionStores {
 
   private final ConcurrentHashMap<String, OcclusionStore> byWorld = new ConcurrentHashMap<>();
+  /**
+   * 已卸载、但尚未重新加载的世界名。
+   *
+   * <p><b>为什么需要墓碑</b>：卸载时 {@link #removeWorld} 只是把表摘掉并置 closed，而在途的改写任务
+   * （已入池、排队 1~10 ms）随后还会调 {@link #of(String)} 建表——没有墓碑就会<b>原地重建</b>一张未关闭的
+   * 新表，把旧世界的几何写进去；同名世界重新加载时它会被当成新世界数据读走（该显示却多藏）。
+   * 墓碑由 {@link #reactivate(String)}（世界加载事件）解除，之后的写才允许建新表。
+   */
+  private final Set<String> retired = ConcurrentHashMap.newKeySet();
 
   /**
    * 取（必要时懒建）某世界的仓库；供<b>写入方</b>（建表 / 方块补丁）使用。
    *
    * <p>{@code worldName} 为 {@code null} 时给出一张独立仓库（不与任何真实世界混），
    * 使「世界名未知」也不会污染真实世界的数据。
+   *
+   * @return {@code null} 表示该世界已卸载且尚未重新加载：调用方必须按「本次无数据」处理（丢弃写入）
    */
   public OcclusionStore of(String worldName) {
-    return byWorld.computeIfAbsent(worldName == null ? "" : worldName,
-        name -> new OcclusionStore());
+    String key = worldName == null ? "" : worldName;
+    if (retired.contains(key)) {
+      return null;
+    }
+    OcclusionStore store = byWorld.computeIfAbsent(key, name -> new OcclusionStore());
+    // 建表与 removeWorld 交错：建的过程中世界被卸载，则它可能已带着旧地图进表（removeWorld 只摘到
+    // 当时的那个实例）。复查墓碑，命中就摘掉本次新建的表并关闭，绝不让它留在表里被同名新世界读走。
+    if (retired.contains(key)) {
+      if (byWorld.remove(key, store)) {
+        store.closeAndClear();
+      }
+      return null;
+    }
+    return store;
   }
 
   /** 只读查询某世界的仓库；不存在返回 {@code null}（射线按「无遮挡数据」fail-open 处理）。 */
@@ -51,6 +75,15 @@ public final class OcclusionStores {
       // 写入；若不清空，同名世界重新加载时这张「旧世界的表」会被当成新世界几何读走（该显示却多藏）。
       removed.closeAndClear();
     }
+    // 墓碑阻止在途任务用 of() 重建表；世界加载时由 reactivate 解除
+    retired.add(worldName);
+  }
+
+  /** 世界已（重新）加载：解除墓碑，允许为该世界名重建遮挡表。 */
+  public void reactivate(String worldName) {
+    if (worldName != null) {
+      retired.remove(worldName);
+    }
   }
 
   /** 清空全部世界（插件停用 / 反矿透整体重建）。 */
@@ -59,6 +92,7 @@ public final class OcclusionStores {
       store.clear();
     }
     byWorld.clear();
+    retired.clear();
   }
 
   /** 当前驻留的世界数。本方法当前仅单测在用，保留以免破坏测试。 */

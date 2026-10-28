@@ -14,8 +14,10 @@ import net.mikumc.mikuxraynet.util.Diagnostics;
 import net.mikumc.mikuxraynet.util.ReloadCoordinator;
 import org.bukkit.Bukkit;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.world.ChunkUnloadEvent;
+import org.bukkit.event.world.WorldLoadEvent;
 import org.bukkit.event.world.WorldUnloadEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -354,10 +356,23 @@ public final class MikuXrayNet extends JavaPlugin {
    */
   void registerWorldUnloadInvalidation() {
     getServer().getPluginManager().registerEvents(new Listener() {
-      @EventHandler
+      // MONITOR + ignoreCancelled：WorldUnloadEvent 可被其它插件取消，而被取消的卸载不会再有
+      // WorldLoadEvent 来解除「已卸载」墓碑——一旦误立墓碑，该世界到重启前都建不了遮挡数据。
+      @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
       public void onWorldUnload(WorldUnloadEvent event) {
-        if (runtime != null) {
-          runtime.invalidateWorld(event.getWorld().getName());
+        AntiXrayRuntime current = runtime;
+        if (current != null) {
+          current.invalidateWorld(event.getWorld().getName());
+        }
+      }
+
+      @EventHandler
+      public void onWorldLoad(WorldLoadEvent event) {
+        // 与上面的卸载配套：卸载时给世界名立了「已卸载」墓碑，重新加载必须解除，
+        // 否则同名世界（副本/小游戏房间重载）永远建不了遮挡数据 → 矿不显形
+        AntiXrayRuntime current = runtime;
+        if (current != null) {
+          current.reactivateWorld(event.getWorld().getName());
         }
       }
 

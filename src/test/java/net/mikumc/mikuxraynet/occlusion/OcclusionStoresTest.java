@@ -73,6 +73,19 @@ class OcclusionStoresTest {
   }
 
   @Test
+  void removedWorldStaysRetiredUntilReactivated() {
+    OcclusionStores stores = new OcclusionStores();
+    stores.of("room").replaceSection(0, 0, 0, SolidOcclusion.INSTANCE);
+    stores.removeWorld("room");
+
+    assertNull(stores.of("room"),
+        "卸载后同名世界的在途写入不得重建表（否则旧几何会被当成新世界数据读走）");
+    stores.reactivate("room");
+    assertNotNull(stores.of("room"), "世界重新加载后必须能重建表（否则该世界永远没有遮挡数据）");
+    assertNull(stores.of("room").section(0, 0, 0), "重建出来的是空表，不得残留旧世界的几何");
+  }
+
+  @Test
   void residentSectionsSumsAcrossWorldsAndClearEmptiesEverything() {
     OcclusionStores stores = new OcclusionStores();
     stores.of("world").replaceSection(1, 0, 1, SolidOcclusion.INSTANCE);

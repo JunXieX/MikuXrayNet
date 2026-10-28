@@ -141,7 +141,6 @@ final class MovePacketFields {
     Field namedY = null;
     Field namedZ = null;
     Field vecDeltaField = null;
-    List<Field> anyShort = new ArrayList<>(4);
     // 失败时用于打印的字段形态清单：只在解析失败时被读取并写进 lastFailure。
     // 它随继承链遍历同步拼接（含成功路径），但本方法对每个具体包类只解析一次（结果进 CACHE），
     // 这点拼接摊到进程生命周期里可忽略，故不为「成功路径零开销」再引入分支。
@@ -165,8 +164,8 @@ final class MovePacketFields {
           if (ENTITY_ID.equals(field.getName())) {
             namedEntityId = field;
           }
-        } else if (fieldType == short.class && anyShort.size() < 3) {
-          anyShort.add(field);
+        } else if (fieldType == short.class) {
+          // 只认名字，不按声明序兜底：认不出就整类 fail-open（见下方 namedX/Y/Z 判定）
           if (DELTA_X.equals(field.getName())) {
             namedX = field;
           } else if (DELTA_Y.equals(field.getName())) {

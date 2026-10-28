@@ -628,6 +628,19 @@ public final class AntiXrayRuntime {
   }
 
   /**
+   * 世界重新加载：解除该世界名的「已卸载」墓碑，允许后续写入重建遮挡表。
+   *
+   * <p>卸载时 {@code OcclusionStores#removeWorld} 会给世界名立墓碑（阻止在途任务重建旧表），
+   * 必须在这里解除——否则同名世界重新加载后永远建不了遮挡数据（显形侧按「缺数据 = 遮挡」→ 矿不显形）。
+   */
+  void reactivateWorld(String worldName) {
+    OcclusionStores stores = this.occlusionStores;
+    if (stores != null) {
+      stores.reactivate(worldName);
+    }
+  }
+
+  /**
    * 区块卸载：摘除该区块整列的遮挡位图，使内存驻留量有界。
    *
    * <p><b>为什么按卸载驱逐是安全的</b>：区块卸载意味着附近已无玩家，而射线只服务于「玩家周围的

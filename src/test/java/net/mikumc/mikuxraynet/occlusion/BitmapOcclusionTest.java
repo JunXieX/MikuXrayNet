@@ -88,6 +88,17 @@ class BitmapOcclusionTest {
   }
 
   @Test
+  void repeatedSetToSameValueDoesNotDriftCount() {
+    BitmapOcclusion bitmap = new BitmapOcclusion();
+    bitmap.setOccluding(3, 3, 3, true);
+    bitmap.setOccluding(3, 3, 3, true);
+    bitmap.setOccluding(3, 3, 3, true);
+    assertFalse(bitmap.isEmpty());
+    bitmap.setOccluding(3, 3, 3, false);
+    assertTrue(bitmap.isEmpty(), "重复设置同一值不得让置位数漂移（isEmpty 走缓存计数）");
+  }
+
+  @Test
   void emptyBitmapReportsEmpty() {
     assertTrue(new BitmapOcclusion().isEmpty());
     BitmapOcclusion bitmap = new BitmapOcclusion();

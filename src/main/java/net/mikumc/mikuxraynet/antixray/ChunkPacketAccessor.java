@@ -221,14 +221,22 @@ public final class ChunkPacketAccessor {
       return;
     }
 
-    List<Object> kept = new ArrayList<>(entries.size());
+    // 单趟 + 惰性分配：一条都没剔除（常态）时零分配、每实体只反射取一次坐标；
+    // 首次命中时才复制已确认保留的前缀，之后逐个追加。
+    List<Object> kept = null;
+    int index = 0;
     for (Object entry : entries) {
-      if (!isObfuscated(entry, localPositions, minHeight)) {
+      if (isObfuscated(entry, localPositions, minHeight)) {
+        if (kept == null) {
+          kept = new ArrayList<>(entries.size() - 1);
+          kept.addAll(entries.subList(0, index));
+        }
+      } else if (kept != null) {
         kept.add(entry);
       }
+      index++;
     }
-
-    if (kept.size() != entries.size()) {
+    if (kept != null) {
       fieldPlan.blockEntities().set(chunkData, kept);
     }
   }

@@ -55,15 +55,14 @@ public final class DiskPayload {
   /**
    * 编码一条负载。
    *
-   * <p><b>编解码刻意不对称，空负载由上层拒绝</b>：本方法允许 {@code data} 为 {@code null} 或空（照常写出
-   * 完整头部），而 {@link #decode} 对空 data 返回 {@code null}。契约是「空负载在上层就被拒绝」——
-   * {@code DiskCacheStore#put} 会丢弃 {@code null}/空 payload，因此正常路径根本不会写出空负载；编码侧
-   * 保持宽容只是为了不因入参抛异常，读写两侧的不对称兜底统一交由上层完成。
+   * <p><b>空区块字节的语义</b>：{@code data} 为空只对「没有任何伪装坐标」的条目合法——这类条目命中后
+   * 不做任何写回（{@code writeBack} 见空坐标清单直接返回），因此省掉整块区块字节；反之「有伪装坐标却
+   * 没有字节」是畸形，{@link #decode} 一律拒绝（否则命中后会按空字节写回封包）。
    *
    * @param sourceHash 原始（未改写）区块字节的指纹
    * @param positions  被伪装坐标；{@code null} 视为空
    * @param occlusion  整列遮挡数据负载；{@code null} 视为「无」（写出长度 0）
-   * @param data       改写后的区块字节；{@code null} 视为空（但正常路径不应传空，见上）
+   * @param data       改写后的区块字节；{@code null} 视为空。无伪装坐标的条目按空字节写（见 {@link #decode}）
    */
   public static byte[] encode(long sourceHash, int[] positions, byte[] occlusion, byte[] data) {
     int[] coordinates = positions == null ? new int[0] : positions;
@@ -109,7 +108,8 @@ public final class DiskPayload {
         positions[index] = buffer.getInt();
       }
       int occlusionLength = buffer.getInt();
-      if (occlusionLength < 0 || occlusionLength > buffer.remaining() - 1) {
+      // 遮挡负载可以吃掉全部剩余字节（其后是否允许没有区块字节由下面的坐标数决定）
+      if (occlusionLength < 0 || occlusionLength > buffer.remaining()) {
         return null;
       }
       byte[] occlusion = null;
@@ -119,7 +119,10 @@ public final class DiskPayload {
       }
       byte[] data = new byte[buffer.remaining()];
       buffer.get(data);
-      if (data.length == 0) {
+      // 空区块字节合法，且只对应「没有任何伪装坐标」的条目：这类条目命中后不需要写回字节
+      // （writeBack 按空坐标清单直接返回），写盘时省掉整块区块字节（几十~几百 KB）。
+      // 反之「有伪装坐标却没有字节」是畸形，必须拒绝——否则命中后会按空字节写回封包。
+      if (data.length == 0 && count > 0) {
         return null;
       }
       return new Decoded(sourceHash, positions, occlusion, data);

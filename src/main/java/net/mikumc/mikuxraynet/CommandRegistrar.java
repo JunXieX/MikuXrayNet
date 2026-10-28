@@ -2,7 +2,6 @@ package net.mikumc.mikuxraynet;
 
 import io.papermc.paper.command.brigadier.BasicCommand;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
-import io.papermc.paper.command.brigadier.Commands;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import java.util.Collection;
 import java.util.List;
@@ -53,43 +52,24 @@ final class CommandRegistrar {
 
   /** 注册管理命令（执行器与补全器）：仅在 Paper/Folia 的 Brigadier 生命周期路径上注册。 */
   void register() {
+    // 真正的注册动作发生在 COMMANDS 事件分发时，因此异常保护必须放在 lambda 内：只包住
+    // registerEventHandler 会漏掉「重复注册 / registrar 已关闭」这类真正的失败；
+    // 成功日志也只能在真正 register 之后打，否则失败时会出现「先说已注册、再报失败」。
     try {
       MikuCommand executor = new MikuCommand(plugin);
-      if (registerLifecycleCommand(executor)) {
-        plugin.getLogger().fine("管理命令 /" + COMMAND_NAME + " 已按 paper-plugin.yml 现代方式注册");
-        return;
-      }
-      // registerLifecycleCommand 返回 false 时已经把真实异常打进日志（见其 catch），这里只汇总一句；
-      // 不再断言「当前核心不是 Paper/Folia」——本项目只跑 Paper/Folia，那样写会把「生命周期管理器
-      // 已关闭 / 重复注册 / 事件类型不匹配」等真实故障误报成「装错了端」，把排查带偏。
-      plugin.getLogger().warning("注册管理命令失败：命令生命周期 API 不可用或注册被拒"
-          + "（详见上一条异常日志），管理命令不可用。");
-    } catch (Throwable throwable) {
-      plugin.getLogger().log(Level.WARNING, "注册管理命令失败（管理命令不可用）", throwable);
-    }
-  }
-
-  /**
-   * 在现代生命周期事件 {@code COMMANDS} 中注册命令（Paper 与 Folia 是同一套 API）。
-   *
-   * <p>返回 {@code false} 表示注册失败（已被吞掉的异常在返回前打进 WARNING 日志——**必须**留下真实
-   * 原因，否则调用方只能猜，过去就出现过把「生命周期管理器已关闭 / 重复注册」误报成「核心不是
-   * Paper/Folia」的情况）。另注意求值顺序：{@code getLifecycleManager()} 先于 lambda 求值。
-   */
-  private boolean registerLifecycleCommand(MikuCommand executor) {
-    try {
       plugin.getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-        Commands commands = event.registrar();
-        commands.register(COMMAND_NAME, COMMAND_DESCRIPTION, COMMAND_ALIASES,
-            new PaperCommandBridge(executor));
+        try {
+          event.registrar().register(COMMAND_NAME, COMMAND_DESCRIPTION, COMMAND_ALIASES,
+              new PaperCommandBridge(executor));
+          plugin.getLogger().fine("管理命令 /" + COMMAND_NAME + " 已按 paper-plugin.yml 现代方式注册");
+        } catch (Throwable throwable) {
+          plugin.getLogger().log(Level.WARNING,
+              "注册管理命令失败（/" + COMMAND_NAME + " 不可用）", throwable);
+        }
       });
-      return true;
     } catch (Throwable throwable) {
-      // 真实故障（生命周期管理器已关闭、重复注册、事件类型不匹配…）必须带堆栈留档：
-      // 只返回 false 会让上层只剩一句「注册失败」，管理员与后续排查者都拿不到原因。
       plugin.getLogger().log(Level.WARNING,
-          "命令生命周期注册失败（/ " + COMMAND_NAME + " 将不可用）", throwable);
-      return false;
+          "命令生命周期 API 不可用（/" + COMMAND_NAME + " 不可用）", throwable);
     }
   }
 

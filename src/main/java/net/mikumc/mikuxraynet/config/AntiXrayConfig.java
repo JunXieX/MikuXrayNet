@@ -862,14 +862,14 @@ public final class AntiXrayConfig {
     this.proximity = proximity;
     this.diskCache = diskCache;
     this.platform = platform == null ? PlatformSupport.Mode.AUTO : platform;
-    this.cacheMaximumSize = Math.max(1, cacheMaximumSize);
-    // 解析侧已按 [CACHE_MAXIMUM_MB_MIN, CACHE_MAXIMUM_MB_MAX] 钳制并留痕；这里只兜底非正数，
-    // 避免「配置项缺省/被写成 0」时把上限变成 0 而让缓存永久不可写（与 cacheMaximumSize 同口径）。
-    this.cacheMaximumMb = Math.max(1, cacheMaximumMb);
-    this.cacheExpireAfterAccessSeconds = Math.max(1, cacheExpireAfterAccessSeconds);
-    this.threads = Math.max(0, threads);
-    this.timeoutMillis = Math.max(100, timeoutMillis);
-    this.queueCapacity = Math.max(1, queueCapacity);
+    // 数值字段一律由解析侧（from）双端钳制并留痕，这里不再二次钳制：静默 Math.max 会掩蔽解析侧
+    // 将来漏钳的真实缺陷（管理员既看不到 WARN，也无从判断配置是否被改写）。
+    this.cacheMaximumSize = cacheMaximumSize;
+    this.cacheMaximumMb = cacheMaximumMb;
+    this.cacheExpireAfterAccessSeconds = cacheExpireAfterAccessSeconds;
+    this.threads = threads;
+    this.timeoutMillis = timeoutMillis;
+    this.queueCapacity = queueCapacity;
     this.unresolvedTags = unresolvedTags == null ? Set.of() : Set.copyOf(unresolvedTags);
     this.worldOverrides = List.copyOf(worldOverrides);
     // 被安全下限抬升过的键（空 = 未抬升）；加载时由 warnIfConfigAdjusted 一次性提示
@@ -1225,8 +1225,8 @@ public final class AntiXrayConfig {
         clampCeiling(root.getInt("advanced.threads", 0), 0, ADVANCED_THREADS_MAX,
             "advanced.threads", floorAdjustments, ceilingAdjustments),
         // advanced.timeout-millis：有效区间 [ADVANCED_TIMEOUT_MILLIS_MIN, ADVANCED_TIMEOUT_MILLIS_MAX]。
-        // 下限不是新行为——构造器的 Math.max(100, ...) 一直把 <100 的取值按 100 生效，只是过去不留痕；
-        // 这里显式按同一区间钳制，让「配置 50、实际 100」也进入 floorAdjustments（绝不静默抬高配置值）。
+        // 钳制只在这里做（构造器不再二次 Math.max）：<100 的取值按 100 生效并进入 floorAdjustments，
+        // 让「配置 50、实际 100」也能在加载日志里看到（绝不静默抬高配置值）。
         // 上限直接决定单任务能挂住一条工作线程多久，见 ADVANCED_TIMEOUT_MILLIS_MAX。
         clampCeiling(root.getInt("advanced.timeout-millis", 2500), ADVANCED_TIMEOUT_MILLIS_MIN,
             ADVANCED_TIMEOUT_MILLIS_MAX, "advanced.timeout-millis",

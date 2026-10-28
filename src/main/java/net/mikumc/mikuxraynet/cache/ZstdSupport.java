@@ -284,11 +284,12 @@ public final class ZstdSupport {
    */
   static String platformToken(String osName) {
     String os = osName == null ? "" : osName.toLowerCase(Locale.ROOT);
-    if (os.contains("win")) {
-      return "win";
-    }
+    // mac/darwin 必须先判：Darwin 含子串 "win"，按 Windows 判会下错平台的原生库（随后回退 Deflater）
     if (os.contains("mac") || os.contains("darwin")) {
       return "macos";
+    }
+    if (os.contains("win")) {
+      return "win";
     }
     if (os.contains("linux")) {
       return "linux";
@@ -872,8 +873,8 @@ public final class ZstdSupport {
   /**
    * 计算文件的 SHA-256 十六进制小写摘要。
    *
-   * <p>测试专用豁免：生产下载路径已改为在 {@link #download} 过程中<b>流式</b>计算摘要（不再回读文件），
-   * 本方法当前仅单测在用，保留以免破坏测试。
+   * <p>生产路径两处使用：下载时在 {@link #download} 内<b>流式</b>计算（不回读文件），以及
+   * {@code initialize} 校验「本地已存在」的 jar（见 {@code matchesExpectedSha256}）。
    */
   static String sha256Hex(Path file) throws IOException {
     try {

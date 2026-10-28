@@ -1019,7 +1019,7 @@ public final class ObfuscationProcessor {
       int minSectionY = worldMinY >> 4;
       int sectionCount = chunk.getSectionCount();
       OcclusionStore store = stores.of(worldName);
-      if (store.isClosed()) {
+      if (store == null || store.isClosed()) {
         // 世界已卸载：本趟建表作废（closed 会丢弃所有写入），等新世界的区块重新发布；
         // 返回 null = 「本次没有遮挡负载」，不改写/缓存行为。
         return null;
@@ -1102,11 +1102,22 @@ public final class ObfuscationProcessor {
       return;
     }
     try {
+      OcclusionStore store = stores.of(worldName);
+      if (store == null) {
+        return; // 世界已卸载且尚未重新加载：丢弃本次恢复（墓碑见 OcclusionStores#of）
+      }
+      // 活表已完整（稳态下几乎总是）时直接返回：整列解码每位图段要复制 512 B，
+      // 主世界十几段就是每次命中约 6~10 KB 的分配，而这些数据随后会被逐段丢弃。
+      int sectionCount = OcclusionPayload.sectionCount(occlusion);
+      if (sectionCount <= 0
+          || !store.hasMissingSection(chunkX, minSectionY, chunkZ, sectionCount)) {
+        return;
+      }
       SectionOcclusion[] column = OcclusionPayload.decode(occlusion);
       if (column == null) {
         return;
       }
-      stores.of(worldName).restoreMissingColumn(chunkX, minSectionY, chunkZ, column);
+      store.restoreMissingColumn(chunkX, minSectionY, chunkZ, column);
     } catch (RuntimeException | LinkageError ignored) {
       // fail-open：恢复失败只意味着少一份遮挡数据。
       // 只吞 RuntimeException / LinkageError，不吞 OOM 等 Error（与 captureOcclusion 同口径）。

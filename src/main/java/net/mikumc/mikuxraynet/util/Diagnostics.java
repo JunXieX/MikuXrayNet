@@ -144,8 +144,7 @@ public final class Diagnostics {
       /**
        * 兼容构造（不含三项新增的「静默路径」计数，等价于全 0）。
        *
-       * <p>保留它是为了不破坏既有调用点与单测：新增字段只在对应异常/竞态实际发生时才非 0，
-       * 其余场景与旧快照逐字段一致。
+       * <p>单测用它构造「旧版快照」形态，验证新增字段缺失时的格式化输出与零值语义。
        */
       public Rewrite(long cacheHits, long cacheMisses, int cacheEntries,
           long cacheContentRejected,
@@ -194,14 +193,6 @@ public final class Diagnostics {
 
       /** 显形索引未启用时的零值兜底。 */
       public static final Index EMPTY = new Index(0, 0, 0, 0L, 0L, 0L, 0L, 0L);
-
-      /** 兼容构造（不含累计登记/摘除，等价于「无从判断」，用于既有调用点与单测）。 */
-      public Index(int obfuscatedChunkCount, int obfuscatedPositionCount,
-          int revealedPositionCount, long revealedRegisteredTotal,
-          long indexEvictedByCapacity, long revealedDroppedByCapacity) {
-        this(obfuscatedChunkCount, obfuscatedPositionCount, revealedPositionCount,
-            revealedRegisteredTotal, indexEvictedByCapacity, revealedDroppedByCapacity, 0L, 0L);
-      }
     }
 
     /**
@@ -257,8 +248,7 @@ public final class Diagnostics {
       /**
        * 兼容构造（不含 {@code cleanupIncomplete}，等价于「清理完整」）。
        *
-       * <p>保留它是为了不破坏既有调用点与单测：新增的可观测字段只在停用失败时才有意义，
-       * 其余场景恒为 {@code false}。
+       * <p>单测用它构造「旧版快照」形态，验证新增字段缺失时的格式化输出与零值语义。
        */
       public Throttle(long entityPacketsCancelled, long entityPacketsPassed,
           long entityMovePackets, long entityMoveRotPackets, long entityLookPackets,

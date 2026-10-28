@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.antixray;
 
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -364,11 +365,8 @@ public final class RevealedSet {
    * <p>锁序与计数口径完全复用 {@link #clearChunk(ChunkKey, UUID)} 的「判活 + 实例匹配 + 扣减」。
    */
   void removePosition(UUID playerId, String worldName, int x, int y, int z) {
-    if (playerId == null || worldName == null) {
-      // 无玩家标识（理论上不会发生）：保守退回全局摘除，语义不弱于调用方预期
-      removePosition(worldName, x, y, z);
-      return;
-    }
+    Objects.requireNonNull(playerId, "playerId");
+    Objects.requireNonNull(worldName, "worldName");
     ChunkKey key = ChunkKey.ofBlock(worldName, x, z);
     ConcurrentHashMap<UUID, Marker> players = chunks.get(key);
     if (players == null) {
@@ -457,11 +455,7 @@ public final class RevealedSet {
    * 并复用同一套判活与计数扣减口径（见 {@link #clearPlayer}）。
    */
   void clearChunk(ChunkKey key, UUID playerId) {
-    if (playerId == null) {
-      // 无玩家标识（理论上不会发生）：退回整体失效，语义更保守
-      clearChunk(key);
-      return;
-    }
+    Objects.requireNonNull(playerId, "playerId");
     ConcurrentHashMap<UUID, Marker> players = chunks.get(key);
     if (players == null) {
       return;

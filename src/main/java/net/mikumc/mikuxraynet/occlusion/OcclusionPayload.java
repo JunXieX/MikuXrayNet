@@ -118,6 +118,20 @@ public final class OcclusionPayload {
   }
 
   /**
+   * 只读负载头部的段数（<b>不解码位图、不分配</b>）；长度不足或段数越界返回 {@code -1}。
+   *
+   * <p>供「命中缓存但活表已完整」的路径先做廉价探测：这时整列解码出来的位图会被全部丢弃，
+   * 白付每命中的数 KB 分配。
+   */
+  public static int sectionCount(byte[] blob) {
+    if (blob == null || blob.length < HEADER_BYTES) {
+      return -1;
+    }
+    int count = ByteBuffer.wrap(blob).getInt();
+    return count < 0 || count > MAX_SECTIONS ? -1 : count;
+  }
+
+  /**
    * 解码整列遮挡数据。
    *
    * @return 下标即 section 偏移的数组；输入为 {@code null}、长度不足、标签非法或长度不匹配时返回 {@code null}

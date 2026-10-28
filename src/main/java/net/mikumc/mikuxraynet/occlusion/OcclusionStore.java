@@ -592,8 +592,13 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     return filled;
   }
 
-  /** 只读预检：该列是否存在任一缺失段（无锁乐观读，命中路径用它避免无谓加锁）。 */
-  private boolean hasMissingSection(int chunkX, int minSectionY, int chunkZ, int sectionCount) {
+  /**
+   * 只读预检：该列是否存在任一缺失段（无锁乐观读）。
+   *
+   * <p>两个用途：缓存命中的恢复路径用它跳过「整列都已存在」时的整列解码与写锁；
+   * {@link #restoreMissingColumn} 用它避免每次命中都抢 writeMutex。
+   */
+  public boolean hasMissingSection(int chunkX, int minSectionY, int chunkZ, int sectionCount) {
     for (int i = 0; i < sectionCount; i++) {
       int sectionY = minSectionY + i;
       if (sectionY < SectionKey.SECTION_Y_MIN || sectionY > SectionKey.SECTION_Y_MAX) {

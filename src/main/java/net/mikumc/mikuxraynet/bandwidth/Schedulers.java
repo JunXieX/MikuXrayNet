@@ -40,15 +40,21 @@ public final class Schedulers {
   /**
    * 在实体所属线程执行一次任务；因插件已停用被拒时打一次中文 WARN（不再完全静默），
    * 实体已退役等正常情形仍静默放弃（剔除模块本身是可选优化，失败不影响正确性）。
+   *
+   * @return {@code true} 表示已成功登记调度；{@code false} 表示本次任务<b>不会执行</b>
+   *         （插件已停用 / 实体已退役）。停用恢复路径必须看这个返回值：账本已被摘走时，
+   *         一次未执行的恢复就等于该实体/视距永久停在旧状态，必须留下可见提示。
    */
-  public static void onEntity(Plugin plugin, Entity entity, Runnable task) {
+  public static boolean onEntity(Plugin plugin, Entity entity, Runnable task) {
     try {
       // 第三参数是「实体已退役」的回调，传 null 表示不处理退役（与原实现一致）
-      entity.getScheduler().run(plugin, scheduled -> task.run(), null);
+      return entity.getScheduler().run(plugin, scheduled -> task.run(), null) != null;
     } catch (IllegalPluginAccessException disabled) {
       noticeRejected(plugin);
+      return false;
     } catch (Throwable ignored) {
       // 实体已退役：放弃执行（剔除模块本身是可选优化，失败不影响正确性）
+      return false;
     }
   }
 

@@ -204,7 +204,10 @@ public final class MikuCommand {
    */
   private void replyToSender(CommandSender sender, String text) {
     if (sender instanceof Entity entity) {
-      Schedulers.onEntity(plugin, entity, () -> safeMessage(sender, text));
+      if (!Schedulers.onEntity(plugin, entity, () -> safeMessage(sender, text))) {
+        // 调度被拒（停用瞬间 / 实体退役）：直接尽力发一次，回显失败也由 safeMessage 吞掉
+        safeMessage(sender, text);
+      }
       return;
     }
     try {

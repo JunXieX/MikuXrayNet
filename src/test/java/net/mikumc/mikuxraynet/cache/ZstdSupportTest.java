@@ -221,6 +221,9 @@ class ZstdSupportTest {
         {"Mac OS X", "amd64", "darwin_x86_64"},
         {"Mac OS X", "aarch64", "darwin_aarch64"},
         {"Mac OS X", "arm64", "darwin_aarch64"},
+        // 部分 JVM 报告 os.name="Darwin"：它含子串 "win"，必须先按 macOS 识别，否则会下错 Windows 包
+        {"Darwin", "aarch64", "darwin_aarch64"},
+        {"Darwin", "x86_64", "darwin_x86_64"},
         // Linux：真实分类器里没有 linux_x86，32 位一律是 linux_i386
         {"Linux", "amd64", "linux_amd64"},
         {"Linux", "x86_64", "linux_amd64"},

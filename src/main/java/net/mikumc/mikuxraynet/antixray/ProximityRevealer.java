@@ -29,6 +29,7 @@ import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
 import org.bukkit.event.block.BlockDamageEvent;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
@@ -604,8 +605,14 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
-  /** 世界卸载：整体清理该世界的已显形标记（伪装清单由改写链路一并失效）。 */
-  @EventHandler(ignoreCancelled = true)
+  /**
+   * 世界卸载：整体清理该世界的已显形标记（伪装清单由改写链路一并失效）。
+   *
+   * <p>MONITOR：与主类的同名监听一致——清理动作不可逆（索引/标记清掉后区块不会自动重发），
+   * 必须等所有插件表态完毕、确认卸载真的会发生再执行；否则第三方在 NORMAL 取消卸载时，
+   * 该世界的假矿会在区块重发前再也无法被还原。
+   */
+  @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
   public void onWorldUnload(WorldUnloadEvent event) {
     try {
       String worldName = event.getWorld().getName();
@@ -767,8 +774,6 @@ public final class ProximityRevealer implements Listener {
     // 只把纯值交给工作线程；这里的 Player 引用仅供「交回所属线程」调度使用，工作线程不对它做任何调用
     ProximitySelector.Eye eye = eyeOf(player);
 
-    int[] coordinates = flatten(candidates);
-
     if (!canOffloadPlanning(workPool)) {
       // 队列已满 / 未装配工作池：本轮直接跳过（计入统计），候选仍在伪装索引里，下一巡检周期会重新取到。
       // 为什么不在当前线程同步算完：这里的候选筛选最多要做 MAX_CANDIDATES 次「暴露面 + 多候选点射线」，
@@ -779,8 +784,9 @@ public final class ProximityRevealer implements Listener {
     }
 
     try {
+      // flatten 放进工作线程：它是纯值转换，没理由每玩家每周期在区域线程上分配最多 6 KB 的 int[]
       workPool.execute(() -> {
-        Plan plan = computePlan(eye, coordinates, worldName, visibility);
+        Plan plan = computePlan(eye, flatten(candidates), worldName, visibility);
         // 读方块与发包必须回到玩家所属线程。世界在候选筛选时已捕获（见 reveal 的 world 局部量），
         // 这里绝不再取 player.getWorld()：异步回调期间玩家可能已切换世界，重取会让「旧世界的候选坐标」
         // 配上「新世界的 ChunkKey」（污染已显形集合）并发出冗余包。改用捕获的世界，且校验玩家仍在同一
@@ -1115,9 +1121,9 @@ public final class ProximityRevealer implements Listener {
           revealEcho.computeIfAbsent(playerId, id -> new ConcurrentHashMap<>());
       long now = System.nanoTime();
       if (perPlayer.size() >= REVEAL_ECHO_MAX_PER_PLAYER) {
-        // 先只清「已过窗口」的记号：满表绝大多数是这些陈旧项，清完仍满才整体清空。
-        // 不先清理就直接 clear() 会把仍在 2 秒窗口内的有效记号一并抹掉——那些在途显形包随后会被当成
-        // 真实变更，从全服共享的伪装索引里摘掉（其它玩家只能等区块重发），正是本机制要防的失效。
+        // 满表绝大多数是「已过窗口」的陈旧项：先只清这些，避免每次插入都跑一遍全表扫描。
+        // 清完仍满（窗口内条数确实超上限，只有极端配置可达）才整体清空——这是硬上界，
+        // 代价是抹掉仍在窗口内的记号（该坐标此后被当成真实变更摘一次共享索引，下一周期补显形）。
         pruneExpiredEchoes(perPlayer, now);
         if (perPlayer.size() >= REVEAL_ECHO_MAX_PER_PLAYER) {
           perPlayer.clear();
@@ -2037,7 +2043,13 @@ public final class ProximityRevealer implements Listener {
       }
     }
     if (schedule) {
-      Schedulers.onEntity(plugin, player, () -> drainChunkReveals(player));
+      if (!Schedulers.onEntity(plugin, player, () -> drainChunkReveals(player))) {
+        // 调度没跑（实体恰在此时退役 / 停用竞态）：复位闸门，下一次区块下发重新排队。
+        // 不复位就会让 scheduled 永远停在 true，该玩家的「区块下发即显形」整局失效。
+        synchronized (pending) {
+          pending.scheduled = false;
+        }
+      }
     }
   }
 
@@ -2092,8 +2104,12 @@ public final class ProximityRevealer implements Listener {
             reschedule = true;
           }
         }
-        if (reschedule) {
-          Schedulers.onEntity(plugin, player, () -> drainChunkReveals(player));
+        if (reschedule
+            && !Schedulers.onEntity(plugin, player, () -> drainChunkReveals(player))) {
+          // 续期调度没跑（实体退役 / 停用竞态）：复位闸门，否则该玩家后续区块下发都不会再排队
+          synchronized (pending) {
+            pending.scheduled = false;
+          }
         }
       }
     } catch (Throwable throwable) {
@@ -2420,7 +2436,12 @@ public final class ProximityRevealer implements Listener {
       return;
     }
     mark.scheduled = true;
-    Schedulers.onEntity(plugin, player, () -> retryViewChange(player));
+    if (Schedulers.onEntity(plugin, player, () -> retryViewChange(player))) {
+      return;
+    }
+    // 调度没跑（实体退役 / 停用竞态）：复位闸门。视野变化的补扫链由下一次移动/转向事件重建，
+    // 但闸门不复位会让该玩家此后再也排不上补扫。
+    mark.scheduled = false;
   }
 
   private void retryViewChange(Player player) {

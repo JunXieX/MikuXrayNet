@@ -31,10 +31,11 @@ public final class ProtocolLibHook {
   private final Plugin plugin;
   private final Logger logger;
 
-  private ProtocolManager protocolManager;
-  private AsynchronousManager asynchronousManager;
-  private AsyncListenerHandler asyncListenerHandler;
-  private ProtocolLibAsyncListener listener;
+  // 装配/停用写，诊断任务（全局区域线程）与 dump（异步线程）读，故必须 volatile（同类字段见 MikuXrayNet）
+  private volatile ProtocolManager protocolManager;
+  private volatile AsynchronousManager asynchronousManager;
+  private volatile AsyncListenerHandler asyncListenerHandler;
+  private volatile ProtocolLibAsyncListener listener;
 
   public ProtocolLibHook(Plugin plugin) {
     this.plugin = plugin;

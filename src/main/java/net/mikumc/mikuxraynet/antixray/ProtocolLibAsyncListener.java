@@ -54,6 +54,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** 未配对的批次闸门数量上限（异常情况下防止无界增长）。 */
   private static final int MAX_PENDING_BATCHES = 256;
 
+  /** 空字节数组：未改写区块的磁盘负载不带区块字节（见 {@code rewrite} 的写入点）。 */
+  private static final byte[] EMPTY_BYTES = new byte[0];
+
   /**
    * 缓存值：源字节指纹 + 改写结果（不含任何封包或世界引用）。
    *
@@ -831,18 +834,23 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 启用异步遮挡时，位图缺失的结果不入缓存（否则该区块会长期「已伪装但永远无位图」→ 玩家漏矿）。
     boolean occlusionRequired = processor.occlusionEnabled();
     if (resultCacheable(result, occlusionRequired)) {
-      CachedChunk value = new CachedChunk(sourceHash, result.data(), result.obfuscatedPositions(),
-          result.occlusion());
+      // 无伪装坐标的区块两级缓存都不保留区块字节：命中后不做任何写回（writeBack 见空坐标即返回），
+      // 留着只会按几十 KB 计入内存/磁盘的字节预算，把真正改写过的条目挤出去。
+      int[] positions = result.obfuscatedPositions();
+      byte[] bytes = result.changed() ? result.data() : EMPTY_BYTES;
+      CachedChunk value = new CachedChunk(sourceHash, bytes, positions, result.occlusion());
       cache.put(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint, value);
       if (diskCache != null) {
         // 写入是「提交即返回」的异步操作（自有磁盘线程），不阻塞本工作线程。
         // 用惰性负载重载：先按编码后的长度判定容量，通过后才真正编码——编码要分配并整块拷贝
         // 改写后的区块字节（几十~几百 KB），被拒时（条目达上限 / 磁盘线程积压）这次拷贝纯属浪费。
         // 负载里带上被伪装坐标（命中时重新写入显形索引）与整列遮挡数据（命中时恢复遮挡仓库）。
+        //
+        // 同上：无伪装坐标的区块不带字节，只保留坐标数/遮挡数据（几十字节），不再为「从未写回」的
+        // 整块区块字节付磁盘占用。
         diskCache.put(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint,
-            DiskPayload.encodedLength(result.obfuscatedPositions(), result.occlusion(), result.data()),
-            () -> DiskPayload.encode(sourceHash, result.obfuscatedPositions(), result.occlusion(),
-                result.data()));
+            DiskPayload.encodedLength(positions, result.occlusion(), bytes),
+            () -> DiskPayload.encode(sourceHash, positions, result.occlusion(), bytes));
       }
     }
     // 失败结果：data == source 且伪装位置为空 → writeBack 直接返回，原包照常下发（fail-open 语义不变）。
@@ -947,9 +955,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 工作池与看门狗都已随停用关闭，入队只会被丢弃。立刻自行放行原包，避免该区块封包永久无人
       // signalOnce（玩家卡在区块加载界面直到重登）。
       if (stopping) {
-        // 再摘一次登记兜底（重复 remove 幂等）：任何早退分支都必须确保条目不会滞留，
-        // 否则 RewriteTask → delivery → PacketEvent → NMS 区块数据整条引用链都会被钉在表里。
-        pendingCaptures.remove(task);
+        // 首行已无条件摘除登记；本回调其余早退分支无需再摘（task 不会在回调执行期间被重新登记）
         timeout.cancel(false);
         task.signalOnce();
         return;
@@ -961,7 +967,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // OPEN 就会被它抢到并放行原包。对尚未到期的正常任务这么调，等于把每个需要邻块的区块都按原包放行、
       // 彻底跳过抓取与改写，功能直接失效。
       if (task.expired()) {
-        pendingCaptures.remove(task);
         // 已到时限：由本回调抢先放行（fail-open 语义本就成立），并沿用看门狗的「超时放行」计数口径；
         // 返回 false 表示看门狗 / 停用兜底已先一步放行，同样不必再抓取。
         if (task.releaseOnTimeout()) {

@@ -31,6 +31,15 @@ public final class BitmapOcclusion implements SectionOcclusion {
 
   private final long[] words;
 
+  /**
+   * 置位数（遮挡格数）：让 {@link #isEmpty()} 与负载标签判定 O(1)。
+   *
+   * <p><b>为什么缓存而不每次扫 64 个 long</b>：方块补丁路径每格都要问一次「该段是否已变空」，
+   * 而批量补丁一次可写 4096 格——逐格全扫就是每条补丁批几十万次 long 读取，且发生在持写锁的封包线程上。
+   * 写者唯一（{@code OcclusionStore} 的 writeMutex 内），读侧可能并发（负载编码），故用 volatile 发布。
+   */
+  private volatile int occludingCount;
+
   /** 新建全零位图（全不遮挡）。 */
   public BitmapOcclusion() {
     this.words = new long[WORD_COUNT];
@@ -61,6 +70,11 @@ public final class BitmapOcclusion implements SectionOcclusion {
    */
   private BitmapOcclusion(long[] words) {
     this.words = words;
+    int count = 0;
+    for (long word : words) {
+      count += Long.bitCount(word);
+    }
+    this.occludingCount = count;
   }
 
   /** 全遮挡位图（全 1）。一般不用它——全遮挡请直接用 {@link SolidOcclusion#INSTANCE}。 */
@@ -144,17 +158,16 @@ public final class BitmapOcclusion implements SectionOcclusion {
     long mask = 1L << packed;
     long word = (long) WORDS.getOpaque(words, wordIndex);
     long updated = occluding ? word | mask : word & ~mask;
+    if (updated == word) {
+      return; // 位未变：不写、不计数（重复设置同一值为常态）
+    }
     WORDS.setOpaque(words, wordIndex, updated);
+    occludingCount += occluding ? 1 : -1;
   }
 
   /** 是否没有任何一格遮挡（全零）。 */
   public boolean isEmpty() {
-    for (int i = 0; i < WORD_COUNT; i++) {
-      if (words[i] != 0L) {
-        return false;
-      }
-    }
-    return true;
+    return occludingCount == 0;
   }
 
   /**
