@@ -1858,26 +1858,6 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * long 版整数钳制：语义与 {@link #clampCeiling(int, int, int, String, List, List)} 完全一致。
-   *
-   * <p>为什么单独给一个 long 重载：容量键（{@code cache.maximum-mb} 可达 4096 MB）
-   * 超出 int 范围，用 {@code getInt} 解析会让 4 GB 这类合法上限被读成默认值；而两端钳制同样要留痕
-   * （下限防「事实关闭缓存」、上限拦「手滑多打一位数」），否则就退回到旧实现那种静默改配置。
-   */
-  private static long clampCeiling(long value, long minimum, long maximum, String key,
-      List<String> floorAdjustments, List<String> ceilingAdjustments) {
-    if (value < minimum) {
-      floorAdjustments.add(key + "=" + value + "（下限 " + minimum + "）");
-      return minimum;
-    }
-    if (value > maximum) {
-      ceilingAdjustments.add(key + "=" + value + "（上限 " + maximum + "）");
-      return maximum;
-    }
-    return value;
-  }
-
-  /**
    * 邻近显形半径的生效值（区块）：0 = 跟随服务器视距；正数原样保留（运行时再与玩家有效视距取小），
    * 超过 {@link #PROXIMITY_DISTANCE_CHUNKS_MAX} 时按上限生效；负数钳到 0 并留痕。
    *

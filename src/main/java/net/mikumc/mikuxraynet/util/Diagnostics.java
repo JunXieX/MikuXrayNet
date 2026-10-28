@@ -1140,6 +1140,12 @@ public final class Diagnostics {
     if (!c.ceilingAdjustments().isEmpty()) {
       sb.append("配置安全上限已回落：").append(String.join("、", c.ceilingAdjustments())).append('\n');
     }
+    // 「写法无法识别」的键（布尔写成引号、权重写成小数、高度写成字符串等）只在**首次**加载时 WARN 一次；
+    // 之后管理员再改错一处，控制台是静默的，dump 是唯一还能看出「你写的值没被采纳」的地方。
+    if (!c.typeAdjustments().isEmpty()) {
+      sb.append("配置写法未被识别、已按安全值处理：").append(String.join("、", c.typeAdjustments()))
+          .append('\n');
+    }
     sb.append("disk-cache.enabled=").append(c.diskCache().enabled())
         .append("，max-entries=").append(c.diskCache().maxEntries())
         .append("，max-file-size-mb=").append(c.diskCache().maxFileSizeMb())
@@ -1237,6 +1243,15 @@ public final class Diagnostics {
         .append("，min-view-distance=").append(c.latency().minViewDistance())
         .append("，check-interval-seconds=").append(c.latency().checkIntervalSeconds()).append('\n');
     sb.append("diagnostics.interval-seconds=").append(c.diagnostics().intervalSeconds()).append('\n');
+    // bandwidth.yml 的两类「配置被改写」明细：此前只在加载时 WARN 一次、dump 完全查不到，
+    // 管理员第二次改错（或改了没生效）时没有任何可观测入口。
+    if (!c.clampAdjustments().isEmpty()) {
+      sb.append("配置超出安全区间已钳制：").append(String.join("、", c.clampAdjustments())).append('\n');
+    }
+    if (!c.typeAdjustments().isEmpty()) {
+      sb.append("配置写法未被识别、已按安全值处理：").append(String.join("、", c.typeAdjustments()))
+          .append('\n');
+    }
   }
 
   /** 缓存命中率文本；无采样时为 0.0%。 */

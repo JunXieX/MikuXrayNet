@@ -75,10 +75,10 @@ import org.bukkit.plugin.Plugin;
  * {@link #MULTI_BLOCK_BATCH_THRESHOLD}，视为「本已是一次批量下发」（反矿透的邻近显形正是
  * 由 Paper 原生 {@code sendMultiBlockChange} 按区块段一次性发出），直接放行原包——不进 Pending、
  * 不延迟、不重编码。此类包再进合并窗口的边际收益极小，却要额外吃满 {@code merge-window-millis}
- * （默认 40ms）的延迟（超过立即放行半径的显形变更尤为明显）。判定只看包自身的坐标数量（不看玩家、
- * 不看世界），且放在近身立即放行之后：近身的批量包仍走上面那条路径（会登记覆盖标记以做
- * last-write-wins），这里只兜住不会被近身判定截获的远处显形包——<b>同样登记</b>覆盖标记，
- * 否则缓冲里同坐标的旧态会在窗口到期时把本包刚下发的新态覆盖回去（方块回退）。
+ * （默认 40ms）的延迟（超过立即放行半径的显形变更尤为明显）。判定只看包自身的坐标数量（不看世界），
+ * 且在<b>解析之前</b>就生效：命中即直通，并顺手登记「这些坐标已有新态下发」（有待发缓冲时按
+ * packed short 直接解包记账，不必解析出 {@code WrappedBlockData}）。这层标记不能省——否则缓冲里
+ * 同坐标的旧态会在窗口到期时把本包刚下发的新态覆盖回去（方块回退）。
  *
  * <p><b>last-write-wins 的微秒级残余窗口（已接受，勿当 bug 修）</b>：{@code passed} 集合是在
  * 持锁的临界区里「读取 + 剔除旧态」的，但把合并包发到客户端、以及取消原包，都发生在<b>释放锁之后</b>。
@@ -700,25 +700,36 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       return;
     }
 
-    // 解析前短路：MULTI_BLOCK_CHANGE 的坐标数直接由坐标数组长度得出，无需先把整包解析成
-    // List<Update<WrappedBlockData>>（每坐标一个 WrappedBlockData + 一个 Update 记录 + ArrayList 扩容）。
-    // 反矿透显形包常有数十到数千个坐标，若先解析再判 bypassesMerge 直通，这份分配在封包线程上纯属浪费，
-    // 多人同时显形时是可见的 GC 抖动源。
-    // 短路条件里的 pending 为空，等价于原路径的「直通 + rememberDelivered 空操作」：没有待发缓冲就不存在
-    // 会被旧态覆盖的条目。读不到坐标数组时跳过短路，退回下面的完整解析路径（fail-open）。
-    // 注意：此处不替代后面的 bypassesMerge 分支——本玩家已有 Pending 时仍须解析出坐标去记覆盖标记。
+    // 解析前短路：MULTI_BLOCK_CHANGE 的坐标数与「段原点 + 每格一个 packed short」都能直接读出，
+    // 无需把整包解析成 List<Update<WrappedBlockData>>（每坐标一个 WrappedBlockData 反射包装 + 一条
+    // Update + ArrayList 扩容）。反矿透显形包常有数十到数千个坐标，多人同时显形时这份分配是封包线程上
+    // 可见的 GC 抖动源。
+    // 有待发缓冲时必须登记覆盖标记（rememberDeliveredCoords），否则窗口到期会把旧态写回去（方块回退）；
+    // 读不到坐标数组或段原点时退回下面的完整解析路径——那条路径自己会记标记或 fail-open，绝不漏记。
     if (event.getPacketType() == PacketType.Play.Server.MULTI_BLOCK_CHANGE) {
       short[] coordShorts;
+      BlockPosition section;
       try {
         coordShorts = event.getPacket().getShortArrays().readSafely(0);
+        section = coordShorts == null ? null : event.getPacket().getSectionPositions().readSafely(0);
       } catch (Throwable ignored) {
         // 读不出坐标数组：跳过短路，走原路径（由 readUpdates 自行 fail-open）
         coordShorts = null;
+        section = null;
       }
-      if (coordShorts != null && bypassesMerge(true, coordShorts.length)
-          && pending.get(player.getUniqueId()) == null) {
-        stats.blockChangesPassed.increment();
-        return;
+      if (coordShorts != null && bypassesMerge(true, coordShorts.length)) {
+        // 本包已是成形批量包：无论有无待发缓冲都直接放行。有缓冲时只需记「这些坐标的新态已下发」，
+        // 用 short[] 逐格解包即可——不必为记账把整包解析成 WrappedBlockData[]（每坐标一个反射包装 + 一条 Update）。
+        if (pending.get(player.getUniqueId()) == null) {
+          stats.blockChangesPassed.increment();
+          return;
+        }
+        if (section != null) {
+          rememberDeliveredCoords(player.getUniqueId(), section, coordShorts);
+          stats.blockChangesPassed.increment();
+          return;
+        }
+        // 有缓冲却读不到段原点：无法记覆盖标记，退回下面的完整解析路径（那里会记标记或自行 fail-open）
       }
     }
 
@@ -738,9 +749,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       return;
     }
 
-    // 已聚合的批量包（MULTI_BLOCK_CHANGE 且坐标数达阈值）直接放行：不进 Pending、不登记延迟、
-    // 不重编码，原包按原样流出——「恰好放行一次」。放在近身立即放行之后，因此近身的批量包仍走上面
-    // 那条路径（登记覆盖标记做 last-write-wins），这里只兜住不会被近身判定截获的远处显形包。
+    // 兜底分支：短路未命中（例如读不到段原点）时才走到这里。语义与上面的短路完全一致——
+    // 已聚合的批量包不进 Pending、不登记延迟、不重编码，原包按原样流出。
     //
     // 这类包同样要登记「这些坐标已有更新下发」：否则若缓冲里还留着同坐标的<b>旧态</b>条目，
     // 窗口到期会把旧态写回客户端，覆盖刚由本包下发的<b>新态</b>（方块回退）。
@@ -855,6 +865,39 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       }
       for (Update<WrappedBlockData> update : updates) {
         target.passed.add(new Coord(update.x(), update.y(), update.z()));
+      }
+    }
+  }
+
+  /**
+   * 同 {@link #rememberDelivered}，但入参是「段原点 + 每格一个 packed short」而不是已解析的更新列表。
+   *
+   * <p><b>为什么需要它</b>：批量直通包（{@code MULTI_BLOCK_CHANGE} 且坐标数达阈值）必须记「这些坐标的新态
+   * 已下发」，否则冲刷时会把缓冲里的旧态写回去（方块回退）。而记账只需要坐标——{@code positions} 本身就是
+   * 每坐标一个 short（高 4 位 x、次 4 位 z、低 4 位 y，与 {@link #readUpdates} 的解包完全一致），
+   * 于是不必为了三个 int 去解析 {@code WrappedBlockData[]}。
+   *
+   * <p>上限闸与 {@link #rememberDelivered} 同口径：超限即整体清空（最多让窗口到期时把某个坐标的旧态再下发
+   * 一次，不影响正确性）。与 {@code flush} 共用 {@code synchronized(target)}。
+   */
+  private void rememberDeliveredCoords(UUID playerId, BlockPosition section, short[] positions) {
+    Pending target = pending.get(playerId);
+    if (target == null) {
+      return;
+    }
+    synchronized (target) {
+      if (target.flushed.get()) {
+        return;
+      }
+      if (target.passed.size() + positions.length > target.passedLimit) {
+        target.passed.clear();
+      }
+      int baseX = section.getX() << 4;
+      int baseY = section.getY() << 4;
+      int baseZ = section.getZ() << 4;
+      for (short packed : positions) {
+        target.passed.add(new Coord(baseX + (packed >> 8 & 15),
+            baseY + (packed & 15), baseZ + (packed >> 4 & 15)));
       }
     }
   }

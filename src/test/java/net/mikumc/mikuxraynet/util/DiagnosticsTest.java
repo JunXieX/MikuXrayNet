@@ -178,6 +178,28 @@ class DiagnosticsTest {
   }
 
   /**
+   * 「写法没被识别」与「被安全区间钳制」两类明细此前只在<b>首次</b>加载时 WARN 一次，dump 完全查不到：
+   * 管理员再改错一处（或改在一次性 WARN 之后）就没有任何可观测入口，只能靠肉眼比对 yml 与生效值。
+   */
+  @Test
+  void dumpEchoesTypeAndClampAdjustments() {
+    String typed = Diagnostics.formatDump(withAntiXray(antiXray("""
+        proximity:
+          frustum:
+            enabled: "nope"
+        """)), "20260925-000000");
+    assertTrue(typed.contains("配置写法未被识别、已按安全值处理：proximity.frustum.enabled"),
+        "dump 必须回显「写法未被识别」的键（含完整路径）：" + typed);
+
+    String clamped = Diagnostics.formatDump(fixed(bandwidth("""
+        block-changes:
+          merge-radius: 0
+        """)), "20260925-000000");
+    assertTrue(clamped.contains("配置超出安全区间已钳制：block-changes.merge-radius"),
+        "dump 必须回显被钳制的 bandwidth 键：" + clamped);
+  }
+
+  /**
    * 新增的三条「此前完全静默」的路径必须在状态面板可见，dump 还要回显内存缓存的字节上限：
    * <ul>
    *   <li>写回未确认生效 → 连旧伪装索引一起作废的次数（否则客户端拿到原始字节后，索引还在指示

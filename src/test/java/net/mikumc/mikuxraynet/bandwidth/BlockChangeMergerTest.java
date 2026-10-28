@@ -105,8 +105,8 @@ class BlockChangeMergerTest {
    * 「已聚合批量包直接放行」判定是纯函数：只依包形态 + 包自身坐标数量，不看玩家/世界。
    *
    * <p>真实链路依赖 ProtocolLib 封包与异步放行，离线不可用；这里直接驱动被抽出的纯函数
-   * {@link BlockChangeMerger#bypassesMerge}——它正是 {@code onPacketSending} 在近身立即放行之后、
-   * 进入 Pending 之前所走的同一个判定：返回 true 即提前 return，原包不进缓冲、不登记延迟。
+   * {@link BlockChangeMerger#bypassesMerge}——它正是 {@code onPacketSending} 在<b>解析之前</b>
+   * 用的同一个判定：返回 true 即提前 return（有缓冲时顺手记覆盖标记），原包不进缓冲、不登记延迟。
    */
   @Test
   @DisplayName("达到阈值的批量包直通（不进合并窗口、不延迟），阈值本身也算达标")
