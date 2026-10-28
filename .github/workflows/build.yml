@@ -69,9 +69,16 @@ jobs:
           # 约定：发版提交（release: 发布正式版 x.y.z / 测试版）的正文就是本次更新日志。
           # 取不到（例如该提交没有正文）时留空，由下面的 generate_release_notes 兜底——
           # 绝不因为「缺日志」让发布失败，也绝不阻断构建。
+          # 优先取发版提交的正文：注解 tag 的 %(contents:body) 会剥掉以 # 开头的行
+          # （章节标题如 ## 修复 会被 git 当成注释丢弃），提交正文则原样保留。
+          # 正文为空时才回落到 tag 正文，绝不因缺日志让发布失败。
           {
             echo 'notes<<MIKUXRAYNET_RELEASE_NOTES_EOF'
-            git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" 2>/dev/null || true
+            NOTES="$(git log -1 --format=%b "$GITHUB_SHA" 2>/dev/null || true)"
+            if [ -z "$NOTES" ]; then
+              NOTES="$(git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" 2>/dev/null || true)"
+            fi
+            printf '%s\n' "$NOTES"
             echo 'MIKUXRAYNET_RELEASE_NOTES_EOF'
           } >> "$GITHUB_OUTPUT"
 
