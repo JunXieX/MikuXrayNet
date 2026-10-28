@@ -126,15 +126,20 @@ final class ProximityScanner {
     });
     int sequence = 0;
 
+    // 预算检查放在区块粒度而不是行粒度：一行有 (2r+1) 个区块、单块可能上千坐标，
+    // 只按行检查会让一次扫描超额数倍（预算默认 0.3 ms，全落在主线程 / 区域线程上）。
+    // 每块一次 nanoTime 的代价是 (2r+1)² 次：视距 10 时 441 次 ≈ 11 µs/趟（50 人 5 趟/s ≈ 0.3% 单核），
+    // 视距 32 时 4225 次 ≈ 106 µs——仍远小于一次「整行区块」超额扫描的代价。
+    scan:
     for (int chunkX = centerX - radius; chunkX <= centerX + radius; chunkX++) {
-      if (System.nanoTime() > deadlineNanos) {
-        // 时间预算耗尽：停止收集，已收集的候选照常返回（调用方按 deadlineTruncated 判断是否需要顺延）
-        if (tally != null) {
-          tally.deadlineTruncated = true;
-        }
-        break;
-      }
       for (int chunkZ = centerZ - radius; chunkZ <= centerZ + radius; chunkZ++) {
+        if (System.nanoTime() > deadlineNanos) {
+          // 时间预算耗尽：停止收集，已收集的候选照常返回（调用方按 deadlineTruncated 判断是否需要顺延）
+          if (tally != null) {
+            tally.deadlineTruncated = true;
+          }
+          break scan;
+        }
         // 用「世界名 + 坐标」的原始分量查询：扫描每周期遍历 13×13 = 169 个区块，
         // 逐块 new ChunkKey 会产出 169 个短命对象（50 人在线时约 4.2 万个/秒，全在主线程/区域线程）。
         // 索引与已显形集合都提供按分量查询的重载，热循环因此零分配。

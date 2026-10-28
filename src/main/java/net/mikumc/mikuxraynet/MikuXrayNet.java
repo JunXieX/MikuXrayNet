@@ -193,7 +193,7 @@ public final class MikuXrayNet extends JavaPlugin {
       pipeline.start();
       this.throttlePipeline = pipeline;
     } catch (Throwable throwable) {
-      getLogger().warning("带宽优化装配失败（不影响反矿透）：" + throwable.getMessage());
+      getLogger().log(Level.WARNING, "带宽优化装配失败（不影响反矿透）", throwable);
       // 装配失败的实例不发布：它可能已注册了部分监听器/任务（start 内部已尽力清理），
       // 但若仍挂在字段上，诊断会把它当成「已启用」去读一套恒为 0 的计数，掩盖真正的失败。
       try {
@@ -234,7 +234,7 @@ public final class MikuXrayNet extends JavaPlugin {
       diagnosticsTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(this,
           scheduled -> outputDiagnosticsLine(), periodTicks, periodTicks);
     } catch (Throwable throwable) {
-      getLogger().warning("周期诊断任务登记失败（不影响其它功能）：" + throwable.getMessage());
+      getLogger().log(Level.WARNING, "周期诊断任务登记失败（不影响其它功能）", throwable);
     }
   }
 
@@ -332,9 +332,14 @@ public final class MikuXrayNet extends JavaPlugin {
    * （否则会留下永不恢复的实体）。代价仅是一次瞬态观感，故<b>明确接受并文档化</b>，不改变行为。
    */
   private void restartBandwidth() {
-    if (throttlePipeline != null) {
-      throttlePipeline.stop();
-      throttlePipeline = null;
+    // 先摘字段再停，与 onDisable 同一顺序：诊断/命令线程此刻读到的是「无管线」，不会把半停状态当成在跑。
+    // ThrottlePipeline#stop() 内部逐模块 catch(Throwable)，对外不抛，因此这里不需要再包一层。
+    // （注销失败的模块会被旧实例保留以便重试，但字段已置空、旧实例不再可达，那条重试路径只在
+    //  同一实例再次 stop 时生效——热重载下拿不到，属已知取舍，重启即恢复。）
+    ThrottlePipeline pipeline = throttlePipeline;
+    throttlePipeline = null;
+    if (pipeline != null) {
+      pipeline.stop();
     }
     startBandwidth();
   }

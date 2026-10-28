@@ -568,10 +568,14 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     try {
       workPool.execute(task, () -> handleAsync(task, accessor, timeout));
     } catch (Throwable throwable) {
-      // 已登记延迟却没能入队：必须立即放行，否则该封包永久卡住
+      // 已登记延迟却没能入队：必须立即放行，否则该封包永久卡住。
+      // 只有「确实由本次放行」才计入「队列满未伪装」——看门狗可能已在这几微秒里先超时放行，
+      // 那时该区块已计入 chunksTimedOut，这里再计一次就是幻影归因（releaseOnTimeout 的 CAS 会区分）。
+      if (task.releaseOnTimeout()) {
+        stats.chunksSkippedQueueFull.increment();
+      }
       logThrottled("区块改写任务入队失败，已按原包放行", throwable);
       timeout.cancel(false);
-      task.signalOnce();
     }
   }
 
@@ -975,10 +979,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       try {
         workPool.execute(task, () -> handleAsync(task, accessor, timeout));
       } catch (Throwable throwable) {
-        // 任何意外都必须归还这次延迟，否则该封包永久卡住（signalOnce 保证恰好放行一次）
+        // 任何意外都必须归还这次延迟，否则该封包永久卡住。抓取路径已跨过一次区域调度往返，
+        // 此刻被拒基本就是队列打满，与预判分支同口径计数（同样只在本次真的放行时计）。
+        if (task.releaseOnTimeout()) {
+          stats.chunksSkippedQueueFull.increment();
+        }
         logThrottled("邻区块抓取后的改写调度失败，已按原包放行", throwable);
         timeout.cancel(false);
-        task.signalOnce();
       }
     };
 

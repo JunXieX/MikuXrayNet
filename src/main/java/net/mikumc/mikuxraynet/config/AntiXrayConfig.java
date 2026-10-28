@@ -262,8 +262,8 @@ public final class AntiXrayConfig {
   /**
    * 视锥竖直全角的<b>默认值</b>（度）：120。
    *
-   * <p>取在安全下限（{@link #FRUSTUM_FOV_FLOOR}）之上：下限保证「按 16:9 屏幕计算的合法可视区不会被剔除」，
-   * 而默认值再宽一些，是为了覆盖更宽的屏幕（21:9 等）与「转头瞬间视锥边界还没更新」的迟滞窗口——
+   * <p>取在安全下限（{@link #FRUSTUM_FOV_FLOOR}）之上：下限保证「按 21:9 屏幕计算的合法可视区不会被剔除」，
+   * 而默认值再宽一些，是为了覆盖极宽屏（32:9 等）与「转头瞬间视锥边界还没更新」的迟滞窗口——
    * 越宽越不会出现「看得见却还是伪装方块」，代价只是多评估一些侧后方向的候选（判定本身很廉价）。
    * 要省带宽请关掉整个视锥剔除，而不是把角度配窄。
    */
@@ -276,8 +276,10 @@ public final class AntiXrayConfig {
    * 的代价是「被剔除的坐标不发包、也不记已显形」——配得比客户端真实视场更窄，就会让玩家<b>明明看得见</b>
    * 的方块一直保持伪装（真机反馈：「站在黑曜石门正前方，一半方块始终是石头/泥土，点一下才变回来」
    * ——周期性显形走视锥判定、点击走的事件显形不走，两者只差这一道闸门）。
-   * 取 110° 时，16:9 屏幕下竖直半角 55°、水平半角 68.4°，恰好覆盖「客户端 FOV 开到上限 + 16:9」
-   * 的整个可视区，因此<b>任何合法客户端能看到的方向都不会被剔除</b>（更宽的屏幕见 {@link #FRUSTUM_FOV_DEFAULT}）。
+   * 取 110° 时，21:9 屏幕下竖直半角 55°、水平半角 73.3°（与 21:9 客户端的真实水平视场一致）。
+   * 默认值 {@link #FRUSTUM_FOV_DEFAULT}（120°）的水平半角 76.1°，换算成宽高比约 25.5:9——
+   * 即 32:9 客户端在 FOV ≤ 约 97° 时仍被完整覆盖，FOV 拉满到 110° 时最边缘约差 2.8°，
+   * 这是已知残余（32:9 属极小众，再放宽会让显形候选量再增约一倍）。
    * 想省带宽应当关掉整个视锥剔除（{@code proximity.frustum.enabled=false}），而不是把角度配窄。
    */
   public static final double FRUSTUM_FOV_FLOOR = 110.0D;
@@ -568,7 +570,7 @@ public final class AntiXrayConfig {
    * @param maxPositionsPerPlayer 单玩家已显形坐标的<b>安全阀</b>（正常运营下不应触发）
    * @param frustumEnabled        是否只显形玩家视野锥内的候选坐标
    * @param frustumFov            视野锥<b>竖直全张开角</b>（度）——与 Minecraft 客户端 FOV 设置同义；
-   *                              水平方向按 16:9 宽高比换算后更宽（约 1.4 倍），
+   *                              水平方向按 21:9 宽高比换算后更宽（约 2.3 倍），
    *                              详见 {@code ProximitySelector#withinFrustum}；
    *                              默认 {@link #FRUSTUM_FOV_DEFAULT}，
    *                              <b>不低于 {@link #FRUSTUM_FOV_FLOOR}</b>（低于下限会被抬升并 WARN）
@@ -1029,7 +1031,8 @@ public final class AntiXrayConfig {
       anyDimensionSection = true;
       // 维度开关同样走宽松解析：enabled: "false" 被 getBoolean 当成默认值 true，会静默反转「关闭」意图
       dimensionEnabled[dimension.ordinal()] = lenientBoolean(section, "enabled",
-          Boolean.TRUE.equals(DEFAULT_ENABLED.get(dimension)), typeAdjustments);
+          Boolean.TRUE.equals(DEFAULT_ENABLED.get(dimension)), typeAdjustments,
+          "dimensions." + dimension.key() + ".enabled");
       effectives[dimension.ordinal()] = parseDimensionSection(section, fallback, unknownTags,
           typeAdjustments, "dimensions." + dimension.key());
     }
@@ -1282,7 +1285,7 @@ public final class AntiXrayConfig {
         ? obfuscationMode(section.get("mode"), path + ".mode", typeAdjustments) : fallback.mode();
     // 缺键沿用 fallback；写了但不是布尔值时回落 fallback 并留一条明细（旧实现会静默当成 false）
     boolean useBlockBelow = lenientBoolean(section, "use-block-below", fallback.useBlockBelow(),
-        typeAdjustments);
+        typeAdjustments, path + ".use-block-below");
     return new EffectiveObfuscation(hideBlocks, weights, bands,
         minY == null ? fallback.minY() : minY, maxY == null ? fallback.maxY() : maxY,
         mode, useBlockBelow);
@@ -1648,7 +1651,19 @@ public final class AntiXrayConfig {
    */
   private static boolean lenientBoolean(ConfigurationSection section, String path,
       boolean defaultValue, List<String> typeAdjustments) {
-    Object raw = section.get(path);
+    return lenientBoolean(section, path, defaultValue, typeAdjustments, path);
+  }
+
+  /**
+   * 同 {@link #lenientBoolean(ConfigurationSection, String, boolean, List)}，但把「读哪个键」与
+   * 「告警里写哪个路径」分开。
+   *
+   * <p>维度段里的 {@code enabled} / {@code use-block-below} 三个维度同名，裸键名告警无法区分是主世界
+   * 还是地狱写错了；一次性 WARN 只有一次机会，必须带上 {@code dimensions.<维度>} 前缀。
+   */
+  private static boolean lenientBoolean(ConfigurationSection section, String key,
+      boolean defaultValue, List<String> typeAdjustments, String path) {
+    Object raw = section.get(key);
     if (raw == null) {
       return defaultValue;
     }

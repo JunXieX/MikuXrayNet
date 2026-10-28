@@ -181,21 +181,26 @@ public final class MikuConfig {
   }
 
   /**
-   * 读取并解析反矿透配置，任何 {@code Throwable}（含解析期间抛出的 {@code Error}）都不冒泡。
-   *
-   * <p>失败语义：已有上一份有效配置则原样保留；首次加载即失败则回落到「全部键缺失」的内置默认
-   * （{@link AntiXrayConfig#from} 传一个空 {@link YamlConfiguration}），绝不返回 {@code null}。
-   */
-  /**
    * 累积一条「本次重载使用了回退值」说明。
    *
    * <p>多份配置文件可能同时解析失败（例如 antixray.yml 与 blacklist.yml 一起写坏）；只保留最后一条
    * 会让管理员以为先失败的那份已生效。拼接后由 {@code configurationFallbackNote()} 一并回显。
    */
   private void noteFallback(String note) {
+    if (note == null) {
+      // 每轮 load() 首要动作是复位：只反映「本次」重载，不能把上一轮的失败说明不断拼接下去
+      this.fallbackNote = null;
+      return;
+    }
     this.fallbackNote = this.fallbackNote == null ? note : this.fallbackNote + "；" + note;
   }
 
+  /**
+   * 读取并解析反矿透配置，任何 {@code Throwable}（含解析期间抛出的 {@code Error}）都不冒泡。
+   *
+   * <p>失败语义：已有上一份有效配置则原样保留；首次加载即失败则回落到「全部键缺失」的内置默认
+   * （{@link AntiXrayConfig#from} 传一个空 {@link YamlConfiguration}），绝不返回 {@code null}。
+   */
   private AntiXrayConfig loadAntiXray() {
     try {
       return AntiXrayConfig.from(read(ANTI_XRAY_FILE));

@@ -13,8 +13,8 @@ package net.mikumc.mikuxraynet.antixray;
  *
  * <p><b>视锥</b>（{@link #withinFrustum}）：{@code fovDegrees} 是<b>竖直方向的张开全角</b>（与 Minecraft
  * 客户端 FOV 设置同义），按客户端的矩形投影分解成两轴判定——竖直半角 = {@code fov/2}，
- * 水平半角 = {@code atan(tan(fov/2) × 宽高比)}（按 16:9 估算，故水平方向明显更宽：
- * fov=110 时竖直半角 55°、水平半角约 68°，恰好覆盖「客户端 FOV 开到上限 110 + 16:9」的整个可视区，
+ * 水平半角 = {@code atan(tan(fov/2) × 宽高比)}（按 21:9 估算，故水平方向明显更宽：
+ * fov=110 时竖直半角 55°、水平半角约 73°，覆盖「客户端 FOV 开到上限 110 + 常见超宽屏」的整个可视区，
  * 因此不会剔除玩家看得见的坐标；而旧实现按「圆锥半角 40°」判定，水平方向过窄，
  * 真机日志表现为 87% 的候选被误剔）。距眼睛不超过 {@code minDistance} 时豁免视锥判定。
  * 判定本身「先粗后细」（{@link #withinFrustum} 内联一次点积粗筛 → {@link #preciseWithinFrustum} 两轴精判）：
@@ -105,8 +105,16 @@ public final class ProximitySelector {
   private static final int[] FACE_ORDER = {
       FACE_POS_X, FACE_NEG_X, FACE_POS_Y, FACE_NEG_Y, FACE_POS_Z, FACE_NEG_Z};
 
-  /** 屏幕宽高比（按 16:9 估算）：客户端水平视场比竖直更宽的依据；服务端拿不到客户端真实宽高比。 */
-  private static final double ASPECT_RATIO = 16.0D / 9.0D;
+  /**
+   * 屏幕宽高比（按 <b>21:9</b> 估算）：客户端水平视场比竖直更宽的依据；服务端拿不到客户端真实宽高比。
+   *
+   * <p><b>为什么不是 16:9</b>：客户端只上报竖直 FOV，水平半角由宽高比推出。按 16:9 估时，默认 120° 的
+   * 水平半角算得 72.0°，而 21:9 屏幕的真实水平半角是 76.1°——差出的 4.1° 正是「屏幕最边缘、且超过
+   * {@code proximity.frustum.min-distance}」的一楔形区域：那里的方块已被伪装却不会被显形，
+   * 与「玩家看得见的方块一定是真的」这条硬保证冲突（表现为贴边那一条始终是石头，转头才变）。
+   * 21:9 覆盖常见超宽屏档位；32:9 的极边缘仍是已知残余（再放宽约一倍视锥面积，性价比不成立）。
+   */
+  private static final double ASPECT_RATIO = 21.0D / 9.0D;
 
   /** 水平分量小于该值时认为视线/目标近似正上正下（水平角不可靠，只按竖直轴判定）。 */
   private static final double VERTICAL_LOOK_EPSILON = 0.05D;
@@ -133,7 +141,8 @@ public final class ProximitySelector {
    *
    * <p>判定按客户端一致的<b>矩形投影</b>分解成两轴（见类注释）：
    * 竖直方向用与视线的仰角之差 ≤ {@code fov/2}；水平方向用偏航角之差 ≤ 水平半角
-   * （{@code atan(tan(fov/2) × 16/9)}）。视线或目标近似正上/正下时水平角不可靠，只按竖直轴判定。
+   * （{@code atan(tan(fov/2) × ASPECT_RATIO)}，见 {@link #ASPECT_RATIO}）。
+   * 视线或目标近似正上/正下时水平角不可靠，只按竖直轴判定。
    *
    * <p><b>先粗后细</b>：精判前先做一次点积粗筛。设视线与目标方向夹角为 θ，精判接受集必满足
    * θ ≤ {@code fov/2} + 水平半角（两轴角差之和是球面角距上界：先沿子午线再沿纬线可走一条长

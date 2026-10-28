@@ -18,7 +18,10 @@ public final class RewriteStats {
   /**
    * 已处理但<b>未改写</b>的区块总数（原包放行）：无目标方块 / 无改动 / 解析失败等。
    *
-   * <p><b>这是「未改写」的总量口径</b>：{@code chunksRewritten + chunksSkipped = 已处理区块总数}。
+   * <p><b>口径范围</b>：{@code chunksRewritten + chunksSkipped} 只覆盖「走完解码/改写流程」的区块。
+   * 缓存命中（不解码，见 {@code ProtocolLibAsyncListener#rewriteOnWorker}）、处理超时
+   * （{@link #chunksTimedOut}）、队列满（{@link #chunksSkippedQueueFull}）各自另有计数器，都不在这个和里
+   * ——稳态服务器上绝大多数区块包走的是缓存命中，因此这个和远小于「已处理区块总数」。
    * 注意 {@link #chunksFailed} 是它的<b>子集</b>（解析失败同样属于「未改写」，失败区块会同时计入
    * 两个计数），因此二者<b>并非互斥</b>，绝不可相加——要得到「本来就无需改写」的数量应取
    * {@code chunksSkipped − chunksFailed}。
@@ -38,11 +41,15 @@ public final class RewriteStats {
   public final LongAdder chunksTimedOut = new LongAdder();
 
   /**
-   * 因改写队列已满而<b>直接放行原包</b>（本区块完全未伪装）的区块数。
+   * 因改写队列无容量而<b>直接放行原包</b>（本区块完全未伪装）的区块数。
    *
-   * <p><b>为什么必须单列</b>：这是唯一「功能静默失效」的路径——该区块以真实矿物下发，对透视端完全可见。
-   * 此前它不递增任何计数器，表现为「改写数看起来正常、但玩家能透视」，无法归因。该计数持续增长说明
-   * 改写吞吐已被打满（{@code advanced.queue-capacity} 耗尽），应降低负载或评估加大队列/线程。
+   * <p>覆盖三种入口：提交前的 {@code hasCapacity()} 预判、入队被拒（{@code RejectedExecutionException}）、
+   * 以及工作池已关闭（关服窗口内提交必被拒）。三者都是「该区块以真实矿物下发、对透视端完全可见」，
+   * 口径一致故合用一个计数器。
+   *
+   * <p><b>为什么必须单列</b>：这条链路会让防护静默失效——改写数看起来正常、但玩家能透视。持续增长说明
+   * 改写吞吐已被打满（{@code advanced.queue-capacity} 耗尽），应降低负载或评估加大队列/线程；
+   * 若只在关服/停用的瞬间冒出个位数，属正常收尾，不必调整容量。
    */
   public final LongAdder chunksSkippedQueueFull = new LongAdder();
 
@@ -64,7 +71,12 @@ public final class RewriteStats {
    * <p><b>为什么必须有这个计数器</b>：{@code RewriteCache#hitCount()} 只统计「键命中且未过期」，
    * 而调用方随后还要比对负载里的原始字节指纹——不符就意味着该区块内容真的变了，本次必须重新改写
    * （并继续查磁盘）。这类「命中但作废」被算进命中数会让命中率虚高，而它恰恰是磁盘查询的一部分来源：
-   * {@code 磁盘查询数 = 内存未命中 + 本计数}，缺了这一项，两边数字对不上时无从归因。
+   * {@code 磁盘查询数 = 内存未命中 + 本计数}（仅就「内容指纹不符」这一类成立：缺位图的那一类直接改写、
+   * 不查磁盘，因此升级后那一轮该等式会偏高），缺了这一项，两边数字对不上时无从归因。
+   *
+   * <p>另有一类「键命中但用不上」也计入本计数：条目命中了，但负载里没带遮挡位图（旧格式条目 / 当时该功能
+   * 关闭），而本次启用了异步遮挡——该区块会长期「已伪装却无位图」，必须当未命中重写一次。这一类的批量出现
+   * 只会发生在「刚升级到带位图负载的版本」那一轮，与区块内容是否真的变化无关。
    */
   public final LongAdder cacheContentRejected = new LongAdder();
 

@@ -68,12 +68,23 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    */
   private static final int MAX_REPLAY_SECTIONS = 8192;
 
-  /** 回放表键的插入顺序（配合 {@link #MAX_REPLAY_SECTIONS} 做 FIFO 淘汰）。 */
-  private final java.util.concurrent.ConcurrentLinkedQueue<Long> replayOrder =
-      new java.util.concurrent.ConcurrentLinkedQueue<>();
+  /**
+   * 回放条目的插入顺序（配合 {@link #MAX_REPLAY_SECTIONS} 做 FIFO 淘汰）。
+   *
+   * <p>全部访问都在 {@link #writeMutex} 内，故用 {@link java.util.ArrayDeque}：它的 {@code size()} 是 O(1)，
+   * 而 {@code ConcurrentLinkedQueue#size()} 是遍历计数——淘汰判据每建一个条目都要读一次，用后者会在
+   * 封包线程持锁期间走完整条 8192 队列（实测 80~200 µs/次）。
+   *
+   * <p>队列里存条目本身（而不是裸键）：{@code removeColumn} 摘掉表条目时不会同步摘队列，裸键的旧位置被
+   * poll 到时会按 key 删掉「同段后来重建的新条目」，使热段失去回放保护。存条目后按
+   * {@code remove(key, entry)} 只删同一实例，陈旧位置被跳过即可。
+   */
+  private final java.util.ArrayDeque<PatchReplay> replayOrder = new java.util.ArrayDeque<>();
 
   /** 单段的补丁回放条目（字段可变、由自身监视器保护；条目本身只在 writeMutex 内被重放/移除）。 */
   private static final class PatchReplay {
+    /** 该条目所属的 section 键（淘汰时用于两参 {@code remove(key, entry)} 的身份校验）。 */
+    final long key;
     final long[] coords = new long[MAX_REPLAY_CELLS];
     final boolean[] occluding = new boolean[MAX_REPLAY_CELLS];
     int size;
@@ -82,6 +93,10 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
      * 置位后该段的整列发布改为<b>跳过</b>（活表已含全部补丁，跳过即正确），避免「发布旧几何 + 部分回放」。
      */
     boolean overflow;
+
+    PatchReplay(long key) {
+      this.key = key;
+    }
   }
 
   /** 因「该段期间被补丁写过」而跳过发布的段数（诊断用，只增不减）。 */
@@ -227,6 +242,9 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     long stamp = 0L;
     long lastKey = 0L;
     boolean stamped = false;
+    // 回放条目的单段缓存（见 replayFor）：相邻格通常同段，避免逐格一次 CHM 查找 + Long 装箱
+    PatchReplay replay = null;
+    long replayKey = 0L;
     synchronized (writeMutex) {
       for (int i = 0; i < count; i++) {
         long key;
@@ -237,7 +255,11 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
           continue;
         }
         applyCellLocked(key, xs[i], ys[i], zs[i], occluding[i]);
-        recordReplayCell(key, xs[i], ys[i], zs[i], occluding[i]);
+        if (replay == null || key != replayKey) {
+          replayKey = key;
+          replay = replayFor(key);
+        }
+        recordReplayCell(replay, xs[i], ys[i], zs[i], occluding[i]);
         applied++;
         // 段戳：同一 section 在批内只写一次（MULTI_BLOCK_CHANGE 恒为同一段，故通常只有 1 次 CHM 写）
         if (stamp == 0L) {
@@ -284,20 +306,36 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     return publishSkippedPatched.sum();
   }
 
-  /** 记录一格待回放补丁（见 {@link #patchReplay}）；容量满时丢弃最旧一格。调用方已持 writeMutex。 */
-  private void recordReplayCell(long key, int x, int y, int z, boolean occluding) {
-    PatchReplay replay = patchReplay.computeIfAbsent(key, ignored -> {
-      replayOrder.add(key);
-      return new PatchReplay();
-    });
-    // 全局上限：FIFO 淘汰最久未更新的段（队列里可能有已移除的键，poll 后 remove 无副作用）
-    while (patchReplay.size() > MAX_REPLAY_SECTIONS) {
-      Long oldest = replayOrder.poll();
+  /**
+   * 取（必要时创建）某段的回放条目；调用方已持 {@link #writeMutex}。
+   *
+   * <p><b>为什么批量入口要按段缓存它</b>：一个 {@code MULTI_BLOCK_CHANGE} 最多 4096 格，相邻格绝大多数落在
+   * 同一段；逐格 {@code computeIfAbsent} 就是逐格一次 Long 装箱 + 一次 CHM 查找，全部落在封包线程上。
+   * 按「上一格所在段」复用后，一次批量只剩「涉及段数」次这类开销。
+   */
+  private PatchReplay replayFor(long key) {
+    PatchReplay existing = patchReplay.get(key);
+    if (existing != null) {
+      return existing;
+    }
+    PatchReplay replay = new PatchReplay(key);
+    patchReplay.put(key, replay);
+    replayOrder.addLast(replay);
+    // 全局上限：按队列长度淘汰最旧段。判据不能看 patchReplay.size()——removeColumn 会摘掉表里的条目却
+    // 不会摘掉队列里的位置，用 map 大小当判据时队列只进不出（数小时可达 MB 级滞留）。
+    // 陈旧位置（该段已被摘除/重建）直接跳过；淘汰只删「队列里这一份」对应的活条目。
+    while (replayOrder.size() > MAX_REPLAY_SECTIONS) {
+      PatchReplay oldest = replayOrder.pollFirst();
       if (oldest == null) {
         break;
       }
-      patchReplay.remove(oldest);
+      patchReplay.remove(oldest.key, oldest);
     }
+    return replay;
+  }
+
+  /** 记录一格待回放补丁（见 {@link #patchReplay}）；容量满时置溢出位。调用方已持 writeMutex。 */
+  private void recordReplayCell(PatchReplay replay, int x, int y, int z, boolean occluding) {
     long packed = packCoordinate(x, y, z);
     synchronized (replay) {
       // 同一格反复改写（红石/活塞/反复挖放）只保留最新一次：否则 32 次就能把容量占满、置 overflow，

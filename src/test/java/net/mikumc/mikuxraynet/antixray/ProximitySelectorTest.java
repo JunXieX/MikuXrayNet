@@ -53,8 +53,8 @@ class ProximitySelectorTest {
   /**
    * 侧前方：水平方向比竖直更宽（客户端 FOV 是「竖直全角」，水平按宽高比更宽）。
    *
-   * <p>fov=80 → 竖直半角 40°、水平半角 ≈56.2°（16:9）。修正前按「圆锥半角 40°」判定，
-   * 真机日志显示 445/512 个候选被误剔（87%）。
+   * <p>fov=80 → 竖直半角 40°、水平半角 ≈62.9°（21:9 估算，见 {@code ASPECT_RATIO}）。修正前按
+   * 「圆锥半角 40°」判定，真机日志显示 445/512 个候选被误剔（87%）。
    */
   @Test
   void sideBoundaryFollowsConfiguredFov() {
@@ -66,12 +66,15 @@ class ProximitySelectorTest {
     // 侧前方 30°：用户明确要求必须可见
     assertTrue(ProximitySelector.withinFrustum(eye, 3, 64, 6, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
         "偏离视线约 30° 的侧前方目标必须可见");
-    // 水平 45°：仍在水平半角（≈56°）内 → 可见（旧实现按圆锥 40° 会误剔）
+    // 水平 45°：仍在水平半角（≈62.9°）内 → 可见（旧实现按圆锥 40° 会误剔）
     assertTrue(ProximitySelector.withinFrustum(eye, 5, 64, 5, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
         "水平 45° 在水平半角内（客户端的水平视场更宽）");
-    // 水平约 60°：超出水平半角 → 剔除
-    assertFalse(ProximitySelector.withinFrustum(eye, 7, 64, 4, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
-        "水平约 60° 超出水平半角，应被剔除");
+    // 水平约 59°：距边界（62.9°）只剩 3.9° → 仍在锥内，与下面外侧用例对称
+    assertTrue(ProximitySelector.withinFrustum(eye, 5, 64, 3, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
+        "水平约 59° 贴边界内侧仍必须可见");
+    // 水平约 67°：超出水平半角 → 剔除
+    assertFalse(ProximitySelector.withinFrustum(eye, 7, 64, 3, DEFAULT_MIN_DISTANCE, DEFAULT_FOV),
+        "水平约 67° 超出水平半角，应被剔除");
   }
 
   /** 竖直方向仍按 fov/2 = 40° 收紧：同样偏离 45° 时竖直超界、水平不超界（正是修正后的差异）。 */
@@ -136,7 +139,7 @@ class ProximitySelectorTest {
   }
 
   /**
-   * 默认 120° 覆盖「客户端 FOV 上限 110 + 16:9」的整个可视区：竖直 60°、水平约 72°。
+   * 默认 120° 覆盖「客户端 FOV 上限 110 + 21:9」的整个可视区：竖直 60°、水平约 76.1°。
    *
    * <p>即：客户端的 FOV 无论怎么调，玩家屏幕上的方块都不会被误剔；更宽的屏幕见 yml 注释。
    */
@@ -147,12 +150,12 @@ class ProximitySelectorTest {
     // 仰角约 50°（与视线俯仰之差 50° > 旧默认的竖直半角 40°，但在新的 60° 内）→ 必须在锥内
     assertTrue(ProximitySelector.withinFrustum(eye, 0, 90, 22, PACKED_MIN_DISTANCE, PACKED_FOV),
         "仰角约 50° 在 60° 半角内（客户端 FOV=100 时屏幕顶部可见）");
-    // 水平约 65°（16:9 客户端 FOV=110 时屏幕侧边；旧默认的水平半角是 56°）→ 必须在锥内
+    // 水平约 65°（21:9 客户端 FOV=110 时屏幕侧边；旧默认的水平半角是 56°）→ 必须在锥内
     assertTrue(ProximitySelector.withinFrustum(eye, 43, 64, 20, PACKED_MIN_DISTANCE, PACKED_FOV),
-        "水平约 65° 在 72° 半角内（16:9、FOV=110 的屏幕边缘）");
+        "水平约 65° 在 76.1° 半角内（21:9、FOV=110 的屏幕边缘）");
     // 远超客户端可视范围（水平约 85°、且已超出 24 格豁免）→ 仍然剔除（视锥的省流作用保留）
     assertFalse(ProximitySelector.withinFrustum(eye, 60, 64, 6, PACKED_MIN_DISTANCE, PACKED_FOV),
-        "水平约 85° 超出 72° 半角，仍应剔除（侧后方继续省流）");
+        "水平约 85° 超出 76.1° 半角，仍应剔除（侧后方继续省流）");
   }
 
   @Test
@@ -722,7 +725,7 @@ class ProximitySelectorTest {
       }
     }
 
-    // 竖直约 40°（fov=80 的竖直半角）与水平约 56°（16:9 水平半角）边界两侧
+    // 竖直约 40°（fov=80 的竖直半角）与水平约 62.9°（21:9 水平半角）边界两侧
     for (int[] block : new int[][] {
         {0, 69, 6}, {0, 70, 6}, {0, 69, 5}, {0, 70, 7},
         {5, 64, 5}, {6, 64, 5}, {7, 64, 4}, {7, 64, 5}, {7, 64, 6}}) {

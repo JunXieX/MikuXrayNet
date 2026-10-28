@@ -703,6 +703,12 @@ public final class DiskCacheStore implements AutoCloseable {
     if (open.get(key) != handle) {
       return; // 句柄已被关闭/替换：其脏数据由 close() 的全量落盘或重建路径处理
     }
+    if (handle.file.isCompacting()) {
+      // 压缩独占期间 isDirty()/hasDirtySlots() 恒为 false（槽位数组正被压缩线程重建），若照常走到
+      // 下面的 clearPending()，就会在「压缩早退、什么都没写」时把待落盘记账清零 → doPut 的上限投影
+      // 少算脏桶。与 doPut / closeIdleHandles / compactGarbage 保持同一避让纪律。
+      return;
+    }
     try {
       if (handle.file.isDirty()) {
         int written = handle.file.flushDirty(RegionFile.FLUSH_BATCH_RECORDS);

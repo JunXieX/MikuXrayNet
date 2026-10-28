@@ -720,11 +720,14 @@ public final class EntityCuller implements Listener {
    */
   private TrackedRotation seedRotationLazily(Player player) {
     // 用「玩家周围一定半径内的实体」补种，而不是 Player#getTrackedEntities()：后者在当前编译目标
-    // （paper-api 26.2）上不存在。半径取强制可见距离的 8 倍（至少 64 格），覆盖本模块会剔除的范围；
-    // 更远的实体本来也不会被通道②判定（超距只做 RESTORE_ONLY）。
-    // 只在「该玩家尚无轮转队列」时执行一次（热重载后首次复检），因此这是一次性开销。
+    // （paper-api 26.2）上不存在。只在「该玩家尚无轮转队列」时执行一次（热重载后首次复检），是一次性开销。
     TrackedRotation target = rotation(player.getUniqueId());
-    double radius = Math.max(64.0D, config.forceVisibleDistance() * 8.0D);
+    // 半径 = 射线硬上限：模块<b>不可能</b>隐藏比 {@link #MAX_RAY_LENGTH} 更远的实体（超长射线一律 fail-open），
+    // 而服务端的实体追踪距离（players/display 128，其它 ≤96）也都在这个半径内——因此它恰好覆盖
+    // 「本模块隐藏得了、且客户端真的在渲染」的全部实体。
+    // 不能取得更大：追踪范围外的实体永远收不到 untrack 事件，补种进来只会永久占用轮转槽位、稀释配额
+    // （旧实现取强制可见距离的 8 倍 = 256 格，其中一半以上永不产生任何事件）。
+    double radius = MAX_RAY_LENGTH;
     for (Entity entity : player.getWorld().getNearbyEntities(player.getLocation(), radius, radius, radius)) {
       // 只补种「本模块会剔除的实体」：其它玩家与烟花在 onTrack / submitRaycast 里被明确排除，
       // 若把它们补进轮转，通道② 会对其它玩家执行 hideEntity（热重载/启用后玩家短暂消失，PvP 可被利用）；
@@ -1513,7 +1516,7 @@ public final class EntityCuller implements Listener {
         Entity entity = entry.entity();
         if (stillEnabled) {
           // 热重载路径：回到玩家所属线程执行（Paper 上即主线程，Folia 上即区域线程）
-          Schedulers.onEntity(plugin, player, () -> restoreWithRetry(player, entity, true));
+          Schedulers.onEntity(plugin, player, () -> restoreWithRetry(player, entity, 0));
         } else {
           // 停用路径：调度器已不可用（plugin.isEnabled()=false），同步恢复
           restoreNow(player, entity);
@@ -1551,38 +1554,100 @@ public final class EntityCuller implements Listener {
   /** Folia 停用时跨区域实体无法同步恢复的一次性中文 WARN（进程级闸门，绝不刷屏）。 */
   private void warnCrossRegionRestore() {
     if (crossRegionRestoreNoticed.compareAndSet(false, true)) {
-      plugin.getLogger().warning("插件停用时检测到跨区域（Folia）被隐藏实体：当前线程无法安全恢复，"
-          + "个别实体可能需玩家重新登录后才可见。此为 Folia 区域化线程的限制，非本插件故障。");
+      plugin.getLogger().warning("检测到被隐藏的实体未能恢复（Folia 跨区域，或实体刚刚退役）："
+          + "若玩家此后仍看不到某个实体，请让其重新登录。此为 Folia 区域化线程的限制，非本插件故障。");
+    }
+  }
+
+  /** 热重载恢复的重试节奏：每秒一拍。 */
+  private static final long RESTORE_RETRY_DELAY_TICKS = 20L;
+  /** 等待超过该拍数（60 秒）仍未恢复时，输出一次性诊断。 */
+  private static final int RESTORE_DIAGNOSTIC_TICKS = 20 * 60;
+
+  /**
+   * 热重载路径恢复单个被隐藏实体：成功即止；跨区域或暂时失败时在玩家所属线程上每秒重试。
+   *
+   * <p><b>跨区域为什么必须重试、而不是当成「已恢复」</b>：{@link #restoreAll()} 已用 {@code drainPlayer}
+   * 把账本摘走，重建后的新管线里没有这条记录——一旦放弃，该实体对这个玩家就会<b>一直不可见</b>
+   * （客户端的 hideEntity 状态跨 untrack 仍生效，只有重新登录才会清）。而 Folia 上实体与玩家不在同一区域
+   * 时本线程不能触碰该实体（TickThread 校验会先打 ERROR 再抛），所以唯一安全的做法是等它跨回来再恢复。
+   *
+   * <p><b>为什么不设重试上限</b>：这条轮询就是该实体唯一的恢复入口（等价于此前的「通道①每周期复检」），
+   * 按次数截断只会把「玩家稍后走回来」变成「必须重登」。终止条件因此只有三个：恢复成功、玩家离线
+   * （隐藏状态随会话清空）、实体已失效（只在同区域时才读得到）。
+   *
+   * <p>注意 {@link #show} 内部已捕获异常并返回 {@code false}，因此这里以「返回值」判断成败。
+   *
+   * @param waitedTicks 已等待的 tick 数，仅用于一次性慢恢复诊断
+   */
+  private void restoreWithRetry(Player player, Entity entity, int waitedTicks) {
+    if (!player.isOnline()) {
+      return;
+    }
+    boolean restored;
+    if (!owns(entity)) {
+      // 跨区域：本线程不能触碰该实体，等它跨回玩家所属区域
+      diagnoseSlowRestore(waitedTicks);
+      scheduleRestoreRetry(player, entity, waitedTicks);
+      return;
+    }
+    try {
+      restored = show(player, entity) || !entity.isValid();
+    } catch (Throwable throwable) {
+      restored = false;
+    }
+    if (!restored) {
+      diagnoseSlowRestore(waitedTicks);
+      scheduleRestoreRetry(player, entity, waitedTicks);
     }
   }
 
   /**
-   * 停用瞬间恢复单个被隐藏实体：失败时做一次重试，再次失败则记一次中文 WARN——
-   * 绝不静默吞掉（旧实现下被隐藏实体可能保持隐藏到玩家重登，管理员无从察觉）。
+   * 在玩家所属线程上按秒重试：仍跨区域就继续下一拍，同区域则立刻恢复。
    *
-   * <p>注意 {@link #show} 内部已捕获异常并返回 {@code false}，所以这里以「返回值」判断成败；
-   * 实体跨区域（{@code owns} 为 false）或已失效时无需恢复，视为成功。
-   *
-   * @param allowRetry 是否还允许再调度一次重试（只重试一次，避免失败时无限重排）
+   * <p>调度被拒（插件已停用 / 实体已退役）时无法再重试，只在插件仍启用时如实告警一次——
+   * 停用路径由 {@link #restoreNow} 负责，实体退役本就无需恢复。
    */
-  private void restoreWithRetry(Player player, Entity entity, boolean allowRetry) {
-    boolean restored;
-    try {
-      restored = !owns(entity) || show(player, entity) || !entity.isValid();
-    } catch (Throwable throwable) {
-      restored = false;
+  private void scheduleRestoreRetry(Player player, Entity entity, int waitedTicks) {
+    int[] waited = {waitedTicks};
+    ScheduledTask[] self = new ScheduledTask[1];
+    self[0] = Schedulers.repeatOnEntity(plugin, player, RESTORE_RETRY_DELAY_TICKS,
+        RESTORE_RETRY_DELAY_TICKS, () -> {
+          waited[0] += (int) RESTORE_RETRY_DELAY_TICKS;
+          if (!player.isOnline()) {
+            // 客户端隐藏状态随会话结束：无需再恢复
+            cancelQuietly(self[0]);
+            return;
+          }
+          if (!owns(entity)) {
+            diagnoseSlowRestore(waited[0]);
+            return; // 仍跨区域：下一拍再试（任务继续）
+          }
+          cancelQuietly(self[0]);
+          restoreWithRetry(player, entity, waited[0]);
+        }, null);
+    if (self[0] == null && plugin.isEnabled()) {
+      warnCrossRegionRestore();
     }
-    if (restored) {
-      return;
+  }
+
+  /** 等了一分钟还没恢复：打一次性诊断，说明它仍在等该实体跨回玩家所属区域。 */
+  private void diagnoseSlowRestore(int waitedTicks) {
+    if (waitedTicks >= RESTORE_DIAGNOSTIC_TICKS && crossRegionRestoreNoticed.compareAndSet(false, true)) {
+      plugin.getLogger().warning("热重载后有被隐藏实体尚未恢复：它与玩家不在同一区域（Folia），"
+          + "会在该实体跨回玩家所属区域时自动恢复；轮询持续到玩家离线为止。"
+          + "若玩家此后仍看不到该实体，请让其重新登录。");
     }
-    if (allowRetry) {
-      // 按玩家区域调度一次重试（停用瞬间的实体/世界可能尚未稳定）
-      Schedulers.onEntity(plugin, player, () -> restoreWithRetry(player, entity, false));
-      return;
-    }
-    if (restoreFailureNoticed.compareAndSet(false, true)) {
-      plugin.getLogger().warning("插件停用时恢复被隐藏实体失败（已重试一次）："
-          + "个别实体可能需玩家重新登录后才可见；不影响其它功能。");
+  }
+
+  /** 取消重试任务；失败只意味着下一拍多看一次同样的状态，不影响语义。 */
+  private static void cancelQuietly(ScheduledTask task) {
+    if (task != null) {
+      try {
+        task.cancel();
+      } catch (Throwable ignored) {
+        // 任务已结束/已取消：忽略
+      }
     }
   }
 
