@@ -63,7 +63,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
 
   /**
    * 全局回放表条目上限：单段约 32 格（long[32]+boolean[32] ≈ 450 B），无上限时活跃服可达数万段、
-   * 常驻数十 MB。超过上限按「最久未更新」淘汰（下界保护：淘汰后该段丢失回放能力，最坏退化为
+   * 常驻数十 MB。超过上限按「最早创建」淘汰（FIFO：复用不续期，热段与冷段一视同仁；下界保护：淘汰后该段丢失回放能力，最坏退化为
    * 戳比较，方向仍是既有行为，不会更差）。
    */
   private static final int MAX_REPLAY_SECTIONS = 8192;

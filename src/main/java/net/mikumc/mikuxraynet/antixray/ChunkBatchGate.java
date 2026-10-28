@@ -45,10 +45,12 @@ public final class ChunkBatchGate {
 
   /** 一个区块改写任务已结束（无论成功、异常还是被看门狗放行）。 */
   public void chunkDone() {
-    // 每次 chunkDone 都必然对应一次 chunkStarted：「取闸门 + chunkStarted」已在 BatchTable#acquire
-    // 里合并为同一次同步操作，放行动作也只挂在唯一的 RewriteTask 上（signalOnce 保证恰好一次）。
-    // 因此这里不需要「钳到非负」的防御——真出现无配对的调用那是配对 bug，钳位只会把它藏起来。
-    pending.decrementAndGet();
+    // 每次 chunkDone 都必然对应一次 chunkStarted（取闸门与 chunkStarted 在 BatchTable#acquire 里是
+    // 一次同步操作，放行动作也只挂在唯一的 RewriteTask 上），所以正常路径不会为负。
+    // 仍然钳到 0：不是为了掩盖配对 bug，而是保证「万一未来某处漏配对」时后果被限制在「当前这批少等一格」，
+    // 而不是 pending 永久偏移 −1、此后每批都在还有区块在途时就放行 FINISHED（客户端会以为批次已读完）。
+    // 它替代不了配对正确性——配对由 acquire 与 signalOnce 负责。
+    pending.updateAndGet(current -> Math.max(0, current - 1));
     maybeRelease();
   }
 

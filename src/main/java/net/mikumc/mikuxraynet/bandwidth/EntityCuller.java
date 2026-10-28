@@ -215,6 +215,14 @@ public final class EntityCuller implements Listener {
 
   /** 每个在线玩家的周期复检任务（Paper 与 Folia 同一套实体调度器；玩家退出即随实体退役失效）。 */
   private final ConcurrentHashMap<UUID, ScheduledTask> recheckTasks = new ConcurrentHashMap<>();
+  /**
+   * 热重载恢复链路（每个「账本被 drain 但尚未恢复」的实体一条）：{@code stop()} 必须把它们一起取消。
+   *
+   * <p><b>为什么必须登记</b>：这些链会在热重载后继续每秒 {@code showEntity} 直到该实体跨回玩家所属区域。
+   * 若只存在局部变量里，第二次热重载就无法取消上一代——旧链仍以 1 Hz 对同一实体反复下发显示包，
+   * 且随着每次重载叠加一条。
+   */
+  private final Set<ScheduledTask> restoreTasks = ConcurrentHashMap.newKeySet();
   /** 「停用时恢复失败」的中文 WARN 一次性闸门。 */
   private final AtomicBoolean restoreFailureNoticed = new AtomicBoolean();
   /** 「停用时存在跨区域被隐藏实体（Folia）无法同步恢复」的中文 WARN 一次性闸门。 */
@@ -428,6 +436,8 @@ public final class EntityCuller implements Listener {
     // 导致恢复完全无声）。这里改为「先 cancel 在途任务闭合并发 → 检测到已停用则同步恢复」。
     stopping = true;
     cancelRecheckTasks();
+    // 先取消上一代的重载恢复链，再由 restoreAll() 重新起本代（顺序不可颠倒，否则会取消刚建的那条）
+    cancelRestoreTasks();
     HandlerList.unregisterAll(this);
     restoreAll();
     rotations.clear();
@@ -636,6 +646,20 @@ public final class EntityCuller implements Listener {
       ScheduledTask task = recheckTasks.remove(playerId);
       if (task != null) {
         task.cancel();
+      }
+    }
+  }
+
+  /**
+   * 取消全部「热重载恢复」重试链（见 {@link #restoreTasks}）。
+   *
+   * <p>与 {@link #cancelRecheckTasks()} 同一套「先摘再取消」：并发注册的链要么被本方法看到并取消，
+   * 要么留在表里由下一次 {@code stop()} 处理——本方法只在停用/重载时调用，不做忙等。
+   */
+  private void cancelRestoreTasks() {
+    for (ScheduledTask task : new ArrayList<>(restoreTasks)) {
+      if (restoreTasks.remove(task)) {
+        cancelQuietly(task);
       }
     }
   }
@@ -1573,8 +1597,9 @@ public final class EntityCuller implements Listener {
    * 时本线程不能触碰该实体（TickThread 校验会先打 ERROR 再抛），所以唯一安全的做法是等它跨回来再恢复。
    *
    * <p><b>为什么不设重试上限</b>：这条轮询就是该实体唯一的恢复入口（等价于此前的「通道①每周期复检」），
-   * 按次数截断只会把「玩家稍后走回来」变成「必须重登」。终止条件因此只有三个：恢复成功、玩家离线
-   * （隐藏状态随会话清空）、实体已失效（只在同区域时才读得到）。
+   * 按次数截断只会把「玩家稍后走回来」变成「必须重登」。终止条件只有四个：恢复成功、玩家离线
+   * （隐藏状态随会话清空）、实体已失效（同区域才读得到 {@code isValid} 并据此判定）、
+   * 以及插件停用/再次热重载（由 {@link #cancelRestoreTasks()} 统一取消）。
    *
    * <p>注意 {@link #show} 内部已捕获异常并返回 {@code false}，因此这里以「返回值」判断成败。
    *
@@ -1616,27 +1641,43 @@ public final class EntityCuller implements Listener {
           waited[0] += (int) RESTORE_RETRY_DELAY_TICKS;
           if (!player.isOnline()) {
             // 客户端隐藏状态随会话结束：无需再恢复
-            cancelQuietly(self[0]);
+            finishRestoreTask(self[0]);
             return;
           }
           if (!owns(entity)) {
             diagnoseSlowRestore(waited[0]);
             return; // 仍跨区域：下一拍再试（任务继续）
           }
-          cancelQuietly(self[0]);
+          finishRestoreTask(self[0]);
           restoreWithRetry(player, entity, waited[0]);
-        }, null);
-    if (self[0] == null && plugin.isEnabled()) {
-      warnCrossRegionRestore();
+        },
+        // 玩家退出时服务端会直接撤销周期任务，任务体往往抢不到最后一拍——退役回调是这条链唯一的摘除点，
+        // 缺了它 restoreTasks 会一直持有（runnable 闭包还钉着已下线的 Player/Entity 引用）。
+        () -> finishRestoreTask(self[0]));
+    if (self[0] == null) {
+      // 调度被拒：插件已停用（停用路径由 restoreNow 负责，不必告警），或实体已退役（本就无需恢复）；
+      // 玩家已离线同理不必告警。三者都不该冒出一条「跨区域未能恢复」。
+      if (plugin.isEnabled() && player.isOnline()) {
+        warnCrossRegionRestore();
+      }
+      return;
     }
+    restoreTasks.add(self[0]);
   }
 
   /** 等了一分钟还没恢复：打一次性诊断，说明它仍在等该实体跨回玩家所属区域。 */
   private void diagnoseSlowRestore(int waitedTicks) {
     if (waitedTicks >= RESTORE_DIAGNOSTIC_TICKS && crossRegionRestoreNoticed.compareAndSet(false, true)) {
-      plugin.getLogger().warning("热重载后有被隐藏实体尚未恢复：它与玩家不在同一区域（Folia），"
-          + "会在该实体跨回玩家所属区域时自动恢复；轮询持续到玩家离线为止。"
+      plugin.getLogger().warning("热重载后有被隐藏实体尚未恢复（跨区域等待，或恢复调用持续失败）："
+          + "跨区域的会在该实体回到玩家所属区域时自动恢复，轮询持续到恢复成功或玩家离线；"
           + "若玩家此后仍看不到该实体，请让其重新登录。");
+    }
+  }
+
+  /** 结束一条恢复重试链：先从登记表摘除，再取消（重复调用无副作用）。 */
+  private void finishRestoreTask(ScheduledTask task) {
+    if (task != null && restoreTasks.remove(task)) {
+      cancelQuietly(task);
     }
   }
 
