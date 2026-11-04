@@ -223,6 +223,17 @@ public class ChunkSection {
    */
   public SectionOcclusion buildOcclusionAndTargets(IntPredicate occludingTable,
       IntPredicate targetTable, IntConsumer targetSink) {
+    return buildOcclusionAndTargets(occludingTable, targetTable, targetSink, null);
+  }
+
+  /**
+   * 同上，并可选地维护「每个调色板条目的引用次数」（供调色板收缩跳过频次扫描）。
+   *
+   * <p>{@code targetCounts} 长度须等于 {@link #paletteSize()}；遍历时对每个格子累加其条目索引，
+   * 因此得到的是全部条目的精确频次。直接调色板没有条目表，传 {@code null}。
+   */
+  public SectionOcclusion buildOcclusionAndTargets(IntPredicate occludingTable,
+      IntPredicate targetTable, IntConsumer targetSink, int[] targetCounts) {
     boolean needBitmap = occludingTable != null;
     if (!needBitmap && targetTable == null) {
       return null;
@@ -237,6 +248,10 @@ public class ChunkSection {
         for (int index = 0; index < SECTION_VOLUME; index++) {
           targetSink.accept(index);
         }
+      }
+      if (targetCounts != null && targetCounts.length > 0) {
+        // 单值调色板：整段 4096 格都是同一条目（与是否目标无关，计数是「全部条目」的引用频次）
+        targetCounts[0] = SECTION_VOLUME;
       }
       return view;
     }
@@ -315,6 +330,10 @@ public class ChunkSection {
       if (words != null && occludingByEntry[id]) {
         words[index >>> 6] |= 1L << index;
         occludedCells++;
+      }
+      if (targetCounts != null && id < targetCounts.length) {
+        // 同时维护「全部条目」的精确引用计数：收缩时无需再扫一遍 4096 格
+        targetCounts[id]++;
       }
       if (targetByEntry != null && targetByEntry[id]) {
         targetSink.accept(index);
@@ -425,6 +444,15 @@ public class ChunkSection {
     return this.palette.contains(stateId);
   }
 
+  /**
+   * 某方块状态在当前调色板里的本地索引（仅间接调色板有意义；状态必须已在调色板内）。
+   *
+   * <p>供改写阶段按「原状态」递减目标条目引用计数；直接/单值调色板没有可裁剪条目，调用方不统计。
+   */
+  public int paletteIdFor(int stateId) {
+    return this.palette.idFor(stateId);
+  }
+
   /** 按序号读出全部 4096 个方块状态（供裁剪/降级自检与单测；不改变任何状态）。 */
   public int[] readAllBlockStates() {
     int[] states = new int[SECTION_VOLUME];
@@ -452,6 +480,17 @@ public class ChunkSection {
    * @return 是否实际发生了裁剪（含降位宽）
    */
   public boolean compactPalette(boolean verify) {
+    return compactPalette(verify, null);
+  }
+
+  /**
+   * 同上，但引用计数可由调用方提供（[[knownCounts]]）：非目标条目预置 1、目标条目由扫描/替换维护，
+   * 省掉每段一次 4096 次 {@code data.get} 的频次统计。
+   *
+   * <p>长度可小于当前调色板条目数（改写期间 grow 新增的条目）：越界条目按「有引用」处理。
+   * 传 {@code null} 等价于旧行为（本方法自行扫描）。
+   */
+  public boolean compactPalette(boolean verify, int[] knownCounts) {
     if (!(this.palette instanceof IndirectPalette indirectPalette)) {
       return false;
     }
@@ -463,10 +502,17 @@ public class ChunkSection {
 
     int[] before = verify ? readAllBlockStates() : null;
 
-    // 1) 统计每个调色板条目的引用计数
+    // 1) 统计每个调色板条目的引用计数：调用方已提供（收集阶段 + 替换递减）时直接复用，
+    //    省掉一次 4096 格扫描；越界条目（改写期间 grow 新增）按「有引用」处理。
     int[] frequency = new int[size];
-    for (int i = 0; i < SECTION_VOLUME; i++) {
-      frequency[this.data.get(i)]++;
+    if (knownCounts != null) {
+      for (int id = 0; id < size; id++) {
+        frequency[id] = id < knownCounts.length ? knownCounts[id] : 1;
+      }
+    } else {
+      for (int i = 0; i < SECTION_VOLUME; i++) {
+        frequency[this.data.get(i)]++;
+      }
     }
 
     // 2) 保留引用非 0 的条目（按原索引顺序压缩，同输入必然同输出，缓存可复用）

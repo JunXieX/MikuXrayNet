@@ -114,11 +114,19 @@ class ChunkSectionVisibilityTest {
       }
 
       List<Integer> actualTargets = new ArrayList<>();
+      int[] counts = section.bitsPerBlock() > 8 ? null : new int[section.paletteSize()];
       SectionOcclusion actualView = section.buildOcclusionAndTargets(
           ChunkSectionVisibilityTest::occluding, ChunkSectionVisibilityTest::target,
-          actualTargets::add);
+          actualTargets::add, counts);
       assertSameView(expectedView, actualView);
       assertEquals(expectedTargets, actualTargets, "目标索引必须与逐格扫描一致（升序）");
+      if (counts != null) {
+        int total = 0;
+        for (int count : counts) {
+          total += count;
+        }
+        assertEquals(VOLUME, total, "条目引用计数之和必须等于 4096（收缩依赖它的精确性）");
+      }
 
       List<Integer> onlyTargets = new ArrayList<>();
       assertNull(section.buildOcclusionAndTargets(null, ChunkSectionVisibilityTest::target,

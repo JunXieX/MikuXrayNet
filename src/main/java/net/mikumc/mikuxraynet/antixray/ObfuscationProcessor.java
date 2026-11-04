@@ -78,6 +78,14 @@ public final class ObfuscationProcessor {
 
   /** 建表失败的一次性中文提示闸门：建表对每个区块都跑，异常一旦成片会刷屏淹没真日志。 */
   private static final AtomicBoolean CAPTURE_FAILURE_WARNED = new AtomicBoolean();
+
+  /**
+   * 触发「位图 6 面判定」的单段目标数阈值：低于它时读实时状态 + undo log 更便宜。
+   *
+   * <p>洞穴形态每段约 256 个目标（全段候选），主世界地下 / 稀疏矿脉每段几十个；
+   * 阈值取 128 正好把前者纳入、后者挡在旧路径。
+   */
+  private static final int BITMAP_FACE_MIN_TARGETS = 128;
   /** 与包内其它类同名的日志通道（本类不持有插件实例，只借同名 logger 输出一次性提示）。 */
   private static final Logger LOGGER = Logger.getLogger("MikuXrayNet");
 
@@ -115,6 +123,12 @@ public final class ObfuscationProcessor {
       }
       values[size++] = value;
     }
+  }
+
+  /**
+   * 建表阶段的产出：可选的缓存负载 + 可选的「改写前原始几何」遮挡位图列（enclosed 模式 6 面判定用）。
+   */
+  private record Prepared(byte[] payload, SectionOcclusion[] antiColumn) {
   }
 
   public record Result(byte[] data, int[] obfuscatedPositions, String failure, int[] sectionBits,
@@ -835,10 +849,14 @@ public final class ObfuscationProcessor {
       boolean[] sectionCandidates = selectCandidateSections(chunk, profile);
       // 每个候选段收集到的目标格索引（升序）；非候选段为 null。
       TargetList[] targetLists = new TargetList[sectionCount];
+      // 每个候选段「调色板条目 → 目标命中次数」：供 compactPalette 跳过频次扫描；直接调色板为 null。
+      int[][] targetCounts = new int[sectionCount][];
       // 异步实体遮挡建表（在改写之前，位图反映真实世界几何）：未启用该功能时 stores 为 null，
       // 只做目标收集（仍是一遍遍历）；启用时同一遍遍历同时建位图并收集目标。
-      occlusion = captureOcclusion(chunk, worldName, chunkX, chunkZ, worldMinY, occlusionStamps,
-          sectionCandidates, targetLists, profile);
+      Prepared prepared = captureOcclusion(chunk, worldName, chunkX, chunkZ, worldMinY,
+          occlusionStamps, sectionCandidates, targetLists, targetCounts, profile);
+      occlusion = prepared.payload();
+      SectionOcclusion[] antiColumn = prepared.antiColumn();
 
       // enclosed 模式的滚动改写日志：保留「上一段」的 undo log（y-1 跨段判定要用，见循环内说明）。
       // mode=all 时恒为 null，零开销。
@@ -871,6 +889,8 @@ public final class ObfuscationProcessor {
         // 而实际被替换的格子通常只有几十~几百个，undo log 的开销与替换数成正比。
         // 下标按升序写入，查询用二分；y-1 落到「本段」或「上一段」时先查日志，未命中说明该格没被改写，
         // 直接读实时状态即可（等价于原始状态）。
+        // 位图只覆盖「目标密集」的段；undo log 仍要为所有 enclosed 段维护——稀疏段命中时
+        // 6 面判定可能回落到相邻的密集段（它已被改写），必须能查回原始状态。
         UndoLog undoLog = profile.obfuscateAll ? null : new UndoLog();
         previousUndoLog = undoLog;
 
@@ -902,7 +922,11 @@ public final class ObfuscationProcessor {
           }
 
           // mode=all：所有目标矿一律伪装（不看 6 面遮挡）；mode=enclosed：只伪装 6 面全遮挡的掩埋矿。
-          if (undoLog != null
+          if (antiColumn != null && antiColumn[sectionIndex] != null) {
+            if (!isFullyOccludedByBitmap(chunk, antiColumn, baseY, index, neighbors)) {
+              continue;
+            }
+          } else if (undoLog != null
               && !isFullyOccluded(chunk, sectionIndex, undoLog, previousUndoLogSnapshot, baseY, index,
                   neighbors)) {
             continue;
@@ -971,7 +995,20 @@ public final class ObfuscationProcessor {
             // 但「洞穴」形态单区块可替换近 3000 格，重复读取的量并不小。
             undoLog.record(index, state);
           }
+          int[] sectionCounts = targetCounts[sectionIndex];
+          if (sectionCounts != null) {
+            int originalEntry = section.paletteIdFor(state);
+            if (originalEntry >= 0 && originalEntry < sectionCounts.length) {
+              sectionCounts[originalEntry]--;
+            }
+          }
           section.setBlockState(index, replacement);
+          if (sectionCounts != null && profile.targets.get(replacement)) {
+            int replacementEntry = section.paletteIdFor(replacement);
+            if (replacementEntry >= 0 && replacementEntry < sectionCounts.length) {
+              sectionCounts[replacementEntry]++;
+            }
+          }
           sectionChanged = true;
           changed = true;
 
@@ -991,7 +1028,7 @@ public final class ObfuscationProcessor {
           // 失败只放弃体积优化，绝不回滚已完成的替换（宁可包体大，不可漏伪装）。
           if (paletteOptions.widthBudget()) {
             try {
-              section.compactPalette(paletteOptions.strictVerify());
+              section.compactPalette(paletteOptions.strictVerify(), targetCounts[sectionIndex]);
               section.downgradePalette(paletteOptions.strictVerify());
             } catch (RuntimeException pruneFailure) {
               // 裁剪/降级失败：保留替换结果原样（可能已 grow），伪装正确性不受影响
@@ -1021,7 +1058,7 @@ public final class ObfuscationProcessor {
    * 已登记的列表（完整）会被跳过，只补未登记的段。
    */
   private static void collectTargetsOnly(Chunk chunk, boolean[] sectionCandidates,
-      TargetList[] targetLists, IntPredicate targetTest) {
+      TargetList[] targetLists, int[][] targetCounts, boolean collectCounts, IntPredicate targetTest) {
     for (int sectionIndex = 0; sectionIndex < sectionCandidates.length; sectionIndex++) {
       if (!sectionCandidates[sectionIndex] || targetLists[sectionIndex] != null) {
         continue;
@@ -1030,10 +1067,65 @@ public final class ObfuscationProcessor {
       if (section == null) {
         continue;
       }
+      int[] counts = !collectCounts || section.bitsPerBlock() > 8
+          ? null : new int[section.paletteSize()];
       TargetList list = new TargetList();
-      section.buildOcclusionAndTargets(null, targetTest, list);
+      section.buildOcclusionAndTargets(null, targetTest, list, counts);
       targetLists[sectionIndex] = list;
+      if (counts != null && targetCounts != null) {
+        targetCounts[sectionIndex] = counts;
+      }
     }
+  }
+
+  /**
+   * 建一列「改写前原始几何」的反矿透视觉口径遮挡位图（enclosed 模式 6 面判定用）。
+   *
+   * <p>与实体口径位图分开建：两套谓词不同（{@code registry::isOccluding} vs
+   * {@code registry::isEntityOccluding}），不能混用。只在 enclosed 模式且需要时构建，
+   * 全伪装模式零调用。
+   *
+   * @param collectTargets true 时同一遍遍历顺带收集目标索引与目标条目计数（位图建表与扫描合并）
+   */
+  /**
+   * 只为「目标密集」的候选段（及其相邻候选段）建 6 面判定位图。
+   *
+   * <p><b>为什么按密度选择</b>：位图位测试单次约 2~5 ns，而「读实时状态 + 调色板换算」在替换数很少时
+   * 更便宜；只有当一个段的目标格足够多、undo log 长到二分查找成为主要成本时，位图才净赚。
+   * 实测洞穴（每段约 256 个目标）收益最大；主世界地下 / 稀疏矿脉（每段几十个）用旧路径更快。
+   *
+   * <p>相邻候选段也建位图：密集段做 y±1 判定时可能落到已被改写的相邻候选段，不能回退读实时状态。
+   */
+  private SectionOcclusion[] buildAntiColumn(Chunk chunk, boolean[] sectionCandidates,
+      TargetList[] targetLists) {
+    int sectionCount = chunk.getSectionCount();
+    boolean[] needed = new boolean[sectionCount];
+    for (int sectionIndex = 0; sectionIndex < sectionCount; sectionIndex++) {
+      if (!sectionCandidates[sectionIndex] || targetLists[sectionIndex] == null
+          || targetLists[sectionIndex].size < BITMAP_FACE_MIN_TARGETS) {
+        continue;
+      }
+      needed[sectionIndex] = true;
+      if (sectionIndex > 0 && sectionCandidates[sectionIndex - 1]) {
+        needed[sectionIndex - 1] = true;
+      }
+      if (sectionIndex + 1 < sectionCount && sectionCandidates[sectionIndex + 1]) {
+        needed[sectionIndex + 1] = true;
+      }
+    }
+    SectionOcclusion[] column = new SectionOcclusion[sectionCount];
+    for (int sectionIndex = 0; sectionIndex < sectionCount; sectionIndex++) {
+      if (!needed[sectionIndex]) {
+        continue;
+      }
+      ChunkSection section = chunk.getSection(sectionIndex);
+      if (section == null || section.isEmpty()) {
+        column[sectionIndex] = EmptyOcclusion.INSTANCE;
+        continue;
+      }
+      column[sectionIndex] = section.buildOcclusionAndTargets(occlusionTable, null, null, null);
+    }
+    return column;
   }
 
   /**
@@ -1054,16 +1146,22 @@ public final class ObfuscationProcessor {
    * 不进缓存（每次重发都要重算），因此失败会计入 {@link RewriteStats#occlusionCaptureFailures}
    * 并打一次限流中文提示。
    */
-  private byte[] captureOcclusion(Chunk chunk, String worldName, int chunkX, int chunkZ,
+  private Prepared captureOcclusion(Chunk chunk, String worldName, int chunkX, int chunkZ,
       int worldMinY, long[] packetThreadStamps, boolean[] sectionCandidates,
-      TargetList[] targetLists, WorldProfile profile) {
+      TargetList[] targetLists, int[][] targetCounts, WorldProfile profile) {
     OcclusionStores stores = this.occlusionStores;
     int sectionCount = chunk.getSectionCount();
     IntPredicate targetTest = profile.targets::get;
     if (stores == null) {
       // 未启用遮挡位图：仍要在一遍遍历里收集目标（替代旧实现的逐格扫描），只是不建位图。
-      collectTargetsOnly(chunk, sectionCandidates, targetLists, targetTest);
-      return null;
+      collectTargetsOnly(chunk, sectionCandidates, targetLists, targetCounts,
+          paletteOptions.widthBudget(), targetTest);
+      if (profile.obfuscateAll) {
+        return new Prepared(null, null);
+      }
+      // enclosed：目标收集完成后再按密度决定哪些段建「改写前几何」位图。
+      SectionOcclusion[] anti = buildAntiColumn(chunk, sectionCandidates, targetLists);
+      return new Prepared(null, anti);
     }
     RewriteStats statsRef = this.stats;
     try {
@@ -1072,8 +1170,9 @@ public final class ObfuscationProcessor {
       if (store == null || store.isClosed()) {
         // 世界已卸载：本趟建表作废（closed 会丢弃所有写入），等新世界的区块重新发布；
         // 返回 null = 「本次没有遮挡负载」，但不影响反矿透改写——目标仍要收集，否则整块会被跳过。
-        collectTargetsOnly(chunk, sectionCandidates, targetLists, targetTest);
-        return null;
+        collectTargetsOnly(chunk, sectionCandidates, targetLists, targetCounts,
+            paletteOptions.widthBudget(), targetTest);
+        return new Prepared(null, null);
       }
       // 补丁戳快照优先用「持包线程」取的那份（见 capturePatchStamps）：它的窗口起点最早，
       // 只覆盖「封包生成 → 持包」的亚毫秒级；缺失或长度不符时才退回本线程现取（旧行为，窗口更长）。
@@ -1092,14 +1191,20 @@ public final class ObfuscationProcessor {
         // 建表与目标收集合并成同一遍遍历：候选段同时建位图 + 收集命中格，
         // 非候选段只建位图（其中的全空/全实心段由调色板级快路径直接返回，零 4096 遍历）。
         TargetList list = null;
+        int[] counts = null;
         if (sectionCandidates[sectionIndex]) {
           list = new TargetList();
+          counts = !paletteOptions.widthBudget() || section.bitsPerBlock() > 8
+              ? null : new int[section.paletteSize()];
         }
         SectionOcclusion view = section.buildOcclusionAndTargets(entityOcclusionTable,
-            list == null ? null : targetTest, list);
+            list == null ? null : targetTest, list, counts);
         if (list != null) {
           // 成功后才登记：异常路径下未登记的段由 catch 统一补收集，避免「半份目标列表」被改写循环当成全部命中
           targetLists[sectionIndex] = list;
+          if (counts != null) {
+            targetCounts[sectionIndex] = counts;
+          }
         }
         column[sectionIndex] = view;
       }
@@ -1114,8 +1219,12 @@ public final class ObfuscationProcessor {
         // 跳过段数持续偏高 = 建表期间方块变更很频繁（补丁被保住，方向安全，但说明发布窗口值得关注）
         statsRef.occlusionPublishSkipped.add(skipped);
       }
+      // enclosed 模式再建一份「反矿透视觉口径」的位图列（实体位图口径不同，不能混用）：
+      // 它只用于 6 面判定，反映改写前几何；全伪装模式完全不需要。
+      SectionOcclusion[] anti = profile.obfuscateAll ? null
+          : buildAntiColumn(chunk, sectionCandidates, targetLists);
       // 同时返回编码后的负载：调用方把它随改写结果一并缓存，使缓存命中路径也能恢复遮挡数据
-      return payload;
+      return new Prepared(payload, anti);
     } catch (RuntimeException | LinkageError failure) {
       // 建表失败不影响反矿透改写（fail-open），但必须留痕（见方法注释的「失败语义」）：
       // 只吞 RuntimeException 与 LinkageError（类/链接层面的不兼容），不吞 OOM 等真正的 Error。
@@ -1123,7 +1232,8 @@ public final class ObfuscationProcessor {
       // 当作「无目标」跳过，矿原样下发给透视端（比没有位图严重得多）。
       // 补收集再失败就放弃整个区块（上抛由 rewrite 兜底为原字节）：宁可本区块不改写，也不能漏矿。
       try {
-        collectTargetsOnly(chunk, sectionCandidates, targetLists, targetTest);
+        collectTargetsOnly(chunk, sectionCandidates, targetLists, targetCounts,
+            paletteOptions.widthBudget(), targetTest);
       } catch (RuntimeException | LinkageError fallbackFailure) {
         throw new IllegalStateException("遮挡建表失败后目标收集仍失败，放弃本区块改写", fallbackFailure);
       }
@@ -1135,7 +1245,7 @@ public final class ObfuscationProcessor {
             + "玩家挖到的矿可能一直显示假方块；且失败结果不进缓存、每次重发都会重算）。"
             + "本条只提示一次，此后请以 /mikuxraynet status 的「遮挡建表失败」计数为准", failure);
       }
-      return null;
+      return new Prepared(null, null);
     }
   }
 
@@ -1513,6 +1623,52 @@ public final class ObfuscationProcessor {
         && isOccluding(chunk, sectionIndex, currentLog, previousLog, y, x - 1, z, neighbors)
         && isOccluding(chunk, sectionIndex, currentLog, previousLog, y, x, z + 1, neighbors)
         && isOccluding(chunk, sectionIndex, currentLog, previousLog, y, x, z - 1, neighbors);
+  }
+
+  /**
+   * 用「改写前几何」位图做 6 面判定：每个面 O(1) 位测试，不再读方块状态、也不再查 undo log。
+   *
+   * <p>与 {@link #isFullyOccluded} 逐面语义一致：世界上下界之外视为未遮挡；越出本区块改查邻块
+   * 贴边快照；区块内直接读该段位图（位图在改写之前构建，等于「原始状态」）。
+   */
+  private boolean isFullyOccludedByBitmap(Chunk chunk, SectionOcclusion[] column, int baseY,
+      int index, NeighborEdges neighbors) {
+    int x = index & 15;
+    int z = index >> 4 & 15;
+    int y = baseY | (index >> 8 & 15);
+    return occludingAtBitmap(chunk, column, y + 1, x, z, neighbors)
+        && occludingAtBitmap(chunk, column, y - 1, x, z, neighbors)
+        && occludingAtBitmap(chunk, column, y, x + 1, z, neighbors)
+        && occludingAtBitmap(chunk, column, y, x - 1, z, neighbors)
+        && occludingAtBitmap(chunk, column, y, x, z + 1, neighbors)
+        && occludingAtBitmap(chunk, column, y, x, z - 1, neighbors);
+  }
+
+  /**
+   * 位图版单面判定：有原始几何位图就用位测试；非候选段（不会被改写）回退读实时状态——
+   * 两者都等价于「改写前的状态」。越界/跨区块沿用旧路径的边界语义。
+   */
+  private boolean occludingAtBitmap(Chunk chunk, SectionOcclusion[] column, int y, int x, int z,
+      NeighborEdges neighbors) {
+    if (y < 0) {
+      return false;
+    }
+    int sectionIndex = y >> 4;
+    if (sectionIndex >= column.length) {
+      return false;
+    }
+    if (x >= 0 && x <= 15 && z >= 0 && z <= 15) {
+      SectionOcclusion view = column[sectionIndex];
+      if (view != null) {
+        return view.isOccluding(x, y & 15, z);
+      }
+      ChunkSection section = chunk.getSection(sectionIndex);
+      if (section == null) {
+        return false;
+      }
+      return occlusionTable.test(section.getBlockState((y & 15) << 8 | z << 4 | x));
+    }
+    return neighborOccluding(neighbors, x, y, z);
   }
 
   /**
