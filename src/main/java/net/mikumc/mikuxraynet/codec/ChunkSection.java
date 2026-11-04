@@ -2,8 +2,13 @@
 package net.mikumc.mikuxraynet.codec;
 
 import java.util.Arrays;
+import java.util.function.IntConsumer;
 import java.util.function.IntPredicate;
 import io.netty.buffer.ByteBuf;
+import net.mikumc.mikuxraynet.occlusion.BitmapOcclusion;
+import net.mikumc.mikuxraynet.occlusion.EmptyOcclusion;
+import net.mikumc.mikuxraynet.occlusion.SectionOcclusion;
+import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
 
 /**
  * 单个 16×16×16 section 的方块数据：方块计数、bitsPerBlock、调色板与位打包索引数组。
@@ -195,6 +200,140 @@ public class ChunkSection {
       }
     }
     return false;
+  }
+
+  /**
+   * 一次遍历完成两件事（<b>建遮挡位图</b>可选、<b>收集目标格索引</b>可选），供反矿透改写链路使用。
+   *
+   * <p><b>为什么合并</b>：建表与逐格扫描都要读同一份 {@code data}（每个候选段 4096 次）。分成两遍时
+   * 位图建表约占改写耗时的 40%、逐格扫描约 28%；合并后只付一遍索引读取，两个判定各用一张
+   * 「调色板条目 → 布尔」表，逐格不再做 {@code valueFor} 与谓词调用。
+   *
+   * <p><b>快路径（只在不需要收集目标时生效）</b>：间接调色板若「没有任何条目遮挡」→ 直接
+   * {@link EmptyOcclusion}；「全部条目遮挡」→ 直接 {@link SolidOcclusion}。两者都不必逐格遍历——
+   * 真实主世界列里全空气段与全实心段占多数，这条能整段省下 4096 次读取。
+   *
+   * <p><b>语义约束</b>：只读本段当前状态，绝不修改任何方块数据；位图必须反映<b>调用时刻</b>的几何
+   * （调用方在改写之前调用）。直接调色板（{@code bitsPerBlock > 8}）没有条目表，退回逐格状态判定。
+   *
+   * @param occludingTable 遮挡谓词；{@code null} 表示不建位图（此时返回 {@code null}）
+   * @param targetTable    目标方块谓词；{@code null} 表示不收集目标
+   * @param targetSink     目标格索引消费者（{@code targetTable} 非 null 时必传），按索引升序收到命中格
+   * @return 遮挡视图；{@code occludingTable == null} 时返回 {@code null}
+   */
+  public SectionOcclusion buildOcclusionAndTargets(IntPredicate occludingTable,
+      IntPredicate targetTable, IntConsumer targetSink) {
+    boolean needBitmap = occludingTable != null;
+    if (!needBitmap && targetTable == null) {
+      return null;
+    }
+    if (this.bitsPerBlock == 0) {
+      int state = this.palette.valueFor(0);
+      SectionOcclusion view = null;
+      if (needBitmap) {
+        view = occludingTable.test(state) ? SolidOcclusion.INSTANCE : EmptyOcclusion.INSTANCE;
+      }
+      if (targetTable != null && targetTable.test(state)) {
+        for (int index = 0; index < SECTION_VOLUME; index++) {
+          targetSink.accept(index);
+        }
+      }
+      return view;
+    }
+
+    boolean direct = this.palette instanceof DirectPalette;
+    int entries = direct ? 0 : this.palette.size();
+    if (!direct && entries == 0) {
+      // 空调色板（损坏/异常输入）：没有任何格子可读到合法状态。位图按「全不遮挡」处理，
+      // 也不可能有目标格——不进入逐格循环，避免 targetByEntry[0] 越界。
+      return needBitmap ? EmptyOcclusion.INSTANCE : null;
+    }
+
+    if (direct) {
+      long[] words = needBitmap ? new long[BitmapOcclusion.WORD_COUNT] : null;
+      int occludedCells = 0;
+      for (int index = 0; index < SECTION_VOLUME; index++) {
+        int state = this.data.get(index);
+        if (needBitmap && occludingTable.test(state)) {
+          words[index >>> 6] |= 1L << index;
+          occludedCells++;
+        }
+        if (targetTable != null && targetTable.test(state)) {
+          targetSink.accept(index);
+        }
+      }
+      if (!needBitmap) {
+        return null;
+      }
+      if (occludedCells == 0) {
+        return EmptyOcclusion.INSTANCE;
+      }
+      if (occludedCells == SECTION_VOLUME) {
+        return SolidOcclusion.INSTANCE;
+      }
+      return BitmapOcclusion.copyOf(words);
+    }
+
+    boolean[] occludingByEntry = null;
+    boolean allOccluding = false;
+    boolean noneOccluding = false;
+    if (needBitmap) {
+      occludingByEntry = new boolean[entries];
+      int occludingEntries = 0;
+      for (int id = 0; id < entries; id++) {
+        boolean occluding = occludingTable.test(this.palette.valueFor(id));
+        occludingByEntry[id] = occluding;
+        if (occluding) {
+          occludingEntries++;
+        }
+      }
+      noneOccluding = occludingEntries == 0;
+      allOccluding = occludingEntries == entries;
+      if (noneOccluding || allOccluding) {
+        // 整段结论恒定：不必逐格写位。但若同时要收集目标，仍需继续遍历（见下）。
+        occludingByEntry = null;
+      }
+    }
+
+    boolean[] targetByEntry = null;
+    if (targetTable != null) {
+      targetByEntry = new boolean[entries];
+      for (int id = 0; id < entries; id++) {
+        targetByEntry[id] = targetTable.test(this.palette.valueFor(id));
+      }
+    }
+
+    if (occludingByEntry == null && targetByEntry == null) {
+      // 位图结论已由调色板确定，且不需要逐格收集：直接返回，零 4096 次遍历。
+      return allOccluding ? SolidOcclusion.INSTANCE : EmptyOcclusion.INSTANCE;
+    }
+
+    long[] words = occludingByEntry != null ? new long[BitmapOcclusion.WORD_COUNT] : null;
+    int occludedCells = 0;
+    for (int index = 0; index < SECTION_VOLUME; index++) {
+      int id = this.data.get(index);
+      if (words != null && occludingByEntry[id]) {
+        words[index >>> 6] |= 1L << index;
+        occludedCells++;
+      }
+      if (targetByEntry != null && targetByEntry[id]) {
+        targetSink.accept(index);
+      }
+    }
+
+    if (!needBitmap) {
+      return null;
+    }
+    if (allOccluding) {
+      return SolidOcclusion.INSTANCE;
+    }
+    if (noneOccluding || occludedCells == 0) {
+      return EmptyOcclusion.INSTANCE;
+    }
+    if (occludedCells == SECTION_VOLUME) {
+      return SolidOcclusion.INSTANCE;
+    }
+    return BitmapOcclusion.copyOf(words);
   }
 
   public void write(ByteBuf buffer) {

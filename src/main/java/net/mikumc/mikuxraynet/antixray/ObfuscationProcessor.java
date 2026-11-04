@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.IntConsumer;
 import java.util.function.IntPredicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -15,13 +16,11 @@ import net.mikumc.mikuxraynet.codec.Chunk;
 import net.mikumc.mikuxraynet.codec.ChunkCodec;
 import net.mikumc.mikuxraynet.codec.ChunkSection;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
-import net.mikumc.mikuxraynet.occlusion.BitmapOcclusion;
 import net.mikumc.mikuxraynet.occlusion.EmptyOcclusion;
 import net.mikumc.mikuxraynet.occlusion.OcclusionPayload;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.occlusion.SectionOcclusion;
-import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
 import net.mikumc.mikuxraynet.registry.BlockStateRegistry;
 
 /**
@@ -99,6 +98,25 @@ public final class ObfuscationProcessor {
    *                            异步实体遮挡时为非 null。调用方把它随改写结果一并缓存，使缓存命中的区块
    *                            也能恢复遮挡数据（否则命中路径不解码、拿不到位图）。
    */
+  /**
+   * 目标格索引收集器：建表/扫描合并那一遍遍历把命中格按升序写入这里，供改写循环消费。
+   *
+   * <p>容量按需翻倍；一个候选 section 的命中数通常只有几十~几百，初始 64 足够。
+   */
+  private static final class TargetList implements IntConsumer {
+
+    int[] values = new int[64];
+    int size;
+
+    @Override
+    public void accept(int value) {
+      if (size == values.length) {
+        values = Arrays.copyOf(values, size << 1);
+      }
+      values[size++] = value;
+    }
+  }
+
   public record Result(byte[] data, int[] obfuscatedPositions, String failure, int[] sectionBits,
       byte[] occlusion) {
 
@@ -808,15 +826,19 @@ public final class ObfuscationProcessor {
     }
 
     try {
-      // 异步实体遮挡建表（在改写之前，位图反映真实世界几何）：未启用该功能时 occlusionStore 为 null，零开销。
-      occlusion = captureOcclusion(chunk, worldName, chunkX, chunkZ, worldMinY, occlusionStamps);
       boolean rangeLimited = profile.minY != Integer.MIN_VALUE || profile.maxY != Integer.MAX_VALUE;
       boolean bandDriven = profile.bandMinY.length > 0;
       // section 级预筛（封包侧判空）：全空气（封包头 blockCount==0）与本段调色板里没有目标方块的
       // section 整段跳过，省下它们各 4096 次逐格查表（见 ChunkSection#paletteCouldContain）。
-      // 判定一次性算在循环外：热循环里只读一个布尔数组，不引入任何接口调用——否则逐格扫描那段
-      // 会有可观测的变慢（实测「24 个 section 全含目标」的形态从 0.34ms 涨到 0.76ms）。
+      // 判定一次性算在循环外：热循环里只读一个布尔数组，不引入任何接口调用。
+      // 必须放在建表之前：建表与逐格扫描合并成同一遍遍历时，需要先知道哪些段要收集目标索引。
       boolean[] sectionCandidates = selectCandidateSections(chunk, profile);
+      // 每个候选段收集到的目标格索引（升序）；非候选段为 null。
+      TargetList[] targetLists = new TargetList[sectionCount];
+      // 异步实体遮挡建表（在改写之前，位图反映真实世界几何）：未启用该功能时 stores 为 null，
+      // 只做目标收集（仍是一遍遍历）；启用时同一遍遍历同时建位图并收集目标。
+      occlusion = captureOcclusion(chunk, worldName, chunkX, chunkZ, worldMinY, occlusionStamps,
+          sectionCandidates, targetLists, profile);
 
       // enclosed 模式的滚动改写日志：保留「上一段」的 undo log（y-1 跨段判定要用，见循环内说明）。
       // mode=all 时恒为 null，零开销。
@@ -861,11 +883,13 @@ public final class ObfuscationProcessor {
         // 候选表占用预算后的剩余调色板空位（use-block-below × 预算联动用；见 buildSectionTables）
         int[] freeAfterTables = {Integer.MAX_VALUE};
 
-        for (int index = 0; index < SECTION_VOLUME; index++) {
+        // 目标格由建表/收集那一遍遍历给出（升序），这里不再逐格扫描 4096 次。
+        // 命中数通常只有几十~几百，逐格读取方块状态只为 undo log 记录原状态。
+        TargetList sectionTargets = targetLists[sectionIndex];
+        int targetCount = sectionTargets == null ? 0 : sectionTargets.size;
+        for (int targetIndex = 0; targetIndex < targetCount; targetIndex++) {
+          int index = sectionTargets.values[targetIndex];
           int state = section.getBlockState(index);
-          if (!profile.targets.get(state)) {
-            continue;
-          }
 
           // 绝对 Y：min-y/max-y 过滤与分区伪装表都按世界坐标判定
           int blockY = 0;
@@ -991,6 +1015,28 @@ public final class ObfuscationProcessor {
   }
 
   /**
+   * 只收集目标格（不建位图）：供「未启用遮挡位图」与「建表失败」两条路径兜底。
+   *
+   * <p>与建表使用同一套「调色板条目 → 是否目标」查表逻辑，因此结果与合并遍历逐格一致；
+   * 已登记的列表（完整）会被跳过，只补未登记的段。
+   */
+  private static void collectTargetsOnly(Chunk chunk, boolean[] sectionCandidates,
+      TargetList[] targetLists, IntPredicate targetTest) {
+    for (int sectionIndex = 0; sectionIndex < sectionCandidates.length; sectionIndex++) {
+      if (!sectionCandidates[sectionIndex] || targetLists[sectionIndex] != null) {
+        continue;
+      }
+      ChunkSection section = chunk.getSection(sectionIndex);
+      if (section == null) {
+        continue;
+      }
+      TargetList list = new TargetList();
+      section.buildOcclusionAndTargets(null, targetTest, list);
+      targetLists[sectionIndex] = list;
+    }
+  }
+
+  /**
    * 异步实体遮挡建表：把本区块各 section 的遮挡位图写入 {@link OcclusionStores}（该世界那一张表）。
    *
    * <p><b>为什么放在这里</b>：本方法运行在反矿透解码工作线程上，且此刻已拿到解码后的 {@link Chunk}
@@ -1009,19 +1055,24 @@ public final class ObfuscationProcessor {
    * 并打一次限流中文提示。
    */
   private byte[] captureOcclusion(Chunk chunk, String worldName, int chunkX, int chunkZ,
-      int worldMinY, long[] packetThreadStamps) {
+      int worldMinY, long[] packetThreadStamps, boolean[] sectionCandidates,
+      TargetList[] targetLists, WorldProfile profile) {
     OcclusionStores stores = this.occlusionStores;
+    int sectionCount = chunk.getSectionCount();
+    IntPredicate targetTest = profile.targets::get;
     if (stores == null) {
+      // 未启用遮挡位图：仍要在一遍遍历里收集目标（替代旧实现的逐格扫描），只是不建位图。
+      collectTargetsOnly(chunk, sectionCandidates, targetLists, targetTest);
       return null;
     }
     RewriteStats statsRef = this.stats;
     try {
       int minSectionY = worldMinY >> 4;
-      int sectionCount = chunk.getSectionCount();
       OcclusionStore store = stores.of(worldName);
       if (store == null || store.isClosed()) {
         // 世界已卸载：本趟建表作废（closed 会丢弃所有写入），等新世界的区块重新发布；
-        // 返回 null = 「本次没有遮挡负载」，不改写/缓存行为。
+        // 返回 null = 「本次没有遮挡负载」，但不影响反矿透改写——目标仍要收集，否则整块会被跳过。
+        collectTargetsOnly(chunk, sectionCandidates, targetLists, targetTest);
         return null;
       }
       // 补丁戳快照优先用「持包线程」取的那份（见 capturePatchStamps）：它的窗口起点最早，
@@ -1036,14 +1087,21 @@ public final class ObfuscationProcessor {
         if (section == null || section.isEmpty()) {
           // 「已知全不遮挡」而非 null：区分开「该段确实没遮挡方块」与「没有该段的数据」
           column[sectionIndex] = EmptyOcclusion.INSTANCE;
-        } else if (section.bitsPerBlock() == 0) {
-          // 单值调色板：整段同一种方块，只需判一次是「全遮挡」还是「全不遮挡」
-          column[sectionIndex] = entityOcclusionTable.test(section.getBlockState(0))
-              ? SolidOcclusion.INSTANCE : EmptyOcclusion.INSTANCE;
-        } else {
-          column[sectionIndex] =
-              BitmapOcclusion.fromStateLookup(section::getBlockState, entityOcclusionTable);
+          continue;
         }
+        // 建表与目标收集合并成同一遍遍历：候选段同时建位图 + 收集命中格，
+        // 非候选段只建位图（其中的全空/全实心段由调色板级快路径直接返回，零 4096 遍历）。
+        TargetList list = null;
+        if (sectionCandidates[sectionIndex]) {
+          list = new TargetList();
+        }
+        SectionOcclusion view = section.buildOcclusionAndTargets(entityOcclusionTable,
+            list == null ? null : targetTest, list);
+        if (list != null) {
+          // 成功后才登记：异常路径下未登记的段由 catch 统一补收集，避免「半份目标列表」被改写循环当成全部命中
+          targetLists[sectionIndex] = list;
+        }
+        column[sectionIndex] = view;
       }
       // 先编码、后发布：encode 用普通数组读遍历位图字，而 restoreColumn 一旦执行，这批位图就对
       // 封包线程的方块补丁（setBlockOccluding，opaque 写）可见——两者对同一 long[] 构成数据竞争，
@@ -1061,6 +1119,14 @@ public final class ObfuscationProcessor {
     } catch (RuntimeException | LinkageError failure) {
       // 建表失败不影响反矿透改写（fail-open），但必须留痕（见方法注释的「失败语义」）：
       // 只吞 RuntimeException 与 LinkageError（类/链接层面的不兼容），不吞 OOM 等真正的 Error。
+      // 失败可能发生在目标收集途中：已登记的列表是完整的，未登记的必须补一遍——否则该段会被
+      // 当作「无目标」跳过，矿原样下发给透视端（比没有位图严重得多）。
+      // 补收集再失败就放弃整个区块（上抛由 rewrite 兜底为原字节）：宁可本区块不改写，也不能漏矿。
+      try {
+        collectTargetsOnly(chunk, sectionCandidates, targetLists, targetTest);
+      } catch (RuntimeException | LinkageError fallbackFailure) {
+        throw new IllegalStateException("遮挡建表失败后目标收集仍失败，放弃本区块改写", fallbackFailure);
+      }
       if (statsRef != null) {
         statsRef.occlusionCaptureFailures.increment();
       }
