@@ -294,6 +294,16 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     return stamps;
   }
 
+  /**
+   * 遮挡补丁的当前代次（全局单调递增，每个被补丁改写的批次 +1）。
+   *
+   * <p>供「运动跳过」之类的缓存失效判断使用：代次变了就说明几何可能变了，不能沿用旧结论。
+   * 与 {@link #patchStamps} 不同，它是一次 O(1) 读，不需要按 section 查询。
+   */
+  public long patchGeneration() {
+    return patchSequence.get();
+  }
+
   /** 因「该段期间被补丁写过」而跳过整列发布的段数（诊断用；持续偏高说明建表期间方块变更很频繁）。 */
   public long skippedPatchedSections() {
     return publishSkippedPatched.sum();

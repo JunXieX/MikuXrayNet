@@ -81,6 +81,15 @@ public final class ThrottleStats {
   public final LongAdder recheckShown = new LongAdder();
 
   /**
+   * 运动跳过生效次数：位置与结论都没变、且遮挡几何未被方块补丁改动，因而省下的重复射线提交数。
+   *
+   * <p><b>为什么单列</b>：它是「节省是否真的发生」的唯一直接证据。与 {@link #recheckSubmitted}
+   * 对照即可判断收益：跳过次数占比高 = 静态实体多、优化有效；恒为 0 = 实体都在动或补丁代次持续变化
+   * （优化自动退化为旧行为，不影响正确性）。
+   */
+  public final LongAdder motionSkips = new LongAdder();
+
+  /**
    * 实体剔除·视锥子项口径：因「视野锥外 + 超出距离门」被隐藏数 / 转头后经复检恢复数。
    *
    * <p><b>为什么单列</b>：视锥剔除与射线剔除的失效模式完全不同——射线剔除出错是「该看见的被藏」，

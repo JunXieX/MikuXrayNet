@@ -279,7 +279,7 @@ class DiagnosticsTest {
             + "（否则「发送 N 但已显形 0」这类口径误读会静默发生）：" + text);
     assertTrue(text.contains("实体隐藏 6/恢复 5（当前隐藏中 4"),
         "实体隐藏/恢复必须附带实时「当前隐藏中」，否则 721 vs 299 这类不对称无法自证：" + text);
-    assertTrue(text.contains("实体复检 40（复检致隐藏 7，复检致恢复 3）"),
+    assertTrue(text.contains("实体复检 40（复检致隐藏 7，复检致恢复 3，静止跳过 0）"),
         "状态面板必须单列周期复检口径，否则「先可见后被遮挡」是否被收敛到隐藏无法观测：" + text);
     assertTrue(text.contains("视锥剔除 隐藏 11/恢复 2"),
         "视锥剔除必须单列隐藏/恢复计数（其失效模式是「转头后实体迟一步出现」，与射线剔除不同）：" + text);
@@ -316,7 +316,7 @@ class DiagnosticsTest {
     Diagnostics.Snapshot withCleanupFailure = new Diagnostics.Snapshot(s.env(), s.rewrite(),
         s.proximity(), s.index(), s.occlusion(),
         new Diagnostics.Snapshot.Throttle(20L, 30L, 11L, 4L, 39L, 0L, 4L, 40L, 12L, 0L, 6L, 5L, 4,
-            40L, 7L, 3L, 11L, 2L, 2, 3L, 8L, 9L, 4L, 5L, 25_000_000L, true),
+            40L, 7L, 3L, 11L, 2L, 2, 3L, 8L, 9L, 4L, 5L, 25_000_000L, true, 0L),
         s.pool(), s.diskCache(), s.chunkAccessor(), s.antiXray(), s.bandwidth());
     String cleanupFailed = String.join("\n", Diagnostics.formatStatus(withCleanupFailure));
     assertTrue(cleanupFailed.contains("上次停用有子模块清理失败"),

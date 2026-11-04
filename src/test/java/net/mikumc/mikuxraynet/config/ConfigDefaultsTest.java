@@ -1235,8 +1235,8 @@ class ConfigDefaultsTest {
     // ⑤ 跨进程字面量（由 CI 采集一次后钉入）：同一份 bandwidth.yml 在任何 JVM / 区域设置下
     //    都必须得到同一值。若参与哈希的字段换成「枚举 identity hash」或依赖默认 Locale 的字符串，
     //    这一行会在别的机器/别的 JDK 上直接变红——这正是结构断言（②）发现不了的那一层。
-    assertEquals(403537882, base.configHash(),
-        "带宽配置指纹必须是跨进程稳定的字面量（本值由 CI 采集；若不同环境不同值，说明参与哈希的字段不稳定）");
+    assertEquals(-1821178470, base.configHash(),
+        "带宽配置指纹必须是跨进程稳定的字面量（本值由 JDK 25 采集；若不同环境不同值，说明参与哈希的字段不稳定）");
 
     // ① 同进程重复解析稳定（原有断言保留：先挡住「每次解析都变」这种最粗糙的回归）
     assertEquals(base.configHash(), BandwidthConfig.from(yaml("enabled: true\n")).configHash(),

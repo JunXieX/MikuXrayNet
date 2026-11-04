@@ -243,7 +243,8 @@ public final class Diagnostics {
         long frustumHidden, long frustumShown,
         int afkPlayers, long afkEntered, long afkPacketsDropped,
         long viewDistanceReduced, long viewDistanceRestored,
-        long blockMergeFlushes, long blockMergeFlushNanos, boolean cleanupIncomplete) {
+        long blockMergeFlushes, long blockMergeFlushNanos, boolean cleanupIncomplete,
+        long motionSkips) {
 
       /**
        * 兼容构造（不含 {@code cleanupIncomplete}，等价于「清理完整」）。
@@ -265,13 +266,13 @@ public final class Diagnostics {
             blockChangesPassed, 0L, entitiesHidden, entitiesShown, entitiesHiddenNow, recheckSubmitted,
             recheckHidden, recheckShown, frustumHidden, frustumShown, afkPlayers, afkEntered,
             afkPacketsDropped, viewDistanceReduced, viewDistanceRestored, blockMergeFlushes,
-            blockMergeFlushNanos, false);
+            blockMergeFlushNanos, false, 0L);
       }
 
       /** 带宽优化未启用时的零值兜底。 */
       public static final Throttle EMPTY = new Throttle(
           0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0,
-          0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, false);
+          0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, 0L);
     }
 
     /** 工作线程池域：线程数、活动数与队列占用。 */
@@ -502,7 +503,8 @@ public final class Diagnostics {
             pipeline.afkPlayerCount(), throttleStats.afkEntered.sum(),
             throttleStats.afkPacketsDropped.sum(), throttleStats.viewDistanceReduced.sum(),
             throttleStats.viewDistanceRestored.sum(), throttleStats.blockMergeFlushes.sum(),
-            throttleStats.blockMergeFlushNanos.sum(), pipeline.cleanupIncomplete());
+            throttleStats.blockMergeFlushNanos.sum(), pipeline.cleanupIncomplete(),
+            throttleStats.motionSkips.sum());
     Snapshot.Pool poolSnapshot = pool == null ? Snapshot.Pool.EMPTY
         : new Snapshot.Pool(pool.poolSize(), pool.activeCount(), pool.queueSize(),
             pool.queueCapacity());
@@ -742,6 +744,7 @@ public final class Diagnostics {
     // 只看总数无法判断「先可见、之后才被挡住」的实体是否真被收敛到隐藏（本次缺陷的观测口径）。
     lines.add("带宽：实体复检 " + s.throttle().recheckSubmitted()
         + "（复检致隐藏 " + s.throttle().recheckHidden() + "，复检致恢复 " + s.throttle().recheckShown()
+        + "，静止跳过 " + s.throttle().motionSkips()
         // 视锥剔除单列：它的失效模式是「转头后实体迟一步出现」，与射线剔除（该看见的被藏）完全不同，
         // 分列后管理员据此判断该不该调大 frustum.min-distance 或关掉该子项。
         + "）｜视锥剔除 隐藏 " + s.throttle().frustumHidden() + "/恢复 " + s.throttle().frustumShown());

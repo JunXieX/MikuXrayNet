@@ -21,6 +21,7 @@ import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.occlusion.OcclusionEngine;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
@@ -135,6 +136,15 @@ public final class EntityCuller implements Listener {
   /** 本周期引擎的时间预算（纳秒）= {@code occlusion-time-budget-ms × 1e6}；{@code 0} = 引擎未接线。 */
   private final long budgetNanos;
   private final double forceVisibleSquared;
+  /**
+   * 运动跳过配置：位置与结论都未变、且遮挡几何未被方块补丁改动时，跳过重复的射线提交。
+   *
+   * <p>可为 {@code null}（手工构造的旧档案）：此时视为关闭，行为退回「每周期都判定」。
+   */
+  private final BandwidthConfig.EntityCulling.MotionSkip motionSkip;
+  /** 玩家 → 实体 id → 运动跳过状态（只在玩家所属线程读写；随 untrack / 退出 / 停用整体释放）。 */
+  private final ConcurrentHashMap<UUID, ConcurrentHashMap<Integer, MotionState>> motionStates =
+      new ConcurrentHashMap<>();
   /** 视锥剔除子项是否启用。 */
   private final boolean frustumCulling;
   /** 视锥竖直张开全角（度），直接交给 {@link ProximitySelector#withinFrustum}。 */
@@ -193,6 +203,98 @@ public final class EntityCuller implements Listener {
    * <p>生产路径一律走带 {@code submitSeq} 的重载，否则乱序保护失效。
    */
   private static final long NO_SUBMIT_SEQ = Long.MIN_VALUE;
+
+  /**
+   * 单次评估的输入快照：玩家眼位、实体脚部坐标与距离平方，包围盒按需惰性读取。
+   *
+   * <p><b>为什么需要它</b>：同一实体的同一周期里，「强制可见距离 → 视锥 → 运动跳过 → 提交射线」
+   * 四处都要读玩家/实体坐标，其中距离平方被算了两遍、包围盒被取了两三次。把输入读一次、沿调用链传递，
+   * 既少重复 getter，也少重复构造 {@code BoundingBox}；判定语义与各处的失败方向完全不变。
+   *
+   * <p>只在玩家所属线程构造与使用，不需要同步。
+   */
+  private static final class View {
+    final double eyeX;
+    final double eyeY;
+    final double eyeZ;
+    final double entityX;
+    final double entityY;
+    final double entityZ;
+    final double distanceSquared;
+    private BoundingBox box;
+
+    View(Player player, Entity entity) {
+      double playerX = player.getX();
+      double playerY = player.getY();
+      double playerZ = player.getZ();
+      this.eyeX = playerX;
+      this.eyeY = playerY + player.getEyeHeight();
+      this.eyeZ = playerZ;
+      this.entityX = entity.getX();
+      this.entityY = entity.getY();
+      this.entityZ = entity.getZ();
+      double dx = playerX - entityX;
+      double dy = playerY - entityY;
+      double dz = playerZ - entityZ;
+      this.distanceSquared = dx * dx + dy * dy + dz * dz;
+    }
+
+    /** 实体包围盒（整条评估链只读一次；视锥慢路径、运动跳过与射线提交共用同一份）。 */
+    BoundingBox box(Entity entity) {
+      if (box == null) {
+        box = entity.getBoundingBox();
+      }
+      return box;
+    }
+  }
+
+  /**
+   * 运动跳过状态：上一次「真正提交判定」时的玩家眼位、实体包围盒中心、结论与遮挡补丁代次。
+   *
+   * <p>只在玩家所属线程读写（复检任务与回投都落在这里），因此无需同步。
+   */
+  static final class MotionState {
+    boolean initialized;
+    boolean hidden;
+    double eyeX;
+    double eyeY;
+    double eyeZ;
+    double centerX;
+    double centerY;
+    double centerZ;
+    long generation;
+    int skips;
+  }
+
+  /**
+   * 纯函数：本次是否可跳过重复判定（包可见，供离线单测逐条验证边界）。
+   *
+   * <p>只有以下条件<b>全部</b>成立才跳过：已初始化、结论未变、遮挡补丁代次未变、
+   * 玩家眼位与实体中心位移都不超过 {@code threshold}、且连续跳过次数未达该结论的上限。
+   * 任何一条不成立都返回 {@code false}（必须重新判定）。
+   */
+  static boolean motionSkipApplies(MotionState state, boolean hidden,
+      double eyeX, double eyeY, double eyeZ,
+      double centerX, double centerY, double centerZ,
+      long generation, double threshold, int maxSkips) {
+    if (state == null || !state.initialized || maxSkips <= 0) {
+      return false;
+    }
+    if (state.hidden != hidden || state.generation != generation || state.skips >= maxSkips) {
+      return false;
+    }
+    double thresholdSquared = threshold * threshold;
+    double eyeDx = state.eyeX - eyeX;
+    double eyeDy = state.eyeY - eyeY;
+    double eyeDz = state.eyeZ - eyeZ;
+    if (eyeDx * eyeDx + eyeDy * eyeDy + eyeDz * eyeDz > thresholdSquared) {
+      return false;
+    }
+    double centerDx = state.centerX - centerX;
+    double centerDy = state.centerY - centerY;
+    double centerDz = state.centerZ - centerZ;
+    return centerDx * centerDx + centerDy * centerDy + centerDz * centerDz <= thresholdSquared;
+  }
 
   /** 防抖账本条目：最近一次判定结论与已连续一致的周期数（只在玩家/实体所属线程上读写）。 */
   private static final class VerdictStreak {
@@ -281,6 +383,7 @@ public final class EntityCuller implements Listener {
     this.ownership = ownership;
     this.bypass = bypass == null ? BypassRegistry::isBypassedNow : bypass;
     this.forceVisibleSquared = config.forceVisibleDistance() * config.forceVisibleDistance();
+    this.motionSkip = config.motionSkip();
     BandwidthConfig.EntityCulling.Frustum frustum = config.frustum();
     this.frustumCulling = frustum != null && frustum.enabled();
     this.frustumFov = frustum == null ? 0.0D : frustum.fov();
@@ -443,6 +546,7 @@ public final class EntityCuller implements Listener {
     rotations.clear();
     streaks.clear();
     appliedSeq.clear();
+    motionStates.clear();
     closeEngine();
   }
 
@@ -525,6 +629,7 @@ public final class EntityCuller implements Listener {
     // 防抖账本与提交序账本随退出整体丢弃（玩家已离线，任何判定结果都不可能再用于切换显示状态）
     streaks.remove(player.getUniqueId());
     appliedSeq.remove(player.getUniqueId());
+    motionStates.remove(player.getUniqueId());
   }
 
   /**
@@ -936,11 +1041,13 @@ public final class EntityCuller implements Listener {
       return;
     }
     try {
+      // 输入快照：眼位 / 实体脚部坐标 / 距离平方只读一次，沿整条评估链传递（视锥、运动跳过、射线提交共用）。
+      // 仍用坐标 getter 手算距离（不再 new 两个 Location）：既省分配，也避免 Location#distanceSquared
+      // 在「实体未加载 / 两侧世界不一致」时抛异常——失败方向一致（判不出距离时宁可当作「近」）。
+      View view = new View(player, entity);
       // 强制可见距离内一律可见（安全策略）：实体只要在近处，任何通道都不得隐藏它，最多恢复显示。
-      // 这里用坐标 getter 手算距离（不再 new 两个 Location）：既省下每次评估的固定分配，
-      // 也避免 Location#distanceSquared 在「实体未加载 / 两侧世界不一致」时抛异常——失败方向一致
-      // （判不出距离时宁可当作「近」→ 只 show 不 hide，绝不误藏）。fromRecheck 仅用于计数归属。
-      if (withinForceVisible(player, entity)) {
+      // fromRecheck 仅用于计数归属。
+      if (withinForceVisible(view)) {
         evaluate(player, entity, false, mode != RecheckMode.INITIAL);
         return;
       }
@@ -952,7 +1059,7 @@ public final class EntityCuller implements Listener {
       //  ② ROTATION：提交全部追踪实体，成本由专用池的时间预算封顶（超预算者顺延，不丢判定）。
       //  ③ INITIAL：入场首评不受距离闸门限制，远距离实体照常剔除（既有行为不变）。
       // 视锥剔除优先：锥外 + 超距的实体根本看不到，直接隐藏，连射线都省下（判定成本仅一次视锥数学）。
-      if (frustumCullable(player, entity)) {
+      if (frustumCullable(player, entity, view)) {
         evaluate(player, entity, true, mode != RecheckMode.INITIAL, true);
         return;
       }
@@ -964,11 +1071,83 @@ public final class EntityCuller implements Listener {
         evaluate(player, entity, false, mode != RecheckMode.INITIAL);
         return;
       }
-      submitAsync(player, entity, mode != RecheckMode.INITIAL);
+      if (mode == RecheckMode.ROTATION && shouldSkipMotion(player, entity, view)) {
+        // 位置与结论都未变、且遮挡几何未被方块补丁改动：本周期跳过重复射线（见 MotionSkip）。
+        // 距离闸门 / 视锥 / 黑名单 / 直通 / 归属校验都已在本方法更早处执行，跳过只省「重复判定」。
+        return;
+      }
+      submitAsync(player, entity, view, mode != RecheckMode.INITIAL);
     } catch (Throwable throwable) {
       // 任意失败都按「保持可见」处理（fail-open：绝不误藏实体）
       logThrottled(throwable);
     }
+  }
+
+  /**
+   * 本周期是否可以跳过该实体的重复射线提交（见 {@link BandwidthConfig.EntityCulling.MotionSkip}）。
+   *
+   * <p>只在玩家所属线程调用；判定与状态推进在同一线程内完成，因此不需要同步。
+   * 实体结论取自隐藏账本（账本里有同一实例 = 上次判定为「被遮挡」），与发布侧写账本的语义一致。
+   */
+  private boolean shouldSkipMotion(Player player, Entity entity, View view) {
+    BandwidthConfig.EntityCulling.MotionSkip cfg = this.motionSkip;
+    if (cfg == null || !cfg.enabled()) {
+      return false;
+    }
+    int entityId = entity.getEntityId();
+    UUID playerId = player.getUniqueId();
+    boolean hidden = isHiddenInstance(playerId, entity, entityId);
+    BoundingBox box = view.box(entity);
+    double centerX = box.getCenterX();
+    double centerY = box.getCenterY();
+    double centerZ = box.getCenterZ();
+    long generation = currentPatchGeneration(entity.getWorld().getName());
+    int maxSkips = hidden ? cfg.maxSkipHidden() : cfg.maxSkipVisible();
+    MotionState state = motionStates
+        .computeIfAbsent(playerId, ignored -> new ConcurrentHashMap<>())
+        .computeIfAbsent(entityId, ignored -> new MotionState());
+    if (motionSkipApplies(state, hidden, view.eyeX, view.eyeY, view.eyeZ,
+        centerX, centerY, centerZ, generation, cfg.threshold(), maxSkips)) {
+      state.skips++;
+      stats.motionSkips.increment();
+      return true;
+    }
+    state.initialized = true;
+    state.hidden = hidden;
+    state.eyeX = view.eyeX;
+    state.eyeY = view.eyeY;
+    state.eyeZ = view.eyeZ;
+    state.centerX = centerX;
+    state.centerY = centerY;
+    state.centerZ = centerZ;
+    state.generation = generation;
+    state.skips = 0;
+    return false;
+  }
+
+  /** 该实体是否正以「同一实例」登记在隐藏账本里（结论为被遮挡）。 */
+  private boolean isHiddenInstance(UUID playerId, Entity entity, int entityId) {
+    Map<Integer, HiddenEntry> map = hidden.get(playerId);
+    if (map == null) {
+      return false;
+    }
+    HiddenEntry entry = map.get(entityId);
+    return entry != null && entry.entity() == entity;
+  }
+
+  /**
+   * 遮挡补丁的当前代次（该世界）。
+   *
+   * <p>方块被挖开 / 炸开 / 放置时补丁路径会推进该代次，运动跳过据此立即失效——
+   * 否则「双方都没动、但墙被炸开」要等跳过窗口结束才恢复可见。
+   */
+  private long currentPatchGeneration(String worldName) {
+    OcclusionStores stores = this.occlusionStores;
+    if (stores == null) {
+      return 0L;
+    }
+    OcclusionStore store = stores.lookup(worldName);
+    return store == null ? 0L : store.patchGeneration();
   }
 
   /** 给异步引擎开一个新周期并给出本玩家的时间预算（未接线时空操作）。 */
@@ -994,20 +1173,26 @@ public final class EntityCuller implements Listener {
    * <p>包可见：供离线单测验证「提交全部追踪实体 / 组请求 / 拒收不影响状态」这段链路。
    */
   void submitAsync(Player player, Entity entity, boolean fromRecheck) {
+    submitAsync(player, entity, new View(player, entity), fromRecheck);
+  }
+
+  /**
+   * 提交侧正式入口：复用调用方已算好的输入快照（眼位 / 包围盒），不再重复读取。
+   *
+   * <p>眼位坐标仍用零分配 getter 求出（{@code getEyeLocation} 每次会新建 {@code Location}）；
+   * {@code eyeY = 脚部 Y + getEyeHeight()} 与 {@code LivingEntity#getEyeLocation()} 的算法逐项一致。
+   */
+  void submitAsync(Player player, Entity entity, View view, boolean fromRecheck) {
     OcclusionEngine current = engine;
     if (current == null || stopping) {
       return;
     }
     try {
-      // 眼睛坐标用零分配 getter（getEyeLocation 每次提交都会新建一个 Location）；提交频率是
-      // 「每玩家每周期每远处实体」，属热路径。
-      // eyeY = 脚部 Y + getEyeHeight()：与 LivingEntity#getEyeLocation() 的算法完全一致
-      // （getEyeLocation 内部就是 getLocation().add(0, getEyeHeight(), 0)），因此几何不变。
-      double eyeX = player.getX();
-      double eyeY = player.getY() + player.getEyeHeight();
-      double eyeZ = player.getZ();
+      double eyeX = view.eyeX;
+      double eyeY = view.eyeY;
+      double eyeZ = view.eyeZ;
       String worldName = entity.getWorld().getName();
-      BoundingBox box = entity.getBoundingBox();
+      BoundingBox box = view.box(entity);
       // 顶点直接写进「最多 ray-samples 个点」的一维数组：旧写法先建 double[][]（+ 最多 7 个内层数组）、
       // 再展平成第二个数组，每次提交 9 份短命分配。这里只有一份，且长度即提交长度。
       int limit = Math.min(Math.max(1, config.raySamples()), MAX_RAY_SAMPLES);
@@ -1167,6 +1352,10 @@ public final class EntityCuller implements Listener {
     if (applied != null) {
       applied.remove(entityId);
     }
+    ConcurrentHashMap<Integer, MotionState> motion = motionStates.get(playerId);
+    if (motion != null) {
+      motion.remove(entityId);
+    }
   }
 
   /**
@@ -1179,16 +1368,31 @@ public final class EntityCuller implements Listener {
    * 任何读取失败都按「在锥内」处理（返回 false，不剔除），遵循 fail-open。
    */
   private boolean frustumCullable(Player player, Entity entity) {
+    return frustumCullable(player, entity, null);
+  }
+
+  /**
+   * 同 {@link #frustumCullable(Player, Entity)}，但复用调用方已算好的输入快照。
+   *
+   * @param view 输入快照；{@code null} 表示由本方法现读（通道①的纯数学复判走这条）
+   */
+  private boolean frustumCullable(Player player, Entity entity, View view) {
     if (!frustumCulling) {
       return false;
     }
-    double dx = player.getX() - entity.getX();
-    double dy = player.getY() - entity.getY();
-    double dz = player.getZ() - entity.getZ();
-    if (dx * dx + dy * dy + dz * dz <= frustumGateSquared) {
+    double distanceSquared;
+    if (view != null) {
+      distanceSquared = view.distanceSquared;
+    } else {
+      double dx = player.getX() - entity.getX();
+      double dy = player.getY() - entity.getY();
+      double dz = player.getZ() - entity.getZ();
+      distanceSquared = dx * dx + dy * dy + dz * dz;
+    }
+    if (distanceSquared <= frustumGateSquared) {
       return false;
     }
-    return !insideFrustum(player, entity);
+    return !insideFrustum(player, entity, view);
   }
 
   /**
@@ -1203,20 +1407,29 @@ public final class EntityCuller implements Listener {
    * 距离豁免传 0——距离门已在 {@link #frustumCullable} 里判过，这里只做纯角度判定。
    */
   private boolean insideFrustum(Player player, Entity entity) {
+    return insideFrustum(player, entity, null);
+  }
+
+  /** 同 {@link #insideFrustum(Player, Entity)}，输入坐标与包围盒优先取自快照（{@code null} = 现读）。 */
+  private boolean insideFrustum(Player player, Entity entity, View view) {
     if (!frustumCulling) {
       return true;
     }
     try {
-      ProximitySelector.Eye snapshot = eyeOf(player);
+      ProximitySelector.Eye snapshot = view == null
+          ? eyeOf(player)
+          : eyeOf(player, view.eyeX, view.eyeY, view.eyeZ);
+      double centerX = view == null ? entity.getX() : view.entityX;
+      double centerY = view == null ? entity.getY() : view.entityY;
+      double centerZ = view == null ? entity.getZ() : view.entityZ;
       // 快路径：中心在锥内 → 直接可见（常见情形只多这一次判定，成本不变）
-      if (ProximitySelector.withinFrustum(snapshot, entity.getX(), entity.getY(), entity.getZ(),
-          0.0D, frustumFov)) {
+      if (ProximitySelector.withinFrustum(snapshot, centerX, centerY, centerZ, 0.0D, frustumFov)) {
         return true;
       }
       // 慢路径：中心已在锥外，再试包围盒水平 4 个角——任一在锥内即判可见（大型实体不被误藏）。
       // 直接逐个传参而不建两个临时 double[]：本方法在「每玩家每周期每远距离实体」上被调用，
       // 两处小数组分配纯属热路径垃圾。
-      BoundingBox box = entity.getBoundingBox();
+      BoundingBox box = view == null ? entity.getBoundingBox() : view.box(entity);
       double midY = (box.getMinY() + box.getMaxY()) / 2.0D;
       double minX = box.getMinX();
       double maxX = box.getMaxX();
@@ -1243,12 +1456,16 @@ public final class EntityCuller implements Listener {
    * 结果本身就是单位向量；再交给 {@link ProximitySelector#eye} 做一次极廉价的归一化兜底。
    */
   private static ProximitySelector.Eye eyeOf(Player player) {
+    return eyeOf(player, player.getX(), player.getY() + player.getEyeHeight(), player.getZ());
+  }
+
+  /** 同上，但眼位坐标由调用方的输入快照提供，避免重复读玩家坐标。 */
+  private static ProximitySelector.Eye eyeOf(Player player, double eyeX, double eyeY, double eyeZ) {
     double yaw = Math.toRadians(player.getYaw());
     double pitch = Math.toRadians(player.getPitch());
     double horizontal = Math.cos(pitch);
-    return ProximitySelector.eye(player.getX(), player.getY() + player.getEyeHeight(),
-        player.getZ(), -horizontal * Math.sin(yaw), -Math.sin(pitch),
-        horizontal * Math.cos(yaw));
+    return ProximitySelector.eye(eyeX, eyeY, eyeZ, -horizontal * Math.sin(yaw),
+        -Math.sin(pitch), horizontal * Math.cos(yaw));
   }
 
   /**
@@ -1264,6 +1481,11 @@ public final class EntityCuller implements Listener {
     double dy = player.getY() - entity.getY();
     double dz = player.getZ() - entity.getZ();
     return dx * dx + dy * dy + dz * dz <= forceVisibleSquared;
+  }
+
+  /** 同 {@link #withinForceVisible(Player, Entity)}，复用调用方已算好的距离平方。 */
+  private boolean withinForceVisible(View view) {
+    return view.distanceSquared <= forceVisibleSquared;
   }
 
   /**

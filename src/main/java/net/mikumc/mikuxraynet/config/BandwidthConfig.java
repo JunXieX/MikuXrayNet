@@ -142,6 +142,21 @@ public final class BandwidthConfig {
   public static final int MAX_OCCLUSION_HYSTERESIS_CYCLES = 5;
 
   /**
+   * 运动跳过：位移阈值下限（0.02 格）。
+   *
+   * <p>低于它等于「任何浮点抖动都算移动」，跳过永不生效（无收益）；只用于拦住手滑写 0。
+   */
+  public static final double MIN_MOTION_THRESHOLD = 0.02D;
+  /**
+   * 运动跳过：位移阈值上限（2.0 格）。
+   *
+   * <p>超过它时缓慢移动的实体（潜行、矿车、水流推动）会被误判成静止，最多延长一个隐藏态复检窗口。
+   */
+  public static final double MAX_MOTION_THRESHOLD = 2.0D;
+  /** 运动跳过：单次最多连续跳过的周期数上限（10）；再大就会让「该显示却仍隐藏」的窗口超出可感知范围。 */
+  public static final int MAX_MOTION_SKIP_CYCLES = 10;
+
+  /**
    * 零位移实体包抑制。
    *
    * @param enabled          模块总开关：为 {@code false} 时本模块完全不注册（零开销）。
@@ -203,7 +218,7 @@ public final class BandwidthConfig {
    */
   public record EntityCulling(boolean enabled, boolean raycast, double forceVisibleDistance,
       int updateIntervalTicks, int raySamples, Frustum frustum,
-      AsyncOcclusion asyncOcclusion) {
+      AsyncOcclusion asyncOcclusion, MotionSkip motionSkip) {
 
     /**
      * 视锥剔除子项。
@@ -254,9 +269,38 @@ public final class BandwidthConfig {
         int maxOccludingBlocks, int timeoutCycles, int hysteresisCycles) {
     }
 
+    /**
+     * 运动跳过：位置未变且结论未变时，跳过重复的遮挡射线提交。
+     *
+     * <p><b>为什么需要</b>：通道②每个周期对轮转到的实体各提交一批射线（默认 7 条）。盔甲架、展柜、
+     * 笼中怪这类位置不变的实体会持续消耗专用池预算，把「刚移动 / 刚被挡住」的实体挤到下一周期。
+     * 跳过只针对<b>重复判定</b>：距离闸门、视锥判定、黑名单、直通、归属校验照旧每周期执行，
+     * 已隐藏实体的「近距离恢复」也不受影响。
+     *
+     * <p><b>安全边界</b>：隐藏态最多跳 {@code maxSkipHidden} 个周期（默认 1，即最多延后一个复检窗口），
+     * 可见态可放宽；任何位移超过 {@code threshold}、结论变化、遮挡补丁代次变化（方块被挖开/炸开/放置）
+     * 都立即重新判定。因此最坏的「该显示却仍隐藏」延迟是 {@code maxSkipHidden × 复检周期}。
+     *
+     * @param enabled        子开关：{@code false} 时每个周期都提交（旧行为）。
+     * @param threshold      位移阈值（格）：玩家眼位或实体包围盒中心任一位移超过它即视为「动过」；
+     *                       钳制 {@value #MIN_MOTION_THRESHOLD}..{@value #MAX_MOTION_THRESHOLD}。
+     * @param maxSkipHidden  结论为「被遮挡」时最多连续跳过的周期数；钳制 0..{@value #MAX_MOTION_SKIP_CYCLES}。
+     * @param maxSkipVisible 结论为「可见」时最多连续跳过的周期数；钳制 0..{@value #MAX_MOTION_SKIP_CYCLES}。
+     */
+    public record MotionSkip(boolean enabled, double threshold, int maxSkipHidden, int maxSkipVisible) {
+    }
+
     /** 异步遮挡子项的内置默认（保守档），供兼容构造使用。 */
     private static final AsyncOcclusion DEFAULT_ASYNC_OCCLUSION =
         new AsyncOcclusion(2.0D, 1, 0, 3, 1);
+
+    /**
+     * 运动跳过的内置默认（保守档）：开、阈值 0.2 格、隐藏态最多跳 1 周期、可见态最多跳 3 周期。
+     *
+     * <p>隐藏态收得比可见态紧：「该显示却仍隐藏」是最严重的方向，宁可多算几次射线。
+     */
+    private static final MotionSkip DEFAULT_MOTION_SKIP =
+        new MotionSkip(true, 0.2D, 1, 3);
 
     /**
      * 兼容构造：未指定异步遮挡子项时按内置默认处理。
@@ -267,7 +311,14 @@ public final class BandwidthConfig {
     public EntityCulling(boolean enabled, boolean raycast, double forceVisibleDistance,
         int updateIntervalTicks, int raySamples, Frustum frustum) {
       this(enabled, raycast, forceVisibleDistance, updateIntervalTicks, raySamples,
-          frustum, DEFAULT_ASYNC_OCCLUSION);
+          frustum, DEFAULT_ASYNC_OCCLUSION, DEFAULT_MOTION_SKIP);
+    }
+
+    /** 兼容构造：未指定运动跳过时按内置默认处理（既有单测按 7 参构造，不必关心新子项）。 */
+    public EntityCulling(boolean enabled, boolean raycast, double forceVisibleDistance,
+        int updateIntervalTicks, int raySamples, Frustum frustum, AsyncOcclusion asyncOcclusion) {
+      this(enabled, raycast, forceVisibleDistance, updateIntervalTicks, raySamples,
+          frustum, asyncOcclusion, DEFAULT_MOTION_SKIP);
     }
   }
 
@@ -421,6 +472,22 @@ public final class BandwidthConfig {
                 clampUpper(clampLower(root.getInt("entity-culling.occlusion-hysteresis-cycles", 1),
                     0, "entity-culling.occlusion-hysteresis-cycles", clampAdjustments),
                     MAX_OCCLUSION_HYSTERESIS_CYCLES, "entity-culling.occlusion-hysteresis-cycles",
+                    clampAdjustments)),
+            // 运动跳过（默认开）：位置与结论都没变时跳过重复射线提交，节省专用池预算。
+            // 阈值默认 0.2 格：高于绝大多数实体每 0.5s 的位移，静止判定不会误伤缓慢移动者。
+            // 隐藏态最多跳 1 周期（把「该显示却仍隐藏」的额外延迟限制在一个复检窗口内），可见态可放宽到 3。
+            new EntityCulling.MotionSkip(
+                lenientBoolean(root, "entity-culling.motion-skip.enabled", true, typeAdjustments),
+                clampRange(root.getDouble("entity-culling.motion-skip.threshold", 0.2D),
+                    0.2D, MIN_MOTION_THRESHOLD, MAX_MOTION_THRESHOLD,
+                    "entity-culling.motion-skip.threshold", clampAdjustments),
+                clampUpper(clampLower(root.getInt("entity-culling.motion-skip.max-skip-hidden", 1),
+                    0, "entity-culling.motion-skip.max-skip-hidden", clampAdjustments),
+                    MAX_MOTION_SKIP_CYCLES, "entity-culling.motion-skip.max-skip-hidden",
+                    clampAdjustments),
+                clampUpper(clampLower(root.getInt("entity-culling.motion-skip.max-skip-visible", 3),
+                    0, "entity-culling.motion-skip.max-skip-visible", clampAdjustments),
+                    MAX_MOTION_SKIP_CYCLES, "entity-culling.motion-skip.max-skip-visible",
                     clampAdjustments))),
         new Afk(
             lenientBoolean(root, "afk.enabled", true, typeAdjustments),
