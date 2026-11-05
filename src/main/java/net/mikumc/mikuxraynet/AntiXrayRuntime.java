@@ -6,6 +6,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.antixray.BlockChangeRevealListener;
+import net.mikumc.mikuxraynet.antixray.LeakFilterListener;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
@@ -57,6 +58,7 @@ public final class AntiXrayRuntime {
   private volatile MikuWorkPool workPool;
   private volatile ProximityRevealer proximityRevealer;
   private volatile BlockChangeRevealListener blockChangeRevealListener;
+  private volatile LeakFilterListener leakFilterListener;
   /**
    * 按区块共享的伪装坐标索引（内存 = O(有伪装的已加载区块数)）。
    *
@@ -321,10 +323,14 @@ public final class AntiXrayRuntime {
           bypassRegistry, workPool, occlusionStores);
       BlockChangeRevealListener listener = new BlockChangeRevealListener(plugin, protocolManager,
           chunkIndex, revealed, stats, revealer);
+      // 隐藏坐标的二次泄露包过滤：方块实体/世界事件/音效/粒子/爆炸。只依赖共享索引，失败不影响显形。
+      LeakFilterListener leakFilter = new LeakFilterListener(plugin, protocolManager, chunkIndex, revealed);
       // 先落到字段再启动：start() 中途抛异常时 stopProximity() 必须能停掉已启动的那一半
       this.proximityRevealer = revealer;
       this.blockChangeRevealListener = listener;
+      this.leakFilterListener = leakFilter;
       listener.start();
+      leakFilter.start();
       revealer.start();
       // 区块包放行后立即显形（M2）：把「该区块中玩家当前可见」的坐标紧随区块包补发，
       // 消掉「区块先伪装、等巡检才还原」的凭空出现窗口。失败只关这一项，周期巡检不受影响。
@@ -424,6 +430,10 @@ public final class AntiXrayRuntime {
       } catch (Throwable throwable) {
         logger.log(Level.FINE, "卸下区块下发即显形回调失败（已忽略）", throwable);
       }
+    }
+    if (leakFilterListener != null) {
+      leakFilterListener.stop();
+      leakFilterListener = null;
     }
     if (blockChangeRevealListener != null) {
       blockChangeRevealListener.stop();
