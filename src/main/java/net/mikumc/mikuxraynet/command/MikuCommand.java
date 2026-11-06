@@ -52,7 +52,9 @@ public final class MikuCommand {
   private static final String PERMISSION_RELOAD = Constants.RELOAD_PERMISSION;
   private static final List<String> SUBCOMMANDS = List.of("status", "dump", "probe", "reload");
   /** 无任何子命令权限时的统一回显（等价于命令描述里声明的 permission-message）。 */
-  private static final String NO_PERMISSION_MESSAGE = "你没有权限使用该命令";
+  /** 无任何子命令权限时的统一回显：<b>必须点名需要的节点</b>，否则管理员只能靠猜（真机「reload 用不了」多为此）。 */
+  private static final String NO_PERMISSION_MESSAGE =
+      "你没有权限使用该命令（需要 mikuxraynet.status / dump / reload 之一，或总权限 mikuxraynet.admin）";
 
   private final MikuXrayNet plugin;
   private final Diagnostics diagnostics;
@@ -113,10 +115,21 @@ public final class MikuCommand {
     };
   }
 
-  /** 发送者是否可执行/可见该子命令。 */
+  /**
+   * 发送者是否可执行/可见该子命令。
+   *
+   * <p><b>父权限必须等效放行</b>：{@code paper-plugin.yml} 把 {@code mikuxraynet.admin} 声明为
+   * {@code status} / {@code dump} / {@code reload} 的父节点，但那只存在于「插件注册的 Permission 对象的
+   * children 里」。权限插件（LuckPerms 等）只查自己库中的节点，<b>不会展开</b>插件注册的 children——
+   * 只把 {@code mikuxraynet.admin} 授予管理组的服主会看到「给了总权限却提示没有权限」（
+   * 真机反馈的「/mxnet reload 用不了」即此情形）。因此这里显式认父节点：拥有 admin 等价位全部子权限。
+   */
   static boolean allowed(CommandSender sender, String subcommand) {
     String permission = permissionOf(subcommand);
-    return permission != null && sender != null && sender.hasPermission(permission);
+    if (permission == null || sender == null) {
+      return false;
+    }
+    return sender.hasPermission(permission) || sender.hasPermission(Constants.ADMIN_PERMISSION);
   }
 
   /** 发送者是否至少拥有一个子命令权限（用于「完全无权限」时的统一拒绝）。 */
@@ -131,7 +144,7 @@ public final class MikuCommand {
 
   private void status(CommandSender sender) {
     if (!allowed(sender, "status")) {
-      message(sender, "你没有权限查看运行状态");
+      message(sender, "你没有权限查看运行状态（需要 mikuxraynet.status 或总权限 mikuxraynet.admin）");
       return;
     }
     try {
@@ -157,7 +170,7 @@ public final class MikuCommand {
    */
   private void dump(CommandSender sender) {
     if (!allowed(sender, "dump")) {
-      message(sender, "你没有权限导出诊断");
+      message(sender, "你没有权限导出诊断（需要 mikuxraynet.dump 或总权限 mikuxraynet.admin）");
       return;
     }
     if (!submitDump(sender)) {
@@ -243,7 +256,7 @@ public final class MikuCommand {
 
   private void reload(CommandSender sender) {
     if (!allowed(sender, "reload")) {
-      message(sender, "你没有权限热重载配置");
+      message(sender, "你没有权限热重载配置（需要 mikuxraynet.reload 或总权限 mikuxraynet.admin）");
       return;
     }
     try {

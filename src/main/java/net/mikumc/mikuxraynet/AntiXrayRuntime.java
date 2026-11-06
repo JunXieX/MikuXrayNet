@@ -431,17 +431,34 @@ public final class AntiXrayRuntime {
         logger.log(Level.FINE, "卸下区块下发即显形回调失败（已忽略）", throwable);
       }
     }
+    // 三步各自兜底：任何一步抛异常都不得中断后面的注销（否则「旧监听已停、新监听没建」，
+    // 热重载一次性把邻近显形打掉，管理员只看到一句「周期任务重启时出现异常」）。
     if (leakFilterListener != null) {
-      leakFilterListener.stop();
+      LeakFilterListener listener = leakFilterListener;
       leakFilterListener = null;
+      try {
+        listener.stop();
+      } catch (Throwable throwable) {
+        logger.log(Level.WARNING, "停用二次泄露包过滤监听失败（已忽略，继续停显形）", throwable);
+      }
     }
     if (blockChangeRevealListener != null) {
-      blockChangeRevealListener.stop();
+      BlockChangeRevealListener listener = blockChangeRevealListener;
       blockChangeRevealListener = null;
+      try {
+        listener.stop();
+      } catch (Throwable throwable) {
+        logger.log(Level.WARNING, "停用方块变更观察监听失败（已忽略，继续停显形）", throwable);
+      }
     }
     if (proximityRevealer != null) {
-      proximityRevealer.stop(clearIndexes);
+      ProximityRevealer revealer = proximityRevealer;
       proximityRevealer = null;
+      try {
+        revealer.stop(clearIndexes);
+      } catch (Throwable throwable) {
+        logger.log(Level.WARNING, "停用邻近显形失败（已忽略）", throwable);
+      }
     }
   }
 

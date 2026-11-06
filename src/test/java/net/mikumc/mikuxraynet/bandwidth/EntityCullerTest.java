@@ -853,6 +853,57 @@ class EntityCullerTest {
     }
   }
 
+  /**
+   * 假实体回归：<b>入场首评在追踪事件内隐藏实体时必须取消该事件</b>。
+   *
+   * <p>真机表现：带宽优化开启后，客户端能看到一个服务端并不存在的实体（例如蜘蛛），不能交互、
+   * 不会移动，重登或换世界后才消失。根因是包序——Paper 的 {@code ChunkMap.TrackedEntity#updatePlayer}
+   * 先把玩家加入 {@code seenBy}、再触发 {@link PlayerTrackEntityEvent}，<b>事件通过之后</b>才
+   * {@code addPairing}（发 spawn 包）；而本模块的入场首评会在事件内同步隐藏实体（视锥剔除是纯数学
+   * 分支，不等异步池），{@code hideEntity} 会立刻把玩家移出 {@code seenBy} 并发 destroy。
+   * 若事件照常通过，客户端就收到「先 destroy、后 spawn」，留下一个服务端不再追踪的实体：
+   * 后续既没有移动包，实体被移除时也没有 destroy，只能靠重登/换世界清除。
+   */
+  @Test
+  void hideInsideTrackEventCancelsTheEventSoNoGhostSpawnIsSent() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 2.0D)),
+        stats, entity -> true, playerId -> false);
+
+    // 玩家朝 +Z；实体在其斜后方且距约 141 格（远超距离门 2 格）→ 视锥剔除在事件内同步隐藏它
+    EntityStub behind = new EntityStub(39_101, world, 100.0D, 65.0D, -100.0D);
+    PlayerTrackEntityEvent event = new PlayerTrackEntityEvent(player.proxy(), behind.proxy());
+    culler.onTrack(event);
+
+    assertEquals(1, culler.hiddenCount(), "锥外 + 超距的实体仍必须被隐藏");
+    assertTrue(event.isCancelled(),
+        "事件内隐藏了实体就必须取消事件：Paper 会在此之后补发 spawn，不取消就会留下假实体");
+  }
+
+  /** 没有发生隐藏时不得取消追踪事件（否则实体会被误判为「不展示」，玩家看不到本该可见的实体）。 */
+  @Test
+  void visibleEntityKeepsTheTrackEventUncancelled() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 2.0D)),
+        stats, entity -> true, playerId -> false);
+
+    // 强制可见距离（2 格）内：任何通道都不得隐藏，事件必须原样通过
+    EntityStub near = new EntityStub(39_102, world, 1.2D, 65.0D, 1.2D);
+    PlayerTrackEntityEvent event = new PlayerTrackEntityEvent(player.proxy(), near.proxy());
+    culler.onTrack(event);
+
+    assertEquals(0, culler.hiddenCount(), "强制可见距离内的实体绝不能被隐藏");
+    assertFalse(event.isCancelled(), "没有隐藏实体时不得取消追踪事件");
+  }
+
   // ------------------------------------------------- 视锥剔除（entity-culling.frustum）
 
   /**

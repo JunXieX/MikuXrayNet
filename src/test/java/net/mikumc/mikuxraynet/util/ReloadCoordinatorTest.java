@@ -200,5 +200,46 @@ class ReloadCoordinatorTest {
     List<String> lines = coordinator.reload(failing);
     assertFalse(lines.isEmpty());
     assertTrue(String.join("\n", lines).contains("保留原配置"), String.join("\n", lines));
+    assertTrue(String.join("\n", lines).contains("模拟配置读取失败"),
+        "失败回显必须带具体原因，否则管理员只能翻日志：" + String.join("\n", lines));
+  }
+
+  /**
+   * 周期任务重启失败必须把具体原因带回游戏内回显。
+   *
+   * <p>真机反馈的「reload 用不了」在多数情况下就是这一步抛了异常，而旧文案只有
+   * 「出现异常，详见服务端日志」——管理员在游戏里看不到日志，等于没有信息。
+   */
+  @Test
+  void restartFailureReportsTheConcreteReason() {
+    ReloadCoordinator coordinator = new ReloadCoordinator();
+    ReloadCoordinator.Target target = new ReloadCoordinator.Target() {
+      @Override
+      public int antiXrayFingerprint() {
+        return 1;
+      }
+
+      @Override
+      public int bandwidthFingerprint() {
+        return 2;
+      }
+
+      @Override
+      public void reloadConfiguration() {
+      }
+
+      @Override
+      public void invalidateCaches() {
+      }
+
+      @Override
+      public void restartPeriodicTasks() {
+        throw new IllegalStateException("模拟邻近显形重启失败");
+      }
+    };
+
+    String text = String.join("\n", coordinator.reload(target));
+    assertTrue(text.contains("周期任务重启时出现异常"), text);
+    assertTrue(text.contains("模拟邻近显形重启失败"), "必须点名具体原因：" + text);
   }
 }

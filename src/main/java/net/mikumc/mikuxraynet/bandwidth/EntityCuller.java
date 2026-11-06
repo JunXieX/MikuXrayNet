@@ -767,6 +767,23 @@ public final class EntityCuller implements Listener {
     }
   }
 
+  /**
+   * 入场首评：实体刚进入该玩家的追踪范围（{@link PlayerTrackEntityEvent}）。
+   *
+   * <p><b>为什么这里可能在事件内隐藏实体，且隐藏后必须取消事件</b>：Paper 的追踪更新顺序是
+   * 「先把玩家加入 {@code seenBy} → 触发本事件 → 事件通过后才 {@code addPairing}（发 spawn 包）」，
+   * 而 {@code hideEntity} 会立刻把玩家移出 {@code seenBy} 并发出 destroy 包。若我们在事件内隐藏了实体
+   * 却让事件照常通过，客户端收到的就是<b>先 destroy、后 spawn</b>——最终留下一个服务端并不追踪的
+   * <b>假实体</b>：它不再收到任何移动/元数据包，实体真正被移除时也不会收到 destroy（玩家不在
+   * {@code seenBy} 里），只有重登或换世界才会消失。
+   *
+   * <p>取消事件与 API 契约一致（cancelled ⇒ 该实体不展示给该玩家），且此时 {@code seenBy} 已被
+   * {@code hideEntity} 清空，追踪状态自洽；之后由复检通道 {@code showEntity} 恢复时，Paper 会重新
+   * {@code updatePlayer} 并把玩家加回 {@code seenBy}，不会留下持久不可见的实体。
+   *
+   * <p>只有「本次首评<b>新</b>发生的隐藏」才取消：事件进门前已隐藏（旧条目）时不做额外动作，
+   * 避免误伤其它插件已恢复可见的实体。
+   */
   @EventHandler(ignoreCancelled = true)
   public void onTrack(PlayerTrackEntityEvent event) {
     if (!active()) {
@@ -793,12 +810,20 @@ public final class EntityCuller implements Listener {
     if (!owns(entity)) {
       return;
     }
-    if (entity.getEntityId() == player.getEntityId()) {
+    int entityId = entity.getEntityId();
+    if (entityId == player.getEntityId()) {
       return;
     }
+    UUID playerId = player.getUniqueId();
+    boolean wasHidden = isHiddenInstance(playerId, entity, entityId);
     // 登记进轮转队列：这是「入场那一刻评估一次」之外的兜底，保证之后出现的遮挡也能被发现
-    rotation(player.getUniqueId()).add(entity);
+    rotation(playerId).add(entity);
     submitRaycast(player, entity, RecheckMode.INITIAL);
+    // 首评可能在事件内同步隐藏该实体（视锥剔除走纯数学分支，不经过异步池）。此时必须取消事件：
+    // Paper 在事件返回之后才发 spawn（见方法注释），不取消就是「先 destroy 后 spawn」→ 客户端假实体。
+    if (!wasHidden && isHiddenInstance(playerId, entity, entityId)) {
+      event.setCancelled(true);
+    }
   }
 
   /** 实体离开追踪范围时从轮转队列摘除（否则队列会无界增长，并浪费复检预算）。 */

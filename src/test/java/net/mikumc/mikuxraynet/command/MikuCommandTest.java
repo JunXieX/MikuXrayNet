@@ -5,8 +5,12 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.lang.reflect.Proxy;
 import java.util.List;
+import java.util.Set;
+import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
 import org.junit.jupiter.api.Test;
 
@@ -113,5 +117,69 @@ class MikuCommandTest {
         "MikuCommand 不得再 implements CommandExecutor（唯一注册路径是 Paper 桥接）");
     assertFalse(TabCompleter.class.isAssignableFrom(MikuCommand.class),
         "MikuCommand 不得再 implements TabCompleter（唯一补全路径是 Paper 桥接）");
+  }
+
+  /**
+   * 父权限必须等效放行：{@code mikuxraynet.admin} 声明为三个子节点的父节点，但权限插件（LuckPerms 等）
+   * 只认自己库里的节点、不展开插件注册的 children。真机反馈「/mxnet reload 用不了」的一种成因就是
+   * 「管理组只授了 admin」，因此这里把父权限钉成三个子命令都放行。
+   */
+  @Test
+  void adminParentPermissionGrantsEverySubcommand() {
+    CommandSender admin = sender(Constants.ADMIN_PERMISSION);
+    assertTrue(MikuCommand.allowed(admin, "status"), "admin 必须放行 status");
+    assertTrue(MikuCommand.allowed(admin, "dump"), "admin 必须放行 dump");
+    assertTrue(MikuCommand.allowed(admin, "probe"), "admin 必须放行 probe（沿用 status 节点）");
+    assertTrue(MikuCommand.allowed(admin, "reload"), "admin 必须放行 reload");
+  }
+
+  /** 子节点单独授予仍然有效；未授予的其它子命令不得被顺带放行。 */
+  @Test
+  void specificNodeDoesNotLeakToOtherSubcommands() {
+    CommandSender statusOnly = sender(Constants.STATUS_PERMISSION);
+    assertTrue(MikuCommand.allowed(statusOnly, "status"));
+    assertTrue(MikuCommand.allowed(statusOnly, "probe"), "probe 沿用 status 节点");
+    assertFalse(MikuCommand.allowed(statusOnly, "reload"), "只授 status 时不得放行 reload");
+    assertFalse(MikuCommand.allowed(statusOnly, "dump"), "只授 status 时不得放行 dump");
+  }
+
+  /** 无发送者或未知子命令一律拒绝（不得因「unknownPermission == null」被当成放行）。 */
+  @Test
+  void nullSenderAndUnknownSubcommandAreDenied() {
+    assertFalse(MikuCommand.allowed(null, "reload"));
+    assertFalse(MikuCommand.allowed(sender(Constants.ALL_PERMISSION), "nope"),
+        "未知子命令没有权限节点，必须拒绝而不是放行");
+  }
+
+  /** 权限桩：只回答 {@code hasPermission(String)}，其余方法返回安全默认值。 */
+  private static CommandSender sender(String... granted) {
+    Set<String> nodes = Set.of(granted);
+    return (CommandSender) Proxy.newProxyInstance(MikuCommandTest.class.getClassLoader(),
+        new Class<?>[] {CommandSender.class}, (proxy, method, args) -> {
+          switch (method.getName()) {
+            case "hasPermission":
+              return args != null && args.length == 1 && nodes.contains(String.valueOf(args[0]));
+            case "getName":
+              return "StubSender";
+            case "toString":
+              return "StubSender";
+            case "hashCode":
+              return System.identityHashCode(proxy);
+            case "equals":
+              return proxy == args[0];
+            default:
+              Class<?> returnType = method.getReturnType();
+              if (returnType == boolean.class) {
+                return false;
+              }
+              if (returnType == int.class) {
+                return 0;
+              }
+              if (returnType == long.class) {
+                return 0L;
+              }
+              return null;
+          }
+        });
   }
 }

@@ -189,19 +189,24 @@ public final class MikuXrayNet extends JavaPlugin {
     // 统计持有者跨 reload 复用（throttleStats / occlusionStats 均为插件级唯一实例）
     AntiXrayRuntime current = runtime;
     OcclusionStores occlusionStores = current == null ? null : current.occlusionStores();
-    ThrottlePipeline pipeline =
-        new ThrottlePipeline(this, config.bandwidth(), throttleStats, occlusionStores, occlusionStats);
+    // 构造也放进 try：构造期异常（配置字段异常、集合初始化失败等）若冒出 onEnable，会让整个插件启用失败；
+    // 冒出 reload 则被编排层记成一句「周期任务重启时出现异常」，管理员无从判断。
+    ThrottlePipeline pipeline = null;
     try {
+      pipeline =
+          new ThrottlePipeline(this, config.bandwidth(), throttleStats, occlusionStores, occlusionStats);
       pipeline.start();
       this.throttlePipeline = pipeline;
     } catch (Throwable throwable) {
       getLogger().log(Level.WARNING, "带宽优化装配失败（不影响反矿透）", throwable);
       // 装配失败的实例不发布：它可能已注册了部分监听器/任务（start 内部已尽力清理），
       // 但若仍挂在字段上，诊断会把它当成「已启用」去读一套恒为 0 的计数，掩盖真正的失败。
-      try {
-        pipeline.stop();
-      } catch (Throwable ignored) {
-        // 清理失败只影响同一次失败诊断，不再外抛
+      if (pipeline != null) {
+        try {
+          pipeline.stop();
+        } catch (Throwable ignored) {
+          // 清理失败只影响同一次失败诊断，不再外抛
+        }
       }
     }
   }

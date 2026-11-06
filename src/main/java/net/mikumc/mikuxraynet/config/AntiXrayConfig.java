@@ -527,7 +527,7 @@ public final class AntiXrayConfig {
 
   /** {@code proximity.interval-ticks} 上限（tick）：200 tick = 10 秒，再长等于「几乎不做邻近显形」。 */
   public static final int PROXIMITY_INTERVAL_TICKS_MAX = 200;
-  /** {@code proximity.max-reveals-per-tick} 上限：单次巡检的发包上限，防一次巡检打出包风暴。 */
+  /** {@code proximity.max-reveals-per-tick} 上限：每名玩家每轮巡检的显形发包上限，防单玩家打出包风暴。 */
   public static final int PROXIMITY_MAX_REVEALS_PER_TICK_MAX = 100_000;
   /** {@code proximity.expire-seconds} 上限（秒，1 天）：再长等于条目永不自然过期。 */
   public static final int PROXIMITY_EXPIRE_SECONDS_MAX = 86_400;
@@ -564,7 +564,8 @@ public final class AntiXrayConfig {
    *                              （服务器视距与客户端自报视距取小）取小值，因此不会给客户端还没加载的
    *                              区块发显形包；配置超过 {@link #PROXIMITY_DISTANCE_CHUNKS_MAX} 会被钳制并 WARN
    * @param intervalTicks         巡检周期（tick）
-   * @param maxRevealsPerTick     单次巡检的发包上限（普通服务端为全服合计，Folia 为每玩家）
+   * @param maxRevealsPerTick     每名玩家每轮巡检各自可发出的显形包上限（两平台语义一致；
+   *                              全服单轮上限 = 在线人数 × 该值，需要封顶请直接调小本键）
    * @param expireSeconds         显形索引条目的过期秒数（区块卸载未触发时的兜底）
    * @param maxPositions          伪装区块索引的坐标总量<b>安全阀</b>（正常运营下不应触发）
    * @param maxPositionsPerPlayer 单玩家已显形坐标的<b>安全阀</b>（正常运营下不应触发）
@@ -604,7 +605,7 @@ public final class AntiXrayConfig {
 
   /**
    * 事件驱动即时显形：观测到玩家身边（曼哈顿距离 ≤ {@code radius}）的出站方块变更时，
-   * <b>当 tick</b>（不经周期巡检）把变更邻域内「已伪装且视线可见」的坐标显形。
+   * <b>不经周期巡检</b>（变更包到达后立即投递到玩家所属线程）把变更邻域内「已伪装且视线可见」的坐标显形。
    *
    * @param enabled    总开关（默认开启）
    * @param radius     曼哈顿半径（格），变更必须落在玩家身边该半径内才触发（默认 4）

@@ -48,7 +48,7 @@ import org.bukkit.plugin.Plugin;
  *
  * <p><b>事件驱动即时显形（P1-4，可选）</b>：构造时传入 {@link ProximityRevealer} 后，每次观测到
  * 变更还会调用 {@link ProximityRevealer#onBlockChangeObserved}——变更邻域内仍有伪装坐标时，
- * 由邻近显形当 tick 补发「玩家身边、已伪装且视线可见」的坐标（周期巡检兜底不变）。
+ * 由邻近显形立即调度到玩家所属线程补发「玩家身边、已伪装且视线可见」的坐标（不等巡检周期；周期巡检兜底不变）。
  * 未传入（{@code null}）时行为与旧版完全一致。
  */
 public final class BlockChangeRevealListener extends PacketAdapter {
@@ -59,7 +59,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private final RevealedSet revealedSet;
   private final ProximityStats stats;
   /**
-   * 事件驱动即时显形（P1-4，可选）：观测到方块变更时交给邻近显形做「当 tick 补发邻域」。
+   * 事件驱动即时显形（P1-4，可选）：观测到方块变更时交给邻近显形「立即投递到玩家线程补发邻域」。
    * {@code null} 表示不启用（只做索引注销，行为与旧版一致）。
    */
   private final ProximityRevealer instantRevealer;

@@ -185,12 +185,13 @@ public final class ProximityRevealer implements Listener {
   private static final int REVEAL_ECHO_MAX_PER_PLAYER = 8192;
 
   /**
-   * 单次巡检的发包额度（非 Folia 为全服合计，Folia 为每个玩家各自的巡检）。
+   * 单次巡检的发包额度：<b>每名玩家每轮各自一份</b>（Paper 与 Folia 语义一致，建法见
+   * {@code passAll} / {@code pass} 里的 {@code new Budget(limit())}）。
    *
-   * <p><b>为什么必须用 {@link AtomicInteger}</b>：非 Folia 的一次巡检里，同一份 {@code Budget} 会被
-   * 多个玩家的异步视锥任务并发持有（{@code workPool.execute} 把后续发包推迟到工作线程 / 玩家线程），
-   * 普通 int 字段的读写无同步、会丢失更新，导致 {@code max-reveals-per-tick} 的「全服合计」语义被突破
-   * （超发若干显形包）。改为原子计数后，扣减不再丢失，「近的先发」的排序与额度上限保持一致。
+   * <p><b>为什么仍用 {@link AtomicInteger}</b>：额度对象会随任务跨线程发布——巡检先在插件线程建额度，
+   * 若本轮回退到工作池做视锥判定，真正的扣减发生在「回到玩家所属线程之后」的 {@code sendCandidates}。
+   * 当前一次发布只有一个消费者，原子字段让可见性不依赖调度器的实现细节；将来若把两条发包路径合到
+   * 同一份额度上，扣减也不会丢更新。
    *
    * <p><b>为什么没有 refund（归还额度）</b>：批量路径在 {@code sendOne} 里「先预扣、再累积」，确实可能有
    * 「预扣但最终没发出」的坐标；但所有潜在归还点都在 {@link #flushBatch} 内、即发包循环结束之后，而
@@ -443,8 +444,8 @@ public final class ProximityRevealer implements Listener {
         scheduleEntityTask(player, interval);
       }
     } else {
-      // Paper：单条全局任务，保留「全服共享发包额度」的既有语义（延迟与周期都以 tick 计）。
-      // 合并为每玩家任务会把 max-reveals-per-tick 从全服合计改成每玩家额度，属可观测的封包行为变化，故不合并。
+      // Paper：单条全局任务（延迟与周期都以 tick 计）。额度本来就「每名玩家人手一份」（见 passAll），
+      // 因此逐玩家建任务不会改变额度语义，只会把一次遍历拆成 N 次调度——在主线程上纯属额外开销，故保持单任务。
       globalTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, scheduled -> passAll(),
           interval, interval);
     }
@@ -497,7 +498,9 @@ public final class ProximityRevealer implements Listener {
     // 否则该句柄无人知晓、任务空转到实体退役并钉住本实例。
     stopping = true;
     if (globalTask != null) {
-      globalTask.cancel();
+      // 用 cancelQuietly：停用瞬间 Bukkit 已把插件置为 disabled，cancel() 可能抛 IllegalPluginAccessException；
+      // 裸调用会让 stop() 半途中断——旧监听已注销、新监听还没建，热重载直接失败（真机表现为「reload 用不了」）。
+      cancelQuietly(globalTask);
       globalTask = null;
     }
     // Folia 每玩家任务句柄全部取消：句柄若被丢弃，区域任务会在停用后继续跑到实体退役（泄漏）
@@ -1654,15 +1657,16 @@ public final class ProximityRevealer implements Listener {
   /**
    * 出站方块变更回调（由 {@link BlockChangeRevealListener} 在封包解析线程调用）：
    * 玩家收到某个方块变更包时，若变更坐标的邻域内（曼哈顿 ≤ {@code instant-reveal.radius}）
-   * 仍有伪装坐标，则调度到玩家所属线程当 tick 补发显形。
+   * 仍有伪装坐标，则调度到玩家所属线程<b>立即</b>补发显形（不等下一轮巡检）。
    *
    * <p><b>为什么只在这里做初筛</b>：封包线程不能读 World / 玩家位置，但伪装索引是纯内存并发结构，
    * 「邻域内是否还有伪装坐标」的初筛可以安全地在这一步完成——邻域内全是非伪装方块时
    * （如在地表插火把）不产生任何调度；命中时也只调度一次，最终判定（身边半径、射线、限额、去重）
    * 全部在玩家所属线程的 {@link #revealImmediately} 里做。
    *
-   * <p><b>与周期巡检的关系</b>：事件触发是<b>补充</b>（把「挖开/爆炸后要等最多一个周期」的窗口压到 0），
-   * 周期巡检兜底不变；两者共用 {@link #sendOne} 与已显形标记，同一坐标当 tick 只发一次。
+   * <p><b>与周期巡检的关系</b>：事件触发是<b>补充</b>——把「挖开/爆炸后要等最多一个周期才还原」的窗口压到
+   * 「一次线程投递 + 一次发包」。周期巡检兜底不变；两者共用 {@link #sendOne} 与已显形标记，同一坐标不会发两次
+   * （靠标记去重，不依赖 tick 对齐）。
    */
   public void onBlockChangeObserved(Player player, String worldName, int x, int y, int z) {
     if (player == null || worldName == null

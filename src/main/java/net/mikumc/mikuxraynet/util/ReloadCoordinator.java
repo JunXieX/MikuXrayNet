@@ -2,6 +2,8 @@ package net.mikumc.mikuxraynet.util;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * 配置热重载编排：把「重读配置 → 失效缓存 → 重启周期任务 → 汇报生效范围」串成一条可测流程。
@@ -57,6 +59,15 @@ public final class ReloadCoordinator {
       return null;
     }
   }
+
+  /**
+   * 失败日志通道。
+   *
+   * <p><b>为什么用静态 logger</b>：本类刻意不持有 {@code Plugin}（可在离线单测里直接驱动）。
+   * 而失败必须落日志——旧实现的回显写着「详见服务端日志」，但三处 catch 里<b>没有任何日志调用</b>，
+   * 管理员按提示去翻日志只会看到空白，「reload 用不了」因此永远无法定位。
+   */
+  private static final Logger LOGGER = Logger.getLogger("MikuXrayNet");
 
   /** 重载会话互斥锁（串行化「读配置 → 失效缓存 → 重建任务」整段流程）。 */
   private final Object reloadLock = new Object();
@@ -198,7 +209,8 @@ public final class ReloadCoordinator {
     try {
       target.reloadConfiguration();
     } catch (Throwable throwable) {
-      lines.add("配置重新读取失败，已保留原配置（详见服务端日志）");
+      LOGGER.log(Level.WARNING, "热重载：重新读取配置失败，已保留原配置", throwable);
+      lines.add("配置重新读取失败，已保留原配置（" + reasonOf(throwable) + "；完整堆栈见服务端日志）");
       return lines;
     }
     int antiAfter = safeAntiXrayFingerprint(target);
@@ -209,13 +221,15 @@ public final class ReloadCoordinator {
       target.invalidateCaches();
       invalidated = true;
     } catch (Throwable throwable) {
-      lines.add("缓存失效时出现异常，已在日志记录（不影响封包主链路）");
+      LOGGER.log(Level.WARNING, "热重载：缓存失效失败（不影响封包主链路）", throwable);
+      lines.add("缓存失效时出现异常（" + reasonOf(throwable) + "），不影响封包主链路；完整堆栈见服务端日志");
     }
 
     try {
       target.restartPeriodicTasks();
     } catch (Throwable throwable) {
-      lines.add("周期任务重启时出现异常，已在日志记录（不影响封包主链路）");
+      LOGGER.log(Level.WARNING, "热重载：周期任务重启失败（不影响封包主链路）", throwable);
+      lines.add("周期任务重启时出现异常（" + reasonOf(throwable) + "），不影响封包主链路；完整堆栈见服务端日志");
     }
 
     // 两侧指纹都比对：只改 bandwidth.yml 时也必须如实指出「带宽侧已变化」，不能因反矿透侧未变就报「未变化」
@@ -267,5 +281,25 @@ public final class ReloadCoordinator {
     } catch (Throwable throwable) {
       return 0;
     }
+  }
+
+  /**
+   * 把异常压成一行短原因（不带堆栈、不含换行），用于让管理员在<b>游戏内</b>看到「为什么这次重载失败」。
+   *
+   * <p>只回显「出现异常，详见服务端日志」等于要管理员自己翻日志——重载失败必须自带原因，
+   * 否则「reload 用不了」这类反馈永远无法定位。
+   */
+  static String reasonOf(Throwable throwable) {
+    if (throwable == null) {
+      return "未知原因";
+    }
+    String message = throwable.getMessage();
+    if (message == null || message.isBlank()) {
+      message = throwable.getClass().getSimpleName();
+    }
+    if (message == null || message.isBlank()) {
+      message = throwable.getClass().getName();
+    }
+    return message.replace('\n', ' ').replace('\r', ' ').trim();
   }
 }
