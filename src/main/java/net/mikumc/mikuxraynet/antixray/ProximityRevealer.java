@@ -353,6 +353,32 @@ public final class ProximityRevealer implements Listener {
   private final ConcurrentHashMap<UUID, long[]> digMarks = new ConcurrentHashMap<>();
   /** 过度显形抽样器（1/N，只计数不改行为；N=0 关闭）。 */
   private final OverRevealSampler overRevealSampler;
+  /**
+   * 玩家最近一次「自己触发的方块变更」所在的 section（起始 tick + section 键）。
+   *
+   * <p><b>用途</b>：事件即时显形会在玩家刚放/刚挖完的同一 tick 里，给**同 section** 的其它伪装坐标发
+   * 显形包。客户端收到段级方块更新会重建该 section 的网格，而刚变更的那一格此刻可能还没拿到稳定的光照 /
+   * 预测确认，于是会有一帧看起来「闪一下」。把**事件路径**的显形延后到安静窗口之外即可让这次重建避开
+   * 它——周期巡检不受影响，因此不会造成「看得见却一直是假方块」。
+   */
+  private final ConcurrentHashMap<UUID, OwnChangeWindow> ownChanges = new ConcurrentHashMap<>();
+  /** 事件显形的「同段安静窗口」（tick）：玩家自己变更后这么多 tick 内，事件路径不再往同 section 发显形包。 */
+  static final int OWN_CHANGE_QUIET_TICKS = 2;
+  /** 一个 section 变更包里最多登记多少个坐标（超出部分只是精度损失：这些坐标不参与安静窗口）。 */
+  private static final int MAX_OWN_CHANGE_RECORDS_PER_PACKET = 64;
+  /** 单个窗口保留的 section 数上限（超出的只影响延后精度，不影响最终还原——周期巡检照常）。 */
+  private static final int OWN_CHANGE_MAX_SECTIONS = 32;
+
+  /** 玩家最近一次自己触发的变更：窗口起始 tick + 涉及的 section 键。 */
+  private static final class OwnChangeWindow {
+    private final long tick;
+    private final long[] sections;
+
+    OwnChangeWindow(long tick, long[] sections) {
+      this.tick = tick;
+      this.sections = sections;
+    }
+  }
 
   private volatile ScheduledTask globalTask;
   /**
@@ -576,6 +602,7 @@ public final class ProximityRevealer implements Listener {
     instantQuota.clear(event.getPlayer().getUniqueId());
     chunkDeliveryQuota.clear(event.getPlayer().getUniqueId());
     digMarks.remove(event.getPlayer().getUniqueId());
+    ownChanges.remove(event.getPlayer().getUniqueId());
     viewChangeQuota.clear(event.getPlayer().getUniqueId());
     viewMarks.remove(event.getPlayer().getUniqueId());
     pendingChunkReveals.remove(event.getPlayer().getUniqueId());
@@ -1669,6 +1696,11 @@ public final class ProximityRevealer implements Listener {
    * （靠标记去重，不依赖 tick 对齐）。
    */
   public void onBlockChangeObserved(Player player, String worldName, int x, int y, int z) {
+    // 先记「本玩家刚变更的 section」（不依赖任何开关与 Bukkit 访问）：紧接着的事件显形要让开这个 section，
+    // 否则显形包会与刚放/刚挖的那一格在同一 tick 里同段重绘，真机观感是「方块闪一下」。
+    if (player != null && !stopping) {
+      rememberOwnChange(player.getUniqueId(), Bukkit.getCurrentTick(), x, y, z);
+    }
     if (player == null || worldName == null
         || !instant.enabled() || instant.maxPerTick() <= 0 || stopping) {
       return;
@@ -1733,6 +1765,16 @@ public final class ProximityRevealer implements Listener {
    * @param coordinates 同一 section 的变更坐标（已去重，扁平三元组，前 {@code count} 个有效）
    */
   public void onSectionChangeObserved(Player player, String worldName, int[] coordinates, int count) {
+    // 与逐坐标入口同口径：整段变更也要登记，事件显形随后让开这些 section（见 onBlockChangeObserved）。
+    if (player != null && coordinates != null && count > 0 && !stopping) {
+      UUID changedBy = player.getUniqueId();
+      long tick = Bukkit.getCurrentTick();
+      int recorded = Math.min(count, MAX_OWN_CHANGE_RECORDS_PER_PACKET);
+      for (int i = 0; i < recorded; i++) {
+        rememberOwnChange(changedBy, tick, coordinates[i * 3], coordinates[i * 3 + 1],
+            coordinates[i * 3 + 2]);
+      }
+    }
     if (player == null || worldName == null || coordinates == null || count <= 0
         || !instant.enabled() || instant.maxPerTick() <= 0 || stopping) {
       return;
@@ -1844,6 +1886,10 @@ public final class ProximityRevealer implements Listener {
         if (!occludedBy(eye, cx, cy, cz, x, y, z)) {
           continue;
         }
+        // 与本次变更同 section 的候选让开安静窗口：与刚变更的方块同段重绘会让它闪一帧（周期巡检照常还原）。
+        if (sameSectionAsOwnChange(playerId, tick, x, y, z)) {
+          continue;
+        }
         // 事件路径不预先算计划（见 revealImmediately 注释）：false = sendOne 在当前线程用遮挡位图判定
         sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
       }
@@ -1935,6 +1981,10 @@ public final class ProximityRevealer implements Listener {
             continue;
           }
           if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
+            continue;
+          }
+          // 与本次变更同 section 的候选让开安静窗口（见 revealImmediately 的同名判断）。
+          if (sameSectionAsOwnChange(playerId, tick, x, y, z)) {
             continue;
           }
           // 事件路径不预先算计划（见 revealImmediately 注释）：false = sendOne 在当前线程用遮挡位图判定
@@ -2324,6 +2374,10 @@ public final class ProximityRevealer implements Listener {
           if (!occludedBy(eye, bx, by, bz, x, y, z)) {
             continue;
           }
+          // 正在挖的那一格所在 section 同样让开安静窗口（与逐坐标路径同一口径）。
+          if (sameSectionAsOwnChange(playerId, tick, x, y, z)) {
+            continue;
+          }
           sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
         }
       } finally {
@@ -2583,6 +2637,67 @@ public final class ProximityRevealer implements Listener {
   /** 候选坐标打包（仅供聚合显形去重；与 {@link RevealedSet} 同一编码：x/z 各 26 位、y 12 位）。 */
   private static long packCoordinate(int x, int y, int z) {
     return ((long) (x & 0x3FFFFFF) << 38) | ((long) (y & 0xFFF) << 26) | (z & 0x3FFFFFF);
+  }
+
+  /** section 坐标打包（与 {@link #packCoordinate} 同一编码；section 取值范围远小于方块坐标）。 */
+  private static long packSection(int x, int y, int z) {
+    return packCoordinate(x >> 4, y >> 4, z >> 4);
+  }
+
+  /**
+   * 记录「该玩家刚变更了一格」：同一波操作内窗口起点保持不变，section 集合增量合并。
+   *
+   * <p>只在事件路径（挖/放）调用，且不做任何 Bukkit 访问，可在封包线程安全执行。
+   *
+   * @param tick 变更所在 tick（{@code Bukkit.getCurrentTick()}，与判定侧同一时钟）
+   */
+  void rememberOwnChange(UUID playerId, long tick, int x, int y, int z) {
+    if (playerId == null) {
+      return;
+    }
+    long section = packSection(x, y, z);
+    ownChanges.compute(playerId, (id, previous) -> {
+      if (previous != null && tick - previous.tick <= OWN_CHANGE_QUIET_TICKS) {
+        for (long existing : previous.sections) {
+          if (existing == section) {
+            return previous;
+          }
+        }
+        if (previous.sections.length >= OWN_CHANGE_MAX_SECTIONS) {
+          return previous;
+        }
+        long[] merged = java.util.Arrays.copyOf(previous.sections, previous.sections.length + 1);
+        merged[previous.sections.length] = section;
+        return new OwnChangeWindow(previous.tick, merged);
+      }
+      return new OwnChangeWindow(tick, new long[] {section});
+    });
+  }
+
+  /**
+   * 该候选是否落在「玩家自己刚变更过的 section」且仍在安静窗口内。
+   *
+   * <p>纯数据判定（不读 Bukkit），{@code nowTick} 由调用方给出，便于离线单测。
+   */
+  boolean sameSectionAsOwnChange(UUID playerId, long nowTick, int x, int y, int z) {
+    if (playerId == null) {
+      return false;
+    }
+    OwnChangeWindow window = ownChanges.get(playerId);
+    if (window == null) {
+      return false;
+    }
+    if (nowTick - window.tick > OWN_CHANGE_QUIET_TICKS) {
+      ownChanges.remove(playerId, window);
+      return false;
+    }
+    long section = packSection(x, y, z);
+    for (long existing : window.sections) {
+      if (existing == section) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

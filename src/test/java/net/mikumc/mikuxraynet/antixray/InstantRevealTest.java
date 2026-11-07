@@ -404,6 +404,22 @@ class InstantRevealTest {
   }
 
   /**
+   * <b>同段安静窗口</b>：玩家自己放/挖一格后，事件路径在 {@code OWN_CHANGE_QUIET_TICKS} 内不往**同一 section**
+   * 发显形包（避免与刚变更的方块同段重绘，真机观感是那一格「闪一下」）。纯数据判定，不触发任何发包。
+   */
+  @Test
+  void ownChangeQuietWindowSuppressesOnlyTheSameSectionWithinTheWindow() {
+    ProximityRevealer revealer = revealer();
+    UUID player = UUID.randomUUID();
+    revealer.rememberOwnChange(player, 100L, 0, 64, 0); // section (0, 4, 0)
+    assertTrue(revealer.sameSectionAsOwnChange(player, 100L, 5, 70, 5), "同 section、窗口内必须命中");
+    assertFalse(revealer.sameSectionAsOwnChange(player, 100L, 40, 64, 0), "不同 section 不得命中");
+    assertTrue(revealer.sameSectionAsOwnChange(player, 102L, 5, 70, 5), "窗口边界（2 tick）仍算命中");
+    assertFalse(revealer.sameSectionAsOwnChange(player, 103L, 5, 70, 5), "超出窗口必须放行，绝不长期不还原");
+    assertFalse(revealer.sameSectionAsOwnChange(UUID.randomUUID(), 100L, 5, 70, 5), "其它玩家不受影响");
+  }
+
+  /**
    * <b>「只还原被挖开那一格挡住的坐标」</b>：立即显形的几何闸门（真机反馈「挖/放方块时方块闪一下」）。
    *
    * <p>原先立即显形只按「距离 + 可见」筛选，于是一次挖/放会把身边 4 格内<b>本来就看得见</b>的伪装方块
