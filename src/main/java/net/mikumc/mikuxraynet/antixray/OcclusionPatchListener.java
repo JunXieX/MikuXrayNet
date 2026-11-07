@@ -2,7 +2,6 @@ package net.mikumc.mikuxraynet.antixray;
 
 import com.comphenix.protocol.PacketType;
 import com.comphenix.protocol.ProtocolManager;
-import com.comphenix.protocol.async.AsyncListenerHandler;
 import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
@@ -266,7 +265,8 @@ public final class OcclusionPatchListener extends PacketAdapter {
   private final java.util.concurrent.ConcurrentHashMap<UUID, String> lastWorlds =
       new java.util.concurrent.ConcurrentHashMap<>();
 
-  private volatile AsyncListenerHandler handler;
+  /** 是否已注册（同步监听器没有句柄，用标志位保证 start/stop 幂等）。 */
+  private volatile boolean registered;
 
   public OcclusionPatchListener(Plugin plugin, ProtocolManager protocolManager, OcclusionStores stores,
       OcclusionStats stats, IntPredicate stateLookup) {
@@ -280,10 +280,16 @@ public final class OcclusionPatchListener extends PacketAdapter {
     this.idResolver = new NmsStateIdResolver(plugin.getLogger());
   }
 
-  /** 注册异步监听器（真异步扣包）。 */
+  /**
+   * 注册<b>同步</b>出站监听器。
+   *
+   * <p>不能用异步：异步注册会把方块变更包扣在异步队列里，紧随其后的 {@code LIGHT_UPDATE} 会先到客户端，
+   * 客户端于是按「旧方块 + 新光照」渲染一帧——真机观感就是刚放/刚挖的那一格闪一下（详见
+   * {@link BlockChangeRevealListener#start()} 的同一条说明）。同步注册在线序上就地处理。
+   */
   public void start() {
-    handler = protocolManager.getAsynchronousManager().registerAsyncHandler(this);
-    handler.start();
+    protocolManager.addPacketListener(this);
+    registered = true;
     plugin.getLogger().fine("遮挡位图方块补丁已启用：出站方块变更即时同步进遮挡位图");
   }
 
@@ -299,14 +305,13 @@ public final class OcclusionPatchListener extends PacketAdapter {
 
   /** 注销监听器；可重复调用，异常安全。 */
   public void stop() {
-    AsyncListenerHandler current = handler;
-    handler = null;
     lastWorlds.clear();
-    if (current == null) {
+    if (!registered) {
       return;
     }
+    registered = false;
     try {
-      protocolManager.getAsynchronousManager().unregisterAsyncHandler(current);
+      protocolManager.removePacketListener(this);
     } catch (Throwable throwable) {
       plugin.getLogger().log(Level.WARNING, "注销遮挡位图方块补丁监听器时出现异常（通常可忽略）", throwable);
     }

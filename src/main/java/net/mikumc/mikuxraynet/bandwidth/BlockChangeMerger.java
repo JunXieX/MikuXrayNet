@@ -1,10 +1,7 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
-import com.comphenix.protocol.AsynchronousManager;
 import com.comphenix.protocol.PacketType;
 import com.comphenix.protocol.ProtocolManager;
-import com.comphenix.protocol.async.AsyncListenerHandler;
-import com.comphenix.protocol.async.AsyncMarker;
 import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
@@ -33,6 +30,7 @@ import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
+import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
@@ -138,7 +136,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    */
   private static final class Pending {
     private final UUID uuid;
-    private final List<Held> held = new ArrayList<>();
+    /** 本窗口内被取消（改为窗口末合并下发）的原包数，供统计与「是否有实包」判定。 */
+    private int cancelledPackets;
     private final Set<Coord> passed = new HashSet<>();
     /**
      * {@link #passed} 的条目上限；超限即整体清空（见 {@link #rememberDelivered}）。
@@ -185,33 +184,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
   }
 
-  /** 被延迟的原包与其一次性放行闸。 */
-  private static final class Held {
-    private final PacketEvent event;
-    private final AtomicBoolean signalled = new AtomicBoolean();
-    /**
-     * 该原包携带的更新。
-     *
-     * <p><b>为什么存原始更新而不是折算好的坐标清单</b>：坐标清单只在 fail-open 的
-     * {@link #allCoordsPassed} 判定里用得到（罕见路径），而对每个被延迟的包都折算一遍，
-     * 会在封包热路径上产生「ArrayList + 每个坐标一个 Coord」的固定分配（每 tick 全服大量相对/方块
-     * 变更包都会走这里）。改为惰性折算，把这份开销推迟到真正需要时（{@link #coordsOf}）。
-     */
-    private final List<Update<WrappedBlockData>> updates;
-
-    private Held(PacketEvent event, List<Update<WrappedBlockData>> updates) {
-      this.event = event;
-      this.updates = updates;
-    }
-
-    List<Update<WrappedBlockData>> updates() {
-      return updates;
-    }
-  }
 
   private final Plugin plugin;
   private final ProtocolManager protocolManager;
-  private final AsynchronousManager asynchronousManager;
   private final BandwidthConfig.BlockChanges config;
   private final ThrottleStats stats;
   private final ScheduledExecutorService flusher;
@@ -247,16 +222,15 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    */
   private static final AtomicBoolean blockDataProbeDone = new AtomicBoolean();
 
-  private volatile boolean verified;
-  private AsyncListenerHandler handler;
+  /** 是否已注册（同步监听器没有句柄，用标志位保证 start/stop 幂等）。 */
+  private volatile boolean registered;
 
   public BlockChangeMerger(Plugin plugin, ProtocolManager protocolManager,
-      AsynchronousManager asynchronousManager, BandwidthConfig.BlockChanges config, ThrottleStats stats) {
+      BandwidthConfig.BlockChanges config, ThrottleStats stats) {
     super(plugin, ListenerPriority.NORMAL, PacketType.Play.Server.BLOCK_CHANGE,
         PacketType.Play.Server.MULTI_BLOCK_CHANGE);
     this.plugin = plugin;
     this.protocolManager = protocolManager;
-    this.asynchronousManager = asynchronousManager;
     this.config = config;
     this.stats = stats;
     this.flusher = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -266,12 +240,20 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     });
   }
 
-  /** 注册异步监听器（真异步扣包）与每 tick 的位置快照刷新任务，并做一次启动期契约探测。 */
+  /**
+   * 注册<b>同步</b>监听器与每 tick 的位置快照刷新任务，并做一次启动期契约探测。
+   *
+   * <p><b>为什么必须同步</b>：异步注册会把<b>所有</b>该类封包（包括本该直通、不参与合并的近身变更）
+   * 扣进异步队列。服务端随后在同一 tick 下发的 {@code LIGHT_UPDATE} 不受我们约束、原样先到，
+   * 客户端就会按「旧方块 + 新光照」渲染一帧——真机观感是刚放/刚挖的那一格闪一下。
+   * 改成同步后：直通分支原包就地流出（线序不变）；需要合并的分支<b>取消</b>原包并在窗口末补发合并包
+   * （合并包用 {@code sendServerPacket(..., filters=false)} 发出，不会再进本监听器）。
+   */
   public void start() {
     // 启动期探测一次：让「服务端结构变更导致合并静默失效」可见（不改变任何行为）
     probeBlockDataContract();
-    handler = asynchronousManager.registerAsyncHandler(this);
-    handler.start();
+    protocolManager.addPacketListener(this);
+    registered = true;
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
     // 位置快照任务「始终登记」：它不只服务近身判定，还承载「玩家当前世界」，而跨世界守卫必须靠它
     // 才能发现「玩家已切维」（见 refreshPosition / isCrossWorld）。immediate-radius=0 时快照只用于
@@ -288,16 +270,14 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   public void stop() {
     // 首行置位：此后任何迟到的 schedulePositionRefresh 都会自行取消（见 stopping 字段说明）。
     stopping = true;
-    // 顺序很关键：必须先注销异步监听器、再排空。旧顺序（先 flush 再 unregister）在两者之间留了一个
-    // 窗口：封包线程仍可为新建的 Pending 成功 schedule 定时器，随后 shutdownNow 把定时器连其队列一起
-    // 丢弃——该批 held 原包既没被取消也没被放行，只能等 ProtocolLib 超时兜底（停用瞬间滞留原包）。
-    if (handler != null) {
+    // 顺序很关键：先注销监听器（此后不再有新包被取消），再排空已取消的批次并补发。
+    if (registered) {
+      registered = false;
       try {
-        asynchronousManager.unregisterAsyncHandler(handler);
+        protocolManager.removePacketListener(this);
       } catch (Throwable throwable) {
-        plugin.getLogger().log(Level.WARNING, "注销方块变更异步监听器时出现异常（通常可忽略）", throwable);
+        plugin.getLogger().log(Level.WARNING, "注销方块变更监听器时出现异常（通常可忽略）", throwable);
       }
-      handler = null;
     }
     flushAll();
     HandlerList.unregisterAll(this);
@@ -581,8 +561,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * （异步投递会重新打开「旧世界数据落在切维包之后」的窗口）。
    */
   private void discard(Pending target) {
-    List<Held> held = List.of();
     ScheduledFuture<?> timer = null;
+    int cancelled = 0;
     try {
       synchronized (target) {
         // 与 flush 共用同一个「恰好处理一次」闸：谁先拿到 flushed 谁负责，另一方成 no-op
@@ -592,31 +572,18 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         pending.remove(target.uuid, target);
         timer = target.timer;
         target.timer = null;
-        held = new ArrayList<>(target.held);
-        target.held.clear();
+        cancelled = target.cancelledPackets;
+        // 原包在入缓冲时已被取消，这里直接丢弃缓冲即可：这些坐标属于玩家已离开的世界，
+        // 绝不能按新世界下发（丢弃不构成丢更新——旧世界区块会整列重建）。
         target.batch.clear();
         target.passed.clear();
       }
       if (timer != null) {
         timer.cancel(false);
       }
-      // 口径：这次被<b>整批丢弃</b>的原包数（切维 / 黑名单切换）。本方法结构上没有任何发包入口，
-      // 因此 CAS 成功时拿到多少个 Held，就是「既未下发、也未合并」的多少个原包。
-      stats.blockChangesDiscarded.add(held.size());
-      if (held.isEmpty()) {
-        return;
-      }
-      // 取消 = 丢弃：这些坐标属于玩家已离开的世界，绝不能按新世界下发。release 负责「恰好放行一次」。
-      for (Held entry : held) {
-        entry.event.setCancelled(true);
-      }
+      stats.blockChangesDiscarded.add(cancelled);
     } catch (Throwable throwable) {
       logThrottled(throwable);
-    } finally {
-      // 兜底：任何未放行过的原包都必须放行（release 为一次性，重复调用无副作用）
-      for (Held entry : held) {
-        release(entry);
-      }
     }
   }
 
@@ -695,11 +662,6 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       return;
     }
 
-    AsyncMarker marker = event.getAsyncMarker();
-    if (marker == null) {
-      return;
-    }
-
     // 解析前短路：MULTI_BLOCK_CHANGE 的坐标数与「段原点 + 每格一个 packed short」都能直接读出，
     // 无需把整包解析成 List<Update<WrappedBlockData>>（每坐标一个 WrappedBlockData 反射包装 + 一条
     // Update + ArrayList 扩容）。反矿透显形包常有数十到数千个坐标，多人同时显形时这份分配是封包线程上
@@ -773,42 +735,31 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
           continue;
         }
         boolean overflow = false;
-        // 「已直通下发的坐标」集合在绝大多数窗口里是空的（本窗口没有近身立即放行、也没有远距离直通批量包）。
-        // isEmpty 与下面的 remove 同处 synchronized(target) 临界区（passed 的写入方 rememberDelivered 也持它），
-        // 因此循环内不可能有并发写入，据此把它提出循环即可省掉「每 update 一个 Coord 分配 + 一次哈希查找」的纯开销。
+        // 先确保窗口定时器在位：排不上就<b>不取消</b>原包（它照常流出），绝不因合并链路不可用而丢更新。
+        if (target.timer == null) {
+          long window = Math.max(1L, config.mergeWindowMillis());
+          final Pending scheduled = target;
+          try {
+            target.timer = flusher.schedule(() -> flush(scheduled), window, TimeUnit.MILLISECONDS);
+          } catch (Throwable rejected) {
+            logThrottled(rejected);
+            return;
+          }
+        }
         boolean hasPassed = !target.passed.isEmpty();
         for (Update<WrappedBlockData> update : updates) {
           // 直接复用解析阶段已构造的 Update 实例（避免同一坐标再造一个等值 record）
           overflow |= target.batch.add(update);
           // 本坐标刚被重新缓冲：此刻缓冲条目才是最新的，必须撤销「已被更新下发覆盖」的标记。
-          // 否则上一轮「立即放行 / 直通批量包」留下的标记会在 flush 时把这条更新的变更当旧态误删（丢更新）。
+          // 否则上一轮「立即放行 / 直通批量包」留下的标记会在冲刷时把这条更新当旧态误删（丢更新）。
           if (hasPassed) {
             target.passed.remove(new Coord(update.x(), update.y(), update.z()));
           }
         }
-        // 先入缓冲、再登记延迟：held.add 若在此之后抛异常，登记过的延迟就再也没人放行（永久卡包）。
-        // flush() 的兜底只遍历 target.held，所以条目必须先在里面，登记才能生效。
-        Held entry = new Held(event, updates);
-        target.held.add(entry);
-        // delayRegistered 记录「延迟是否真的登记成功」：未登记则从未延迟，不能 release（那会多减一次）。
-        boolean delayRegistered = false;
-        try {
-          marker.incrementProcessingDelay();
-          delayRegistered = true;
-          if (target.timer == null) {
-            long window = Math.max(1L, config.mergeWindowMillis());
-            final Pending scheduled = target;
-            target.timer = flusher.schedule(() -> flush(scheduled), window, TimeUnit.MILLISECONDS);
-          }
-        } catch (Throwable throwable) {
-          // 登记或调度失败（含冲刷线程已失效的 RejectedExecutionException）：撤销缓冲条目，
-          // 已登记过延迟则立即原样放行，绝不卡包；未登记则原包本就照常流出，无需 release。
-          target.held.remove(entry);
-          if (delayRegistered) {
-            release(entry);
-          }
-          logThrottled(throwable);
-        }
+        // 入缓冲成功后才取消原包：此后由窗口末的合并包交付；合并失败会逐条补发（见 deliver），绝不丢更新。
+        event.setCancelled(true);
+        target.cancelledPackets++;
+
         // 溢出调度闸（synchronized(target) 内置位）：只有「本 Pending 尚未排过溢出冲刷」才排任务。
         // add 达上限后每个后续包都返回 overflow=true，但首个任务执行前的窗口内重复排队只是空转
         //（flushed CAS 全 no-op，还会把 blockMergeFlushes 统计注水）。置位与判定同锁，不丢排不重排。
@@ -934,9 +885,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * 遍历放行，即可保证「取得写入权 ⇒ 恰好放行一次」这一不变量在任何路径（含 Error）下都成立。
    */
   private boolean flushInternal(Pending target) {
-    List<Held> held = List.of();
     List<List<Update<WrappedBlockData>>> clusters = List.of();
     Set<Coord> passed = Set.of();
+    int cancelled = 0;
     ScheduledFuture<?> timer = null;
     try {
       synchronized (target) {
@@ -947,106 +898,74 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         pending.remove(target.uuid, target);
         timer = target.timer;
         target.timer = null;
-        held = new ArrayList<>(target.held);
-        target.held.clear();
         clusters = target.batch.drainClusters(config.mergeRadius());
         // 本窗口内「已有更新下发覆盖过」的坐标：缓冲里的同一坐标属旧状态，必须剔除
         passed = target.passed.isEmpty() ? Set.of() : new HashSet<>(target.passed);
+        cancelled = target.cancelledPackets;
       }
       if (timer != null) {
         timer.cancel(false);
       }
-      if (held.isEmpty()) {
+      if (cancelled <= 0) {
         return false; // 只有清理、没有实包：不计入「冲刷次数/耗时」
       }
-      sendOrPass(held, clusters, passed);
+      deliver(target.uuid, clusters, passed, cancelled);
     } catch (Throwable throwable) {
       logThrottled(throwable);
-    } finally {
-      // 兜底：任何未被取消的原包都必须放行（release 为一次性，重复调用无副作用）
-      for (Held entry : held) {
-        release(entry);
-      }
     }
     return true;
   }
 
   /**
-   * 冲刷的投递主体：按 last-write-wins 把缓冲结果构造成合并包发出，并决定各原包取消还是放行。
+   * 冲刷的投递主体：把缓冲结果构造成合并包发给玩家；构造/发送失败时<b>逐条补发</b>。
    *
-   * <p><b>不自行放行</b>：所有出口的兜底放行由 {@link #flushInternal} 的 finally 统一完成。
+   * <p>原包在入缓冲时已经取消（见 {@code onPacketSending}），因此这里必须保证「这些变更一定交付」：
+   * 合并包成功即交付；失败则按 section 逐条重发同样的更新（幂等），绝不因合并链路故障而丢方块更新。
    */
-  private void sendOrPass(List<Held> held, List<List<Update<WrappedBlockData>>> clusters,
-      Set<Coord> passed) {
-    if (!passed.isEmpty()) {
-      // 本窗口内有坐标经「更新于缓冲条目」的路径先行下发（近身立即放行 / 远距离直通批量包）：
-      // 做 last-write-wins——合并包只保留未被更新下发覆盖的坐标，其余原包一律取消（其数据要么已由
-      // 更新的包交付、要么由下方的合并结果交付），绝不把旧状态晚发回去覆盖新态。
-      // 注意：此处不套用「首个成功发送前保留原包」的宽松策略——对新态与旧态同坐标的情形，
-      // 重复下发旧态即等于回退；改为完全信任 {@link #trySendMerged} 的回读自检（失败即 fail-open 放行）。
-      List<List<Update<WrappedBlockData>>> survivors = dropPassed(clusters, passed);
-      boolean anySurvivor = false;
-      for (List<Update<WrappedBlockData>> cluster : survivors) {
-        if (!cluster.isEmpty()) {
-          anySurvivor = true;
-          break;
-        }
-      }
-      if (!anySurvivor) {
-        // 所有坐标都已有更新的下发：无需发包，取消原包即可（更新已交付）。
-        // 不计 blockMergeBatches——本次没有发出任何合并包，计入会让「合并批次」虚高。
-        stats.blockChangesMerged.add(held.size());
-        for (Held entry : held) {
-          entry.event.setCancelled(true);
-        }
-        return;
-      }
-      if (trySendMerged(held.get(0).event.getPlayer(), survivors)) {
-        stats.blockMergeBatches.increment();
-        stats.blockChangesMerged.add(held.size());
-        for (Held entry : held) {
-          entry.event.setCancelled(true);
-        }
-        return;
-      }
-      // 构造/发送失败：退回既有 fail-open（原包照常放行，绝不丢更新）——但本窗口内已有更新下发的
-      // 坐标，其<b>旧态原包必须一并取消</b>：否则旧态晚到会把先到的新态覆盖回去（方块回退）。
-      // 注意：passed 只记坐标不记值，无法重发新态，所以只能「整包取消」——仅当该原包携带的坐标
-      // 全部已有更新下发时才取消，避免误丢未下发坐标的更新（跨坐标混合包只能照常放行）。
-      int cancelled = 0;
-      for (Held entry : held) {
-        if (allCoordsPassed(coordsOf(entry.updates()), passed)) {
-          entry.event.setCancelled(true);
-          cancelled++;
-        }
-      }
-      // 只把真正放行的计入「放行」：被取消的原包并未下发，计入会让「放行数」虚高
-      stats.blockChangesPassed.add(held.size() - cancelled);
+  private void deliver(UUID playerId, List<List<Update<WrappedBlockData>>> clusters,
+      Set<Coord> passed, int cancelled) {
+    Player player = Bukkit.getPlayer(playerId);
+    if (player == null || !player.isOnline()) {
+      // 玩家已离线：客户端不存在了，取消原包不构成丢更新
+      stats.blockChangesMerged.add(cancelled);
       return;
     }
-
-    boolean mergeable = false;
-    if (held.size() >= 2) {
-      for (List<Update<WrappedBlockData>> cluster : clusters) {
-        if (cluster.size() >= 2) {
-          mergeable = true;
-          break;
+    List<List<Update<WrappedBlockData>>> survivors =
+        passed.isEmpty() ? clusters : dropPassed(clusters, passed);
+    boolean anySurvivor = false;
+    for (List<Update<WrappedBlockData>> cluster : survivors) {
+      if (!cluster.isEmpty()) {
+        anySurvivor = true;
+        break;
+      }
+    }
+    if (!anySurvivor) {
+      // 所有坐标都已有更新的下发：无需发包（不计 blockMergeBatches，避免「合并批次」虚高）
+      stats.blockChangesMerged.add(cancelled);
+      return;
+    }
+    if (trySendMerged(player, survivors)) {
+      stats.blockMergeBatches.increment();
+      stats.blockChangesMerged.add(cancelled);
+      return;
+    }
+    // 合并包构造/发送失败：逐条补发。原包入缓冲时已取消，这里必须把变更交付出去（幂等重发）。
+    int total = 0;
+    int resent = 0;
+    for (List<Update<WrappedBlockData>> cluster : survivors) {
+      for (Update<WrappedBlockData> update : cluster) {
+        total++;
+        SectionKey key = new SectionKey(update.x() >> 4, update.y() >> 4, update.z() >> 4);
+        if (sendSection(player, key, List.of(update))) {
+          resent++;
         }
       }
     }
-    if (mergeable) {
-      boolean wasVerified = verified;
-      if (trySendMerged(held.get(0).event.getPlayer(), clusters) && wasVerified) {
-        // 已通过结构自检：取消原包（更新已由合并包交付）
-        stats.blockMergeBatches.increment();
-        stats.blockChangesMerged.add(held.size());
-        for (Held entry : held) {
-          entry.event.setCancelled(true);
-        }
-        return;
-      }
+    stats.blockChangesMerged.add(cancelled);
+    if (resent < total && errorCounter.getAndIncrement() < Constants.MAX_ERROR_LOGS) {
+      plugin.getLogger().warning("合并包构造失败后逐条补发仍有 " + (total - resent)
+          + " 条未发出（客户端可能短暂缺少这些方块更新）");
     }
-    stats.blockChangesPassed.add(held.size());
   }
 
   /**
@@ -1098,17 +1017,6 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     return true;
   }
 
-  /** 放行一个被延迟的原包，恰好一次。 */
-  private void release(Held entry) {
-    if (!entry.signalled.compareAndSet(false, true)) {
-      return;
-    }
-    try {
-      asynchronousManager.signalPacketTransmission(entry.event);
-    } catch (Throwable throwable) {
-      logThrottled(throwable);
-    }
-  }
 
   private void flushAll() {
     for (Pending target : new ArrayList<>(pending.values())) {
@@ -1154,9 +1062,6 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
             sentAny = true;
           }
         }
-      }
-      if (sentAny) {
-        verified = true;
       }
       return sentAny;
     } catch (Throwable throwable) {

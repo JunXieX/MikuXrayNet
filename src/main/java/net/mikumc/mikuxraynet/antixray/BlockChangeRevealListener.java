@@ -2,7 +2,6 @@ package net.mikumc.mikuxraynet.antixray;
 
 import com.comphenix.protocol.PacketType;
 import com.comphenix.protocol.ProtocolManager;
-import com.comphenix.protocol.async.AsyncListenerHandler;
 import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
@@ -74,7 +73,8 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private static final int MAX_JOURNAL_RECORDS_PER_PACKET = 64;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
-  private volatile AsyncListenerHandler handler;
+  /** 是否已注册（同步监听器没有句柄，用标志位保证 start/stop 幂等）。 */
+  private volatile boolean registered;
 
   /**
    * @param obfuscatedChunkIndex 伪装区块索引；{@code null} 表示不做邻近显形（只做索引注销）
@@ -125,22 +125,29 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     this.changeJournal = changeJournal;
   }
 
-  /** 注册异步监听器（真异步扣包，与合并模块同一条链路）。 */
+  /**
+   * 注册<b>同步</b>出站监听器。
+   *
+   * <p>不能用异步：异步注册会把本包<b>扣在异步队列</b>里，而服务端在方块变更之后紧跟着下发的
+   * {@code LIGHT_UPDATE} 不受本监听器约束、原样先走——客户端于是「先拿到新光照、后拿到新方块」，
+   * 会把刚放/刚挖的那一格按旧方块 + 新光照渲染一帧（真机观感：那一格闪一下）。
+   * 同步注册在 netty 管线内就地处理，线序不变。
+   */
   public void start() {
-    handler = protocolManager.getAsynchronousManager().registerAsyncHandler(this);
-    handler.start();
+    // 同步监听：在 netty 管线内就地处理，绝不把封包扣在异步队列里（见类注释的「包序」说明）。
+    protocolManager.addPacketListener(this);
+    registered = true;
     plugin.getLogger().fine("方块变更观察已启用：命中已伪装坐标即从显形索引移除");
   }
 
   /** 注销监听器；可重复调用，异常安全。 */
   public void stop() {
-    AsyncListenerHandler current = handler;
-    handler = null;
-    if (current == null) {
+    if (!registered) {
       return;
     }
+    registered = false;
     try {
-      protocolManager.getAsynchronousManager().unregisterAsyncHandler(current);
+      protocolManager.removePacketListener(this);
     } catch (Throwable throwable) {
       plugin.getLogger().log(Level.WARNING, "注销方块变更观察监听器时出现异常（通常可忽略）", throwable);
     }

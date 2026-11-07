@@ -254,11 +254,12 @@ public final class ThrottlePipeline {
           ? "entity-packets.skip-zero-movement" : "entity-packets.enabled");
     }
     if (plan.blockChanges()) {
-      if (manager == null || asynchronous == null) {
+      if (manager == null) {
         plugin.getLogger().warning("方块变更合并需要 ProtocolLib，已停用");
       } else {
+        // 合并器是**同步**监听器（不能异步扣包，见 BlockChangeMerger#start）：只需要 ProtocolManager。
         blockChangeMerger = register(
-            () -> new BlockChangeMerger(plugin, manager, asynchronous, config.blockChanges(),
+            () -> new BlockChangeMerger(plugin, manager, config.blockChanges(),
                 stats),
             BlockChangeMerger::start, BlockChangeMerger::stop);
       }
