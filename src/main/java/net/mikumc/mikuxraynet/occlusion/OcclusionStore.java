@@ -654,8 +654,8 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
   /**
    * 由「逐格方块状态 + 遮挡谓词」构建一段的遮挡数据（建表入口）。
    *
-   * <p>委托 {@link BitmapOcclusion#fromStates}：全不遮挡返回 {@code null}（不上表），全遮挡返回
-   * {@link SolidOcclusion#INSTANCE}（共享单例），其余返回逐格位图。
+   * <p>委托 {@link BitmapOcclusion#fromStates}：全不遮挡返回 {@link EmptyOcclusion#INSTANCE}（共享单例，
+   * 占表但零内存），全遮挡返回 {@link SolidOcclusion#INSTANCE}（共享单例），其余返回逐格位图。
    *
    * <p><b>测试专用豁免</b>：生产建表走 {@link BitmapOcclusion#fromStateLookup}（旁路生成，免逐格拷数组），
    * 本方法当前仅单测在用，保留以免破坏测试。

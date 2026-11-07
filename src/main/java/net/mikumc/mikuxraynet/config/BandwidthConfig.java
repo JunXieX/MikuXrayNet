@@ -722,8 +722,7 @@ public final class BandwidthConfig {
   /**
    * 布尔键写法不被理解、已按默认值生效的明细（空列表 = 未发生）。
    *
-   * <p>供加载期一次性提示（{@link #warnIfClampApplied}）与单测使用；{@code /mxnet dump} 当前尚未输出
-   * 该明细（{@code util/Diagnostics} 属另一模块，需要时在那里补一行即可，与 AntiXrayConfig 同类明细一致）。
+   * <p>加载期一次性提示（{@link #warnIfClampApplied}）与 {@code /mxnet dump} 都会输出本明细。
    */
   public List<String> typeAdjustments() {
     return typeAdjustments;

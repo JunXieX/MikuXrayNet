@@ -133,9 +133,8 @@ public final class MikuWorkPool implements AutoCloseable {
     }
     // 配置下限已抬到 4（cap<4 无法既预留又准入：预留 1 会让阈值降到 0 → 规划/清理永久停摆；
     // 不预留又会让非关键任务占掉唯一改写槽位 → 窗口内区块不伪装）。
-    int reserved = Math.max(1, this.queueCapacity / REWRITE_RESERVE_DIVISOR);
-    int threshold = Math.max(1, this.queueCapacity - reserved);
-    return this.queuedTasks.get() < threshold;
+    int reserved = this.queueCapacity / REWRITE_RESERVE_DIVISOR;
+    return this.queuedTasks.get() < this.queueCapacity - reserved;
   }
 
   /** 提交任务；队列已满会抛 {@link java.util.concurrent.RejectedExecutionException}。 */

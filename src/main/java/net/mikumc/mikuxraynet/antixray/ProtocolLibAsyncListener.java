@@ -700,8 +700,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 本方法不自行放行，也不允许把异常抛给调用方之外的任何路径。
    */
   private void rewriteOnWorker(RewriteTask task, ChunkPacketAccessor accessor) {
-    // 实时读「当前」配置并固定在本轮改写内使用：配置指纹 / remove-block-entities 必须随 reload 生效
-    // （本监听器不随热重载重建），且同一轮里 cache.get 与 cache.put 必须用同一份指纹——
+    // 实时读「当前」配置并固定在本轮改写内使用：remove-block-entities 必须随 reload 生效
+    // （本监听器不随热重载重建），且同一轮里 cache.get 与 cache.put 必须用同一份取值——
     // 若每处各读一次、reload 恰好发生在中途，读写键会不一致，导致刚写的条目立刻读不到。
     AntiXrayConfig current = live();
 
@@ -717,7 +717,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         NeighborEdges neighbors = neighborsNeeded(task.worldName(), task.dimension())
             ? neighborProvider.cached(task.worldName(), task.chunkX(), task.chunkZ())
             : null;
-        int fingerprint = rewriteFingerprint(current, neighbors);
+        int fingerprint = rewriteFingerprint(neighbors);
 
         CachedChunk cached = cache.get(task.worldName(), task.chunkX(), task.chunkZ(),
             fingerprint);
@@ -1115,19 +1115,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   }
 
   /**
-   * 区块封包<b>真正放行之后</b>，作废「该接收者在这个区块」的已显形标记。
-   *
-   * <p><b>为什么必须等放行之后</b>：区块包在异步管线里被扣住，放行前的显形包会排在它前面、被客户端按
-   * 「区块未加载」丢弃；若此时标记已写下且不被清掉，该坐标就会一直不显形（直到区块重发或标记过期）。
-   * 把作废放在放行动作里，任何在放行前落下的显形标记都会被清掉，下一轮巡检（≤1 个周期）立即补发。
-   *
-   * <p><b>只作废该玩家</b>：其它玩家的客户端仍显示我们此前发回的真实方块，把它们一并清掉只会让它们
-   * 下个周期重复显形一遍（纯浪费带宽与主线程开销）。
-   *
-   * <p><b>异常必须吞</b>：本方法在封包放行动作里执行，动作一旦抛出就会干扰 {@code signalOnce} 的
-   * 恰好一次语义；而清理失败只会让个别坐标多藏一个周期（下次区块重发会再清），属安全方向。
-   */
-  /**
    * 区块包放行后补发「持包期间被改过」的格子。
    *
    * <p>改写期间服务端可能又对该区块下发了方块变更；那条变更先到客户端，随后到达的旧区块字节会把它盖回去
@@ -1160,6 +1147,19 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
   }
 
+  /**
+   * 区块封包<b>真正放行之后</b>，作废「该接收者在这个区块」的已显形标记。
+   *
+   * <p><b>为什么必须等放行之后</b>：区块包在异步管线里被扣住，放行前的显形包会排在它前面、被客户端按
+   * 「区块未加载」丢弃；若此时标记已写下且不被清掉，该坐标就会一直不显形（直到区块重发或标记过期）。
+   * 把作废放在放行动作里，任何在放行前落下的显形标记都会被清掉，下一轮巡检（≤1 个周期）立即补发。
+   *
+   * <p><b>只作废该玩家</b>：其它玩家的客户端仍显示我们此前发回的真实方块，把它们一并清掉只会让它们
+   * 下个周期重复显形一遍（纯浪费带宽与主线程开销）。
+   *
+   * <p><b>异常必须吞</b>：本方法在封包放行动作里执行，动作一旦抛出就会干扰 {@code signalOnce} 的
+   * 恰好一次语义；而清理失败只会让个别坐标多藏一个周期（下次区块重发会再清），属安全方向。
+   */
   private void clearRevealedOnDelivery(String worldName, int chunkX, int chunkZ, UUID playerId) {
     if (worldName == null || playerId == null) {
       return;
@@ -1263,27 +1263,34 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 取「当前」的反矿透配置（实时读取，热重载后立即生效）。
    *
    * <p>本监听器<b>不随热重载重建</b>，而 {@link AntiXrayConfig} 实例会被 reload 整体替换。
-   * 凡影响运行期行为的读取——世界黑名单、{@code configHash()}、超时、{@code remove-block-entities}、
-   * {@code neighbors.enabled}——都必须走这里；否则 reload 后仍按启动期配置工作：
-   * 旧指纹继续命中旧缓存（即使配置已变）、新超时不生效、remove-block-entities 切换被忽略。
+   * 凡<b>真正热生效</b>的读取——世界黑名单、超时、{@code remove-block-entities}、
+   * {@code neighbors.enabled}——都必须走这里；否则 reload 后仍按启动期配置工作。
+   * 例外：缓存指纹用启动期配置（见 {@link #rewriteFingerprint}），因为改写规则本身是启动期冻结的。
    */
   private AntiXrayConfig live() {
     return resolveConfig(config, liveConfig);
   }
 
   /**
-   * 改写结果的全部决定因素指纹：反矿透配置指纹 <b>+</b> 参与编码的调色板选项指纹
-   * （{@link ObfuscationProcessor#paletteFingerprint()}）<b>+</b> 本次改写实际用到的邻块快照内容指纹
-   * （{@link NeighborEdges#contentFingerprint()}；{@code all} 模式或快照缺失时为 0）。
+   * 改写结果的全部决定因素指纹：<b>启动期</b>反矿透配置指纹 + 实时的 {@code remove-block-entities}
+   * + 调色板选项指纹（{@link ObfuscationProcessor#paletteFingerprint()}）
+   * + 本次改写实际用到的邻块快照内容指纹（{@link NeighborEdges#contentFingerprint()}）。
    *
-   * <p><b>为什么必须三者合并</b>：① 调色板位宽预算/自检开关由 {@code bandwidth.yml} 决定，却直接改变
-   * 重写后的区块字节；② {@code mode=enclosed} 的遮挡判定依赖邻块贴边快照，而快照内容会随邻块方块变化。
-   * 若缓存键只含 {@code AntiXrayConfig#configHash()}，上述任一变化都不会让旧条目失效
-   * （默认磁盘 7 天才过期），表现为「改了配置不生效」或「邻块变化后边界矿仍按旧结果伪装」。
-   * 读、写两侧都走本方法，保证键一致。
+   * <p><b>为什么用启动期配置指纹而不是 {@link #live()}</b>：隐藏方块表、伪装权重、分层与遮挡规则都在
+   * {@link ObfuscationProcessor#create} 时冻结，热重载不会重建它。若这里读实时指纹，reload 改完规则后
+   * 区块仍按<b>旧规则</b>改写、却以<b>新指纹</b>落盘；之后重启（处理器换成新规则）时同指纹命中这批旧
+   * 产物，这些区块的配置改动就永久不生效。用启动期指纹则相反：reload 期间沿用旧指纹，重启后指纹才随
+   * 新配置变化，旧槽自然不命中、按新规则重写。
+   *
+   * <p>实时的 {@code remove-block-entities} 必须单独混入：它直接决定写进封包的字节且热重载立即生效
+   * （见 {@code writeBack}），不混入就会在 reload 切换后读到旧字节。
+   *
+   * <p>另外两者：调色板位宽预算/自检开关由 {@code bandwidth.yml} 决定却直接改变重写字节；enclosed 模式
+   * 的遮挡判定依赖邻块贴边快照内容。读、写两侧都走本方法，保证键一致。
    */
-  private int rewriteFingerprint(AntiXrayConfig current, NeighborEdges neighbors) {
-    int base = current.configHash() * 31 + processor.paletteFingerprint();
+  private int rewriteFingerprint(NeighborEdges neighbors) {
+    int base = config.configHash() * 31 + (live().removeBlockEntities() ? 1 : 0);
+    base = base * 31 + processor.paletteFingerprint();
     if (neighbors == null) {
       return base;
     }

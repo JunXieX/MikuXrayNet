@@ -179,7 +179,8 @@ public final class OcclusionPayload {
         }
       }
       return column;
-    } catch (Throwable throwable) {
+    } catch (RuntimeException | LinkageError throwable) {
+      // 只吞畸形负载会抛的这两类；Error 里只剩 OOM/StackOverflow，那属于真正的内存告警，不能在这里降级成「没有遮挡数据」
       return null;
     }
   }

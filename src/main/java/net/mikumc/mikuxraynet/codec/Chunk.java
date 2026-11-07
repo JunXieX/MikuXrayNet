@@ -134,11 +134,6 @@ public class Chunk implements AutoCloseable {
   }
 
   public byte[] finalizeOutput() {
-    // 入口先校验所有「按绝对下标从输入缓冲区搬运」的源区间都落在缓冲区内。校验通过后，writeAll 期间
-    // 唯一可能的越界就只剩「输出缓冲区容量不足」，重试条件因此可精确判定；真正的数据损坏在这里就被
-    // 拦下（不进入任何扩容重试，直接交由上层 fail-open）。
-    validateSourceRanges();
-
     for (;;) {
       ByteBuf out = this.outputBuffer;
       out.clear();
@@ -170,7 +165,7 @@ public class Chunk implements AutoCloseable {
         // 容量只由 scratch.growOutput 决定，故此处无需回写容量（原 keepOutputCapacity 是死代码）。
         return Arrays.copyOfRange(array, out.arrayOffset(), out.arrayOffset() + readable);
       } catch (IndexOutOfBoundsException overflow) {
-        // 源区间已在入口校验，因此「输出写满」是唯一允许重试的情形。但**不能把所有越界都当成写满**：
+        // 只有「输出写满」允许扩容重试。但**不能把所有越界都当成写满**：
         // 编码链路自身（调色板 id 越界、位宽/长度不一致等）也会抛 IndexOutOfBoundsException，若一并
         // 当成容量不足，就会反复翻倍重写到 64 MiB 才放弃——既掩盖真正的编码 BUG、又把报错文案带偏，
         // 还会在大区块上产生一次数十 MB 的瞬时分配。故只在「剩余可写空间已经很小」时才判定为写满。
@@ -204,37 +199,6 @@ public class Chunk implements AutoCloseable {
         releaseQuietly(previousOut);
       }
     }
-  }
-
-  /**
-   * 校验写出时会按绝对下标搬运的源区间都在输入缓冲区内；任何越界即判「数据损坏」并就地抛出
-   * （{@link RuntimeException}，交由封包链路 fail-open），从而与「容量不足」的重试路径彻底分开。
-   */
-  private void validateSourceRanges() {
-    int capacity = this.inputBuffer.capacity();
-    checkSourceRange(this.trailingOffset, this.trailingLength, capacity);
-    for (ChunkSectionHolder chunkSection : this.sections) {
-      if (chunkSection != null) {
-        chunkSection.validateSourceRange(capacity);
-      }
-    }
-  }
-
-  private static void checkSourceRange(int offset, int length, int capacity) {
-    if (length < 0 || offset < 0 || (long) offset + length > capacity) {
-      throw new IllegalStateException("区块源字节区间越界（offset=" + offset + ", length=" + length
-          + ", capacity=" + capacity + "）：数据已损坏，放弃改写");
-    }
-  }
-
-  /**
-   * <b>仅测试用</b>：把一个 section 的原始字节区间改成越界值，用于验证「源数据损坏」会在
-   * {@link #finalizeOutput()} 入口被立即拦下（不进入扩容重试、直接 fail-open）。
-   */
-  void corruptSectionRangeForTest(int index, int offset, int length) {
-    ChunkSectionHolder holder = this.sections[index];
-    holder.sectionOffset = offset;
-    holder.sectionLength = length;
   }
 
   private void writeAll(ByteBuf out) {
@@ -340,16 +304,6 @@ public class Chunk implements AutoCloseable {
         return null;
       }
       return new SectionRange(this.sectionOffset, this.sectionLength);
-    }
-
-    /** 校验写出时按绝对下标搬运的两个源区间（未改动 section 的整体区间 / 尾部群系容器）都在输入缓冲区内。 */
-    void validateSourceRange(int inputCapacity) {
-      if (this.sectionLength > 0) {
-        checkSourceRange(this.sectionOffset, this.sectionLength, inputCapacity);
-      }
-      if (this.extraBytes > 0) {
-        checkSourceRange(this.extraOffset, this.extraBytes, inputCapacity);
-      }
     }
 
     public void write(ByteBuf outputBuffer) {

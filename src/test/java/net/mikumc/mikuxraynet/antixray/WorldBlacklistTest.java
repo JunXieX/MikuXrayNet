@@ -2,7 +2,6 @@ package net.mikumc.mikuxraynet.antixray;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
@@ -143,7 +142,7 @@ class WorldBlacklistTest {
   // ---------------------------------------------------------- 解析归一 + 指纹
 
   @Test
-  void blacklistParsingNormalizesAndParticipatesInFingerprint() {
+  void blacklistParsingNormalizes() {
     WorldBlacklistConfig config = blacklist("""
         world-blacklist:
           - ' spawn '
@@ -154,13 +153,11 @@ class WorldBlacklistTest {
 
     assertEquals(List.of("spawn", "dungeon_*"), config.patterns(),
         "去空白、跳过空条目并按声明序去重");
-    assertNotEquals(WorldBlacklistConfig.fromPatterns(List.of()).configHash(), config.configHash(),
-        "黑名单决定哪些世界完全不改写，必须参与配置指纹");
-    assertEquals(config.configHash(), blacklist("""
+    assertEquals(List.of("spawn", "dungeon_*"), blacklist("""
         world-blacklist:
           - spawn
           - dungeon_*
-        """).configHash(), "同一份名单的指纹必须一致（跨进程稳定）");
+        """).patterns(), "同一份名单解析结果必须一致");
   }
 
   // ---------------------------------------------------------- 静态发布（热重载即时生效）

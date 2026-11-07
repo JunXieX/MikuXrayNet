@@ -549,6 +549,12 @@ public final class AntiXrayRuntime {
     if (!antiXrayActive || proximityStats == null) {
       // 反矿透整体未启用（或尚未装配完成）时邻近显形无从接入改写链路，重启项静默无效。
       // 必须显式告知管理员「为什么没生效」，否则「重启邻近显形」这类操作会被误读为已生效。
+      // 核心装配只在 onEnable 执行一次：启动时关闭或装配失败之后，reload 无法把它重新装上，
+      // 因此配置此刻若已开启，必须明确要求重启，不能让管理员以为 reload 已经恢复了防护。
+      if (plugin.mikuConfig().antiXray().enabled()) {
+        logger.warning("反矿透核心改写未装配（启动时配置关闭或装配失败）："
+            + "热重载不会重新装配它，请重启服务端后生效");
+      }
       stopProximity();
       logger.fine("反矿透未启用，proximity 重启项已跳过");
       return;
@@ -795,8 +801,8 @@ public final class AntiXrayRuntime {
    * 默认 384 高世界不受影响；这里只提示，不做兼容（扩位需要同步改 OcclusionPayload/RevealedSet 布局）。
    */
   private void warnUnsupportedWorldHeight() {
-    // 只提示一次（startAntiXray() 每次热重载都会执行）；闸门放在「遍历成功之后」，
-    // 首次因世界列表不可读而失败时不消费这次提示，下次重载还能再试。
+    // 只提示一次；闸门放在「遍历成功之后」，首次因世界列表不可读而失败时不消费这次提示，
+    // 同实例再次启用时还能再试。
     if (WORLD_HEIGHT_WARNED.get()) {
       return;
     }

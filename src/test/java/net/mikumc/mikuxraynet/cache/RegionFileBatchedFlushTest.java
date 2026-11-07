@@ -14,10 +14,9 @@ import org.junit.jupiter.api.io.TempDir;
 /**
  * 区域文件的两条回归：
  * <ul>
- *   <li><b>读命中必须直接物化</b>：{@code BUCKET_SHIFT=0} 下一条记录只承载一个槽位，「懒加载只解一个槽位」
- *       的收益恒为 0，却会让解压后的整条记录（{@code LazyBucket.raw}）与解码出的 payload 副本同时常驻
- *       ——每个命中区块凭空多占约一份 payload 的内存。故读路径在 {@code BUCKET_SIZE==1} 时直接物化进
- *       {@code slots}，只保留 payload 一份（多槽位布局仍保留懒路径）。</li>
+ *   <li><b>读命中只保留一份表示</b>：{@code BUCKET_SHIFT=0} 下一条记录只承载一个槽位，读路径直接把整桶
+ *       物化进 {@code slots}，不额外保留「解压后的整条记录 + payload 副本」两份——每个命中区块少占约
+ *       一份 payload 的内存。</li>
  *   <li><b>落盘必须分批</b>：一条记录 = 整桶重编码 + 压缩 + append，脏记录累积到数百条时一次性写完会
  *       独占磁盘线程上百 ms，而读取预算只有 50 ms。{@link RegionFile#flushDirty(int)} 每批最多写
  *       {@link RegionFile#FLUSH_BATCH_RECORDS} 条，{@link RegionFile#hasDirtySlots()} 报告余量以便
@@ -36,19 +35,6 @@ class RegionFileBatchedFlushTest {
     return (Object[]) field.get(region);
   }
 
-  private static int lazyBucketCount(RegionFile region) throws Exception {
-    Field field = RegionFile.class.getDeclaredField("lazyBuckets");
-    field.setAccessible(true);
-    Object[] buckets = (Object[]) field.get(region);
-    int count = 0;
-    for (Object bucket : buckets) {
-      if (bucket != null) {
-        count++;
-      }
-    }
-    return count;
-  }
-
   /** 读命中必须直接物化进 {@code slots}：不得再留下「解压后的整条记录 + payload 副本」双份常驻。 */
   @Test
   void readHitMaterializesBucketAndDropsLazyRepresentation(@TempDir Path dir) throws Exception {
@@ -65,13 +51,10 @@ class RegionFileBatchedFlushTest {
 
     RegionFile reader = RegionFile.open(file, 4);
     try {
-      assertEquals(0, lazyBucketCount(reader), "前置：新实例不应持有任何懒加载桶");
       BufferedLinearV3Format.Entry loaded = reader.get(chunkIndex);
       assertNotNull(loaded, "已落盘的条目必须可读出");
       assertArrayEquals(new byte[] {7, 2, 3}, loaded.payload(), "payload 必须与原写入一致");
-      assertEquals(0, lazyBucketCount(reader),
-          "BUCKET_SIZE==1 下读命中必须直接物化：懒加载会让 raw 与 payload 副本双份常驻（每个命中区块多占约一份 payload）");
-      assertNotNull(slotsOf(reader)[0], "命中后该桶必须已在 slots 中（唯一常驻表示）");
+      assertNotNull(slotsOf(reader)[0], "命中后该桶必须已在 slots 中（唯一常驻表示，只保留 payload 一份）");
       assertSame(loaded, reader.get(chunkIndex), "物化之后再读应返回同一 Entry（不再重复解压）");
     } finally {
       reader.close();

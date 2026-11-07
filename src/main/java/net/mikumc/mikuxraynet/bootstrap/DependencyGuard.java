@@ -260,6 +260,7 @@ public final class DependencyGuard {
         }
         continue;
       }
+      // 段起始归零：value 的初值与「上一段结束」都是 -1，不归零会让本段从负数开始
       value = value < 0 ? 0 : value;
       value = value * 10 + (cleaned.charAt(i) - '0');
     }

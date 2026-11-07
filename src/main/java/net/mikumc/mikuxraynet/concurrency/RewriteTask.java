@@ -71,18 +71,6 @@ public final class RewriteTask {
   }
 
   /**
-   * @param dimension    该世界所属维度（决定用哪一段 {@code dimensions.<维度>} 配置改写）
-   * @param minHeight    该世界最低建筑高度，用于与封包中绝对 Y 坐标的方块实体对齐
-   * @param sectionCount 该世界的 section 数量（高度 / 16）
-   * @param timeoutMillis 处理超时（毫秒）
-   * @param delivery     放行动作（通常是 ProtocolLib 的 {@code signalPacketTransmission}）
-   */
-  public RewriteTask(int chunkX, int chunkZ, String worldName, AntiXrayConfig.Dimension dimension,
-      int minHeight, int sectionCount, long timeoutMillis, Runnable delivery) {
-    this(chunkX, chunkZ, worldName, dimension, minHeight, sectionCount, timeoutMillis, delivery, null);
-  }
-
-  /**
    * 完整构造：额外携带「持包时刻的遮挡补丁戳快照」（见 {@link #occlusionStamps()}）。
    *
    * @param occlusionStamps 持包线程取的整列戳快照；{@code null} 表示未启用遮挡建表（worker 侧自行取）

@@ -278,7 +278,7 @@ public final class OcclusionEngine implements AutoCloseable {
     if (count == 0) {
       return false; // 没有可试的顶点 → 按可见处理（fail-open）
     }
-    lookup.store = stores == null ? null : stores.lookup(request.worldName());
+    lookup.store = stores.lookup(request.worldName());
     try {
       for (int i = 0; i < count; i++) {
         int base = i * 3;
