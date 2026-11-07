@@ -369,11 +369,6 @@ public final class BlockStateRegistry implements RegistryAccessor {
     return entityOcclusionTable == null ? -1 : entityOcclusionTable.occludingStateCount();
   }
 
-  /** 实体口径里「逐状态真值不可用、回落启发式」的状态数；未构建实体口径表时为 -1。 */
-  public int entityOcclusionFallbackCount() {
-    return entityOcclusionTable == null ? -1 : heuristicFallbackStateCount;
-  }
-
   /** 逐状态真值解析成功（并生效）的状态数。 */
   public int truthStateCount() {
     return truthStateCount;

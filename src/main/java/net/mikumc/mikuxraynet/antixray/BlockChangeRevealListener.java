@@ -77,35 +77,6 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private volatile boolean registered;
 
   /**
-   * @param obfuscatedChunkIndex 伪装区块索引；{@code null} 表示不做邻近显形（只做索引注销）
-   * @param revealedSet          已显形集合；{@code null} 表示不做邻近显形
-   * @param stats                显形统计；{@code null} 表示不统计
-   */
-  public BlockChangeRevealListener(Plugin plugin, ProtocolManager protocolManager,
-      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats) {
-    this(plugin, protocolManager, obfuscatedChunkIndex, revealedSet, stats, null);
-  }
-
-  /**
-   * 完整构造（事件驱动即时显形）。
-   *
-   * @param instantRevealer 邻近显形器；{@code null} 表示不启用事件显形
-   */
-  public BlockChangeRevealListener(Plugin plugin, ProtocolManager protocolManager,
-      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet,
-      ProximityStats stats, ProximityRevealer instantRevealer) {
-    super(plugin, ListenerPriority.HIGHEST, PacketType.Play.Server.BLOCK_CHANGE,
-        PacketType.Play.Server.MULTI_BLOCK_CHANGE);
-    this.plugin = plugin;
-    this.protocolManager = protocolManager;
-    this.obfuscatedChunkIndex = obfuscatedChunkIndex;
-    this.revealedSet = revealedSet;
-    this.stats = stats;
-    this.instantRevealer = instantRevealer;
-    this.changeJournal = null;
-  }
-
-  /**
    * 完整构造（含方块变更日志）。
    *
    * @param changeJournal 区块包在途期间被改过的格子靠它补发（见 {@link ChunkChangeJournal}）；

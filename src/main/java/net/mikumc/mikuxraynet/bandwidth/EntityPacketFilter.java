@@ -47,7 +47,7 @@ import org.bukkit.plugin.Plugin;
  * {@code ENTITY_LOOK} 三个包（PacketEvents 中对应 ENTITY_RELATIVE_MOVE /
  * ENTITY_RELATIVE_MOVE_AND_ROTATION / ENTITY_ROTATION，ProtocolLib 常量名不同）。
  *
- * <p>字段读取一律走 {@code getSpecificModifier} 并做数量与类型容错：字段形态与预期不符
+ * <p>字段读取走 {@link MovePacketFields}（沿类继承链定位并按类缓存结果）：字段形态与预期不符
  * （不同服务端版本的字段布局差异）时直接放行原包，绝不误判取消。
  *
  * <p><b>白名单索引的维护方式</b>：实体 id → 类型 的索引需要 Bukkit 世界访问，因此按平台分别处理：

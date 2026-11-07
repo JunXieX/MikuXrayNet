@@ -132,33 +132,6 @@ final class RegionFile implements AutoCloseable {
     boolean keep(int chunkIndex, BufferedLinearV3Format.Entry entry);
   }
 
-  /**
-   * 读路径懒加载的桶：持有解压后的整桶原始字节与已解析好的槽位表，请求哪个槽位才解码哪个。
-   *
-   * <p><b>与 {@link #slots} 的关系</b>：一个桶要么是「已整桶解码」（{@code slots[bucket] != null}），
-   * 要么是「只解析了槽位表」的 {@code LazyBucket}，二者互斥；需要整桶时（写 / 压缩回收）由
-   * {@link #ensureLoaded} 把 LazyBucket 一次性解码并转入 {@code slots}。
-   *
-   * <p><b>当前布局（{@code BUCKET_SIZE==1}）不使用本表示</b>：一条记录只承载一个槽位，懒加载没有
-   * 「少解码其余槽位」的收益，却会让解压后的整条记录与 payload 副本同时常驻，故 {@link #readSlot}
-   * 改为直接物化。仅当布局恢复为「一桶多槽」时才会重新启用。
-   */
-  private static final class LazyBucket {
-
-    /** 解压后的整桶原始字节（槽位表与全部条目数据都在其中）。 */
-    final byte[] raw;
-    /** 每个槽位条目在 {@link #raw} 中的起始偏移；{@code -1} = 空槽（或结构损坏后的整桶作废）。 */
-    final int[] offsets;
-    /** 每个槽位条目的字节长度；{@code 0} = 空槽。 */
-    final int[] lengths;
-
-    LazyBucket(byte[] raw, int[] offsets, int[] lengths) {
-      this.raw = raw;
-      this.offsets = offsets;
-      this.lengths = lengths;
-    }
-  }
-
   private final Path path;
   private final int hashSeed;
   private final int bucketCacheSize;
@@ -175,14 +148,6 @@ final class RegionFile implements AutoCloseable {
   private final BufferedLinearV3Format.Entry[][] slots =
       new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_COUNT][];
   private final boolean[] dirty = new boolean[BufferedLinearV3Format.BUCKET_COUNT];
-  /**
-   * 读路径懒加载的桶（与 {@link #slots} 互斥，见 {@link LazyBucket}）：只解析槽位表、按需解码单个槽位。
-   * 写 / 压缩需要整桶时由 {@link #ensureLoaded} 一次性解码并转入 {@link #slots}。
-   *
-   * <p><b>当前布局下恒为全 null</b>：{@code BUCKET_SIZE==1} 时懒加载收益为 0 且会让解压记录与 payload
-   * 双份常驻，{@link #readSlot} 直接物化（见其说明）；只有多槽位布局（{@code BUCKET_SIZE>1}）才会用到它。
-   */
-  private final LazyBucket[] lazyBuckets = new LazyBucket[BufferedLinearV3Format.BUCKET_COUNT];
 
   /** 已加载 bucket 的 LRU（accessOrder=true，值恒为 FALSE，仅借其顺序）。 */
   private final LinkedHashMap<Integer, Boolean> loaded = new LinkedHashMap<>(8, 0.75f, true);
@@ -435,7 +400,6 @@ final class RegionFile implements AutoCloseable {
       bucketSizes[bucket] = 0L;
       dirty[bucket] = false;
       slots[bucket] = null;
-      lazyBuckets[bucket] = null;
     }
     loaded.clear();
     writeHeaderAndEmptyTable();
@@ -486,17 +450,10 @@ final class RegionFile implements AutoCloseable {
   /**
    * 读取一个区块的条目；不存在、损坏、或该文件已被其它进程占用时为 {@code null}。
    *
-   * <p><b>读路径不再整桶解码</b>：桶未在内存时只解析槽位表、只解码本次请求的那一个槽位（见
-   * {@link #readSlot}）。因此返回的条目在「桶已整桶解码」时与内部缓存共享同一实例，只在多槽位布局的
-   * 懒加载下才是本次新解出的实例；两种情况下调用方都必须<b>只读</b>对待它，或在使用前自行复制。若要跨
-   * 后续的 {@code put}/{@code clear}/{@code compact} 长期持有该 payload，应先复制。实际安全由上层保证：
-   * {@code DiskPayload.decode} 解码时已把 payload 复制成独立的字节数组，因此正常读写路径不会就地改写
-   * 本方法返回的字节。
-   *
-   * <p><b>当前布局（{@code BUCKET_SIZE==1}）不走懒加载</b>：一条记录只承载一个槽位，读命中在
-   * {@link #readSlot} 里直接物化（只保留 payload 一份，避免「解压后的整条记录 + payload 副本」双份常驻），
-   * 因此本方法返回的条目<b>恒为</b>内部缓存共享的同一实例。懒加载表示只保留给多槽位布局
-   * （{@code BUCKET_SIZE>1}）——那时「一桶多槽、只解一个」才有收益。
+   * <p><b>返回的条目恒为内部缓存共享的同一实例</b>：桶未在内存时整桶载入后直接返回该槽位（见
+   * {@link #readSlot}）。调用方必须<b>只读</b>对待它；若要跨后续的 {@code put}/{@code clear}/
+   * {@code compact} 长期持有该 payload，应先复制。实际安全由上层保证：{@code DiskPayload.decode}
+   * 解码时已把 payload 复制成独立的字节数组，因此正常读写路径不会就地改写本方法返回的字节。
    */
   BufferedLinearV3Format.Entry get(int chunkIndex) {
     if (lockUnavailable) {
@@ -537,18 +494,10 @@ final class RegionFile implements AutoCloseable {
   }
 
   /**
-   * 读取一个槽位：桶已在内存（整桶已解码）时直接返回该槽位；否则按布局选路径——{@code BUCKET_SIZE==1}
-   * 时<b>直接物化</b>（见下），多槽位布局（{@code BUCKET_SIZE>1}）才走懒加载（只解析槽位表、只解码本次
-   * 请求的那一个槽位）。
+   * 读取一个槽位：桶尚未在内存时先整桶载入。
    *
-   * <p><b>为什么要懒解码</b>：旧实现每次读取都 {@link #ensureLoaded} 整桶（旧布局一桶 64 个槽位，逐槽分配 payload、
-   * 复制、XXHash 校验），单次区块读取要付出最多 64 个区块的工作量；而读取只有 50ms 预算，常常跑不完
-   * 而被记未命中，上层于是回退整块重写，磁盘缓存几乎失效。懒加载布局下只解码被请求的槽位，其余槽位的
-   * 校验/复制都推迟到真正需要（写、压缩回收）时。
-   *
-   * <p><b>当前布局（{@code BUCKET_SIZE==1}）不走懒加载</b>：一条记录只承载一个槽位，懒加载「只解被请求
-   * 槽位」的收益恒为 0，却会让解压后的整条记录与 payload 副本同时常驻（每个命中区块凭空多占约一份
-   * payload 的内存）；故这里直接 {@code ensureLoaded} 物化，LazyBucket 表示只在多槽位布局下启用。
+   * <p>当前布局一条记录只承载一个槽位（{@link BufferedLinearV3Format#BUCKET_SHIFT}=0），物化即所得，
+   * 因此不需要「只解析槽位表」的中间表示。
    */
   private BufferedLinearV3Format.Entry readSlot(int bucket, int slot) {
     BufferedLinearV3Format.Entry[] bucketSlots = slots[bucket];
@@ -556,132 +505,7 @@ final class RegionFile implements AutoCloseable {
       loaded.get(bucket);
       return bucketSlots[slot];
     }
-    // 当前布局（BUCKET_SHIFT=0 → BUCKET_SIZE=1）一条记录只承载一个槽位：懒加载「只解码被请求的槽位」
-    // 的收益恒为 0，却会让「解压后的整条记录」（LazyBucket.raw）与「解码出的 payload 副本」同时常驻
-    // ——每个命中区块凭空多占约一份 payload 的内存（直到被 LRU 驱逐）。故直接物化进 slots，只保留
-    // payload 一份。多槽位布局（BUCKET_SIZE>1）仍保留懒路径：那时「一桶多槽、只解一个」才是真收益。
-    if (BufferedLinearV3Format.BUCKET_SIZE == 1) {
-      return ensureLoaded(bucket)[slot];
-    }
-    LazyBucket lazy = lazyBuckets[bucket];
-    if (lazy == null) {
-      lazy = loadLazyBucket(bucket);
-      lazyBuckets[bucket] = lazy;
-      loaded.put(bucket, Boolean.FALSE);
-      // 正在加载的桶不得被本轮驱逐（与 ensureLoaded 同理，否则返回的字节会变成孤儿）
-      evictIfNeeded(bucket);
-    } else {
-      loaded.get(bucket);
-    }
-    return decodeLazySlot(lazy, slot);
-  }
-
-  /**
-   * 懒加载一个桶：读桶头 → 边界与 {@code rawLength} 钳制校验 → 解压 → <b>只解析槽位表</b>。
-   *
-   * <p>校验口径与 {@link #ensureLoaded} 完全一致（桶尾边界、{@link #rawLengthWithinFileBudget}、
-   * {@link BufferedLinearV3Format#decompress} 内部的 {@code MAX_RAW_SIZE} 与压缩比闸门）；任何损坏或
-   * 异常都退化为「全空槽位的桶」（fail-open）。桶未写入（偏移为 0）时同样返回空桶，以保持「空桶也会
-   * 进入 LRU」的既有语义（LRU 计数不变）。
-   */
-  private LazyBucket loadLazyBucket(int bucket) {
-    if (positions[bucket] <= 0L) {
-      return emptyLazyBucket();
-    }
-    try {
-      byte[] lengths = readAt(channel, positions[bucket], 8);
-      ByteBuffer buffer = ByteBuffer.wrap(lengths);
-      int rawLength = buffer.getInt();
-      int compressedLength = buffer.getInt();
-      if (rawLength > 0 && compressedLength > 0
-          && positions[bucket] + 8L + compressedLength <= fileSize
-          && rawLengthWithinFileBudget(rawLength)) {
-        byte[] compressed = readAt(channel, positions[bucket] + 8L, compressedLength);
-        byte[] raw = BufferedLinearV3Format.decompress(compressed, rawLength, compression);
-        return parseSlotTable(raw);
-      }
-    } catch (IOException | RuntimeException exception) {
-      // 结构损坏：整桶视为空（fail-open，绝不因此影响封包链路）
-    }
-    return emptyLazyBucket();
-  }
-
-  /**
-   * 解析一个桶的槽位表（只读长度前缀，不解码、不复制任何条目负载）。
-   *
-   * <p>遍历规则与 {@link BufferedLinearV3Format#decodeBucket} 一致：长度 ≤ 0 视为空槽；尾部不足一个长度
-   * 前缀即停止（其余按空槽）；某个槽位声明的长度越过桶尾属<b>结构性损坏</b>，此时整桶按空处理——
-   * 与旧「整桶解码抛异常 → 整桶当空」的结论一致，保证损坏桶不会返回半截数据。
-   */
-  private static LazyBucket parseSlotTable(byte[] raw) {
-    int[] offsets = new int[BufferedLinearV3Format.BUCKET_SIZE];
-    int[] lengths = new int[BufferedLinearV3Format.BUCKET_SIZE];
-    for (int slot = 0; slot < offsets.length; slot++) {
-      offsets[slot] = -1;
-    }
-    int offset = 0;
-    for (int slot = 0; slot < BufferedLinearV3Format.BUCKET_SIZE; slot++) {
-      if (offset + Integer.BYTES > raw.length) {
-        break;
-      }
-      int length = readIntAt(raw, offset);
-      offset += Integer.BYTES;
-      if (length <= 0) {
-        continue;
-      }
-      if (length > raw.length - offset) {
-        // 结构性损坏：整桶作废（偏移全部置空），与 decodeBucket 抛异常后整桶当空的结论一致
-        for (int index = 0; index < offsets.length; index++) {
-          offsets[index] = -1;
-        }
-        return new LazyBucket(raw, offsets, lengths);
-      }
-      offsets[slot] = offset;
-      lengths[slot] = length;
-      offset += length;
-    }
-    return new LazyBucket(raw, offsets, lengths);
-  }
-
-  /** 全空槽位的懒加载桶（桶未写入 / 结构损坏时使用）。 */
-  private static LazyBucket emptyLazyBucket() {
-    return parseSlotTable(new byte[0]);
-  }
-
-  /**
-   * 解码懒加载桶中的一个槽位；槽位为空、偏移非法或条目损坏（长度非法、XXHash 校验失败等）都只丢该槽位。
-   *
-   * <p>不复用整桶的槽位数组，因此每次读取只分配「被请求的那一条负载」（旧布局一桶 64 槽，最多 64 条）。
-   */
-  private BufferedLinearV3Format.Entry decodeLazySlot(LazyBucket lazy, int slot) {
-    int offset = lazy.offsets[slot];
-    if (offset < 0) {
-      return null;
-    }
-    try {
-      return BufferedLinearV3Format.decodeEntry(lazy.raw, offset, lazy.lengths[slot], hashSeed);
-    } catch (IOException | RuntimeException exception) {
-      // 单槽损坏：只丢该槽位（与整桶解码时「单槽损坏只丢该槽位」口径一致）
-      return null;
-    }
-  }
-
-  /** 把懒加载桶整体解码为槽位数组（写 / 压缩回收需要整桶时调用）。 */
-  private BufferedLinearV3Format.Entry[] decodeLazyBucket(LazyBucket lazy) {
-    BufferedLinearV3Format.Entry[] bucketSlots =
-        new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
-    for (int slot = 0; slot < bucketSlots.length; slot++) {
-      bucketSlots[slot] = decodeLazySlot(lazy, slot);
-    }
-    return bucketSlots;
-  }
-
-  /** 读取一个大端 i32（与 {@link BufferedLinearV3Format} 内部的长度前缀编码同字节序）。 */
-  private static int readIntAt(byte[] raw, int offset) {
-    return (raw[offset] & 0xFF) << 24
-        | (raw[offset + 1] & 0xFF) << 16
-        | (raw[offset + 2] & 0xFF) << 8
-        | (raw[offset + 3] & 0xFF);
+    return ensureLoaded(bucket)[slot];
   }
 
   // ------------------------------------------------------------------ 写
@@ -772,26 +596,17 @@ final class RegionFile implements AutoCloseable {
   /**
    * 清空一个区块的条目（惰性清理过期/旧代次条目时使用）。
    *
-   * <p><b>三种桶状态</b>：
-   * <ul>
-   *   <li>已整桶解码（{@code slots[bucket] != null}）→ 直接就地清空槽位并置 {@code dirty}（轻量）；</li>
-   *   <li>懒加载过（{@link #readSlot} 只物化了 {@code lazyBuckets}）→ <b>先物化整桶再清</b>
-   *       <i>（当前布局 {@code BUCKET_SIZE==1} 下读命中已直接物化，本分支不再出现；仅多槽位布局可达）</i>。物化只
-   *       解已在内存的 {@code lazy.raw}（<b>无磁盘 IO</b>），且只在「确实要删」这条罕见路径发生
-   *       （条目过期 / 换配置）；若不物化，陈旧条目会滞留并在此后<b>每次读取都重复单槽解码</b>
-   *       （直到 put 覆盖或维护压缩），且 clear 必须返回 {@code true} 才能让调用方的条目计数
-   *       正确扣减（{@code DiskCacheStore#removeEntry}），否则磁盘与计数会背离。清完置 dirty，
-   *       下次 {@link #flushDirty} 把该桶从磁盘真正删除；</li>
-   *   <li>从未加载 → 返回 {@code false}（<b>绝不为清一个槽位把整桶从磁盘解码</b>，见
-   *       {@code RegionFileHardeningTest#clearOnUnloadedBucketDoesNotForceDecode}）。</li>
-   * </ul>
+   * <p>桶已解码则就地清空并置 {@code dirty}，下次 {@link #flushDirty} 真正删除；<b>从未加载则返回
+   * {@code false}</b>——绝不为清一个槽位把整桶从磁盘解码（见
+   * {@code RegionFileHardeningTest#clearOnUnloadedBucketDoesNotForceDecode}）。清不掉时调用方的条目计数
+   * 也不扣，磁盘与计数保持一致。
    */
   boolean clear(int chunkIndex) {
     if (lockUnavailable) {
       return false; // 该文件归其它进程所有：跳过（不落盘、不报错）
     }
     if (compacting) {
-      // 与其它入口同一纪律：压缩期间不触碰 slots/loaded。本方法要读 slots/lazyBuckets、可能物化整桶，
+      // 与其它入口同一纪律：压缩期间不触碰 slots/loaded。本方法要读 slots、可能整桶载入，
       // 还要用 loaded.get 改 LRU 顺序，而压缩线程正在整体重建这两者；此时清一个槽位，压缩线程随后
       // 用自己那份快照重建 slots，刚清掉的条目又回来了，甚至把 slots 覆盖成空桶。
       // 返回 false 表示「本次没清掉」：调用方的条目计数因此不扣（与「没清」一致），陈旧条目留到压缩
@@ -801,15 +616,7 @@ final class RegionFile implements AutoCloseable {
     int bucket = bucketIndex(chunkIndex);
     BufferedLinearV3Format.Entry[] bucketSlots = slots[bucket];
     if (bucketSlots == null) {
-      if (lazyBuckets[bucket] == null) {
-        return false; // 从未加载：不为它解码（磁盘 IO 一律不发生），交给维护期回收
-      }
-      // 懒加载桶：物化（仅内存解码，无磁盘 IO）后走正常清除，使 dirty 能真正落盘删掉陈旧条目
-      ensureLoaded(bucket);
-      bucketSlots = slots[bucket];
-      if (bucketSlots == null) {
-        return false; // 物化失败（防御性）：按未清除处理，计数不扣
-      }
+      return false; // 从未加载：不为它解码（磁盘 IO 一律不发生），交给维护期回收
     }
     loaded.get(bucket); // 与 ensureLoaded 一致地标记为最近使用，保持 LRU 语义
     int slot = slotInBucket(chunkIndex);
@@ -1090,8 +897,6 @@ final class RegionFile implements AutoCloseable {
   private void slotsLoad(BufferedLinearV3Format.Entry[][] all) {
     for (int bucket = 0; bucket < all.length; bucket++) {
       slots[bucket] = all[bucket];
-      // 整桶已解码，懒加载表示不再需要（两者互斥，见 LazyBucket 说明）
-      lazyBuckets[bucket] = null;
       loaded.put(bucket, Boolean.FALSE);
     }
   }
@@ -1303,10 +1108,6 @@ final class RegionFile implements AutoCloseable {
     if (slots[bucket] != null) {
       return 0L;
     }
-    LazyBucket lazy = lazyBuckets[bucket];
-    if (lazy != null) {
-      return lazy.raw.length;
-    }
     if (positions[bucket] <= 0L) {
       return 0L;
     }
@@ -1339,38 +1140,27 @@ final class RegionFile implements AutoCloseable {
       return bucketSlots;
     }
 
-    // 读路径懒加载过的桶：需要整桶（写 / 压缩回收）时在此一次性解码，避免两套表示长期并存
-    LazyBucket lazy = lazyBuckets[bucket];
-    if (lazy != null) {
-      lazyBuckets[bucket] = null;
-      if (compactRawBudget != null) {
-        // 该桶的原始字节已由懒加载解压并常驻内存：计入压缩总量闸，避免内存尖峰被漏算
-        compactRawBudget[0] += lazy.raw.length;
-      }
-      bucketSlots = decodeLazyBucket(lazy);
-    } else {
-      bucketSlots = new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
-      if (positions[bucket] > 0L) {
-        try {
-          byte[] lengths = readAt(channel, positions[bucket], 8);
-          ByteBuffer buffer = ByteBuffer.wrap(lengths);
-          int rawLength = buffer.getInt();
-          int compressedLength = buffer.getInt();
-          if (rawLength > 0 && compressedLength > 0
-              && positions[bucket] + 8L + compressedLength <= fileSize
-              && rawLengthWithinFileBudget(rawLength)) {
-            if (compactRawBudget != null) {
-              // 只在「确实要按 rawLength 分配解压缓冲」时才计入，避免把已内存驻留的桶重复计数
-              compactRawBudget[0] += rawLength;
-            }
-            byte[] compressed = readAt(channel, positions[bucket] + 8L, compressedLength);
-            bucketSlots = BufferedLinearV3Format.decodeBucket(
-                BufferedLinearV3Format.decompress(compressed, rawLength, compression), hashSeed);
+    bucketSlots = new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
+    if (positions[bucket] > 0L) {
+      try {
+        byte[] lengths = readAt(channel, positions[bucket], 8);
+        ByteBuffer buffer = ByteBuffer.wrap(lengths);
+        int rawLength = buffer.getInt();
+        int compressedLength = buffer.getInt();
+        if (rawLength > 0 && compressedLength > 0
+            && positions[bucket] + 8L + compressedLength <= fileSize
+            && rawLengthWithinFileBudget(rawLength)) {
+          if (compactRawBudget != null) {
+            // 只在「确实要按 rawLength 分配解压缓冲」时才计入（已常驻内存的桶不会走到这里）
+            compactRawBudget[0] += rawLength;
           }
-        } catch (IOException | RuntimeException exception) {
-          // 结构损坏：整个 bucket 视为空（fail-open，绝不因此影响封包链路）
-          bucketSlots = new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
+          byte[] compressed = readAt(channel, positions[bucket] + 8L, compressedLength);
+          bucketSlots = BufferedLinearV3Format.decodeBucket(
+              BufferedLinearV3Format.decompress(compressed, rawLength, compression), hashSeed);
         }
+      } catch (IOException | RuntimeException exception) {
+        // 结构损坏：整个 bucket 视为空（fail-open，绝不因此影响封包链路）
+        bucketSlots = new BufferedLinearV3Format.Entry[BufferedLinearV3Format.BUCKET_SIZE];
       }
     }
 
@@ -1464,7 +1254,6 @@ final class RegionFile implements AutoCloseable {
       // 先确认能安全移除再移除，保证不变式：桶要么在 loaded 记账内，要么 slots 已释放。
       loaded.remove(victim);
       slots[victim] = null;
-      lazyBuckets[victim] = null;
     }
   }
 
@@ -1478,7 +1267,7 @@ final class RegionFile implements AutoCloseable {
    */
   private int selectEvictableVictim(int pinned) {
     // 第一趟：优先选「干净」的牺牲桶——驱逐它不需要任何磁盘 IO。
-    // 为什么必须先找干净的：本方法也会被<b>读路径</b>调用（懒加载新桶时的 LRU 驱逐），而下面那条
+    // 为什么必须先找干净的：本方法也会被<b>读路径</b>调用（载入新桶时的 LRU 驱逐），而下面那条
     // 「脏桶先落盘再驱逐」的路径会同步执行 flushBucket（encodeBucket + zstd 压缩 + append 写）
     // 与 writePosTable——一次区块读取就可能内联一次桶压缩与磁盘写，足以击穿 50 ms 读预算
     // （超时即记未命中 → 上层回退整块重写，命中率下降）。先挑干净的即可在绝大多数情况下完全避开它。

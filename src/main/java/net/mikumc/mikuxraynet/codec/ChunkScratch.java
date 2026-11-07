@@ -26,8 +26,8 @@ import java.util.Arrays;
  */
 public final class ChunkScratch {
 
-  /** 每线程空闲池上限：正常串行处理时只需 1 个，留 2 个只作为嵌套解码（同线程同时开两个 Chunk）的余量。 */
-  private static final int MAX_IDLE_PER_THREAD = 2;
+  /** 每线程空闲池上限：同线程同一时刻只有一个 {@link Chunk} 在解码/重编码，留 1 个即可。 */
+  private static final int MAX_IDLE_PER_THREAD = 1;
 
   /**
    * 输出缓冲区容量的绝对上限（字节）。合法区块的未压缩负载远小于此值（典型几百 KB 到几 MB），

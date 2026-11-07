@@ -2,7 +2,6 @@ package net.mikumc.mikuxraynet.config;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import org.bukkit.configuration.ConfigurationSection;
@@ -44,13 +43,6 @@ public final class WorldBlacklistConfig {
   private final List<String> exact;
   /** 通配匹配器（启动期预编译，热路径不做正则编译）。 */
   private final List<Pattern> globs;
-  /**
-   * 名单的内容哈希（跨进程稳定：字符串列表有规范 hashCode，顺序敏感）。
-   *
-   * <p><b>不参与磁盘缓存指纹</b>：黑名单世界的区块根本不会被改写、也就不会写入缓存，因此名单变化
-   * 天然不影响任何缓存条目的有效性。该值仅供诊断/测试核对「名单是否与上一份相同」。
-   */
-  private final int configHash;
 
   /**
    * 匹配结果缓存的上界（条目数）：世界数量天然有限（几十个量级），设上限只为拦住「异常输入 / 插件动态
@@ -82,8 +74,6 @@ public final class WorldBlacklistConfig {
     }
     this.exact = List.copyOf(exactNames);
     this.globs = List.copyOf(globPatterns);
-    // 指纹只由名单本身决定（跨进程稳定：字符串列表有规范 hashCode）；顺序敏感，故用有序列表。
-    this.configHash = Objects.hash(this.patterns);
   }
 
   /** 解析 {@code world-blacklist} 段（缺段 = 空名单）。 */
@@ -186,10 +176,5 @@ public final class WorldBlacklistConfig {
   /** 原始模式列表（声明序）；供启动日志与诊断回显。 */
   public List<String> patterns() {
     return patterns;
-  }
-
-  /** 参与磁盘缓存指纹的取值（名单变化 → 相关世界旧缓存一次性失效重建）。 */
-  public int configHash() {
-    return configHash;
   }
 }

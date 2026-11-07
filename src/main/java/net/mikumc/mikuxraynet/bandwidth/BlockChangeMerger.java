@@ -44,9 +44,9 @@ import org.bukkit.plugin.Plugin;
  * 方块变更合并：把同一玩家在短时间窗内的多条 {@code BLOCK_CHANGE} / {@code MULTI_BLOCK_CHANGE}
  * 按配置 {@code block-changes.merge-radius}（默认 2）的曼哈顿邻域聚簇，并按 section 分组重建成更少的合并包。
  *
- * <p><b>同步监听无法延迟放行</b>，因此走 ProtocolLib 异步通道：
- * {@code incrementProcessingDelay()} 登记延迟 → 变更入有界缓冲 → 时间窗到期（或条目超限）时冲刷 →
- * 合并包通过 {@link ProtocolManager#sendServerPacket}（Netty 安全）发出，原包被取消。
+ * <p><b>同步监听 + 取消原包</b>：命中合并窗口的变更<b>先入有界缓冲、随即取消原包</b>（两步在同一把锁内完成，
+ * 不存在「已取消却没进缓冲」的丢更新）→ 时间窗到期（或条目超限）时冲刷 → 合并包经
+ * {@link ProtocolManager#sendServerPacket}（Netty 安全）发出；构包/发送失败则按 section 逐条补发原更新。
  *
  * <p><b>近身变更立即放行</b>：距离玩家 {@code block-changes.immediate-radius}（默认 8 格）以内的
  * 方块变更<b>不进合并窗口</b>，原包立即放行——玩家自己挖/放方块时目标就在脚边，被窗口延迟会让
@@ -55,19 +55,17 @@ import org.bukkit.plugin.Plugin;
  * 封包线程不触碰实体状态，且刷新跟随实体/区域归属，因此传送等任何位置变化都会在一个 tick 内生效
  * （旧实现依赖 {@code PlayerMoveEvent}，而传送有独立 HandlerList，会按陈旧坐标判错）。
  *
- * <p><b>fail-open</b>：读不出字段、构造失败、玩家离线 —— 一律原样放行原包，绝不丢更新。
- * 原包放行通过 {@link AsyncMarker} 的 {@code signalPacketTransmission} 完成，并用一次性闸保证
- * 「恰好放行一次」。位置快照不可用（尚未建立 / 刷新或读取异常）时同样 fail-open：近身判定按
- * 「立即放行」处理，宁可少合并、绝不制造延迟。
+ * <p><b>fail-open</b>：读不出字段、构包失败、定时器排不上、玩家离线 —— 一律原样放行原包，绝不丢更新；
+ * 只有「已确认写入缓冲」的包才会被取消。位置快照不可用（尚未建立 / 刷新或读取异常）时同样 fail-open：
+ * 近身判定按「立即放行」处理，宁可少合并、绝不制造延迟。
  *
- * <p><b>fail-open 的唯一例外</b>：合并包构造/发送失败时，对「携带的坐标已全部经立即放行先行下发」
- * 的原包会予以取消（见 {@link #flush} 的 last-write-wins 分支）——此时这些坐标的新态已交付，取消旧态
- * 原包不构成丢更新，反而避免旧态晚到覆盖新态（方块回退）；未全部先行下发的原包仍照常放行。
+ * <p><b>last-write-wins</b>：窗口内已经由「立即放行」路径下发过新状态的坐标，会在冲刷时从合并结果里
+ * 剔除（见 {@link #dropPassed}）——旧态晚到会把先到的新态覆盖回去（方块回退）。剔除后没有剩余坐标时
+ * 直接不发包。
  *
  * <p><b>结构自检是「每次发送」而非「首包」</b>：{@code sendSection} 每次构造完合并包都会回读刚写入的
- * 字段做结构校验（单条与多条的路径都做）。校验通过会置 {@code verified}；在第一次成功发送之前
- * （{@code verified} 仍为 false）合并包照发，但<em>同时</em>保留原包（重复下发相同方块状态是无害的
- * 幂等操作），此后才开始取消原包。
+ * 字段做结构校验（单条与多条的路径都做）。校验不过即放弃本次合并结果、按 section 逐条补发原更新——
+ * 原包此时已被取消，退化成逐条补发是唯一能保证「不丢更新」的做法。
  *
  * <p><b>已聚合的批量包直接放行</b>：{@code MULTI_BLOCK_CHANGE} 若携带的坐标数达到
  * {@link #MULTI_BLOCK_BATCH_THRESHOLD}，视为「本已是一次批量下发」（反矿透的邻近显形正是
@@ -79,7 +77,7 @@ import org.bukkit.plugin.Plugin;
  * 同坐标的旧态会在窗口到期时把本包刚下发的新态覆盖回去（方块回退）。
  *
  * <p><b>last-write-wins 的微秒级残余窗口（已接受，勿当 bug 修）</b>：{@code passed} 集合是在
- * 持锁的临界区里「读取 + 剔除旧态」的，但把合并包发到客户端、以及取消原包，都发生在<b>释放锁之后</b>。
+ * 持锁的临界区里「读取 + 剔除旧态」的，但把合并包发到客户端发生在<b>释放锁之后</b>。
  * 因此「本窗口内某坐标经立即放行先行下发」与「合并包真正抵达客户端」之间存在一个微秒级窗口：
  * 若该坐标恰在此窗口内又发生一次新的变更，客户端理论上可能在极短时间内看到「新→旧→新」的抖动。
  * 后果仅为<b>一帧级</b>的方块观感抖动，不丢更新、不影响判定，且窗口宽度远小于客户端一帧；
@@ -613,13 +611,10 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   }
 
   /**
-   * 延迟登记与放行：<b>先入 held 缓冲、再登记延迟</b>。
+   * 合并窗口的主判定：命中窗口的变更<b>先入缓冲、再取消原包</b>（两步在同一把锁内）。
    *
-   * <p>顺序不能颠倒：{@code flush()} 的兜底只遍历 {@code target.held} 来放行原包，若先
-   * {@code incrementProcessingDelay()} 却没能把条目放进 {@code held}（登记后构造/入队抛异常），
-   * 该包就永远等不到放行（永久卡包）。把 {@code held.add} 提到登记之前后，两者都在
-   * {@code synchronized(target)} 内、且 {@code flush()} 持同一把锁，因此顺序调整不产生竞态；
-   * 登记/调度整段再包 {@code try/catch}，异常时撤销条目并放行原包，保证「恰好放行一次」。
+   * <p>顺序不能颠倒：先取消后入缓冲，中间一旦抛异常这条变更就既没进缓冲也没下发（永久丢更新）。
+   * 入缓冲失败或窗口定时器排不上时退回「原样放行」，绝不取消原包。
    */
   @Override
   public void onPacketSending(PacketEvent event) {
@@ -878,11 +873,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * {@code false} = 无实包可处理（CAS 已被并发抢占，或缓冲为空——后者只做摘除 Pending 与取消
    * 定时器的清理，不该算作一次「冲刷」）。
    *
-   * <p><b>为什么整个主体都在 try/finally 内</b>：CAS 一旦成功（写入权归本线程）且已从 pending 摘除，
-   * 后续任何步骤（拷贝 held、{@code drainClusters}、取定时器、构包发送）抛异常都会让这些原包
-   * <b>永久无人放行</b>——因为后续所有 {@code flush}（含 {@code stop()} 的 flushAll）都会因 CAS 失败
-   * 变成 no-op，而异常还会被调度执行器静默吞掉（无日志）。把 held 先置为空列表、让 finally 无条件
-   * 遍历放行，即可保证「取得写入权 ⇒ 恰好放行一次」这一不变量在任何路径（含 Error）下都成立。
+   * <p>CAS 成功后写入权归本线程、且已从 pending 摘除，后续所有 {@code flush}（含 {@code stop()} 的
+   * flushAll）都会因 CAS 失败变成空转，因此本方法必须把「已取消的包一定交付」这条兜在自己身上：
+   * 构包/发送失败由 {@link #deliver} 逐条补发同一批更新（幂等），异常只记限流日志。
    */
   private boolean flushInternal(Pending target) {
     List<List<Update<WrappedBlockData>>> clusters = List.of();
@@ -988,35 +981,6 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     return survivors;
   }
 
-  /** 把一批更新折算为坐标清单（供 {@link #allCoordsPassed} 判定原包携带的坐标是否已全部先行下发）。 */
-  private static List<Coord> coordsOf(List<Update<WrappedBlockData>> updates) {
-    List<Coord> coords = new ArrayList<>(updates.size());
-    for (Update<WrappedBlockData> update : updates) {
-      coords.add(new Coord(update.x(), update.y(), update.z()));
-    }
-    return coords;
-  }
-
-  /**
-   * fail-open 放行时：一个原包携带的坐标是否<b>全部</b>已经由「立即放行」路径先行下发。
-   *
-   * <p>是则应取消该原包——其旧状态晚到会把先到的新状态覆盖回去（方块回退）；不是则必须照常放行，
-   * 否则会丢掉未放行坐标的更新。空清单按「不可取消」处理（保守放行）。
-   *
-   * <p>包可见：供离线单测直接驱动该纯逻辑（真实链路依赖 ProtocolLib 封包，离线不可用）。
-   */
-  static boolean allCoordsPassed(List<Coord> coords, Set<Coord> passed) {
-    if (coords.isEmpty()) {
-      return false;
-    }
-    for (Coord coord : coords) {
-      if (!passed.contains(coord)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
 
   private void flushAll() {
     for (Pending target : new ArrayList<>(pending.values())) {
@@ -1098,8 +1062,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         // 与协议一致：section 内相对坐标打包为 (x & 15) << 8 | (z & 15) << 4 | (y & 15)
         positions[i] = (short) (((update.x() & 15) << 8) | ((update.z() & 15) << 4) | (update.y() & 15));
       }
+      BlockPosition expectedSection = new BlockPosition(section.x(), section.y(), section.z());
       packet = new PacketContainer(PacketType.Play.Server.MULTI_BLOCK_CHANGE);
-      packet.getSectionPositions().writeSafely(0, new BlockPosition(section.x(), section.y(), section.z()));
+      packet.getSectionPositions().writeSafely(0, expectedSection);
       packet.getBlockDataArrays().writeSafely(0, data);
       packet.getShortArrays().writeSafely(0, positions);
       // trustEdges 不写：编译期 ProtocolLib（5.3.0）未为本包提供该字段的类型化访问器
@@ -1108,10 +1073,13 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       // 以免在字段布局不同的服务端上写错字段）。合并包由本模块自行构造，未设置该布尔时沿用默认值，
       // 语义为「不信任边缘」，安全侧成立。
 
-      // 回读自检：字段必须真实存在且条目数与写入一致，否则视为结构不可用（fail-open）
+      // 回读自检：字段必须真实存在、section 位置正确、条目数与写入一致，否则视为结构不可用（fail-open）。
+      // 位置也必须比对：映射失效时若只有位置写丢，所有坐标会落到默认 section (0,0,0)，而原包已被取消。
       short[] readPositions = packet.getShortArrays().readSafely(0);
       WrappedBlockData[] readData = packet.getBlockDataArrays().readSafely(0);
-      if (readPositions == null || readData == null
+      BlockPosition readSection = packet.getSectionPositions().readSafely(0);
+      if (readPositions == null || readData == null || readSection == null
+          || !readSection.equals(expectedSection)
           || readPositions.length != positions.length || readData.length != data.length) {
         return false;
       }

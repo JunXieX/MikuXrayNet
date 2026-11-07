@@ -177,19 +177,13 @@ class RegionFileHardeningTest {
   }
 
   /**
-   * <b>本轮修复回归</b>：懒加载桶上的 {@code clear} 必须物化后真正清除并返回 {@code true}。
+   * 已载入桶上的 {@code clear} 必须就地清除并返回 {@code true}，且 {@code dirty} 置位后落盘真正删掉该条记录。
    *
-   * <p>修复前：{@code readSlot} 只建 {@code lazyBuckets} 而不填 {@code slots}，{@code clear} 见
-   * {@code slots[bucket] == null} 恒返回 {@code false} → 陈旧条目（过期 / 换配置）既清不掉、
-   * 调用方 {@code DiskCacheStore#removeEntry} 也因 false 不扣计数，且此后<b>每次读取都重复单槽解码</b>
-   * （直到 put 覆盖或维护压缩）。物化只解已在内存的 raw（无磁盘 IO），且 dirty 置位后落盘真删。
-   *
-   * <p>注：当前布局（{@code BUCKET_SHIFT=0}）下读命中已改为<b>直接物化</b>（懒加载在该布局下零收益且
-   * 会让解压记录与 payload 双份常驻，见 {@code RegionFile#readSlot}），因此本用例现在走的是「已物化」
-   * 路径；它仍然有效——若将来布局恢复为「一桶多槽」，懒路径会重新启用，本用例继续守同一语义。
+   * <p>未载入的桶必须返回 {@code false}（不为清一个槽位把整桶从磁盘解码）——调用方据此不扣条目计数，
+   * 磁盘与计数保持一致。
    */
   @Test
-  void clearOnLazyLoadedBucketMaterializesAndRemovesSlot(@TempDir Path dir) throws Exception {
+  void clearOnLoadedBucketRemovesSlot(@TempDir Path dir) throws Exception {
     Path file = dir.resolve("r.0.0.b_linear");
 
     RegionFile writer = RegionFile.open(file, 2);
@@ -204,10 +198,9 @@ class RegionFileHardeningTest {
     RegionFile reader = RegionFile.open(file, 2);
     try {
       assertTrue(loadedOf(reader).isEmpty(), "前置：新实例不应预加载任何桶");
-      assertNotNull(reader.get(chunkIndexForBucket(0)),
-          "前置：先读一次，让桶进入懒加载态（只物化槽位表）");
+      assertNotNull(reader.get(chunkIndexForBucket(0)), "前置：先读一次，让桶载入内存");
       assertTrue(reader.clear(chunkIndexForBucket(0)),
-          "懒桶上的 clear 必须物化后就地清除并返回 true（修复前恒 false → 陈旧条目滞留）");
+          "已载入桶上的 clear 必须就地清除并返回 true");
       assertNull(reader.get(chunkIndexForBucket(0)), "已清除的条目不得再被读出");
       assertNotNull(reader.get(chunkIndexForBucket(1)),
           "对照条目必须不受影响（清理不得误伤别的记录）");

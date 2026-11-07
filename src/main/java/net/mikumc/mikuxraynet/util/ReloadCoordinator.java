@@ -123,6 +123,7 @@ public final class ReloadCoordinator {
       "AFK 降级（判定时长/丢弃距离/包类型）",
       "高延迟降视距（阈值/幅度/下限/巡检周期）",
       "带宽全部子模块（零位移/变更合并/实体剔除）",
+      "方块实体剔除开关（remove-block-entities，改写缓存指纹随之变化）",
       // 异步遮挡的调优键随「停旧管线、建新管线」即时生效（新管线会按新配置重建引擎与线程池）。
       // 注意「开关本身」不在此列，见 RESTART_REQUIRED。
       "实体剔除异步遮挡调优（occlusion-time-budget-ms / occlusion-threads / max-occluding-blocks / "
@@ -139,7 +140,7 @@ public final class ReloadCoordinator {
   /** 需要重启服务端才生效的配置项（在启动期已固化的部分）。 */
   public static final List<String> RESTART_REQUIRED = List.of(
       "隐藏方块表与伪装权重",
-      "层状混淆 / 方块实体剔除开关",
+      "层状混淆（layer-obfuscation）",
       // 只有「关闭」是热生效的（见 APPLIED）：启动时 neighbors.enabled=false 时提供者为 null，
       // 本进程内不再抓取；missing-policy 与 cache-maximum-size 在启动期固化进 NeighborChunkProvider。
       "邻块快照启用 / 缺失策略 / 容量（neighbors.enabled 启动时为 false 则本进程内不再抓取；"
@@ -160,7 +161,10 @@ public final class ReloadCoordinator {
       "遮挡规则表（occlusion.extra-occluding / extra-non-occluding）",
       // ObscuredChunkIndex / RevealedSet 的容量与过期在启动期固化进实例；restartProximity 只在
       // 实例为 null 时新建（否则会丢已下发假矿），故这三键改了必须重启，不能回显成「已热生效」。
-      "邻近显形安全阀与过期（proximity.max-positions / max-positions-per-player / expire-seconds）");
+      "邻近显形安全阀与过期（proximity.max-positions / max-positions-per-player / expire-seconds）",
+      // 核心装配（ProtocolLib 通道、工作池、磁盘缓存、编码器）只在 onEnable 跑一次。启动时
+      // antixray.enabled=false 或装配失败后，reload 只重启显形/带宽任务，不会重新装配改写链路。
+      "反矿透核心装配（启动时 antixray.enabled=false 或装配失败时，需重启才启用改写）");
 
   /**
    * 执行一次热重载。

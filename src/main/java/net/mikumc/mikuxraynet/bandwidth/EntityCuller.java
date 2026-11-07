@@ -914,11 +914,13 @@ public final class EntityCuller implements Listener {
       return;
     }
     UUID playerId = player.getUniqueId();
+    // 玩家当前世界名：黑名单判定与「跨世界条目跳过」共用这一次读取
+    String playerWorld = player.getWorld().getName();
 
     // 世界黑名单：命中世界不做任何带宽优化。玩家此刻就在黑名单世界时，恢复其全部<b>本区域</b>已隐藏
     // 实体（避免从普通世界走进来时残留隐藏；跨区域条目保留在账本里，见 restorePlayer），直接返回；
     // 不再开周期预算、不再提交任何判定。
-    if (WorldBlacklistConfig.isBlacklistedNow(player.getWorld().getName())) {
+    if (WorldBlacklistConfig.isBlacklistedNow(playerWorld)) {
       restorePlayer(player);
       return;
     }
@@ -966,6 +968,13 @@ public final class EntityCuller implements Listener {
             stale = new ArrayList<>(4);
           }
           stale.add(entity);
+          continue;
+        }
+        // 跨世界：玩家已离开该实体所在世界（传送门 / 跨服 /tp），账本条目仍在。
+        // 此时玩家与实体坐标属于不同坐标系，距离与视锥都没有意义（且玩家根本看不到它），
+        // 因此跳过判定但<b>保留条目</b>——玩家回到该世界后恢复正常判定，条目随退出/停用清理。
+        // 按世界名比较（服务端保证唯一），与射线提交侧同一口径。
+        if (!playerWorld.equals(entity.getWorld().getName())) {
           continue;
         }
         // 计数口径不变：每条「本区域 + 有效」的已隐藏记录每周期都算一次复检提交
@@ -1217,6 +1226,12 @@ public final class EntityCuller implements Listener {
       double eyeY = view.eyeY;
       double eyeZ = view.eyeZ;
       String worldName = entity.getWorld().getName();
+      // 跨世界：玩家与实体已不在同一世界（传送门 / 跨服 /tp），两套坐标不可比、玩家也看不到它。
+      // 跳过判定并保留账本，玩家回到该世界后由复检恢复正常判定。用世界名比较而不是 World 实例，
+      // 语义就是「同不同一个世界」，也不需要在区域线程上触碰玩家所在区域的实体状态。
+      if (!worldName.equals(player.getWorld().getName())) {
+        return;
+      }
       BoundingBox box = view.box(entity);
       // 顶点直接写进「最多 ray-samples 个点」的一维数组：旧写法先建 double[][]（+ 最多 7 个内层数组）、
       // 再展平成第二个数组，每次提交 9 份短命分配。这里只有一份，且长度即提交长度。
@@ -1499,7 +1514,8 @@ public final class EntityCuller implements Listener {
    * <p>刻意不用 {@code Location#distanceSquared}：那会为玩家与实体各构造一个 {@code Location}，
    * 是每次评估的一笔固定分配，且它要求两侧都带世界，实体未加载时会直接抛异常。坐标 getter 在任何
    * 情况下都可用，失败方向也一致（判不出距离时按「近」处理 → 只 showIfHidden，绝不误藏）。
-   * 生产环境里被追踪的实体必与玩家同世界（追踪事件只对同世界实体触发），故无需再做世界比较。
+   * 本方法<b>刻意不做世界比较</b>：调用方负责保证两侧同世界（通道①已跳过异世界条目，
+   * 异步回投侧有「提交世界名 vs 当前世界名」守卫），在这里再比一次只是重复校验。
    */
   private boolean withinForceVisible(Player player, Entity entity) {
     double dx = player.getX() - entity.getX();

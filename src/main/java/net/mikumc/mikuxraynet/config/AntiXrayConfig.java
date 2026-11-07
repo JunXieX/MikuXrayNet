@@ -454,7 +454,7 @@ public final class AntiXrayConfig {
    * {@code disk-cache.max-file-size-mb}（单个区域文件大小上限）的安全上限。
    *
    * <p>压缩回收会把整个区域文件读进内存重写，单文件越大，这一瞬间的内存尖峰越高。
-   * 上限 1024 MB（1 GB）远超默认 16 MB 与正常调优范围，只为拦住手滑多打一位数。
+   * 上限 1024 MB（1 GB）远超默认 32 MB 与正常调优范围，只为拦住手滑多打一位数。
    */
   public static final int DISK_CACHE_MAX_FILE_SIZE_MB_MAX = 1024;
 
@@ -2038,9 +2038,7 @@ public final class AntiXrayConfig {
   /**
    * 写法无法识别、已按安全取值处理的明细（权重条目 / 高度键 / 布尔开关 / 枚举类开关；空列表 = 无）。
    *
-   * <p>唯一的生产消费点是 {@link #warnIfConfigAdjusted}（加载期一次性 WARN，内部直接读字段）；
-   * 本访问器本身只被单测使用，诊断 dump（{@code util/Diagnostics}）当前尚未输出它，需要时可在那里补一行
-   * （与 floorAdjustments / ceilingAdjustments 同口径）。
+   * <p>加载期一次性 WARN 与 {@code /mxnet dump} 都会输出本明细。
    *
    * @implNote 保留为 public 的原因：单测用它逐类断言「宽松解析是否真的留了痕」（权重四舍五入/被跳过、
    *     高度键回落、布尔与枚举键按默认值生效）。若把断言改为读日志会引入对日志格式的耦合，故保留访问器。

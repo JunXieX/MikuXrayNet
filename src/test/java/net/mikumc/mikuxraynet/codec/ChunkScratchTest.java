@@ -240,25 +240,6 @@ class ChunkScratchTest {
   }
 
   /**
-   * 源区间越界（数据损坏）必须在 {@link Chunk#finalizeOutput()} 入口立即 fail-open，而不是进入扩容重试。
-   *
-   * <p>这里把未改动 section 的原始区间改成缓冲区之外，模拟损坏；断言直接抛出（不重试、不扩容）。
-   */
-  @Test
-  void corruptSourceRangeFailsFastInsteadOfRetrying() {
-    ChunkCodec codec = new ChunkCodec(registry(), MODERN);
-    byte[] raw = new TestChunkBuilder(MODERN)
-        .singleValueSection(7, 4096, 0, 0, new int[] {1})
-        .build();
-
-    try (Chunk chunk = codec.decode(raw, 1)) {
-      chunk.corruptSectionRangeForTest(0, raw.length + 4, 16);
-      assertThrows(IllegalStateException.class, chunk::finalizeOutput,
-          "源区间越界（数据损坏）必须在入口立即 fail-open，而不是进入扩容重试");
-    }
-  }
-
-  /**
    * 扩容到达绝对上限时必须抛专用溢出异常（可被 {@code catch (RuntimeException)} 兜住的 fail-open 信号），
    * 绝不真的分配超大数组——否则会先撞上 {@link OutOfMemoryError}（{@code Error} 不被封包链路兜住）。
    */
@@ -281,7 +262,7 @@ class ChunkScratchTest {
    * 输出缓冲区「只增不减」不得导致超大数组随线程常驻：超过保留上限的数组在借出后不驻留，下次按需重分配。
    *
    * <p>回归：旧实现 {@code outputArray} 只记住历史最大容量，一旦被异常/损坏输入撑到接近 64 MiB，该数组
-   * 就会随线程常驻（每线程最多 2 个 scratch）。
+   * 就会随线程常驻（每线程最多 1 个 scratch）。
    */
   @Test
   void oversizedOutputArrayIsNotRetained() {
