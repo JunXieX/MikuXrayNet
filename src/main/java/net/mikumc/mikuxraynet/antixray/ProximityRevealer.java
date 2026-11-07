@@ -1839,6 +1839,11 @@ public final class ProximityRevealer implements Listener {
         if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
           continue;
         }
+        // 只还原「本来被这一次变更挡住」的坐标：身边本来就看得见的伪装方块交给周期巡检，
+        // 否则一次挖/放会同时改掉十几个方块的外观（真机观感：方块闪一下）。
+        if (!occludedBy(eye, cx, cy, cz, x, y, z)) {
+          continue;
+        }
         // 事件路径不预先算计划（见 revealImmediately 注释）：false = sendOne 在当前线程用遮挡位图判定
         sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
       }
@@ -1918,6 +1923,12 @@ public final class ProximityRevealer implements Listener {
           int y = cy + offsets[o][1];
           int z = cz + offsets[o][2];
           evaluationsLeft--;
+          // 只有被「当前这个变更格」挡住的候选才值得立即显形（见 occludedBy）。
+          // 刻意放在去重<b>之前</b>：没被这一格挡住的候选还要从同批的其它变更格再看一次，
+          // 若先占掉去重槽位，它就会因为「第一个变更格没挡住」而被永久跳过。
+          if (!occludedBy(eye, cx, cy, cz, x, y, z)) {
+            continue;
+          }
           // 去重必须放在昂贵判定之前：同一绝对坐标会从多个变更坐标的邻域反复到达，
           // 先做纯位运算去重，可省下重复的「索引查表 + 已显形集合加锁」。
           if (!evaluated.add(packCoordinate(x, y, z))) {
@@ -2308,6 +2319,11 @@ public final class ProximityRevealer implements Listener {
           if (!isInstantCandidate(playerId, worldName, x, y, z)) {
             continue;
           }
+          // 开掘预显形的本意是「挖开之后才看得见」的那几格：只有位于正在挖的方块<b>背后</b>
+          // （从眼睛看被它挡住）的候选才提前还原；与它并排、本来就看得见的坐标交给周期巡检。
+          if (!occludedBy(eye, bx, by, bz, x, y, z)) {
+            continue;
+          }
           sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
         }
       } finally {
@@ -2586,6 +2602,48 @@ public final class ProximityRevealer implements Listener {
   /** 曼哈顿距离 ≤ radius 即命中（含恰好等于；纯函数，供触发判定与单测复用）。 */
   static boolean withinManhattanRadius(int px, int py, int pz, int cx, int cy, int cz, int radius) {
     return Math.abs(px - cx) + Math.abs(py - cy) + Math.abs(pz - cz) <= radius;
+  }
+
+  /**
+   * 候选是否被「刚变更的那一格」遮挡过——只有本来被它挡住的坐标才值得在事件路径立即显形。
+   *
+   * <p><b>为什么需要这道闸</b>：立即显形原先只按「距离 + 可见」筛选，于是玩家挖开或放置一个方块时，
+   * 身边 {@code instant-reveal.radius} 格内<b>本来就看得见</b>的伪装方块也会被一起还原——一次动作最多
+   * {@code max-per-tick} 个方块同时换外观，真机观感就是「一挖/一放，周围的方块闪一下」。这些坐标本来就
+   * 该由周期巡检还原（最坏晚 0.8 秒），提前还原没有收益，只会制造可见的画面跳变。
+   *
+   * <p><b>判定方式</b>：用「变更格对眼睛张开的角度」做近似——眼睛→候选 与 眼睛→变更格 的夹角落在变更格
+   * 的角半径内、且候选更远，就认为它原本被那一格挡住。近似只会<b>漏判</b>（少显形，交给周期巡检兜底），
+   * 不会把「其实没被挡住」的坐标判成被挡住，因此安全方向是「少闪、不误导」。
+   *
+   * @param eye 玩家眼位；{@code null}（射线判定关闭、拿不到眼位）时返回 {@code true}，保持旧行为
+   * @return 该候选是否原本被变更格遮挡
+   */
+  static boolean occludedBy(ProximitySelector.Eye eye, int changeX, int changeY, int changeZ,
+      int x, int y, int z) {
+    if (eye == null) {
+      return true;
+    }
+    double ax = changeX + 0.5D - eye.x();
+    double ay = changeY + 0.5D - eye.y();
+    double az = changeZ + 0.5D - eye.z();
+    double bx = x + 0.5D - eye.x();
+    double by = y + 0.5D - eye.y();
+    double bz = z + 0.5D - eye.z();
+    double la = Math.sqrt(ax * ax + ay * ay + az * az);
+    double lb = Math.sqrt(bx * bx + by * by + bz * bz);
+    if (la < 1.0E-6D || lb < 1.0E-6D) {
+      // 眼位就在变更格或候选格内（例如在脚下挖）：张角判定无意义，按「被挡住」处理（保持既有行为）
+      return true;
+    }
+    if (lb <= la + 0.5D) {
+      // 候选不比变更格更远：它不可能被那一格挡住
+      return false;
+    }
+    double cos = (ax * bx + ay * by + az * bz) / (la * lb);
+    // 变更格是 1×1×1 的立方体：角半径取 atan(0.5 / 距离)，再加 0.02 弧度容差吸收采样误差。
+    double halfAngle = Math.atan(0.5D / Math.max(la, 0.5D)) + 0.02D;
+    return cos >= Math.cos(halfAngle);
   }
 
   /** 曼哈顿半径偏移表的缓存（键为钳制后的半径；表只建一次，热路径零分配）。 */

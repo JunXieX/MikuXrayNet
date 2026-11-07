@@ -404,6 +404,29 @@ class InstantRevealTest {
   }
 
   /**
+   * <b>「只还原被挖开那一格挡住的坐标」</b>：立即显形的几何闸门（真机反馈「挖/放方块时方块闪一下」）。
+   *
+   * <p>原先立即显形只按「距离 + 可见」筛选，于是一次挖/放会把身边 4 格内<b>本来就看得见</b>的伪装方块
+   * 也一起还原（一次最多 16 个同时换外观）。{@link ProximityRevealer#occludedBy} 用「变更格对眼睛张开的
+   * 角度」判断候选是否原本被它挡住：只有正后方的坐标才允许提前显形，其余交给周期巡检。
+   */
+  @Test
+  void occlusionGateOnlyAllowsCandidatesBehindTheChangedBlock() {
+    // 眼位在主视高度、朝 +Z；变更格在 (0,64,3)
+    ProximitySelector.Eye eye = ProximitySelector.eye(0.5D, 65.62D, 0.5D, 0.0D, 0.0D, 1.0D);
+    assertTrue(ProximityRevealer.occludedBy(eye, 0, 64, 3, 0, 64, 5),
+        "正后方（更远、同一视线上）的候选必须判为被挡住");
+    assertFalse(ProximityRevealer.occludedBy(eye, 0, 64, 3, 3, 64, 5),
+        "侧后方的候选本来就看得见，不得判为被挡住（否则又会一片闪）");
+    assertFalse(ProximityRevealer.occludedBy(eye, 0, 64, 3, 0, 65, 3),
+        "变更格正上方的候选不在视线上，不得判为被挡住");
+    assertFalse(ProximityRevealer.occludedBy(eye, 0, 64, 3, 0, 64, 1),
+        "比变更格更近的候选不可能被它挡住");
+    assertTrue(ProximityRevealer.occludedBy(null, 0, 64, 3, 3, 64, 5),
+        "拿不到眼位（射线判定关闭）时保持旧行为：不因闸门而漏显形");
+  }
+
+  /**
    * <b>重算：真实评估循环必须评估全部候选</b>（第 10 轮 P2 补测）。
    *
    * <p>为什么必须驱动真实方法：{@link #revealCeilingIsCandidateWindowAndNeverTruncatesConfiguredValueBelowIt}
