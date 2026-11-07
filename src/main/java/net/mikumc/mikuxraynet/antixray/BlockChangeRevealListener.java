@@ -63,6 +63,15 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * {@code null} 表示不启用（只做索引注销，行为与旧版一致）。
    */
   private final ProximityRevealer instantRevealer;
+  /**
+   * 最近方块变更日志（可为 {@code null}）：区块包在途期间被改过的格子由它记录，放行后补发。
+   *
+   * <p>只记**真实**变更（回显已在 {@link #unregisterCoordinate} 剔除）：回显不改变服务端内容，记进去只会
+   * 让放行后多补发一次同样的状态。
+   */
+  private final ChunkChangeJournal changeJournal;
+  /** 单个多方块变更包最多记多少条（超出只少补发几格，不影响正确性）。 */
+  private static final int MAX_JOURNAL_RECORDS_PER_PACKET = 64;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
   private volatile AsyncListenerHandler handler;
@@ -93,6 +102,27 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     this.revealedSet = revealedSet;
     this.stats = stats;
     this.instantRevealer = instantRevealer;
+    this.changeJournal = null;
+  }
+
+  /**
+   * 完整构造（含方块变更日志）。
+   *
+   * @param changeJournal 区块包在途期间被改过的格子靠它补发（见 {@link ChunkChangeJournal}）；
+   *                      {@code null} 表示不记录（未接入改写链路时无意义）
+   */
+  public BlockChangeRevealListener(Plugin plugin, ProtocolManager protocolManager,
+      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet,
+      ProximityStats stats, ProximityRevealer instantRevealer, ChunkChangeJournal changeJournal) {
+    super(plugin, ListenerPriority.HIGHEST, PacketType.Play.Server.BLOCK_CHANGE,
+        PacketType.Play.Server.MULTI_BLOCK_CHANGE);
+    this.plugin = plugin;
+    this.protocolManager = protocolManager;
+    this.obfuscatedChunkIndex = obfuscatedChunkIndex;
+    this.revealedSet = revealedSet;
+    this.stats = stats;
+    this.instantRevealer = instantRevealer;
+    this.changeJournal = changeJournal;
   }
 
   /** 注册异步监听器（真异步扣包，与合并模块同一条链路）。 */
@@ -187,6 +217,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
           ? null : (world, x, y, z) -> isOurRevealEcho(player, world, x, y, z);
       processChanges(worldName, coordinates, positions.length, obfuscatedChunkIndex, revealedSet,
           stats, (changed, changedCount) -> {
+            recordChanges(worldName, changed, changedCount);
             if (instantRevealer != null && changedCount > 0) {
               instantRevealer.onSectionChangeObserved(player, worldName, changed, changedCount);
             }
@@ -557,6 +588,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     if (unregisterCoordinate(player, worldName, x, y, z)) {
       return; // 回显：服务端内容未变，不产生新的观察事件（理由见方法注释）
     }
+    recordChange(worldName, x, y, z);
     if (instantRevealer != null) {
       instantRevealer.onBlockChangeObserved(player, worldName, x, y, z);
     }
@@ -585,6 +617,26 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    *         据此再触发新的观察事件）；{@code false} = 真实变更，或无法判定（世界名未知 / 索引未装配
    *         ——此时按真实变更处理，保留既有行为，绝不因判定能力缺失而漏掉邻域显形）。
    */
+  /** 记录一条真实方块变更（供区块包放行后补发；日志缺失时零开销）。 */
+  private void recordChange(String worldName, int x, int y, int z) {
+    ChunkChangeJournal journal = changeJournal;
+    if (journal != null) {
+      journal.record(worldName, x, y, z);
+    }
+  }
+
+  /** 记录一个 section 的真实变更（上限 {@link #MAX_JOURNAL_RECORDS_PER_PACKET} 条）。 */
+  private void recordChanges(String worldName, int[] coordinates, int count) {
+    ChunkChangeJournal journal = changeJournal;
+    if (journal == null || coordinates == null || count <= 0) {
+      return;
+    }
+    int limit = Math.min(count, MAX_JOURNAL_RECORDS_PER_PACKET);
+    for (int i = 0; i < limit; i++) {
+      journal.record(worldName, coordinates[i * 3], coordinates[i * 3 + 1], coordinates[i * 3 + 2]);
+    }
+  }
+
   private boolean unregisterCoordinate(Player player, String worldName, int x, int y, int z) {
     if (worldName == null || obfuscatedChunkIndex == null) {
       return false;

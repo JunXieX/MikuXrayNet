@@ -6,6 +6,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.antixray.BlockChangeRevealListener;
+import net.mikumc.mikuxraynet.antixray.ChunkChangeJournal;
 import net.mikumc.mikuxraynet.antixray.LeakFilterListener;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
@@ -321,8 +322,10 @@ public final class AntiXrayRuntime {
     try {
       ProximityRevealer revealer = new ProximityRevealer(plugin, antiXray, chunkIndex, revealed, stats,
           bypassRegistry, workPool, occlusionStores);
+      // 变更日志：区块包在途期间被改过的格子靠它「放行后补发」（否则旧区块字节会把新方块盖回去）。
+      ChunkChangeJournal changeJournal = protocolLibHook == null ? null : protocolLibHook.changeJournal();
       BlockChangeRevealListener listener = new BlockChangeRevealListener(plugin, protocolManager,
-          chunkIndex, revealed, stats, revealer);
+          chunkIndex, revealed, stats, revealer, changeJournal);
       // 隐藏坐标的二次泄露包过滤：方块实体/世界事件/音效/粒子/爆炸。只依赖共享索引，失败不影响显形。
       LeakFilterListener leakFilter = new LeakFilterListener(plugin, protocolManager, chunkIndex, revealed);
       // 先落到字段再启动：start() 中途抛异常时 stopProximity() 必须能停掉已启动的那一半

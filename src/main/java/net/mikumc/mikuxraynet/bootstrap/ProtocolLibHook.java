@@ -11,6 +11,7 @@ import net.mikumc.mikuxraynet.antixray.ChunkPacketAccessor;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
+import net.mikumc.mikuxraynet.antixray.ChunkChangeJournal;
 import net.mikumc.mikuxraynet.antixray.ProtocolLibAsyncListener;
 import net.mikumc.mikuxraynet.antixray.RevealedSet;
 import net.mikumc.mikuxraynet.antixray.RewriteStats;
@@ -116,6 +117,17 @@ public final class ProtocolLibHook {
   /** ProtocolLib 协议管理器（供邻近显形与方块变更注销复用同一入口）。 */
   public ProtocolManager protocolManager() {
     return protocolManager;
+  }
+
+  /**
+   * 方块变更日志（供 {@code BlockChangeRevealListener} 写入；区块包放行后据它补发在途变更）。
+   *
+   * <p>未接入改写链路（{@code listener == null}）时返回 {@code null}：此时没有区块包被扣住，也就没有
+   * 「旧区块字节覆盖新方块」的可能，记录纯属浪费。
+   */
+  public ChunkChangeJournal changeJournal() {
+    ProtocolLibAsyncListener current = listener;
+    return current == null ? null : current.changeJournal();
   }
 
   /**

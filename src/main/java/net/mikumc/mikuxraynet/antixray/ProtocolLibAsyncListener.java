@@ -18,6 +18,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import java.util.logging.Level;
+import net.mikumc.mikuxraynet.bandwidth.Schedulers;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
 import net.mikumc.mikuxraynet.cache.DiskPayload;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
@@ -26,6 +27,7 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -211,6 +213,14 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final BypassRegistry bypassRegistry;
   private final DiskCacheStore diskCache;
   private final RewriteStats stats = new RewriteStats();
+  /**
+   * 最近方块变更的环形日志（见 {@link ChunkChangeJournal}）。
+   *
+   * <p>由 {@link BlockChangeRevealListener} 放入（每条出站方块变更一条），本类在区块包放行时按序号比对：
+   * 若持包期间该区块被改过，就补发那几格的当前状态——否则客户端先收到的方块变更会被随后到达的
+   * 「改写时刻的旧区块字节」盖回去（真机观感：边走边放方块时，刚放的那一格闪一下）。
+   */
+  private final ChunkChangeJournal changeJournal = new ChunkChangeJournal();
   private final BatchTable batches;
   /**
    * 玩家退出清理批次闸门的 Bukkit 监听。
@@ -268,6 +278,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** 装配/卸下「区块包放行后」回调（传 {@code null} 表示停用；由 {@code AntiXrayRuntime} 调用）。 */
   public void setChunkDeliveryHook(ChunkDeliveryHook hook) {
     this.chunkDeliveryHook = hook;
+  }
+
+  /** 方块变更日志（由 {@link BlockChangeRevealListener} 写入；供放行后补发使用）。 */
+  public ChunkChangeJournal changeJournal() {
+    return changeJournal;
   }
 
   /**
@@ -494,11 +509,15 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       String releaseWorld = world.getName();
       int releaseChunkX = accessor.chunkX();
       int releaseChunkZ = accessor.chunkZ();
+      // 持包时刻的变更序号：放行时若已前进，说明这段时间该区块可能又被改过，需要补发（见 changeJournal）。
+      long capturedChanges = changeJournal.sequence();
       Runnable release = () -> {
         if (gate != null) {
           gate.chunkDone();
         }
         asynchronousManager.signalPacketTransmission(event);
+        resendCellsChangedDuringRewrite(player, releaseWorld, releaseChunkX, releaseChunkZ,
+            capturedChanges);
         clearRevealedOnDelivery(releaseWorld, releaseChunkX, releaseChunkZ, releasePlayerId);
         // 区块包已写出：紧接着把「该区块中玩家当前可见」的坐标显形（区块下发即显形）。
         // 必须排在放行之后：客户端会按顺序应用，显形包跟着区块包落到同一次收包批次里。
@@ -1108,6 +1127,39 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * <p><b>异常必须吞</b>：本方法在封包放行动作里执行，动作一旦抛出就会干扰 {@code signalOnce} 的
    * 恰好一次语义；而清理失败只会让个别坐标多藏一个周期（下次区块重发会再清），属安全方向。
    */
+  /**
+   * 区块包放行后补发「持包期间被改过」的格子。
+   *
+   * <p>改写期间服务端可能又对该区块下发了方块变更；那条变更先到客户端，随后到达的旧区块字节会把它盖回去
+   * （玩家边走边放方块时最明显：刚放的一格闪一下）。放行后按日志补发这几格的**当前**状态即可纠正。
+   *
+   * <p>线程与成本：本方法在放行线程（网络线程/看门狗）上只做一次日志查询（序号未变则零成本返回），
+   * 真正读世界与发包投递到玩家所属线程；单次最多补发 {@link ChunkChangeJournal#MAX_REPLAY} 格。
+   * 任何失败都只记限流日志：下一次区块下发或显形链路会自然纠正。
+   */
+  private void resendCellsChangedDuringRewrite(Player player, String worldName, int chunkX, int chunkZ,
+      long capturedChanges) {
+    List<int[]> cells = changeJournal.changedSince(capturedChanges, worldName, chunkX, chunkZ);
+    if (cells.isEmpty()) {
+      return;
+    }
+    try {
+      Schedulers.onEntity(plugin, player, () -> {
+        World world = player.getWorld();
+        if (world == null || !worldName.equals(world.getName())
+            || !world.isChunkLoaded(chunkX, chunkZ)) {
+          return;
+        }
+        for (int[] cell : cells) {
+          player.sendBlockChange(new Location(world, cell[0], cell[1], cell[2]),
+              world.getBlockData(cell[0], cell[1], cell[2]));
+        }
+      });
+    } catch (Throwable throwable) {
+      logThrottled("区块下发后补发在途方块变更失败（已忽略，下一次区块下发或显形会纠正）", throwable);
+    }
+  }
+
   private void clearRevealedOnDelivery(String worldName, int chunkX, int chunkZ, UUID playerId) {
     if (worldName == null || playerId == null) {
       return;
