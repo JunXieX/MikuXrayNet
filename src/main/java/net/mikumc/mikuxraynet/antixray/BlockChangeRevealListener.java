@@ -7,6 +7,11 @@ import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.wrappers.BlockPosition;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
@@ -75,6 +80,18 @@ public final class BlockChangeRevealListener extends PacketAdapter {
 
   /** 是否已注册（同步监听器没有句柄，用标志位保证 start/stop 幂等）。 */
   private volatile boolean registered;
+  /**
+   * 注销执行器：把「摘伪装索引 + 清已显形标记」移出封包线程。
+   *
+   * <p><b>为什么必须移出</b>：这两步要对该区块的坐标数组做二分 + 整段复制，并遍历该区块所有玩家的标记
+   * 逐个加锁。单人低负载下是微秒级，几十人在线时会与区块解码（同区块 compute / 建表）和显形扫描抢锁，
+   * 封包线程因此被挡住，方块包晚于同一 tick 的光照包写出——客户端按「旧方块 + 新光照」渲染一帧，
+   * 真机观感就是「那一格亮度闪一下」。放到后台单线程后，封包线程只做解析与入队，线序不再受影响。
+   *
+   * <p>队列有界：极端积压时退回同步执行（宁可慢一次，也不丢注销——丢了会留下「索引还有、方块已变」的
+   * 幽灵坐标，显形时反复发同一个位置）。
+   */
+  private volatile ExecutorService undoExecutor;
 
   /**
    * 完整构造（含方块变更日志）。
@@ -105,6 +122,14 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * 同步注册在 netty 管线内就地处理，线序不变。
    */
   public void start() {
+    if (undoExecutor == null || undoExecutor.isShutdown()) {
+      undoExecutor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+          new ArrayBlockingQueue<>(8192), runnable -> {
+            Thread thread = new Thread(runnable, "MikuXrayNet-BlockUndo");
+            thread.setDaemon(true);
+            return thread;
+          }, new ThreadPoolExecutor.AbortPolicy());
+    }
     // 同步监听：在 netty 管线内就地处理，绝不把封包扣在异步队列里（见类注释的「包序」说明）。
     protocolManager.addPacketListener(this);
     registered = true;
@@ -113,6 +138,11 @@ public final class BlockChangeRevealListener extends PacketAdapter {
 
   /** 注销监听器；可重复调用，异常安全。 */
   public void stop() {
+    ExecutorService executor = undoExecutor;
+    undoExecutor = null;
+    if (executor != null) {
+      executor.shutdownNow();
+    }
     if (!registered) {
       return;
     }
@@ -193,13 +223,18 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       // 回显判定绑定「本包的接收者」：显形回显只发给了这个玩家，因此也只会在他名下命中
       RevealEchoCheck echoCheck = instantRevealer == null || player == null
           ? null : (world, x, y, z) -> isOurRevealEcho(player, world, x, y, z);
-      processChanges(worldName, coordinates, positions.length, obfuscatedChunkIndex, revealedSet,
-          stats, (changed, changedCount) -> {
-            recordChanges(worldName, changed, changedCount);
-            if (instantRevealer != null && changedCount > 0) {
-              instantRevealer.onSectionChangeObserved(player, worldName, changed, changedCount);
-            }
-          }, echoCheck);
+      SectionDispatch dispatch = (changed, changedCount) -> {
+        recordChanges(worldName, changed, changedCount);
+        if (instantRevealer != null && changedCount > 0) {
+          instantRevealer.onSectionChangeObserved(player, worldName, changed, changedCount);
+        }
+      };
+      // 同上：批量摘除在几十人在线时可能与解码/显形抢锁，必须离开封包线程。
+      // coordinates 来自线程本地复用缓冲，投递前先交出精确长度的独立快照。
+      int[] snapshot = java.util.Arrays.copyOf(coordinates, positions.length * 3);
+      int count = positions.length;
+      submitUndo(() -> processChanges(worldName, snapshot, count, obfuscatedChunkIndex, revealedSet,
+          stats, dispatch, echoCheck));
     } finally {
       ParseScratch.release(parse);
     }
@@ -509,9 +544,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
     // 已显形标记必须与伪装清单同步摘除：维持「已显形坐标 ⊆ 区块伪装清单」不变式。
     // 索引未命中也要摘（宁可多摘一次也不能留孤儿标记，见 unregisterCoordinate）。
-    // 一个 SectionBuffer 的坐标同属一个区块，故一次批量摘除即可（与索引侧 removePositions 对称）：
-    // 逐坐标调用会为每个坐标重复一次 ChunkKey.ofBlock + 遍历全部玩家 + 逐 marker 加锁，
-    // 一个 section 最多 4096 个坐标时会把这段工作量在 netty 线程上确定性放大。
+    //
     if (revealedSet != null) {
       revealedSet.removePositions(worldName, section.data, section.count);
     }
@@ -563,10 +596,13 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     // 也会看到「我们自己发出的显形回显」。回显不改变服务端内容，必须与真实变更区别对待
     // （见 unregisterCoordinate）；磁盘缓存方面两者都不需要作废任何条目——条目有效性由负载里的
     // 原始区块字节指纹判定（见 DiskCacheStore 类注释），回显不改变区块字节。
-    if (unregisterCoordinate(player, worldName, x, y, z)) {
+    // 回显判定留在封包线程（只是一次并发 map 查/删），真实变更的注销投递到后台：
+    // 摘索引与清标记会与解码 / 显形抢锁，留在封包线程上会把方块包压到光照包之后（见 undoExecutor 说明）。
+    if (isOurRevealEcho(player, worldName, x, y, z)) {
       return; // 回显：服务端内容未变，不产生新的观察事件（理由见方法注释）
     }
     recordChange(worldName, x, y, z);
+    submitUndo(() -> removeFromIndexAndMarks(worldName, x, y, z));
     if (instantRevealer != null) {
       instantRevealer.onBlockChangeObserved(player, worldName, x, y, z);
     }
@@ -581,20 +617,41 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   }
 
   /**
-   * 从「伪装区块清单」与「各玩家的已显形标记」中同步摘除该坐标。
-   *
-   * <p>两者必须同步摘除，才能维持「已显形坐标 ⊆ 区块伪装清单」这一不变式——「整块已全部显形
-   * 则跳过该区块」的判断依赖它。只摘变更的那一个坐标，该区块其它坐标照常显形（与既有行为一致）。
-   *
-   * <p><b>为什么索引未命中也要摘已显形标记（容忍「标记先行」）</b>：邻近显形改为「先标记、再发包」
-   * 后，我们发出的显形包会回显到这里。若另一个玩家已先把该坐标从共享索引里摘掉，本次 {@code removePosition}
-   * 就未命中，但本玩家刚写入的标记仍在——那是一枚孤儿标记（已显形数虚增会让「整块跳过」提前成立，
-   * 真实坐标被长期漏显形）。因此这里无条件摘标记：正常情况无副作用，异常情况恰好清掉孤儿。
-   *
-   * @return {@code true} = 这是本插件刚为该玩家发出的显形回显（服务端内容未变，调用方<b>不得</b>
-   *         据此再触发新的观察事件）；{@code false} = 真实变更，或无法判定（世界名未知 / 索引未装配
-   *         ——此时按真实变更处理，保留既有行为，绝不因判定能力缺失而漏掉邻域显形）。
+   * 把注销任务交给后台单线程；执行器未就绪或队列满时退回同步执行（绝不丢注销）。
    */
+  private void submitUndo(Runnable task) {
+    ExecutorService executor = undoExecutor;
+    if (executor == null) {
+      task.run();
+      return;
+    }
+    try {
+      executor.execute(task);
+    } catch (RejectedExecutionException rejected) {
+      // 队列满 / 正在停用：退回同步（这一步本身不读世界，只是并发结构上的摘除）
+      task.run();
+    }
+  }
+
+  /**
+   * 后台线程执行的真实变更注销：摘共享伪装索引 + 清该坐标在所有玩家上的已显形标记。
+   *
+   * <p><b>不再判回显</b>：调用方已在封包线程用 {@link #isOurRevealEcho} 判过，因此这里可以安全地
+   * 在任意线程执行（索引与标记都是并发结构）。
+   */
+  private void removeFromIndexAndMarks(String worldName, int x, int y, int z) {
+    if (worldName == null || obfuscatedChunkIndex == null) {
+      return;
+    }
+    boolean removedFromIndex = obfuscatedChunkIndex.removePosition(worldName, x, y, z);
+    if (revealedSet != null) {
+      revealedSet.removePosition(worldName, x, y, z);
+    }
+    if (removedFromIndex && stats != null) {
+      stats.unregistered.increment();
+    }
+  }
+
   /** 记录一条真实方块变更（供区块包放行后补发；日志缺失时零开销）。 */
   private void recordChange(String worldName, int x, int y, int z) {
     ChunkChangeJournal journal = changeJournal;
@@ -613,26 +670,6 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     for (int i = 0; i < limit; i++) {
       journal.record(worldName, coordinates[i * 3], coordinates[i * 3 + 1], coordinates[i * 3 + 2]);
     }
-  }
-
-  private boolean unregisterCoordinate(Player player, String worldName, int x, int y, int z) {
-    if (worldName == null || obfuscatedChunkIndex == null) {
-      return false;
-    }
-    if (isOurRevealEcho(player, worldName, x, y, z)) {
-      // 回显（本插件自己刚为该玩家发出的显形包）：服务端内容没有变化，因此<b>绝不能</b>摘共享伪装索引
-      // ——索引按区块全服共享，摘掉会让其它玩家对同一坐标再也无法被主动显形（他们的客户端仍持伪装
-      // 区块，只能等区块重载才恢复）。本玩家的已显形标记也保留：它确实已被显形，再发一次毫无意义。
-      return true;
-    }
-    boolean removedFromIndex = obfuscatedChunkIndex.removePosition(worldName, x, y, z);
-    if (revealedSet != null) {
-      revealedSet.removePosition(worldName, x, y, z);
-    }
-    if (removedFromIndex && stats != null) {
-      stats.unregistered.increment();
-    }
-    return false;
   }
 
   /**

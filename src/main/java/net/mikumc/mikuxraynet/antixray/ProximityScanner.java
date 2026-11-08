@@ -70,6 +70,16 @@ final class ProximityScanner {
   private record Scored(ObfuscatedChunkIndex.Position position, long distanceSquared, int sequence) {
   }
 
+  /**
+   * 「近处重试」的距离平方（8 格）：重试周期里，玩家身边的已显形坐标会被<b>强制重新评估一次</b>。
+   *
+   * <p><b>为什么需要</b>：显形包发出后无法确认客户端是否真的应用了（区块刚下发、客户端仍在加载、
+   * 合并包被丢弃等），而「已显形」标记一旦写下，整块跳过与坐标过滤就不会再重试——玩家会一直看到
+   * 假方块，直到标记过期（{@code proximity.expire-seconds}）或区块重发。近处坐标是玩家最容易盯着看的，
+   * 因此按固定周期给它们一次重试机会，把「永久假」收敛成「最多一个重试周期」。
+   */
+  static final double NEAR_RETRY_DISTANCE_SQUARED = 64.0D;
+
   private ProximityScanner() {
   }
 
@@ -92,7 +102,16 @@ final class ProximityScanner {
       RevealedSet revealed, UUID playerId, String worldName, int x, int y, int z,
       double maxDistance, int limit, int shard, int shards, Tally tally) {
     return candidates(index, revealed, playerId, worldName, x, y, z, maxDistance, limit, shard,
-        shards, tally, Long.MAX_VALUE);
+        shards, tally, Long.MAX_VALUE, false);
+  }
+
+  /** 同上，并可指定「本轮是否重试近处已显形坐标」（见 {@link #NEAR_RETRY_DISTANCE_SQUARED}）。 */
+  static List<ObfuscatedChunkIndex.Position> candidates(ObfuscatedChunkIndex index,
+      RevealedSet revealed, UUID playerId, String worldName, int x, int y, int z,
+      double maxDistance, int limit, int shard, int shards, Tally tally,
+      boolean retryNearbyRevealed) {
+    return candidates(index, revealed, playerId, worldName, x, y, z, maxDistance, limit, shard,
+        shards, tally, Long.MAX_VALUE, retryNearbyRevealed);
   }
 
   /**
@@ -105,7 +124,8 @@ final class ProximityScanner {
    */
   static List<ObfuscatedChunkIndex.Position> candidates(ObfuscatedChunkIndex index,
       RevealedSet revealed, UUID playerId, String worldName, int x, int y, int z,
-      double maxDistance, int limit, int shard, int shards, Tally tally, long deadlineNanos) {
+      double maxDistance, int limit, int shard, int shards, Tally tally, long deadlineNanos,
+      boolean retryNearbyRevealed) {
     if (index == null || revealed == null || playerId == null || worldName == null
         || limit <= 0 || maxDistance < 0.0D) {
       return List.of();
@@ -162,7 +182,9 @@ final class ProximityScanner {
           }
           continue;
         }
-        if (revealed.sizeFor(playerId, worldName, chunkX, chunkZ) >= entry.size()) {
+        boolean nearChunk = Math.abs(chunkX - centerX) <= 1 && Math.abs(chunkZ - centerZ) <= 1;
+        if (revealed.sizeFor(playerId, worldName, chunkX, chunkZ) >= entry.size()
+            && !(retryNearbyRevealed && nearChunk)) {
           // 整块已全部显形：稳态下每周期只处理「新进入视野的区块」
           if (tally != null) {
             tally.chunksSkipped++;
@@ -197,7 +219,8 @@ final class ProximityScanner {
               continue;
             }
           }
-          if (revealed.contains(playerId, worldName, chunkX, chunkZ, blockX, blockY, blockZ)) {
+          if (revealed.contains(playerId, worldName, chunkX, chunkZ, blockX, blockY, blockZ)
+              && !(retryNearbyRevealed && distanceSq <= NEAR_RETRY_DISTANCE_SQUARED)) {
             continue;
           }
           // 传原始分量而非先构造 Position：堆满之后绝大多数候选注定被淘汰，只有真正入堆时才需要对象

@@ -1089,7 +1089,7 @@ public final class AntiXrayConfig {
                 PROXIMITY_MAX_REVEALS_PER_TICK_MAX, "proximity.max-reveals-per-tick",
                 floorAdjustments, ceilingAdjustments),
             // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处。
-            clampCeiling(root.getInt("proximity.expire-seconds", 300), 1, PROXIMITY_EXPIRE_SECONDS_MAX,
+            clampCeiling(root.getInt("proximity.expire-seconds", 30), 1, PROXIMITY_EXPIRE_SECONDS_MAX,
                 "proximity.expire-seconds", floorAdjustments, ceilingAdjustments),
             // 安全阀容量见 PROXIMITY_MAX_POSITIONS(_PER_PLAYER)_MAX：两个键都只在异常态触发，
             // 但同样需要上限，否则误配大数会让「安全阀」失效、内存失去上界。

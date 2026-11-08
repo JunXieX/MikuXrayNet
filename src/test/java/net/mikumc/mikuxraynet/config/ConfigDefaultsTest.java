@@ -57,7 +57,8 @@ class ConfigDefaultsTest {
         "单玩家坐标上限默认 524288（262144 在真机仍被顶到、淘汰 1400 个坐标）");
     assertEquals(4194304, config.proximity().maxPositions(),
         "全服坐标上限默认 4194304（原 2097152，约 8 个满配玩家，避免多玩家同时在线立刻触顶）");
-    assertEquals(300, config.proximity().expireSeconds(), "显形索引过期默认 300 秒（原为 120）");
+    assertEquals(30, config.proximity().expireSeconds(),
+        "已显形记录过期默认 30 秒：它同时是「显形包没有生效」的自愈窗口（原 300 秒时一次丢包要等 5 分钟）");
   }
 
   /**

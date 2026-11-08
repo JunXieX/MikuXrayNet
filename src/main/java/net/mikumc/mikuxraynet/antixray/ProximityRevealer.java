@@ -273,6 +273,15 @@ public final class ProximityRevealer implements Listener {
    * 出站监听器的摘除路径对齐，杜绝孤儿标记；发送失败回滚则保证未发出的坐标仍会被后续周期重试。
    * 坐标为绝对方块坐标；方块状态在玩家所属线程读取（见 {@link #sendOne}）。
    */
+  /**
+   * 近处重试周期（tick）：每这么多个 tick，本轮巡检会把玩家身边 8 格内「已显形」的坐标重新评估一次。
+   *
+   * <p><b>解决什么</b>：显形包发出后服务端无法确认客户端是否应用（区块尚在加载、包被丢弃等），
+   * 而「已显形」标记会让后续扫描整块跳过。近处坐标按固定周期重试，把「永久假方块」收敛成最多一个
+   * 重试周期（25 tick ≈ 1.25 秒）。
+   */
+  private static final int NEAR_RETRY_PERIOD_TICKS = 25;
+
   private static final class RevealBatch {
 
     private final World world;
@@ -783,10 +792,14 @@ public final class ProximityRevealer implements Listener {
     int revealChunks = effectiveRevealChunks(proximity.distanceChunks(),
         playerViewDistance(player), playerClientViewDistance(player));
     double maxDistance = revealChunks * 16.0D;
+    // 近处重试的相位按 tick 分散：所有玩家的巡检落在同一 tick 时也只是重扫身边 3×3 区块，
+    // 不会因为「全服同时重试」放大成尖峰（每 25 tick 命中一次）。
+    // 抽成一个方法是为了让局部变量保持 effectively final（下面的工作线程 lambda 要捕获它）
+    final boolean retryNearbyRevealed = nearRetryPhase();
     List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex,
         revealedSet, player.getUniqueId(), worldName, location.getBlockX(), location.getBlockY(),
         location.getBlockZ(), maxDistance, fetchLimit(budget.remaining()), shard,
-        SCAN_SHARDS, scanTally);
+        SCAN_SHARDS, scanTally, retryNearbyRevealed);
     if (candidates.isEmpty()) {
       return;
     }
@@ -797,7 +810,8 @@ public final class ProximityRevealer implements Listener {
     // 处理（严格方向：不显形），绝不裸发——「无数据 ≠ 通畅」是显形侧的既定安全方向。
     if (!frustum && !visibility) {
       // 两项筛选都关闭：无任何可做的判定，直接发包
-      sendCandidates(player, world, candidates, null, null, budget, scanTally, false);
+      sendCandidates(player, world, candidates, null, null, budget, scanTally, false,
+          retryNearbyRevealed);
       return;
     }
 
@@ -824,7 +838,8 @@ public final class ProximityRevealer implements Listener {
         Schedulers.onEntity(plugin, player, () -> {
           try {
             if (player.isOnline() && player.getWorld() == world) {
-              sendCandidates(player, world, null, plan, eye, budget, scanTally, visibility);
+              sendCandidates(player, world, null, plan, eye, budget, scanTally, visibility,
+                  retryNearbyRevealed);
             }
           } catch (Throwable throwable) {
             logThrottled(throwable);
@@ -836,6 +851,19 @@ public final class ProximityRevealer implements Listener {
       // 此时旧实例本就不会再发包（sendCandidates 入口的 stopping 闸），跳过不丢任何新实例的显形。
       logThrottled(throwable);
       skipPassBecauseNoCapacity();
+    }
+  }
+
+  /**
+   * 本轮是否进入「近处重试」相位（见 {@link #NEAR_RETRY_PERIOD_TICKS}）。
+   *
+   * <p>离线/测试环境没有 tick 时钟：返回 false（生产环境恒可用，且这只是「更早自愈」的优化）。
+   */
+  private static boolean nearRetryPhase() {
+    try {
+      return Bukkit.getCurrentTick() % NEAR_RETRY_PERIOD_TICKS == 0;
+    } catch (Throwable throwable) {
+      return false;
     }
   }
 
@@ -926,7 +954,8 @@ public final class ProximityRevealer implements Listener {
    */
   private void sendCandidates(Player player, World world,
       List<ObfuscatedChunkIndex.Position> candidates, Plan plan, ProximitySelector.Eye eye,
-      Budget budget, ProximityScanner.Tally scanTally, boolean visibilityInPlan) {
+      Budget budget, ProximityScanner.Tally scanTally, boolean visibilityInPlan,
+      boolean retryNearbyRevealed) {
     if (stopping) {
       // 停用 / 热重载已开始：绝不继续发包。本方法可能在异步工作池算完 computePlan 后才被回投到玩家线程
       // 执行（见 reveal 的 Schedulers.onEntity 回调），此时旧实例的索引已被 stop() 清空，
@@ -953,6 +982,8 @@ public final class ProximityRevealer implements Listener {
         if (budget.remaining() <= 0) {
           break;
         }
+        resetNearbyMarkForRetry(player, world, position.x(), position.y(), position.z(),
+            retryNearbyRevealed);
         sendOne(player, world, position.x(), position.y(), position.z(), eye, budget, tally, batch,
             visibilityInPlan);
       }
@@ -969,6 +1000,8 @@ public final class ProximityRevealer implements Listener {
       if (budget.remaining() <= 0) {
         break;
       }
+      resetNearbyMarkForRetry(player, world, plan.coordinates[i * 3], plan.coordinates[i * 3 + 1],
+          plan.coordinates[i * 3 + 2], retryNearbyRevealed);
       sendOne(player, world, plan.coordinates[i * 3], plan.coordinates[i * 3 + 1],
           plan.coordinates[i * 3 + 2], eye, budget, tally, batch, visibilityInPlan);
     }
@@ -982,6 +1015,31 @@ public final class ProximityRevealer implements Listener {
    * <p>非 Folia 恒为 {@code true}（单主线程，不存在跨 region 问题）；判定本身抛异常时按
    * <b>「不拥有」</b>处理——宁可少显形一个坐标，也绝不跨 region 读世界（那会触发 TickThread 校验）。
    */
+  /**
+   * 近处重试：清掉该玩家在这个坐标上的「已显形」标记，让随后的 {@code sendOne} 重新标记并发包。
+   *
+   * <p>不做这一步，重试出来的候选会被 {@code claimForSend}/{@code markThenSend} 的「已显形就不发」
+   * 判重直接丢掉——那正是「显形包没生效、标记却留着 → 永远不再重发」的死角。
+   * 只在重试周期对身边 {@link ProximityScanner#NEAR_RETRY_DISTANCE_SQUARED} 内的候选执行。
+   */
+  private void resetNearbyMarkForRetry(Player player, World world, int x, int y, int z,
+      boolean retryNearbyRevealed) {
+    if (!retryNearbyRevealed || revealedSet == null) {
+      return;
+    }
+    double dx = player.getX() - (x + 0.5D);
+    double dy = player.getY() + player.getEyeHeight() - (y + 0.5D);
+    double dz = player.getZ() - (z + 0.5D);
+    if (dx * dx + dy * dy + dz * dz > ProximityScanner.NEAR_RETRY_DISTANCE_SQUARED) {
+      return;
+    }
+    try {
+      revealedSet.removePosition(player.getUniqueId(), world.getName(), x, y, z);
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
   private static boolean ownsChunk(World world, int chunkX, int chunkZ) {
     if (!PlatformSupport.isFolia()) {
       return true;
@@ -1016,6 +1074,17 @@ public final class ProximityRevealer implements Listener {
       // 区块未加载：本次跳过，坐标留在索引里等玩家真正靠近
       stats.revealsSkipped.increment();
       return;
+    }
+    // 客户端是否已收到这个区块：区块包在 ProtocolLib 的异步管线里可能还没放行，此刻发出去的方块变更
+    // 会被客户端按「区块未加载」丢弃；而「已显形」标记一旦写下，扫描与整块跳过就不会再重试它——
+    // 「丢一次就永久伪装」的死角正是这么来的（服务端原生方块广播有同样的加载判定，所以不会踩到）。
+    // 判定不可用（离线替身 / 异常）时维持原行为，交给近处重试与过期兜底。
+    try {
+      if (!player.isChunkSent(Chunk.getChunkKey(x >> 4, z >> 4))) {
+        return;
+      }
+    } catch (Throwable ignored) {
+      // 见上：不因判定异常而漏显形
     }
 
     // 可见性判定（事件即时显形等未走 computePlan 的路径）：在当前线程用遮挡位图判定。位图缺失时按
@@ -1326,6 +1395,20 @@ public final class ProximityRevealer implements Listener {
     }
     UUID playerId = player.getUniqueId();
     String worldName = batch.world.getName();
+
+    // 发包前重读一次当前状态：批次里的方块数据是「累积时刻」读到的，而累积到真正发出之间可能隔着
+    // 工作线程回投（plan 分支）或同一 tick 内更早的判定。若玩家在这段时间里放置/破坏过这些格子，
+    // 批次就会带着旧材质发出，把客户端刚应用的新方块覆盖回去——真机观感就是「那一格闪一下」。
+    // 代价只是每个待发坐标多一次世界读（通常几十个）。
+    for (int i = 0; i < batch.states.size(); i++) {
+      int[] position = batch.positions.get(i);
+      try {
+        batch.states.set(i, batch.world.getBlockData(position[0], position[1], position[2]));
+      } catch (Throwable throwable) {
+        // 读不到就保留原快照：宁可发一次旧状态，也不因一次读失败丢掉显形
+        logThrottled(throwable);
+      }
+    }
 
     // 原子复核 + 标记：只对「本周期尚未显形、本次真正新登记」的坐标发包（见 claimForSend）。
     int[] fresh = claimForSend(playerId, worldName, batch.positions);
@@ -2574,7 +2657,7 @@ public final class ProximityRevealer implements Listener {
       List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex, revealedSet,
           player.getUniqueId(), worldName, eyeLocation.getBlockX(), eyeLocation.getBlockY(),
           eyeLocation.getBlockZ(), viewChange.radius(), MAX_VIEW_CHANGE_CANDIDATES, 0, 1, scanTally,
-          deadline);
+          deadline, false);
       // 预算耗尽只计一次：取候选被截断（截到 0 条也算）与判定超时合并为同一次计数
       boolean truncated = scanTally.deadlineTruncated;
       if (candidates.isEmpty()) {

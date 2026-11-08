@@ -511,28 +511,30 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       int releaseChunkZ = accessor.chunkZ();
       // 持包时刻的变更序号：放行时若已前进，说明这段时间该区块可能又被改过，需要补发（见 changeJournal）。
       long capturedChanges = changeJournal.sequence();
-      Runnable release = () -> {
-        if (gate != null) {
-          gate.chunkDone();
+      // 持包期间被改过的格子（绝大多数区块为空）：必须与区块包在同一次收包批次里补发。
+      // 旧实现把补发投递到下一 tick，客户端会先按旧区块字节渲染一帧、再被补发纠正——真机观感就是
+      // 「刚放/刚挖的那一格闪一下」。现在只要本区块有在途变更，就把放行动作整体挪到玩家线程：
+      // 放行区块包后紧接着读当前方块并发补发，两包同一 tick 到达，客户端只渲染一次。
+      List<int[]> heldChanges = changeJournal.changedSince(capturedChanges, releaseWorld,
+          releaseChunkX, releaseChunkZ);
+      // 放行动作本身（由 RewriteTask 在改写完成 / 超时 / 失败时触发一次）：
+      // 有在途变更时切到玩家线程连续执行「放行 + 补发」，无变更时在封包线程直接放行。
+      Runnable delivery = () -> {
+        Runnable releaseOnPacketThread = () -> completeRelease(player, event, gate, releaseWorld,
+            releaseChunkX, releaseChunkZ, releasePlayerId, heldChanges, false);
+        if (heldChanges.isEmpty()) {
+          releaseOnPacketThread.run();
+          return;
         }
-        asynchronousManager.signalPacketTransmission(event);
-        resendCellsChangedDuringRewrite(player, releaseWorld, releaseChunkX, releaseChunkZ,
-            capturedChanges);
-        clearRevealedOnDelivery(releaseWorld, releaseChunkX, releaseChunkZ, releasePlayerId);
-        // 区块包已写出：紧接着把「该区块中玩家当前可见」的坐标显形（区块下发即显形）。
-        // 必须排在放行之后：客户端会按顺序应用，显形包跟着区块包落到同一次收包批次里。
-        try {
-          ChunkDeliveryHook hook = chunkDeliveryHook;
-          if (hook != null) {
-            hook.onChunkDelivered(player, releaseWorld, releaseChunkX, releaseChunkZ);
-          }
-        } catch (Throwable throwable) {
-          // 本回调只是优化项：失败只影响「更早显形」，周期巡检仍会兜底，绝不影响封包放行
-          logThrottled("区块下发后立即显形调度失败（已忽略，周期巡检仍会兜底）", throwable);
+        Runnable releaseOnPlayerThread = () -> completeRelease(player, event, gate, releaseWorld,
+            releaseChunkX, releaseChunkZ, releasePlayerId, heldChanges, true);
+        // 调度失败（实体退役 / 停用竞态）时退化为立即放行、不补发：绝不因为补发卡住区块包。
+        if (!Schedulers.onEntity(plugin, player, releaseOnPlayerThread)) {
+          releaseOnPacketThread.run();
         }
       };
       task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
-          world.getName(), dimension, minHeight, sectionCount, timeoutMillis, release,
+          world.getName(), dimension, minHeight, sectionCount, timeoutMillis, delivery,
           processor.capturePatchStamps(world.getName(), accessor.chunkX(), accessor.chunkZ(),
               minHeight >> 4, sectionCount));
     } catch (Throwable throwable) {
@@ -1115,35 +1117,55 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   }
 
   /**
-   * 区块包放行后补发「持包期间被改过」的格子。
+   * 区块包放行的统一收尾：归还批次计数 → 放行封包 →（玩家线程时）补发在途变更 → 作废标记 → 区块下发即显形。
    *
-   * <p>改写期间服务端可能又对该区块下发了方块变更；那条变更先到客户端，随后到达的旧区块字节会把它盖回去
-   * （玩家边走边放方块时最明显：刚放的一格闪一下）。放行后按日志补发这几格的**当前**状态即可纠正。
-   *
-   * <p>线程与成本：本方法在放行线程（网络线程/看门狗）上只做一次日志查询（序号未变则零成本返回），
-   * 真正读世界与发包投递到玩家所属线程；单次最多补发 {@link ChunkChangeJournal#MAX_REPLAY} 格。
-   * 任何失败都只记限流日志：下一次区块下发或显形链路会自然纠正。
+   * @param canReadWorld 当前线程是否能安全读世界（玩家线程才为 true）。补发要读当前方块状态，
+   *                     因此只在玩家线程执行；封包线程上的退化路径只做放行与清理，绝不跨线程读世界。
    */
-  private void resendCellsChangedDuringRewrite(Player player, String worldName, int chunkX, int chunkZ,
-      long capturedChanges) {
-    List<int[]> cells = changeJournal.changedSince(capturedChanges, worldName, chunkX, chunkZ);
-    if (cells.isEmpty()) {
+  private void completeRelease(Player player, PacketEvent event, ChunkBatchGate gate,
+      String worldName, int chunkX, int chunkZ, UUID playerId, List<int[]> heldChanges,
+      boolean canReadWorld) {
+    if (gate != null) {
+      gate.chunkDone();
+    }
+    asynchronousManager.signalPacketTransmission(event);
+    if (canReadWorld && !heldChanges.isEmpty()) {
+      resendCellsDirectly(player, worldName, chunkX, chunkZ, heldChanges);
+    }
+    clearRevealedOnDelivery(worldName, chunkX, chunkZ, playerId);
+    // 区块包已写出：紧接着把「该区块中玩家当前可见」的坐标显形（区块下发即显形）。
+    // 必须排在放行之后：客户端会按顺序应用，显形包跟着区块包落到同一次收包批次里。
+    try {
+      ChunkDeliveryHook hook = chunkDeliveryHook;
+      if (hook != null) {
+        hook.onChunkDelivered(player, worldName, chunkX, chunkZ);
+      }
+    } catch (Throwable throwable) {
+      // 本回调只是优化项：失败只影响「更早显形」，周期巡检仍会兜底，绝不影响封包放行
+      logThrottled("区块下发后立即显形调度失败（已忽略，周期巡检仍会兜底）", throwable);
+    }
+  }
+
+  /**
+   * 在玩家线程上把「持包期间被改过」的格子按当前状态补发一次（{@link #completeRelease} 调用）。
+   *
+   * <p>必须紧跟 {@code signalPacketTransmission} 执行：客户端按连接上的写入顺序处理，
+   * 先应用区块字节、再应用这几格，同一 tick 内完成，不会渲染出中间的旧状态。
+   */
+  private void resendCellsDirectly(Player player, String worldName, int chunkX, int chunkZ,
+      List<int[]> cells) {
+    World world = player.getWorld();
+    if (world == null || !worldName.equals(world.getName()) || !world.isChunkLoaded(chunkX, chunkZ)) {
       return;
     }
-    try {
-      Schedulers.onEntity(plugin, player, () -> {
-        World world = player.getWorld();
-        if (world == null || !worldName.equals(world.getName())
-            || !world.isChunkLoaded(chunkX, chunkZ)) {
-          return;
-        }
-        for (int[] cell : cells) {
-          player.sendBlockChange(new Location(world, cell[0], cell[1], cell[2]),
-              world.getBlockData(cell[0], cell[1], cell[2]));
-        }
-      });
-    } catch (Throwable throwable) {
-      logThrottled("区块下发后补发在途方块变更失败（已忽略，下一次区块下发或显形会纠正）", throwable);
+    for (int[] cell : cells) {
+      try {
+        player.sendBlockChange(new Location(world, cell[0], cell[1], cell[2]),
+            world.getBlockData(cell[0], cell[1], cell[2]));
+      } catch (Throwable throwable) {
+        logThrottled("区块放行时补发在途方块变更失败（已忽略，下一次显形或区块重发会纠正）", throwable);
+        return;
+      }
     }
   }
 
