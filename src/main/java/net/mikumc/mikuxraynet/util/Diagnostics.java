@@ -571,18 +571,225 @@ public final class Diagnostics {
     }
   }
 
+  /**
+   * 采样点：一次运行状态快照里「随时间变化」的关键量。
+   *
+   * <p>用于 {@code /mxnet dump} 的 10 秒采样：单点快照只能说「累计多少」，采样能给出「每秒多少、
+   * 峰值多高、期间有没有掉 TPS」——后者才是判断卡顿/漏显形规模的关键。
+   */
+  public record Sample(double tps, double mspt, int players,
+      long rewritten, long blocksReplaced, long revealsSent, long rayMissing,
+      long entitiesHidden, long entitiesShown, long occlusionComputed,
+      long diskHits, long diskMisses, long diskPayloadRejected,
+      int queueSize, int queueCapacity, int poolActive,
+      int indexPositions, int revealedPositions, int sectionsResident) {
+  }
+
+  /** 取一个采样点（在全局区域线程调用；只读计数器与 TPS，不触发任何计算）。 */
+  public Sample sample() {
+    Snapshot s = snapshot();
+    double tps;
+    double mspt;
+    try {
+      tps = Bukkit.getTPS()[0];
+    } catch (Throwable ignored) {
+      tps = -1.0D;
+    }
+    try {
+      mspt = Bukkit.getAverageTickTime();
+    } catch (Throwable ignored) {
+      mspt = -1.0D;
+    }
+    int players;
+    try {
+      players = Bukkit.getOnlinePlayers().size();
+    } catch (Throwable ignored) {
+      players = -1;
+    }
+    return new Sample(tps, mspt, players,
+        s.rewrite().chunksRewritten(), s.rewrite().blocksReplaced(), s.proximity().revealsSent(),
+        s.proximity().rayCulledMissingData(), s.throttle().entitiesHidden(),
+        s.throttle().entitiesShown(), s.occlusion().computed(), s.diskCache().hits(),
+        s.diskCache().misses(), s.diskCache().payloadRejected(),
+        s.pool().queueSize(), s.pool().queueCapacity(), s.pool().active(),
+        s.index().obfuscatedPositionCount(), s.index().revealedPositionCount(),
+        s.occlusion().sectionsResident());
+  }
+
+  /**
+   * 把采样序列格式化成一段报告（纯函数，可离线单测）。
+   *
+   * <p>计数类输出「首末差 + 每秒速率」；水位类输出「最小 / 平均 / 最大」。
+   * 计数在窗口内变小（插件热重载重建了模块）时标注「计数被重置」，不给错误的负增量。
+   */
+  static String formatSamples(List<Sample> samples, long durationMillis, boolean reloadDuring) {
+    if (samples == null || samples.size() < 2) {
+      return "\n---- 运行采样 ----\n样本不足（<2），无法计算增量。\n";
+    }
+    double seconds = Math.max(0.001D, durationMillis / 1000.0D);
+    Sample first = samples.get(0);
+    Sample last = samples.get(samples.size() - 1);
+    StringBuilder sb = new StringBuilder(1024);
+    sb.append("\n---- 运行采样 ----\n");
+    sb.append("窗口：").append(String.format(Locale.ROOT, "%.1f", seconds)).append(" 秒（")
+        .append(samples.size()).append(" 个样本，间隔约 ")
+        .append(String.format(Locale.ROOT, "%.0f", durationMillis / (double) (samples.size() - 1)))
+        .append(" ms）\n");
+    sb.append("TPS（1m）：最小 ").append(fmt(tpsMin(samples))).append(" / 平均 ")
+        .append(fmt(avg(samples, Sample::tps))).append(" / 最大 ").append(fmt(tpsMax(samples)))
+        .append("；平均 tick：最小 ").append(fmt(msptMin(samples))).append(" / 平均 ")
+        .append(fmt(avg(samples, Sample::mspt))).append(" / 最大 ").append(fmt(msptMax(samples)))
+        .append(" ms\n");
+    sb.append("在线人数：最小 ").append(intMin(samples, Sample::players)).append(" / 最大 ")
+        .append(intMax(samples, Sample::players)).append('\n');
+
+    appendDelta(sb, "改写区块", first.rewritten(), last.rewritten(), seconds);
+    appendDelta(sb, "替换方块", first.blocksReplaced(), last.blocksReplaced(), seconds);
+    appendDelta(sb, "显形发送", first.revealsSent(), last.revealsSent(), seconds);
+    appendDelta(sb, "射线剔除中缺数据", first.rayMissing(), last.rayMissing(), seconds);
+    appendDelta(sb, "实体隐藏", first.entitiesHidden(), last.entitiesHidden(), seconds);
+    appendDelta(sb, "实体恢复", first.entitiesShown(), last.entitiesShown(), seconds);
+    appendDelta(sb, "遮挡判定", first.occlusionComputed(), last.occlusionComputed(), seconds);
+    appendDelta(sb, "磁盘命中", first.diskHits(), last.diskHits(), seconds);
+    appendDelta(sb, "磁盘未命中", first.diskMisses(), last.diskMisses(), seconds);
+    appendDelta(sb, "磁盘载荷被拒", first.diskPayloadRejected(), last.diskPayloadRejected(), seconds);
+
+    sb.append("线程池队列：最小 ").append(intMin(samples, Sample::queueSize)).append(" / 平均 ")
+        .append(String.format(Locale.ROOT, "%.1f", avgInt(samples, Sample::queueSize)))
+        .append(" / 最大 ").append(intMax(samples, Sample::queueSize))
+        .append("（上限 ").append(last.queueCapacity()).append("）；活动线程：最小 ")
+        .append(intMin(samples, Sample::poolActive)).append(" / 最大 ")
+        .append(intMax(samples, Sample::poolActive)).append('\n');
+    sb.append("伪装坐标：最小 ").append(intMin(samples, Sample::indexPositions)).append(" / 最大 ")
+        .append(intMax(samples, Sample::indexPositions)).append("；已显形标记：最小 ")
+        .append(intMin(samples, Sample::revealedPositions)).append(" / 最大 ")
+        .append(intMax(samples, Sample::revealedPositions)).append("；位图 section：最小 ")
+        .append(intMin(samples, Sample::sectionsResident)).append(" / 最大 ")
+        .append(intMax(samples, Sample::sectionsResident)).append('\n');
+    sb.append("期间发生过热重载：").append(reloadDuring ? "是" : "否").append('\n');
+    return sb.toString();
+  }
+
+  private static void appendDelta(StringBuilder sb, String label, long first, long last,
+      double seconds) {
+    long delta = last - first;
+    if (delta < 0) {
+      sb.append(label).append("：计数在窗口内被重置（").append(first).append(" → ").append(last)
+          .append("），增量不可用\n");
+      return;
+    }
+    sb.append(label).append("：+").append(delta).append("（")
+        .append(String.format(Locale.ROOT, "%.1f", delta / seconds)).append("/s）\n");
+  }
+
+  private static String fmt(double value) {
+    return value < 0 ? "不可用" : String.format(Locale.ROOT, "%.2f", value);
+  }
+
+  private static double tpsMin(List<Sample> samples) {
+    double min = Double.MAX_VALUE;
+    for (Sample sample : samples) {
+      if (sample.tps() >= 0) {
+        min = Math.min(min, sample.tps());
+      }
+    }
+    return min == Double.MAX_VALUE ? -1 : min;
+  }
+
+  private static double tpsMax(List<Sample> samples) {
+    double max = -1;
+    for (Sample sample : samples) {
+      max = Math.max(max, sample.tps());
+    }
+    return max;
+  }
+
+  private static double msptMin(List<Sample> samples) {
+    double min = Double.MAX_VALUE;
+    for (Sample sample : samples) {
+      if (sample.mspt() >= 0) {
+        min = Math.min(min, sample.mspt());
+      }
+    }
+    return min == Double.MAX_VALUE ? -1 : min;
+  }
+
+  private static double msptMax(List<Sample> samples) {
+    double max = -1;
+    for (Sample sample : samples) {
+      max = Math.max(max, sample.mspt());
+    }
+    return max;
+  }
+
+  private static double avg(List<Sample> samples, java.util.function.ToDoubleFunction<Sample> getter) {
+    double sum = 0;
+    int count = 0;
+    for (Sample sample : samples) {
+      double value = getter.applyAsDouble(sample);
+      if (value >= 0) {
+        sum += value;
+        count++;
+      }
+    }
+    return count == 0 ? -1 : sum / count;
+  }
+
+  private static int intMin(List<Sample> samples, java.util.function.ToIntFunction<Sample> getter) {
+    int min = Integer.MAX_VALUE;
+    for (Sample sample : samples) {
+      min = Math.min(min, getter.applyAsInt(sample));
+    }
+    return min == Integer.MAX_VALUE ? 0 : min;
+  }
+
+  private static int intMax(List<Sample> samples, java.util.function.ToIntFunction<Sample> getter) {
+    int max = Integer.MIN_VALUE;
+    for (Sample sample : samples) {
+      max = Math.max(max, getter.applyAsInt(sample));
+    }
+    return max == Integer.MIN_VALUE ? 0 : max;
+  }
+
+  private static double avgInt(List<Sample> samples, java.util.function.ToIntFunction<Sample> getter) {
+    long sum = 0;
+    for (Sample sample : samples) {
+      sum += getter.applyAsInt(sample);
+    }
+    return samples.isEmpty() ? 0 : sum / (double) samples.size();
+  }
+
   public String dumpText(String timestamp) {
-    return formatDump(snapshot(), timestamp) + runtimeSection();
+    return dumpText(timestamp, List.of(), 0L, false);
+  }
+
+  /** 带 10 秒采样的转储文本（采样段插在状态面板之后、运行环境之前）。 */
+  public String dumpText(String timestamp, List<Sample> samples, long durationMillis,
+      boolean reloadDuring) {
+    return formatDump(snapshot(), timestamp) + formatSamples(samples, durationMillis, reloadDuring)
+        + runtimeSection();
   }
 
   /** 生成并写入转储文件，返回文件对象（目录不存在会自动创建；超出保留上限时清理最旧的转储）。 */
   public File writeDump() throws IOException {
+    return writeDump(List.of(), 0L, false);
+  }
+
+  /**
+   * 写入带采样段的转储文件。
+   *
+   * @param samples        采样点（至少 2 个才有增量；不足时报告里会注明）
+   * @param durationMillis 采样窗口（毫秒）
+   * @param reloadDuring   窗口内是否发生过热重载（计数被重置时用于解释）
+   */
+  public File writeDump(List<Sample> samples, long durationMillis, boolean reloadDuring)
+      throws IOException {
     String stamp = LocalDateTime.now().format(FILE_STAMP);
     File folder = plugin.getDataFolder();
     if (!folder.isDirectory() && !folder.mkdirs() && !folder.isDirectory()) {
       throw new IOException("无法创建数据目录：" + folder.getAbsolutePath());
     }
-    File file = writeNewDump(folder, stamp, dumpText(stamp));
+    File file = writeNewDump(folder, stamp, dumpText(stamp, samples, durationMillis, reloadDuring));
     int removed = pruneOldDumps(folder, MAX_DUMP_FILES);
     if (removed > 0) {
       // 只做一次 INFO：清理是正常行为，不需要 WARN 级别的噪音

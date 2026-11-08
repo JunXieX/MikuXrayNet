@@ -58,6 +58,9 @@ public final class MikuCommand {
 
   private final MikuXrayNet plugin;
   private final Diagnostics diagnostics;
+  /** dump 采样闸门：两次采样并行会互相拖慢，而且各自写盘。 */
+  private final java.util.concurrent.atomic.AtomicBoolean dumpSampling =
+      new java.util.concurrent.atomic.AtomicBoolean();
 
   public MikuCommand(MikuXrayNet plugin) {
     this.plugin = plugin;
@@ -173,38 +176,76 @@ public final class MikuCommand {
       message(sender, "你没有权限导出诊断（需要 mikuxraynet.dump 或总权限 mikuxraynet.admin）");
       return;
     }
-    if (!submitDump(sender)) {
-      // 提交阶段就失败（插件停用中 / 调度器拒绝）：立刻如实回显，不能让管理员等一个永远不会来的结果
-      message(sender, "诊断转储任务提交失败（调度器不可用），详见服务端日志");
+    if (!dumpSampling.compareAndSet(false, true)) {
+      message(sender, "已有一次诊断采样在进行，请等它完成（约 10 秒）");
       return;
     }
-    message(sender, "正在生成诊断转储（后台线程执行，完成后会回显保存路径）…");
+    startSampling(sender);
   }
 
   /**
-   * 把「生成 + 写盘 + 清理旧转储」提交到异步线程。
+   * 先采样 10 秒再生成转储：单点快照只有累计值，采样能给出每秒速率、峰值与窗口内是否掉 TPS。
    *
-   * @return {@code true} 表示已被调度器受理；{@code false} 表示提交即失败（已记日志，由调用方回显）
+   * <p>采样在全局区域线程按 10 tick 一次推进（只读计数器与 TPS，不做任何计算），
+   * 到点后把样本交给后台线程写盘；期间再次执行 dump 会被拒绝（避免两次采样互相拖慢）。
    */
-  private boolean submitDump(CommandSender sender) {
+  private void startSampling(CommandSender sender) {
+    List<Diagnostics.Sample> samples =
+        java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+    long[] firstNanos = {0L};
+    long reloadAtStart = plugin.lastReloadAt();
+    message(sender, "开始采样 10 秒运行数据（期间请保持服务器运行），完成后会回显保存路径…");
+    try {
+      plugin.getServer().getGlobalRegionScheduler().runAtFixedRate(plugin, task -> {
+        try {
+          if (samples.isEmpty()) {
+            firstNanos[0] = System.nanoTime();
+          }
+          samples.add(diagnostics.sample());
+          long elapsed = System.nanoTime() - firstNanos[0];
+          if (elapsed >= java.util.concurrent.TimeUnit.SECONDS.toNanos(10L)) {
+            task.cancel();
+            finishSampling(sender, samples, elapsed, reloadAtStart);
+          }
+        } catch (Throwable throwable) {
+          task.cancel();
+          dumpSampling.set(false);
+          plugin.getLogger().log(Level.WARNING, "诊断采样失败", throwable);
+          replyToSender(sender, "诊断采样失败：" + describeDumpFailure(throwable) + "（详见服务端日志）");
+        }
+      }, 1L, 10L);
+    } catch (Throwable throwable) {
+      dumpSampling.set(false);
+      plugin.getLogger().log(Level.WARNING, "提交诊断采样任务失败", throwable);
+      replyToSender(sender, "诊断采样任务提交失败（调度器不可用），详见服务端日志");
+    }
+  }
+
+  /** 采样结束：复制样本、交给后台线程写盘，最后回显路径（任何异常都要复位采样闸门）。 */
+  private void finishSampling(CommandSender sender, List<Diagnostics.Sample> samples,
+      long elapsedNanos, long reloadAtStart) {
+    long durationMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
+    boolean reloadDuring = plugin.lastReloadAt() > reloadAtStart;
     try {
       plugin.getServer().getAsyncScheduler().runNow(plugin, scheduled -> {
         String resultLine;
         try {
-          File file = diagnostics.writeDump();
-          resultLine = "诊断转储已写入：" + file.getAbsolutePath();
+          java.io.File file = diagnostics.writeDump(new java.util.ArrayList<>(samples),
+              durationMillis, reloadDuring);
+          resultLine = "诊断转储已写入：" + file.getAbsolutePath()
+              + "（采样 " + (durationMillis / 1000.0D) + " 秒）";
         } catch (Throwable throwable) {
-          // 原因既进日志（带堆栈）也进回显（一行）：「不能静默失败」是这条路径的硬要求，
-          // 而管理员在游戏内看不到日志，只回显「失败」而不给原因等于要他自己去翻文件。
           plugin.getLogger().log(Level.WARNING, "导出诊断转储失败", throwable);
           resultLine = "导出诊断转储失败：" + describeDumpFailure(throwable) + "（详见服务端日志）";
+        } finally {
+          dumpSampling.set(false);
         }
         replyToSender(sender, resultLine);
       });
-      return true;
     } catch (Throwable throwable) {
+      dumpSampling.set(false);
       plugin.getLogger().log(Level.WARNING, "提交诊断转储任务失败", throwable);
-      return false;
+      replyToSender(sender, "诊断转储任务提交失败（调度器不可用），详见服务端日志");
     }
   }
 
