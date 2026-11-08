@@ -2,15 +2,18 @@ package net.mikumc.mikuxraynet.util;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import net.mikumc.mikuxraynet.AntiXrayRuntime;
@@ -25,6 +28,7 @@ import net.mikumc.mikuxraynet.bandwidth.ThrottleStats;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
 import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.bootstrap.ProtocolLibHook;
+import net.mikumc.mikuxraynet.cache.BufferedLinearV3Format;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
@@ -33,6 +37,7 @@ import net.mikumc.mikuxraynet.config.MikuConfig;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import org.bukkit.Bukkit;
+import org.bukkit.World;
 
 /**
  * 诊断聚合入口：把反矿透与带宽各模块暴露的计数器、依赖状态与配置有效值汇总为中文状态面板与转储文件。
@@ -352,8 +357,222 @@ public final class Diagnostics {
   }
 
   /** 拉取实时指标并生成转储文本。 */
+  /**
+   * 运行环境 / 模块接线 / 最近告警 / 最近重载 / 磁盘目录（实例方法：需要读 Bukkit 与插件状态）。
+   *
+   * <p>只收集数据、不下结论：这些值由人（或分析工具）在拿到 dump 后判断。
+   * 任何一项读取失败只影响该行，不中断整份转储。
+   */
+  private String runtimeSection() {
+    StringBuilder sb = new StringBuilder(3072);
+    sb.append('\n').append("---- 运行环境 ----\n");
+    try {
+      sb.append("在线人数：").append(Bukkit.getOnlinePlayers().size()).append('\n');
+    } catch (Throwable ignored) {
+      sb.append("在线人数：（读取失败）\n");
+    }
+    try {
+      double[] tps = Bukkit.getTPS();
+      sb.append("TPS（1m/5m/15m）：")
+          .append(String.format(Locale.ROOT, "%.2f / %.2f / %.2f", tps[0], tps[1], tps[2]))
+          .append("；平均 tick：")
+          .append(String.format(Locale.ROOT, "%.2f ms", Bukkit.getAverageTickTime())).append('\n');
+    } catch (Throwable ignored) {
+      sb.append("TPS：（读取失败）\n");
+    }
+    try {
+      sb.append("视距：view=").append(Bukkit.getViewDistance())
+          .append("，simulation=").append(Bukkit.getSimulationDistance())
+          .append("；世界数=").append(Bukkit.getWorlds().size()).append('\n');
+    } catch (Throwable ignored) {
+      sb.append("视距：（读取失败）\n");
+    }
+    Runtime runtime = Runtime.getRuntime();
+    long mb = 1024L * 1024L;
+    sb.append("堆内存：已用 ").append((runtime.totalMemory() - runtime.freeMemory()) / mb)
+        .append(" MB / 已分配 ").append(runtime.totalMemory() / mb)
+        .append(" MB / 上限 ").append(runtime.maxMemory() / mb).append(" MB")
+        .append("；活动线程：").append(Thread.activeCount()).append('\n');
+    sb.append("系统：").append(System.getProperty("os.name", "?")).append(' ')
+        .append(System.getProperty("os.arch", "?")).append("；CPU：")
+        .append(runtime.availableProcessors()).append(" 核；Java：")
+        .append(System.getProperty("java.version", "?")).append('\n');
+    try {
+      long uptime = ManagementFactory.getRuntimeMXBean().getUptime() / 1000L;
+      sb.append("运行时长（JVM）：").append(formatDuration(uptime)).append('\n');
+    } catch (Throwable ignored) {
+      sb.append("运行时长：（读取失败）\n");
+    }
+    try {
+      int normal = 0;
+      int nether = 0;
+      int end = 0;
+      int other = 0;
+      for (World world : Bukkit.getWorlds()) {
+        int players = world.getPlayers().size();
+        switch (world.getEnvironment()) {
+          case NORMAL -> normal += players;
+          case NETHER -> nether += players;
+          case THE_END -> end += players;
+          default -> other += players;
+        }
+      }
+      sb.append("玩家分布（按维度）：主世界 ").append(normal).append(" / 地狱 ").append(nether)
+          .append(" / 末地 ").append(end).append(" / 其它 ").append(other).append('\n');
+    } catch (Throwable ignored) {
+      sb.append("玩家分布：（读取失败）\n");
+    }
+    try {
+      org.bukkit.plugin.Plugin[] plugins = Bukkit.getPluginManager().getPlugins();
+      StringBuilder list = new StringBuilder();
+      int printed = 0;
+      for (org.bukkit.plugin.Plugin installed : plugins) {
+        if (printed >= 40) {
+          list.append("…");
+          break;
+        }
+        if (printed > 0) {
+          list.append('、');
+        }
+        String version;
+        try {
+          version = installed.getPluginMeta().getVersion();
+        } catch (Throwable ignored) {
+          version = "?";
+        }
+        list.append(installed.getName()).append('=').append(version);
+        printed++;
+      }
+      sb.append("插件（共 ").append(plugins.length).append(" 个）：").append(list).append('\n');
+      appendInstalledVersion(sb, "ProtocolLib");
+      appendInstalledVersion(sb, "packetevents");
+      appendInstalledVersion(sb, "ViaVersion");
+      appendInstalledVersion(sb, "ViaBackwards");
+      appendInstalledVersion(sb, "Geyser-Spigot");
+    } catch (Throwable ignored) {
+      sb.append("插件列表：（读取失败）\n");
+    }
+
+    sb.append('\n').append("---- 模块接线 ----\n");
+    try {
+      AntiXrayRuntime runtimeState = plugin.antiXrayRuntime();
+      if (runtimeState == null) {
+        sb.append("反矿透：未装配\n");
+      } else {
+        sb.append("反矿透：ProtocolLib=").append(yesNo(runtimeState.protocolLibHook() != null))
+            .append("，工作池=").append(yesNo(runtimeState.workPool() != null))
+            .append("，磁盘缓存=").append(yesNo(runtimeState.diskCacheStore() != null))
+            .append("，邻近显形=").append(yesNo(runtimeState.proximityStats() != null))
+            .append("，遮挡仓库=").append(yesNo(runtimeState.occlusionStores() != null)).append('\n');
+      }
+      ThrottlePipeline pipeline = plugin.bandwidthPipeline();
+      sb.append("带宽：").append(pipeline == null ? "未装配" : "已装配").append('\n');
+    } catch (Throwable ignored) {
+      sb.append("模块接线：（读取失败）\n");
+    }
+
+    sb.append('\n').append("---- 最近告警（插件日志，最新在前，最多 32 条）----\n");
+    List<String> warnings = LogBuffer.recent(32);
+    if (warnings.isEmpty()) {
+      sb.append("（无）\n");
+    } else {
+      for (String line : warnings) {
+        sb.append(line).append('\n');
+      }
+    }
+
+    sb.append('\n').append("---- 最近一次热重载 ----\n");
+    try {
+      long at = plugin.lastReloadAt();
+      if (at <= 0) {
+        sb.append("本次启动后未执行\n");
+      } else {
+        sb.append("时间：").append(java.time.LocalDateTime.ofInstant(
+                java.time.Instant.ofEpochMilli(at), java.time.ZoneId.systemDefault())
+            .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))).append('\n');
+        for (String line : plugin.lastReloadResult()) {
+          sb.append(line).append('\n');
+        }
+      }
+    } catch (Throwable ignored) {
+      sb.append("（读取失败）\n");
+    }
+
+    sb.append('\n').append("---- 磁盘缓存目录 ----\n");
+    Path cache = plugin.getDataFolder().toPath().resolve("cache");
+    sb.append("路径：").append(cache).append('\n');
+    long files = 0L;
+    long bytes = 0L;
+    boolean capped = false;
+    try (java.util.stream.Stream<Path> stream = Files.walk(cache)) {
+      Iterator<Path> iterator = stream.iterator();
+      while (iterator.hasNext()) {
+        Path path = iterator.next();
+        if (!Files.isRegularFile(path)) {
+          continue;
+        }
+        files++;
+        try {
+          bytes += Files.size(path);
+        } catch (Throwable ignored) {
+          // 单个文件读不到只少算这一份
+        }
+        if (files >= 20000) {
+          capped = true;
+          break;
+        }
+      }
+    } catch (Throwable ignored) {
+      // 目录不存在 / 无权限：下面按已知信息输出
+    }
+    sb.append("文件数：").append(files).append(capped ? "（已截断，实际更多）" : "")
+        .append("；总大小：")
+        .append(String.format(Locale.ROOT, "%.1f MB", bytes / (1024.0 * 1024.0))).append('\n');
+    try {
+      Path marker = cache.resolve("plugin-version.txt");
+      sb.append("版本标记：")
+          .append(Files.isRegularFile(marker) ? Files.readString(marker).trim() : "（无）")
+          .append("；容器格式版本：0x")
+          .append(String.format(Locale.ROOT, "%02x", BufferedLinearV3Format.VERSION)).append('\n');
+    } catch (Throwable ignored) {
+      sb.append("版本标记：（读取失败）\n");
+    }
+    return sb.toString();
+  }
+
+  /** 事故时长：秒 → 「X 天 Y 小时 Z 分」。 */
+  private static String formatDuration(long seconds) {
+    long days = seconds / 86400L;
+    long hours = (seconds % 86400L) / 3600L;
+    long minutes = (seconds % 3600L) / 60L;
+    if (days > 0) {
+      return days + " 天 " + hours + " 小时 " + minutes + " 分";
+    }
+    if (hours > 0) {
+      return hours + " 小时 " + minutes + " 分";
+    }
+    return minutes + " 分";
+  }
+
+  private static String yesNo(boolean value) {
+    return value ? "是" : "否";
+  }
+
+  /** 已知前置插件的版本（未安装则不输出）。 */
+  private static void appendInstalledVersion(StringBuilder sb, String pluginName) {
+    try {
+      org.bukkit.plugin.Plugin installed = Bukkit.getPluginManager().getPlugin(pluginName);
+      if (installed != null) {
+        sb.append("前置 ").append(pluginName).append('=')
+            .append(installed.getPluginMeta().getVersion()).append('\n');
+      }
+    } catch (Throwable ignored) {
+      // 单个前置读取失败不影响其它行
+    }
+  }
+
   public String dumpText(String timestamp) {
-    return formatDump(snapshot(), timestamp);
+    return formatDump(snapshot(), timestamp) + runtimeSection();
   }
 
   /** 生成并写入转储文件，返回文件对象（目录不存在会自动创建；超出保留上限时清理最旧的转储）。 */
@@ -1042,8 +1261,8 @@ public final class Diagnostics {
     sb.append("服务端：").append(s.env().serverVersion())
         .append(s.env().folia() ? "（Folia 系，区域化多线程）" : "（Paper 系，单主线程）").append('\n');
     sb.append("JVM：").append(s.env().javaVersion()).append('\n');
+    sb.append("插件版本：").append(s.env().pluginVersion()).append('\n');
     sb.append("配置指纹：").append(s.configFingerprint()).append('\n');
-    sb.append('\n');
     for (String line : formatStatus(s)) {
       sb.append(line).append('\n');
     }

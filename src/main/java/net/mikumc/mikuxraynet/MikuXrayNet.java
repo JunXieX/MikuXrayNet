@@ -11,6 +11,7 @@ import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.util.Diagnostics;
+import net.mikumc.mikuxraynet.util.LogBuffer;
 import net.mikumc.mikuxraynet.util.ReloadCoordinator;
 import org.bukkit.Bukkit;
 import org.bukkit.event.EventHandler;
@@ -76,6 +77,9 @@ public final class MikuXrayNet extends JavaPlugin {
   private volatile AntiXrayRuntime runtime;
 
   private final ReloadCoordinator reloadCoordinator = new ReloadCoordinator();
+  /** 最近一次热重载的回显（供 dump 带出：reload 后配置没生效是最常见的反馈之一）。 */
+  private volatile List<String> lastReloadResult = List.of();
+  private volatile long lastReloadAt;
 
   @Override
   public void onLoad() {
@@ -127,6 +131,7 @@ public final class MikuXrayNet extends JavaPlugin {
     });
     new CommandRegistrar(this).register();
     startDiagnosticsTask();
+    LogBuffer.install(getLogger());
     getLogger().info("MikuXrayNet " + pluginVersion() + " 已启用（" + PlatformSupport.platformDescription() + "）");
   }
 
@@ -146,6 +151,11 @@ public final class MikuXrayNet extends JavaPlugin {
     reloadCoordinator.runExclusively(() -> {
       // 逐步兜底：任何一步抛错都不能吞掉后续清理（否则会留下被隐藏的实体/降过的视距/未注销的监听器）。
       // 顺序本身是纪律（先带宽、后反矿透），所以不用 finally 串联，而是各步独立 try/catch。
+      try {
+        LogBuffer.uninstall(getLogger());
+      } catch (Throwable throwable) {
+        getLogger().log(Level.FINE, "摘除诊断日志缓冲失败（忽略）", throwable);
+      }
       try {
         stopDiagnosticsTask();
       } catch (Throwable throwable) {
@@ -286,7 +296,7 @@ public final class MikuXrayNet extends JavaPlugin {
    * @return 中文结果行
    */
   public List<String> reloadConfigs() {
-    return reloadCoordinator.reload(new ReloadCoordinator.Target() {
+    List<String> result = reloadCoordinator.reload(new ReloadCoordinator.Target() {
       @Override
       public int antiXrayFingerprint() {
         return config.antiXray().configHash();
@@ -327,6 +337,19 @@ public final class MikuXrayNet extends JavaPlugin {
         return config.fallbackNote();
       }
     });
+    this.lastReloadResult = List.copyOf(result);
+    this.lastReloadAt = System.currentTimeMillis();
+    return result;
+  }
+
+  /** 最近一次热重载的回显（启动后未执行过时为空列表）。 */
+  public List<String> lastReloadResult() {
+    return lastReloadResult;
+  }
+
+  /** 最近一次热重载的时间戳（毫秒；0 = 本次启动后未执行）。 */
+  public long lastReloadAt() {
+    return lastReloadAt;
   }
 
   /**
