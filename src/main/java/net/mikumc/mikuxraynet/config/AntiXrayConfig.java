@@ -87,14 +87,6 @@ public final class AntiXrayConfig {
     }
   }
 
-  /**
-   * 默认隐藏的容器方块：只保留箱子 {@code chest}（透视端最想找的地下基地/矿洞标志物）。
-   *
-   * <p>桶/熔炉族/漏斗/发射器/投掷器/潜影盒/末影箱/陷阱箱<b>不再默认隐藏</b>：它们可制造、遍布建筑，
-   * 藏它们换来的是到处「假方块」的观感与更高的替换量（按需自行加回 {@code hide-blocks} 即可）。
-   */
-  private static final List<String> CONTAINER_BLOCKS = List.of("chest");
-
   /** 16 种主世界矿石（含深层变体）。 */
   private static final List<String> OVERWORLD_ORES = List.of(
       "coal_ore", "deepslate_coal_ore", "iron_ore", "deepslate_iron_ore",
@@ -103,26 +95,29 @@ public final class AntiXrayConfig {
       "diamond_ore", "deepslate_diamond_ore", "emerald_ore", "deepslate_emerald_ore");
 
   /**
-   * 主世界默认隐藏清单（共 22 种）：16 种主世界矿石 + 3 种粗金属块 + {@code chest}
+   * 主世界默认隐藏清单（共 21 种）：16 种主世界矿石 + 3 种粗金属块
    * + {@code spawner}（刷怪笼）+ {@code mossy_cobblestone}（苔石）。
    *
-   * <p>箱子为方块实体，被伪装 section 内它的方块实体本就会被 {@code remove-block-entities} 剔除，
-   * 与伪装不冲突；粗金属块直接对应富矿脉。刻意不再隐藏：桶/熔炉族/漏斗/发射器/投掷器/潜影盒/末影箱/
-   * 陷阱箱（可制造、遍布建筑）与基岩/黑曜石/黏土（自然结构方块，透视价值低）。
-   * 全部名称已在真机 PE 2.13.0（V_26_2）状态表逐一核实可解析（见 PeRealDataOcclusionTest）。
+   * <p><b>不默认隐藏箱子（含陷阱箱/末影箱）</b>：容器是方块实体，伪装后显形只补方块状态、不补容器数据，
+   * 客户端在「空容器」和「假泥土」之间容易出观感问题；而箱子几乎只出现在玩家自己建的基地里，
+   * 透视价值远低于矿脉。需要藏时在 {@code hide-blocks} 里显式加回即可。
+   *
+   * <p>粗金属块直接对应富矿脉。刻意不再隐藏：桶/熔炉族/漏斗/发射器/投掷器/潜影盒与基岩/黑曜石/黏土
+   * （可制造或自然结构方块，透视价值低）。全部名称已在真机 PE 2.13.0（V_26_2）状态表逐一核实可解析
+   * （见 PeRealDataOcclusionTest）。
    */
   private static final List<String> DEFAULT_NORMAL_HIDE_BLOCKS;
   /**
-   * 地狱默认隐藏清单（共 4 种）：{@code ancient_debris}、{@code nether_gold_ore}、{@code chest}、
-   * {@code spawner}。桶/基岩不再默认隐藏（可制造 / 自然方块，透视价值低）。
+   * 地狱默认隐藏清单（共 3 种）：{@code ancient_debris}、{@code nether_gold_ore}、{@code spawner}。
+   * 桶/基岩/箱子不再默认隐藏（可制造、自然或建筑方块，透视价值低）。
    *
    * <p><b>明确不含 {@code nether_quartz_ore}</b>：地狱石英分布极广、单块价值极低，若把它也全藏，
    * 玩家在地狱会挖到大量「假石头」，观感与效率都不可接受（用户明确要求地狱不隐藏石英矿）。
    */
   private static final List<String> DEFAULT_NETHER_HIDE_BLOCKS;
   /**
-   * 末地默认隐藏清单（共 1 种）：{@code chest}。末地本身无矿物，默认维度整体关闭；
-   * 如需隐藏末地城的箱子再开启 {@code dimensions.the_end.enabled}。
+   * 末地默认隐藏清单：<b>空</b>（末地无矿物，默认维度整体关闭；需要时自行在
+   * {@code dimensions.the_end.hide-blocks} 里填写）。
    */
   private static final List<String> DEFAULT_THE_END_HIDE_BLOCKS;
 
@@ -148,17 +143,14 @@ public final class AntiXrayConfig {
     // ---- 默认隐藏清单（顺序与打包 antixray.yml 保持一致，便于人工对照）----
     List<String> normal = new ArrayList<>(OVERWORLD_ORES);
     normal.addAll(List.of("raw_iron_block", "raw_gold_block", "raw_copper_block"));
-    normal.addAll(CONTAINER_BLOCKS);
     normal.addAll(List.of("spawner", "mossy_cobblestone"));
     DEFAULT_NORMAL_HIDE_BLOCKS = List.copyOf(normal);
 
     List<String> nether = new ArrayList<>(List.of("ancient_debris", "nether_gold_ore"));
-    nether.addAll(CONTAINER_BLOCKS);
     nether.addAll(List.of("spawner"));
     DEFAULT_NETHER_HIDE_BLOCKS = List.copyOf(nether);
 
-    List<String> end = new ArrayList<>(CONTAINER_BLOCKS);
-    DEFAULT_THE_END_HIDE_BLOCKS = List.copyOf(end);
+    DEFAULT_THE_END_HIDE_BLOCKS = List.of();
 
     Map<Dimension, Boolean> enabled = new LinkedHashMap<>();
     enabled.put(Dimension.NORMAL, true);
@@ -459,13 +451,24 @@ public final class AntiXrayConfig {
   public static final int DISK_CACHE_MAX_FILE_SIZE_MB_MAX = 1024;
 
   /**
-   * {@code disk-cache.max-region-files}（磁盘上保留的区域文件数上限）的<b>默认值</b>：4096。
+   * {@code disk-cache.max-region-files}（磁盘上保留的区域文件数上限）的<b>默认值</b>：0（不限制）。
    *
-   * <p>一个区域文件覆盖 32×32 = 1024 个区块，4096 个文件约合 400 万个区块的改写结果；而默认
-   * {@code max-entries} 只有 20000 条，正常运营下先撞到的总是条目上限——本项只是兜住「条目一直没到顶、
-   * 文件却随世界数量持续增长」的情形，避免磁盘被无止境地铺满。
+   * <p>磁盘由服主自备，缓存文件越多命中率越高；文件数本身不占堆（常驻句柄由 idle-close-seconds
+   * 与 bucket-cache-size 约束）。需要控盘时设正整数即可，上限见 {@link #DISK_CACHE_MAX_REGION_FILES_MAX}。
    */
-  public static final int DISK_CACHE_MAX_REGION_FILES_DEFAULT = 4096;
+  public static final int DISK_CACHE_MAX_REGION_FILES_DEFAULT = 0;
+
+  /**
+   * {@code disk-cache.max-open-files}（同时常驻的区域文件句柄上限）的<b>默认值</b>：64。
+   *
+   * <p>每个句柄携带 {@code bucket-cache-size}（默认 32）条已解压条目，约 4~8 MB；64 个约 1 GB 量级。
+   * 这是磁盘缓存常驻内存的主要来源，因此独立于 {@code max-region-files}（磁盘保留文件数）单独可调。
+   * {@code 0} = 不限制（内存随活动范围增长，仅建议在内存充裕时使用）。
+   */
+  public static final int DISK_CACHE_MAX_OPEN_FILES_DEFAULT = 64;
+
+  /** {@code disk-cache.max-open-files} 的安全上限：4096（只拦失控配置）。 */
+  public static final int DISK_CACHE_MAX_OPEN_FILES_MAX = 4096;
 
   /**
    * {@code disk-cache.max-region-files} 的<b>安全上限</b>：65536。
@@ -654,19 +657,37 @@ public final class AntiXrayConfig {
    *                                   {@code ""} = 不校验（默认），非空则下载后校验，不匹配即拒绝使用该 jar
    * @param maxRegionFiles             磁盘上最多保留多少个区域文件（超出按最久未访问淘汰，默认
    *                                   {@link AntiXrayConfig#DISK_CACHE_MAX_REGION_FILES_DEFAULT}，
-   *                                   钳制 16..{@link AntiXrayConfig#DISK_CACHE_MAX_REGION_FILES_MAX}）；
-   *                                   与 {@code maxEntries} 一起界定磁盘占用
+   *                                   钳制 0..{@link AntiXrayConfig#DISK_CACHE_MAX_REGION_FILES_MAX}）；
+   *                                   {@code 0} = 不限制
+   * @param maxOpenFiles               同时常驻的区域文件句柄上限（默认
+   *                                   {@link AntiXrayConfig#DISK_CACHE_MAX_OPEN_FILES_DEFAULT}，
+   *                                   钳制 0..{@link AntiXrayConfig#DISK_CACHE_MAX_OPEN_FILES_MAX}）；
+   *                                   {@code 0} = 不限制。每个句柄携带 bucketCacheSize 条已解压条目，
+   *                                   是磁盘缓存常驻内存的主要来源
    */
   public record DiskCache(boolean enabled, int maxEntries, int maxFileSizeMb, int expireSeconds,
       int bucketCacheSize, int idleCloseSeconds, int maintenanceIntervalSeconds, int compactPerPass,
       int queueCapacity, boolean zstdAutoDownload, String zstdDownloadUrl,
-      int zstdTimeoutSeconds, String zstdSha256, int maxRegionFiles) {
+      int zstdTimeoutSeconds, String zstdSha256, int maxRegionFiles, int maxOpenFiles) {
 
     /**
-     * 不含区域文件上限的构造：按 {@link AntiXrayConfig#DISK_CACHE_MAX_REGION_FILES_DEFAULT} 补齐。
+     * 不含「句柄上限」的构造：按 {@link AntiXrayConfig#DISK_CACHE_MAX_OPEN_FILES_DEFAULT} 补齐。
      *
-     * <p><b>为什么保留</b>：区域文件上限是后加的限额，既有调用点（测试夹具、以及只关心其余键的装配代码）
-     * 仍按原来的 13 个参数构造；没有它，每加一个磁盘限额键都得把所有调用点改一遍。
+     * <p><b>为什么保留</b>：句柄上限是后加的限额，既有调用点仍按原来的参数个数构造；没有它，
+     * 每加一个磁盘限额键都得把所有调用点改一遍。
+     */
+    public DiskCache(boolean enabled, int maxEntries, int maxFileSizeMb, int expireSeconds,
+        int bucketCacheSize, int idleCloseSeconds, int maintenanceIntervalSeconds,
+        int compactPerPass, int queueCapacity, boolean zstdAutoDownload, String zstdDownloadUrl,
+        int zstdTimeoutSeconds, String zstdSha256, int maxRegionFiles) {
+      this(enabled, maxEntries, maxFileSizeMb, expireSeconds, bucketCacheSize, idleCloseSeconds,
+          maintenanceIntervalSeconds, compactPerPass, queueCapacity, zstdAutoDownload,
+          zstdDownloadUrl, zstdTimeoutSeconds, zstdSha256, maxRegionFiles,
+          DISK_CACHE_MAX_OPEN_FILES_DEFAULT);
+    }
+
+    /**
+     * 不含区域文件上限与句柄上限的构造：两者都按内置默认补齐。
      */
     public DiskCache(boolean enabled, int maxEntries, int maxFileSizeMb, int expireSeconds,
         int bucketCacheSize, int idleCloseSeconds, int maintenanceIntervalSeconds,
@@ -674,7 +695,8 @@ public final class AntiXrayConfig {
         int zstdTimeoutSeconds, String zstdSha256) {
       this(enabled, maxEntries, maxFileSizeMb, expireSeconds, bucketCacheSize, idleCloseSeconds,
           maintenanceIntervalSeconds, compactPerPass, queueCapacity, zstdAutoDownload,
-          zstdDownloadUrl, zstdTimeoutSeconds, zstdSha256, DISK_CACHE_MAX_REGION_FILES_DEFAULT);
+          zstdDownloadUrl, zstdTimeoutSeconds, zstdSha256, DISK_CACHE_MAX_REGION_FILES_DEFAULT,
+          DISK_CACHE_MAX_OPEN_FILES_DEFAULT);
     }
   }
 
@@ -1153,14 +1175,17 @@ public final class AntiXrayConfig {
         new DiskCache(
             lenientBoolean(root, "disk-cache.enabled", true, typeAdjustments),
             // 上限见 DISK_CACHE_MAX_ENTRIES_MAX：条目上限直接决定磁盘占用与启动期扫描量。
-            clampCeiling(root.getInt("disk-cache.max-entries", 20000), 1,
+            // 默认 0 = 不限制：磁盘由服主自备，缓存条目越多命中率越高；条目只有在打开的文件里才占内存，
+            // 关句柄即归还（见 DiskCacheStore 的层级说明），所以「不限制」不会让堆随总条目线性增长。
+            // 需要控盘时可设正整数；上限只拦失控配置。
+            clampCeiling(root.getInt("disk-cache.max-entries", 0), 0,
                 DISK_CACHE_MAX_ENTRIES_MAX, "disk-cache.max-entries", floorAdjustments,
                 ceilingAdjustments),
             // 上限见 DISK_CACHE_MAX_FILE_SIZE_MB_MAX：压缩回收会把整个区域文件读进内存重写。
-            // 默认 32 MB 的依据：一个区域文件覆盖 1024 个区块，单条负载约 22~26 KB（改写后区块字节
-            // ~19.8 KB + 坐标表 + 遮挡负载），整区装满约需 24~27 MB；16 MB 只能装下约 2/3 的区块，
-            // 且文件满了以后没有垃圾可回收 → 该区域剩余区块永远无法进缓存、每次重发都要重算。
-            clampCeiling(root.getInt("disk-cache.max-file-size-mb", 32), 1,
+            // 默认 0 = 不限制：一个区域文件覆盖 1024 个区块，装满约 24~27 MB；限制它只会在人多时
+            // 提前停止写入（该区剩余区块再也进不了缓存）。压实时的内存尖峰仍由 compact 的总量闸
+            // （MAX_COMPACT_TOTAL_RAW）兜住，所以「不限制单文件大小」不等于「无界占堆」。
+            clampCeiling(root.getInt("disk-cache.max-file-size-mb", 0), 0,
                 DISK_CACHE_MAX_FILE_SIZE_MB_MAX, "disk-cache.max-file-size-mb", floorAdjustments,
                 ceilingAdjustments),
             // 过期秒数有安全下限（见 DISK_CACHE_EXPIRE_FLOOR_SECONDS）：从写入时刻算的过期时间配得比
@@ -1198,12 +1223,17 @@ public final class AntiXrayConfig {
                 floorAdjustments, ceilingAdjustments),
             // 下载文件的期望 SHA-256：留空 = 不校验（默认）
             zstdSha256(root),
-            // 磁盘上最多保留多少个区域文件（超出按最久未访问淘汰）：与 max-entries 一起界定磁盘占用。
-            // 下限 16 —— 再小的话缓存刚热起来就会被淘汰挤掉，命中率趋近 0（等于白写磁盘）；
+            // 磁盘上最多保留多少个区域文件（超出按最久未访问淘汰）。默认 0 = 不限制：文件数随访问分布
+            // 自然增长，磁盘由服主自备；常驻句柄另由 idle-close-seconds 约束，不受本项影响。
             // 上限见 DISK_CACHE_MAX_REGION_FILES_MAX，只拦失控配置。
             clampCeiling(root.getInt("disk-cache.max-region-files",
-                DISK_CACHE_MAX_REGION_FILES_DEFAULT), 16, DISK_CACHE_MAX_REGION_FILES_MAX,
-                "disk-cache.max-region-files", floorAdjustments, ceilingAdjustments)),
+                DISK_CACHE_MAX_REGION_FILES_DEFAULT), 0, DISK_CACHE_MAX_REGION_FILES_MAX,
+                "disk-cache.max-region-files", floorAdjustments, ceilingAdjustments),
+            // 常驻句柄上限：磁盘缓存内存占用的主旋钮（每句柄约 4~8 MB × bucket-cache-size）。
+            // 默认 64（约 1 GB 量级）；0 = 不限制。
+            clampCeiling(root.getInt("disk-cache.max-open-files",
+                DISK_CACHE_MAX_OPEN_FILES_DEFAULT), 0, DISK_CACHE_MAX_OPEN_FILES_MAX,
+                "disk-cache.max-open-files", floorAdjustments, ceilingAdjustments)),
         PlatformSupport.Mode.parse(root.getString("advanced.platform", "auto")),
         // 未配置时的内置兜底必须与打包 antixray.yml 的默认值保持一致（有单测对照）
         // 上限见 CACHE_MAXIMUM_SIZE_MAX：每条约 20~25 KB，饱和时内存占用与条目数成正比。

@@ -199,11 +199,14 @@ public final class AntiXrayRuntime {
     DiskCacheStore diskCache = null;
     if (diskCacheConfig.enabled()) {
       try {
+        // 插件版本变化 → 旧缓存整体作废：跨版本可能改了负载布局、指纹口径或显形语义，
+        // 继续复用会读到「当前版本看不懂/语义不同」的条目。同版本重启不清（否则缓存永远白写）。
+        File cacheDirectory = new File(plugin.getDataFolder(), "cache");
+        clearCacheOnVersionChange(cacheDirectory.toPath(), pluginVersion(), logger);
         ZstdSupport.initialize(new File(plugin.getDataFolder(), "lib").toPath(),
             diskCacheConfig.zstdAutoDownload(), diskCacheConfig.zstdDownloadUrl(),
             diskCacheConfig.zstdSha256(), diskCacheConfig.zstdTimeoutSeconds(), logger);
-        diskCache = new DiskCacheStore(new File(plugin.getDataFolder(), "cache").toPath(),
-            diskCacheConfig, logger);
+        diskCache = new DiskCacheStore(cacheDirectory.toPath(), diskCacheConfig, logger);
       } catch (Throwable throwable) {
         // 磁盘缓存只是可选加速：zstd 解析（含自动下载写盘）或缓存目录初始化失败时，必须只关掉缓存并
         // 继续启用反矿透与带宽模块。旧实现让异常上抛到 onEnable —— 一个可选的加速层失败会拖垮整个插件。
@@ -481,6 +484,69 @@ public final class AntiXrayRuntime {
     } catch (Throwable throwable) {
       logger.log(Level.WARNING, "关闭磁盘缓存时出现异常（已强制结束）", throwable);
     }
+  }
+
+  /** 插件版本号（读取失败返回空串：此时跳过版本清理，绝不因读不到版本就删缓存）。 */
+  private String pluginVersion() {
+    try {
+      return plugin.getPluginMeta().getVersion();
+    } catch (Throwable throwable) {
+      return "";
+    }
+  }
+
+  /**
+   * 插件版本变化时清空磁盘缓存目录（只留版本标记文件）。
+   *
+   * <p><b>为什么按插件版本而不是只靠格式版本</b>：负载布局、缓存指纹口径、显形语义都可能随版本变化，
+   * 而这些变化不一定体现在容器格式版本号上。跨版本复用旧条目最坏会读到「按旧语义生成」的区块字节。
+   * 代价只是升级后第一次启动缓存为空（命中率随后恢复），远小于正确性风险。
+   *
+   * <p>同版本重启不清空；读不到版本号时跳过；目录被另一个实例占用导致删不掉时只告警、继续使用现有缓存
+   * （不写标记，下次启动再试）。
+   */
+  static void clearCacheOnVersionChange(java.nio.file.Path cacheDirectory, String version,
+      Logger logger) {
+    if (cacheDirectory == null || version == null || version.isBlank()) {
+      return;
+    }
+    try {
+      java.nio.file.Files.createDirectories(cacheDirectory);
+      java.nio.file.Path marker = cacheDirectory.resolve("plugin-version.txt");
+      String previous = java.nio.file.Files.isRegularFile(marker)
+          ? java.nio.file.Files.readString(marker).trim() : "";
+      if (version.equals(previous)) {
+        return;
+      }
+      deleteChildren(cacheDirectory, marker);
+      java.nio.file.Files.writeString(marker, version);
+      logger.info("插件版本" + (previous.isEmpty() ? "（首次记录）" : " " + previous + " → " + version)
+          + "：旧磁盘缓存已清空（避免跨版本缓存内容不一致）");
+    } catch (Throwable throwable) {
+      logger.log(Level.WARNING, "按插件版本清理磁盘缓存失败（继续使用现有缓存）", throwable);
+    }
+  }
+
+  private static void deleteChildren(java.nio.file.Path directory, java.nio.file.Path keep)
+      throws java.io.IOException {
+    try (java.util.stream.Stream<java.nio.file.Path> children = java.nio.file.Files.list(directory)) {
+      for (java.nio.file.Path child : children.toList()) {
+        if (!child.equals(keep)) {
+          deleteRecursively(child);
+        }
+      }
+    }
+  }
+
+  private static void deleteRecursively(java.nio.file.Path path) throws java.io.IOException {
+    if (java.nio.file.Files.isDirectory(path)) {
+      try (java.util.stream.Stream<java.nio.file.Path> children = java.nio.file.Files.list(path)) {
+        for (java.nio.file.Path child : children.toList()) {
+          deleteRecursively(child);
+        }
+      }
+    }
+    java.nio.file.Files.deleteIfExists(path);
   }
 
   /**

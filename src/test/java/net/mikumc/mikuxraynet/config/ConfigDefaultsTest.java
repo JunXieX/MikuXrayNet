@@ -310,8 +310,9 @@ class ConfigDefaultsTest {
     // 2026-09 更新②：新增 obfuscation.remove-block-entities 参与指纹（它直接改变写进缓存的区块负载字节）。
     // 更新③：移除 occlusion.fluid-cover（岩浆改为恒判视觉遮挡，不再是开关）→ 指纹随之变化。
     // 更新④：world-blacklist 迁出为独立配置 blacklist.yml（不再参与 AntiXrayConfig 指纹）→ 指纹随之变化。
+    // 更新⑤：默认隐藏清单移除箱子（主世界 22→21、地狱 4→3、末地→空）→ 指纹随之变化。
     // 以上改动都会使期望值变化、现存磁盘缓存一次性失效重建（属正常）。
-    assertEquals(-519526893, config.configHash(),
+    assertEquals(1488711269, config.configHash(),
         "配置指纹必须是跨进程稳定的固定值（不得混入枚举 identity hash / 随机值）");
     // 同一份内容重复解析必须得到同一个值（同一进程内的自洽性）
     assertEquals(config.configHash(), AntiXrayConfig.from(yaml("""
@@ -347,7 +348,7 @@ class ConfigDefaultsTest {
   }
 
   /**
-   * 默认隐藏清单按维度独立：主世界 22 种、地狱 4 种（<b>不含 nether_quartz_ore</b>）、末地 1 种。
+   * 默认隐藏清单按维度独立：主世界 21 种、地狱 3 种（<b>不含 nether_quartz_ore 与箱子</b>）、末地空。
    *
    * <p>回归用户核心诉求：地狱分布极广、价值极低的石英矿默认不隐藏（否则玩家在地狱到处挖到假石头）。
    */
@@ -362,18 +363,21 @@ class ConfigDefaultsTest {
     List<String> end =
         config.dimensionEffective(AntiXrayConfig.Dimension.THE_END).hideBlocks();
 
-    assertEquals(22, normal.size(),
-        "主世界默认隐藏清单 22 种（16 矿 + 3 粗金属块 + chest + spawner + mossy_cobblestone）：" + normal);
-    assertEquals(4, nether.size(), "地狱默认隐藏清单 4 种（残骸 + 金矿 + chest + 刷怪笼）：" + nether);
-    assertEquals(1, end.size(), "末地默认隐藏清单 1 种（chest）：" + end);
+    assertEquals(21, normal.size(),
+        "主世界默认隐藏清单 21 种（16 矿 + 3 粗金属块 + spawner + mossy_cobblestone，不含箱子）：" + normal);
+    assertEquals(3, nether.size(), "地狱默认隐藏清单 3 种（残骸 + 金矿 + 刷怪笼，不含箱子）：" + nether);
+    assertEquals(0, end.size(), "末地默认隐藏清单为空（末地无矿物，维度默认关闭）：" + end);
 
     assertTrue(normal.contains("spawner"),
         "主世界必须隐藏刷怪笼（真机 PE 26.2 注册名就是 spawner）：" + normal);
     assertTrue(normal.contains("mossy_cobblestone"),
         "主世界必须隐藏苔石（地牢/要塞/矿洞结构的标志物）：" + normal);
-    for (String name : new String[] {"chest", "raw_iron_block", "raw_gold_block", "raw_copper_block"}) {
+    for (String name : new String[] {"raw_iron_block", "raw_gold_block", "raw_copper_block"}) {
       assertTrue(normal.contains(name), "主世界清单必须包含 " + name + "：" + normal);
     }
+    // 箱子不再默认隐藏（容器是方块实体，显形只补方块状态；需要时由服主显式加回）
+    assertFalse(normal.contains("chest"), "主世界默认清单不得含箱子：" + normal);
+    assertFalse(nether.contains("chest"), "地狱默认清单不得含箱子：" + nether);
     // 本轮默认值收紧：这些方块不再默认隐藏（可制造 / 自然结构方块，藏它们只换来到处「假方块」与更高替换量）
     for (String name : new String[] {"trapped_chest", "ender_chest", "barrel", "furnace",
         "blast_furnace", "smoker", "hopper", "dropper", "dispenser", "shulker_box",
@@ -642,12 +646,16 @@ class ConfigDefaultsTest {
     assertTrue(config.proximity().batchRevealSends(),
         "显形包批量合并默认开启（Paper 原生多方块变更包，关掉即回退为逐坐标单包）");
 
-    // disk-cache 全部 14 键
+    // disk-cache 全部 15 键
     assertTrue(config.diskCache().enabled(), "磁盘缓存默认开启");
-    assertEquals(20000, config.diskCache().maxEntries(), "条目总数上限默认 20000");
-    assertEquals(32, config.diskCache().maxFileSizeMb(),
-        "单区域文件上限默认 32 MB：16 MB 装不下一个区域文件的 1024 个区块（单条约 22~26 KB），"
-            + "文件满了没有可回收垃圾时该区域剩余区块将永久无法进缓存");
+    assertEquals(0, config.diskCache().maxEntries(),
+        "条目总数上限默认 0 = 不限制（磁盘由服主自备；条目只在已打开文件里占内存）");
+    assertEquals(0, config.diskCache().maxFileSizeMb(),
+        "单区域文件上限默认 0 = 不限制（压实内存尖峰由总解压量闸门兜住）");
+    assertEquals(0, config.diskCache().maxRegionFiles(),
+        "区域文件数上限默认 0 = 不限制（文件数不占堆，常驻句柄由 max-open-files 约束）");
+    assertEquals(64, config.diskCache().maxOpenFiles(),
+        "常驻句柄默认 64（每个约 4~8 MB 桶缓存，合计约 1 GB 量级；0 = 不限制）");
     assertEquals(7 * 24 * 60 * 60, config.diskCache().expireSeconds(),
         "条目过期默认 7 天（原 1800 秒：从写入时刻算起，配得比两次启动间隔还短 → 重启后条目全过期、"
             + "命中率恒为 0；实机 70 分钟后重启命中 0／未命中 2096）。内容新鲜度由原始字节指纹判定，"

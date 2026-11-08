@@ -218,6 +218,8 @@ public final class DiskCacheStore implements AutoCloseable {
    */
   private final Set<RegionKey> entryCounted = ConcurrentHashMap.newKeySet();
   private final long maxFileSizeBytes;
+
+
   private final long readTimeoutMillis;
   /** flush / 世界失效的等待预算（毫秒）；生产为 {@link #FLUSH_WAIT_MILLIS}，测试可放宽。 */
   private final long flushWaitMillis;
@@ -283,7 +285,8 @@ public final class DiskCacheStore implements AutoCloseable {
     this.logger = logger;
     this.readTimeoutMillis = Math.max(1L, readTimeoutMillis);
     this.flushWaitMillis = Math.max(1L, flushWaitMillis);
-    this.maxFileSizeBytes = Math.max(1L, config.maxFileSizeMb()) * 1024L * 1024L;
+    // 0 表示不限制单文件大小（磁盘换命中率）；压实时的内存尖峰仍由 compact 的总解压量闸门兜住。
+    this.maxFileSizeBytes = config.maxFileSizeMb() <= 0 ? 0L : (long) config.maxFileSizeMb() * 1024L * 1024L;
     this.executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
       Thread thread = new Thread(() -> {
         // 由磁盘线程自身写入身份标记：只有在磁盘线程内执行时才为 true，外来线程无法伪造（见 DISK_THREAD）
@@ -401,7 +404,9 @@ public final class DiskCacheStore implements AutoCloseable {
       stats.rejectedByCapacity.increment();
       return;
     }
-    if (approximateEntries.get() >= config.maxEntries()) {
+    // max-entries <= 0 表示不限制（磁盘换命中率：条目不淘汰，内存只保留「已打开文件」的桶，
+    // 不随总条目线性增长）。
+    if (config.maxEntries() > 0 && approximateEntries.get() >= config.maxEntries()) {
       // 已达条目上限即拒绝写入（不区分「新条目」与「覆盖已有条目」）。
       //
       // 曾考虑放行「覆盖已有条目」以免缓存停止更新，但唯一可靠的判据（该区块是否已有条目）只存在于
@@ -640,7 +645,7 @@ public final class DiskCacheStore implements AutoCloseable {
     long projectedBucketBytes = handle.file.encodedBucketSizeEstimateAfterPut(chunkIndex, payload.length);
     long projectedFileBytes = handle.file.sizeBytes() + handle.pendingBytes
         - pendingBucketBytes[bucket] + projectedBucketBytes;
-    if (projectedFileBytes >= maxFileSizeBytes) {
+    if (maxFileSizeBytes > 0 && projectedFileBytes >= maxFileSizeBytes) {
       stats.rejectedBySize.increment();
       return;
     }
@@ -1157,9 +1162,27 @@ public final class DiskCacheStore implements AutoCloseable {
    * 压缩中的句柄一律跳过——它正独占该文件，此时关闭通道会让压缩失败。
    */
   private void evictRegionFilesIfNeeded() {
-    int limit = Math.max(1, config.maxRegionFiles());
-    int excess = open.size() - limit;
-    if (excess <= 0) {
+    // ① 磁盘文件数上限（用户配置；0 = 不限制，不删任何文件）。
+    int diskLimit = config.maxRegionFiles();
+    if (diskLimit > 0) {
+      evictOpenHandles(diskLimit, true);
+    }
+    // ② 常驻句柄上限（disk-cache.max-open-files，默认 64，0 = 不限制）：<b>只关句柄、不删文件</b>。
+    // 句柄携带每文件 bucket-cache-size 条已解压条目（约 4~8 MB），是磁盘缓存常驻内存的主旋钮；
+    // 磁盘可以无限大，但「300 秒内访问过的每个区域文件都保持打开」会随活动范围无界涨内存。
+    int handleLimit = config.maxOpenFiles();
+    if (handleLimit > 0) {
+      evictOpenHandles(handleLimit, false);
+    }
+  }
+
+  /**
+   * 把当前打开的句柄压到 {@code limit} 个以内，按「最久未访问」优先。
+   *
+   * @param deleteFile true = 同时删除磁盘文件（磁盘文件数上限）；false = 只关句柄释放内存
+   */
+  private void evictOpenHandles(int limit, boolean deleteFile) {
+    if (limit <= 0 || open.size() <= limit) {
       return;
     }
     int before = open.size();
@@ -1182,8 +1205,7 @@ public final class DiskCacheStore implements AutoCloseable {
         // 全部句柄都在压缩中：本轮放弃，等下一次打开或维护周期再试（容量暂时超标可接受）
         return;
       }
-      // deleteFile=true：这才是「真正的磁盘回收」——只关句柄不删文件等于没回收（见 removeAndClose 说明）。
-      removeAndClose(victimKey, victim, true);
+      removeAndClose(victimKey, victim, deleteFile);
       if (open.size() >= before) {
         // 兜底：removeAndClose 未能摘除（句柄已被别处移除等），避免死循环
         return;
