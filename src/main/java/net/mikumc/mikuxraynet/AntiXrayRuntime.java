@@ -13,6 +13,7 @@ import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
 import net.mikumc.mikuxraynet.antixray.OcclusionPatchListener;
 import net.mikumc.mikuxraynet.antixray.ProximityRevealer;
+import net.mikumc.mikuxraynet.antixray.PlayerWorldIndex;
 import net.mikumc.mikuxraynet.antixray.ProximityStats;
 import net.mikumc.mikuxraynet.antixray.RevealedSet;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
@@ -161,6 +162,9 @@ public final class AntiXrayRuntime {
     // 遮挡位图恒建：它是实体剔除与邻近显形可见性判定的唯一数据源（原生命中射线已移除）。
     // 数据仓库在此创建并交给改写链路写入（ObfuscationProcessor#captureOcclusion）；
     // 带宽侧的遮挡判定引擎只读消费（见 ThrottlePipeline），显形侧只读消费（见 ProximityRevealer）。
+    // 玩家世界名快照：封包线程上的三个出站监听器只查这张表，不读 player.getWorld()
+    // （Folia 会抛 No currently ticking region，导致变更注销失败、显形发回旧状态）。
+    PlayerWorldIndex.start(plugin);
     OcclusionStores occlusionStores = new OcclusionStores();
     ObfuscationProcessor processor = ObfuscationProcessor.create(codec, registry, antiXray, logger,
         new ObfuscationProcessor.PaletteOptions(paletteUsable && palette.strictVerify(),
@@ -554,6 +558,7 @@ public final class AntiXrayRuntime {
    * 注销封包拦截 → 停邻近显形 → 关磁盘缓存 → 关工作池 → 停直通名单。
    */
   void stopForDisable() {
+    PlayerWorldIndex.stop();
     if (protocolLibHook != null) {
       // 先停区块改写：之后不会再有坐标被写进显形索引
       protocolLibHook.unregister();

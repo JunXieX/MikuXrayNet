@@ -12,6 +12,18 @@ public interface RegistryAccessor {
 
   int getUniqueBlockStateCount();
 
+  /**
+   * 调色板反查表（{@code byValue}）的容量：<b>必须覆盖服务端可能下发的全部状态 id</b>，而不只是
+   * PacketEvents 能映射的 vanilla 状态数。
+   *
+   * <p>原因：装了自定义方块插件（如 CraftEngine）的服务端会在 vanilla 之后追加状态 id，调色板里会读到
+   * 超出 vanilla 映射的 id。若反查表按 vanilla 数量建，解码会越界抛异常，整个区块被 fail-open（矿全部裸露）。
+   * 默认取 {@link #getUniqueBlockStateCount()}；平台实现可放大到探测扫描上限。
+   */
+  default int paletteCapacity() {
+    return getUniqueBlockStateCount();
+  }
+
   int getMaxBitsPerBlockState();
 
   boolean isAir(int blockId);

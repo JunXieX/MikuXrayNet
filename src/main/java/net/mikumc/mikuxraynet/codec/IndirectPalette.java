@@ -40,7 +40,8 @@ public class IndirectPalette implements Palette {
     this.chunkSection = chunkSection;
 
     // byValue 由 scratch 复用、内容未初始化：不做整表 memset，命中与否交由 byId 反查校验（见类注释）
-    this.byValue = chunkSection.scratch().bytes(chunkSection.registryAccessor().getUniqueBlockStateCount());
+    // 容量必须覆盖自定义方块状态 id（见 RegistryAccessor#paletteCapacity）
+    this.byValue = chunkSection.scratch().bytes(chunkSection.registryAccessor().paletteCapacity());
     this.byId = new int[1 << bitsPerValue];
   }
 

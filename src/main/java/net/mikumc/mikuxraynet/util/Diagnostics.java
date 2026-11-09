@@ -374,12 +374,18 @@ public final class Diagnostics {
     try {
       double[] tps = Bukkit.getTPS();
       sb.append("TPS（1m/5m/15m）：")
-          .append(String.format(Locale.ROOT, "%.2f / %.2f / %.2f", tps[0], tps[1], tps[2]))
-          .append("；平均 tick：")
-          .append(String.format(Locale.ROOT, "%.2f ms", Bukkit.getAverageTickTime())).append('\n');
+          .append(String.format(Locale.ROOT, "%.2f / %.2f / %.2f", tps[0], tps[1], tps[2]));
     } catch (Throwable ignored) {
-      sb.append("TPS：（读取失败）\n");
+      sb.append("TPS：（读取失败）");
     }
+    try {
+      // 与 TPS 分开读：部分服务端分支（如 Shiroha）没有 getAverageTickTime，合在一起会把 TPS 一起吞掉
+      sb.append("；平均 tick：")
+          .append(String.format(Locale.ROOT, "%.2f ms", Bukkit.getAverageTickTime()));
+    } catch (Throwable ignored) {
+      sb.append("；平均 tick：（读取失败）");
+    }
+    sb.append('\n');
     try {
       sb.append("视距：view=").append(Bukkit.getViewDistance())
           .append("，simulation=").append(Bukkit.getSimulationDistance())
@@ -1568,6 +1574,8 @@ public final class Diagnostics {
     sb.append("disk-cache.enabled=").append(c.diskCache().enabled())
         .append("，max-entries=").append(c.diskCache().maxEntries())
         .append("，max-file-size-mb=").append(c.diskCache().maxFileSizeMb())
+        .append("，max-region-files=").append(c.diskCache().maxRegionFiles())
+        .append("，max-open-files=").append(c.diskCache().maxOpenFiles())
         .append("，expire-seconds=").append(c.diskCache().expireSeconds()).append('\n');
     sb.append("disk-cache.bucket-cache-size=").append(c.diskCache().bucketCacheSize())
         .append("，idle-close-seconds=").append(c.diskCache().idleCloseSeconds())

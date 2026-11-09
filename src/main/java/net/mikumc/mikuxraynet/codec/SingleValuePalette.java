@@ -49,7 +49,8 @@ public class SingleValuePalette implements Palette {
     // 否则负值/超大值会一路传到 ObfuscationProcessor 的 targets BitSet（BitSet.get(-1) 抛异常），
     // 或被当成合法 id 去下标字节表——两种结果都让<b>整个区块</b> fail-open（原字节放行、矿全部裸露）。
     // 这里按 fail-open 约定早失败：异常由上层解码兜底，只拒绝这一个 section。
-    int registry = this.chunkSection.registryAccessor().getUniqueBlockStateCount();
+    // 用调色板容量而非 vanilla 状态数：自定义方块 id 可能超出 vanilla 映射（见 RegistryAccessor#paletteCapacity）
+    int registry = this.chunkSection.registryAccessor().paletteCapacity();
     if (read < 0 || read >= registry) {
       throw new IndexOutOfBoundsException(
           "block state id out of range: " + read + " (registry " + registry + ")");

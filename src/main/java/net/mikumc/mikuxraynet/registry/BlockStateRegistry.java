@@ -176,11 +176,13 @@ public final class BlockStateRegistry implements RegistryAccessor {
       warnUncertainProbe(count, width, logger);
     }
 
-    BitSet airStates = new BitSet(count);
-    BitSet fluidStates = new BitSet(count);
-    BitSet occludingStates = new BitSet(count);
+    // 位图容量按探测上限建，而不是按 vanilla 状态数：自定义方块（CraftEngine 等）的 id 会超出 vanilla 映射，
+    // 按 count 建会让 targets.get(id) 越界、调色板解码失败，最终整块 fail-open。
+    BitSet airStates = new BitSet(MAX_STATE_SCAN);
+    BitSet fluidStates = new BitSet(MAX_STATE_SCAN);
+    BitSet occludingStates = new BitSet(MAX_STATE_SCAN);
     // 实体口径 = 逐状态真值（不含 extra-* 覆盖）；与伪装口径同源，仅差覆盖表。
-    BitSet entityOccludingStates = new BitSet(count);
+    BitSet entityOccludingStates = new BitSet(MAX_STATE_SCAN);
     int truthCount = 0;
     int fallbackCount = 0;
     int overrideHitCount = 0;
@@ -315,7 +317,17 @@ public final class BlockStateRegistry implements RegistryAccessor {
     return ids == null ? EMPTY_IDS : ids.clone();
   }
 
+  /**
+   * 调色板反查表容量：取探测扫描上限，覆盖「vanilla 之后追加的自定义方块状态」。
+   *
+   * <p>内存代价：每个 section 的 {@code byValue} 由 32 KB 级变为 256 KB 级，按线程 scratch 复用，
+   * 4 个工作线程合计约 24 MB——远小于「整块 fail-open 导致矿全部裸露」的代价。
+   */
   @Override
+  public int paletteCapacity() {
+    return MAX_STATE_SCAN;
+  }
+
   public int getUniqueBlockStateCount() {
     return uniqueBlockStateCount;
   }

@@ -222,7 +222,7 @@ public final class ObfuscationProcessor {
      */
     static WorldProfile resolve(BlockStateRegistry registry, AntiXrayConfig.EffectiveObfuscation effective,
         Logger logger, String label) {
-      BitSet targets = new BitSet(registry.getUniqueBlockStateCount());
+      BitSet targets = new BitSet(registry.paletteCapacity());
       List<String> resolvedTargets = new ArrayList<>();
       for (String name : effective.hideBlocks()) {
         // hide-blocks 填的是「方块注册名」，语义上要隐藏该方块的**全部状态**（箱子有 24 种朝向/含水

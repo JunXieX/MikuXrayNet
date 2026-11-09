@@ -726,14 +726,9 @@ public final class OcclusionPatchListener extends PacketAdapter {
     }
   }
 
-  /** 世界名（封包线程读取一个不可变字符串，不触碰任何世界对象内容）。 */
+  /** 世界名：只查玩家世界快照；封包线程不读 {@code player.getWorld()}（Folia 会抛 No currently ticking region）。 */
   private static String worldNameOf(Player player) {
-    try {
-      World world = player.getWorld();
-      return world == null ? null : world.getName();
-    } catch (Throwable throwable) {
-      return null;
-    }
+    return player == null ? null : PlayerWorldIndex.worldName(player.getUniqueId());
   }
 
   private void logThrottled(Throwable throwable) {
