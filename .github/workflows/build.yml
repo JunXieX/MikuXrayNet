@@ -59,11 +59,11 @@ jobs:
         run: |
           VER="${GITHUB_REF_NAME#v}"
           echo "title=MikuXrayNet ${VER}" >> "$GITHUB_OUTPUT"
-          # 版本规则（大版本.正式版.测试版）：第三位 > 0 视为测试版（预发布），= 0 为正式版
-          PATCH="${VER##*.}"
-          case "$PATCH" in
-            0) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
-            *) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+          # 版本规则：只有显式后缀（-alpha / -beta / -rc 等）才是预发布；
+          # 纯数字 x.y.z 一律正式版（1.30.5 这类补丁版也是正式版，自动置为 Latest）。
+          case "$VER" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
           esac
           # 更新日志：取该 tag 所指提交的正文（%(contents:body)；打轻量 tag 时会回落到提交正文）。
           # 约定：发版提交（release: 发布正式版 x.y.z / 测试版）的正文就是本次更新日志。
