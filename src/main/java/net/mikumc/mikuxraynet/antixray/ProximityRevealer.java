@@ -2377,8 +2377,7 @@ public final class ProximityRevealer implements Listener {
    */
   @EventHandler(ignoreCancelled = true)
   public void onBlockDamage(BlockDamageEvent event) {
-    if (stopping || !proximity.preRevealOnDig() || !proximity.raycastEnabled()
-        || !instant.enabled() || instant.maxPerTick() <= 0) {
+    if (stopping || !instant.enabled() || instant.maxPerTick() <= 0) {
       return;
     }
     Player player = event.getPlayer();
@@ -2391,10 +2390,69 @@ public final class ProximityRevealer implements Listener {
       int x = block.getX();
       int y = block.getY();
       int z = block.getZ();
-      if (!digDedupAllows(player.getUniqueId(), x, y, z, Bukkit.getCurrentTick())) {
+      // 兜底先做：正在挖的这一格必须已经是真实方块。显形要经过「巡检周期 → 工作线程规划 →
+      // 回投玩家线程」，快速挖掘时这段延迟比挖穿一格还长，客户端会一直画着伪装方块直到空气包到达，
+      // 结果就是「挖玄武岩掉下界残骸」。这里在方块尚未破坏时同 tick 补发真实状态。
+      revealDigTarget(player, x, y, z);
+      if (!proximity.preRevealOnDig() || !proximity.raycastEnabled()
+          || !digDedupAllows(player.getUniqueId(), x, y, z, Bukkit.getCurrentTick())) {
         return;
       }
       revealAfterDig(player, x, y, z);
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /**
+   * 挖掘兜底：玩家开始挖某格时，若该格仍是伪装坐标，立刻把真实状态发给他。
+   *
+   * <p><b>为什么需要</b>：正常路径要经过「巡检周期（默认 4 tick）→ 工作线程规划 → 回投玩家线程 → 发包」，
+   * 合计 250~400 ms；效率镐/急迫下挖穿一格只要 50~200 ms。玩家看到伪装方块被挖掉、却掉了真实物品，
+   * 过程与结果不一致。这里在开始挖（方块尚未破坏）的同 tick 补发一次真实状态，玩家在挖掘动画期间
+   * 先看到真方块，破坏后掉落与所见一致。
+   *
+   * <p><b>安全边界</b>：只处理「玩家正在挖的那一格」——不扩大半径、不做视线判定（他正在挖它，必然可见），
+   * 因此不会造成隔墙透视；已显形、非伪装坐标、跨 region、未加载区块一律跳过。
+   */
+  private void revealDigTarget(Player player, int x, int y, int z) {
+    try {
+      if (stopping || !player.isOnline()) {
+        return;
+      }
+      if (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId())) {
+        return;
+      }
+      World world = player.getWorld();
+      if (world == null || !shouldRevealInWorld(world.getName())) {
+        return;
+      }
+      if (chunkIndex == null || revealedSet == null) {
+        return;
+      }
+      if (!ownsChunk(world, x >> 4, z >> 4) || !world.isChunkLoaded(x >> 4, z >> 4)) {
+        return;
+      }
+      UUID playerId = player.getUniqueId();
+      ChunkKey key = ChunkKey.ofBlock(world.getName(), x, z);
+      if (!chunkIndex.containsPosition(key, x, y, z)) {
+        return; // 不是伪装坐标：客户端本来显示的就是真实方块
+      }
+      if (revealedSet.contains(playerId, key, x, y, z)) {
+        return; // 已经显形
+      }
+      long tick = Bukkit.getCurrentTick();
+      int granted = instantQuota.claim(playerId, tick, 1, 1);
+      if (granted <= 0) {
+        return;
+      }
+      Budget budget = new Budget(granted);
+      PassTally tally = new PassTally();
+      RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
+      // eye=null + visibilityInPlan=true：跳过位图判定，按当前真实状态直发（玩家正在挖它，必然可见）
+      sendOne(player, world, x, y, z, null, budget, tally, batch, true);
+      flushBatch(player, batch, tally);
+      instantQuota.release(playerId, tick, 1, granted, tally.sent);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
