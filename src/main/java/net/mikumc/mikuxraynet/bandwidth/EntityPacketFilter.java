@@ -32,6 +32,7 @@ import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.world.WorldUnloadEvent;
@@ -335,7 +336,10 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
    * 同理也不在这里动 {@code rebuildChunkCursors}——它每完成一轮覆盖就整体 {@code clear()}，
    * 本身不随卸载增长，无需在此处理（且与游标字段一样已是并发容器，跨线程动它也不会坏）。
    */
-  @EventHandler
+  // MONITOR + ignoreCancelled：与反矿透侧同一纪律——世界卸载可被其它插件取消；被取消时世界仍然加载，
+  // 若照常清表，该世界的实体类型索引会消失，白名单实体（盔甲架/展示框）的零位移包会被误取消，
+  // 姿态卡住直到索引被兜底重建。
+  @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
   public void onWorldUnload(WorldUnloadEvent event) {
     try {
       entityTypeIndex.remove(event.getWorld().getName());
