@@ -23,7 +23,6 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Consumer;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.antixray.SectionCoords;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
@@ -514,35 +513,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * @return 是否确有缓冲被丢弃
    */
   boolean discardPending(UUID playerId) {
-    return discardPendingFor(pending, playerId, this::discard);
-  }
-
-  /**
-   * 「按玩家丢弃待发缓冲」的<b>纯逻辑</b>：取出该玩家的缓冲并交给 {@code disposer}。
-   *
-   * <p><b>为什么抽成包级静态方法</b>：离线单测不构造本类（避免初始化 ProtocolLib 的 {@code PacketType}、
-   * 起冲刷线程、伪造 {@code PacketEvent}/{@code AsyncMarker}），只驱动这条路由逻辑——按 uuid <b>精确</b>
-   * 取到该玩家的缓冲、交给丢弃回调、其它玩家不受影响、重复调用幂等。事件处理器只做一行转发，
-   * 因此这里测到的就是切维丢弃的全部判定逻辑。
-   *
-   * <p>签名用泛型而不出现 {@code Pending}：单测可用任意值类型驱动，不必为了测一行路由把私有缓冲类型
-   * 暴露出去；生产调用点传的就是 {@code Pending}。另外本方法<b>没有任何发包入口</b>（不收
-   * ProtocolManager/Player），因此「切维时绝不发送合并包」由签名本身保证。
-   *
-   * @param buffers  待发缓冲表（生产为 {@link #pending}）
-   * @param playerId 玩家
-   * @param disposer 真正的丢弃动作（生产为 {@link #discard(Pending)}）
-   * @return 是否确有缓冲被丢弃
-   */
-  static <B> boolean discardPendingFor(Map<UUID, B> buffers, UUID playerId, Consumer<B> disposer) {
-    if (buffers == null || playerId == null || disposer == null) {
+    Pending target = pending.get(playerId);
+    if (target == null) {
       return false;
     }
-    B buffer = buffers.get(playerId);
-    if (buffer == null) {
-      return false;
-    }
-    disposer.accept(buffer);
+    discard(target);
     return true;
   }
 
@@ -885,8 +860,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         // 窗口已冲刷：缓冲内容已定型（本次记录再无处生效），跳过
         return;
       }
-      // 上限闸：超限即整体清空（只可能让窗口到期时把某个坐标的旧态再下发一次，不影响正确性）。
-      // 放在循环前判断，避免「先涨到上限再多加一批」这种瞬时超额。
+      // 上限闸：超限即整体清空重来（只可能让窗口到期时把某个坐标的旧态再下发一次，不影响正确性）。
+      // 近似有界：单批 updates 本身可能远超上限，清空后整批加入仍会瞬时超额，下一次调用才再清。
       if (target.passed.size() + updates.size() > target.passedLimit) {
         target.passed.clear();
       }

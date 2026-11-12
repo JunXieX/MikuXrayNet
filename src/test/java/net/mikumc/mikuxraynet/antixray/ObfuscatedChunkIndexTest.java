@@ -42,7 +42,7 @@ class ObfuscatedChunkIndexTest {
   private final long[] clock = {0L};
 
   private ObfuscatedChunkIndex index(int maxPositions, long expireNanos) {
-    return new ObfuscatedChunkIndex(maxPositions, expireNanos, () -> clock[0]);
+    return new ObfuscatedChunkIndex(maxPositions, () -> clock[0]);
   }
 
   /** 由世界内绝对方块坐标算出区块内相对坐标编码（{@code 相对Y << 8 | z << 4 | x}）。 */
@@ -171,7 +171,7 @@ class ObfuscatedChunkIndexTest {
     int c = local(MIN_HEIGHT, 3, 64, 1);
 
     index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {a, b, c});
-    assertTrue(index.removePosition(WORLD, 1, 64, 1), "前置：摘除 a");
+    assertEquals(1, index.removePositions(WORLD, new int[] {1, 64, 1}, 1), "前置：摘除 a");
 
     // 覆盖为 {b, d}：旧清单是 {b, c}（a 已被摘除）→ 差集 = 旧有而新无 = {c}；d 是新增不得入差集
     int d = local(MIN_HEIGHT, 4, 64, 1);
@@ -249,11 +249,11 @@ class ObfuscatedChunkIndexTest {
         local(MIN_HEIGHT, 1, 11, 1)};
     index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, locals);
 
-    assertTrue(index.removePosition(WORLD, 2, 10, 1), "方块变更：命中并摘除该坐标");
-    assertFalse(index.removePosition(WORLD, 2, 10, 1), "重复摘除必须返回 false");
+    assertEquals(1, index.removePositions(WORLD, new int[] {2, 10, 1}, 1), "方块变更：命中并摘除该坐标");
+    assertEquals(0, index.removePositions(WORLD, new int[] {2, 10, 1}, 1), "重复摘除必须返回 0");
     assertEquals(2, index.positionCount(), "同区块其它坐标不受影响");
     assertEquals(1, index.chunkCount(), "清单非空，条目保留");
-    assertFalse(index.removePosition(WORLD, 30, 10, 1), "其它区块的坐标不命中");
+    assertEquals(0, index.removePositions(WORLD, new int[] {30, 10, 1}, 1), "其它区块的坐标不命中");
     assertEquals(2, index.positionCount());
   }
 
@@ -262,7 +262,7 @@ class ObfuscatedChunkIndexTest {
     ObfuscatedChunkIndex index = index(1_000_000, 60 * SECOND_NANOS);
     index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(MIN_HEIGHT, 1, 10, 1)});
 
-    assertTrue(index.removePosition(WORLD, 1, 10, 1));
+    assertEquals(1, index.removePositions(WORLD, new int[] {1, 10, 1}, 1));
     assertEquals(0, index.positionCount());
     assertEquals(0, index.chunkCount(), "空清单必须整条摘除");
     assertNull(index.entry(new ChunkKey(WORLD, 0, 0)));
@@ -318,32 +318,6 @@ class ObfuscatedChunkIndexTest {
     assertEquals(1L, index.registeredChunks() - index.invalidatedChunks(),
         "「累计登记 − 卸载清理」应等于当前驻留区块数（安全阀 0 时）");
     assertEquals(1, index.chunkCount(), "当前驻留区块数");
-  }
-
-  @Test
-  void entriesExpireAfterWindowUnlessScanned() {
-    long window = 10 * SECOND_NANOS;
-    ObfuscatedChunkIndex index = index(1_000_000, window);
-    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, positions(2));
-
-    clock[0] = 9 * SECOND_NANOS;
-    index.expire();
-    assertEquals(1, index.chunkCount(), "窗口内不应清理");
-
-    clock[0] = 10 * SECOND_NANOS;
-    index.expire();
-    assertEquals(1, index.chunkCount(), "恰好到达窗口边界仍保留");
-
-    // 扫描一次（entry 会刷新活跃时间）→ 过期窗口重新计时
-    assertNotNull(index.entry(new ChunkKey(WORLD, 0, 0)));
-    clock[0] = 19 * SECOND_NANOS;
-    index.expire();
-    assertEquals(1, index.chunkCount(), "被扫描到的条目必须刷新活跃时间，不得被误清");
-
-    clock[0] = 20 * SECOND_NANOS + 1;
-    index.expire();
-    assertEquals(0, index.chunkCount(), "长期未被扫描的条目必须清理（兜底）");
-    assertEquals(0, index.positionCount());
   }
 
   // ------------------------------------------------------------------ 安全阀

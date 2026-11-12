@@ -37,7 +37,7 @@ import org.bukkit.plugin.Plugin;
 
 /**
  * ProtocolLib 异步区块监听器：反矿透区块改写链路的封包拦截入口
- * （另有 {@link BlockChangeRevealListener} 注册异步出站方块变更监听，用于注销伪装坐标与推进缓存代次）。
+ * （另有 {@link BlockChangeRevealListener} 注册同步出站方块变更监听，用于注销伪装坐标与推进缓存代次）。
  *
  * <p>线程模型：网络线程（本监听回调）只做「读坐标 → 建任务 → 登记延迟 → 入队」，
  * 解码/判定/重编码全部交给 {@link MikuWorkPool} 的工作线程；工作线程不触碰任何 Bukkit API。
@@ -55,7 +55,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** 未配对的批次闸门数量上限（异常情况下防止无界增长）。 */
   private static final int MAX_PENDING_BATCHES = 256;
 
-  /** 空字节数组：未改写区块的磁盘负载不带区块字节（见 {@code rewrite} 的写入点）。 */
   /**
    * 未配对批次闸门表：按插入序持有，超限时<b>只淘汰最旧的一个</b>，玩家退出时按 UUID 清理。
    *
@@ -534,15 +533,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       int releaseChunkZ = accessor.chunkZ();
       // 持包时刻的变更序号：放行时若已前进，说明这段时间该区块可能又被改过，需要补发（见 changeJournal）。
       long capturedChanges = changeJournal.sequence();
-      // 持包期间被改过的格子（绝大多数区块为空）：必须与区块包在同一次收包批次里补发。
-      // 旧实现把补发投递到下一 tick，客户端会先按旧区块字节渲染一帧、再被补发纠正——真机观感就是
-      // 「刚放/刚挖的那一格闪一下」。现在只要本区块有在途变更，就把放行动作整体挪到玩家线程：
-      // 放行区块包后紧接着读当前方块并发补发，两包同一 tick 到达，客户端只渲染一次。
-      List<int[]> heldChanges = changeJournal.changedSince(capturedChanges, releaseWorld,
-          releaseChunkX, releaseChunkZ);
       // 放行动作本身（由 RewriteTask 在改写完成 / 超时 / 失败时触发一次）：
-      // 有在途变更时切到玩家线程连续执行「放行 + 补发」，无变更时在封包线程直接放行。
+      // 在途变更必须在「放行时」求值——建任务时序号刚取完，changedSince 此刻恒为空；只有等改写
+      // 完成（1~10ms 后）真正放行时再查，才能拿到持包期间被改过的格子。有变更时切到玩家线程连续
+      // 执行「放行 + 补发」（两包同一 tick 到达，客户端只渲染一次），无变更时在封包线程直接放行。
       Runnable delivery = () -> {
+        List<int[]> heldChanges = changeJournal.changedSince(capturedChanges, releaseWorld,
+            releaseChunkX, releaseChunkZ);
         Runnable releaseOnPacketThread = () -> completeRelease(player, event, gate, releaseWorld,
             releaseChunkX, releaseChunkZ, releasePlayerId, heldChanges, false);
         if (heldChanges.isEmpty()) {
@@ -1115,7 +1112,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 把区块内局部坐标编码差集转为「绝对坐标三元组」（{@code x,y,z} 连续存放），供
    * {@link RevealedSet#removePositions} 批量摘除。
    *
-   * <p><b>编码必须与另两处互逆</b>：{@link ObfuscatedChunkIndex#removePosition} 的编码
+   * <p><b>编码必须与另两处互逆</b>：{@link ObfuscatedChunkIndex#removePositions} 的编码
    * （{@code (y-minHeight)<<8 | (z&15)<<4 | (x&15)}）与 {@link ProximityScanner} 的解码
    * （{@code (chunkX<<4)|(local&15)} 等）。{@code relY = local>>8} 恒非负（登记时 {@code y ≥ minHeight}），
    * 故算术移位无符号问题；负 chunkX 经 {@code (chunkX<<4)|低4位} 与 {@code x>>4} 可逆。
@@ -1170,7 +1167,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   }
 
   /**
-   * 改写结果的全部决定因素指纹：<b>启动期</b>反矿透配置指纹 + 实时的 {@code remove-block-entities}
+   * 改写结果的全部决定因素指纹：<b>启动期</b>反矿透配置指纹
    * + 调色板选项指纹（{@link ObfuscationProcessor#paletteFingerprint()}）
    * + 本次改写实际用到的邻块快照内容指纹（{@link NeighborEdges#contentFingerprint()}）。
    *
@@ -1180,17 +1177,14 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 产物，这些区块的配置改动就永久不生效。用启动期指纹则相反：reload 期间沿用旧指纹，重启后指纹才随
    * 新配置变化，旧槽自然不命中、按新规则重写。
    *
-   * <p>实时的 {@code remove-block-entities} 必须单独混入：它直接决定写进封包的字节且热重载立即生效
-   * （见 {@code writeBack}），不混入就会在 reload 切换后读到旧字节。
-   *
-   * <p>另外两者：调色板位宽预算/自检开关由 {@code bandwidth.yml} 决定却直接改变重写字节；enclosed 模式
-   * 的遮挡判定依赖邻块贴边快照内容。读、写两侧都走本方法，保证键一致。
+   * <p>调色板位宽预算/自检开关由 {@code bandwidth.yml} 决定却直接改变重写字节；enclosed 模式的遮挡判定
+   * 依赖邻块贴边快照内容。读、写两侧都走本方法，保证键一致。{@code remove-block-entities} 不参与指纹：
+   * 它只作用于写回时的封包方块实体列表（见 {@code writeBack} 按实时开关施加），从不进入缓存的区块字节。
    */
   private int rewriteFingerprint(NeighborEdges neighbors) {
     // 组合逻辑集中在 RewriteFingerprint：新增会改变改写字节的输入时只需改那一处，
     // 不会再出现「读侧加了、写侧漏了」的静默不命中。
-    return RewriteFingerprint.of(config.configHash(), live().removeBlockEntities(),
-        processor.paletteFingerprint(),
+    return RewriteFingerprint.of(config.configHash(), processor.paletteFingerprint(),
         neighbors == null ? 0L : neighbors.contentFingerprint(), neighbors != null);
   }
 
@@ -1269,7 +1263,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       neighborProvider.invalidateWorld(worldName);
     }
     // 清单（含墓碑）与标记一并失效：单一入口见 ChunkRevealBook。
-    book.invalidateWorld(worldName);
     book.invalidateWorld(worldName);
   }
 

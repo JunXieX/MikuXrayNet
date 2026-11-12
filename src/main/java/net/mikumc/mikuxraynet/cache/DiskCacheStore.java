@@ -128,16 +128,8 @@ public final class DiskCacheStore implements AutoCloseable {
   private static final class Handle {
 
     private final RegionFile file;
+    /** 最近一次访问的单调纳秒（只有磁盘线程写）：闲置关句柄与文件级 LRU 淘汰都用它（不受系统改时间影响）。 */
     private volatile long lastAccessNanos;
-    /**
-     * 最近一次访问的墙钟毫秒（只有磁盘线程写、诊断与淘汰读）。
-     *
-     * <p><b>为什么除了 {@link #lastAccessNanos} 还要这一个</b>：纳秒那个是单调时钟，专门用于
-     * 「闲置多久该关句柄」的差值判定（不受系统改时间影响）；而<b>文件级 LRU 淘汰</b>要在多个句柄之间
-     * 比较先后、并写进诊断日志给服主看，墙钟毫秒更直观且可跨重启比较。两者都在 {@link #touch()} 里更新，
-     * 不额外增加热路径开销。
-     */
-    private volatile long lastAccessMillis;
 
     /**
      * 已接受但尚未 append 到文件里的负载字节（只有磁盘线程访问）。
@@ -193,12 +185,10 @@ public final class DiskCacheStore implements AutoCloseable {
     private Handle(RegionFile file) {
       this.file = file;
       this.lastAccessNanos = System.nanoTime();
-      this.lastAccessMillis = System.currentTimeMillis();
     }
 
     private void touch() {
       this.lastAccessNanos = System.nanoTime();
-      this.lastAccessMillis = System.currentTimeMillis();
     }
   }
 
@@ -401,7 +391,7 @@ public final class DiskCacheStore implements AutoCloseable {
       return;
     }
     if (encodedBytes > BufferedLinearV3Format.MAX_PAYLOAD_SIZE) {
-      stats.rejectedByCapacity.increment();
+      stats.rejectedBySize.increment();
       return;
     }
     // max-entries <= 0 表示不限制（磁盘换命中率：条目不淘汰，内存只保留「已打开文件」的桶，

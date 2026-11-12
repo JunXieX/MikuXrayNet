@@ -8,7 +8,7 @@ import java.util.UUID;
 
 /**
  * 邻近显形的「局部扫描」：只遍历玩家身边 {@code ceil(distance/16)} 个区块半径内的区块
- * （默认 distance=96 → 半径 6 → 13×13=169 个区块），因此单周期候选评估量与「玩家的探索历史」完全脱钩
+ * （distance 默认跟随玩家视距，视距 10 → 半径 10 → 21×21 个区块），因此单周期候选评估量与「玩家的探索历史」完全脱钩
  * ——旧实现要遍历该玩家索引里的<b>全部</b>坐标，玩家走得越远、评估量越大。
  *
  * <p>每个区块的处理：
@@ -105,15 +105,6 @@ final class ProximityScanner {
         shards, tally, Long.MAX_VALUE, false);
   }
 
-  /** 同上，并可指定「本轮是否重试近处已显形坐标」（见 {@link #NEAR_RETRY_DISTANCE_SQUARED}）。 */
-  static List<ObfuscatedChunkIndex.Position> candidates(ObfuscatedChunkIndex index,
-      RevealedSet revealed, UUID playerId, String worldName, int x, int y, int z,
-      double maxDistance, int limit, int shard, int shards, Tally tally,
-      boolean retryNearbyRevealed) {
-    return candidates(index, revealed, playerId, worldName, x, y, z, maxDistance, limit, shard,
-        shards, tally, Long.MAX_VALUE, retryNearbyRevealed);
-  }
-
   /**
    * 同上，但带<b>时间预算</b>：每进入一个区块前检查一次 {@code System.nanoTime() > deadlineNanos}，
    * 超时即停止收集（已收集的候选照常返回，{@link Tally#deadlineTruncated} 置位）。
@@ -153,7 +144,9 @@ final class ProximityScanner {
     scan:
     for (int chunkX = centerX - radius; chunkX <= centerX + radius; chunkX++) {
       for (int chunkZ = centerZ - radius; chunkZ <= centerZ + radius; chunkZ++) {
-        if (System.nanoTime() > deadlineNanos) {
+        // 周期巡检传 Long.MAX_VALUE（无预算）：跳过时钟读取，省去每区块一次 nanoTime
+        //（视距 32 时 (2r+1)²=4225 次/趟，50 人约 106 万次/秒）；仅视野增量巡检带真实 deadline。
+        if (deadlineNanos != Long.MAX_VALUE && System.nanoTime() > deadlineNanos) {
           // 时间预算耗尽：停止收集，已收集的候选照常返回（调用方按 deadlineTruncated 判断是否需要顺延）
           if (tally != null) {
             tally.deadlineTruncated = true;

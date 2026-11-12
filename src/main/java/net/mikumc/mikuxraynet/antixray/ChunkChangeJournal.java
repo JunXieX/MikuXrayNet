@@ -20,8 +20,8 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
  * 在玩家所属线程上补发一次当前状态。补发的是**当前**方块状态（与显形包同源），不会把伪装后的状态写回客户端：
  * 被改过的坐标在 {@code BlockChangeRevealListener} 里已从伪装索引注销。
  *
- * <p><b>线程</b>：{@link #record} 在封包/网络线程调用，{@link #changedSince} 在放行线程调用，两者都只做
- * 无锁的原子数组读写；绝不触碰 Bukkit。
+ * <p><b>线程</b>：{@link #record} 在封包/网络线程或 BlockUndo 后台线程调用，{@link #changedSince} 在放行
+ * 线程调用，两者都只做无锁的原子数组读写；绝不触碰 Bukkit。
  */
 public final class ChunkChangeJournal {
 

@@ -185,16 +185,10 @@ public final class BlockChangeBatch<V> {
   /**
    * 是否存在任一变更落在「玩家所在方块坐标」的 {@code radius} 欧氏邻域内（含边界）。
    *
-   * <p><b>为什么单独抽成纯函数</b>：合并模块用它决定「本次封包是立即放行还是进入合并窗口」，
-   * 而这个判定不依赖 Bukkit / ProtocolLib，抽出来即可离线单测。
-   *
-   * <p>语义：返回值 true 表示「该封包内含近身变更」——调用方应原样立即放行，不进合并窗口；
-   * false 表示照常合并。{@code radius <= 0} 表示关闭立即放行，恒为 false。
-   *
-   * @param updates  一次封包解析出的全部变更（可能为 null/空，此时恒为 false）
-   * @param radius   立即放行半径（格）；0 或负数即关闭该特性
+   * <p>合并模块用它决定「本次封包是立即放行还是进入合并窗口」：true 表示含近身变更，应原样立即放行；
+   * false 表示照常合并。{@code radius <= 0} 表示关闭立即放行，恒为 false。坐标版供「只解坐标」的快速
+   * 路径复用（不构造 {@code Update}），与列表版逐条等价。
    */
-  /** 坐标版：与列表版逐条等价，供「只解坐标」的快速路径复用（不构造 {@code Update}）。 */
   public static boolean anyWithinRadius(int[] coordinates, int count, int playerX, int playerY,
       int playerZ, int radius) {
     if (coordinates == null || count <= 0 || radius <= 0) {

@@ -113,24 +113,6 @@ public final class SwmrLongMap<V> {
     }
   }
 
-  /** 键不存在时才写入（独占）。 */
-  public V putIfAbsent(long key, V value) {
-    Objects.requireNonNull(value, "value");
-    long stamp = lock.writeLock();
-    try {
-      Object existing = getLocked(key);
-      if (existing != null) {
-        @SuppressWarnings("unchecked")
-        V cast = (V) existing;
-        return cast;
-      }
-      putLocked(key, value);
-      return null;
-    } finally {
-      lock.unlockWrite(stamp);
-    }
-  }
-
   /**
    * 删除（独占）。
    *
@@ -270,20 +252,6 @@ public final class SwmrLongMap<V> {
 
     if ((size + tombstones) * 1.0f / capacity >= LOAD_FACTOR) {
       rehash(capacity << 1);
-    }
-    return null;
-  }
-
-  @SuppressWarnings("unchecked")
-  private V getLocked(long key) {
-    Table<V> t = table;
-    int mask = t.keys.length - 1;
-    int index = spread(key) & mask;
-    while (t.slots[index] != 0) {
-      if (t.slots[index] == USED && t.keys[index] == key) {
-        return (V) t.values[index];
-      }
-      index = (index + 1) & mask;
     }
     return null;
   }

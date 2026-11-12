@@ -28,7 +28,7 @@ class ProximitySelectionTest {
 
   private final long[] clock = {0L};
   private final ObfuscatedChunkIndex index =
-      new ObfuscatedChunkIndex(1_000_000, 60 * TimeUnit.SECONDS.toNanos(1), () -> clock[0]);
+      new ObfuscatedChunkIndex(1_000_000, () -> clock[0]);
   private final RevealedSet revealed =
       new RevealedSet(1_000_000, 60 * TimeUnit.SECONDS.toNanos(1), () -> clock[0]);
 

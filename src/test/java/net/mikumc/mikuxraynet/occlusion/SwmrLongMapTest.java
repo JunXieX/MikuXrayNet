@@ -50,15 +50,6 @@ class SwmrLongMapTest {
   }
 
   @Test
-  void putIfAbsentOnlyInsertsWhenMissing() {
-    SwmrLongMap<Integer> map = new SwmrLongMap<>();
-    assertNull(map.putIfAbsent(key(1), 10));
-    assertEquals(10, map.putIfAbsent(key(1), 20));
-    assertEquals(10, map.get(key(1)));
-    assertEquals(1, map.size());
-  }
-
-  @Test
   void clearEmptiesEntriesAndSlots() {
     SwmrLongMap<String> map = new SwmrLongMap<>();
     for (int i = 0; i < 100; i++) {

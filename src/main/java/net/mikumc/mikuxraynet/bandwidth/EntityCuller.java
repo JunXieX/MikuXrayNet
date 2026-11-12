@@ -198,6 +198,14 @@ public final class EntityCuller implements Listener {
   /** 判定提交序号计数器（唯一用途见 {@link #appliedSeq}）。 */
   private final AtomicLong submitSeqCounter = new AtomicLong();
   /**
+   * 是否启用提交序乱序保护：仅当异步遮挡线程数 &gt; 1 时才需要。
+   *
+   * <p>单工作线程下「先提交者先完成」由引擎 FIFO 出队保证，结果再经实体调度器 FIFO 回投，
+   * 同一实体的结论必然按提交序到达，乱序分支不可能命中——此时序号账本纯属每次回投白付的
+   * 三次 CHM 操作 + Long 装箱。多线程下保护完整保留。
+   */
+  private final boolean seqGuard;
+  /**
    * 「无序号」哨兵：仅供单测直接驱动回投的兼容入口使用（不做序判定、也不写序号账本）。
    *
    * <p>生产路径一律走带 {@code submitSeq} 的重载，否则乱序保护失效。
@@ -336,13 +344,7 @@ public final class EntityCuller implements Listener {
   private volatile boolean stopping;
 
   public EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats) {
-    this(plugin, config, stats, EntityCuller::ownedByCurrentRegion);
-  }
-
-  /** 完整构造（追加实体归属判定；离线单测可注入假实现，见 {@link EntityOwnership}）。 */
-  EntityCuller(Plugin plugin, BandwidthConfig.EntityCulling config, ThrottleStats stats,
-      EntityOwnership ownership) {
-    this(plugin, config, stats, ownership, BypassRegistry::isBypassedNow);
+    this(plugin, config, stats, EntityCuller::ownedByCurrentRegion, BypassRegistry::isBypassedNow);
   }
 
   /**
@@ -400,6 +402,7 @@ public final class EntityCuller implements Listener {
     this.occlusionStores = wired ? occlusionStores : null;
     this.occlusionStats = wired ? occlusionStats : null;
     this.hysteresisCycles = wired ? Math.max(0, async.hysteresisCycles()) : 0;
+    this.seqGuard = wired && async.threads() > 1;
     long intervalNanos = Math.max(1, config.updateIntervalTicks()) * NANOS_PER_TICK;
     this.timeoutNanos = wired ? Math.max(1, async.timeoutCycles()) * intervalNanos : 0L;
     this.budgetNanos = wired ? Math.max(0L, (long) (async.timeBudgetMillis() * 1_000_000.0D)) : 0L;
@@ -1202,13 +1205,7 @@ public final class EntityCuller implements Listener {
    * 那会与通道②的隐藏判定反复争夺，表现为闪烁。
    *
    * <p>包可见：供离线单测验证「提交全部追踪实体 / 组请求 / 拒收不影响状态」这段链路。
-   */
-  void submitAsync(Player player, Entity entity, boolean fromRecheck) {
-    submitAsync(player, entity, new View(player, entity), fromRecheck);
-  }
-
-  /**
-   * 提交侧正式入口：复用调用方已算好的输入快照（眼位 / 包围盒），不再重复读取。
+   * 输入坐标与包围盒取自调用方已算好的快照（{@link View}），不再重复读取。
    *
    * <p>眼位坐标仍用零分配 getter 求出（{@code getEyeLocation} 每次会新建 {@code Location}）；
    * {@code eyeY = 脚部 Y + getEyeHeight()} 与 {@code LivingEntity#getEyeLocation()} 的算法逐项一致。
@@ -1243,7 +1240,8 @@ public final class EntityCuller implements Listener {
       long deadline = System.nanoTime() + timeoutNanos;
       // 提交序号：回投时据此丢弃「后完成但更旧」的结论（见 appliedSeq）。序号取自本类的单调计数器，
       // 不放进 Request（引擎不关心它），由回投闭包携带，因此不需要改引擎契约。
-      long submitSeq = submitSeqCounter.incrementAndGet();
+      // 单工作线程下结论必按提交序到达（见 seqGuard），无需序号，省去每次回投的账本开销。
+      long submitSeq = seqGuard ? submitSeqCounter.incrementAndGet() : NO_SUBMIT_SEQ;
       OcclusionEngine.Request request = new OcclusionEngine.Request(player.getUniqueId(),
           entity.getEntityId(), worldName, deadline, eyeX, eyeY, eyeZ, vertices,
           (result, occluded) ->
@@ -1442,12 +1440,8 @@ public final class EntityCuller implements Listener {
    *
    * <p>失败方向：任何异常都返回 {@code true}（视为「在锥内」→ 不剔除），绝不因判定失败而误藏实体。
    * 距离豁免传 0——距离门已在 {@link #frustumCullable} 里判过，这里只做纯角度判定。
+   * 输入坐标与包围盒优先取自快照（{@code null} = 现读）。
    */
-  private boolean insideFrustum(Player player, Entity entity) {
-    return insideFrustum(player, entity, null);
-  }
-
-  /** 同 {@link #insideFrustum(Player, Entity)}，输入坐标与包围盒优先取自快照（{@code null} = 现读）。 */
   private boolean insideFrustum(Player player, Entity entity, View view) {
     if (!frustumCulling) {
       return true;

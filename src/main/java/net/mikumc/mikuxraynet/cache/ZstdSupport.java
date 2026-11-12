@@ -859,8 +859,8 @@ public final class ZstdSupport {
       // 先停线程再让调用方删临时文件：超时后下载线程可能仍在写 target，若此处不等待就返回，
       // downloadOnce 的 finally（deleteQuietly(temp)）会与写入线程竞争——删除先执行、写入随后重建文件，
       // 于是缓存目录里永久残留一个 .tmp（Windows 上删除还会因句柄占用直接失败）。
-      // 这里给一个很短的收尾预算：interrupt 会让阻塞中的 read/connect 立刻返回，
-      // 拿不到也只是多留一个临时文件（下次启动不认领它，但不会影响功能）。
+      // 这里给一个很短的收尾预算：interrupt 只对可中断等待生效，阻塞的 read/connect 由自身
+      // connect/read 超时收尾；拿不到也只是多留一个临时文件（下次启动不认领它，但不会影响功能）。
       executor.shutdownNow();
       try {
         executor.awaitTermination(DOWNLOAD_THREAD_JOIN_MILLIS, TimeUnit.MILLISECONDS);

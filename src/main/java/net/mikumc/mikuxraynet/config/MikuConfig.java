@@ -168,15 +168,11 @@ public final class MikuConfig {
     try {
       return WorldBlacklistConfig.from(read(BLACKLIST_FILE));
     } catch (Throwable throwable) {
+      // blacklist 分量恒非 null（loaded 初始化与每次 load 都写入非 null），直接保留上一份。
       WorldBlacklistConfig previous = this.loaded.blacklist();
-      if (previous != null) {
-        warnFallbackOnce(blacklistFallbackWarned, BLACKLIST_FILE, "已保留上一份配置", throwable);
-        noteFallback(BLACKLIST_FILE + " 解析失败，已保留上一份配置");
-        return previous;
-      }
-      warnFallbackOnce(blacklistFallbackWarned, BLACKLIST_FILE, "已改用空白名单", throwable);
-      noteFallback(BLACKLIST_FILE + " 解析失败，已改用空白名单（所有世界都启用）");
-      return WorldBlacklistConfig.fromPatterns(List.of());
+      warnFallbackOnce(blacklistFallbackWarned, BLACKLIST_FILE, "已保留上一份配置", throwable);
+      noteFallback(BLACKLIST_FILE + " 解析失败，已保留上一份配置");
+      return previous;
     }
   }
 

@@ -123,7 +123,7 @@ public final class ReloadCoordinator {
       "AFK 降级（判定时长/丢弃距离/包类型）",
       "高延迟降视距（阈值/幅度/下限/巡检周期）",
       "带宽全部子模块（零位移/变更合并/实体剔除）",
-      "方块实体剔除开关（remove-block-entities，改写缓存指纹随之变化）",
+      "方块实体剔除开关（remove-block-entities，写回时实时施加，不影响缓存）",
       // 异步遮挡的调优键随「停旧管线、建新管线」即时生效（新管线会按新配置重建引擎与线程池）。
       // 注意「开关本身」不在此列，见 RESTART_REQUIRED。
       "实体剔除异步遮挡调优（occlusion-time-budget-ms / occlusion-threads / max-occluding-blocks / "

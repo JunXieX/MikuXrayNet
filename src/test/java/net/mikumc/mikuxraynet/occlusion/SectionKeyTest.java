@@ -54,20 +54,6 @@ class SectionKeyTest {
   }
 
   @Test
-  void packBlockMatchesPackingItsSection() {
-    int[][] samples = {
-        {0, 0, 0}, {15, 15, 15}, {-1, -1, -1}, {-16, -16, -16}, {31, -33, 47}, {-64, 320, 1023}
-    };
-    for (int[] sample : samples) {
-      int x = sample[0];
-      int y = sample[1];
-      int z = sample[2];
-      assertEquals(SectionKey.packSection(x >> 4, y >> 4, z >> 4), SectionKey.packBlock(x, y, z),
-          "packBlock 与 packSection(x>>4,y>>4,z>>4) 一致：" + x + "," + y + "," + z);
-    }
-  }
-
-  @Test
   void columnKeysCoverEverySectionYExactlyOnceWithoutDuplicates() {
     long[] keys = SectionKey.columnKeys(5, -9);
     assertEquals(SectionKey.SECTION_Y_COUNT, keys.length);

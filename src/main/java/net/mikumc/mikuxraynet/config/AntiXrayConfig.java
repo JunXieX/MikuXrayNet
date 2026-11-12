@@ -944,10 +944,8 @@ public final class AntiXrayConfig {
         neighbors.enabled(), neighbors.missingPolicy().name(),
         OcclusionRules.sortedList(this.occlusion.extraOccluding()),
         OcclusionRules.sortedList(this.occlusion.extraNonOccluding()),
-        // remove-block-entities 直接改变「写进缓存的区块负载字节」（是否从区块封包剔除方块实体数据），
-        // 必须参与指纹：否则开↔关切换后旧缓存仍被命中（即使重启也不生效，管理员只能手动清缓存）。
-        // 纳入后现存磁盘缓存会一次性失效重建（属预期）。
-        this.removeBlockEntities,
+        // remove-block-entities 不参与指纹：它只作用于写回时的封包方块实体列表（ChunkPacketAccessor#update），
+        // 从不进入缓存的区块字节，写回按实时开关施加——切换它不应触发缓存失效。
         // zstd 下载校验哈希参与指纹（按任务要求）：切换它会让现存磁盘缓存一次性失效重建（属正常）。
         this.diskCache.zstdSha256());
   }

@@ -161,11 +161,6 @@ public final class NeighborChunkProvider {
     this(cacheMaximumSize, DEFAULT_CACHE_TTL_MILLIS, System::nanoTime, Set.of(), Set.of());
   }
 
-  /** 带 TTL 的构造（毫秒，{@code <= 0} 表示不过期）；供装配方按需传入更短/更长的过期时间。 */
-  public NeighborChunkProvider(int cacheMaximumSize, long cacheTtlMillis) {
-    this(cacheMaximumSize, cacheTtlMillis, System::nanoTime, Set.of(), Set.of());
-  }
-
   /**
    * 生产构造：额外带上伪装口径的用户覆盖表（{@code occlusion.extra-*}），使边界邻块与区块内部判定同源。
    *

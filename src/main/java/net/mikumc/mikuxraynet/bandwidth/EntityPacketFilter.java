@@ -114,12 +114,6 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
   private final AtomicBoolean shapeWarned = new AtomicBoolean();
 
   /**
-   * 实体 id → 归一化类型键。
-   *
-   * <p><b>为什么用并发容器</b>：增量事件可能在实体所属的区域线程（Folia）或主线程触发，而读取来自
-   * 封包线程；{@link ConcurrentHashMap} 保证三者安全，且未命中即 {@code null}（等同旧 volatile 快照）。
-   */
-  /**
    * 实体类型索引：<b>世界名 → (entityId → 白名单类型键)</b>。
    *
    * <p><b>为什么必须带世界维度</b>：Java 版的 entityId 是<b>每个世界各自计数</b>的（每个世界从 1 开始
@@ -137,11 +131,6 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
   private final Map<String, Map<Integer, String>> entityTypeIndex = new ConcurrentHashMap<>();
   private ScheduledTask indexTask;
 
-  /**
-   * 兜底重建的跨 tick 分片游标：当前世界下标 + 每个世界内已处理到的区块下标。
-   *
-   * <p>只在 {@code GlobalRegionScheduler}（Paper 主线程）上读写，天然单线程，无需任何并发控制。
-   */
   /**
    * 兜底重建的推进游标：<b>世界级</b>用原子整数、<b>逐世界区块级</b>用并发 map。
    *
