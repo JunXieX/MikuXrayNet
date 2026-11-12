@@ -404,7 +404,10 @@ public final class MikuXrayNet extends JavaPlugin {
         }
       }
 
-      @EventHandler
+      // MONITOR + ignoreCancelled：与 WorldUnload 同一纪律——卸载被其它插件取消时区块仍然加载，
+      // 若照常摘除位图/索引，该区块会变成「没有遮挡数据、也没有显形清单」，玩家眼前的矿一直不还原，
+      // 直到区块因走远/重登被重发。
+      @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
       public void onChunkUnload(ChunkUnloadEvent event) {
         AntiXrayRuntime current = runtime;
         if (current == null) {
