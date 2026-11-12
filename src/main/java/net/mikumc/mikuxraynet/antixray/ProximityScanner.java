@@ -105,6 +105,15 @@ final class ProximityScanner {
         shards, tally, Long.MAX_VALUE, false);
   }
 
+  /** 同上，并可指定「本轮是否重试近处已显形坐标」（见 {@link #NEAR_RETRY_DISTANCE_SQUARED}）。 */
+  static List<ObfuscatedChunkIndex.Position> candidates(ObfuscatedChunkIndex index,
+      RevealedSet revealed, UUID playerId, String worldName, int x, int y, int z,
+      double maxDistance, int limit, int shard, int shards, Tally tally,
+      boolean retryNearbyRevealed) {
+    return candidates(index, revealed, playerId, worldName, x, y, z, maxDistance, limit, shard,
+        shards, tally, Long.MAX_VALUE, retryNearbyRevealed);
+  }
+
   /**
    * 同上，但带<b>时间预算</b>：每进入一个区块前检查一次 {@code System.nanoTime() > deadlineNanos}，
    * 超时即停止收集（已收集的候选照常返回，{@link Tally#deadlineTruncated} 置位）。
