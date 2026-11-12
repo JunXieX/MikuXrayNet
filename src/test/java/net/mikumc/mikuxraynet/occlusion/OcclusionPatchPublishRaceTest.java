@@ -113,14 +113,17 @@ class OcclusionPatchPublishRaceTest {
     store.setBlockOccluding(1, 1 * 16 + 2, 3, true);
 
     long[] stamps = store.patchStamps(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, SECTION_COUNT);
-    SectionOcclusion[] column = {null, null, null};
+    // 发布值为「已知全不遮挡」：回放会在该段上把补丁格写回位图。
+    // 不能用 null —— null 表示「该段无数据」，显形侧按缺数据=遮挡处理，回放不得凭空建位图。
+    SectionOcclusion[] column = {EmptyOcclusion.INSTANCE, EmptyOcclusion.INSTANCE,
+        EmptyOcclusion.INSTANCE};
     int skipped = store.restoreColumn(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, column, stamps);
 
     assertEquals(0, skipped, "快照已包含该补丁，不得再判为「期间变更」");
     SectionOcclusion replayed = store.section(0, 1, 0);
-    assertNotNull(replayed, "回放必须补回该段（否则补丁被 null 覆盖丢失）");
+    assertNotNull(replayed, "回放必须补回该段（否则补丁被覆盖丢失）");
     assertTrue(replayed.isOccludingLocal(1, 2, 3), "回放必须恢复补丁格");
-    assertNull(store.section(0, 0, 0), "未被补丁的段保持发布值");
+    assertSame(EmptyOcclusion.INSTANCE, store.section(0, 0, 0), "未被补丁的段保持发布值");
   }
 
   @Test
@@ -173,13 +176,14 @@ class OcclusionPatchPublishRaceTest {
     store.setBlockOccluding(1, 1 * 16 + 2, 3, true);
 
     int skipped = store.restoreColumn(CHUNK_X, MIN_SECTION_Y, CHUNK_Z,
-        new SectionOcclusion[] {null, null, null}, null);
+        new SectionOcclusion[] {EmptyOcclusion.INSTANCE, EmptyOcclusion.INSTANCE,
+            EmptyOcclusion.INSTANCE}, null);
 
     assertEquals(0, skipped, "未提供快照时不得跳过任何段");
-    // 整列按 null 覆盖后，回放会补回窗口内的补丁格（否则该补丁会被旧几何吞掉，方向「该显示却多藏」）；
-    // 未被补丁的段保持发布值（null）。
-    assertNull(store.section(0, 0, 0));
-    assertNull(store.section(0, 2, 0));
+    // 整列按「已知全不遮挡」覆盖后，回放会补回窗口内的补丁格（否则该补丁会被旧几何吞掉）；
+    // 未被补丁的段保持发布值。
+    assertSame(EmptyOcclusion.INSTANCE, store.section(0, 0, 0));
+    assertSame(EmptyOcclusion.INSTANCE, store.section(0, 2, 0));
     SectionOcclusion survivor = store.section(0, 1, 0);
     assertNotNull(survivor, "回放必须补回窗口内被补丁改过的段");
     assertTrue(survivor.isOccludingLocal(1, 2, 3), "回放必须恢复补丁格");
