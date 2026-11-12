@@ -69,11 +69,11 @@ public final class AntiXrayRuntime {
    * 需要跨线程立即可见，避免「已关闭但工作线程仍在一小段时间内登记」的可见性竞态。
    */
   private volatile ObfuscatedChunkIndex obfuscatedChunkIndex;
+  /** 按玩家的已显形集合（内存 = O(玩家身边确实显形过的坐标数)）；volatile 原因同上。 */
+  private volatile RevealedSet revealedSet;
   /** 清单与已显形标记的唯一维护入口（字段可能在热重载中置空/重建，故用 supplier 延迟读）。 */
   private final ChunkRevealBook revealBook =
       new ChunkRevealBook(() -> obfuscatedChunkIndex, () -> revealedSet);
-  /** 按玩家的已显形集合（内存 = O(玩家身边确实显形过的坐标数)）；volatile 原因同上。 */
-  private volatile RevealedSet revealedSet;
   private volatile ProximityStats proximityStats;
   private volatile DiskCacheStore diskCacheStore;
   /**
