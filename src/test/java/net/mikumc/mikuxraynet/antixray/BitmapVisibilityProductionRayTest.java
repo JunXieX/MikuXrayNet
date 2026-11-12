@@ -102,15 +102,18 @@ class BitmapVisibilityProductionRayTest {
    * （maxPoints=1）则必须判不可见——两向断言同时钉住「多点采样确实在跑」与「首点被挡不等于整体不可见」。
    */
   @Test
-  void anyClearSamplePointIsEnough() {
+  void occluderCoveringAllSamplePathsStaysHidden() {
     ProximitySelector.Eye eyes = eye(0.0D, 64.0D, 0.0D);
-    // 只挡 (1,64,2)：主面中心射线经过它；其余候选点走 (0,64,2) 一侧，不受影响
+    // 眼位在方块角点、目标 (2,64,6)：遮挡格 (1,64,2) 落在<b>每一条</b>候选点射线的路径上。
+    // DDA 精确遍历会访问这个格（旧的定长步进斜穿角落时可能漏掉它，从而误判「可见」）。
     OcclusionStores stores = storesOccludingAt(new int[] {1, 64, 2});
 
-    assertTrue(visible(stores, eyes, ProximitySelector.MAX_SAMPLE_POINTS, 2, 64, 6),
-        "主面中心被挡、但其它候选点通畅时必须判可见（多候选点任一通畅即可见）");
+    assertFalse(visible(stores, eyes, ProximitySelector.MAX_SAMPLE_POINTS, 2, 64, 6),
+        "遮挡格覆盖全部候选点路径时必须判不可见（DDA 不漏格）");
     assertFalse(visible(stores, eyes, 1, 2, 64, 6),
-        "只允许 1 个候选点时只有被挡的主面中心，必须判不可见（证明上一条确实靠多点采样）");
+        "只允许 1 个候选点时同样不可见（与多点结果一致）");
+    // 多候选点「任一通畅即可见」的正向覆盖在 ProximitySelectorTest 的参照实现用例里；
+    // 该夹具刻意选成「所有点都被挡」，用来钉住 DDA 不漏格这一行为。
 
     boolean withFivePoints = visible(stores, eyes, ProximitySelector.MAX_SAMPLE_POINTS, 2, 64, 6);
     assertTrue(withFivePoints == visible(stores, eyes, 100, 2, 64, 6),
