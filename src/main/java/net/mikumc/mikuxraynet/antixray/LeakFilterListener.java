@@ -54,7 +54,7 @@ public final class LeakFilterListener extends PacketAdapter {
     this.revealedSet = revealedSet;
   }
 
-  /** 注册异步监听器（与方块变更观察同一条链路）。 */
+  /** 注册独立的异步监听器（方块变更观察走同步链路，两者互不依赖；这里只需要“看到包后取消”，不参与包序）。 */
   public void start() {
     handler = protocolManager.getAsynchronousManager().registerAsyncHandler(this);
     handler.start();
