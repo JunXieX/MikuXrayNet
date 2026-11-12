@@ -159,7 +159,7 @@ public final class AntiXrayRuntime {
     // palette.enabled=false（或带宽总开关关闭）时 widthBudget=false，即完全不收缩、不降级，零开销。
     BandwidthConfig.Palette palette = config.bandwidth().palette();
     boolean paletteUsable = config.bandwidth().enabled() && palette.enabled();
-    // 遮挡位图恒建：它是实体剔除与邻近显形可见性判定的唯一数据源（原生命中射线已移除）。
+    // 遮挡位图恒建：它是实体剔除与邻近显形「周期/事件」可见性判定的唯一数据源。
     // 数据仓库在此创建并交给改写链路写入（ObfuscationProcessor#captureOcclusion）；
     // 带宽侧的遮挡判定引擎只读消费（见 ThrottlePipeline），显形侧只读消费（见 ProximityRevealer）。
     // 玩家世界名快照：封包线程上的三个出站监听器只查这张表，不读 player.getWorld()
@@ -181,10 +181,12 @@ public final class AntiXrayRuntime {
       return;
     }
 
-    NeighborChunkProvider neighborProvider = antiXray.neighbors().enabled()
-        ? new NeighborChunkProvider(antiXray.neighbors().cacheMaximumSize(),
-            antiXray.occlusion().extraOccluding(), antiXray.occlusion().extraNonOccluding())
-        : null;
+    // 恒定创建、由改写链路实时读 neighbors.enabled 决定是否抓取：该开关可在 reload 时改变，
+    // 而监听器不随 reload 重建——启动时若按开关建 null，之后重新开启也永远不会抓取。
+    // 构造只分配一个空 LRU（零抓取、零开销），关闭期间不会有任何缓存写入。
+    NeighborChunkProvider neighborProvider = new NeighborChunkProvider(
+        antiXray.neighbors().cacheMaximumSize(), antiXray.occlusion().extraOccluding(),
+        antiXray.occlusion().extraNonOccluding());
 
     // 邻近显形索引：拆成「按区块共享的伪装清单」+「按玩家的已显形集合」两个结构。
     // 关闭该功能时都传 null，改写路径完全不做任何额外记录。
@@ -255,7 +257,7 @@ public final class AntiXrayRuntime {
     startProximity(antiXray, chunkIndex, revealed, proximityStats, true);
     startOcclusionPatch(registry);
     logger.fine("反矿透已启用（按维度分段）：" + dimensionSummary(antiXray)
-        + "；区块边界邻块快照 " + neighborState(neighborProvider, processor) + "；磁盘缓存 "
+        + "；区块边界邻块快照 " + neighborState(antiXray, processor) + "；磁盘缓存 "
         + (diskCache != null ? "已启用（" + new File(plugin.getDataFolder(), "cache").getPath() + "）"
             : "已关闭"));
   }
@@ -266,9 +268,9 @@ public final class AntiXrayRuntime {
    * <p>{@code mode=all}（默认）下改写不做 6 面遮挡判定，邻块数据一位都用不到，因此连抓取都省掉
    * （判定见 {@code ObfuscationProcessor#needsNeighbors}）——这一句让「邻块缓存为什么一直是空的」可见。
    */
-  private static String neighborState(NeighborChunkProvider provider, ObfuscationProcessor processor) {
-    if (provider == null) {
-      return "已关闭";
+  private static String neighborState(AntiXrayConfig config, ObfuscationProcessor processor) {
+    if (!config.neighbors().enabled()) {
+      return "已关闭（neighbors.enabled=false；该开关热重载即时生效）";
     }
     for (AntiXrayConfig.Dimension dimension : AntiXrayConfig.Dimension.values()) {
       if (processor.needsNeighbors(null, dimension)) {
@@ -320,7 +322,7 @@ public final class AntiXrayRuntime {
     }
 
     // 先建邻近显形器（持有显形链路），再把它交给方块变更观察监听器做事件驱动即时显形（P1-4）。
-    // 遮挡位图仓库一并传入：显形可见性判定恒走该位图（原生命中射线已移除）。
+    // 遮挡位图仓库一并传入：周期/事件显形的可见性判定走该位图（视线即时显形另用一次 6 格方块射线）。
     //
     // 构造与启动整体落在 try 内：构造期异常（例如 PacketAdapter 注册被拒、配置字段异常）若冒出
     // startAntiXray，会一路顶到 onEnable 让整个插件启用失败——而此时 ProtocolLib 拦截、线程池、
