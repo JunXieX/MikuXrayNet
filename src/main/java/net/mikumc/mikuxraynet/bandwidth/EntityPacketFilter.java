@@ -23,6 +23,7 @@ import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
+import net.mikumc.mikuxraynet.util.PlayerWorldIndex;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.NamespacedKey;
@@ -356,12 +357,17 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     // 封包线程读 player.getWorld() 属跨线程读取（Folia 上是跨区域读实体状态）：与同包另两个模块
     // （BlockChangeMerger / AfkTracker）保持同一纪律——取不到世界名就按「不做任何优化」直通，
     // 绝不让一次读取失败把包扣住、也不让异常逃出封包监听器。
-    String worldName;
-    try {
-      worldName = packetPlayer.getWorld().getName();
-    } catch (Throwable ignored) {
-      pass();
-      return;
+    // 世界名优先查 PlayerWorldIndex 快照：封包线程不读实体状态（Folia 上跨区域读会先打 ERROR
+    // 再抛 No currently ticking region，每包一次）。快照缺失只可能出现在「反矿透未启用」的部署，
+    // 此时才回退到读实体世界；取不到就按「不做任何优化」直通。
+    String worldName = PlayerWorldIndex.worldName(packetPlayer.getUniqueId());
+    if (worldName == null) {
+      try {
+        worldName = packetPlayer.getWorld().getName();
+      } catch (Throwable ignored) {
+        pass();
+        return;
+      }
     }
     if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       return;

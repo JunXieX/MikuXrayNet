@@ -137,6 +137,16 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     private final UUID uuid;
     /** 本窗口内被取消（改为窗口末合并下发）的原包数，供统计与「是否有实包」判定。 */
     private int cancelledPackets;
+    /**
+     * 本缓冲内坐标所属的世界名（入缓冲时由封包线程从 {@code PlayerWorldIndex} 快照写入；
+     * {@code null} = 尚未入过包）。
+     *
+     * <p><b>为什么需要它</b>：方块变更包<b>不含世界标识</b>，冲刷时无法从包本身判断「这些坐标属于哪个世界」。
+     * 若玩家在合并窗口内切维（切维事件与快照比对都漏接的极端情形），窗口到期仍会把旧世界坐标按新世界
+     * 下发——客户端在新世界对应位置出现「鬼影方块」。冲刷前比对该值与此刻的快照世界，不一致即整批丢弃
+     * （旧世界区块会整列重建，丢弃不构成丢更新）。
+     */
+    private volatile String world;
     private final Set<Coord> passed = new HashSet<>();
     /**
      * {@link #passed} 的条目上限；超限即整体清空（见 {@link #rememberDelivered}）。
@@ -478,18 +488,6 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   }
 
   /**
-   * 本包所属世界是否已不是该玩家「当前」所在的世界（跨世界切换窗口）。
-   *
-   * <p>判据只有一份：玩家所属线程每 tick 写入快照的世界名。快照缺失（刚登录 / 刚重置 / 读取异常）时
-   * 无法判断，按「不是跨世界」处理（即照常走后续流程）——这与其它快照缺失点的 fail-open 方向一致：
-   * 宁可按旧逻辑合并，也不凭空丢弃合并能力。
-   */
-  private boolean isCrossWorld(UUID playerId, String packetWorld) {
-    PlayerPositionSnapshots.Position snapshot = positions.get(playerId);
-    return snapshot != null && snapshot.world() != null && !snapshot.world().equals(packetWorld);
-  }
-
-  /**
    * 立即冲刷该玩家的合并缓冲（仅在「玩家退出」时使用）。
    *
    * <p>绝不能像 {@link #flushInternal} 那样内联在本（封包）线程跑：聚簇 + 构包 + 发送会阻塞所有玩家的
@@ -643,17 +641,10 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       discardPending(player.getUniqueId());
       return;
     }
-    // 跨世界守卫：封包里的方块坐标<b>不含世界标识</b>。若玩家已经离开该包所属的世界（合并窗口内
-    // 传送门 / /tp 跨世界），把该包照常合并、或只入缓冲等窗口到期，都会在客户端按<b>新世界</b>坐标
-    // 解释这些变更 → 新世界对应位置出现「鬼影方块」，直到该区块被重新下发。
-    // 因此：本包立即原样放行（它此刻仍在旧世界的发送流里，语义正确），并把该玩家在旧世界攒下的缓冲
-    // <b>整体丢弃</b>（不发送、不重编码）——玩家离开后旧世界区块会整列重建，丢弃不构成丢更新。
-    // 世界名取自玩家所属线程写入的快照，不在封包线程读实体状态。
-    if (isCrossWorld(player.getUniqueId(), worldName)) {
-      discardPending(player.getUniqueId());
-      stats.blockChangesPassed.increment();
-      return;
-    }
+    // 跨世界守卫（三道）：① PlayerChangedWorldEvent 零窗口丢弃；② refreshPosition 的每 tick 快照比对；
+    // ③ flushInternal 冲刷前比对「缓冲世界」与此刻快照世界（兜住前两道都漏接的极端情形）。
+    // 方块变更包不含世界标识，封包线程无法判断「这个包属于哪个世界」，因此这里不再有第四道即时判定——
+    // 旧实现曾在此比较「快照世界」与「快照世界」（恒相等），那道守卫实际从未生效，已移除。
 
     // 解析前短路：MULTI_BLOCK_CHANGE 的坐标数与「段原点 + 每格一个 packed short」都能直接读出，
     // 无需把整包解析成 List<Update<WrappedBlockData>>（每坐标一个 WrappedBlockData 反射包装 + 一条
@@ -752,6 +743,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         // 入缓冲成功后才取消原包：此后由窗口末的合并包交付；合并失败会逐条补发（见 deliver），绝不丢更新。
         event.setCancelled(true);
         target.cancelledPackets++;
+        // 记录本批坐标所属世界：冲刷前据此做「跨世界」兜底校验（见 flushInternal）。
+        target.world = worldName;
 
         // 溢出调度闸（synchronized(target) 内置位）：只有「本 Pending 尚未排过溢出冲刷」才排任务。
         // add 达上限后每个后续包都返回 overflow=true，但首个任务执行前的窗口内重复排队只是空转
@@ -879,6 +872,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     List<List<Update<WrappedBlockData>>> clusters = List.of();
     Set<Coord> passed = Set.of();
     int cancelled = 0;
+    int discarded = 0;
+    boolean worldChanged = false;
     ScheduledFuture<?> timer = null;
     try {
       synchronized (target) {
@@ -889,13 +884,32 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         pending.remove(target.uuid, target);
         timer = target.timer;
         target.timer = null;
-        clusters = target.batch.drainClusters(config.mergeRadius());
-        // 本窗口内「已有更新下发覆盖过」的坐标：缓冲里的同一坐标属旧状态，必须剔除
-        passed = target.passed.isEmpty() ? Set.of() : new HashSet<>(target.passed);
-        cancelled = target.cancelledPackets;
+        // 第三道跨世界守卫：缓冲内的坐标属于 target.world（入缓冲时的世界）；玩家此刻若已在别的世界，
+        // 整批丢弃——旧世界坐标按新世界下发会在客户端留下「鬼影方块」。旧世界区块会整列重建，
+        // 丢弃不构成丢更新。快照缺失（刚登录 / 刚重置）时无法判断，保持原行为（照常合并，fail-open）。
+        String bufferedWorld = target.world;
+        if (bufferedWorld != null) {
+          PlayerPositionSnapshots.Position snapshot = positions.get(target.uuid);
+          worldChanged = snapshot != null && snapshot.world() != null
+              && !snapshot.world().equals(bufferedWorld);
+        }
+        if (worldChanged) {
+          discarded = target.cancelledPackets;
+          target.batch.clear();
+          target.passed.clear();
+        } else {
+          clusters = target.batch.drainClusters(config.mergeRadius());
+          // 本窗口内「已有更新下发覆盖过」的坐标：缓冲里的同一坐标属旧状态，必须剔除
+          passed = target.passed.isEmpty() ? Set.of() : new HashSet<>(target.passed);
+          cancelled = target.cancelledPackets;
+        }
       }
       if (timer != null) {
         timer.cancel(false);
+      }
+      if (worldChanged) {
+        stats.blockChangesDiscarded.add(discarded);
+        return false; // 旧世界的被延迟包按丢弃处理：既未下发、也未合并
       }
       if (cancelled <= 0) {
         return false; // 只有清理、没有实包：不计入「冲刷次数/耗时」
