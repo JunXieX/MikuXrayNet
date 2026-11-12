@@ -315,7 +315,7 @@ public final class ProximityRevealer implements Listener {
   private final ObfuscatedChunkIndex chunkIndex;
   private final RevealedSet revealedSet;
   /** 清单与已显形标记的唯一维护入口（卸载/退出路径不再分别调用两个索引）。 */
-  private final ChunkRevealBook book = new ChunkRevealBook(() -> chunkIndex, () -> revealedSet);
+  private final ChunkRevealBook book;
   private final ProximityStats stats;
   private final BypassRegistry bypassRegistry;
   private final MikuWorkPool workPool;
@@ -478,6 +478,8 @@ public final class ProximityRevealer implements Listener {
     this.bypassRegistry = bypassRegistry;
     this.workPool = workPool;
     this.occlusionStores = occlusionStores;
+    // 必须在两个索引赋值之后创建（字段初始化器不能引用构造器赋值的 final 字段）
+    this.book = new ChunkRevealBook(() -> chunkIndex, () -> revealedSet);
     // 过期清理窗口 = 巡检周期 × EXPIRE_EVERY_PASSES（tick→纳秒：1 tick = 50ms）。
     // 对巡检周期做上限钳制（≤1 小时）再相乘，避免极端配置把乘法推到溢出。
     long ticks = Math.max(1L, Math.min(72_000L, proximity.intervalTicks()));

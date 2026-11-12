@@ -66,8 +66,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private final ObfuscatedChunkIndex obfuscatedChunkIndex;
   private final RevealedSet revealedSet;
   /** 清单与标记的唯一维护入口（封包线程批量注销走这里，避免两处各自维护同一不变式）。 */
-  private final ChunkRevealBook book =
-      new ChunkRevealBook(() -> obfuscatedChunkIndex, () -> revealedSet);
+  private final ChunkRevealBook book;
   private final ProximityStats stats;
   /**
    * 事件驱动即时显形（P1-4，可选）：观测到方块变更时交给邻近显形「立即投递到玩家线程补发邻域」。
@@ -118,6 +117,8 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     this.stats = stats;
     this.instantRevealer = instantRevealer;
     this.changeJournal = changeJournal;
+    // 必须在本构造器内创建：字段初始化器不能引用构造器赋值的 final 字段
+    this.book = new ChunkRevealBook(() -> obfuscatedChunkIndex, () -> revealedSet);
   }
 
   /**
