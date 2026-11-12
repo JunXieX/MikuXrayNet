@@ -2475,6 +2475,15 @@ public final class ProximityRevealer implements Listener {
         return;
       }
       Location eye = player.getEyeLocation();
+      // Folia 线程纪律：rayTraceBlocks 会连续读方块，射线跨到邻 region 时 TickThread 校验会先打 ERROR
+      // 再抛异常（本路径每 tick 都跑，等于持续刷日志且视线显形失效）。6 格射线最多跨一个区块边界，
+      // 因此只要求起点与终点区块都属于本 region；不属于就跳过（该坐标仍留在索引里，靠近后由巡检补上）。
+      int endX = (int) Math.floor(eye.getX() + eye.getDirection().getX() * LOOK_MAX_DISTANCE);
+      int endZ = (int) Math.floor(eye.getZ() + eye.getDirection().getZ() * LOOK_MAX_DISTANCE);
+      if (!ownsChunk(world, eye.getBlockX() >> 4, eye.getBlockZ() >> 4)
+          || !ownsChunk(world, endX >> 4, endZ >> 4)) {
+        return;
+      }
       RayTraceResult hit = world.rayTraceBlocks(eye, eye.getDirection(), LOOK_MAX_DISTANCE,
           FluidCollisionMode.NEVER, true);
       if (hit == null || hit.getHitBlock() == null) {
