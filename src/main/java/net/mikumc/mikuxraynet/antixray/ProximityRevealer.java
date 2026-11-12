@@ -68,9 +68,10 @@ import org.bukkit.util.Vector;
  *       候选点数由 {@code proximity.raycast.samples} 限制（<b>有效上限 5</b>，即
  *       {@code ProximitySelector.MAX_SAMPLE_POINTS}，配置给得再大也会被截断）；六面全被遮挡（完全掩埋）时一个点都不采
  *       → 直接判不可见，绝不隔着墙还原。判定走反矿透已建好的<b>遮挡位图</b>（{@link BitmapVisibility}），
- *       因此可整段在工作线程上跑（不需要任何 Bukkit API）。<b>这是唯一的可见性判定路径</b>——
- *       原生命中射线（{@code World#rayTraceBlocks}）已移除；位图缺失（罕见故障）时按「遮挡」处理
- *       （严格方向：不显形），绝不裸发。</li>
+ *       因此可整段在工作线程上跑（不需要任何 Bukkit API）。<b>周期巡检的可见性判定只有这一条路径</b>；
+ *       位图缺失（罕见故障）时按「遮挡」处理（严格方向：不显形），绝不裸发。另有一条独立于巡检的
+ *       <b>视线即时显形</b>（{@link #revealLookedAt}）：每 tick 对玩家视线做一次 6 格射线，只还原
+ *       射线命中的<b>第一个</b>方块——它回答的是「玩家正看着哪个方块」，不是「附近哪些方块可见」。
  *   <li><b>岩浆遮挡</b>（统一入口）：岩浆视觉不透明（服务端 {@code isOccluding()} 却返回 false），
  *       现由 {@code OcclusionRules} 的视觉口径并入遮挡，因此位图天然把岩浆当遮挡——
  *       刷在岩浆里的下界残骸在显形侧不会被还原，不必再单独补判。<b>水不参与</b>（透明，玩家应当能看见
@@ -267,15 +268,6 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 一个周期（或一次事件触发）内待发的显形批次：只累积「已通过全部筛选、待发包」的坐标与真实方块状态，
-   * 周期末由 {@link #flushBatch} 一次发出并逐个写回「已显形」标记。
-   *
-   * <p><b>为什么先累积再发</b>：批量合并的前提是「先知道本周期有哪些坐标要发」。发包时按
-   * 「<b>先写标记、再发包、失败回滚</b>」的顺序处理（见 {@link #markThenSend}）：标记先行是为了与
-   * 出站监听器的摘除路径对齐，杜绝孤儿标记；发送失败回滚则保证未发出的坐标仍会被后续周期重试。
-   * 坐标为绝对方块坐标；方块状态在玩家所属线程读取（见 {@link #sendOne}）。
-   */
-  /**
    * 近处重试周期（tick）：每这么多个 tick，本轮巡检会把玩家身边 8 格内「已显形」的坐标重新评估一次。
    *
    * <p><b>解决什么</b>：显形包发出后服务端无法确认客户端是否应用（区块尚在加载、包被丢弃等），
@@ -284,6 +276,15 @@ public final class ProximityRevealer implements Listener {
    */
   private static final int NEAR_RETRY_PERIOD_TICKS = 25;
 
+  /**
+   * 一个周期（或一次事件触发）内待发的显形批次：只累积「已通过全部筛选、待发包」的坐标与真实方块状态，
+   * 周期末由 {@link #flushBatch} 一次发出并逐个写回「已显形」标记。
+   *
+   * <p><b>为什么先累积再发</b>：批量合并的前提是「先知道本周期有哪些坐标要发」。发包时按
+   * 「<b>先写标记、再发包、失败回滚</b>」的顺序处理（见 {@link #markThenSend}）：标记先行是为了与
+   * 出站监听器的摘除路径对齐，杜绝孤儿标记；发送失败回滚则保证未发出的坐标仍会被后续周期重试。
+   * 坐标为绝对方块坐标；方块状态在玩家所属线程读取（见 {@link #sendOne}）。
+   */
   private static final class RevealBatch {
 
     private final World world;
@@ -349,6 +350,15 @@ public final class ProximityRevealer implements Listener {
   private final AtomicBoolean noCapacityWarned = new AtomicBoolean();
   /** 事件显形的每玩家每 tick 限额（默认 16，防爆刷；见 {@link TickQuota}）。 */
   private final TickQuota instantQuota = new TickQuota();
+  /**
+   * 视线即时显形的独立额度（每玩家每 tick 1 个）。
+   *
+   * <p>与事件显形、挖掘兜底分开：视线路径每 tick 都在跑，若共用一份额度，会先把额度吃掉，
+   * 使「开始挖时补发」在同 tick 拿不到额度而失效（那正是 0 tick 破坏场景的兜底）。
+   */
+  private final TickQuota lookQuota = new TickQuota();
+  /** 挖掘兜底的独立额度（每玩家每 tick 1 个），理由同上。 */
+  private final TickQuota digQuota = new TickQuota();
   /** 视野变化增量巡检的每玩家每 tick 发包限额（与事件显形分开，避免互相挤占）。 */
   private final TickQuota viewChangeQuota = new TickQuota();
   /** 区块下发即显形的每玩家每 tick 发包限额（与事件显形分开，避免区块集中下发吃光即时显形额度）。 */
@@ -1162,7 +1172,7 @@ public final class ProximityRevealer implements Listener {
 
     if (batch != null) {
       // 批量模式：先累积，周期末由 flushBatch 一次发出（按「先标记、再发包、失败回滚」处理）。
-      // 这里先预扣额度以封住单周期上限；若最终未能发出，由 flushBatch 归还（见其「额度归还」说明）。
+      // 这里预扣额度以封住单周期上限；不归还——额度对象每周期新建、用后即弃（见 Budget 注释）。
       batch.add(x, y, z, data);
       budget.decrement();
       return;
@@ -1796,7 +1806,7 @@ public final class ProximityRevealer implements Listener {
   // ============================== 事件驱动即时显形（P1-4）==============================
 
   /**
-   * 出站方块变更回调（由 {@link BlockChangeRevealListener} 在封包解析线程调用）：
+   * 出站方块变更回调（由 {@link BlockChangeRevealListener} <b>投递到玩家所属线程</b>后调用）：
    * 玩家收到某个方块变更包时，若变更坐标的邻域内（曼哈顿 ≤ {@code instant-reveal.radius}）
    * 仍有伪装坐标，则调度到玩家所属线程<b>立即</b>补发显形（不等下一轮巡检）。
    *
@@ -2480,7 +2490,7 @@ public final class ProximityRevealer implements Listener {
         return;
       }
       long tick = Bukkit.getCurrentTick();
-      int granted = instantQuota.claim(playerId, tick, 1, 1);
+      int granted = lookQuota.claim(playerId, tick, 1, 1);
       if (granted <= 0) {
         return;
       }
@@ -2489,7 +2499,7 @@ public final class ProximityRevealer implements Listener {
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
       sendOne(player, world, x, y, z, null, budget, tally, batch, true);
       flushBatch(player, batch, tally);
-      instantQuota.release(playerId, tick, 1, granted, tally.sent);
+      lookQuota.release(playerId, tick, 1, granted, tally.sent);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
@@ -2533,7 +2543,7 @@ public final class ProximityRevealer implements Listener {
         return; // 已经显形
       }
       long tick = Bukkit.getCurrentTick();
-      int granted = instantQuota.claim(playerId, tick, 1, 1);
+      int granted = digQuota.claim(playerId, tick, 1, 1);
       if (granted <= 0) {
         return;
       }
@@ -2543,7 +2553,7 @@ public final class ProximityRevealer implements Listener {
       // eye=null + visibilityInPlan=true：跳过位图判定，按当前真实状态直发（玩家正在挖它，必然可见）
       sendOne(player, world, x, y, z, null, budget, tally, batch, true);
       flushBatch(player, batch, tally);
-      instantQuota.release(playerId, tick, 1, granted, tally.sent);
+      digQuota.release(playerId, tick, 1, granted, tally.sent);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
