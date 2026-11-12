@@ -3,7 +3,6 @@ package net.mikumc.mikuxraynet.config;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
@@ -204,32 +203,35 @@ class AntiXrayDimensionConfigTest {
         "仅改变地狱维度权重也必须改变指纹");
   }
 
-  /** remove-block-entities 决定写进缓存的区块负载字节，必须参与 configHash。 */
+  /**
+   * remove-block-entities 只作用于写回时的封包方块实体列表（ChunkPacketAccessor#update），从不进入
+   * 缓存的区块字节，且写回按实时开关施加——因此它<b>不参与</b> configHash，切换它不应触发缓存失效。
+   */
   @Test
-  void configHashChangesWhenRemoveBlockEntitiesToggles() {
+  void configHashUnchangedWhenRemoveBlockEntitiesToggles() {
     AntiXrayConfig on = config("obfuscation:\n  remove-block-entities: true\n");
     AntiXrayConfig off = config("obfuscation:\n  remove-block-entities: false\n");
 
     assertTrue(on.removeBlockEntities(), "键打开时为 true");
     assertFalse(off.removeBlockEntities(), "键关闭时为 false");
-    assertNotEquals(on.configHash(), off.configHash(),
-        "remove-block-entities 决定是否从区块负载里剔除方块实体数据，必须参与配置指纹");
+    assertEquals(on.configHash(), off.configHash(),
+        "remove-block-entities 不改变缓存的区块字节，不得参与配置指纹（切换它不应使缓存失效）");
   }
 
-  /** 回归：关→开后旧指纹不再命中（旧缓存绝不能按旧指纹被复用）。 */
+  /** 回归：关→开后指纹不变，旧缓存照常命中（缓存字节与方块实体剔除无关，写回时按实时开关施加）。 */
   @Test
-  void togglingRemoveBlockEntitiesMissesOldCacheEntry() {
+  void togglingRemoveBlockEntitiesKeepsCacheEntry() {
     AntiXrayConfig off = config("obfuscation:\n  remove-block-entities: false\n");
     AntiXrayConfig on = config("obfuscation:\n  remove-block-entities: true\n");
 
     // 生产构造是「条目数 + 字节数 + 过期秒数 + 体积函数」：本用例只关心 configHash 命中，
     // 故字节上限取不限、体积函数返回 0（不计账）。
     RewriteCache<String> cache = new RewriteCache<>(8, Long.MAX_VALUE, 3600, value -> 0L);
-    cache.put("world", 3, 4, off.configHash(), "旧负载（未剔除方块实体）");
+    cache.put("world", 3, 4, off.configHash(), "改写后的区块字节");
 
-    assertEquals("旧负载（未剔除方块实体）", cache.get("world", 3, 4, off.configHash()),
+    assertEquals("改写后的区块字节", cache.get("world", 3, 4, off.configHash()),
         "原配置指纹照常命中");
-    assertNull(cache.get("world", 3, 4, on.configHash()),
-        "开启 remove-block-entities 后指纹变化 → 旧缓存不再命中（即使重启也不复用）");
+    assertEquals("改写后的区块字节", cache.get("world", 3, 4, on.configHash()),
+        "切换 remove-block-entities 后指纹不变 → 旧缓存照常命中（方块实体在写回时按实时开关剔除）");
   }
 }
