@@ -818,7 +818,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    *
    * <p><b>为什么需要它</b>：批量直通包（{@code MULTI_BLOCK_CHANGE} 且坐标数达阈值）必须记「这些坐标的新态
    * 已下发」，否则冲刷时会把缓冲里的旧态写回去（方块回退）。而记账只需要坐标——{@code positions} 本身就是
-   * 每坐标一个 short（高 4 位 x、次 4 位 z、低 4 位 y，与 {@link #readUpdates} 的解包完全一致），
+   * 每坐标一个 short（高 4 位 y、次 4 位 z、低 4 位 x，与 {@link #readUpdates} 的解包完全一致），
    * 于是不必为了三个 int 去解析 {@code WrappedBlockData[]}。
    *
    * <p>上限闸与 {@link #rememberDelivered} 同口径：超限即整体清空（最多让窗口到期时把某个坐标的旧态再下发
@@ -840,8 +840,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       int baseY = section.getY() << 4;
       int baseZ = section.getZ() << 4;
       for (short packed : positions) {
-        target.passed.add(new Coord(baseX + (packed >> 8 & 15),
-            baseY + (packed & 15), baseZ + (packed >> 4 & 15)));
+        target.passed.add(new Coord(baseX + (packed & 15),
+            baseY + ((packed >> 8) & 15), baseZ + ((packed >> 4) & 15)));
       }
     }
   }
@@ -1057,8 +1057,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       for (int i = 0; i < blocks.size(); i++) {
         Update<WrappedBlockData> update = blocks.get(i);
         data[i] = update.value();
-        // 与协议一致：section 内相对坐标打包为 (x & 15) << 8 | (z & 15) << 4 | (y & 15)
-        positions[i] = (short) (((update.x() & 15) << 8) | ((update.z() & 15) << 4) | (update.y() & 15));
+        // 与协议一致：section 内相对坐标打包为 (y & 15) << 8 | (z & 15) << 4 | (x & 15)。
+        // 早前把 x 与 y 放反了——合并包会把方块画到错误高度，客户端表现为方块错位/闪一下。
+        positions[i] = (short) (((update.y() & 15) << 8) | ((update.z() & 15) << 4) | (update.x() & 15));
       }
       BlockPosition expectedSection = new BlockPosition(section.x(), section.y(), section.z());
       packet = new PacketContainer(PacketType.Play.Server.MULTI_BLOCK_CHANGE);
@@ -1113,9 +1114,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       int baseZ = section.getZ() << 4;
       for (int i = 0; i < positions.length; i++) {
         short packed = positions[i];
-        int x = baseX + (packed >> 8 & 15);
-        int z = baseZ + (packed >> 4 & 15);
-        int y = baseY + (packed & 15);
+        // 协议：(y & 15) << 8 | (z & 15) << 4 | (x & 15)。早前这里把 bit8..11 当 x、低 4 位当 y（x/y 对调），
+        // 与 sendSection 的对调恰好抵消才没有暴露；两处必须同时正确，不能再依赖错误互抵。
+        int x = baseX + (packed & 15);
+        int z = baseZ + ((packed >> 4) & 15);
+        int y = baseY + ((packed >> 8) & 15);
         updates.add(new Update<>(x, y, z, data[i]));
       }
       return updates;
