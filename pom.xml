@@ -6,7 +6,7 @@
 
     <groupId>net.mikumc</groupId>
     <artifactId>mikuxraynet</artifactId>
-    <version>1.32.12</version>
+    <version>1.32.13</version>
     <packaging>jar</packaging>
 
     <name>MikuXrayNet</name>
@@ -149,6 +149,17 @@
         </resources>
 
         <plugins>
+            <!--
+              固定 resources 插件版本：Maven 默认会取「当前 Maven 版本对应的默认插件版本」，
+              而该版本一旦尚未同步到 Central（实测 3.4.0 出现 Could not find artifact），整个构建会在
+              resources 阶段直接失败——与代码无关、且联网环境不同结果不同。显式固定到长期稳定版，
+              让 CI 可重复。
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.3.1</version>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
