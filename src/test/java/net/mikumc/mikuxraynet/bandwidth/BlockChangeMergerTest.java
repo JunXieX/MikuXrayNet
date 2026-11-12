@@ -9,6 +9,7 @@ import com.comphenix.protocol.wrappers.WrappedBlockData;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
