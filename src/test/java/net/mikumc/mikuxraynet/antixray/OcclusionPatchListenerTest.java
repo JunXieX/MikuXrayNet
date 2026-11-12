@@ -92,6 +92,8 @@ class OcclusionPatchListenerTest {
   void multiplePatchesApplyIndependently() {
     OcclusionStore store = new OcclusionStore();
     OcclusionStats stats = new OcclusionStats();
+    // 前置：该段已建表且为「已知全不遮挡」（缺数据段不接受补丁，见 OcclusionStore#applyCellLocked）
+    store.replaceSection(0, 0, 0, EmptyOcclusion.INSTANCE);
 
     // 三格分属不同 section：遮挡格 / 未解析格（降级另一段）/ 越界坐标（SectionKey 显式拒绝 → 单格失败）
     OcclusionPatchListener.applyPatches(store,
