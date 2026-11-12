@@ -314,6 +314,8 @@ public final class ProximityRevealer implements Listener {
   private final boolean batchRevealSends;
   private final ObfuscatedChunkIndex chunkIndex;
   private final RevealedSet revealedSet;
+  /** 清单与已显形标记的唯一维护入口（卸载/退出路径不再分别调用两个索引）。 */
+  private final ChunkRevealBook book = new ChunkRevealBook(() -> chunkIndex, () -> revealedSet);
   private final ProximityStats stats;
   private final BypassRegistry bypassRegistry;
   private final MikuWorkPool workPool;
@@ -648,7 +650,7 @@ public final class ProximityRevealer implements Listener {
         // 任务可能已随实体退役结束，取消失败可忽略
       }
     }
-    revealedSet.clearPlayer(event.getPlayer().getUniqueId());
+    book.clearPlayer(event.getPlayer().getUniqueId());
     instantQuota.clear(event.getPlayer().getUniqueId());
     chunkDeliveryQuota.clear(event.getPlayer().getUniqueId());
     digMarks.remove(event.getPlayer().getUniqueId());
@@ -680,8 +682,7 @@ public final class ProximityRevealer implements Listener {
     try {
       Chunk chunk = event.getChunk();
       String worldName = chunk.getWorld().getName();
-      chunkIndex.invalidateChunk(worldName, chunk.getX(), chunk.getZ());
-      revealedSet.clearChunk(worldName, chunk.getX(), chunk.getZ());
+      book.invalidateChunk(worldName, chunk.getX(), chunk.getZ());
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
@@ -698,8 +699,7 @@ public final class ProximityRevealer implements Listener {
   public void onWorldUnload(WorldUnloadEvent event) {
     try {
       String worldName = event.getWorld().getName();
-      chunkIndex.invalidateWorld(worldName);
-      revealedSet.clearWorld(worldName);
+      book.invalidateWorld(worldName);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }

@@ -65,6 +65,9 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   private final ProtocolManager protocolManager;
   private final ObfuscatedChunkIndex obfuscatedChunkIndex;
   private final RevealedSet revealedSet;
+  /** 清单与标记的唯一维护入口（封包线程批量注销走这里，避免两处各自维护同一不变式）。 */
+  private final ChunkRevealBook book =
+      new ChunkRevealBook(() -> obfuscatedChunkIndex, () -> revealedSet);
   private final ProximityStats stats;
   /**
    * 事件驱动即时显形（P1-4，可选）：观测到方块变更时交给邻近显形「立即投递到玩家线程补发邻域」。
@@ -248,8 +251,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       // coordinates 来自线程本地复用缓冲，投递前先交出精确长度的独立快照。
       int[] snapshot = java.util.Arrays.copyOf(coordinates, positions.length * 3);
       int count = positions.length;
-      submitUndo(() -> processChanges(worldName, snapshot, count, obfuscatedChunkIndex, revealedSet,
-          stats, dispatch, echoCheck));
+      submitUndo(() -> processChanges(worldName, snapshot, count, book, stats, dispatch, echoCheck));
     } finally {
       ParseScratch.release(parse);
     }
@@ -478,6 +480,12 @@ public final class BlockChangeRevealListener extends PacketAdapter {
         null);
   }
 
+  /** 生产重载：清单与标记经 {@link ChunkRevealBook} 一次摘除。 */
+  static void processChanges(String worldName, int[] coordinates, int count, ChunkRevealBook book,
+      ProximityStats stats, SectionDispatch dispatch, RevealEchoCheck echoCheck) {
+    processChanges(worldName, coordinates, count, null, null, book, stats, dispatch, echoCheck);
+  }
+
   /**
    * 同上一重载，追加显形回显判定（{@code null} = 不做区分，保持既有整段批量摘除的快路径）。
    *
@@ -487,6 +495,15 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   static void processChanges(String worldName, int[] coordinates, int count,
       ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
       SectionDispatch dispatch, RevealEchoCheck echoCheck) {
+    ChunkRevealBook book = new ChunkRevealBook(() -> obfuscatedChunkIndex, () -> revealedSet);
+    processChanges(worldName, coordinates, count, obfuscatedChunkIndex, revealedSet, book, stats,
+        dispatch, echoCheck);
+  }
+
+  /** 内部实现：{@code book} 非空时走单一入口，否则按传入索引临时包装（仅供旧重载）。 */
+  private static void processChanges(String worldName, int[] coordinates, int count,
+      ObfuscatedChunkIndex ignoredIndex, RevealedSet ignoredRevealed, ChunkRevealBook book,
+      ProximityStats stats, SectionDispatch dispatch, RevealEchoCheck echoCheck) {
     if (worldName == null || coordinates == null || count <= 0) {
       return;
     }
@@ -518,8 +535,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       }
 
       for (int s = 0; s < sectionCount; s++) {
-        processSection(worldName, parse.bufferAt(s), obfuscatedChunkIndex, revealedSet, stats,
-            dispatch, echoCheck);
+        processSection(worldName, parse.bufferAt(s), book, stats, dispatch, echoCheck);
       }
     } finally {
       ParseScratch.release(parse);
@@ -528,9 +544,8 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   }
 
   /** 处理单个 section：过滤回显 → 一次批量摘除 → 一次调度。 */
-  private static void processSection(String worldName, SectionBuffer section,
-      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
-      SectionDispatch dispatch, RevealEchoCheck echoCheck) {
+  private static void processSection(String worldName, SectionBuffer section, ChunkRevealBook book,
+      ProximityStats stats, SectionDispatch dispatch, RevealEchoCheck echoCheck) {
     if (echoCheck != null) {
       // 就地过滤：把「本插件刚发出的显形回显」从有效段里剔除（回显不改变服务端内容，绝不能摘索引）。
       // 复用同一数组前段，不新增任何分配；被剔除的坐标也不参与后续摘除与调度。
@@ -553,16 +568,9 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       }
       section.count = kept;
     }
-    int removed = 0;
-    if (obfuscatedChunkIndex != null) {
-      removed = obfuscatedChunkIndex.removePositions(worldName, section.data, section.count);
-    }
-    // 已显形标记必须与伪装清单同步摘除：维持「已显形坐标 ⊆ 区块伪装清单」不变式。
+    // 清单与已显形标记一次摘除：维持「已显形坐标 ⊆ 区块伪装清单」不变式。
     // 索引未命中也要摘（宁可多摘一次也不能留孤儿标记，见 unregisterCoordinate）。
-    //
-    if (revealedSet != null) {
-      revealedSet.removePositions(worldName, section.data, section.count);
-    }
+    int removed = book.removePositions(worldName, section.data, section.count);
     if (removed > 0 && stats != null) {
       stats.unregistered.add(removed);
     }

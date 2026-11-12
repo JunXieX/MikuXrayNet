@@ -7,6 +7,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import net.mikumc.mikuxraynet.antixray.BlockChangeRevealListener;
 import net.mikumc.mikuxraynet.antixray.ChunkChangeJournal;
+import net.mikumc.mikuxraynet.antixray.ChunkRevealBook;
 import net.mikumc.mikuxraynet.antixray.LeakFilterListener;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider;
 import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
@@ -68,6 +69,9 @@ public final class AntiXrayRuntime {
    * 需要跨线程立即可见，避免「已关闭但工作线程仍在一小段时间内登记」的可见性竞态。
    */
   private volatile ObfuscatedChunkIndex obfuscatedChunkIndex;
+  /** 清单与已显形标记的唯一维护入口（字段可能在热重载中置空/重建，故用 supplier 延迟读）。 */
+  private final ChunkRevealBook revealBook =
+      new ChunkRevealBook(() -> obfuscatedChunkIndex, () -> revealedSet);
   /** 按玩家的已显形集合（内存 = O(玩家身边确实显形过的坐标数)）；volatile 原因同上。 */
   private volatile RevealedSet revealedSet;
   private volatile ProximityStats proximityStats;
@@ -734,15 +738,12 @@ public final class AntiXrayRuntime {
         logger.log(Level.WARNING, "摘除世界磁盘缓存时出现异常（已忽略）", throwable);
       }
     }
-    // 已显形标记同样必须随世界卸载作废：索引被清后，残留的标记会让 sizeFor 虚增，
-    // 邻近显形的「整块跳过」提前成立，同名世界重新加载后真实坐标被周期性跳过（漏显形）。
-    RevealedSet revealed = revealedSet;
-    if (revealed != null) {
-      try {
-        revealed.clearWorld(worldName);
-      } catch (Throwable throwable) {
-        logger.log(Level.WARNING, "摘除世界已显形标记时出现异常（已忽略）", throwable);
-      }
+    // 伪装清单与所有玩家的已显形标记必须随世界卸载一并作废（单一入口）：索引被清后残留的标记会让
+    // sizeFor 虚增，邻近显形的「整块跳过」提前成立，同名世界重新加载后真实坐标被周期性跳过（漏显形）。
+    try {
+      revealBook.invalidateWorld(worldName);
+    } catch (Throwable throwable) {
+      logger.log(Level.WARNING, "摘除世界显形结构时出现异常（已忽略）", throwable);
     }
   }
 
@@ -781,27 +782,17 @@ public final class AntiXrayRuntime {
         logger.log(Level.WARNING, "摘除区块遮挡位图时出现异常（已忽略）", throwable);
       }
     }
-    // 2) 显形索引：同步摘除该区块的伪装清单。
+    // 2) 显形结构：伪装清单与所有玩家的已显形标记一并摘除（单一入口见 ChunkRevealBook）。
     //
     // 这是「索引只随区块卸载清理」策略的<b>唯一</b>回收路径（时间过期已被取消，见
     // ObfuscatedChunkIndex 的说明）：漏了这一步，索引就会随「本局游戏曾改写过的区块数」无界增长。
     // 为什么可以安全摘除：区块卸载意味着该区块已不在任何玩家的客户端里，其伪装坐标此刻不可能被显形；
     // 区块下次被下发时会重新改写并重新登记（改写结果走缓存时同样会重新记录）。
-    ObfuscatedChunkIndex index = obfuscatedChunkIndex;
-    if (index != null) {
-      try {
-        if (index.invalidateChunk(worldName, chunkX, chunkZ)) {
-          // 该区块的清单消失 ⇒ 其上所有玩家的「已显形」标记必须同步作废，否则成为孤儿标记：
-          // sizeFor 虚增会让邻近显形的「整块跳过」提前成立，真实坐标被周期跳过（漏显形）。
-          RevealedSet revealed = revealedSet;
-          if (revealed != null) {
-            // 用「世界名 + 坐标」的公开入口：ChunkKey 是本插件 antixray 包的内部表示，不对外暴露。
-            revealed.clearChunk(worldName, chunkX, chunkZ);
-          }
-        }
-      } catch (Throwable throwable) {
-        logger.log(Level.WARNING, "摘除区块显形索引时出现异常（已忽略）", throwable);
-      }
+    // 标记清除是无条件的：卸载后任何残留记录都只会在重载后被当成「已经显形过」而漏发包。
+    try {
+      revealBook.invalidateChunk(worldName, chunkX, chunkZ);
+    } catch (Throwable throwable) {
+      logger.log(Level.WARNING, "摘除区块显形结构时出现异常（已忽略）", throwable);
     }
   }
 
