@@ -4,7 +4,6 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.LongSupplier;
@@ -42,7 +41,7 @@ public final class ObfuscatedChunkIndex {
   public record Position(int x, int y, int z) {
   }
 
-  /** 单个区块的伪装坐标清单：坐标不可变，活跃时间可变（扫描时刷新，供过期兜底）。 */
+  /** 单个区块的伪装坐标清单：坐标不可变，活跃时间可变（扫描时刷新，供容量安全阀「最旧优先」淘汰）。 */
   static final class ChunkEntry {
 
     private final int minHeight;

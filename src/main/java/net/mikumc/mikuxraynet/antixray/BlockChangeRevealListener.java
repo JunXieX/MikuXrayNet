@@ -57,8 +57,6 @@ public final class BlockChangeRevealListener extends PacketAdapter {
 
   private final Plugin plugin;
   private final ProtocolManager protocolManager;
-  private final ObfuscatedChunkIndex obfuscatedChunkIndex;
-  private final RevealedSet revealedSet;
   /** 清单与标记的唯一维护入口（封包线程批量注销走这里，避免两处各自维护同一不变式）。 */
   private final ChunkRevealBook book;
   private final ProximityStats stats;
@@ -70,7 +68,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   /**
    * 最近方块变更日志（可为 {@code null}）：区块包在途期间被改过的格子由它记录，放行后补发。
    *
-   * <p>只记**真实**变更（回显已在 {@link #unregisterCoordinate} 剔除）：回显不改变服务端内容，记进去只会
+   * <p>只记**真实**变更（回显已在 {@link #observeChange} / {@link #processSection} 剔除）：回显不改变服务端内容，记进去只会
    * 让放行后多补发一次同样的状态。
    */
   private final ChunkChangeJournal changeJournal;
@@ -106,12 +104,10 @@ public final class BlockChangeRevealListener extends PacketAdapter {
         PacketType.Play.Server.MULTI_BLOCK_CHANGE);
     this.plugin = plugin;
     this.protocolManager = protocolManager;
-    this.obfuscatedChunkIndex = obfuscatedChunkIndex;
-    this.revealedSet = revealedSet;
     this.stats = stats;
     this.instantRevealer = instantRevealer;
     this.changeJournal = changeJournal;
-    // 必须在本构造器内创建：字段初始化器不能引用构造器赋值的 final 字段
+    // book 直接捕获构造参数（索引/标记集合的可变引用），无需另存字段
     this.book = new ChunkRevealBook(() -> obfuscatedChunkIndex, () -> revealedSet);
   }
 
@@ -469,7 +465,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * 包级可见以便离线单测直接喂跨 section 坐标并注入调度计数桩（{@link SectionDispatch}）。
    *
    * <p><b>不变式</b>：无论索引是否命中，都要把该坐标的已显形标记同步摘除——索引未命中而标记仍在，
-   * 就是会让「整块跳过」提前成立的孤儿标记（见 {@link #unregisterCoordinate}）。
+   * 就是会让「整块跳过」提前成立的孤儿标记（见 {@link #observeChange}）。
    */
   static void processChanges(String worldName, int[] coordinates, int count, ChunkRevealBook book,
       ProximityStats stats, SectionDispatch dispatch, RevealEchoCheck echoCheck) {
@@ -538,7 +534,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       section.count = kept;
     }
     // 清单与已显形标记一次摘除：维持「已显形坐标 ⊆ 区块伪装清单」不变式。
-    // 索引未命中也要摘（宁可多摘一次也不能留孤儿标记，见 unregisterCoordinate）。
+    // 索引未命中也要摘（宁可多摘一次也不能留孤儿标记，见 observeChange）。
     int removed = book.removePositions(worldName, section.data, section.count);
     if (removed > 0 && stats != null) {
       stats.unregistered.add(removed);
@@ -569,7 +565,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * （邻域初筛、身边半径、射线、限额、去重）都在 {@link ProximityRevealer#onBlockChangeObserved}
    * 内部完成，未启用时只有一个空引用判断的开销。
    *
-   * <p><b>回显不产生新的观察事件</b>：{@code unregisterCoordinate} 会告诉我们这次变更是不是
+   * <p><b>回显不产生新的观察事件</b>：{@link #isOurRevealEcho} 会告诉我们这次变更是不是
    * 「本插件刚为该玩家发出的显形回显」。回显只代表服务端把玩家本就该看到的真实方块发了一遍，
    * 服务端内容没有任何变化，因此<b>不应</b>再触发一次事件显形——否则每发一个单方块显形包都会：
    * ① 在 netty 线程上白扫一遍变更点的曼哈顿邻域（默认半径 4 共 129 个偏移）；
@@ -587,7 +583,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
     // 1.1.6 起显形包走 Paper 原生通道（sendMultiBlockChange / sendBlockChange），因此本监听器
     // 也会看到「我们自己发出的显形回显」。回显不改变服务端内容，必须与真实变更区别对待
-    // （见 unregisterCoordinate）；磁盘缓存方面两者都不需要作废任何条目——条目有效性由负载里的
+    // （见 isOurRevealEcho）；磁盘缓存方面两者都不需要作废任何条目——条目有效性由负载里的
     // 原始区块字节指纹判定（见 DiskCacheStore 类注释），回显不改变区块字节。
     // 回显判定留在封包线程（只是一次并发 map 查/删），真实变更的注销投递到后台：
     // 摘索引与清标记会与解码 / 显形抢锁，留在封包线程上会把方块包压到光照包之后（见 undoExecutor 说明）。

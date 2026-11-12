@@ -1189,7 +1189,7 @@ public final class ProximityRevealer implements Listener {
     // 「已显形但被视锥/射线判可见」的候选）。最终判重仍由 flushBatch 的 claimForSend 原子兜底，
     // 这里只是省掉无谓的世界读与短命对象（TOCTOU 由 claimForSend 闭合，语义不变）。
     if (batch != null && revealedSet != null
-        && revealedSet.contains(player.getUniqueId(), ChunkKey.ofBlock(world.getName(), x, z), x, y, z)) {
+        && revealedSet.contains(player.getUniqueId(), world.getName(), x >> 4, z >> 4, x, y, z)) {
       stats.revealsSkipped.increment();
       return;
     }

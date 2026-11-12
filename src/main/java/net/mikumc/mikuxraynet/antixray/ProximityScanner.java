@@ -148,8 +148,8 @@ final class ProximityScanner {
 
     // 预算检查放在区块粒度而不是行粒度：一行有 (2r+1) 个区块、单块可能上千坐标，
     // 只按行检查会让一次扫描超额数倍（预算默认 0.3 ms，全落在主线程 / 区域线程上）。
-    // 每块一次 nanoTime 的代价是 (2r+1)² 次：视距 10 时 441 次 ≈ 11 µs/趟（50 人 5 趟/s ≈ 0.3% 单核），
-    // 视距 32 时 4225 次 ≈ 106 µs——仍远小于一次「整行区块」超额扫描的代价。
+    // 仅视野增量巡检（带真实 deadline）每块读一次 nanoTime，代价 (2r+1)² 次/趟（r=扫描半径/16）；
+    // 周期巡检传 Long.MAX_VALUE 短路、不读时钟（见下方判定）。
     scan:
     for (int chunkX = centerX - radius; chunkX <= centerX + radius; chunkX++) {
       for (int chunkZ = centerZ - radius; chunkZ <= centerZ + radius; chunkZ++) {
@@ -162,8 +162,8 @@ final class ProximityScanner {
           }
           break scan;
         }
-        // 用「世界名 + 坐标」的原始分量查询：扫描每周期遍历 13×13 = 169 个区块，
-        // 逐块 new ChunkKey 会产出 169 个短命对象（50 人在线时约 4.2 万个/秒，全在主线程/区域线程）。
+        // 用「世界名 + 坐标」的原始分量查询：扫描每周期遍历 (2r+1)² 个区块（r=有效视距），
+        // 逐块 new ChunkKey 会产出等量短命对象（全在主线程/区域线程）。
         // 索引与已显形集合都提供按分量查询的重载，热循环因此零分配。
         ObfuscatedChunkIndex.ChunkEntry entry = index.entry(worldName, chunkX, chunkZ);
         if (entry == null) {
