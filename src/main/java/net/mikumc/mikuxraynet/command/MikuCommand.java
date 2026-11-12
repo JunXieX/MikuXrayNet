@@ -226,12 +226,20 @@ public final class MikuCommand {
       long elapsedNanos, long reloadAtStart) {
     long durationMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
     boolean reloadDuring = plugin.lastReloadAt() > reloadAtStart;
+    // 运行环境段必须在当前（全局区域线程）采集：异步线程读 TPS / 世界列表在部分服务端分支会失败
+    String collectedRuntime;
+    try {
+      collectedRuntime = diagnostics.runtimeSection();
+    } catch (Throwable throwable) {
+      collectedRuntime = "\n---- 运行环境 ----\n（采集失败：" + describeDumpFailure(throwable) + "）\n";
+    }
+    final String runtimeSection = collectedRuntime;
     try {
       plugin.getServer().getAsyncScheduler().runNow(plugin, scheduled -> {
         String resultLine;
         try {
           java.io.File file = diagnostics.writeDump(new java.util.ArrayList<>(samples),
-              durationMillis, reloadDuring);
+              durationMillis, reloadDuring, runtimeSection);
           resultLine = "诊断转储已写入：" + file.getAbsolutePath()
               + "（采样 " + (durationMillis / 1000.0D) + " 秒）";
         } catch (Throwable throwable) {

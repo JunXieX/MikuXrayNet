@@ -362,8 +362,11 @@ public final class Diagnostics {
    *
    * <p>只收集数据、不下结论：这些值由人（或分析工具）在拿到 dump 后判断。
    * 任何一项读取失败只影响该行，不中断整份转储。
+   *
+   * <p><b>必须在全局区域线程调用</b>：{@code Bukkit#getTPS} / {@code getWorlds} / {@code getOnlinePlayers}
+   * 在部分服务端分支（如 Shiroha）会校验调用线程，在异步线程读到的是「读取失败」。
    */
-  private String runtimeSection() {
+  public String runtimeSection() {
     StringBuilder sb = new StringBuilder(3072);
     sb.append('\n').append("---- 运行环境 ----\n");
     try {
@@ -378,14 +381,16 @@ public final class Diagnostics {
     } catch (Throwable ignored) {
       sb.append("TPS：（读取失败）");
     }
+    // 先取值再拼串：getAverageTickTime 抛异常时若已 append 了前缀，会出现「平均 tick：；平均 tick：（读取失败）」
+    double mspt;
     try {
-      // 与 TPS 分开读：部分服务端分支（如 Shiroha）没有 getAverageTickTime，合在一起会把 TPS 一起吞掉
-      sb.append("；平均 tick：")
-          .append(String.format(Locale.ROOT, "%.2f ms", Bukkit.getAverageTickTime()));
+      mspt = Bukkit.getAverageTickTime();
     } catch (Throwable ignored) {
-      sb.append("；平均 tick：（读取失败）");
+      mspt = -1.0D;
     }
-    sb.append('\n');
+    sb.append("；平均 tick：")
+        .append(mspt < 0 ? "（读取失败）" : String.format(Locale.ROOT, "%.2f ms", mspt))
+        .append('\n');
     try {
       sb.append("视距：view=").append(Bukkit.getViewDistance())
           .append("，simulation=").append(Bukkit.getSimulationDistance())
@@ -772,8 +777,14 @@ public final class Diagnostics {
   /** 带 10 秒采样的转储文本（采样段插在状态面板之后、运行环境之前）。 */
   public String dumpText(String timestamp, List<Sample> samples, long durationMillis,
       boolean reloadDuring) {
+    return dumpText(timestamp, samples, durationMillis, reloadDuring, runtimeSection());
+  }
+
+  /** 同上，但运行环境段由调用方在主线程预先采集（异步线程读 Bukkit 指标会失败）。 */
+  public String dumpText(String timestamp, List<Sample> samples, long durationMillis,
+      boolean reloadDuring, String runtimeSection) {
     return formatDump(snapshot(), timestamp) + formatSamples(samples, durationMillis, reloadDuring)
-        + runtimeSection();
+        + runtimeSection;
   }
 
   /** 生成并写入转储文件，返回文件对象（目录不存在会自动创建；超出保留上限时清理最旧的转储）。 */
@@ -790,12 +801,19 @@ public final class Diagnostics {
    */
   public File writeDump(List<Sample> samples, long durationMillis, boolean reloadDuring)
       throws IOException {
+    return writeDump(samples, durationMillis, reloadDuring, runtimeSection());
+  }
+
+  /** 同上，但运行环境段由调用方在主线程预先采集。 */
+  public File writeDump(List<Sample> samples, long durationMillis, boolean reloadDuring,
+      String runtimeSection) throws IOException {
     String stamp = LocalDateTime.now().format(FILE_STAMP);
     File folder = plugin.getDataFolder();
     if (!folder.isDirectory() && !folder.mkdirs() && !folder.isDirectory()) {
       throw new IOException("无法创建数据目录：" + folder.getAbsolutePath());
     }
-    File file = writeNewDump(folder, stamp, dumpText(stamp, samples, durationMillis, reloadDuring));
+    File file = writeNewDump(folder, stamp,
+        dumpText(stamp, samples, durationMillis, reloadDuring, runtimeSection));
     int removed = pruneOldDumps(folder, MAX_DUMP_FILES);
     if (removed > 0) {
       // 只做一次 INFO：清理是正常行为，不需要 WARN 级别的噪音

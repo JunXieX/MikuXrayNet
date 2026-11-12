@@ -14,6 +14,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
+import net.mikumc.mikuxraynet.bandwidth.Schedulers;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.World;
@@ -604,7 +605,11 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     recordChange(worldName, x, y, z);
     submitUndo(() -> removeFromIndexAndMarks(worldName, x, y, z));
     if (instantRevealer != null) {
-      instantRevealer.onBlockChangeObserved(player, worldName, x, y, z);
+      // 投递到玩家线程：onBlockChangeObserved 内部要读 Bukkit.getCurrentTick()，Folia 上在封包线程读会抛
+      // No currently ticking region——整条注销包被外层 catch 后 fail-open 放行，坐标就留在伪装索引里。
+      // 投递失败（玩家离线/区域关闭）只放弃事件显形，周期巡检会兜底。
+      Schedulers.onEntity(plugin, player,
+          () -> instantRevealer.onBlockChangeObserved(player, worldName, x, y, z));
     }
   }
 
