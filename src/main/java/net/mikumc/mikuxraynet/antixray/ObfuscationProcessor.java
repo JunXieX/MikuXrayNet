@@ -1003,7 +1003,12 @@ public final class ObfuscationProcessor {
             }
           }
           section.setBlockState(index, replacement);
-          if (sectionCounts != null && profile.targets.get(replacement)) {
+          if (sectionCounts != null) {
+            // 替换条目必须计数，**不论它是不是目标方块**：compactPalette 会裁掉所有引用计数为 0 的
+            // 条目，而伪装方块（石头/深板岩等）几乎都不是目标——若这里跳过计数，一个「原本未被引用、
+            // 只由本次替换引入」的伪装条目就会被当成失效条目裁掉，该格的本地索引重映射到条目 0，
+            // 客户端看到的方块与写入的伪装完全不同（方块错乱/闪）。早前只在 targets 命中时计数，
+            // 正是这条路径的漏洞。
             int replacementEntry = section.paletteIdFor(replacement);
             if (replacementEntry >= 0 && replacementEntry < sectionCounts.length) {
               sectionCounts[replacementEntry]++;
