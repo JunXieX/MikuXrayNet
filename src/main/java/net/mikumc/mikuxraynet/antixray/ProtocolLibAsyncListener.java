@@ -479,11 +479,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 与 world.getMinHeight() 同一处安全取数点：这两个值都必须在此（网络线程读 Bukkit）取出，
     // 之后只传纯值给任务；worker 线程严禁触碰 Bukkit API。
     //
-    // 这段必须包 try/catch：闸门一旦取到就已把该玩家的 pending 计数 +1，而归还它的唯一途径
-    // （gate.chunkDone()）在还没构造出来的 task 的 delivery 闭包里。若中途抛异常（Folia 上跨线程读
-    // World、世界正在卸载等），这次 pending 永远回不去 —— 该玩家的 CHUNK_BATCH_FINISHED 会被拖到
-    // 看门狗超时（默认 2.5 秒），加载节奏被打断。此处还没登记处理延迟，直接返回即可，
-    // 放行由 ProtocolLib 自行完成（不要调 signalOnce，那会多放行一次）。
+    // 这段必须包 try/catch：闸门一旦取到就已把该玩家的 pending 计数 +1，而归还它的唯一途径是
+    // gate.chunkDone()（正常路径在 delivery 闭包里）。若中途抛异常（Folia 上跨线程读 World、世界
+    // 正在卸载等），必须在 catch 里显式归还，否则该玩家的 CHUNK_BATCH_FINISHED 会被拖到看门狗超时
+    // （默认 2.5 秒），加载节奏被打断。此处还没登记处理延迟，也不要调 signalOnce（那会多放行一次）。
     RewriteTask task;
     // 后面还要用（看门狗预算 / 邻块判定），故在 try 外声明。
     long timeoutMillis;
@@ -1433,7 +1432,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
   }
 
-  /** 由「世界名 + 区块坐标 + 配置指纹」推导的确定性种子：同输入必然同结果，缓存可安全复用。 */
+  /** 由「世界名 + 区块坐标」推导的确定性种子：同输入必然同结果，缓存可安全复用。 */
   private static long seed(String worldName, int chunkX, int chunkZ) {
     long hash = 0xcbf29ce484222325L;
     hash = (hash ^ worldName.hashCode()) * 0x100000001b3L;
