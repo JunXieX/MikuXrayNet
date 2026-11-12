@@ -27,6 +27,7 @@ import java.util.function.Consumer;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
+import net.mikumc.mikuxraynet.util.PlayerWorldIndex;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
@@ -629,13 +630,10 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     // 世界黑名单：命中世界不做任何带宽优化（变更合并一并跳过，原包照常放行）。
     // 名单为空（默认）时 isBlacklistedNow 直接早退，热路径近乎零开销。
     //
-    // 封包线程读 player.getWorld() 属跨线程读取（Folia 上是跨区域读实体状态），异常一律 fail-open
-    // 直通：取不到世界名就无法判定黑名单与跨世界，此时绝不把变更包卡进缓冲，原包原样放行。
-    String worldName;
-    try {
-      worldName = player.getWorld().getName();
-    } catch (Throwable ignored) {
-      // 无法判定世界：直通（原包照常下发，不入缓冲、不登记延迟）
+    // 封包线程不读实体状态（Folia 会抛 No currently ticking region）：只查玩家世界名快照。
+    // 快照缺失（刚登录）按「无法判定」直通：原包照常下发，绝不把方块包卡进缓冲。
+    String worldName = PlayerWorldIndex.worldName(player.getUniqueId());
+    if (worldName == null) {
       stats.blockChangesPassed.increment();
       return;
     }

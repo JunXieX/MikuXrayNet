@@ -459,13 +459,13 @@ public final class AntiXrayConfig {
   public static final int DISK_CACHE_MAX_REGION_FILES_DEFAULT = 0;
 
   /**
-   * {@code disk-cache.max-open-files}（同时常驻的区域文件句柄上限）的<b>默认值</b>：64。
+   * {@code disk-cache.max-open-files}（同时常驻的区域文件句柄上限）的<b>默认值</b>：128。
    *
-   * <p>每个句柄携带 {@code bucket-cache-size}（默认 32）条已解压条目，约 4~8 MB；64 个约 1 GB 量级。
+   * <p>每个句柄携带 {@code bucket-cache-size}（默认 32）条已解压条目，约 4~8 MB；128 个约 2 GB 量级。
    * 这是磁盘缓存常驻内存的主要来源，因此独立于 {@code max-region-files}（磁盘保留文件数）单独可调。
    * {@code 0} = 不限制（内存随活动范围增长，仅建议在内存充裕时使用）。
    */
-  public static final int DISK_CACHE_MAX_OPEN_FILES_DEFAULT = 64;
+  public static final int DISK_CACHE_MAX_OPEN_FILES_DEFAULT = 128;
 
   /** {@code disk-cache.max-open-files} 的安全上限：4096（只拦失控配置）。 */
   public static final int DISK_CACHE_MAX_OPEN_FILES_MAX = 4096;
@@ -1230,7 +1230,7 @@ public final class AntiXrayConfig {
                 DISK_CACHE_MAX_REGION_FILES_DEFAULT), 0, DISK_CACHE_MAX_REGION_FILES_MAX,
                 "disk-cache.max-region-files", floorAdjustments, ceilingAdjustments),
             // 常驻句柄上限：磁盘缓存内存占用的主旋钮（每句柄约 4~8 MB × bucket-cache-size）。
-            // 默认 64（约 1 GB 量级）；0 = 不限制。
+            // 默认 128（约 2 GB 量级）；0 = 不限制。
             clampCeiling(root.getInt("disk-cache.max-open-files",
                 DISK_CACHE_MAX_OPEN_FILES_DEFAULT), 0, DISK_CACHE_MAX_OPEN_FILES_MAX,
                 "disk-cache.max-open-files", floorAdjustments, ceilingAdjustments)),

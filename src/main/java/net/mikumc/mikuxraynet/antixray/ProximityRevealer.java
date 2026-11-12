@@ -1961,6 +1961,10 @@ public final class ProximityRevealer implements Listener {
         int x = cx + offset[0];
         int y = cy + offset[1];
         int z = cz + offset[2];
+        if (x == cx && y == cy && z == cz) {
+          // 变更坐标本身：客户端刚收到服务端广播的方块包，再发一次会造成同格重绘（观感闪一下）。
+          continue;
+        }
         if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
           continue;
         }

@@ -27,6 +27,7 @@ import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.occlusion.SectionKey;
 import net.mikumc.mikuxraynet.util.Constants;
+import net.mikumc.mikuxraynet.util.PlayerWorldIndex;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;

@@ -13,7 +13,7 @@ import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ObfuscationProcessor;
 import net.mikumc.mikuxraynet.antixray.OcclusionPatchListener;
 import net.mikumc.mikuxraynet.antixray.ProximityRevealer;
-import net.mikumc.mikuxraynet.antixray.PlayerWorldIndex;
+import net.mikumc.mikuxraynet.util.PlayerWorldIndex;
 import net.mikumc.mikuxraynet.antixray.ProximityStats;
 import net.mikumc.mikuxraynet.antixray.RevealedSet;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;

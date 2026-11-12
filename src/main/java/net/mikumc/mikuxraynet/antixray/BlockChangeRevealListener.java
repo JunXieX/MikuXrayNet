@@ -17,7 +17,9 @@ import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.Schedulers;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.util.Constants;
+import net.mikumc.mikuxraynet.util.PlayerWorldIndex;
 import org.bukkit.World;
+import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 
@@ -182,7 +184,15 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     if (position == null) {
       return;
     }
-    observeChange(player, worldName, position.getX(), position.getY(), position.getZ());
+    // 只有「变更后不再是遮挡方块」才可能露出后面的伪装矿；放置石头/泥土不会，
+    // 此时再触发事件显形只会把同一格重绘一次（真机观感：放置时闪一下）。
+    boolean exposes = true;
+    try {
+      exposes = exposes(packet.getBlockData().readSafely(0));
+    } catch (Throwable ignored) {
+      // 读不到状态（协议差异）：按「可能暴露」处理，行为与之前一致
+    }
+    observeChange(player, worldName, position.getX(), position.getY(), position.getZ(), exposes);
   }
 
   /**
@@ -588,7 +598,8 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * 不派发），单方块路径此前漏了这一步。真实变更（玩家挖开 / 爆炸 / 放置）返回 {@code false}，
    * 仍照常触发邻域显形。
    */
-  private void observeChange(Player player, String worldName, int x, int y, int z) {
+  private void observeChange(Player player, String worldName, int x, int y, int z,
+      boolean exposes) {
     // 黑名单世界不做任何反矿透工作：不注销显形、不触发事件即时显形。
     if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       return;
@@ -604,12 +615,28 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
     recordChange(worldName, x, y, z);
     submitUndo(() -> removeFromIndexAndMarks(worldName, x, y, z));
-    if (instantRevealer != null) {
+    if (exposes && instantRevealer != null) {
       // 投递到玩家线程：onBlockChangeObserved 内部要读 Bukkit.getCurrentTick()，Folia 上在封包线程读会抛
       // No currently ticking region——整条注销包被外层 catch 后 fail-open 放行，坐标就留在伪装索引里。
       // 投递失败（玩家离线/区域关闭）只放弃事件显形，周期巡检会兜底。
       Schedulers.onEntity(plugin, player,
           () -> instantRevealer.onBlockChangeObserved(player, worldName, x, y, z));
+    }
+  }
+
+  /**
+   * 该变更是否可能「露出后面的方块」：变更后不再是遮挡方块（空气、玻璃、水等）才可能。
+   *
+   * <p>读不到状态时按 {@code true} 处理（与改动前行为一致，宁可多一次事件显形也不漏显）。
+   */
+  private static boolean exposes(BlockData data) {
+    if (data == null) {
+      return true;
+    }
+    try {
+      return !data.getMaterial().isOccluding();
+    } catch (Throwable throwable) {
+      return true;
     }
   }
 

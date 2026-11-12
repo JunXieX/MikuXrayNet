@@ -1,4 +1,4 @@
-package net.mikumc.mikuxraynet.antixray;
+package net.mikumc.mikuxraynet.util;
 
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
