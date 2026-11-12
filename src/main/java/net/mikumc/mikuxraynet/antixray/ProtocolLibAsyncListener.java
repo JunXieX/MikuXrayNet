@@ -1311,13 +1311,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 的遮挡判定依赖邻块贴边快照内容。读、写两侧都走本方法，保证键一致。
    */
   private int rewriteFingerprint(NeighborEdges neighbors) {
-    int base = config.configHash() * 31 + (live().removeBlockEntities() ? 1 : 0);
-    base = base * 31 + processor.paletteFingerprint();
-    if (neighbors == null) {
-      return base;
-    }
-    long neighborHash = neighbors.contentFingerprint();
-    return base * 31 + (int) (neighborHash ^ (neighborHash >>> 32));
+    // 组合逻辑集中在 RewriteFingerprint：新增会改变改写字节的输入时只需改那一处，
+    // 不会再出现「读侧加了、写侧漏了」的静默不命中。
+    return RewriteFingerprint.of(config.configHash(), live().removeBlockEntities(),
+        processor.paletteFingerprint(),
+        neighbors == null ? 0L : neighbors.contentFingerprint(), neighbors != null);
   }
 
   /**
