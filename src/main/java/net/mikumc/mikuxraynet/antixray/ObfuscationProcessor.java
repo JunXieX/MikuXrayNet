@@ -668,7 +668,6 @@ public final class ObfuscationProcessor {
     return (paletteOptions.strictVerify() ? 1 : 0) | (paletteOptions.widthBudget() ? 2 : 0);
   }
 
-  /** 是否具备生效条件（任一维度档案或任一世界覆盖档案的目标与伪装候选都已解析）。 */
   /**
    * 是否启用了异步遮挡（即是否会给区块生成遮挡位图）。
    *
@@ -718,6 +717,7 @@ public final class ObfuscationProcessor {
     return store.patchStamps(chunkX, minSectionY, chunkZ, sectionCount);
   }
 
+  /** 是否具备生效条件（任一维度档案或任一世界覆盖档案的目标与伪装候选都已解析）。 */
   public boolean isActive() {
     for (WorldProfile profile : dimensionProfiles) {
       if (profile.active()) {
