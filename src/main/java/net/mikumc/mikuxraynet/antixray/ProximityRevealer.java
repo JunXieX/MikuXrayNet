@@ -813,18 +813,42 @@ public final class ProximityRevealer implements Listener {
     return worldName != null && !WorldBlacklistConfig.isBlacklistedNow(worldName);
   }
 
+  /**
+   * 显形尝试的统一前置（不碰世界）：停用中、离线、直通玩家一律不显形。
+   *
+   * <p>六条路径（周期 / 事件 / 视线 / 挖掘 / 区块下发 / 视野增量）此前各自复制这三项判断；
+   * 新增一条路径漏掉任意一项，就会给直通玩家或已停用的实例发包（或该显形的不显形）。统一后只需维护一处。
+   */
+  private boolean gateOpen(Player player) {
+    return !stopping && player != null && player.isOnline()
+        && (bypassRegistry == null || !bypassRegistry.isBypassed(player.getUniqueId()));
+  }
+
+  /**
+   * 显形尝试的统一世界闸门：捕获玩家当前世界并做黑名单判定；不允许显形时返回 {@code null}。
+   *
+   * <p>必须在拥有该玩家的线程调用（读 {@code player.getWorld()}）。让返回值同时充当「世界名」，
+   * 避免各路径各自读一次世界造成口径不一致——历史上「世界捕获时机不同」正是显形错位的来源。
+   */
+  private String revealWorld(Player player) {
+    World world = player.getWorld();
+    if (world == null) {
+      return null;
+    }
+    String worldName = world.getName();
+    return shouldRevealInWorld(worldName) ? worldName : null;
+  }
+
   /** 主线程 / 区域线程：局部扫描取候选 → （可选）工作线程筛选 → 读真实方块 → 发包 → 标记已显形。 */
   private void reveal(Player player, Budget budget, int shard) {
-    if (!player.isOnline()
-        || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
+    if (!gateOpen(player)) {
       return;
     }
-
     World world = player.getWorld();
-    String worldName = world.getName();
     // 只排除黑名单世界：总开关关闭后仍保留索引与巡检，好让已下发到客户端的假矿还能被还原
     //（索引为空时天然零发包，见 shouldRevealInWorld 的说明）。
-    if (!shouldRevealInWorld(worldName)) {
+    String worldName = revealWorld(player);
+    if (worldName == null) {
       return;
     }
 
@@ -1964,13 +1988,13 @@ public final class ProximityRevealer implements Listener {
    */
   private void revealImmediately(Player player, int cx, int cy, int cz) {
     try {
-      if (stopping || !player.isOnline()
-          || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
+      if (!gateOpen(player)) {
         return;
       }
       World world = player.getWorld();
       // 只排除黑名单世界：与周期巡检共用同一门闸（总开关关闭后仍要还原已下发的假矿）。
-      if (!shouldRevealInWorld(world.getName())) {
+      String liveWorld = revealWorld(player);
+      if (liveWorld == null) {
         return;
       }
       int radius = instant.radius();
@@ -1997,7 +2021,6 @@ public final class ProximityRevealer implements Listener {
       ProximitySelector.Eye eye = proximity.raycastEnabled() ? eyeOf(player) : null;
       PassTally tally = new PassTally();
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
-      String liveWorld = world.getName();
       for (int[] offset : instantOffsets(radius)) {
         if (budget.remaining() <= 0) {
           break;
@@ -2038,13 +2061,13 @@ public final class ProximityRevealer implements Listener {
    */
   private void revealSectionImmediately(Player player, int[] coordinates, int count) {
     try {
-      if (stopping || !player.isOnline()
-          || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
+      if (!gateOpen(player)) {
         return;
       }
       World world = player.getWorld();
       // 只排除黑名单世界：与周期巡检共用同一门闸（总开关关闭后仍要还原已下发的假矿）。
-      if (!shouldRevealInWorld(world.getName())) {
+      String liveWorld = revealWorld(player);
+      if (liveWorld == null) {
         return;
       }
       int radius = instant.radius();
@@ -2062,7 +2085,6 @@ public final class ProximityRevealer implements Listener {
       ProximitySelector.Eye eye = proximity.raycastEnabled() ? eyeOf(player) : null;
       PassTally tally = new PassTally();
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
-      String liveWorld = world.getName();
       // 候选判定复用线程本地区块键缓存（键只用于 CHM 查询、绝不入表），避免逐候选 new ChunkKey。
       int[][] offsets = instantOffsets(radius);
       // 去重：同一候选坐标可能同时落在多个变更坐标的邻域里，只评估一次（保证「恰好一次放行」）。
@@ -2207,12 +2229,12 @@ public final class ProximityRevealer implements Listener {
   public void onChunkDelivered(Player player, String worldName, int chunkX, int chunkZ) {
     // 离线玩家直接忽略：对已退役实体 Schedulers.onEntity 会静默丢弃任务，drain 的清理兜底永不执行，
     // 条目会留下 scheduled=true（重登后 M2 整局失效 + 小泄漏）。
-    if (player == null || worldName == null || stopping || !player.isOnline()
+    if (!gateOpen(player) || worldName == null
         || !proximity.revealOnChunkSend()
         || !instant.enabled() || instant.maxPerTick() <= 0) {
       return;
     }
-    if (chunkIndex == null || revealedSet == null || WorldBlacklistConfig.isBlacklistedNow(worldName)) {
+    if (chunkIndex == null || revealedSet == null || !shouldRevealInWorld(worldName)) {
       return;
     }
     UUID playerId = player.getUniqueId();
@@ -2464,14 +2486,11 @@ public final class ProximityRevealer implements Listener {
    */
   private void revealLookedAt(Player player) {
     try {
-      if (stopping || !player.isOnline() || chunkIndex == null || revealedSet == null) {
-        return;
-      }
-      if (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId())) {
+      if (!gateOpen(player) || chunkIndex == null || revealedSet == null) {
         return;
       }
       World world = player.getWorld();
-      if (world == null || !shouldRevealInWorld(world.getName())) {
+      if (revealWorld(player) == null) {
         return;
       }
       Location eye = player.getEyeLocation();
@@ -2530,14 +2549,11 @@ public final class ProximityRevealer implements Listener {
    */
   private void revealDigTarget(Player player, int x, int y, int z) {
     try {
-      if (stopping || !player.isOnline()) {
-        return;
-      }
-      if (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId())) {
+      if (!gateOpen(player)) {
         return;
       }
       World world = player.getWorld();
-      if (world == null || !shouldRevealInWorld(world.getName())) {
+      if (revealWorld(player) == null) {
         return;
       }
       if (chunkIndex == null || revealedSet == null) {
@@ -2595,12 +2611,12 @@ public final class ProximityRevealer implements Listener {
    */
   private void revealAfterDig(Player player, int bx, int by, int bz) {
     try {
-      if (stopping || !player.isOnline()) {
+      if (!gateOpen(player)) {
         return;
       }
       World world = player.getWorld();
-      String worldName = world.getName();
-      if (!shouldRevealInWorld(worldName)) {
+      String worldName = revealWorld(player);
+      if (worldName == null) {
         return;
       }
       UUID playerId = player.getUniqueId();
@@ -2813,12 +2829,12 @@ public final class ProximityRevealer implements Listener {
    */
   private void runViewChangeScan(Player player, AntiXrayConfig.ViewChange viewChange) {
     // 先做门闸再计时：门闸失败的调用不算一次「扫描」，否则面板里的平均耗时会被大量空调用稀释
-    if (stopping || !player.isOnline() || chunkIndex == null || revealedSet == null) {
+    if (!gateOpen(player) || chunkIndex == null || revealedSet == null) {
       return;
     }
     World world = player.getWorld();
-    String worldName = world.getName();
-    if (!shouldRevealInWorld(worldName)) {
+    String worldName = revealWorld(player);
+    if (worldName == null) {
       return;
     }
     long start = System.nanoTime();
