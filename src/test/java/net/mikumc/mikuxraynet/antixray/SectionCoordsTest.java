@@ -17,7 +17,7 @@ class SectionCoordsTest {
   void packingMatchesTheProtocolLayout() {
     // (y << 8) | (z << 4) | x
     assertEquals((2 << 8) | (3 << 4) | 1, SectionCoords.pack(1, 2, 3));
-    assertEquals(0x0F0F, SectionCoords.pack(15, 15, 15));
+    assertEquals(0x0FFF, SectionCoords.pack(15, 15, 15));
     assertEquals(0, SectionCoords.pack(0, 0, 0));
   }
 
