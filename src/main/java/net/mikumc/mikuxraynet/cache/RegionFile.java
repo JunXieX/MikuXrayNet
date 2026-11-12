@@ -709,7 +709,14 @@ final class RegionFile implements AutoCloseable {
    */
   private boolean flushBucket(int bucket) throws IOException {
     if (fileSize < BufferedLinearV3Format.DATA_AREA_OFFSET) {
-      // 兜底不变式：数据区之前永远先有头部与偏移表，绝不把 bucket 写进元数据区
+      // 兜底不变式：数据区之前永远先有头部与偏移表，绝不把 bucket 写进元数据区。
+      // 走到这里说明文件被截断/重建，旧偏移全部指向不存在的区域：必须先清空索引再写头，
+      // 否则 writeHeaderAndEmptyTable 会把这些失效偏移写回头部，读侧随后反复按损坏处理。
+      // 保留 slots/dirty（内存中的待落盘数据），随后各桶会重新 append 并重写偏移。
+      java.util.Arrays.fill(positions, 0L);
+      java.util.Arrays.fill(bucketSizes, 0L);
+      liveBytes = 0L;
+      garbageBytes = 0L;
       writeHeaderAndEmptyTable();
     }
 

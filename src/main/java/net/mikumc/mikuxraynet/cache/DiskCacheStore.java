@@ -580,25 +580,35 @@ public final class DiskCacheStore implements AutoCloseable {
       // 惰性清理，绝不返回不符合本次改写前提的负载。
       // 必须计数：这是「升级/改配置后命中率骤降」的唯一成因出口，否则该清理完全不可见
       //（过期清理恒为 0，管理员会误以为条目有效却读不到）。
-      stats.configMismatchRemoved.increment();
-      removeEntry(handle, chunkIndex);
+      if (removeEntry(handle, chunkIndex)) {
+        stats.configMismatchRemoved.increment();
+      }
       return null;
     }
     if (isExpired(entry)) {
-      removeEntry(handle, chunkIndex);
-      stats.expiredRemoved.increment();
+      if (removeEntry(handle, chunkIndex)) {
+        stats.expiredRemoved.increment();
+      }
       return null;
     }
 
     return entry.payload();
   }
 
-  /** 惰性清理一个条目并同步近似计数（计数只作容量判断，夹在 0 以上）。 */
-  private void removeEntry(Handle handle, int chunkIndex) throws IOException {
-    if (handle.file.clear(chunkIndex)) {
-      handle.accountedEntries = Math.max(0L, handle.accountedEntries - 1L);
-      approximateEntries.updateAndGet(value -> Math.max(0, value - 1));
+  /**
+   * 惰性清理一个条目并同步近似计数（计数只作容量判断，夹在 0 以上）。
+   *
+   * @return 是否真的清掉了；桶未加载时 {@link RegionFile#clear} 不做磁盘 IO、返回 false，
+   *         此时条目仍在磁盘上——调用方据此**不要**累加「已清理」计数，否则同一陈旧条目
+   *         会在每次读取时重复计数，面板显示被清掉的条目数远大于实际。
+   */
+  private boolean removeEntry(Handle handle, int chunkIndex) throws IOException {
+    if (!handle.file.clear(chunkIndex)) {
+      return false;
     }
+    handle.accountedEntries = Math.max(0L, handle.accountedEntries - 1L);
+    approximateEntries.updateAndGet(value -> Math.max(0, value - 1));
+    return true;
   }
 
   private void doPut(String worldName, int chunkX, int chunkZ, int configHash, long writtenAt,
