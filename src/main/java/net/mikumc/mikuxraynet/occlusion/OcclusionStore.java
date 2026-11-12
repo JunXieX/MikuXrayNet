@@ -247,11 +247,9 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
           // 越界坐标：本格不写入，继续处理后面的格（整批不因一格被拒而回滚）
           continue;
         }
-        if (!applyCellLocked(key, xs[i], ys[i], zs[i], occluding[i])) {
-          // 该段从未建表：补丁被丢弃（见 applyCellLocked）。不记回放、不记戳、不计 applied——
-          // 否则面板会显示「已补丁」而位图其实没变，发布/回放链路也会为一条不存在的补丁反复跳过。
-          continue;
-        }
+        // 即时补丁：allowCreate=false —— 缺数据段不凭空建位图（显形侧会把其余格判成不遮挡，隔墙透视）。
+        // 但仍记录回放与补丁戳：区块随后建表发布时由 replayPendingCells 在「允许创建」模式下补齐。
+        applyCellLocked(key, xs[i], ys[i], zs[i], occluding[i], false);
         if (replay == null || key != replayKey) {
           replayKey = key;
           replay = replayFor(key);
@@ -387,7 +385,8 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
       int x = (int) (packed >> 38);
       int y = (int) ((packed >> 26) & 0xFFF);
       int z = (int) (packed & 0x3FFFFFF);
-      applyCellLocked(key, x, y, z, replay.occluding[i]);
+      // 回放发生在整列发布之后、同一把写锁内：允许在缺数据段上创建位图，把窗口内的补丁补进新几何。
+      applyCellLocked(key, x, y, z, replay.occluding[i], true);
     }
     return size;
   }
@@ -407,7 +406,8 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * 包里的坐标一旦越出 28 位水平 / 8 位 sectionY 范围，{@code packBlock} 会按位截断成<b>另一个 section
    * 的键</b>，把补丁静默写到错误的几何上。调用方按「本格被拒」计数并跳过，故显式拒绝是安全方向。
    */
-  private boolean applyCellLocked(long key, int x, int y, int z, boolean occluding) {
+  private boolean applyCellLocked(long key, int x, int y, int z, boolean occluding,
+      boolean allowCreate) {
     int localX = x & SectionOcclusion.LOCAL_MASK;
     int localY = y & SectionOcclusion.LOCAL_MASK;
     int localZ = z & SectionOcclusion.LOCAL_MASK;
@@ -420,10 +420,18 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
     // 方向性：该格漏记为遮挡 = 实体射线少算一格遮挡（少藏，安全侧），但显形侧会据此把该方块后方
     // 本不可见的坐标误判为可见而还原（偏漏防）。故按「零遮挡位」统一处理，保证位图与真实世界一致。
     if (current == null) {
-      // 从未建表：绝不能凭空造一张「只有这一格遮挡」的位图。显形侧把「无数据」当遮挡（严格方向），
-      // 而「有数据」的段按位判定——凭空建位图会让该段其余 4095 格从「遮挡」变成「不遮挡」，
-      // 墙后的伪装矿随即被还原，等于隔墙透视。保持缺数据，等区块重新下发、建表时统一覆盖。
-      return false;
+      // 从未建表：即时补丁绝不能凭空造一张「只有这一格遮挡」的位图——显形侧把「无数据」当遮挡
+      // （严格方向），而「有数据」的段按位判定；凭空建位图会让该段其余 4095 格从「遮挡」变成
+      // 「不遮挡」，墙后的伪装矿随即被还原，等于隔墙透视。
+      // 但「建表发布时的回放」必须允许创建：此刻整列即将被覆盖，回放的目的正是把窗口内的补丁
+      // 补进新几何；不建就会把补丁丢掉（该显示却多藏）。两者用 allowCreate 区分。
+      if (!allowCreate || !occluding) {
+        return false;
+      }
+      BitmapOcclusion created = new BitmapOcclusion();
+      created.setOccluding(localX, localY, localZ, true);
+      sections.put(key, created);
+      return true;
     }
     if (current.isEmpty()) {
       // 已知全不遮挡（空气段）里新放置遮挡方块：建位图是正确的，整段语义仍是「有数据、按位判定」。
