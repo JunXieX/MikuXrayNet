@@ -20,7 +20,6 @@ import java.util.function.Supplier;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.Schedulers;
 import net.mikumc.mikuxraynet.cache.DiskCacheStore;
-import net.mikumc.mikuxraynet.cache.DiskPayload;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.concurrency.RewriteTask;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
@@ -57,17 +56,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private static final int MAX_PENDING_BATCHES = 256;
 
   /** 空字节数组：未改写区块的磁盘负载不带区块字节（见 {@code rewrite} 的写入点）。 */
-  private static final byte[] EMPTY_BYTES = new byte[0];
-
-  /**
-   * 缓存值：源字节指纹 + 改写结果（不含任何封包或世界引用）。
-   *
-   * <p>{@code occlusion} 为<b>整列遮挡数据负载</b>（见 {@code occlusion.OcclusionPayload}；未启用异步实体
-   * 遮挡时为 {@code null}）。随缓存一起保存，使<b>缓存命中路径</b>（不经解码）也能恢复遮挡数据。
-   */
-  private record CachedChunk(long sourceHash, byte[] data, int[] positions, byte[] occlusion) {
-  }
-
   /**
    * 未配对批次闸门表：按插入序持有，超限时<b>只淘汰最旧的一个</b>，玩家退出时按 UUID 清理。
    *
@@ -212,6 +200,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final Supplier<RevealedSet> revealedSet;
   private final BypassRegistry bypassRegistry;
   private final DiskCacheStore diskCache;
+  /** 改写编排（缓存 / 磁盘 / 邻块 / 指纹 / 种子全部注入，可离线测；见 RewritePipeline）。 */
+  private final RewritePipeline pipeline;
   private final RewriteStats stats = new RewriteStats();
   /**
    * 最近方块变更的环形日志（见 {@link ChunkChangeJournal}）。
@@ -332,6 +322,31 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 把本监听器的统计容器交给改写处理器：建表失败 / 发布时跳过被补丁段这两类事件只发生在处理器内部，
     // 不注入的话它们在面板上永远不可见（诊断读的就是这同一个 RewriteStats 实例）。
     this.processor.bindStats(stats);
+    this.pipeline = new RewritePipeline(processor, cache,
+        new RewritePipeline.DiskStore() {
+          @Override
+          public boolean usable() {
+            return diskCache != null && diskCache.usable();
+          }
+
+          @Override
+          public byte[] get(String worldName, int chunkX, int chunkZ, int fingerprint) {
+            return diskCache == null ? null : diskCache.get(worldName, chunkX, chunkZ, fingerprint);
+          }
+
+          @Override
+          public void put(String worldName, int chunkX, int chunkZ, int fingerprint, int encodedBytes,
+              java.util.function.Supplier<byte[]> payload) {
+            if (diskCache != null) {
+              diskCache.put(worldName, chunkX, chunkZ, fingerprint, encodedBytes, payload::get);
+            }
+          }
+        },
+        (worldName, chunkX, chunkZ, dimension) ->
+            neighborProvider != null && neighborsNeeded(worldName, dimension)
+                ? neighborProvider.cached(worldName, chunkX, chunkZ) : null,
+        this::rewriteFingerprint,
+        ProtocolLibAsyncListener::seed);
     registerQuitHook();
   }
 
@@ -708,51 +723,33 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    */
   private void rewriteOnWorker(RewriteTask task, ChunkPacketAccessor accessor) {
     // 实时读「当前」配置并固定在本轮改写内使用：remove-block-entities 必须随 reload 生效
-    // （本监听器不随热重载重建），且同一轮里 cache.get 与 cache.put 必须用同一份取值——
-    // 若每处各读一次、reload 恰好发生在中途，读写键会不一致，导致刚写的条目立刻读不到。
+    // （本监听器不随热重载重建），且同一轮里缓存键与写回必须用同一份取值。
     AntiXrayConfig current = live();
 
     try {
       if (!task.expired()) {
         byte[] source = accessor.buffer();
         long sourceHash = hash(source);
-        // 邻块依赖：enclosed 模式的改写结果依赖邻块贴边快照的遮挡位，因此必须把「本次改写实际用到的
-        // 快照内容」一并并入缓存键——否则邻块方块变化（本区块原始字节未变）后，缓存仍会返回按旧邻块
-        // 算出的结果（默认内存 600s / 磁盘 7 天）。all 模式不使用邻块，指纹与之无关。
-        // 快照缺失时 neighbors 为 null（改写按 missing-policy 处理），指纹与「已抓到快照」自然不同，
-        // 快照补上后该条目随即失效重写，语义正确。
-        NeighborEdges neighbors = neighborsNeeded(task.worldName(), task.dimension())
-            ? neighborProvider.cached(task.worldName(), task.chunkX(), task.chunkZ())
-            : null;
-        int fingerprint = rewriteFingerprint(neighbors);
-
-        CachedChunk cached = cache.get(task.worldName(), task.chunkX(), task.chunkZ(),
-            fingerprint);
-        if (cached == null || cached.sourceHash() != sourceHash) {
-          if (cached != null) {
-            // 键命中但内容已变：命中计数 +1 却用不上，必须单列，否则命中率虚高且磁盘查询数对不上
-            stats.cacheContentRejected.increment();
-          }
-          cached = loadFromDisk(task, sourceHash, fingerprint);
+        // 缓存查询 / 磁盘回填 / 改写 / 回填缓存全部交给 RewritePipeline（纯编排，可离线测）；
+        // 本方法只负责「取源字节 → 计数 → 写回」。
+        RewritePipeline.Outcome outcome = pipeline.rewrite(new RewritePipeline.Request(
+            task.worldName(), task.chunkX(), task.chunkZ(), task.minHeight(), task.sectionCount(),
+            task.dimension(), source, sourceHash, task.occlusionStamps()));
+        if (outcome.diskRejected()) {
+          stats.diskPayloadRejected.increment();
         }
-
-        if (cached != null && processor.occlusionEnabled() && cached.occlusion() == null) {
-          // 启用了异步遮挡，但这条缓存没有随负载携带遮挡位图（旧版本写下的条目 / 当时功能关闭）。
-          // 直接命中会让该区块长期「已伪装但无位图」：显形侧按「缺数据 = 遮挡」判定，
-          // 玩家挖到这里的矿会一直显示假方块 —— 属于「为了多藏而让玩家漏矿」，必须避免。
-          // 视为未命中、重新改写一次即可重建位图（代价仅一次性）。
-          stats.cacheContentRejected.increment();
-          cached = null;
+        if (outcome.contentRejected() > 0) {
+          // 键命中但内容已变 / 缺遮挡位图：命中率不能算作有效命中，必须单列
+          stats.cacheContentRejected.add(outcome.contentRejected());
         }
-
-        if (cached != null) {
-          // 缓存命中路径不解码，遮挡位图只能来自随负载一起缓存的副本（方案 b）：
+        if (outcome.hit()) {
+          // 命中路径不解码，遮挡位图只能来自随负载一起缓存的副本（方案 b）：
           // 未启用该功能时 occlusion 为 null、restoreOcclusion 为 no-op，零开销。
-          processor.restoreOcclusion(cached.occlusion(), task.worldName(), task.chunkX(),
+          processor.restoreOcclusion(outcome.cached().occlusion(), task.worldName(), task.chunkX(),
               task.minHeight() >> 4, task.chunkZ());
-          writeBack(accessor, task, cached.data(), cached.positions(), current);
+          writeBack(accessor, task, outcome.cached().data(), outcome.cached().positions(), current);
         } else {
-          rewrite(task, accessor, source, sourceHash, neighbors, fingerprint, current);
+          finishRewrite(task, accessor, source, outcome.result(), current);
         }
       }
     } catch (Throwable throwable) {
@@ -769,54 +766,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
   }
 
-  /**
-   * 内存未命中时尝试磁盘缓存；命中则回填内存缓存。
-   *
-   * <p>磁盘读带 50ms 预算（见 {@code DiskCacheStore}），超时/异常一律按未命中降级，
-   * 因此不会把封包处理拖过时限。负载里带原始字节指纹（指纹不符即视为未命中）与<b>被伪装坐标</b>
-   * （回填后由 {@link #writeBack} 写回显形索引——否则磁盘命中的区块永远不进索引）。
-   */
-  private CachedChunk loadFromDisk(RewriteTask task, long sourceHash, int fingerprint) {
-    if (diskCache == null || !diskCache.usable()) {
-      return null;
-    }
-    try {
-      byte[] payload = diskCache.get(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint);
-      if (payload == null) {
-        return null;
-      }
-      DiskPayload.Decoded decoded = DiskPayload.decode(payload, sourceHash);
-      if (decoded == null) {
-        // 读到了负载但用不上（信封损坏或原始字节指纹不符）：这是「命中率正常但仍在重写」的唯一出口，
-        // 必须计数——否则它会被混进普通未命中里，无法区分是内容指纹在拦还是配置指纹在拦。
-        stats.diskPayloadRejected.increment();
-        return null;
-      }
-      CachedChunk fromDisk = new CachedChunk(decoded.sourceHash(), decoded.data(),
-          decoded.positions(), decoded.occlusion());
-      cache.put(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint, fromDisk);
-      return fromDisk;
-    } catch (Throwable throwable) {
-      logThrottled("读取磁盘缓存失败，已按未命中处理", throwable);
-      return null;
-    }
-  }
-
-  /**
-   * 改写并回填内存缓存与磁盘缓存。
-   *
-   * @param fingerprint 本次改写的完整决定因素指纹（配置 + 调色板 + 邻块快照内容），
-   *                    与 {@link #rewriteOnWorker} 的读取侧同源，保证读写键一致
-   */
-  private void rewrite(RewriteTask task, ChunkPacketAccessor accessor, byte[] source, long sourceHash,
-      NeighborEdges neighbors, int fingerprint, AntiXrayConfig current) {
-    // 世界名 + 维度 + 最低 Y 一并传入：world-overrides（按世界名）优先于 dimensions.<维度>，
-    // min-y/max-y 过滤与分区伪装表需要把 section 内相对 Y 换算成绝对 Y。
-    ObfuscationProcessor.Result result = processor.rewrite(source, task.sectionCount(),
-        seed(task.worldName(), task.chunkX(), task.chunkZ()), neighbors,
-        task.worldName(), task.dimension(), task.minHeight(), task.chunkX(), task.chunkZ(),
-        task.occlusionStamps());
-
+  /** 未命中路径的收尾：计数、一次性诊断、写回封包并维护显形索引（缓存已由 pipeline 回填）。 */
+  private void finishRewrite(RewriteTask task, ChunkPacketAccessor accessor, byte[] source,
+      ObfuscationProcessor.Result result, AntiXrayConfig current) {
     if (result.failed()) {
       // 解码/重编码异常：必须可观测——否则「本该伪装却失败」会被并进「跳过」里，看起来一切正常。
       // 失败结果不写入任何一级缓存（见 resultCacheable）：瞬时故障若被固化，同指纹区块在缓存有效期内
@@ -857,28 +809,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     logFirstRewriteDiagnostic(task, source, result);
 
-    // 启用异步遮挡时，位图缺失的结果不入缓存（否则该区块会长期「已伪装但永远无位图」→ 玩家漏矿）。
-    boolean occlusionRequired = processor.occlusionEnabled();
-    if (resultCacheable(result, occlusionRequired)) {
-      // 无伪装坐标的区块两级缓存都不保留区块字节：命中后不做任何写回（writeBack 见空坐标即返回），
-      // 留着只会按几十 KB 计入内存/磁盘的字节预算，把真正改写过的条目挤出去。
-      int[] positions = result.obfuscatedPositions();
-      byte[] bytes = result.changed() ? result.data() : EMPTY_BYTES;
-      CachedChunk value = new CachedChunk(sourceHash, bytes, positions, result.occlusion());
-      cache.put(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint, value);
-      if (diskCache != null) {
-        // 写入是「提交即返回」的异步操作（自有磁盘线程），不阻塞本工作线程。
-        // 用惰性负载重载：先按编码后的长度判定容量，通过后才真正编码——编码要分配并整块拷贝
-        // 改写后的区块字节（几十~几百 KB），被拒时（条目达上限 / 磁盘线程积压）这次拷贝纯属浪费。
-        // 负载里带上被伪装坐标（命中时重新写入显形索引）与整列遮挡数据（命中时恢复遮挡仓库）。
-        //
-        // 同上：无伪装坐标的区块不带字节，只保留坐标数/遮挡数据（几十字节），不再为「从未写回」的
-        // 整块区块字节付磁盘占用。
-        diskCache.put(task.worldName(), task.chunkX(), task.chunkZ(), fingerprint,
-            DiskPayload.encodedLength(positions, result.occlusion(), bytes),
-            () -> DiskPayload.encode(sourceHash, positions, result.occlusion(), bytes));
-      }
-    }
+    // 缓存回填（内存 + 磁盘）已由 RewritePipeline 在返回前完成；此处只负责写回与索引维护。
     // 失败结果：data == source 且伪装位置为空 → writeBack 直接返回，原包照常下发（fail-open 语义不变）。
     writeBack(accessor, task, result.data(), result.obfuscatedPositions(), current);
   }
@@ -894,7 +825,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * <p>包级可见，便于离线单测（无需实例化整个监听器）。
    */
   static boolean resultCacheable(ObfuscationProcessor.Result result) {
-    return result != null && !result.failed();
+    // 单一实现见 RewritePipeline（缓存回填已移入该管线，判定不允许两处漂移）。
+    return RewritePipeline.resultCacheable(result);
   }
 
   /**
@@ -913,10 +845,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * @param occlusionRequired 当前是否启用了异步遮挡（{@code occlusionStores != null}）
    */
   static boolean resultCacheable(ObfuscationProcessor.Result result, boolean occlusionRequired) {
-    if (!resultCacheable(result)) {
-      return false;
-    }
-    return !occlusionRequired || result.occlusion() != null;
+    return RewritePipeline.resultCacheable(result, occlusionRequired);
   }
 
   /**
