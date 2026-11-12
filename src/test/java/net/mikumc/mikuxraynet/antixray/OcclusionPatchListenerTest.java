@@ -28,7 +28,10 @@ class OcclusionPatchListenerTest {
   void occludingPatchCreatesBitAndCountsIt() {
     OcclusionStore store = new OcclusionStore();
     OcclusionStats stats = new OcclusionStats();
-    assertNull(store.section(CHUNK, 0, CHUNK), "前置：该段无数据");
+    // 前置：该段「已建表且确认全不遮挡」（空气段）。从未建表的段不接受补丁——否则会凭空造出
+    // 「只有这一格遮挡」的位图，让该段其余格在显形侧从「缺数据 = 遮挡」变成「不遮挡」（隔墙透视）。
+    store.replaceSection(CHUNK, 0, CHUNK, EmptyOcclusion.INSTANCE);
+    assertSame(EmptyOcclusion.INSTANCE, store.section(CHUNK, 0, CHUNK), "前置：该段为已知全不遮挡");
 
     OcclusionPatchListener.applyPatches(store, new int[] {3, 4, 5},
         new byte[] {OcclusionPatchListener.OCCLUDING}, stats);

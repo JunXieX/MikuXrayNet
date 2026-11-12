@@ -44,7 +44,10 @@ class OcclusionPatchPublishRaceTest {
 
     // 2) 「建表窗口」内玩家挖开了一个方块：中间那段（sectionY=1）被补丁写下
     //    坐标 (1, 1*16+2, 3) → section (0,1,0)，局部坐标 (1,2,3)
-    assertNull(store.section(0, 1, 0), "前置：补丁前该段无数据");
+    // 前置：该段已建表且为「已知全不遮挡」（与 column[1] = null 的旧几何等价）。
+    // 从未建表的段不接受补丁（否则凭空建位图会让其余格在显形侧变成「不遮挡」）。
+    store.replaceSection(0, 1, 0, EmptyOcclusion.INSTANCE);
+    assertSame(EmptyOcclusion.INSTANCE, store.section(0, 1, 0), "前置：补丁前该段为已知全不遮挡");
     store.setBlockOccluding(1, 1 * 16 + 2, 3, true);
     SectionOcclusion patched = store.section(0, 1, 0);
     assertNotNull(patched, "补丁必须在该段建立位图");
@@ -106,6 +109,7 @@ class OcclusionPatchPublishRaceTest {
     // 快照晚于补丁：戳已经包含本次补丁，戳比较不会跳过；但发布数据为 null 会清掉旧条目，
     // 因此必须靠「补丁格回放」把该格补回来（否则这次补丁被旧几何吞掉）。
     OcclusionStore store = new OcclusionStore();
+    store.replaceSection(0, 1, 0, EmptyOcclusion.INSTANCE);
     store.setBlockOccluding(1, 1 * 16 + 2, 3, true);
 
     long[] stamps = store.patchStamps(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, SECTION_COUNT);
@@ -142,6 +146,7 @@ class OcclusionPatchPublishRaceTest {
   void batchPatchStampsItsSectionOnceAndIsSkipped() {
     // 批量补丁（MULTI_BLOCK_CHANGE）：同一段多格只记一次戳，发布时只跳过该段一次
     OcclusionStore store = new OcclusionStore();
+    store.replaceSection(0, 1, 0, EmptyOcclusion.INSTANCE);
     long[] stamps = store.patchStamps(CHUNK_X, MIN_SECTION_Y, CHUNK_Z, SECTION_COUNT);
     int applied = store.setBlocksOccluding(
         new int[] {1, 2, 3}, new int[] {1 * 16 + 1, 1 * 16 + 2, 1 * 16 + 3},
@@ -164,6 +169,7 @@ class OcclusionPatchPublishRaceTest {
   void nullStampSnapshotPublishesUnconditionallyAsDocumented() {
     // stamps == null 表示「不做比较」（旧行为）：这条语义必须保留，供缓存恢复等无快照调用方使用
     OcclusionStore store = new OcclusionStore();
+    store.replaceSection(0, 1, 0, EmptyOcclusion.INSTANCE);
     store.setBlockOccluding(1, 1 * 16 + 2, 3, true);
 
     int skipped = store.restoreColumn(CHUNK_X, MIN_SECTION_Y, CHUNK_Z,

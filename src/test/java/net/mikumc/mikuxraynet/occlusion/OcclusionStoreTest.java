@@ -105,9 +105,8 @@ class OcclusionStoreTest {
   @Test
   void patchOnKnownEmptySectionCreatesBitmap() {
     OcclusionStore store = new OcclusionStore();
-    // 位图清空后回落到「已知全不遮挡」快路径（与「从未建表」的 null 不同）
-    store.setBlockOccluding(5, 5, 5, true);
-    store.setBlockOccluding(5, 5, 5, false);
+    // 前置：该段已建表且确认全不遮挡（与「从未建表」的 null 不同）
+    store.replaceSection(0, 0, 0, EmptyOcclusion.INSTANCE);
     assertSame(EmptyOcclusion.INSTANCE, store.section(0, 0, 0), "前置：该段已是「已知全不遮挡」快路径");
 
     // 在该空段上放置一块遮挡方块：必须能置位（旧实现在此强转抛 CCE → 补丁失败、位图不更新）
