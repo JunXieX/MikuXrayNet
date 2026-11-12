@@ -83,15 +83,6 @@ class OcclusionPayloadTest {
   }
 
   @Test
-  void encodeTreatsNullAsKnownEmpty() {
-    // 生产路径的列不含 null，但编码必须对 null 宽容（按「已知全不遮挡」编码，绝不编出非法负载）
-    SectionOcclusion[] decoded = OcclusionPayload.decode(
-        OcclusionPayload.encode(new SectionOcclusion[] {null}));
-    assertNotNull(decoded);
-    assertSame(EmptyOcclusion.INSTANCE, decoded[0]);
-  }
-
-  @Test
   void decodeRejectsMalformedPayloads() {
     assertNull(OcclusionPayload.decode(null), "null 必须拒绝");
     assertNull(OcclusionPayload.decode(new byte[0]), "空数组必须拒绝");
@@ -120,7 +111,9 @@ class OcclusionPayloadTest {
   void largeBitmapColumnRoundTripsExactly() {
     // 多个位图段（触发 word 复用缓冲的路径）：每段内容必须互不串扰
     SectionOcclusion[] column = new SectionOcclusion[24];
-    Arrays.fill(column, null);
+    // 未使用的段用「已知全不遮挡」（有数据）而不是 null（缺数据）：null 段现在会被编码拒绝，
+    // 因为把它读回成 EMPTY 会让显形侧把整段判成不遮挡（隔墙透视）。
+    Arrays.fill(column, EmptyOcclusion.INSTANCE);
     BitmapOcclusion first = new BitmapOcclusion();
     first.setOccluding(1, 1, 1, true);
     BitmapOcclusion second = new BitmapOcclusion();
