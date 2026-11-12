@@ -330,6 +330,9 @@ public final class ObfuscatedChunkIndex {
       hit[0] = true;
       subtract(totalPositions, 1);
       if (locals.length == 1) {
+        // 清单被摘空 → 条目整体消失：与卸载同口径计入「摘除区块数」，否则
+        // 「累计登记 − 摘除」会与当前驻留对不上（诊断面板的三个数加不起来）。
+        invalidatedChunks.increment();
         return null;
       }
       int[] reduced = new int[locals.length - 1];
@@ -382,6 +385,7 @@ public final class ObfuscatedChunkIndex {
       hitCount[0] = hits;
       subtract(totalPositions, hits);
       if (hits == locals.length) {
+        invalidatedChunks.increment();
         return null;
       }
       int[] reduced = new int[locals.length - hits];

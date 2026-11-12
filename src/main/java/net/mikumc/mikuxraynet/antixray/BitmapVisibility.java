@@ -8,7 +8,9 @@ import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
 
 /**
  * 邻近显形的「位图可见性判定」：复用反矿透已建好的遮挡位图（{@link OcclusionStores}）在纯内存里回答
- * 「这个坐标对玩家可见吗」。<b>这是显形侧唯一的可见性判定实现</b>（原生命中射线已移除）。
+ * 「这个坐标对玩家可见吗」。<b>周期巡检 / 事件显形的可见性判定只有这一条路径</b>；
+ * 另有独立的「视线即时显形」（{@code ProximityRevealer#revealLookedAt}）用一次 6 格方块射线判断
+ * 「玩家正看着哪个方块」，两者的用途不同、互不替代。
  *
  * <p><b>为什么在纯内存里做</b>：位图判定只读 {@link OcclusionStores}（底层是单写多读容器，读侧无锁）
  * 与纯浮点步进（{@link OcclusionRay}），不触碰任何 Bukkit API，因此可整段交给工作线程
