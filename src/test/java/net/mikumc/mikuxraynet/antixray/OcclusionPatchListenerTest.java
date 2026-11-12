@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.BitSet;
+import net.mikumc.mikuxraynet.occlusion.EmptyOcclusion;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
