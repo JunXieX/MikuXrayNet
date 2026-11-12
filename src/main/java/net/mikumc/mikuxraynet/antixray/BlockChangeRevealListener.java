@@ -685,13 +685,12 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * 在任意线程执行（索引与标记都是并发结构）。
    */
   private void removeFromIndexAndMarks(String worldName, int x, int y, int z) {
-    if (worldName == null || obfuscatedChunkIndex == null) {
+    if (worldName == null) {
       return;
     }
-    boolean removedFromIndex = obfuscatedChunkIndex.removePosition(worldName, x, y, z);
-    if (revealedSet != null) {
-      revealedSet.removePosition(worldName, x, y, z);
-    }
+    // 清单与标记一次摘除（单一入口）。索引未命中也要摘标记——宁可多摘一次，也不能留孤儿标记
+    // （sizeFor 虚增会让邻近显形的「整块跳过」提前成立，真实坐标被周期跳过）。
+    boolean removedFromIndex = book.removePosition(worldName, x, y, z);
     if (removedFromIndex && stats != null) {
       stats.unregistered.increment();
     }
