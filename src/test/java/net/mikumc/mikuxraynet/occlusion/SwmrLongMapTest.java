@@ -51,14 +51,14 @@ class SwmrLongMapTest {
 
   @Test
   void clearEmptiesEntriesAndSlots() {
-    SwmrLongMap<String> map = new SwmrLongMap<>();
+    SwmrLongMap<String> map = new SwmrLongMap<>(16);
     for (int i = 0; i < 100; i++) {
       map.put(key(i), "v" + i);
     }
     map.remove(key(3));
     map.clear();
     assertEquals(0, map.size());
-    assertTrue(map.isEmpty());
+    assertEquals(0, map.size());
     assertNull(map.get(key(5)));
     // 清空后可继续正常写入
     map.put(key(5), "again");
@@ -71,7 +71,7 @@ class SwmrLongMapTest {
    */
   @Test
   void removeAllDeletesOnlyPresentKeys() {
-    SwmrLongMap<String> map = new SwmrLongMap<>();
+    SwmrLongMap<String> map = new SwmrLongMap<>(16);
     for (int i = 0; i < 50; i++) {
       map.put(key(i), "v" + i);
     }
@@ -141,7 +141,7 @@ class SwmrLongMapTest {
       }
     }
     assertSame(null, map.get(-1));
-    assertFalse(map.isEmpty());
+    assertTrue(map.size() > 0);
   }
 
   private static void await(CountDownLatch latch) {

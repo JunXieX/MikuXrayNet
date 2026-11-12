@@ -2,7 +2,6 @@ package net.mikumc.mikuxraynet.occlusion;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.LongAdder;
 import java.util.function.IntPredicate;
 
 /**
@@ -104,9 +103,6 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
       this.key = key;
     }
   }
-
-  /** 因「该段期间被补丁写过」而跳过发布的段数（诊断用，只增不减）。 */
-  private final LongAdder publishSkippedPatched = new LongAdder();
 
   public OcclusionStore() {
     this(256);
@@ -294,11 +290,6 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    */
   public long patchGeneration() {
     return patchSequence.get();
-  }
-
-  /** 因「该段期间被补丁写过」而跳过整列发布的段数（诊断用；持续偏高说明建表期间方块变更很频繁）。 */
-  public long skippedPatchedSections() {
-    return publishSkippedPatched.sum();
   }
 
   /**
@@ -500,7 +491,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * 宁可写入解码时刻的几何，也不能让整段留空）。
    *
    * @param stamps 建表前取的戳快照；{@code null} = 不做比较（等价于旧行为）
-   * @return 因期间有补丁而被跳过覆盖的段数（已累加进 {@link #skippedPatchedSections()}）
+   * @return 因期间有补丁而被跳过覆盖的段数（调用方计入 RewriteStats.occlusionPublishSkipped 供诊断）
    */
   public int restoreColumn(int chunkX, int minSectionY, int chunkZ, SectionOcclusion[] column,
       long[] stamps) {
@@ -550,9 +541,6 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         // 补丁应丢弃（缺数据保持缺数据）。
         replayPendingCells(key, data != null);
       }
-    }
-    if (skipped > 0) {
-      publishSkippedPatched.add(skipped);
     }
     return skipped;
   }

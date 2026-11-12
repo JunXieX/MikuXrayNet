@@ -197,9 +197,8 @@ public final class RevealedSet {
     this.clock = clock;
   }
 
-  /** 该玩家在该区块已显形的坐标数（无记录返回 0）。 */
   /**
-   * 按「世界名 + 区块坐标」查询已显形坐标数，<b>不分配 {@link ChunkKey}</b>（供扫描热循环使用）。
+   * 按「世界名 + 区块坐标」查询已显形坐标数（无记录返回 0），<b>不分配 {@link ChunkKey}</b>（供扫描热循环使用）。
    *
    * <p>用 {@link ChunkKey.Probe} 作查询键：它只用于 {@code ConcurrentHashMap} 查询、绝不入表，
    * 哈希与相等判定与 record 逐字段一致，语义与 {@link #sizeFor(UUID, ChunkKey)} 完全相同。
@@ -232,7 +231,6 @@ public final class RevealedSet {
     }
   }
 
-  /** 该玩家在该区块的该坐标是否已显形过。 */
   /** 按「世界名 + 区块坐标」判断某坐标是否已显形，<b>不分配 {@link ChunkKey}</b>（供扫描热循环使用）。 */
   boolean contains(UUID playerId, String worldName, int chunkX, int chunkZ, int x, int y, int z) {
     if (playerId == null || worldName == null) {
@@ -319,8 +317,7 @@ public final class RevealedSet {
     }
   }
 
-  /** 刷新该玩家在该区块的活跃时间（扫描到该区块时调用，避免身边的标记被过期清掉）。 */
-  /** 按「世界名 + 区块坐标」刷新活跃时间，<b>不分配 {@link ChunkKey}</b>（供扫描热循环使用）。 */
+  /** 按「世界名 + 区块坐标」刷新活跃时间（扫描到该区块时调用，避免身边的标记被过期清掉），<b>不分配 {@link ChunkKey}</b>。 */
   void touch(UUID playerId, String worldName, int chunkX, int chunkZ) {
     if (playerId == null || worldName == null) {
       return;
@@ -570,7 +567,7 @@ public final class RevealedSet {
     }
   }
 
-  /** 清空全部标记（插件停用 / 热重载时调用，不留副作用）。 */
+  /** 清空全部标记（插件停用时调用，不留副作用；热重载刻意不清，见 ProximityRevealer#stop(boolean)）。 */
   void clear() {
     chunks.clear();
     playerTotals.clear();

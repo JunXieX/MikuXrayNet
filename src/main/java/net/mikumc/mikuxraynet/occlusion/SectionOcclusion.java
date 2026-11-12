@@ -22,9 +22,6 @@ public interface SectionOcclusion {
   /** 局部坐标掩码（16 − 1）。 */
   int LOCAL_MASK = 15;
 
-  /** section 边长。 */
-  int SECTION_SIZE = 16;
-
   /**
    * 局部坐标 {@code (x, y, z)} 处的方块是否遮挡（三者取值均须在 {@code [0, 15]}）。
    */

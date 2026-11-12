@@ -238,7 +238,7 @@ public final class MikuXrayNet extends JavaPlugin {
    */
   private void startDiagnosticsTask() {
     stopDiagnosticsTask();
-    int intervalSeconds = Math.max(0, config.bandwidth().diagnostics().intervalSeconds());
+    int intervalSeconds = config.bandwidth().diagnostics().intervalSeconds();
     if (intervalSeconds == 0) {
       return;
     }

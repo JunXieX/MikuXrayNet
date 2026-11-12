@@ -95,11 +95,6 @@ public final class OcclusionStores {
     retired.clear();
   }
 
-  /** 当前驻留的世界数。本方法当前仅单测在用，保留以免破坏测试。 */
-  public int worldCount() {
-    return byWorld.size();
-  }
-
   /** 当前驻留的 section 条目总数（诊断用，近似值；跨世界求和）。 */
   public int residentSections() {
     int total = 0;

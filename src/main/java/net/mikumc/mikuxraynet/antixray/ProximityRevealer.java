@@ -1080,12 +1080,6 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 当前线程是否拥有该区块（Folia 区域化线程模型的访问前置条件）。
-   *
-   * <p>非 Folia 恒为 {@code true}（单主线程，不存在跨 region 问题）；判定本身抛异常时按
-   * <b>「不拥有」</b>处理——宁可少显形一个坐标，也绝不跨 region 读世界（那会触发 TickThread 校验）。
-   */
-  /**
    * 近处重试：清掉该玩家在这个坐标上的「已显形」标记，让随后的 {@code sendOne} 重新标记并发包。
    *
    * <p>不做这一步，重试出来的候选会被 {@code claimForSend}/{@code markThenSend} 的「已显形就不发」
@@ -1110,6 +1104,12 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
+  /**
+   * 当前线程是否拥有该区块（Folia 区域化线程模型的访问前置条件）。
+   *
+   * <p>非 Folia 恒为 {@code true}（单主线程，不存在跨 region 问题）；判定本身抛异常时按
+   * <b>「不拥有」</b>处理——宁可少显形一个坐标，也绝不跨 region 读世界（那会触发 TickThread 校验）。
+   */
   private static boolean ownsChunk(World world, int chunkX, int chunkZ) {
     if (!PlatformSupport.isFolia()) {
       return true;

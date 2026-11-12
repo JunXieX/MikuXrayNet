@@ -18,8 +18,7 @@ import org.junit.jupiter.api.Test;
  * 刚挖开的墙会继续保持遮挡 → 玩家眼前的矿被永久藏住。
  *
  * <p><b>修法</b>：建表前取 {@link OcclusionStore#patchStamps} 快照；发布时逐段比较当前补丁戳，
- * 戳变了（该段期间被补丁写过）就<b>跳过覆盖</b>、保留含补丁的活位图，并计入
- * {@link OcclusionStore#skippedPatchedSections()}。
+ * 戳变了（该段期间被补丁写过）就<b>跳过覆盖</b>、保留含补丁的活位图，并以返回值报告跳过段数。
  *
  * <p>本用例用公开 API 单线程编排（先取快照 → 打补丁 → 发布），不依赖线程调度与 sleep，
  * 因此是确定性的：把「跳过」判定删掉，断言立刻失败。
@@ -63,7 +62,6 @@ class OcclusionPatchPublishRaceTest {
 
     // 4) 只有「期间被补丁写过」的那一段被跳过
     assertEquals(1, skipped, "只应跳过被补丁写过的那一段");
-    assertEquals(1L, store.skippedPatchedSections(), "跳过段数必须计入可观测计数");
 
     // 5) 被跳过的那段必须保留补丁后的位图（而不是退回 null / 旧 Solid 几何）
     SectionOcclusion survivor = store.section(0, 1, 0);
@@ -101,7 +99,6 @@ class OcclusionPatchPublishRaceTest {
     assertSame(EmptyOcclusion.INSTANCE, store.section(0, 0, 0));
     assertSame(SolidOcclusion.INSTANCE, store.section(0, 1, 0));
     assertSame(EmptyOcclusion.INSTANCE, store.section(0, 2, 0));
-    assertEquals(0L, store.skippedPatchedSections());
   }
 
   @Test
@@ -160,7 +157,6 @@ class OcclusionPatchPublishRaceTest {
         new SectionOcclusion[] {EmptyOcclusion.INSTANCE, EmptyOcclusion.INSTANCE,
             EmptyOcclusion.INSTANCE}, stamps);
     assertEquals(1, skipped, "同一段被批量补丁写过，只应跳过这一段（不是按格数计）");
-    assertEquals(1L, store.skippedPatchedSections());
     SectionOcclusion survivor = store.section(0, 1, 0);
     assertNotNull(survivor, "该段必须保留补丁位图");
     assertTrue(survivor.isOccludingLocal(1, 1, 4));

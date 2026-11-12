@@ -1167,7 +1167,7 @@ public final class DiskCacheStore implements AutoCloseable {
     if (diskLimit > 0) {
       evictOpenHandles(diskLimit, true);
     }
-    // ② 常驻句柄上限（disk-cache.max-open-files，默认 64，0 = 不限制）：<b>只关句柄、不删文件</b>。
+    // ② 常驻句柄上限（disk-cache.max-open-files，默认 128，0 = 不限制）：<b>只关句柄、不删文件</b>。
     // 句柄携带每文件 bucket-cache-size 条已解压条目（约 4~8 MB），是磁盘缓存常驻内存的主旋钮；
     // 磁盘可以无限大，但「300 秒内访问过的每个区域文件都保持打开」会随活动范围无界涨内存。
     int handleLimit = config.maxOpenFiles();

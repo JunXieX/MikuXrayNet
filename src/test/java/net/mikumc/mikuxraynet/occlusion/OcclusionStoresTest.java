@@ -43,14 +43,13 @@ class OcclusionStoresTest {
         "下界必须持有自己写入的那份位图");
     assertNotSame(stores.of("world"), stores.of("world_nether"),
         "不同世界必须是彼此独立的仓库实例");
-    assertEquals(2, stores.worldCount());
   }
 
   @Test
   void lookupDoesNotCreateAndIsNullSafe() {
     OcclusionStores stores = new OcclusionStores();
     assertNull(stores.lookup("world"), "只读查询不得建表");
-    assertEquals(0, stores.worldCount());
+    assertEquals(0, stores.residentSections());
     assertNull(stores.lookup(null), "世界名为 null 时按「查不到」处理，不得抛异常");
     // of(null) 给出一张独立仓库：不得与真实世界混用
     assertNotNull(stores.of(null), "of(null) 必须给出一张独立仓库（供写入方使用）");
@@ -65,7 +64,6 @@ class OcclusionStoresTest {
     assertEquals(2, stores.residentSections());
 
     stores.removeWorld("world_nether");
-    assertEquals(1, stores.worldCount());
     assertNull(stores.lookup("world_nether"), "被卸载世界的表必须整体释放");
     assertSame(SolidOcclusion.INSTANCE, stores.of("world").section(0, 0, 0),
         "卸载一个世界不得影响其它世界");
@@ -94,7 +92,6 @@ class OcclusionStoresTest {
     assertEquals(3, stores.residentSections(), "驻留数必须跨世界求和");
 
     stores.clear();
-    assertEquals(0, stores.worldCount());
     assertEquals(0, stores.residentSections());
   }
 }

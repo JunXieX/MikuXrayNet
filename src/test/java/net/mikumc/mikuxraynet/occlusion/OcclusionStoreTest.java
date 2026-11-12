@@ -194,7 +194,6 @@ class OcclusionStoreTest {
     assertNotNull(live, "跳过覆盖应保留活位图，而不是把条目删掉");
     assertFalse(live.isOccludingLocal(1, 2, 3), "挖开的格不得被旧几何重新标成遮挡");
     assertTrue(live.isOccludingLocal(3, 2, 1), "其余格沿用活位图的遮挡状态");
-    assertEquals(1L, store.skippedPatchedSections(), "跳过段数必须计入观测点");
   }
 
   /**
@@ -216,7 +215,6 @@ class OcclusionStoreTest {
     assertFalse(store.section(0, 0, 0).isOccludingLocal(1, 2, 3),
         "回放必须把该格修正回不遮挡（否则旧几何吞掉补丁）");
     assertTrue(store.section(0, 0, 0).isOccludingLocal(2, 2, 4), "其余格按发布几何");
-    assertEquals(0L, store.skippedPatchedSections());
   }
 
   /** 旧入口（不带快照）仍整列覆盖，但窗口内的补丁格会由回放补回。 */

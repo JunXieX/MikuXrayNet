@@ -69,10 +69,6 @@ public final class SwmrLongMap<V> {
     }
   }
 
-  public SwmrLongMap() {
-    this(MIN_CAPACITY);
-  }
-
   /** 以「期望条目数」构造（实际容量向上取到 2 的幂，并按负载因子放大）。 */
   public SwmrLongMap(int expectedEntries) {
     this.table = new Table<>(capacityFor(Math.max(MIN_CAPACITY, expectedEntries)));
@@ -193,10 +189,6 @@ public final class SwmrLongMap<V> {
   /** 当前条目数（不含墓碑）。 */
   public int size() {
     return size;
-  }
-
-  public boolean isEmpty() {
-    return size == 0;
   }
 
   /** 清空（独占）。原地清空当前代，不换数组（换数组会让并发的乐观读跨代，见 {@link #table} 说明）。 */

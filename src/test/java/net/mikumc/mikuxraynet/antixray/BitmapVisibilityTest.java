@@ -141,7 +141,7 @@ class BitmapVisibilityTest {
 
   /** 造一个「只在局部 z=layer 那一层放同一种方块」的 section（其余为空气）。 */
   private static SectionOcclusion layerSection(int layer, int material) {
-    int size = SectionOcclusion.SECTION_SIZE;
+    int size = 16;
     int[] states = new int[size * size * size];
     for (int y = 0; y < size; y++) {
       for (int x = 0; x < size; x++) {
