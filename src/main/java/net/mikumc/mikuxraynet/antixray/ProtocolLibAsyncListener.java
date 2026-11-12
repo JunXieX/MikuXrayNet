@@ -1230,9 +1230,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     int[] absolute = new int[removedLocals.length * 3];
     for (int i = 0; i < removedLocals.length; i++) {
       int local = removedLocals[i];
-      absolute[i * 3] = (chunkX << 4) | (local & 15);
+      absolute[i * 3] = (chunkX << 4) | SectionCoords.x(local);
+      // 相对 Y 是整个区块内的绝对高度偏移（不只 0..15），不能走 SectionCoords 的段内掩码。
       absolute[i * 3 + 1] = minHeight + (local >> 8);
-      absolute[i * 3 + 2] = (chunkZ << 4) | ((local >> 4) & 15);
+      absolute[i * 3 + 2] = (chunkZ << 4) | SectionCoords.z(local);
     }
     return absolute;
   }

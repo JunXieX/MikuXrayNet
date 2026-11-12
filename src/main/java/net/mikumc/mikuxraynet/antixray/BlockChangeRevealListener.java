@@ -229,9 +229,10 @@ public final class BlockChangeRevealListener extends PacketAdapter {
         short packed = positions[i];
         // 协议编码（ClientboundSectionBlocksUpdatePacket）：(y << 8) | (z << 4) | x。
         // 早前这里把低 4 位当成了 y、把 bit8..11 当成了 x——x/y 对调，注销的是另一个坐标。
-        coordinates[i * 3] = baseX + (packed & 15);
-        coordinates[i * 3 + 1] = baseY + ((packed >> 8) & 15);
-        coordinates[i * 3 + 2] = baseZ + ((packed >> 4) & 15);
+        int raw = SectionCoords.unsigned(packed);
+        coordinates[i * 3] = baseX + SectionCoords.x(raw);
+        coordinates[i * 3 + 1] = baseY + SectionCoords.y(raw);
+        coordinates[i * 3 + 2] = baseZ + SectionCoords.z(raw);
       }
 
       // 回显判定绑定「本包的接收者」：显形回显只发给了这个玩家，因此也只会在他名下命中
@@ -313,7 +314,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
 
     private void add(int x, int y, int z) {
-      int slot = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
+      int slot = SectionCoords.pack(x, y, z);
       if (!scratch.mark(slot, generation)) {
         return;
       }

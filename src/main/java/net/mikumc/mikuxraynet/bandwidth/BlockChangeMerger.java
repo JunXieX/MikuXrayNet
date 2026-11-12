@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.logging.Level;
+import net.mikumc.mikuxraynet.antixray.SectionCoords;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.util.PlayerWorldIndex;
@@ -833,8 +834,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       int baseY = section.getY() << 4;
       int baseZ = section.getZ() << 4;
       for (short packed : positions) {
-        target.passed.add(new Coord(baseX + (packed & 15),
-            baseY + ((packed >> 8) & 15), baseZ + ((packed >> 4) & 15)));
+        int raw = SectionCoords.unsigned(packed);
+        target.passed.add(new Coord(baseX + SectionCoords.x(raw),
+            baseY + SectionCoords.y(raw), baseZ + SectionCoords.z(raw)));
       }
     }
   }
@@ -1073,7 +1075,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         data[i] = update.value();
         // 与协议一致：section 内相对坐标打包为 (y & 15) << 8 | (z & 15) << 4 | (x & 15)。
         // 早前把 x 与 y 放反了——合并包会把方块画到错误高度，客户端表现为方块错位/闪一下。
-        positions[i] = (short) (((update.y() & 15) << 8) | ((update.z() & 15) << 4) | (update.x() & 15));
+        positions[i] = (short) SectionCoords.pack(update.x(), update.y(), update.z());
       }
       BlockPosition expectedSection = new BlockPosition(section.x(), section.y(), section.z());
       packet = new PacketContainer(PacketType.Play.Server.MULTI_BLOCK_CHANGE);
@@ -1127,12 +1129,12 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       int baseY = section.getY() << 4;
       int baseZ = section.getZ() << 4;
       for (int i = 0; i < positions.length; i++) {
-        short packed = positions[i];
-        // 协议：(y & 15) << 8 | (z & 15) << 4 | (x & 15)。早前这里把 bit8..11 当 x、低 4 位当 y（x/y 对调），
-        // 与 sendSection 的对调恰好抵消才没有暴露；两处必须同时正确，不能再依赖错误互抵。
-        int x = baseX + (packed & 15);
-        int z = baseZ + ((packed >> 4) & 15);
-        int y = baseY + ((packed >> 8) & 15);
+        // 协议：(y & 15) << 8 | (z & 15) << 4 | (x & 15)，唯一实现在 SectionCoords。
+        // 早前这里把 bit8..11 当 x、低 4 位当 y（x/y 对调），与 sendSection 的对调恰好抵消才没有暴露。
+        int raw = SectionCoords.unsigned(positions[i]);
+        int x = baseX + SectionCoords.x(raw);
+        int z = baseZ + SectionCoords.z(raw);
+        int y = baseY + SectionCoords.y(raw);
         updates.add(new Update<>(x, y, z, data[i]));
       }
       return updates;

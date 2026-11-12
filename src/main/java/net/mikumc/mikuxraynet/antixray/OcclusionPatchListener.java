@@ -429,11 +429,10 @@ public final class OcclusionPatchListener extends PacketAdapter {
    */
   static void unpackMultiCoords(int baseX, int baseY, int baseZ, short[] positions, int[] coords) {
     for (int i = 0; i < positions.length; i++) {
-      short packed = positions[i];
-      // (y << 8) | (z << 4) | x：与协议一致；早前把低 4 位当 y、bit8..11 当 x（x/y 对调）。
-      coords[i * 3] = baseX + (packed & 15);
-      coords[i * 3 + 1] = baseY + ((packed >> 8) & 15);
-      coords[i * 3 + 2] = baseZ + ((packed >> 4) & 15);
+      int raw = SectionCoords.unsigned(positions[i]);
+      coords[i * 3] = baseX + SectionCoords.x(raw);
+      coords[i * 3 + 1] = baseY + SectionCoords.y(raw);
+      coords[i * 3 + 2] = baseZ + SectionCoords.z(raw);
     }
   }
 
