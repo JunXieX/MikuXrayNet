@@ -654,8 +654,8 @@ class ConfigDefaultsTest {
         "单区域文件上限默认 0 = 不限制（压实内存尖峰由总解压量闸门兜住）");
     assertEquals(0, config.diskCache().maxRegionFiles(),
         "区域文件数上限默认 0 = 不限制（文件数不占堆，常驻句柄由 max-open-files 约束）");
-    assertEquals(64, config.diskCache().maxOpenFiles(),
-        "常驻句柄默认 64（每个约 4~8 MB 桶缓存，合计约 1 GB 量级；0 = 不限制）");
+    assertEquals(128, config.diskCache().maxOpenFiles(),
+        "常驻句柄默认 128（每个约 4~8 MB 桶缓存，合计约 2 GB 量级；0 = 不限制）");
     assertEquals(7 * 24 * 60 * 60, config.diskCache().expireSeconds(),
         "条目过期默认 7 天（原 1800 秒：从写入时刻算起，配得比两次启动间隔还短 → 重启后条目全过期、"
             + "命中率恒为 0；实机 70 分钟后重启命中 0／未命中 2096）。内容新鲜度由原始字节指纹判定，"
