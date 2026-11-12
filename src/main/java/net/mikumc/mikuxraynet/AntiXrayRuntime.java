@@ -734,6 +734,16 @@ public final class AntiXrayRuntime {
         logger.log(Level.WARNING, "摘除世界磁盘缓存时出现异常（已忽略）", throwable);
       }
     }
+    // 已显形标记同样必须随世界卸载作废：索引被清后，残留的标记会让 sizeFor 虚增，
+    // 邻近显形的「整块跳过」提前成立，同名世界重新加载后真实坐标被周期性跳过（漏显形）。
+    RevealedSet revealed = revealedSet;
+    if (revealed != null) {
+      try {
+        revealed.clearWorld(worldName);
+      } catch (Throwable throwable) {
+        logger.log(Level.WARNING, "摘除世界已显形标记时出现异常（已忽略）", throwable);
+      }
+    }
   }
 
   /**

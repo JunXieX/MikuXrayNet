@@ -569,8 +569,8 @@ public final class RevealedSet {
     playerTotals.remove(playerId);
   }
 
-  /** 世界卸载时清理该世界的全部标记。 */
-  void clearWorld(String worldName) {
+  /** 世界卸载时清理该世界的全部标记（同名世界重新加载后不得残留孤儿标记）。 */
+  public void clearWorld(String worldName) {
     if (worldName == null) {
       return;
     }
