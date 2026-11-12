@@ -847,8 +847,9 @@ public final class ProximityRevealer implements Listener {
 
     boolean frustum = proximity.frustumEnabled();
     boolean visibility = proximity.raycastEnabled();
-    // 可见性判定唯一走遮挡位图（原生命中射线已移除）。位图缺失（罕见故障）时 BitmapVisibility 按「遮挡」
-    // 处理（严格方向：不显形），绝不裸发——「无数据 ≠ 通畅」是显形侧的既定安全方向。
+    // 周期/事件显形的候选可见性判定走遮挡位图（视线即时显形是独立的 6 格方块射线，不经过这里）。
+    // 位图缺失（罕见故障）时 BitmapVisibility 按「遮挡」处理（严格方向：不显形），绝不裸发——
+    // 「无数据 ≠ 通畅」是显形侧的既定安全方向。
     if (!frustum && !visibility) {
       // 两项筛选都关闭：无任何可做的判定，直接发包
       sendCandidates(player, world, candidates, null, null, budget, scanTally, false,
