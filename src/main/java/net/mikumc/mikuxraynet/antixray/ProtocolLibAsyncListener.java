@@ -425,40 +425,46 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 下面又取一次——玩家恰在两次取之间切换世界时，可能用「新世界的生效判定」去放行
     // 「旧世界的区块原包」（窗口极小，但确实存在 TOCTOU）。这里固定一次读取。
     World world = player.getWorld();
-    if (world == null || !appliesTo(player, world)) {
-      return;
-    }
+    boolean bypassed = bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId());
+    // 纯值取值：以下全部是 Bukkit 取值，判定本身由 RewriteGate 完成（可离线枚举顺序语义）。
+    boolean worldPermitted = world != null && worldAllowed(live(), world.getName());
 
     // 维度关闭的世界（默认 dimensions.the_end.enabled=false）必须在构造 accessor / 队列判定 /
     // 取批次闸门之前放行：accessor 构造会做 ProtocolLib 修饰符解析（getSpecificModifier().read(0)），
     // 而这些区块永远进不了缓存（profile 非 active），每包都是纯白付。此路径没有取得任何闸门/延迟，
     // 直接返回由 ProtocolLib 自行放行。
-    AntiXrayConfig.Dimension dimension;
-    try {
-      dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
-    } catch (Throwable throwable) {
-      // 读维度失败（世界正在卸载等）：按原包放行，绝不阻塞区块加载
-      return;
-    }
-    try {
-      if (!live().enabledForWorld(world.getName(), dimension)) {
+    AntiXrayConfig.Dimension dimension = null;
+    if (world != null) {
+      try {
+        dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
+      } catch (Throwable throwable) {
+        // 读维度失败（世界正在卸载等）：按原包放行，绝不阻塞区块加载
         return;
       }
-    } catch (Throwable throwable) {
-      // 配置供应器/世界黑名单异常：按原包放行并记录，绝不把异常冒出异步监听器
-      logThrottled("维度开关判定失败，已按原包放行", throwable);
-      return;
+    }
+    boolean dimensionEnabled = false;
+    if (dimension != null) {
+      try {
+        dimensionEnabled = live().enabledForWorld(world.getName(), dimension);
+      } catch (Throwable throwable) {
+        // 配置供应器/世界黑名单异常：按原包放行并记录，绝不把异常冒出异步监听器
+        logThrottled("维度开关判定失败，已按原包放行", throwable);
+        return;
+      }
     }
 
     AsyncMarker marker = event.getAsyncMarker();
     if (marker == null) {
       return;
     }
-    // 队列满：直接放行原包，不登记延迟。
-    // 必须计数：这是唯一「本区块完全未伪装、矿物以真实状态下发」的路径，若不计数，
-    // 现象是「改写数看起来正常但玩家能透视」，无法归因（见 RewriteStats#chunksSkippedQueueFull）。
-    if (!workPool.hasCapacity()) {
-      stats.chunksSkippedQueueFull.increment();
+    RewriteGate.Decision decision = RewriteGate.decide(true, world != null, bypassed, worldPermitted,
+        dimension != null, dimensionEnabled, workPool.hasCapacity());
+    if (decision != RewriteGate.Decision.PROCEED) {
+      if (decision == RewriteGate.Decision.SKIP_QUEUE_FULL) {
+        // 队列满：直接放行原包，不登记延迟。必须计数：这是唯一「本区块完全未伪装、矿物以真实状态
+        // 下发」的路径，不计数就无法归因（见 RewriteStats#chunksSkippedQueueFull）。
+        stats.chunksSkippedQueueFull.increment();
+      }
       return;
     }
 
