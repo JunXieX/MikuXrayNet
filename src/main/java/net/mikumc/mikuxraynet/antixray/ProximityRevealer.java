@@ -22,6 +22,7 @@ import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
+import org.bukkit.FluidCollisionMode;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.block.Block;
@@ -38,6 +39,7 @@ import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
 import org.bukkit.event.world.WorldUnloadEvent;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 
 /**
@@ -412,6 +414,9 @@ public final class ProximityRevealer implements Listener {
   }
 
   private final ConcurrentHashMap<UUID, EntityScan> entityScans = new ConcurrentHashMap<>();
+  /** 视线即时显形的每 tick 任务句柄（Folia：每玩家一条；Paper：一条全局任务）。 */
+  private final ConcurrentHashMap<UUID, ScheduledTask> lookScans = new ConcurrentHashMap<>();
+  private ScheduledTask lookTask;
 
   /**
    * 显形回显窗口：玩家 → (世界 + 坐标) → 过期时刻（纳秒）。
@@ -483,6 +488,12 @@ public final class ProximityRevealer implements Listener {
       // 因此逐玩家建任务不会改变额度语义，只会把一次遍历拆成 N 次调度——在主线程上纯属额外开销，故保持单任务。
       globalTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, scheduled -> passAll(),
           interval, interval);
+      // 视线即时显形：每 tick 对「玩家正看着的第一个方块」做一次定向显形（主线程统一遍历）
+      lookTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, scheduled -> {
+        for (Player player : Bukkit.getOnlinePlayers()) {
+          revealLookedAt(player);
+        }
+      }, 1L, 1L);
     }
     // 单周期实际生效的发包上限 = min(配置, 候选窗口)；配置超过窗口时只提示一次，绝不静默改配置，
     // 也绝不为了兑现一个配得过大的值去放大取候选/评估量（那会把射线 CPU 无上限地推高）。
@@ -543,6 +554,14 @@ public final class ProximityRevealer implements Listener {
       cancelQuietly(scan.task());
     }
     entityScans.clear();
+    for (ScheduledTask look : lookScans.values()) {
+      cancelQuietly(look);
+    }
+    lookScans.clear();
+    if (lookTask != null) {
+      cancelQuietly(lookTask);
+      lookTask = null;
+    }
     digMarks.clear();
     viewMarks.clear();
     pendingChunkReveals.clear();
@@ -564,6 +583,14 @@ public final class ProximityRevealer implements Listener {
       return;
     }
     // 计数随句柄一起建：任务首次执行至少在一个周期之后，故 pass() 读到的一定是本条目
+    ScheduledTask look = Schedulers.repeatOnEntity(plugin, player, 1L, 1L,
+        () -> revealLookedAt(player));
+    if (look != null) {
+      ScheduledTask previousLook = lookScans.put(player.getUniqueId(), look);
+      if (previousLook != null) {
+        cancelQuietly(previousLook);
+      }
+    }
     EntityScan mine = new EntityScan(task, new AtomicLong());
     EntityScan previous = entityScans.put(player.getUniqueId(), mine);
     if (previous != null) {
@@ -599,6 +626,10 @@ public final class ProximityRevealer implements Listener {
   /** 玩家登出：取消其巡检任务句柄，并清理其已显形标记，避免为离线玩家保留坐标。 */
   @EventHandler(ignoreCancelled = true)
   public void onQuit(PlayerQuitEvent event) {
+    ScheduledTask lookScan = lookScans.remove(event.getPlayer().getUniqueId());
+    if (lookScan != null) {
+      cancelQuietly(lookScan);
+    }
     EntityScan scan = entityScans.remove(event.getPlayer().getUniqueId());
     if (scan != null) {
       try {
@@ -2399,6 +2430,66 @@ public final class ProximityRevealer implements Listener {
         return;
       }
       revealAfterDig(player, x, y, z);
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /** 视线即时显形：射线最多看多远（格）。 */
+  private static final double LOOK_MAX_DISTANCE = 6.0D;
+
+  /**
+   * 视线即时显形：玩家正看着的第一个方块若是伪装坐标，立刻发真实状态。
+   *
+   * <p><b>为什么需要</b>：生存端「效率 V + 急迫 II」对软方块是 0 tick 破坏，比创造还快；客户端按
+   * 伪装方块的硬度做破坏预测，服务端按真实方块拒绝，玩家会在「预测破坏 → 回滚」之间看到闪动，
+   * 并且挖掉时掉落与所见不符。等玩家按下再发（挖掘兜底）仍慢 1 个 RTT；这里在「看向」时就发，
+   * 对准的那一刻方块已经是真实的。
+   *
+   * <p><b>为什么不透视</b>：只取射线命中的<b>第一个</b>方块（玩家真正看到的表面），不穿透、不扩大范围、
+   * 不在命中非伪装方块时继续往后找；水/可穿过方块按 {@link FluidCollisionMode#NEVER} 处理。
+   */
+  private void revealLookedAt(Player player) {
+    try {
+      if (stopping || !player.isOnline() || chunkIndex == null || revealedSet == null) {
+        return;
+      }
+      if (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId())) {
+        return;
+      }
+      World world = player.getWorld();
+      if (world == null || !shouldRevealInWorld(world.getName())) {
+        return;
+      }
+      Location eye = player.getEyeLocation();
+      RayTraceResult hit = world.rayTraceBlocks(eye, eye.getDirection(), LOOK_MAX_DISTANCE,
+          FluidCollisionMode.NEVER, true);
+      if (hit == null || hit.getHitBlock() == null) {
+        return;
+      }
+      Block block = hit.getHitBlock();
+      int x = block.getX();
+      int y = block.getY();
+      int z = block.getZ();
+      UUID playerId = player.getUniqueId();
+      ChunkKey key = ChunkKey.ofBlock(world.getName(), x, z);
+      if (!chunkIndex.containsPosition(key, x, y, z)) {
+        return;
+      }
+      if (revealedSet.contains(playerId, key, x, y, z)) {
+        return;
+      }
+      long tick = Bukkit.getCurrentTick();
+      int granted = instantQuota.claim(playerId, tick, 1, 1);
+      if (granted <= 0) {
+        return;
+      }
+      Budget budget = new Budget(granted);
+      PassTally tally = new PassTally();
+      RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
+      sendOne(player, world, x, y, z, null, budget, tally, batch, true);
+      flushBatch(player, batch, tally);
+      instantQuota.release(playerId, tick, 1, granted, tally.sent);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
