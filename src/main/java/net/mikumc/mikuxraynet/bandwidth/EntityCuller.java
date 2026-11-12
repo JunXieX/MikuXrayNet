@@ -811,9 +811,7 @@ public final class EntityCuller implements Listener {
       return;
     }
     int entityId = entity.getEntityId();
-    if (entityId == player.getEntityId()) {
-      return;
-    }
+    // 「实体就是玩家自己」不需要单独判：上面的 `entity instanceof Player` 已把玩家自己与其它玩家一并排除。
     UUID playerId = player.getUniqueId();
     boolean wasHidden = isHiddenInstance(playerId, entity, entityId);
     // 登记进轮转队列：这是「入场那一刻评估一次」之外的兜底，保证之后出现的遮挡也能被发现
@@ -888,8 +886,7 @@ public final class EntityCuller implements Listener {
       // 跨区域实体必须跳过：TrackedRotation.add 会读 entity.getEntityId()，而本方法在玩家线程上跑，
       // 补种半径（128）必然跨越区域切片——读跨区域实体会触发 Folia 线程校验并抛异常，补种就此半途失败，
       // 队列却已留在 rotations 里、再也不会补种。这些实体本来也无法在本区域判定，跳过即可。
-      if (entity == player || entity instanceof Player || entity instanceof Firework
-          || !owns(entity)) {
+      if (entity instanceof Player || entity instanceof Firework || !owns(entity)) {
         continue;
       }
       seeds.add(entity);
