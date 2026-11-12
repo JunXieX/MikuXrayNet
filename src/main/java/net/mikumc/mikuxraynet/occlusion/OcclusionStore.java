@@ -371,7 +371,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    *
    * @return 重放的格数（0 = 该段近期没有补丁）
    */
-  private int replayPendingCells(long key) {
+  private int replayPendingCells(long key, boolean allowCreate) {
     // 不取走条目：回放是幂等的，同源旧字节可能被多个任务并发发布（多玩家同时收到同一区块）。
     // 若首次回放后就清空，后发布者会用旧几何覆盖已修正的补丁格（该显示却多藏）。
     // 条目由 removeColumn / clear / removeSection 清理，规模 ≈ 已加载区块里被补丁过的段数。
@@ -385,8 +385,10 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
       int x = (int) (packed >> 38);
       int y = (int) ((packed >> 26) & 0xFFF);
       int z = (int) (packed & 0x3FFFFFF);
-      // 回放发生在整列发布之后、同一把写锁内：允许在缺数据段上创建位图，把窗口内的补丁补进新几何。
-      applyCellLocked(key, x, y, z, replay.occluding[i], true);
+      // 回放发生在整列发布之后、同一把写锁内：只有「本次确有发布几何」的段才允许创建位图；
+      // 发布值为 null（该段无数据/未加载）时不得凭空建一张只含补丁格的位图——那会让显形侧把该段
+      // 其余格判成「不遮挡」，等于隔墙透视。
+      applyCellLocked(key, x, y, z, replay.occluding[i], allowCreate);
     }
     return size;
   }
@@ -540,7 +542,8 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
           if (current != null && current.longValue() != stamps[i] && sections.get(key) != null) {
             skipped++;
             // 跳过旧几何覆盖；但「解码 → 取快照」窗口内的补丁不在戳差异里，仍要回放（幂等）。
-            replayPendingCells(key);
+            // 该分支要求活表已有数据（见上面的 `sections.get(key) != null`），因此允许创建是安全的。
+            replayPendingCells(key, true);
             continue;
           }
         }
@@ -552,8 +555,10 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         }
         // 发布成功后该段已是最新几何，旧戳不再需要——不清会让戳表随「补丁过的段」无界增长
         patchStamps.remove(key);
-        // 再回放「解码 → 取快照」窗口内落库的补丁格：戳比较发现不了这段，回放保证其不被旧几何覆盖
-        replayPendingCells(key);
+        // 再回放「解码 → 取快照」窗口内落库的补丁格：戳比较发现不了这段，回放保证其不被旧几何覆盖。
+        // 只有发布值非 null（本段确有几何）才允许回放创建位图；发布值为 null 说明该段无数据，
+        // 补丁应丢弃（缺数据保持缺数据）。
+        replayPendingCells(key, data != null);
       }
     }
     if (skipped > 0) {
@@ -614,8 +619,8 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         sections.put(key, data);
         patchStamps.remove(key);
         // 缓存负载是更早的几何：回放该段近期补丁格，避免「无活数据期间被补丁改过的格」被旧几何覆盖
-        // （含打断类补丁——不建条目、只留戳的那种）。
-        replayPendingCells(key);
+        // （含打断类补丁——不建条目、只留戳的那种）。该段刚写入真实几何，允许回放创建位图。
+        replayPendingCells(key, true);
         filled++;
       }
     }
