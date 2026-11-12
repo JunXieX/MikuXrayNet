@@ -152,16 +152,28 @@ final class PlayerPositionSnapshots {
     if (radius <= 0) {
       return false;
     }
-    if (snapshot == null) {
-      // fail-open：无快照 → 按近身处理（宁可少合并，绝不制造延迟）
-      return true;
-    }
-    if (!snapshot.positionKnown()) {
-      // 坐标未知（该玩家此前处于黑名单世界、坐标捕获被有意跳过）：与「无快照」同一 fail-open 方向。
-      // 绝不拿一个与当前世界无关的旧坐标去算距离（那会把近身变更误判为远、白吃一个合并窗口的延迟）。
+    if (snapshot == null || !snapshot.positionKnown()) {
+      // fail-open：无快照 / 坐标未知 → 按近身处理（宁可少合并，绝不制造延迟）。
+      // 坐标未知时绝不拿与当前世界无关的旧坐标算距离（会把近身变更误判为远、白吃一个窗口）。
       return true;
     }
     return BlockChangeBatch.anyWithinRadius(updates, blockCoordinate(snapshot.x()),
+        blockCoordinate(snapshot.y()), blockCoordinate(snapshot.z()), radius);
+  }
+
+  /**
+   * 坐标版近身判定：供「只解坐标、不构造方块数据」的快速路径使用，语义与列表版逐条一致。
+   *
+   * @param coordinates 绝对坐标三元组（{@code x,y,z} 连续，前 {@code count} 个）
+   */
+  static boolean immediatePass(Position snapshot, int[] coordinates, int count, int radius) {
+    if (radius <= 0) {
+      return false;
+    }
+    if (snapshot == null || !snapshot.positionKnown()) {
+      return true;
+    }
+    return BlockChangeBatch.anyWithinRadius(coordinates, count, blockCoordinate(snapshot.x()),
         blockCoordinate(snapshot.y()), blockCoordinate(snapshot.z()), radius);
   }
 

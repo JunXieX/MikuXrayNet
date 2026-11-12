@@ -194,6 +194,25 @@ public final class BlockChangeBatch<V> {
    * @param updates  一次封包解析出的全部变更（可能为 null/空，此时恒为 false）
    * @param radius   立即放行半径（格）；0 或负数即关闭该特性
    */
+  /** 坐标版：与列表版逐条等价，供「只解坐标」的快速路径复用（不构造 {@code Update}）。 */
+  public static boolean anyWithinRadius(int[] coordinates, int count, int playerX, int playerY,
+      int playerZ, int radius) {
+    if (coordinates == null || count <= 0 || radius <= 0) {
+      return false;
+    }
+    long limit = (long) radius * radius;
+    int usable = Math.min(count, coordinates.length / 3);
+    for (int i = 0; i < usable; i++) {
+      long dx = (long) coordinates[i * 3] - playerX;
+      long dy = (long) coordinates[i * 3 + 1] - playerY;
+      long dz = (long) coordinates[i * 3 + 2] - playerZ;
+      if (dx * dx + dy * dy + dz * dz <= limit) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   public static <V> boolean anyWithinRadius(List<Update<V>> updates, int playerX, int playerY, int playerZ,
       int radius) {
     if (updates == null || updates.isEmpty() || radius <= 0) {

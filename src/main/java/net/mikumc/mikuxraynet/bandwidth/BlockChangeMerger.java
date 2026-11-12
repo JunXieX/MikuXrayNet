@@ -586,6 +586,44 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   }
 
   /**
+   * 只解析坐标、不构造 {@code WrappedBlockData}：近身判定只需要坐标。
+   *
+   * <p>为什么值得单独一条路径：玩家挖/放方块是最常见的方块变更（每包 1~8 个坐标），而完整解析会为
+   * 每个坐标构造一个 ProtocolLib 的反射包装 + 一条 {@code Update} + ArrayList——这些对象在「近身立即
+   * 放行」分支里<b>一个都不会被使用</b>。先只解坐标、命中近身就直接放行，非近身才走完整解析。
+   *
+   * @return 绝对坐标三元组（{@code x,y,z} 连续）；读不到结构时返回 {@code null}（调用方退回完整解析）
+   */
+  private static int[] positionsOnly(PacketType type, PacketContainer packet) {
+    try {
+      if (type == PacketType.Play.Server.BLOCK_CHANGE) {
+        BlockPosition position = packet.getBlockPositionModifier().readSafely(0);
+        return position == null ? null
+            : new int[] {position.getX(), position.getY(), position.getZ()};
+      }
+      BlockPosition section = packet.getSectionPositions().readSafely(0);
+      short[] positions = packet.getShortArrays().readSafely(0);
+      if (section == null || positions == null || positions.length == 0) {
+        return null;
+      }
+      int baseX = section.getX() << 4;
+      int baseY = section.getY() << 4;
+      int baseZ = section.getZ() << 4;
+      int[] coordinates = new int[positions.length * 3];
+      for (int i = 0; i < positions.length; i++) {
+        int raw = SectionCoords.unsigned(positions[i]);
+        coordinates[i * 3] = baseX + SectionCoords.x(raw);
+        coordinates[i * 3 + 1] = baseY + SectionCoords.y(raw);
+        coordinates[i * 3 + 2] = baseZ + SectionCoords.z(raw);
+      }
+      return coordinates;
+    } catch (Throwable throwable) {
+      // 读不出结构：退回完整解析（那里同样 fail-open 放行原包）
+      return null;
+    }
+  }
+
+  /**
    * 该玩家的近身变更判定：<b>只读位置快照</b>（封包线程不触碰任何 Bukkit API）。
    *
    * <p>fail-open：快照尚未建立（刚登录 / 刚重置）或读取异常 → 按近身处理（立即放行）。
@@ -607,6 +645,45 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     } catch (Throwable throwable) {
       noticeSnapshotFailOpen(throwable);
       return true;
+    }
+  }
+
+  /** 坐标版近身判定（快速路径；不构造任何方块数据包装）。 */
+  private boolean shouldPassThroughImmediately(UUID playerId, int[] coordinates, int count) {
+    int radius = config.immediateRadius();
+    if (radius <= 0) {
+      return false;
+    }
+    try {
+      PlayerPositionSnapshots.Position position = positions.get(playerId);
+      if (position == null) {
+        noticeSnapshotFailOpen(null);
+      }
+      return PlayerPositionSnapshots.immediatePass(position, coordinates, count, radius);
+    } catch (Throwable throwable) {
+      noticeSnapshotFailOpen(throwable);
+      return true;
+    }
+  }
+
+  /** 记录「这些绝对坐标已有新态下发」（快速路径用，不经过 {@code Update} 列表）。 */
+  private void rememberDeliveredCoords(UUID playerId, int[] coordinates, int count) {
+    Pending target = pending.get(playerId);
+    if (target == null) {
+      return;
+    }
+    synchronized (target) {
+      if (target.flushed.get()) {
+        return;
+      }
+      if (target.passed.size() + count > target.passedLimit) {
+        target.passed.clear();
+      }
+      int usable = Math.min(count, coordinates.length / 3);
+      for (int i = 0; i < usable; i++) {
+        target.passed.add(new Coord(coordinates[i * 3], coordinates[i * 3 + 1],
+            coordinates[i * 3 + 2]));
+      }
     }
   }
 
@@ -677,6 +754,18 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
           return;
         }
         // 有缓冲却读不到段原点：无法记覆盖标记，退回下面的完整解析路径（那里会记标记或自行 fail-open）
+      }
+    }
+
+    // 近身快速路径：先只解坐标；命中近身就直接放行，完全跳过 WrappedBlockData / Update 的构造。
+    // 这是玩家挖/放方块（最常见的小批量）的主路径，省下的反射包装与集合扩容都发生在封包线程上。
+    int[] quickCoordinates = positionsOnly(event.getPacketType(), event.getPacket());
+    if (quickCoordinates != null) {
+      int quickCount = quickCoordinates.length / 3;
+      if (shouldPassThroughImmediately(player.getUniqueId(), quickCoordinates, quickCount)) {
+        rememberDeliveredCoords(player.getUniqueId(), quickCoordinates, quickCount);
+        stats.blockChangesPassed.increment();
+        return;
       }
     }
 
