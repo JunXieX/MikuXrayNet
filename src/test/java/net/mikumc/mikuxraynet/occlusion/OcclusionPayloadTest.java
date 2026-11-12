@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Arrays;
@@ -12,6 +13,16 @@ import org.junit.jupiter.api.Test;
 
 /** {@link OcclusionPayload} 的编解码往返与畸形输入拒绝测试。 */
 class OcclusionPayloadTest {
+
+  /**
+   * 缺数据段不能被编码成「已知全不遮挡」：读回后显形侧会把整段判成不遮挡（墙后伪装矿被还原）。
+   * 宁可让该区块不进缓存（调用方按建表失败处理），也不接受语义错误的负载。
+   */
+  @Test
+  void nullSectionIsRejectedInsteadOfBecomingEmpty() {
+    assertThrows(IllegalArgumentException.class,
+        () -> OcclusionPayload.encode(new SectionOcclusion[] {EmptyOcclusion.INSTANCE, null}));
+  }
 
   @Test
   void sectionCountPeekMatchesEncodedColumn() {

@@ -109,9 +109,20 @@ public final class OcclusionPayload {
     }
   }
 
-  /** 段 → 标签；{@code null}（理论上不该出现）按「已知全不遮挡」处理，避免编出非法负载。 */
+  /**
+   * 段 → 标签。
+   *
+   * <p><b>{@code null} 段必须拒绝，不能编码成「已知全不遮挡」</b>：{@code null} 的语义是「该段没有数据」
+   * （区块未 loaded / 版本布局缺段），而负载只有三态，没有「未知」。若把 null 写成 {@code TAG_EMPTY}，
+   * 读回后显形侧会把整段判成「已知全不遮挡」，该段里的伪装矿会被全部还原——等于隔墙透视。
+   * 抛出让调用方（{@code captureOcclusion}）按建表失败处理：该区块不进缓存，改写本身照常。
+   */
   private static byte tagOf(SectionOcclusion section) {
-    if (section == null || section.isEmpty()) {
+    if (section == null) {
+      throw new IllegalArgumentException(
+          "遮挡负载含 null 段（缺数据）：不能把「未知」编码成「已知全不遮挡」（读回会造成整段透视）");
+    }
+    if (section.isEmpty()) {
       return TAG_EMPTY;
     }
     return section.isSolid() ? TAG_SOLID : TAG_BITMAP;
