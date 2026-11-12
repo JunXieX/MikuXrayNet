@@ -202,6 +202,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final DiskCacheStore diskCache;
   /** 改写编排（缓存 / 磁盘 / 邻块 / 指纹 / 种子全部注入，可离线测；见 RewritePipeline）。 */
   private final RewritePipeline pipeline;
+  /** 伪装清单与已显形标记的唯一维护入口（见 ChunkRevealBook）。 */
+  private final ChunkRevealBook book;
   private final RewriteStats stats = new RewriteStats();
   /**
    * 最近方块变更的环形日志（见 {@link ChunkChangeJournal}）。
@@ -347,6 +349,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
                 ? neighborProvider.cached(worldName, chunkX, chunkZ) : null,
         this::rewriteFingerprint,
         ProtocolLibAsyncListener::seed);
+    this.book = new ChunkRevealBook(obfuscatedChunkIndex, revealedSet);
     registerQuitHook();
   }
 
@@ -1011,43 +1014,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return;
     }
 
-    // 记录「这个区块被伪装过的坐标」（按区块共享，只存一份；纯内存写入，可在工作线程执行）。
-    // 索引走可变引用：热重载关闭 proximity 后引用被置空，这里直接跳过，不再登记（真正零开销且与面板一致）。
-    ObfuscatedChunkIndex index = index();
-    if (index != null) {
-      // 用差集接口覆盖：本次覆盖会把「旧清单有、新清单没有」的坐标移出共享索引（如 enclosed 模式下
-      // 邻块指纹翻转导致边界坐标改写结果变化）。这些坐标上<b>所有玩家</b>的已显形标记必须同步摘除——
-      // 否则标记虚增会让邻近显形的「整块跳过」（sizeFor >= entry.size）提前成立，真实未显形坐标被
-      // 周期性跳过（标记又被扫描 touch 续期、玩家不离开扫描半径就永不过期）。
-      // 这正是 RevealedSet 类注释声明的「已显形坐标 ⊆ 区块当前清单」不变式，覆盖路径必须维护它。
-      // 容量安全阀可能为腾位置而整体淘汰其它区块：那些区块的索引条目随之消失，其坐标上各玩家的
-      // 已显形标记必须同步作废，否则成为孤儿标记（sizeFor 虚增 → 「整块跳过」提前成立 → 真实坐标漏显形）。
-      // 常态下 mayEvict 为 false，零分配；只有真的可能淘汰时才准备容器。
-      List<ChunkKey> evictedChunks = index.mayEvict(positions.length) ? new ArrayList<>(4) : null;
-      int[] removedLocals =
-          index.recordChunkWithRemovals(task.worldName(), task.chunkX(), task.chunkZ(),
-              task.minHeight(), positions, evictedChunks);
-      RevealedSet revealed = revealed();
-      if (revealed != null) {
-        if (evictedChunks != null) {
-          for (ChunkKey evictedKey : evictedChunks) {
-            // 索引条目已整体消失：该区块上「所有玩家」的已显形标记都必须作废
-            revealed.clearChunk(evictedKey);
-          }
-        }
-        if (removedLocals.length > 0) {
-          // 局部坐标 → 绝对坐标三元组（removePositions 按首坐标导出区块键，同区块批量摘除）
-          int[] absolute = toAbsoluteCoordinates(task.chunkX(), task.chunkZ(), task.minHeight(),
-              removedLocals);
-          revealed.removePositions(task.worldName(), absolute, removedLocals.length);
-        }
-        // 本接收者的标记作废已挪到「封包放行之后」（见 handleChunk 的放行动作与 clearRevealedOnDelivery）：
-        // 在放行之前清，会与「周期显形在区域线程上抢跑」形成竞态——显形包排在区块包之前被客户端丢弃，
-        // 标记却留了下来，该坐标直到区块重发 / 标记过期都不会再显形。
-        // 只作废该玩家：其它玩家的客户端仍显示我们此前发回的真实方块，把它们一并清掉只会让它们下个周期
-        // 重复显形一遍（纯浪费带宽与主线程开销）。
-      }
-    }
+    // 清单与标记的维护集中在 ChunkRevealBook：差集 / 容量淘汰 / 孤儿标记在同一个入口处理，
+    // 调用方不再成对调用两个索引（历史上漏清一处就会留下孤儿标记 → 漏显形）。
+    book.recordChunk(task.worldName(), task.chunkX(), task.chunkZ(), task.minHeight(), positions);
+    // 本接收者的标记作废已挪到「封包放行之后」（见 clearRevealedOnDelivery）：放行前清会与周期显形
+    // 抢跑，显形包排在区块包之前被客户端丢弃、标记却留下，该坐标直到区块重发才再显形。
   }
 
   /**
@@ -1121,10 +1092,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       return;
     }
     try {
-      RevealedSet revealed = revealed();
-      if (revealed != null) {
-        revealed.clearChunk(worldName, chunkX, chunkZ, playerId);
-      }
+      book.clearChunkMarks(worldName, chunkX, chunkZ, playerId);
     } catch (Throwable throwable) {
       // 清理失败只会让个别坐标多藏一个周期（区块重发/标记过期会再清），属安全方向；但必须留痕。
       logThrottled("区块封包放行后作废已显形标记失败（下一轮巡检会重试）", throwable);
@@ -1139,15 +1107,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 否则邻近显形会为不存在的伪装发冗余包，并留下孤儿标记（破坏 revealed ⊆ 清单 的不变式）。
    */
   private void dropChunkRegistration(RewriteTask task) {
-    ObfuscatedChunkIndex staleIndex = index();
-    if (staleIndex == null) {
-      return;
-    }
-    staleIndex.invalidateChunk(task.worldName(), task.chunkX(), task.chunkZ());
-    RevealedSet staleRevealed = revealed();
-    if (staleRevealed != null) {
-      staleRevealed.clearChunk(new ChunkKey(task.worldName(), task.chunkX(), task.chunkZ()));
-    }
+    // 清单与所有玩家的标记一并作废（单一入口，见 ChunkRevealBook）
+    book.invalidateChunk(task.worldName(), task.chunkX(), task.chunkZ());
   }
 
   /**
@@ -1162,27 +1123,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * <p>包级可见，供离线单测直接驱动三方编码互逆性（真实链路依赖封包上下文，离线不可达）。
    */
   static int[] toAbsoluteCoordinates(int chunkX, int chunkZ, int minHeight, int[] removedLocals) {
-    int[] absolute = new int[removedLocals.length * 3];
-    for (int i = 0; i < removedLocals.length; i++) {
-      int local = removedLocals[i];
-      absolute[i * 3] = (chunkX << 4) | SectionCoords.x(local);
-      // 相对 Y 是整个区块内的绝对高度偏移（不只 0..15），不能走 SectionCoords 的段内掩码。
-      absolute[i * 3 + 1] = minHeight + (local >> 8);
-      absolute[i * 3 + 2] = (chunkZ << 4) | SectionCoords.z(local);
-    }
-    return absolute;
-  }
-
-  /** 取「当前」的伪装区块索引（可变引用）；未启用或已被热重载关闭时返回 {@code null}。 */
-  private ObfuscatedChunkIndex index() {
-    Supplier<ObfuscatedChunkIndex> supplier = obfuscatedChunkIndex;
-    return supplier == null ? null : supplier.get();
-  }
-
-  /** 取「当前」的已显形集合（可变引用）；未启用或已被热重载关闭时返回 {@code null}。 */
-  private RevealedSet revealed() {
-    Supplier<RevealedSet> supplier = revealedSet;
-    return supplier == null ? null : supplier.get();
+    return ChunkRevealBook.toAbsolute(chunkX, chunkZ, minHeight, removedLocals);
   }
 
   /**
@@ -1327,14 +1268,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     if (neighborProvider != null) {
       neighborProvider.invalidateWorld(worldName);
     }
-    ObfuscatedChunkIndex index = index();
-    if (index != null) {
-      index.invalidateWorld(worldName);
-    }
-    RevealedSet revealed = revealed();
-    if (revealed != null) {
-      revealed.clearWorld(worldName);
-    }
+    // 清单（含墓碑）与标记一并失效：单一入口见 ChunkRevealBook。
+    book.invalidateWorld(worldName);
+    book.invalidateWorld(worldName);
   }
 
   /** 当前缓存条目数（诊断用）。 */
