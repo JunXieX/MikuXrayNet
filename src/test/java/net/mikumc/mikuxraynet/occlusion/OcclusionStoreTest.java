@@ -74,26 +74,24 @@ class OcclusionStoreTest {
     assertNull(store.section(10, 0, 0));
   }
 
+  /**
+   * 从未建表的段<b>不接受任何补丁</b>：既不能建位图，也不能记成「已知全不遮挡」。
+   *
+   * <p><b>为什么</b>：显形侧把「无数据」当遮挡（严格方向），而「有数据」的段按位判定。若凭空建一张
+   * 「只有这一格遮挡」的位图，该段其余 4095 格就会从「遮挡」变成「不遮挡」——墙后的伪装矿随即被还原，
+   * 等于隔墙透视。该段可能在缓存命中路径上从未解码，也可能本来就是实心石头。
+   *
+   * <p>「空气段里新放置方块必须进位图」的需求由 {@link #patchOnKnownEmptySectionCreatesBitmap} 覆盖：
+   * 那种段的位图是<b>建过表并确认全不遮挡</b>的 {@link EmptyOcclusion}，不是「未知」。
+   */
   @Test
-  void patchOnMissingSectionCreatesBitmapOnlyWhenOccluding() {
+  void patchOnMissingSectionIsIgnored() {
     OcclusionStore store = new OcclusionStore();
 
-    // 把「不遮挡」补丁打到不存在的 section：应当什么都不建
     store.setBlockOccluding(5, 5, 5, false);
-    assertNull(store.section(0, 0, 0));
-    assertEquals(0, store.loadedSectionCount());
-
-    // 把「遮挡」补丁打到不存在的 section：建位图，仅该格为 1
     store.setBlockOccluding(5, 5, 5, true);
-    SectionOcclusion section = store.section(0, 0, 0);
-    assertNotNull(section);
-    assertTrue(section.isOccludingLocal(5, 5, 5));
-    assertFalse(section.isOccludingLocal(5, 5, 6));
-
-    // 再清掉该格：位图变空 → 退化为「已知全不遮挡」快路径（而不是删条目，避免退化成「未知」）
-    store.setBlockOccluding(5, 5, 5, false);
-    assertSame(EmptyOcclusion.INSTANCE, store.section(0, 0, 0));
-    assertEquals(1, store.loadedSectionCount());
+    assertNull(store.section(0, 0, 0), "从未建表的段不得因补丁被创建成位图");
+    assertEquals(0, store.loadedSectionCount());
   }
 
   /**
