@@ -119,17 +119,17 @@ class OcclusionPatchListenerTest {
   }
 
   /**
-   * MULTI_BLOCK_CHANGE 的坐标展开：{@code (x & 15) << 8 | (z & 15) << 4 | (y & 15)}。
+   * MULTI_BLOCK_CHANGE 的坐标展开：{@code (y & 15) << 8 | (z & 15) << 4 | (x & 15)}。
    *
    * <p>展开错位会去补丁「另一格」，表现为位图与真实世界不一致（可能误藏或漏补），故单独钉死。
    */
   @Test
   void multiBlockCoordsUnpackMatchesTheProtocolPacking() {
-    // section (3, -2, 5) → 基准 (48, -32, 80)；三格相对坐标 (1,2,3) / (15,0,0) / (0,15,15)
+    // section (3, -2, 5) → 基准 (48, -32, 80)；三格相对坐标 (x=1,y=2,z=3) / (15,0,0) / (0,15,15)
     short[] positions = {
-        (short) ((1 << 8) | (3 << 4) | 2),
-        (short) ((15 << 8) | (0 << 4) | 0),
-        (short) ((0 << 8) | (15 << 4) | 15)
+        (short) ((2 << 8) | (3 << 4) | 1),
+        (short) ((0 << 8) | (0 << 4) | 15),
+        (short) ((15 << 8) | (15 << 4) | 0)
     };
     int[] coords = new int[positions.length * 3];
     OcclusionPatchListener.unpackMultiCoords(48, -32, 80, positions, coords);
