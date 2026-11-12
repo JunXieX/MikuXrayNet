@@ -673,7 +673,9 @@ public final class ProximityRevealer implements Listener {
    * 客户端里，任何残留的「已显形」记录都只会在重载后被当成「这块已经显形过」而漏发显形包。
    * 两处都做是幂等的（{@code clearChunk} 对不存在的键直接返回），不重复扣减计数。
    */
-  @EventHandler(ignoreCancelled = true)
+  // MONITOR：与主类的同名监听同一纪律——必须等所有插件表态完毕、确认卸载真的会发生再清理；
+  // 否则第三方在 NORMAL 取消卸载时，本监听已把清单/标记清掉，该区块的假矿会一直留到区块重发。
+  @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
   public void onChunkUnload(ChunkUnloadEvent event) {
     try {
       Chunk chunk = event.getChunk();
