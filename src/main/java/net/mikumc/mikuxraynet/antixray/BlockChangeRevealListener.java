@@ -7,6 +7,7 @@ import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.wrappers.BlockPosition;
+import com.comphenix.protocol.wrappers.WrappedBlockData;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
@@ -18,8 +19,8 @@ import net.mikumc.mikuxraynet.bandwidth.Schedulers;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.util.Constants;
 import net.mikumc.mikuxraynet.util.PlayerWorldIndex;
+import org.bukkit.Material;
 import org.bukkit.World;
-import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 
@@ -629,12 +630,13 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    *
    * <p>读不到状态时按 {@code true} 处理（与改动前行为一致，宁可多一次事件显形也不漏显）。
    */
-  private static boolean exposes(BlockData data) {
+  private static boolean exposes(WrappedBlockData data) {
     if (data == null) {
       return true;
     }
     try {
-      return !data.getMaterial().isOccluding();
+      Material material = data.getType();
+      return material == null || !material.isOccluding();
     } catch (Throwable throwable) {
       return true;
     }
