@@ -247,7 +247,11 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
           // 越界坐标：本格不写入，继续处理后面的格（整批不因一格被拒而回滚）
           continue;
         }
-        applyCellLocked(key, xs[i], ys[i], zs[i], occluding[i]);
+        if (!applyCellLocked(key, xs[i], ys[i], zs[i], occluding[i])) {
+          // 该段从未建表：补丁被丢弃（见 applyCellLocked）。不记回放、不记戳、不计 applied——
+          // 否则面板会显示「已补丁」而位图其实没变，发布/回放链路也会为一条不存在的补丁反复跳过。
+          continue;
+        }
         if (replay == null || key != replayKey) {
           replayKey = key;
           replay = replayFor(key);
@@ -403,7 +407,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * 包里的坐标一旦越出 28 位水平 / 8 位 sectionY 范围，{@code packBlock} 会按位截断成<b>另一个 section
    * 的键</b>，把补丁静默写到错误的几何上。调用方按「本格被拒」计数并跳过，故显式拒绝是安全方向。
    */
-  private void applyCellLocked(long key, int x, int y, int z, boolean occluding) {
+  private boolean applyCellLocked(long key, int x, int y, int z, boolean occluding) {
     int localX = x & SectionOcclusion.LOCAL_MASK;
     int localY = y & SectionOcclusion.LOCAL_MASK;
     int localZ = z & SectionOcclusion.LOCAL_MASK;
@@ -419,27 +423,27 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
       // 从未建表：绝不能凭空造一张「只有这一格遮挡」的位图。显形侧把「无数据」当遮挡（严格方向），
       // 而「有数据」的段按位判定——凭空建位图会让该段其余 4095 格从「遮挡」变成「不遮挡」，
       // 墙后的伪装矿随即被还原，等于隔墙透视。保持缺数据，等区块重新下发、建表时统一覆盖。
-      return;
+      return false;
     }
     if (current.isEmpty()) {
       // 已知全不遮挡（空气段）里新放置遮挡方块：建位图是正确的，整段语义仍是「有数据、按位判定」。
       if (!occluding) {
-        return;
+        return true; // 已是目标状态：无需写入，但口径明确、算「已处理」
       }
       BitmapOcclusion created = new BitmapOcclusion();
       created.setOccluding(localX, localY, localZ, true);
       sections.put(key, created);
-      return;
+      return true;
     }
 
     if (current.isSolid()) {
       if (occluding) {
-        return; // 已全遮挡，无需改动
+        return true; // 已全遮挡，无需改动
       }
       BitmapOcclusion downgraded = BitmapOcclusion.solid();
       downgraded.setOccluding(localX, localY, localZ, false);
       sections.put(key, downgraded);
-      return;
+      return true;
     }
 
     BitmapOcclusion bitmap = (BitmapOcclusion) current;
@@ -449,6 +453,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
       // 既浪费日后重建、又会让覆盖率指标误报「缺数据」）
       sections.put(key, EmptyOcclusion.INSTANCE);
     }
+    return true;
   }
 
   /**
