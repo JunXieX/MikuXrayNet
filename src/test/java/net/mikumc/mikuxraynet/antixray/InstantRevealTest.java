@@ -157,7 +157,7 @@ class InstantRevealTest {
     assertTrue(revealer.isInstantCandidate(other, WORLD, 10, 64, 10),
         "已显形按玩家记录：其它玩家仍需显形");
 
-    index.removePosition(WORLD, 10, 64, 10);
+    index.removePositions(WORLD, new int[] {10, 64, 10}, 1);
     assertFalse(revealer.isInstantCandidate(other, WORLD, 10, 64, 10),
         "服务端已下发变更（已注销）：不再是伪装坐标，无需显形");
   }

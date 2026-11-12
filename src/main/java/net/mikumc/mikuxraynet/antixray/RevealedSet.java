@@ -21,7 +21,7 @@ import java.util.function.LongSupplier;
  * 区块条目的大小比较——相等即说明整块都已显形，直接跳过该区块（稳态下每周期只处理「新进入视野的
  * 区块」）。该比较成立的前提是「已显形坐标 ⊆ 该区块当前的伪装清单」，这一不变式由三处共同保证：
  * ① 只有从区块清单里取出的坐标才会被标记；② 区块清单被覆盖（重新下发）或被摘除坐标时，
- * 本结构会同步清理（{@link #clearChunk} / {@link #removePosition}）。
+ * 本结构会同步清理（{@link #clearChunk} / {@link #removePositions}）。
  *
  * <p><b>线程纪律</b>：标记来自主线程 / Folia 区域线程（发包成功后）；清理来自主线程 / 区域线程
  * （区块卸载、玩家退出、世界卸载）与出站封包线程（方块变更注销）；读取来自区域线程 / 主线程。
@@ -197,9 +197,8 @@ public final class RevealedSet {
     this.clock = clock;
   }
 
-  /** 该玩家在该区块已显形的坐标数（无记录返回 0）。 */
   /**
-   * 按「世界名 + 区块坐标」查询已显形坐标数，<b>不分配 {@link ChunkKey}</b>（供扫描热循环使用）。
+   * 按「世界名 + 区块坐标」查询已显形坐标数（无记录返回 0），<b>不分配 {@link ChunkKey}</b>（供扫描热循环使用）。
    *
    * <p>用 {@link ChunkKey.Probe} 作查询键：它只用于 {@code ConcurrentHashMap} 查询、绝不入表，
    * 哈希与相等判定与 record 逐字段一致，语义与 {@link #sizeFor(UUID, ChunkKey)} 完全相同。
@@ -232,7 +231,6 @@ public final class RevealedSet {
     }
   }
 
-  /** 该玩家在该区块的该坐标是否已显形过。 */
   /** 按「世界名 + 区块坐标」判断某坐标是否已显形，<b>不分配 {@link ChunkKey}</b>（供扫描热循环使用）。 */
   boolean contains(UUID playerId, String worldName, int chunkX, int chunkZ, int x, int y, int z) {
     if (playerId == null || worldName == null) {
@@ -319,8 +317,7 @@ public final class RevealedSet {
     }
   }
 
-  /** 刷新该玩家在该区块的活跃时间（扫描到该区块时调用，避免身边的标记被过期清掉）。 */
-  /** 按「世界名 + 区块坐标」刷新活跃时间，<b>不分配 {@link ChunkKey}</b>（供扫描热循环使用）。 */
+  /** 按「世界名 + 区块坐标」刷新活跃时间（扫描到该区块时调用，避免身边的标记被过期清掉），<b>不分配 {@link ChunkKey}</b>。 */
   void touch(UUID playerId, String worldName, int chunkX, int chunkZ) {
     if (playerId == null || worldName == null) {
       return;
@@ -344,20 +341,9 @@ public final class RevealedSet {
   }
 
   /**
-   * 注销一个坐标的已显形标记（服务端自行下发了该坐标的方块变更时调用）。
-   *
-   * <p>与 {@link ObfuscatedChunkIndex#removePosition} 配套：两者必须同步摘除，才能维持
-   * 「已显形坐标 ⊆ 区块伪装清单」这一不变式。委托给批量接口，保证与 {@link #removePositions}
-   * 用同一把锁、同一套判活逻辑。
-   */
-  void removePosition(String worldName, int x, int y, int z) {
-    removePositions(worldName, new int[] {x, y, z}, 1);
-  }
-
-  /**
    * 只注销<b>某一个玩家</b>在该坐标的已显形标记（发包失败回滚时调用）。
    *
-   * <p><b>为什么不能复用全局版本</b>：{@link #removePosition(String, int, int, int)} 会摘除该坐标上
+   * <p><b>为什么不能复用全局版本</b>：{@link #removePositions} 会摘除该坐标上
    * <b>所有玩家</b>的标记。回滚场景里失败的只是「本次这个玩家」的发包——其它玩家此前成功收到的显形
    * 仍然有效，把它们一并摘掉只会让它们在下一个巡检周期重复显形一遍（白白多发包 + 多占主线程）。
    * 摘除方向本身是安全的（不会造成漏显形、也不破坏不变式），因此这只是效率问题，但成本极低。
@@ -581,7 +567,7 @@ public final class RevealedSet {
     }
   }
 
-  /** 清空全部标记（插件停用 / 热重载时调用，不留副作用）。 */
+  /** 清空全部标记（插件停用时调用，不留副作用；热重载刻意不清，见 ProximityRevealer#stop(boolean)）。 */
   void clear() {
     chunks.clear();
     playerTotals.clear();

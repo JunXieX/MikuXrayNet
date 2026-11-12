@@ -536,11 +536,6 @@ public final class ProximityRevealer implements Listener {
     return "已开启（遮挡位图步进射线 + 暴露面上至多 " + proximity.raycastSamples() + " 个候选点，工作线程执行）";
   }
 
-  /** 停用：注销任务与事件监听，并清空两个显形索引（不留副作用）。 */
-  public void stop() {
-    stop(true);
-  }
-
   /**
    * 停止巡检并注销事件监听。
    *
@@ -603,6 +598,11 @@ public final class ProximityRevealer implements Listener {
       ScheduledTask previousLook = lookScans.put(player.getUniqueId(), look);
       if (previousLook != null) {
         cancelQuietly(previousLook);
+      }
+      // 入账后复查停用闸（与下方 entityScans 同一处理）：stop() 可能已清完 lookScans，
+      // 这条晚到的视线任务句柄不会有人取消，会空转到实体退役并钉住旧实例。
+      if (stopping && lookScans.remove(player.getUniqueId(), look)) {
+        cancelQuietly(look);
       }
     }
     EntityScan mine = new EntityScan(task, new AtomicLong());
@@ -1080,12 +1080,6 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 当前线程是否拥有该区块（Folia 区域化线程模型的访问前置条件）。
-   *
-   * <p>非 Folia 恒为 {@code true}（单主线程，不存在跨 region 问题）；判定本身抛异常时按
-   * <b>「不拥有」</b>处理——宁可少显形一个坐标，也绝不跨 region 读世界（那会触发 TickThread 校验）。
-   */
-  /**
    * 近处重试：清掉该玩家在这个坐标上的「已显形」标记，让随后的 {@code sendOne} 重新标记并发包。
    *
    * <p>不做这一步，重试出来的候选会被 {@code claimForSend}/{@code markThenSend} 的「已显形就不发」
@@ -1110,6 +1104,12 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
+  /**
+   * 当前线程是否拥有该区块（Folia 区域化线程模型的访问前置条件）。
+   *
+   * <p>非 Folia 恒为 {@code true}（单主线程，不存在跨 region 问题）；判定本身抛异常时按
+   * <b>「不拥有」</b>处理——宁可少显形一个坐标，也绝不跨 region 读世界（那会触发 TickThread 校验）。
+   */
   private static boolean ownsChunk(World world, int chunkX, int chunkZ) {
     if (!PlatformSupport.isFolia()) {
       return true;
@@ -1183,6 +1183,15 @@ public final class ProximityRevealer implements Listener {
           ChunkKey.ofBlock(world.getName(), x, z), x, y, z)) {
         stats.overRevealWasted.increment();
       }
+    }
+
+    // 批量模式先做廉价判重：已显形的候选直接跳过，不必读方块状态（稳态下周期巡检的主要负载正是
+    // 「已显形但被视锥/射线判可见」的候选）。最终判重仍由 flushBatch 的 claimForSend 原子兜底，
+    // 这里只是省掉无谓的世界读与短命对象（TOCTOU 由 claimForSend 闭合，语义不变）。
+    if (batch != null && revealedSet != null
+        && revealedSet.contains(player.getUniqueId(), world.getName(), x >> 4, z >> 4, x, y, z)) {
+      stats.revealsSkipped.increment();
+      return;
     }
 
     // 真实方块状态必须在玩家所属线程读取（本方法即运行在该线程上）。
@@ -1466,19 +1475,8 @@ public final class ProximityRevealer implements Listener {
     UUID playerId = player.getUniqueId();
     String worldName = batch.world.getName();
 
-    // 发包前重读一次当前状态：批次里的方块数据是「累积时刻」读到的，而累积到真正发出之间可能隔着
-    // 工作线程回投（plan 分支）或同一 tick 内更早的判定。若玩家在这段时间里放置/破坏过这些格子，
-    // 批次就会带着旧材质发出，把客户端刚应用的新方块覆盖回去——真机观感就是「那一格闪一下」。
-    // 代价只是每个待发坐标多一次世界读（通常几十个）。
-    for (int i = 0; i < batch.states.size(); i++) {
-      int[] position = batch.positions.get(i);
-      try {
-        batch.states.set(i, batch.world.getBlockData(position[0], position[1], position[2]));
-      } catch (Throwable throwable) {
-        // 读不到就保留原快照：宁可发一次旧状态，也不因一次读失败丢掉显形
-        logThrottled(throwable);
-      }
-    }
+    // 方块状态在 sendOne 累积时已读，且累积与冲刷都在同一玩家线程任务内连续执行（plan 分支的工作
+    // 线程回投发生在 sendOne 之前），两次读取之间不可能插入方块变更——无需在此整批重读。
 
     // 原子复核 + 标记：只对「本周期尚未显形、本次真正新登记」的坐标发包（见 claimForSend）。
     int[] fresh = claimForSend(playerId, worldName, batch.positions);
@@ -1908,7 +1906,8 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 单个 section（一组变更坐标）的即时显形入口（由 {@link BlockChangeRevealListener} 在封包线程调用）。
+   * 单个 section（一组变更坐标）的即时显形入口（由 {@link BlockChangeRevealListener} 经实体调度器
+   * 投递到玩家所属线程调用）。
    *
    * <p>语义与 {@link #onBlockChangeObserved} 完全一致（邻域内仍有伪装坐标才调度），但把同一 section 的
    * 多个变更坐标聚合为「<b>一次初筛 + 一次调度</b>」：逐坐标版本会对每个变更坐标各初筛一次、各调度一个

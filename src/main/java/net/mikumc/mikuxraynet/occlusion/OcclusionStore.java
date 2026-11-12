@@ -2,7 +2,6 @@ package net.mikumc.mikuxraynet.occlusion;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.LongAdder;
 import java.util.function.IntPredicate;
 
 /**
@@ -18,8 +17,9 @@ import java.util.function.IntPredicate;
  * 因此射线遍历可以无锁并发，代价仅是「读到写入途中的旧值」——对本模块无害（少一格遮挡 = 偏可见，
  * 属安全方向）。
  *
- * <p><b>null 语义</b>：表里没有某 section（{@code section(...) == null}）与「该段全不遮挡」等价，
- * 射线按其「不计遮挡」处理。因此写入全不遮挡的段 = {@link #removeSection}。
+ * <p><b>null 语义</b>：表里没有某 section（{@code section(...) == null}）＝缺数据，实体射线按「不计遮挡」
+ * 处理（显形侧则按遮挡，见 {@link SectionOcclusion}）。「已知全不遮挡」写 {@link EmptyOcclusion#INSTANCE}，
+ * 与 null（未知）刻意区分，使覆盖率指标不被全空气段稀释。
  */
 public final class OcclusionStore implements OcclusionRay.Lookup {
 
@@ -103,9 +103,6 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
       this.key = key;
     }
   }
-
-  /** 因「该段期间被补丁写过」而跳过发布的段数（诊断用，只增不减）。 */
-  private final LongAdder publishSkippedPatched = new LongAdder();
 
   public OcclusionStore() {
     this(256);
@@ -192,7 +189,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
   }
 
   /**
-   * 批量单格补丁：整批只取一次 {@link #writeMutex}。
+   * 批量单格补丁：整批只取一次 {@link #writeMutex}（显式给定本次有效格数）。
    *
    * <p><b>为什么必须要有批量入口</b>：一个 {@code MULTI_BLOCK_CHANGE} 包最多带 4096 个坐标，逐格调用
    * {@link #setBlockOccluding} 就是 4096 次加解锁。而同一把锁还被解码工作线程的整列建表
@@ -200,29 +197,18 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * 既把建表那侧的长临界区切碎，又让网络线程在锁上停顿成千上万次。整批只取一次锁后，锁次数从 4096
    * 降到 1，临界区变成一段连续的内存写入——这正是「网络线程零计算、少阻塞」纪律的落点。
    *
-   * <p><b>越界语义</b>：单格的越界判定仍由 {@link SectionKey#packSection} 权威给出（抛
-   * {@link IllegalArgumentException}）。本方法<b>跳过</b>该格、继续处理后面的格，而不是让整批失败——
-   * 一个坏坐标不该连累同包其余 4095 格；跳过的格数由调用方计入失败计数。
-   *
-   * @param xs        每格的方块 X 坐标
-   * @param ys        每格的方块 Y 坐标
-   * @param zs        每格的方块 Z 坐标
-   * @param occluding 每格变更后是否遮挡
-   * @return 实际应用的格数；越界坐标被跳过（不写入），由调用方计入失败计数
-   */
-  public int setBlocksOccluding(int[] xs, int[] ys, int[] zs, boolean[] occluding) {
-    return setBlocksOccluding(xs, ys, zs, occluding, xs == null ? 0 : xs.length);
-  }
-
-  /**
-   * 批量单格补丁（显式给定本次有效格数）。
-   *
    * <p><b>为什么单独带 {@code count}</b>：补丁热路径改用了线程本地复用的数组（见
    * {@code OcclusionPatchListener}），数组长度通常大于本次有效格数，不能再拿 {@code xs.length}
    * 当批量边界——否则会把上一包残留的坐标一起应用（把补丁写到错误的几何上）。
    *
+   * <p><b>越界语义</b>：单格的越界判定仍由 {@link SectionKey#packSection} 权威给出（抛
+   * {@link IllegalArgumentException}）。本方法<b>跳过</b>该格、继续处理后面的格，而不是让整批失败——
+   * 一个坏坐标不该连累同包其余 4095 格；跳过的格数由调用方计入失败计数。
+   *
    * <p><b>补丁戳</b>：每个「被本批坐标覆盖」的 section 记一次代次（同一段在批内只写一次 CHM），
    * 使随后到来的整列建表知道这一段期间被补丁改过、不能用更早的几何覆盖它。
+   *
+   * @return 实际应用的格数；越界坐标被跳过（不写入），由调用方计入失败计数
    */
   public int setBlocksOccluding(int[] xs, int[] ys, int[] zs, boolean[] occluding, int count) {
     if (closed || xs == null || ys == null || zs == null || occluding == null || count <= 0) {
@@ -304,11 +290,6 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    */
   public long patchGeneration() {
     return patchSequence.get();
-  }
-
-  /** 因「该段期间被补丁写过」而跳过整列发布的段数（诊断用；持续偏高说明建表期间方块变更很频繁）。 */
-  public long skippedPatchedSections() {
-    return publishSkippedPatched.sum();
   }
 
   /**
@@ -404,8 +385,8 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * <p>抽出来是为了让单格入口与批量入口共用同一套「取旧值 → 表示升降级 → 写回」逻辑：批量入口要在
    * 一个临界区内连续写多格，不能再逐格加锁。
    *
-   * <p>键由调用方用带校验的 {@link SectionKey#packSection} 算出（而非射线热路径用的 {@code packBlock}）：
-   * 包里的坐标一旦越出 28 位水平 / 8 位 sectionY 范围，{@code packBlock} 会按位截断成<b>另一个 section
+   * <p>键由调用方用带校验的 {@link SectionKey#packSection} 算出（而非无校验的 {@link SectionKey#packUnchecked}）：
+   * 包里的坐标一旦越出 28 位水平 / 8 位 sectionY 范围，{@code packUnchecked} 会按位截断成<b>另一个 section
    * 的键</b>，把补丁静默写到错误的几何上。调用方按「本格被拒」计数并跳过，故显式拒绝是安全方向。
    */
   private boolean applyCellLocked(long key, int x, int y, int z, boolean occluding,
@@ -510,7 +491,7 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
    * 宁可写入解码时刻的几何，也不能让整段留空）。
    *
    * @param stamps 建表前取的戳快照；{@code null} = 不做比较（等价于旧行为）
-   * @return 因期间有补丁而被跳过覆盖的段数（已累加进 {@link #skippedPatchedSections()}）
+   * @return 因期间有补丁而被跳过覆盖的段数（调用方计入 RewriteStats.occlusionPublishSkipped 供诊断）
    */
   public int restoreColumn(int chunkX, int minSectionY, int chunkZ, SectionOcclusion[] column,
       long[] stamps) {
@@ -560,9 +541,6 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
         // 补丁应丢弃（缺数据保持缺数据）。
         replayPendingCells(key, data != null);
       }
-    }
-    if (skipped > 0) {
-      publishSkippedPatched.add(skipped);
     }
     return skipped;
   }

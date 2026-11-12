@@ -1084,16 +1084,9 @@ public final class ObfuscationProcessor {
   }
 
   /**
-   * 建一列「改写前原始几何」的反矿透视觉口径遮挡位图（enclosed 模式 6 面判定用）。
-   *
-   * <p>与实体口径位图分开建：两套谓词不同（{@code registry::isOccluding} vs
-   * {@code registry::isEntityOccluding}），不能混用。只在 enclosed 模式且需要时构建，
-   * 全伪装模式零调用。
-   *
-   * @param collectTargets true 时同一遍遍历顺带收集目标索引与目标条目计数（位图建表与扫描合并）
-   */
-  /**
-   * 只为「目标密集」的候选段（及其相邻候选段）建 6 面判定位图。
+   * 建一列「改写前原始几何」的反矿透视觉口径遮挡位图（enclosed 模式 6 面判定用），只为「目标密集」的
+   * 候选段（及其相邻候选段）建。与实体口径位图分开建：两套谓词不同（{@code registry::isOccluding} vs
+   * {@code registry::isEntityOccluding}），不能混用；全伪装模式零调用。
    *
    * <p><b>为什么按密度选择</b>：位图位测试单次约 2~5 ns，而「读实时状态 + 调色板换算」在替换数很少时
    * 更便宜；只有当一个段的目标格足够多、undo log 长到二分查找成为主要成本时，位图才净赚。

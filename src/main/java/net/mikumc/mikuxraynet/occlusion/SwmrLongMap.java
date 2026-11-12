@@ -69,10 +69,6 @@ public final class SwmrLongMap<V> {
     }
   }
 
-  public SwmrLongMap() {
-    this(MIN_CAPACITY);
-  }
-
   /** 以「期望条目数」构造（实际容量向上取到 2 的幂，并按负载因子放大）。 */
   public SwmrLongMap(int expectedEntries) {
     this.table = new Table<>(capacityFor(Math.max(MIN_CAPACITY, expectedEntries)));
@@ -108,24 +104,6 @@ public final class SwmrLongMap<V> {
     long stamp = lock.writeLock();
     try {
       return putLocked(key, value);
-    } finally {
-      lock.unlockWrite(stamp);
-    }
-  }
-
-  /** 键不存在时才写入（独占）。 */
-  public V putIfAbsent(long key, V value) {
-    Objects.requireNonNull(value, "value");
-    long stamp = lock.writeLock();
-    try {
-      Object existing = getLocked(key);
-      if (existing != null) {
-        @SuppressWarnings("unchecked")
-        V cast = (V) existing;
-        return cast;
-      }
-      putLocked(key, value);
-      return null;
     } finally {
       lock.unlockWrite(stamp);
     }
@@ -213,10 +191,6 @@ public final class SwmrLongMap<V> {
     return size;
   }
 
-  public boolean isEmpty() {
-    return size == 0;
-  }
-
   /** 清空（独占）。原地清空当前代，不换数组（换数组会让并发的乐观读跨代，见 {@link #table} 说明）。 */
   public void clear() {
     long stamp = lock.writeLock();
@@ -270,20 +244,6 @@ public final class SwmrLongMap<V> {
 
     if ((size + tombstones) * 1.0f / capacity >= LOAD_FACTOR) {
       rehash(capacity << 1);
-    }
-    return null;
-  }
-
-  @SuppressWarnings("unchecked")
-  private V getLocked(long key) {
-    Table<V> t = table;
-    int mask = t.keys.length - 1;
-    int index = spread(key) & mask;
-    while (t.slots[index] != 0) {
-      if (t.slots[index] == USED && t.keys[index] == key) {
-        return (V) t.values[index];
-      }
-      index = (index + 1) & mask;
     }
     return null;
   }

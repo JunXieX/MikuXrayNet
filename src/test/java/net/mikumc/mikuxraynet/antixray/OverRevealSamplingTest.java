@@ -79,7 +79,7 @@ class OverRevealSamplingTest {
     revealed.markIfAbsent(player, key, x, y, z);
     assertTrue(revealed.contains(player, key, x, y, z),
         "已显形（未注销）时再发包 = 过度显形（抽样计数口径）");
-    revealed.removePosition(world, x, y, z);
+    revealed.removePositions(world, new int[] {x, y, z}, 1);
     assertFalse(revealed.contains(player, key, x, y, z),
         "服务端下发变更注销后：客户端重新看到伪装，再次显形不算浪费");
   }

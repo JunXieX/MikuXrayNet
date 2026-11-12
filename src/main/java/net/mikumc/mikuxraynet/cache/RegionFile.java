@@ -537,8 +537,9 @@ final class RegionFile implements AutoCloseable {
    * 长度是否仍不超过读取侧上界 {@link BufferedLinearV3Format#MAX_RAW_SIZE}。
    *
    * <p><b>为什么写入侧要判</b>：读取侧对 {@code rawLength} 超过该上界的桶一律判为损坏、整桶当空；写入侧
-   * 若不先行拦下，一个合法写入（单条负载 ≤ 16 MiB × 单桶 64 条）就可能撑出超限的桶，表现为
-   * 「写成功却读不回」。这里复用与读取侧<b>同一个常量</b>，越界即由调用方按既有拒绝路径丢弃本次写入。
+   * 若不先行拦下就可能撑出超限的桶，表现为「写成功却读不回」。当前布局一桶一条（{@code BUCKET_SHIFT=0}），
+   * 单条 ≤ 16 MiB + 记录头恒不超过 32 MiB 上界，本判定是读写同口径的护栏（防 {@code BUCKET_SHIFT} 变更回归）。
+   * 这里复用与读取侧<b>同一个常量</b>，越界即由调用方按既有拒绝路径丢弃本次写入。
    */
   boolean bucketRawLengthFitsAfterPut(int chunkIndex, int payloadLength) {
     if (lockUnavailable) {
@@ -982,7 +983,7 @@ final class RegionFile implements AutoCloseable {
    * 关闭并<b>丢弃</b>未落盘的脏桶（仅用于「文件即将被删除」的淘汰路径）。
    *
    * <p>与 {@link #close()} 的区别：不调用 {@code flushDirty()}——文件随后即删除，先整桶重编码 +
-   * 压缩 + fsync 纯属白做（且压缩线程的读预算只有几十毫秒）。压缩中与非关闭态的处理同 close：
+   * 压缩 + fsync 纯属白做（且磁盘线程的读预算只有几十毫秒）。压缩中与非关闭态的处理同 close：
    * 直接返回，由压缩收尾负责关闭。
    */
   void closeDiscarding() {

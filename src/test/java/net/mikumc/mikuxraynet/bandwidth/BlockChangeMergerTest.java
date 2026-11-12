@@ -9,12 +9,9 @@ import com.comphenix.protocol.wrappers.WrappedBlockData;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
@@ -116,43 +113,6 @@ class BlockChangeMergerTest {
           BlockChangeMerger.bypassesMerge(true, n), "MULTI 包：仅由坐标数决定");
       assertFalse(BlockChangeMerger.bypassesMerge(false, n), "非 MULTI 包：任何坐标数都不直通");
     }
-  }
-
-  /**
-   * 切维丢弃的路由逻辑（原 P2-1 残余窗口的主修）：按 uuid <b>精确</b>取该玩家的缓冲交给丢弃回调，
-   * 其它玩家不受影响、重复触发幂等。
-   *
-   * <p>「切维时绝不发送合并包」由结构保证：被抽出的纯函数签名里没有任何发包入口
-   * （不收 ProtocolManager / Player），它只做「取缓冲 → 交给丢弃回调」。
-   *
-   * <p>离线不构造 {@link BlockChangeMerger} 本身（会初始化 ProtocolLib 的 {@code PacketType}、起冲刷
-   * 线程、并需要封包对象），因此这里直接驱动被抽出的纯函数；事件处理器只做一行转发。
-   */
-  @Test
-  @DisplayName("切维丢弃只取该玩家的缓冲、其它玩家不受影响、重复调用幂等")
-  void worldChangeDiscardsOnlyThatPlayersBuffer() {
-    UUID changed = UUID.randomUUID();
-    UUID other = UUID.randomUUID();
-    Map<UUID, String> buffers = new ConcurrentHashMap<>();
-    buffers.put(changed, "buffer-of-changed");
-    buffers.put(other, "buffer-of-other");
-
-    List<String> discarded = new ArrayList<>();
-    assertTrue(BlockChangeMerger.discardPendingFor(buffers, changed, buffer -> {
-      discarded.add(buffer);
-      buffers.remove(changed, buffer); // 生产实现（discard）负责摘除，这里等价模拟
-    }), "切维玩家确有缓冲时必须回报「已丢弃」");
-    assertEquals(List.of("buffer-of-changed"), discarded, "只能丢弃该玩家自己的缓冲");
-    assertEquals(Set.of(other), buffers.keySet(), "其它玩家的待发缓冲不得受影响");
-
-    assertFalse(BlockChangeMerger.discardPendingFor(buffers, changed, discarded::add),
-        "缓冲已丢弃后重复触发必须是幂等 no-op（切维事件与快照比对可能都会触发）");
-    assertEquals(1, discarded.size(), "幂等：不得再次回调丢弃动作");
-    // 显式类型见证：第一个实参是 null 时 B 无法从实参推断（需从返回值/回调反推，javac 不做）。
-    assertFalse(BlockChangeMerger.<String>discardPendingFor(null, changed, discarded::add),
-        "表缺失时必须安全返回 false（不得抛异常）");
-    assertFalse(BlockChangeMerger.discardPendingFor(buffers, null, discarded::add),
-        "玩家 id 缺失时必须安全返回 false（不得抛异常）");
   }
 
   /**

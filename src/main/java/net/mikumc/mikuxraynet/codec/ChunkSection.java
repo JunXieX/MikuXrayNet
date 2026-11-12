@@ -120,6 +120,29 @@ public class ChunkSection {
 
     this.setBitsPerBlock(bitsPerBlock, true);
 
+    // 升 direct（全局）格式时，位打包按注册表位宽写出：状态 id 必须落在 [0, 2^registryBits) 内。
+    // 间接调色板读侧只按 paletteCapacity（探测上限 262144）校验，自定义方块（CraftEngine 等）的
+    // id 可能 ≥ 2^registryBits（vanilla 约 3.2 万、registryBits=15 → 上限 32768，仅差几百）。
+    // 若不拦下，SimpleVarBitBuffer.set 会按位宽掩码把它静默截断成另一个状态（方块错乱、不计数、
+    // 不 fail-open）。这里显式拒绝，交由上层 rewrite 的 catch 按原包放行（与 bitsPerBlock 2/3、
+    // 调色板重复值等非法编码同一处置口径）。
+    if (this.palette instanceof DirectPalette) {
+      int stateLimit = 1 << this.bitsPerBlock;
+      for (int i = 0; i < data.size(); i++) {
+        int preBlockId = palette.valueFor(data.get(i));
+        if (preBlockId < 0 || preBlockId >= stateLimit) {
+          throw new IllegalArgumentException("状态 id " + preBlockId
+              + " 超出直接格式位宽 " + this.bitsPerBlock + " 的表示范围，放弃改写");
+        }
+        this.data.set(i, preBlockId);
+      }
+      if (blockId < 0 || blockId >= stateLimit) {
+        throw new IllegalArgumentException("伪装状态 id " + blockId
+            + " 超出直接格式位宽 " + this.bitsPerBlock + " 的表示范围，放弃改写");
+      }
+      return blockId;
+    }
+
     for (int i = 0; i < data.size(); i++) {
       int preBlockId = palette.valueFor(data.get(i));
       this.data.set(i, this.palette.idFor(preBlockId));
@@ -129,7 +152,8 @@ public class ChunkSection {
   }
 
   static int positionToIndex(int x, int y, int z) {
-    return y << 8 | z << 4 | x;
+    // 段内坐标唯一实现见 SectionOcclusion.packLocal（不变量 16）；codec 分层可依赖 occlusion。
+    return net.mikumc.mikuxraynet.occlusion.SectionOcclusion.packLocal(x, y, z);
   }
 
   public void setBlockState(int x, int y, int z, int blockId) {

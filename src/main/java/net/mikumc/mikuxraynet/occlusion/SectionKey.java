@@ -72,18 +72,7 @@ public final class SectionKey {
     return packUnchecked(chunkX, sectionY, chunkZ);
   }
 
-  /**
-   * 由「方块世界坐标」打包其所属 section 的键（{@code x>>4, y>>4, z>>4}）。
-   *
-   * <p><b>越界不抛异常</b>：越界坐标按位掩码截断后仍得到某个键。因此它只适合<b>坐标必然合法</b>
-   * 且失败可容忍的场景；写入路径（方块补丁）必须改用 {@link #packSection}，否则越界坐标会被
-   * 静默写到另一个 section 上。射线遍历不经过本方法（它直接以 {@code >>4} 得到的三个分量查表）。
-   */
-  public static long packBlock(int x, int y, int z) {
-    return packUnchecked(x >> 4, y >> 4, z >> 4);
-  }
-
-  /** 不做范围校验的打包（越界坐标按位截断）；{@link #packSection} 与 {@link #packBlock} 共用。 */
+  /** 不做范围校验的打包（越界坐标按位截断）；{@link #packSection} 用它实现。 */
   public static long packUnchecked(int chunkX, int sectionY, int chunkZ) {
     return ((long) chunkX & HORIZONTAL_MASK) << (SECTION_Y_BITS + HORIZONTAL_BITS)
         | ((long) sectionY & SECTION_Y_MASK) << HORIZONTAL_BITS

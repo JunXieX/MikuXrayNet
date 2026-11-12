@@ -31,11 +31,15 @@ class SectionBatchProcessingTest {
   private final long[] clock = {0L};
 
   private ObfuscatedChunkIndex index() {
-    return new ObfuscatedChunkIndex(1_000_000, 300 * SECOND_NANOS, () -> clock[0]);
+    return new ObfuscatedChunkIndex(1_000_000, () -> clock[0]);
   }
 
   private RevealedSet revealed() {
     return new RevealedSet(1_000_000, 300 * SECOND_NANOS, () -> clock[0]);
+  }
+
+  private static ChunkRevealBook book(ObfuscatedChunkIndex index, RevealedSet revealed) {
+    return new ChunkRevealBook(() -> index, () -> revealed);
   }
 
   private static int local(int x, int y, int z) {
@@ -71,8 +75,8 @@ class SectionBatchProcessingTest {
     };
 
     List<int[]> dispatched = new ArrayList<>();
-    BlockChangeRevealListener.processChanges(WORLD, changes, changes.length / 3, index, revealed,
-        stats, (coords, count) -> dispatched.add(java.util.Arrays.copyOf(coords, count * 3)));
+    BlockChangeRevealListener.processChanges(WORLD, changes, changes.length / 3, book(index, revealed),
+        stats, (coords, count) -> dispatched.add(java.util.Arrays.copyOf(coords, count * 3)), null);
 
     assertEquals(2, dispatched.size(), "两个 section → 恰好调度两次（每 section 一次）");
     assertEquals(Set.of(pack(1, 64, 1), pack(2, 64, 1), pack(9, 64, 9)), packAll(dispatched.get(0)),
@@ -83,9 +87,9 @@ class SectionBatchProcessingTest {
     // 结果与「逐坐标 removePosition」等价
     ObfuscatedChunkIndex reference = index();
     reference.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, locals);
-    reference.removePosition(WORLD, 1, 64, 1);
-    reference.removePosition(WORLD, 2, 64, 1);
-    reference.removePosition(WORLD, 1, 80, 1);
+    reference.removePositions(WORLD, new int[] {1, 64, 1}, 1);
+    reference.removePositions(WORLD, new int[] {2, 64, 1}, 1);
+    reference.removePositions(WORLD, new int[] {1, 80, 1}, 1);
     assertArrayEquals(reference.entry(key).locals(), index.entry(key).locals(),
         "批量摘除的剩余伪装坐标必须与逐坐标摘除完全一致");
     assertEquals(3L, stats.unregistered.sum(), "命中并摘除的坐标数为 3");
@@ -96,7 +100,7 @@ class SectionBatchProcessingTest {
     assertTrue(revealed.contains(PLAYER, key, 3, 70, 3), "未被变更的坐标标记必须保留");
     assertEquals(1, revealed.sizeFor(PLAYER, key), "计数与剩余伪装清单自洽（均为 1）");
 
-    reference.removePosition(WORLD, 3, 70, 3);
+    reference.removePositions(WORLD, new int[] {3, 70, 3}, 1);
     assertNull(reference.entry(key), "摘空后条目移除");
   }
 
@@ -111,8 +115,8 @@ class SectionBatchProcessingTest {
     revealed.markIfAbsent(PLAYER, key, 1, 64, 1);
     assertEquals(1, revealed.sizeFor(PLAYER, key));
 
-    BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1}, 1, index, revealed,
-        new ProximityStats(), null);
+    BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1}, 1, book(index, revealed),
+        new ProximityStats(), null, null);
 
     assertEquals(0, revealed.sizeFor(PLAYER, key), "索引未命中也要摘标记，杜绝孤儿标记");
   }
@@ -130,11 +134,11 @@ class SectionBatchProcessingTest {
     int[] changes = {1, 64, 1, 1, 64, 1, 2, 64, 1};
 
     List<int[]> first = new ArrayList<>();
-    BlockChangeRevealListener.processChanges(WORLD, changes, 3, index, revealed, null,
-        (coords, count) -> first.add(java.util.Arrays.copyOf(coords, count * 3)));
+    BlockChangeRevealListener.processChanges(WORLD, changes, 3, book(index, revealed), null,
+        (coords, count) -> first.add(java.util.Arrays.copyOf(coords, count * 3)), null);
     List<int[]> second = new ArrayList<>();
-    BlockChangeRevealListener.processChanges(WORLD, changes, 3, index, revealed, null,
-        (coords, count) -> second.add(java.util.Arrays.copyOf(coords, count * 3)));
+    BlockChangeRevealListener.processChanges(WORLD, changes, 3, book(index, revealed), null,
+        (coords, count) -> second.add(java.util.Arrays.copyOf(coords, count * 3)), null);
 
     assertEquals(1, first.size());
     assertEquals(2, first.get(0).length / 3, "同一调用内重复坐标被去重");
@@ -171,11 +175,11 @@ class SectionBatchProcessingTest {
   void dispatchHandsOutIndependentSnapshotsAcrossReusedScratch() {
     List<int[]> dispatched = new ArrayList<>();
     BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1, 2, 64, 1}, 2,
-        index(), revealed(), new ProximityStats(),
-        (coords, count) -> dispatched.add(coords));
+        book(index(), revealed()), new ProximityStats(),
+        (coords, count) -> dispatched.add(coords), null);
     BlockChangeRevealListener.processChanges(WORLD, new int[] {5, 70, 5}, 1,
-        index(), revealed(), new ProximityStats(),
-        (coords, count) -> dispatched.add(coords));
+        book(index(), revealed()), new ProximityStats(),
+        (coords, count) -> dispatched.add(coords), null);
 
     assertEquals(2, dispatched.size(), "两次调用各派发一次");
     assertArrayEquals(new int[] {1, 64, 1, 2, 64, 1}, dispatched.get(0),
@@ -192,11 +196,11 @@ class SectionBatchProcessingTest {
     // 清理后同一线程再次处理变更：SeenScratch / ParseScratch 会被重新创建，派发内容仍正确
     int[] dispatched = new int[3];
     int[] seen = {0};
-    BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1}, 1, index(), revealed(),
+    BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1}, 1, book(index(), revealed()),
         new ProximityStats(), (coords, count) -> {
           System.arraycopy(coords, 0, dispatched, 0, count * 3);
           seen[0] = count;
-        });
+        }, null);
     assertEquals(1, seen[0], "清理后仍能正常派发");
     assertArrayEquals(new int[] {1, 64, 1}, dispatched, "清理后解析结果必须正确");
   }

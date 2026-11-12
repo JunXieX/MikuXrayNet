@@ -33,16 +33,10 @@ import org.bukkit.plugin.Plugin;
  * 单方块变更只摘<b>变更的那一个坐标</b>；多方块变更（一个 section）按 section 聚合，一次批量摘除
  * 该 section 的全部变更坐标（见 {@link #processChanges}），该区块其它坐标照常显形。
  *
- * <p><b>为什么走异步通道（而不是同步监听）</b>：
- * <ol>
- *   <li>同步出站监听器会把该包类型登记为「需要主线程」，于是本插件自己用
- *       {@code sendServerPacket(..., filters=false)} 发出的合并包与显形包会被 ProtocolLib 推迟一 tick
- *       并改到主线程发送——合并模块会因此平白多一次主线程写入；异步注册没有这个副作用；</li>
- *   <li>异步链路上的监听器按优先级排定执行顺序，本类优先级最高，正常先于合并模块执行；</li>
- *   <li>即便顺序相反也不会漏：同一条异步链路上每个监听器都会看到同一个变更包，
- *       合并模块的取消只决定「原包最终是否下发」，不影响本类读到坐标。</li>
- * </ol>
- * 本类<b>不</b>登记处理延迟、不取消、不改包，纯观察，因此不会与合并时间窗互相打架。
+ * <p><b>为什么走同步监听（而不是异步通道）</b>：异步注册会把本包<b>扣在异步队列</b>里，而服务端在
+ * 方块变更之后紧跟着下发的 {@code LIGHT_UPDATE} 不受本监听器约束、原样先走——客户端于是「先拿到新光照、
+ * 后拿到新方块」，把刚放/刚挖的那一格按旧方块 + 新光照渲染一帧（真机观感：那一格闪一下）。同步注册在
+ * netty 管线内就地处理，线序不变（见 {@link #start()}）。本类<b>不</b>登记处理延迟、不取消、不改包，纯观察。
  *
  * <p><b>线程与内存纪律</b>：回调里只做「读包内坐标 + 查内存索引」，不读 World 的方块；
  * 注销按「世界名 + 坐标」精确定位，因此不需要扫描全部玩家或全部区块。不检查取消状态：即使原包被
@@ -63,8 +57,6 @@ public final class BlockChangeRevealListener extends PacketAdapter {
 
   private final Plugin plugin;
   private final ProtocolManager protocolManager;
-  private final ObfuscatedChunkIndex obfuscatedChunkIndex;
-  private final RevealedSet revealedSet;
   /** 清单与标记的唯一维护入口（封包线程批量注销走这里，避免两处各自维护同一不变式）。 */
   private final ChunkRevealBook book;
   private final ProximityStats stats;
@@ -76,7 +68,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   /**
    * 最近方块变更日志（可为 {@code null}）：区块包在途期间被改过的格子由它记录，放行后补发。
    *
-   * <p>只记**真实**变更（回显已在 {@link #unregisterCoordinate} 剔除）：回显不改变服务端内容，记进去只会
+   * <p>只记**真实**变更（回显已在 {@link #observeChange} / {@link #processSection} 剔除）：回显不改变服务端内容，记进去只会
    * 让放行后多补发一次同样的状态。
    */
   private final ChunkChangeJournal changeJournal;
@@ -112,12 +104,10 @@ public final class BlockChangeRevealListener extends PacketAdapter {
         PacketType.Play.Server.MULTI_BLOCK_CHANGE);
     this.plugin = plugin;
     this.protocolManager = protocolManager;
-    this.obfuscatedChunkIndex = obfuscatedChunkIndex;
-    this.revealedSet = revealedSet;
     this.stats = stats;
     this.instantRevealer = instantRevealer;
     this.changeJournal = changeJournal;
-    // 必须在本构造器内创建：字段初始化器不能引用构造器赋值的 final 字段
+    // book 直接捕获构造参数（索引/标记集合的可变引用），无需另存字段
     this.book = new ChunkRevealBook(() -> obfuscatedChunkIndex, () -> revealedSet);
   }
 
@@ -224,7 +214,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     int baseZ = section.getZ() << 4;
 
     // 坐标去重由 processChanges/SectionBuffer 统一完成（同一 section 内坐标编码唯一）。
-    // 绝对坐标缓冲从线程本地 scratch 取（netty 线程固定、长生存）：满载包每包最多约 48KB，复用可避免
+    // 绝对坐标缓冲从池化 scratch 取（acquire/release 成对）：满载包每包最多约 48KB，复用可避免
     // 短命大数组；只写满前 positions.length*3 个单元，读取以该长度为准，不残留上一次数据。
     ParseScratch parse = ParseScratch.acquire();
     try {
@@ -245,11 +235,15 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       SectionDispatch dispatch = (changed, changedCount) -> {
         recordChanges(worldName, changed, changedCount);
         if (instantRevealer != null && changedCount > 0) {
-          instantRevealer.onSectionChangeObserved(player, worldName, changed, changedCount);
+          // 投递到玩家线程：onSectionChangeObserved 内部要读 Bukkit.getCurrentTick()，本回调跑在
+          // BlockUndo 后台线程，Folia 上非区域线程读会抛 No currently ticking region（与单方块路径
+          // observeChange 同一处理）。changed 已是独立快照，可安全跨线程持有。
+          Schedulers.onEntity(plugin, player,
+              () -> instantRevealer.onSectionChangeObserved(player, worldName, changed, changedCount));
         }
       };
       // 同上：批量摘除在几十人在线时可能与解码/显形抢锁，必须离开封包线程。
-      // coordinates 来自线程本地复用缓冲，投递前先交出精确长度的独立快照。
+      // coordinates 来自池化复用缓冲，投递前先交出精确长度的独立快照。
       int[] snapshot = java.util.Arrays.copyOf(coordinates, positions.length * 3);
       int count = positions.length;
       submitUndo(() -> processChanges(worldName, snapshot, count, book, stats, dispatch, echoCheck));
@@ -332,10 +326,10 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   }
 
   /**
-   * 去重 scratch（线程本地，复用避免为每个 section 新分配一个 {@code boolean[4096]}）：
+   * 去重 scratch（类静态有界池复用，避免为每个 section 新分配一个 {@code boolean[4096]}）：
    * 用「代次戳数组」而非每次清零的布尔数组——同一 16³ 槽位只记一个 {@code stamp[slot] == generation}
-   * 即视为已见，换一个 section 只递增代次，无需清空 4096 个槽。仅 netty 事件循环线程会用到，
-   * 线程数量少且长生存，因此 ThreadLocal 复用是安全的（每个线程各自持有）。
+   * 即视为已见，换一个 section 只递增代次，无需清空 4096 个槽。acquire/release 成对、单回调独占，
+   * netty 与 BlockUndo 两类线程先后取用同一池实例均安全（见 {@link #releasePooledBuffers()}）。
    */
   private static final class SeenScratch {
 
@@ -382,13 +376,12 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   }
 
   /**
-   * 多方块变更解析的线程本地复用缓冲（netty 事件循环线程固定且长生存）。
+   * 多方块变更解析的池化复用缓冲（类静态有界并发池，acquire/release 成对、单回调独占）。
    *
-   * <p><b>为什么可以复用</b>：本类只在出站回调线程上<b>同步</b>使用——解析一个包期间不会重入（监听器
-   * 自身不发包：显形调度只是 {@code Schedulers.onEntity} 投递，回显判定是纯 map 查询），同一线程的多个
-   * 包串行处理。因此每个线程各持一份即可，省掉每包最多约 48KB（绝对坐标）+ 48KB（section 数据）的
-   * 短命分配。<b>若将来在回调里同步发出会回到本监听器的包，必须先把本缓冲改成不可重入或改用独立缓冲</b>
-   * （否则内层会覆盖外层正在解析的数据）。
+   * <p><b>为什么可以复用</b>：解析一个包期间不会重入（监听器自身不发包：显形调度只是
+   * {@code Schedulers.onEntity} 投递，回显判定是纯 map 查询），同一回调内串行处理。池化省掉每包最多约
+   * 48KB（绝对坐标）+ 48KB（section 数据）的短命分配。<b>若将来在回调里同步发出会回到本监听器的包，
+   * 必须先把本缓冲改成不可重入或改用独立缓冲</b>（否则内层会覆盖外层正在解析的数据）。
    *
    * <p>每次使用只重置「有效区间」的计数（{@code bufferCount} 与各 buffer 的 {@code count}），
    * <b>不清零整段数组</b>：所有读取都以计数为界，残留旧值不会被读到；容量则保留，避免反复扩容拷贝。
@@ -472,38 +465,9 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * 包级可见以便离线单测直接喂跨 section 坐标并注入调度计数桩（{@link SectionDispatch}）。
    *
    * <p><b>不变式</b>：无论索引是否命中，都要把该坐标的已显形标记同步摘除——索引未命中而标记仍在，
-   * 就是会让「整块跳过」提前成立的孤儿标记（见 {@link #unregisterCoordinate}）。
+   * 就是会让「整块跳过」提前成立的孤儿标记（见 {@link #observeChange}）。
    */
-  static void processChanges(String worldName, int[] coordinates, int count,
-      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
-      SectionDispatch dispatch) {
-    processChanges(worldName, coordinates, count, obfuscatedChunkIndex, revealedSet, stats, dispatch,
-        null);
-  }
-
-  /** 生产重载：清单与标记经 {@link ChunkRevealBook} 一次摘除。 */
   static void processChanges(String worldName, int[] coordinates, int count, ChunkRevealBook book,
-      ProximityStats stats, SectionDispatch dispatch, RevealEchoCheck echoCheck) {
-    processChanges(worldName, coordinates, count, null, null, book, stats, dispatch, echoCheck);
-  }
-
-  /**
-   * 同上一重载，追加显形回显判定（{@code null} = 不做区分，保持既有整段批量摘除的快路径）。
-   *
-   * <p>回显坐标必须被排除在摘除之外（见 {@link #unregisterCoordinate}），因此本方法在过滤阶段就地把
-   * 它们从 {@code section} 的有效段里剔除，后续批量摘除只作用于真实变更，既不新增分配也不改变快路径。
-   */
-  static void processChanges(String worldName, int[] coordinates, int count,
-      ObfuscatedChunkIndex obfuscatedChunkIndex, RevealedSet revealedSet, ProximityStats stats,
-      SectionDispatch dispatch, RevealEchoCheck echoCheck) {
-    ChunkRevealBook book = new ChunkRevealBook(() -> obfuscatedChunkIndex, () -> revealedSet);
-    processChanges(worldName, coordinates, count, obfuscatedChunkIndex, revealedSet, book, stats,
-        dispatch, echoCheck);
-  }
-
-  /** 内部实现：{@code book} 非空时走单一入口，否则按传入索引临时包装（仅供旧重载）。 */
-  private static void processChanges(String worldName, int[] coordinates, int count,
-      ObfuscatedChunkIndex ignoredIndex, RevealedSet ignoredRevealed, ChunkRevealBook book,
       ProximityStats stats, SectionDispatch dispatch, RevealEchoCheck echoCheck) {
     if (worldName == null || coordinates == null || count <= 0) {
       return;
@@ -570,14 +534,14 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       section.count = kept;
     }
     // 清单与已显形标记一次摘除：维持「已显形坐标 ⊆ 区块伪装清单」不变式。
-    // 索引未命中也要摘（宁可多摘一次也不能留孤儿标记，见 unregisterCoordinate）。
+    // 索引未命中也要摘（宁可多摘一次也不能留孤儿标记，见 observeChange）。
     int removed = book.removePositions(worldName, section.data, section.count);
     if (removed > 0 && stats != null) {
       stats.unregistered.add(removed);
     }
     if (dispatch != null) {
       // <b>必须交出独立快照</b>：生产实现（{@link ProximityRevealer#onSectionChangeObserved}）会把坐标
-      // 数组交给实体调度器、在玩家线程上延后执行，而 {@link SectionBuffer} 的 data 已改为线程本地复用
+      // 数组交给实体调度器、在玩家线程上延后执行，而 {@link SectionBuffer} 的 data 是池化复用缓冲
       // （见 {@link ParseScratch}）——若直接交出复用数组，下一个包解析时会把仍在排队的坐标覆盖掉，
       // 显形就会发到错误位置。快照按精确长度拷贝，活跃路径每包仍比「不复用」少一次等长数组分配。
       dispatch.dispatch(java.util.Arrays.copyOf(section.data, section.count * 3), section.count);
@@ -601,7 +565,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * （邻域初筛、身边半径、射线、限额、去重）都在 {@link ProximityRevealer#onBlockChangeObserved}
    * 内部完成，未启用时只有一个空引用判断的开销。
    *
-   * <p><b>回显不产生新的观察事件</b>：{@code unregisterCoordinate} 会告诉我们这次变更是不是
+   * <p><b>回显不产生新的观察事件</b>：{@link #isOurRevealEcho} 会告诉我们这次变更是不是
    * 「本插件刚为该玩家发出的显形回显」。回显只代表服务端把玩家本就该看到的真实方块发了一遍，
    * 服务端内容没有任何变化，因此<b>不应</b>再触发一次事件显形——否则每发一个单方块显形包都会：
    * ① 在 netty 线程上白扫一遍变更点的曼哈顿邻域（默认半径 4 共 129 个偏移）；
@@ -619,7 +583,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
     // 1.1.6 起显形包走 Paper 原生通道（sendMultiBlockChange / sendBlockChange），因此本监听器
     // 也会看到「我们自己发出的显形回显」。回显不改变服务端内容，必须与真实变更区别对待
-    // （见 unregisterCoordinate）；磁盘缓存方面两者都不需要作废任何条目——条目有效性由负载里的
+    // （见 isOurRevealEcho）；磁盘缓存方面两者都不需要作废任何条目——条目有效性由负载里的
     // 原始区块字节指纹判定（见 DiskCacheStore 类注释），回显不改变区块字节。
     // 回显判定留在封包线程（只是一次并发 map 查/删），真实变更的注销投递到后台：
     // 摘索引与清标记会与解码 / 显形抢锁，留在封包线程上会把方块包压到光照包之后（见 undoExecutor 说明）。

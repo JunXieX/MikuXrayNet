@@ -45,9 +45,9 @@ import org.bukkit.plugin.Plugin;
  * 「服务端真正改了并让客户端知道」的全部来源（玩家挖掘 / 放置、爆炸、其它插件与命令方的编辑），
  * 而 Bukkit 的事件族（Break/Place/Explode/…）覆盖不全（例如 {@code /setblock} 与多数插件编辑）。
  *
- * <p><b>为什么走异步通道</b>：与 {@link BlockChangeRevealListener} 同理——同步注册会把该包类型标记为
- * 「需要主线程」，本插件自己发出的合并包 / 显形包会被推迟一 tick 并改到主线程发送；异步注册没有这个
- * 副作用。本类<b>不取消、不改包</b>，纯观察，因此与合并模块的时间窗互不干扰。
+ * <p><b>为什么走同步监听</b>：与 {@link BlockChangeRevealListener} 同理——异步注册会把本包扣在异步队列里，
+ * 而紧随其后的 {@code LIGHT_UPDATE} 原样先走，客户端会按「旧方块 + 新光照」渲染一帧。同步注册在 netty
+ * 管线内就地处理，线序不变（见 {@link #start()}）。本类<b>不取消、不改包</b>，纯观察。
  *
  * <p><b>线程纪律</b>：回调运行在封包（netty）线程上，只做「读包内坐标 + 读新方块口径 + 写内存位图」，
  * <b>不读 World 的方块</b>。写入走 {@link OcclusionStore} 的写锁（与解码 / 缓存命中路径共用），

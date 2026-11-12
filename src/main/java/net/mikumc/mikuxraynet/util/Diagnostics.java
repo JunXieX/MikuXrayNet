@@ -770,41 +770,21 @@ public final class Diagnostics {
     return samples.isEmpty() ? 0 : sum / (double) samples.size();
   }
 
-  public String dumpText(String timestamp) {
-    return dumpText(timestamp, List.of(), 0L, false);
-  }
-
-  /** 带 10 秒采样的转储文本（采样段插在状态面板之后、运行环境之前）。 */
-  public String dumpText(String timestamp, List<Sample> samples, long durationMillis,
-      boolean reloadDuring) {
-    return dumpText(timestamp, samples, durationMillis, reloadDuring, runtimeSection());
-  }
-
-  /** 同上，但运行环境段由调用方在主线程预先采集（异步线程读 Bukkit 指标会失败）。 */
+  /** 转储文本（采样段插在状态面板之后、运行环境之前）；运行环境段由调用方在主线程预先采集。 */
   public String dumpText(String timestamp, List<Sample> samples, long durationMillis,
       boolean reloadDuring, String runtimeSection) {
     return formatDump(snapshot(), timestamp) + formatSamples(samples, durationMillis, reloadDuring)
         + runtimeSection;
   }
 
-  /** 生成并写入转储文件，返回文件对象（目录不存在会自动创建；超出保留上限时清理最旧的转储）。 */
-  public File writeDump() throws IOException {
-    return writeDump(List.of(), 0L, false);
-  }
-
   /**
-   * 写入带采样段的转储文件。
+   * 写入带采样段的转储文件，返回文件对象（目录不存在会自动创建；超出保留上限时清理最旧的转储）。
+   * 运行环境段由调用方在主线程预先采集（异步线程读 Bukkit 指标会失败）。
    *
    * @param samples        采样点（至少 2 个才有增量；不足时报告里会注明）
    * @param durationMillis 采样窗口（毫秒）
    * @param reloadDuring   窗口内是否发生过热重载（计数被重置时用于解释）
    */
-  public File writeDump(List<Sample> samples, long durationMillis, boolean reloadDuring)
-      throws IOException {
-    return writeDump(samples, durationMillis, reloadDuring, runtimeSection());
-  }
-
-  /** 同上，但运行环境段由调用方在主线程预先采集。 */
   public File writeDump(List<Sample> samples, long durationMillis, boolean reloadDuring,
       String runtimeSection) throws IOException {
     String stamp = LocalDateTime.now().format(FILE_STAMP);
@@ -1232,9 +1212,7 @@ public final class Diagnostics {
 
   /**
    * 插件版本号（纯读取，绝不抛异常）：状态面板第一行回显，供「同一份日志到底是哪个构建」对照。
-   *
-   * <p>优先走 Paper 的 {@code getPluginMeta()}；纯 Bukkit/Spigot 核心没有该方法，回落到已废弃但仍
-   * 处处可用的 {@code getDescription()}。两处都失败时返回空串（面板不显示版本，绝不因此报错）。
+   * 读取失败时返回空串（面板不显示版本，绝不因此报错）。本项目只支持 Paper 系，与主类同口径。
    */
   private static String pluginVersion(MikuXrayNet plugin) {
     if (plugin == null) {
@@ -1242,11 +1220,6 @@ public final class Diagnostics {
     }
     try {
       return plugin.getPluginMeta().getVersion();
-    } catch (Throwable ignored) {
-      // 非 Paper 核心：走传统描述
-    }
-    try {
-      return plugin.getDescription().getVersion();
     } catch (Throwable ignored) {
       return "";
     }

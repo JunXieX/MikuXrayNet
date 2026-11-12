@@ -82,7 +82,7 @@ class RevealedSetTest {
     revealed.markIfAbsent(PLAYER, key, 2, 64, 1);
     revealed.markIfAbsent(OTHER_PLAYER, key, 1, 64, 1);
 
-    revealed.removePosition(WORLD, 1, 64, 1);
+    revealed.removePositions(WORLD, new int[] {1, 64, 1}, 1);
 
     assertFalse(revealed.contains(PLAYER, key, 1, 64, 1), "命中即注销");
     assertFalse(revealed.contains(OTHER_PLAYER, key, 1, 64, 1), "所有玩家同一坐标都要注销（维持子集不变式）");
@@ -281,7 +281,7 @@ class RevealedSetTest {
     assertEquals(count, revealed.sizeFor(PLAYER, key), "扩容后不得丢条目");
 
     for (int i = 0; i < count; i += 2) {
-      revealed.removePosition(WORLD, i & 15, i >> 4, i % 7);
+      revealed.removePositions(WORLD, new int[] {i & 15, i >> 4, i % 7}, 1);
     }
     assertEquals(count / 2, revealed.sizeFor(PLAYER, key), "注销后计数必须精确");
     assertEquals(count / 2, revealed.positionCount());
@@ -447,7 +447,7 @@ class RevealedSetTest {
           try {
             for (int i = 0; i < perThread; i++) {
               int v = base + i;
-              revealed.removePosition(WORLD, (v & 31) - 16, (v >> 10) & 255, (v >> 5 & 31) - 16);
+              revealed.removePositions(WORLD, new int[] {(v & 31) - 16, (v >> 10) & 255, (v >> 5 & 31) - 16}, 1);
             }
           } catch (Throwable throwable) {
             failure.compareAndSet(null, throwable);

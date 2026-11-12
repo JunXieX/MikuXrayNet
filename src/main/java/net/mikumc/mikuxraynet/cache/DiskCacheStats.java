@@ -30,10 +30,10 @@ public final class DiskCacheStats {
    */
   public final LongAdder configMismatchRemoved = new LongAdder();
 
-  /** 因总条目上限或负载过大被拒绝的写入数。 */
+  /** 因总条目上限被拒绝的写入数。 */
   public final LongAdder rejectedByCapacity = new LongAdder();
 
-  /** 因单文件大小上限被拒绝的写入数。 */
+  /** 因单文件大小上限或单条负载过大被拒绝的写入数。 */
   public final LongAdder rejectedBySize = new LongAdder();
 
   /**

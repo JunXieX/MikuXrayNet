@@ -33,7 +33,7 @@ class ProximityScannerTest {
   private final long[] clock = {0L};
 
   private ObfuscatedChunkIndex index() {
-    return new ObfuscatedChunkIndex(1_000_000, 300 * SECOND_NANOS, () -> clock[0]);
+    return new ObfuscatedChunkIndex(1_000_000, () -> clock[0]);
   }
 
   private RevealedSet revealed() {
@@ -195,7 +195,7 @@ class ProximityScannerTest {
   @Test
   void skippedChunkKeepsItsMarkerFreshAgainstExpiry() {
     long window = 10 * SECOND_NANOS;
-    ObfuscatedChunkIndex index = new ObfuscatedChunkIndex(1_000_000, 300 * SECOND_NANOS, () -> clock[0]);
+    ObfuscatedChunkIndex index = new ObfuscatedChunkIndex(1_000_000, () -> clock[0]);
     RevealedSet revealed = new RevealedSet(1_000_000, window, () -> clock[0]);
     index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
 
@@ -235,8 +235,8 @@ class ProximityScannerTest {
     assertEquals(index.entry(key).size(), revealed.sizeFor(PLAYER, key), "开始前必须整块显形");
 
     // 维护点①：BlockChangeRevealListener 的真实顺序（命中才摘除，两者同步）
-    assertTrue(index.removePosition(WORLD, 1, 64, 1));
-    revealed.removePosition(WORLD, 1, 64, 1);
+    assertEquals(1, index.removePositions(WORLD, new int[] {1, 64, 1}, 1));
+    revealed.removePositions(WORLD, new int[] {1, 64, 1}, 1);
     assertEquals(index.entry(key).size(), revealed.sizeFor(PLAYER, key));
 
     // 维护点②：ProtocolLibAsyncListener#writeBack 的真实顺序（先 recordChunk，再 clearChunk）

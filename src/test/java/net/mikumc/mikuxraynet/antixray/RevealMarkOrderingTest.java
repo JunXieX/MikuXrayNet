@@ -31,9 +31,10 @@ class RevealMarkOrderingTest {
 
   private final long[] clock = {0L};
   private final ObfuscatedChunkIndex index =
-      new ObfuscatedChunkIndex(1_000_000, 300 * SECOND_NANOS, () -> clock[0]);
+      new ObfuscatedChunkIndex(1_000_000, () -> clock[0]);
   private final RevealedSet revealed =
       new RevealedSet(1_000_000, 300 * SECOND_NANOS, () -> clock[0]);
+  private final ChunkRevealBook book = new ChunkRevealBook(() -> index, () -> revealed);
   private final ProximityRevealer revealer = new ProximityRevealer(null, config(), index,
       revealed, new ProximityStats(), null, null, null);
 
@@ -91,7 +92,7 @@ class RevealMarkOrderingTest {
 
     int[] coordinates = {1, 64, 1, 2, 64, 1};
     // 坐标 (1,64,1) 判为回显（本插件刚发给该玩家的显形），(2,64,1) 是真实变更
-    BlockChangeRevealListener.processChanges(WORLD, coordinates, 2, index, revealed,
+    BlockChangeRevealListener.processChanges(WORLD, coordinates, 2, book,
         new ProximityStats(), null, (world, x, y, z) -> x == 1);
 
     assertEquals(1, index.entry(chunk).size(),
@@ -110,7 +111,7 @@ class RevealMarkOrderingTest {
     ChunkKey chunk = ChunkKey.ofBlock(WORLD, 3, 3);
     revealed.markIfAbsent(PLAYER, chunk, 3, 64, 3);
 
-    BlockChangeRevealListener.processChanges(WORLD, new int[] {3, 64, 3}, 1, index, revealed,
+    BlockChangeRevealListener.processChanges(WORLD, new int[] {3, 64, 3}, 1, book,
         new ProximityStats(), null, (world, x, y, z) -> true);
 
     assertEquals(1, index.entry(chunk).size(), "整段回显不得摘除共享索引");
@@ -129,8 +130,8 @@ class RevealMarkOrderingTest {
 
     boolean sent = revealer.markThenSend(PLAYER, WORLD, 1, 64, 1, () -> {
       // 模拟出站监听器（异步）处理我们刚发出的显形包：同步摘除伪装清单与已显形标记
-      index.removePosition(WORLD, 1, 64, 1);
-      revealed.removePosition(WORLD, 1, 64, 1);
+      index.removePositions(WORLD, new int[] {1, 64, 1}, 1);
+      revealed.removePositions(WORLD, new int[] {1, 64, 1}, 1);
       return true;
     });
 
@@ -280,12 +281,12 @@ class RevealMarkOrderingTest {
     index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {local(1, 64, 1), local(2, 64, 1)});
     int[] dispatched = {0};
 
-    BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1}, 1, index, revealed,
+    BlockChangeRevealListener.processChanges(WORLD, new int[] {1, 64, 1}, 1, book,
         new ProximityStats(), (coordinates, count) -> dispatched[0]++,
         (world, x, y, z) -> true);
     assertEquals(0, dispatched[0], "回显不得触发事件即时显形");
 
-    BlockChangeRevealListener.processChanges(WORLD, new int[] {2, 64, 1}, 1, index, revealed,
+    BlockChangeRevealListener.processChanges(WORLD, new int[] {2, 64, 1}, 1, book,
         new ProximityStats(), (coordinates, count) -> dispatched[0]++,
         (world, x, y, z) -> false);
     assertEquals(1, dispatched[0], "真实变更必须照常派发邻域显形（不得把正常观察一起过滤掉）");

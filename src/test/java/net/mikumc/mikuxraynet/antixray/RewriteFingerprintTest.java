@@ -9,11 +9,10 @@ import org.junit.jupiter.api.Test;
  */
 class RewriteFingerprintTest {
 
-  /** 历史公式的独立复刻：用于证明重构没有改变任何一条既有缓存键。 */
-  private static int legacy(int configHash, boolean removeBlockEntities, int paletteFingerprint,
-      long neighborHash, boolean hasNeighbors) {
-    int base = configHash * 31 + (removeBlockEntities ? 1 : 0);
-    base = base * 31 + paletteFingerprint;
+  /** 公式的独立复刻：用于证明组合逻辑没有改变任何一条既有缓存键。 */
+  private static int legacy(int configHash, int paletteFingerprint, long neighborHash,
+      boolean hasNeighbors) {
+    int base = configHash * 31 + paletteFingerprint;
     if (!hasNeighbors) {
       return base;
     }
@@ -28,13 +27,11 @@ class RewriteFingerprintTest {
     for (int config : configs) {
       for (int palette : palettes) {
         for (long neighbor : neighbors) {
-          for (boolean remove : new boolean[] {false, true}) {
-            for (boolean has : new boolean[] {false, true}) {
-              assertEquals(legacy(config, remove, palette, neighbor, has),
-                  RewriteFingerprint.of(config, remove, palette, neighbor, has),
-                  "config=" + config + " palette=" + palette + " neighbor=" + neighbor
-                      + " remove=" + remove + " has=" + has);
-            }
+          for (boolean has : new boolean[] {false, true}) {
+            assertEquals(legacy(config, palette, neighbor, has),
+                RewriteFingerprint.of(config, palette, neighbor, has),
+                "config=" + config + " palette=" + palette + " neighbor=" + neighbor
+                    + " has=" + has);
           }
         }
       }
@@ -43,19 +40,18 @@ class RewriteFingerprintTest {
 
   @Test
   void neighborHashIgnoredWhenNotConsulted() {
-    int a = RewriteFingerprint.of(7, true, 2, 0L, false);
-    int b = RewriteFingerprint.of(7, true, 2, 123456L, false);
+    int a = RewriteFingerprint.of(7, 2, 0L, false);
+    int b = RewriteFingerprint.of(7, 2, 123456L, false);
     assertEquals(a, b);
-    assertEquals(RewriteFingerprint.of(7, true, 2), a);
+    assertEquals(RewriteFingerprint.of(7, 2), a);
   }
 
   @Test
   void everyInputChangesTheFingerprint() {
-    int base = RewriteFingerprint.of(1, false, 0);
-    assertNotEqualsFingerprint(base, RewriteFingerprint.of(2, false, 0));
-    assertNotEqualsFingerprint(base, RewriteFingerprint.of(1, true, 0));
-    assertNotEqualsFingerprint(base, RewriteFingerprint.of(1, false, 1));
-    assertNotEqualsFingerprint(base, RewriteFingerprint.of(1, false, 0, 42L, true));
+    int base = RewriteFingerprint.of(1, 0);
+    assertNotEqualsFingerprint(base, RewriteFingerprint.of(2, 0));
+    assertNotEqualsFingerprint(base, RewriteFingerprint.of(1, 1));
+    assertNotEqualsFingerprint(base, RewriteFingerprint.of(1, 0, 42L, true));
   }
 
   private static void assertNotEqualsFingerprint(int expected, int actual) {

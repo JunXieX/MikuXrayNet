@@ -4,7 +4,6 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.LongSupplier;
@@ -18,10 +17,10 @@ import java.util.function.LongSupplier;
  * 也只占 1 份。
  *
  * <p><b>失效时机</b>：① 世界卸载（{@link #invalidateWorld}）；② 区块卸载（{@link #invalidateChunk}，
- * 由 {@code ChunkUnloadEvent} 驱动，<b>这是唯一的回收路径</b>——{@link #expire} 仍保留但生产路径
- * 已不再调用，见其说明）；③ 该区块观测到方块变更
- * （{@link #removePosition}，出站方块变更封包路径，只摘除变更的那一个坐标，与既有行为一致）；
- * ④ 区块被重新下发（{@link #recordChunkWithRemovals} 直接覆盖该区块条目）。
+ * 由 {@code ChunkUnloadEvent} 驱动，<b>这是唯一的回收路径</b>——索引不再按时间过期，玩家走远又折返时
+ * 清单仍在，矿照常显形）；③ 该区块观测到方块变更
+ * （{@link #removePositions}，出站方块变更封包路径，摘除变更的坐标，与既有行为一致）；
+ * ④ 区块被重新下发（{@link #recordChunkWithRemovals} 直接覆盖该区块条目）；⑤ 容量安全阀整体淘汰（{@link #mayEvict}）。
  *
  * <p><b>共享索引的影响面（既有设计，非 bug）</b>：本索引按区块共享一份，而「方块变更 → 摘除该坐标」
  * 也发生在这一份上。因此<b>显形即摘除对其它玩家也有影响</b>——玩家 A 挖开某矿（或邻近显形把某坐标
@@ -42,7 +41,7 @@ public final class ObfuscatedChunkIndex {
   public record Position(int x, int y, int z) {
   }
 
-  /** 单个区块的伪装坐标清单：坐标不可变，活跃时间可变（扫描时刷新，供过期兜底）。 */
+  /** 单个区块的伪装坐标清单：坐标不可变，活跃时间可变（扫描时刷新，供容量安全阀「最旧优先」淘汰）。 */
   static final class ChunkEntry {
 
     private final int minHeight;
@@ -97,21 +96,19 @@ public final class ObfuscatedChunkIndex {
   private final LongAdder invalidatedChunks = new LongAdder();
 
   private final int maxPositions;
-  private final long expireNanos;
   private final LongSupplier clock;
 
   /**
    * @param maxPositions 全服伪装坐标总量上限（<b>安全阀</b>：正常运营下应为 0 触发，见类注释）
-   * @param expireSeconds 条目过期秒数（区块卸载未触发时的兜底）
+   * @param expireSeconds 保留参数（索引只随区块卸载清理，不再按时间过期；见类注释「失效时机」）
    */
   public ObfuscatedChunkIndex(int maxPositions, int expireSeconds) {
-    this(maxPositions, TimeUnit.SECONDS.toNanos(Math.max(1L, expireSeconds)), System::nanoTime);
+    this(maxPositions, System::nanoTime);
   }
 
-  /** 测试用构造：可注入时钟与纳秒级过期时间。 */
-  ObfuscatedChunkIndex(int maxPositions, long expireNanos, LongSupplier clock) {
+  /** 测试用构造：可注入时钟（活跃时间用于安全阀「最旧优先」淘汰）。 */
+  ObfuscatedChunkIndex(int maxPositions, LongSupplier clock) {
     this.maxPositions = Math.max(1, maxPositions);
-    this.expireNanos = Math.max(1L, expireNanos);
     this.clock = clock;
   }
 
@@ -302,56 +299,14 @@ public final class ObfuscatedChunkIndex {
   }
 
   /**
-   * 注销一个坐标（服务端自行下发了该坐标的方块变更时调用）。
-   *
-   * <p>只从「该坐标所属区块」的清单里摘除这一个坐标，其它坐标不受影响；清单被摘空时整条移除。
-   *
-   * @return 是否命中并注销
-   */
-  public boolean removePosition(String worldName, int x, int y, int z) {
-    if (worldName == null) {
-      return false;
-    }
-    ChunkKey key = ChunkKey.ofBlock(worldName, x, z);
-    boolean[] hit = {false};
-    chunks.computeIfPresent(key, (ignored, entry) -> {
-      int local = ((y - entry.minHeight()) << 8) | ((z & 15) << 4) | (x & 15);
-      int[] locals = entry.locals();
-      // 二分查找依赖「locals 严格升序」不变式，该不变式已在写入路径核实成立：
-      // 唯一的生产写入方 ObfuscationProcessor#rewrite 按「section 升序 → 段内 index 升序」逐个登记，
-      // 编码 {@code 相对Y << 8 | z << 4 | x} 随遍历严格递增；摘除一个元素（保持其余相对顺序）
-      // 与重新 recordChunk（整表替换）都不破坏有序性。原线性查找 O(n) 改为二分 O(log n)。
-      // 注意：recordChunkWithRemovals 是公开 API、不校验顺序——若有外部调用方传入无序数组，二分可能漏摘
-      // （返回 false，即「未命中」），本项目内不存在这样的调用方。
-      int found = Arrays.binarySearch(locals, local);
-      if (found < 0) {
-        return entry;
-      }
-      hit[0] = true;
-      subtract(totalPositions, 1);
-      if (locals.length == 1) {
-        // 清单被摘空 → 条目整体消失：与卸载同口径计入「摘除区块数」，否则
-        // 「累计登记 − 摘除」会与当前驻留对不上（诊断面板的三个数加不起来）。
-        invalidatedChunks.increment();
-        return null;
-      }
-      int[] reduced = new int[locals.length - 1];
-      System.arraycopy(locals, 0, reduced, 0, found);
-      System.arraycopy(locals, found + 1, reduced, found, locals.length - found - 1);
-      return new ChunkEntry(entry.minHeight(), reduced, entry.updatedAtNanos());
-    });
-    return hit[0];
-  }
-
-  /**
    * 批量注销<b>同一区块</b>内的多个坐标（出站多方块变更包路径，一个 section 只调用一次）。
    *
-   * <p><b>为什么需要它</b>：{@link #removePosition} 每摘一个坐标都要二分定位后把整个 {@code locals}
+   * <p><b>为什么需要它</b>：逐坐标摘除每摘一个都要二分定位后把整个 {@code locals}
    * 数组整段复制一次；一个 section 最多 4096 个坐标时会退化成 {@code O(k·n)} 的元素拷贝（最坏千万级）。
    * 这里把同一区块的一批坐标合并成「一次定位 + 一次重建」：先用二分在原始数组里标出全部命中位置，
    * 再一次性重建，净成本从 {@code O(k·n)} 降到 {@code O(n + k·log n)}。
    *
-   * <p>与 {@link #removePosition} 语义一致：只摘传入坐标，其它坐标不受影响；清单被摘空时整条移除。
+   * <p>只摘传入坐标，其它坐标不受影响；清单被摘空时整条移除。
    * 传入坐标允许重复（重复项只计一次命中）。
    *
    * @param coordinates 绝对坐标三元组（{@code x,y,z} 连续存放）；调用方保证它们同属一个区块
@@ -404,7 +359,7 @@ public final class ObfuscatedChunkIndex {
    * 查询一个绝对方块坐标当前是否仍在伪装清单里（只读，不修改任何状态）。
    *
    * <p>供事件驱动即时显形的触发判定使用：出站方块变更包的解析线程会调用本方法做
-   * 「邻域内是否还有伪装坐标」的初筛，因此实现必须是线程安全的纯读（与 {@link #removePosition}
+   * 「邻域内是否还有伪装坐标」的初筛，因此实现必须是线程安全的纯读（与 {@link #removePositions}
    * 使用同一套编码与查找逻辑）。
    */
   public boolean containsPosition(String worldName, int x, int y, int z) {
@@ -476,38 +431,7 @@ public final class ObfuscatedChunkIndex {
     }
   }
 
-  /**
-   * 清理超过过期时间的条目。
-   *
-   * <p><b>生产路径已不再调用</b>（玩家体验优先）：时间过期会让「玩家走远超过 expire-seconds 又折返」
-   * 的区块在未重新下发时丢失伪装清单，那些矿从此不再显形、玩家一直看到假方块；而玩家折返是极常见的
-   * 操作。改为<b>只随区块卸载清理</b>（{@code AntiXrayRuntime#invalidateChunk}）：区块卸载本就意味着
-   * 附近无玩家，驻留量因此 ≈ 已加载且被改写过的区块数，内存仍有界。
-   *
-   * <p>本方法保留给单测与「需要主动收敛」的极端场景使用。
-   */
-  public void expire() {
-    expire(clock.getAsLong());
-  }
-
-  /**
-   * 清理超过过期时间的条目。
-   *
-   * @param nowNanos 当前时刻（纳秒），必须与构造索引时的时钟同一来源
-   */
-  public void expire(long nowNanos) {
-    for (Map.Entry<ChunkKey, ChunkEntry> entry : chunks.entrySet()) {
-      ChunkEntry value = entry.getValue();
-      if (nowNanos - value.updatedAtNanos() <= expireNanos) {
-        continue;
-      }
-      if (chunks.remove(entry.getKey(), value)) {
-        subtract(totalPositions, value.size());
-      }
-    }
-  }
-
-  /** 清空全部条目（插件停用 / 热重载时调用，不留副作用）。 */
+  /** 清空全部条目（插件停用时调用，不留副作用）。 */
   public void clear() {
     chunks.clear();
     totalPositions.set(0);

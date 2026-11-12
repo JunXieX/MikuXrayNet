@@ -8,7 +8,8 @@ package net.mikumc.mikuxraynet.occlusion;
  *
  * <p><b>三态表示</b>（由 {@link OcclusionStore} 决定存哪一种）：
  * <ul>
- *   <li>{@code null}（表里没有该 section）——按「不遮挡」处理（fail-open：宁可少藏，绝不误藏）；</li>
+ *   <li>{@code null}（表里没有该 section）＝缺数据：实体射线按「不遮挡」处理（fail-open，少藏），
+ *       显形侧按「遮挡」处理（严格，不显形）——两方向刻意相反，见 DEVELOPMENT 不变量 #4；</li>
  *   <li>{@link BitmapOcclusion}——一般的逐格位图；</li>
  *   <li>{@link SolidOcclusion}——整段全遮挡（实心段）的快路径，省下 512 字节位图。</li>
  * </ul>
@@ -20,9 +21,6 @@ public interface SectionOcclusion {
 
   /** 局部坐标掩码（16 − 1）。 */
   int LOCAL_MASK = 15;
-
-  /** section 边长。 */
-  int SECTION_SIZE = 16;
 
   /**
    * 局部坐标 {@code (x, y, z)} 处的方块是否遮挡（三者取值均须在 {@code [0, 15]}）。
