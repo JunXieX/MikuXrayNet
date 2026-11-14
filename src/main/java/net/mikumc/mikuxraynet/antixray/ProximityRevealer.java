@@ -658,6 +658,7 @@ public final class ProximityRevealer implements Listener {
     instantQuota.clear(event.getPlayer().getUniqueId());
     chunkDeliveryQuota.clear(event.getPlayer().getUniqueId());
     digMarks.remove(event.getPlayer().getUniqueId());
+    nearRetryMarks.remove(event.getPlayer().getUniqueId());
     ownChanges.remove(event.getPlayer().getUniqueId());
     viewChangeQuota.clear(event.getPlayer().getUniqueId());
     viewMarks.remove(event.getPlayer().getUniqueId());
