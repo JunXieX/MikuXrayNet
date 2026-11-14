@@ -224,4 +224,22 @@ class ChunkSectionDirectWidthTest {
       assertArrayEquals(raw, chunk.finalizeOutput(), "混合声明位宽必须逐字节往返一致");
     }
   }
+
+  /** 位宽 31/32 的 contains 上界必须按 long 计算（int 下 1<<31 溢出成负数会误判全部放不下）。 */
+  @Test
+  void directContainsHandlesWideDeclaredWidths() {
+    ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+    for (int bits : new int[] {30, 31, 32}) {
+      int[] states = states(3);
+      byte[] raw = new TestChunkBuilder(MODERN)
+          .directSection(bits, 4096, 0, states, 0, new int[] {7})
+          .build();
+      try (Chunk chunk = codec.decode(raw, 1)) {
+        ChunkSection section = chunk.getSection(0);
+        assertEquals(true, section.paletteContains(0), "bits=" + bits + "：0 必定可表示");
+        assertEquals(true, section.paletteContains(32000), "bits=" + bits + "：32000 必定可表示");
+        assertEquals(false, section.paletteContains(-1), "bits=" + bits + "：负数不可表示");
+      }
+    }
+  }
 }

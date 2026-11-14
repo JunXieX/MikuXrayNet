@@ -50,9 +50,14 @@ public class DirectPalette implements Palette {
     return 0;
   }
 
-  /** 本表示能否容纳该状态 id（{@code 0..2^声明位宽-1}）：放不下就会被位打包掩码截断，必须判 false。 */
+  /**
+   * 本表示能否容纳该状态 id（{@code 0..2^声明位宽-1}）：放不下就会被位打包掩码截断，必须判 false。
+   *
+   * <p>上界必须用 {@code long} 算：位宽 31 时 {@code 1 << 31} 在 int 下溢出成负数，
+   * 会让所有正数都判成「放不下」；位宽 32 时同理。{@code 1L << 32} 恒大于任何 int，无需特判。
+   */
   @Override
   public boolean contains(int value) {
-    return value >= 0 && (bitsPerBlock >= 32 || value < (1 << bitsPerBlock));
+    return value >= 0 && value < (1L << bitsPerBlock);
   }
 }

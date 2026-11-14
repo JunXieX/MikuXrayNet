@@ -483,7 +483,12 @@ public class ChunkSection {
     return this.palette.size();
   }
 
-  /** 调色板是否已包含某方块状态（预算筛选「替换方块是否已在调色板内」用；直接调色板恒 true）。 */
+  /**
+   * 调色板能否容纳某方块状态（预算筛选「替换方块是否写得进本段」用）。
+   *
+   * <p>间接调色板：已在本段条目表内才返回 true（写进去不升位）。
+   * 直接调色板：按<b>声明位宽</b>判断能否表示（写不进就会被位打包掩码截断，见 {@link DirectPalette}）。
+   */
   public boolean paletteContains(int stateId) {
     return this.palette.contains(stateId);
   }
