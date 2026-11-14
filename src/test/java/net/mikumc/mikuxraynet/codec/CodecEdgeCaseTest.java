@@ -146,25 +146,37 @@ class CodecEdgeCaseTest {
   }
 
   /**
-   * 直接（direct/global）格式的声明位宽若不等于注册表位宽，必须显式拒绝（交由上层 fail-open），
-   * 不得按注册表位宽重新解释。
+   * 直接（direct/global）格式的声明位宽<b>不必等于</b>注册表位宽：9..32 都是合法编码，必须按声明值解包。
    *
-   * <p>位打包是按<b>声明的位宽</b>写出的：客户端按声明值解包（{@code Configuration.Global(bitsInMemory,
-   * bitsInStorage)}——存储位宽取声明值，读完再重排到内存位宽）。声明 9..14 或 &gt;15 时若按注册表位宽 15
-   * 重解释，同一段字节会被读出错值、多读/少读若干 long，把后续（群系容器 / 下一个 section）字节吞进
-   * 方块数据——1.21.5+ 没有 long 数组长度字段可校验，错位无内建校验能兜住，最坏整块按垃圾字节重编码。
+   * <p>一手取证（Paper 26.3 字节码）：{@code Strategy#getConfigurationForBitCount(bits)} 对 {@code bits>8}
+   * 构造 {@code Configuration.Global(globalPaletteBitsInMemory, bits)}——存储位宽取声明值；出站声明位宽由
+   * {@code PalettedContainer#pack} 按调色板规模选择。上界 32 来自 {@code SimpleBitStorage} 的
+   * {@code Validate.inclusiveBetween(1, 32, bits)}，超出即损坏数据。
+   *
+   * <p>本用例原先断言「≠15 一律拒绝」，那会把服务端合法下发的 16 位 section 判为非法 → 整块 fail-open →
+   * 该区块全部 section 都不伪装（真机 dump 实测）。现按取证结论改为「合法区间接受 + 超界拒绝」。
    */
   @Test
-  void directSectionWithWrongBitWidthIsRejected() {
+  void directSectionDeclaredWidthIsHonoredAndOnlyOutOfRangeRejected() {
     int[] blockStates = new int[4096];
-    for (int bits : new int[] {9, 12, 14, 16, 64}) {
+    ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+
+    for (int bits : new int[] {9, 12, 14, 16, 32}) {
       byte[] raw = new TestChunkBuilder(MODERN)
           .directSection(bits, 0, 0, blockStates, 0, new int[] {1})
           .build();
+      try (Chunk chunk = codec.decode(raw, 1)) {
+        assertEquals(bits, chunk.getSection(0).bitsPerBlock(),
+            "声明位宽 " + bits + " 合法，必须原值保留而不是按注册表位宽 15 重解释");
+      }
+    }
 
-      ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+    for (int bits : new int[] {33, 64}) {
+      byte[] raw = new TestChunkBuilder(MODERN)
+          .directSection(bits, 0, 0, blockStates, 0, new int[] {1})
+          .build();
       assertThrows(IllegalArgumentException.class, () -> codec.decode(raw, 1),
-          "直接格式声明位宽 " + bits + " ≠ 注册表位宽 15，必须显式拒绝而不是按 15 位重解释");
+          "位宽 " + bits + " 超出 SimpleBitStorage 上界 32，属损坏数据，必须显式拒绝");
     }
   }
 

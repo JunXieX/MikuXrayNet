@@ -6,8 +6,9 @@ import io.netty.buffer.ByteBuf;
 /**
  * 直接（direct）调色板：数据里存的就是方块状态 id 本身，没有调色板段。
  *
- * <p>关键约束：读写均为空操作，因此重编码不会输出调色板；位宽由注册表决定，不含调色板意味着
- * 位打包数据必须按注册表位宽解释。
+ * <p>关键约束：读写均为空操作，因此重编码不会输出调色板；不含调色板意味着位打包数据里存的就是状态 id，
+ * 必须按 {@link ChunkSection#bitsPerBlock()} 的<b>声明位宽</b>解释——读取时保留服务端声明值（9..32），
+ * 只有本插件升位时才取注册表位宽。
  */
 public class DirectPalette implements Palette {
 
@@ -35,7 +36,7 @@ public class DirectPalette implements Palette {
     return 0;
   }
 
-  /** 直接调色板的位宽即注册表位宽、不存在「塞不下新状态」，预算筛选对它恒放行。 */
+  /** 直接调色板按声明位宽可容纳全部状态 id、不存在「塞不下新状态」，预算筛选对它恒放行。 */
   @Override
   public boolean contains(int value) {
     return true;
