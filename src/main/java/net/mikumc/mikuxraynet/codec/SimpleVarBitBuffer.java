@@ -69,6 +69,11 @@ public class SimpleVarBitBuffer implements VarBitBuffer {
    * @param buffer 长度必须等于 {@link #calculateArraySize(int, int)}：长度会参与写出与读取校验
    */
   SimpleVarBitBuffer(int bitsPerEntry, int size, long[] buffer) {
+    // 位宽越界必须显式拒绝：64/bitsPerEntry 在 65..127 上先算出 0，随后「乘魔数」分支按 0 取模
+    // 直接抛 ArithmeticException（信息量为零，且看起来像数据损坏而不是配置/代码错误）。
+    if (bitsPerEntry < 1 || bitsPerEntry > 64) {
+      throw new IllegalArgumentException("bitsPerEntry 必须在 1..64，实际 " + bitsPerEntry);
+    }
     this.bitsPerEntry = bitsPerEntry;
     this.entriesPerLong = 64 / bitsPerEntry;
     // bitsPerEntry == 64 时 (1L << 64) 是未定义行为（Java 移位按 64 取模，等价于 1L << 0，

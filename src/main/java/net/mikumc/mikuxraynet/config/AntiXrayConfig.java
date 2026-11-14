@@ -1105,10 +1105,12 @@ public final class AntiXrayConfig {
                 "proximity.interval-ticks", floorAdjustments, ceilingAdjustments),
             // 默认 512（原 256）：配合按视距的显形半径与放宽的视锥，单周期通过筛选的坐标更多，
             // 单次额度也要相应放大，避免「近处的矿排队等到下一周期才还原」。
+            // 下限为 1：本键的 0 不能表达「关闭」（会被钳到 1），与 instant-reveal.max-per-tick 的 0 = 关闭语义不同。
             clampCeiling(root.getInt("proximity.max-reveals-per-tick", 512), 1,
                 PROXIMITY_MAX_REVEALS_PER_TICK_MAX, "proximity.max-reveals-per-tick",
                 floorAdjustments, ceilingAdjustments),
-            // 默认 300（原为 120）：登录/传送后区块一次性连续下发，玩家往往过一会儿才走到近处。
+            // 默认 30：过期后该坐标不再参与显形判定，过短会让刚下发的区块早早失效（玩家走到近处时已不在索引里），
+            // 过长只是白占内存。稳定分母是 max-positions（安全阀），本键只调「记忆时长」。
             clampCeiling(root.getInt("proximity.expire-seconds", 30), 1, PROXIMITY_EXPIRE_SECONDS_MAX,
                 "proximity.expire-seconds", floorAdjustments, ceilingAdjustments),
             // 安全阀容量见 PROXIMITY_MAX_POSITIONS(_PER_PLAYER)_MAX：两个键都只在异常态触发，

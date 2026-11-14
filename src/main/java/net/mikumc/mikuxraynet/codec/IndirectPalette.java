@@ -47,6 +47,11 @@ public class IndirectPalette implements Palette {
 
   @Override
   public int idFor(int value) {
+    // 入参必须是合法状态 id：byValue 的长度就是调色板容量，越界会在 (byte) 转换后命中别人的槽位，
+    // 表现为「写进去的方块变成另一个方块」。越界只可能来自编程错误/损坏输入，显式拒绝而不是静默。
+    if (value < 0 || value >= this.byValue.length) {
+      throw new IllegalArgumentException("状态 id 越界：" + value + "（容量 " + this.byValue.length + "）");
+    }
     int id = this.byValue[value] & 0xFF;
     // byValue 复用、可能残留上一轮的登记：只有 id 落在已登记区间且反向表自洽才算命中（见类注释）。
     // 不能用 0xFF 排除 id=255——那正是 8 位调色板的合法第 256 项。
@@ -58,7 +63,14 @@ public class IndirectPalette implements Palette {
         this.byValue[value] = (byte) id;
         this.byId[id] = value;
       } else {
-        id = this.chunkSection.grow(this.bitsPerValue + 1, value);
+        // size 已在上面的 size++ 里推进（grow 依赖这个前提，不能改顺序）；因此 grow 失败必须回滚，
+        // 否则调色板会留下一个「已计数但未登记」的空洞，后续 valueFor 读到 0、idFor 永远越界。
+        try {
+          id = this.chunkSection.grow(this.bitsPerValue + 1, value);
+        } catch (RuntimeException growFailure) {
+          this.size--;
+          throw growFailure;
+        }
       }
     }
     return id;

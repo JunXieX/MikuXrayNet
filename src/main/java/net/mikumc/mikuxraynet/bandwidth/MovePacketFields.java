@@ -114,6 +114,9 @@ final class MovePacketFields {
       if (delta == access.vecDeltaZero()) {
         return true; // 就是 ZERO 单例：明确无位移
       }
+      // 待取证：26.3 的 VecDelta.stepCount()==0 是否等价于「零位移」尚未用 javap 对内层 jar 复验
+      // （外层 paperclip 包未解出）。当前按「0 = 无位移」处理；若上游语义相反，取消条件会过于宽松，
+      // 届时这条最坏表现为少量零位移包未被合并（只损失带宽收益，不影响正确性）。
       return ((Number) access.stepCount().invoke(delta)).intValue() == 0;
     }
     return MovementDelta.isRedundantEntityUpdate(false,
@@ -146,6 +149,10 @@ final class MovePacketFields {
     // 这点拼接摊到进程生命周期里可忽略，故不为「成功路径零开销」再引入分支。
     StringBuilder inventory = new StringBuilder();
 
+    // 字段遍历本身也会反射抛错（模块化/权限受限的类上 getDeclaredFields 可抛 SecurityException，
+    // 类加载器不一致时还可能抛 NoClassDefFoundError）。它必须和后面的解析同在一个 try 里：
+    // 否则异常会冒出 of()、越过「解析不出就放行」的兜底，让整个带宽模块在装配期被静默停用。
+    try {
     for (int i = chain.size() - 1; i >= 0; i--) {
       Class<?> type = chain.get(i);
       Field[] fields = type.getDeclaredFields();
@@ -178,6 +185,12 @@ final class MovePacketFields {
           vecDeltaField = field;
         }
       }
+    }
+    } catch (Throwable throwable) {
+      lastFailure = "遍历 " + concrete.getSimpleName() + " 的继承链字段时抛出 "
+          + throwable.getClass().getSimpleName() + ": " + throwable.getMessage()
+          + "（已按解析不出处理、原包一律放行）。字段形态：" + inventory;
+      return UNRESOLVED;
     }
 
     try {

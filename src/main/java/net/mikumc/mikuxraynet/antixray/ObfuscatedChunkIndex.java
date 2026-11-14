@@ -270,6 +270,24 @@ public final class ObfuscatedChunkIndex {
     return removed;
   }
 
+  /**
+   * 取出区块条目<b>且不刷新</b>活跃时间：供诊断/探针这类「只读」路径使用。
+   *
+   * <p>为什么单独开一个入口：{@link #entry(ChunkKey)} 会 touch，而探针（{@code /mxnet probe}）与 dump
+   * 若走它就会顺带把条目的活跃时间推到当下，等于「执行一次诊断 = 续期一次」，与「探针只读」的自述相反。
+   */
+  ChunkEntry peek(ChunkKey key) {
+    return chunks.get(key);
+  }
+
+  /** 同上，按「世界名 + 区块坐标」查询，不刷新活跃时间。 */
+  ChunkEntry peek(String worldName, int chunkX, int chunkZ) {
+    if (worldName == null) {
+      return null;
+    }
+    return chunks.get(ChunkKey.Probe.local().set(worldName, chunkX, chunkZ));
+  }
+
   /** 取出区块条目，并刷新其活跃时间（供邻近显形扫描使用；未命中返回 {@code null}）。 */
   ChunkEntry entry(ChunkKey key) {
     ChunkEntry entry = chunks.get(key);

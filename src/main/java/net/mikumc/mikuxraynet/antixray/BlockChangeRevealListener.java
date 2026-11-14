@@ -139,7 +139,16 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     ExecutorService executor = undoExecutor;
     undoExecutor = null;
     if (executor != null) {
-      executor.shutdownNow();
+      // shutdownNow 会丢弃队列里尚未执行的注销任务：那些坐标本该从显形索引摘掉，丢掉就等于
+      // 「服务端已经改了方块、索引还留着」，之后显形包会把旧状态发回去。停机路径上队列很短，
+      // 直接在调用线程补跑（索引本身是并发结构，安全）。
+      for (Runnable dropped : executor.shutdownNow()) {
+        try {
+          dropped.run();
+        } catch (Throwable throwable) {
+          plugin.getLogger().log(Level.FINE, "停机补跑方块变更注销任务失败（忽略）", throwable);
+        }
+      }
     }
     if (!registered) {
       return;

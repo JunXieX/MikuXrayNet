@@ -26,7 +26,9 @@ class VarBitBufferWidthValidationTest {
 
   @Test
   void acceptsBoundaryWidths() {
-    new SimpleVarBitBuffer(1, 16, new long[16]);
-    new SimpleVarBitBuffer(64, 16, new long[16]);
+    // 缓冲区长度必须由 calculateArraySize 给出（构造处会校验），这里只需确认边界位宽本身可用
+    for (int bits : new int[] {1, 4, 8, 32, 64}) {
+      new SimpleVarBitBuffer(bits, 16, new long[SimpleVarBitBuffer.calculateArraySize(bits, 16)]);
+    }
   }
 }

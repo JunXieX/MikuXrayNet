@@ -374,6 +374,8 @@ public final class ProximityRevealer implements Listener {
    * 「6 邻索引查询 + 射线判定」。窗口 {@value #DIG_DEDUP_TICKS} tick 内同一格只放行一次。
    */
   private final ConcurrentHashMap<UUID, long[]> digMarks = new ConcurrentHashMap<>();
+  /** 开掘去重的槽位数（见 digDedupAllows）：太小会被交替坐标绕过，太大则白占内存。 */
+  private static final int DIG_DEDUP_SLOTS = 4;
   /** 每玩家上次「近处重试」相位所在的 tick（见 nearRetryDue：按间隔推进，不按墙钟取模）。 */
   private final ConcurrentHashMap<UUID, long[]> nearRetryMarks = new ConcurrentHashMap<>();
   /** 过度显形抽样器（1/N，只计数不改行为；N=0 关闭）。 */
@@ -574,6 +576,9 @@ public final class ProximityRevealer implements Listener {
       lookTask = null;
     }
     digMarks.clear();
+    nearRetryMarks.clear();
+    // 自变更安静窗口同样要清：stop() 之后没有巡检会再读它，留着只会让下一轮启用把陈旧的 section 当噪声
+    ownChanges.clear();
     viewMarks.clear();
     pendingChunkReveals.clear();
     HandlerList.unregisterAll(this);
@@ -2637,7 +2642,8 @@ public final class ProximityRevealer implements Listener {
       Budget budget = new Budget(granted);
       PassTally tally = new PassTally();
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
-      // eye=null + visibilityInPlan=true：跳过位图判定，按当前真实状态直发（玩家正在挖它，必然可见）
+      // eye=null + visibilityInPlan=true：视线已在上方用「眼睛 → 方块中心」的射线判过（被挡就 return），
+      // 这里不再重复位图判定，直接按当前真实状态发给他。
       sendOne(player, world, x, y, z, null, budget, tally, batch, true);
       flushBatch(player, batch, tally);
       digQuota.release(playerId, tick, 1, granted, tally.sent);
@@ -2646,19 +2652,38 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
-  /** 开掘去重（纯逻辑，可离线单测）：同一格在窗口内只放行一次；窗口外的旧记号直接覆盖。 */
+  /**
+   * 开掘去重（纯逻辑，可离线单测）：同一格在窗口内只放行一次；窗口外的旧记号被最旧槽覆盖。
+   *
+   * <p>槽位数 {@value #DIG_DEDUP_SLOTS}：单槽只记住最后一格，玩家在两个格里交替点击时每次都命中
+   * 「换了坐标」，去重形同失效（每个 tick 都可能对同一格重复下发显形包）。槽位按「最旧优先覆盖」，
+   * 因此连续挖同一格时最早那条不会被新坐标挤掉。
+   */
   boolean digDedupAllows(UUID playerId, int x, int y, int z, long tick) {
     long packed = packCoordinate(x, y, z);
-    long[] mark = digMarks.computeIfAbsent(playerId, ignored -> new long[2]);
-    synchronized (mark) {
-      if (mark[1] != 0L && mark[0] == packed && tick >= mark[1]
-          && tick - mark[1] < DIG_DEDUP_TICKS) {
+    long[] marks = digMarks.computeIfAbsent(playerId, ignored -> new long[DIG_DEDUP_SLOTS * 2]);
+    synchronized (marks) {
+      return digDedupAllows(marks, packed, tick);
+    }
+  }
+
+  /** 开掘去重的槽位判定（纯逻辑，与 {@link #digDedupAllows(UUID, int, int, int, long)} 同一实现）。 */
+  static boolean digDedupAllows(long[] marks, long packed, long tick) {
+    int oldestSlot = 0;
+    for (int slot = 0; slot < DIG_DEDUP_SLOTS; slot++) {
+      long storedTick = marks[slot * 2 + 1];
+      if (storedTick != 0L && marks[slot * 2] == packed && tick >= storedTick
+          && tick - storedTick < DIG_DEDUP_TICKS) {
         return false;
       }
-      mark[0] = packed;
-      mark[1] = tick;
-      return true;
+      // 空槽（tick=0）与更旧的槽都会被最旧选择命中，因此不需要额外维护游标
+      if (storedTick < marks[oldestSlot * 2 + 1]) {
+        oldestSlot = slot;
+      }
     }
+    marks[oldestSlot * 2] = packed;
+    marks[oldestSlot * 2 + 1] = tick;
+    return true;
   }
 
   /**

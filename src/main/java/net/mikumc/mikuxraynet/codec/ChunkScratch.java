@@ -7,10 +7,10 @@ import java.util.Arrays;
 /**
  * 按线程复用的区块编解码 scratch：缓存一次「解码 + 重编码」中需要反复新建的大数组，供同线程的下一个区块复用。
  *
- * <p>动机：一次编解码里每个<b>间接调色板</b>的 section 都会新建调色板反查表（长度 = 唯一方块状态数，
- * 实测 32 KB 级），单值调色板不需要反查表；连同位打包 long 数组，24 个 section 叠加就是每区块
- * 几百 KB 到 1 MB 级的分配量。这些数组只服务于「当前区块」，区块关闭后即可整批复用，
- * 因此这里按线程缓存：同一线程处理下一个区块时按同样顺序取回，稳态下几乎不再分配。
+ * <p>动机：一次编解码里每个<b>间接调色板</b>的 section 都会新建调色板反查表（长度 = 调色板容量，
+ * vanilla 约 256 KB；装了自定义方块插件的服务端更大），单值调色板不需要反查表；连同位打包 long
+ * 数组，24 个 section 叠加就是每区块数 MB 的分配量。这些数组只服务于「当前区块」，区块关闭后即可
+ * 整批复用，因此这里按线程缓存：同一线程处理下一个区块时按同样顺序取回，稳态下几乎不再分配。
  *
  * <p>并发与生命周期约束：
  * <ul>
@@ -49,6 +49,16 @@ public final class ChunkScratch {
    * 小数组照常复用、性能不受影响。
    */
   static final int MAX_RETAINED_OUTPUT_CAPACITY = 4 * 1024 * 1024;
+
+  /**
+   * 每线程缓存的数组<b>条目数</b>上限（字节数组与 long 数组各算各的）。
+   *
+   * <p>为什么要单独限条目数：{@link #MAX_RETAINED_OUTPUT_CAPACITY} 只限单个数组的大小，而借出游标
+   * 只增不减——一次异常/损坏输入让某个 section 反复以不同长度借数组，条目就会按次数无界增长并随线程
+   * 常驻。合法区块的借出次数由 section 数决定（24 段 + 生物群系，各一字节一 long），64 已有 2 倍余量；
+   * 超过它只可能是异常输入，此时宁可放弃缓存（每次重新分配）也不让条目常驻。
+   */
+  static final int MAX_CACHED_ARRAYS = 64;
 
   /**
    * 输出缓冲区容量已达绝对上限、无法再扩容。它与「数据损坏」区分开：表示「需要更大的输出缓冲而不可得」，
@@ -131,7 +141,9 @@ public final class ChunkScratch {
       return fresh;
     }
     byte[] fresh = new byte[size];
-    this.byteArrays.add(fresh);
+    if (this.byteArrays.size() < MAX_CACHED_ARRAYS) {
+      this.byteArrays.add(fresh);
+    }
     this.byteCursor++;
     return fresh;
   }
@@ -154,7 +166,9 @@ public final class ChunkScratch {
       }
     } else {
       array = new long[size];
-      this.longArrays.add(array);
+      if (this.longArrays.size() < MAX_CACHED_ARRAYS) {
+        this.longArrays.add(array);
+      }
     }
     this.longCursor++;
     Arrays.fill(array, 0L);

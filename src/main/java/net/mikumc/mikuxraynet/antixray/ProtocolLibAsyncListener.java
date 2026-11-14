@@ -119,6 +119,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     void open(UUID playerId) {
       long totalEvicted;
       synchronized (this) {
+        // 同一玩家重复 START：上一批的 FINISHED 从未到达（客户端断流 / 包被上游丢弃）。此时他的旧闸门
+        // 已经永远不会配对，直接原地替换即可；若走下面的「腾位」逻辑，被逐出的会是另一个玩家的在途
+        // 批次（他的 FINISHED 从此无配对 START → 直接放行），把一个玩家的丢包放大成别人的放行。
+        if (gates.containsKey(playerId)) {
+          gates.put(playerId, new ChunkBatchGate());
+          return;
+        }
         boolean evicted = false;
         while (gates.size() >= maxPending) {
           Iterator<UUID> iterator = gates.keySet().iterator();

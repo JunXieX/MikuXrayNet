@@ -45,6 +45,9 @@ public final class LeakFilterListener extends PacketAdapter {
         PacketType.Play.Server.TILE_ENTITY_DATA,
         PacketType.Play.Server.WORLD_EVENT,
         PacketType.Play.Server.BLOCK_BREAK_ANIMATION,
+        // 箱子/门/活塞开合：携带坐标与动作，客户端按<b>真实方块类型</b>决定是否播动画，
+        // 伪装坐标上的这类包会让客户端据此推断出真方块的身份（隐藏坐标的二次泄露）。
+        PacketType.Play.Server.BLOCK_ACTION,
         PacketType.Play.Server.NAMED_SOUND_EFFECT,
         PacketType.Play.Server.CUSTOM_SOUND_EFFECT,
         PacketType.Play.Server.WORLD_PARTICLES,
@@ -113,7 +116,8 @@ public final class LeakFilterListener extends PacketAdapter {
   private boolean shouldFilter(Player player, String worldName, PacketType type, PacketContainer packet) {
     UUID playerId = player.getUniqueId();
     if (type == PacketType.Play.Server.TILE_ENTITY_DATA
-        || type == PacketType.Play.Server.BLOCK_BREAK_ANIMATION) {
+        || type == PacketType.Play.Server.BLOCK_BREAK_ANIMATION
+        || type == PacketType.Play.Server.BLOCK_ACTION) {
       BlockPosition position = packet.getBlockPositionModifier().readSafely(0);
       return position != null && isHidden(obfuscatedChunkIndex, revealedSet, playerId, worldName,
           position.getX(), position.getY(), position.getZ());

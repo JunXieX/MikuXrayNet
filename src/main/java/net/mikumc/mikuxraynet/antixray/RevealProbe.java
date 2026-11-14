@@ -49,8 +49,9 @@ public final class RevealProbe {
     int chunkZ = z >> 4;
 
     // ① 显形索引：区块是否登记、该坐标是否仍在清单里
+    // 用 peek 而不是 entry：探针只读，不能顺手刷新条目活跃时间（否则「诊断一次 = 续期一次」）
     ObfuscatedChunkIndex.ChunkEntry entry =
-        index == null ? null : index.entry(worldName, chunkX, chunkZ);
+        index == null ? null : index.peek(worldName, chunkX, chunkZ);
     if (index == null) {
       lines.add("① 显形索引：未启用（邻近显形关闭 → 不会有任何显形）");
     } else if (entry == null) {

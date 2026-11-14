@@ -332,6 +332,8 @@ public final class OcclusionPatchListener extends PacketAdapter {
       // 跨世界守卫：方块变更包不含世界标识，坐标按「接收者当前世界」解释。玩家切世界瞬间仍在途的
       // 旧世界变更包若按新世界名写位图，会在新世界的无关坐标上造成单格错误（写 CLEAR 时显形侧
       // 会把该格当透明，削弱反矿透一格）。与 BlockChangeMerger 同一口径：世界名变化即丢弃本包补丁。
+      // 取舍方向：切换后「第一个」变更包被丢弃（该格本轮不补丁），位图停在旧值 → 偏「遮挡」→ 多藏，
+      // 属安全方向；代价是这一次补丁不可观测（既不计成功也不计失败）。
       String previousWorld = lastWorlds.put(player.getUniqueId(), worldName);
       if (previousWorld != null && !previousWorld.equals(worldName)) {
         return;

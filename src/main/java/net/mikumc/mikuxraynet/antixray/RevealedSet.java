@@ -329,14 +329,20 @@ public final class RevealedSet {
     }
     Marker marker = players.get(playerId);
     if (marker != null) {
-      marker.updatedAtNanos = clock.getAsLong();
+      // 续期必须与 expire 的「判活 → 移除」持同一把 marker 锁：否则「判活」读到的可能是续期之前的
+      // 旧值，刚被扫描刷新的条目仍会被过期清掉（表现为身边坐标偶尔要等下一轮才重新显形）。
+      synchronized (marker) {
+        marker.updatedAtNanos = clock.getAsLong();
+      }
     }
   }
 
   void touch(UUID playerId, ChunkKey key) {
     Marker marker = markerOf(playerId, key);
     if (marker != null) {
-      marker.updatedAtNanos = clock.getAsLong();
+      synchronized (marker) {
+        marker.updatedAtNanos = clock.getAsLong();
+      }
     }
   }
 
