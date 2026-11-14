@@ -1477,18 +1477,10 @@ public final class ObfuscationProcessor {
    *         直接调色板返回空表（不能 grow，保留原表会让 id 被掩码截断）
    */
   private static int[][] filterTable(int[] ids, int[] cum, ChunkSection section) {
-    return filterTable(ids, cum, section, section.bitsPerBlock() > 8);
-  }
-
-  /**
-   * 同 {@link #filterTable(int[], int[], ChunkSection)}，显式给出「本段是否直接调色板」。
-   *
-   * <p><b>为什么必须区分</b>：间接调色板在候选被剔空时可以「保留原表」作为逃生口——写入会触发
-   * {@link ChunkSection#grow} 升位，语义仍然正确。直接调色板<b>不能升位</b>（id 即状态 id），
-   * 保留原表只会把放不下的 id 写进位打包数据、被掩码<b>静默截断成另一个方块</b>。
-   * 因此 direct 下剔空即返回空表，由改写循环跳过这一格（宁可少伪装这一块，绝不写错方块）。
-   */
-  private static int[][] filterTable(int[] ids, int[] cum, ChunkSection section, boolean direct) {
+    // 间接调色板剔空时可「保留原表」作逃生口——写入会触发 ChunkSection#grow 升位，语义仍正确；
+    // 直接调色板不能升位（id 即状态 id），保留原表只会把放不下的 id 写进位打包数据、
+    // 被掩码静默截断成另一个方块。故 direct 剔空即返回空表，由改写循环跳过这一格。
+    boolean direct = section.bitsPerBlock() > 8;
     int kept = 0;
     for (int id : ids) {
       if (section.paletteContains(id)) {
