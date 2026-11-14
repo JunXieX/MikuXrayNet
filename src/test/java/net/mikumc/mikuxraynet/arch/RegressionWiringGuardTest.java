@@ -27,7 +27,8 @@ class RegressionWiringGuardTest {
   @Test
   void worldEventFilterReadsBlockPositionField() throws IOException {
     String source = readSource("antixray/LeakFilterListener.java");
-    String body = methodBody(source, "shouldFilter");
+    // 去掉注释：说明文字里提到 getIntegers（解释为什么不能用它）不算违规
+    String body = stripComments(methodBody(source, "shouldFilter"));
     assertTrue(body != null, "shouldFilter 必须存在（泄露过滤的坐标解析入口）");
     int branchStart = body.indexOf("PacketType.Play.Server.WORLD_EVENT");
     assertTrue(branchStart >= 0, "必须保留 WORLD_EVENT 分支（2001 方块破坏粒子带真实方块状态）");
