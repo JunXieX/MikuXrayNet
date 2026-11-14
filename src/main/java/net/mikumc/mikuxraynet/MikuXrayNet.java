@@ -12,6 +12,7 @@ import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.util.Diagnostics;
 import net.mikumc.mikuxraynet.util.LogBuffer;
+import net.mikumc.mikuxraynet.util.PlayerWorldIndex;
 import net.mikumc.mikuxraynet.util.ReloadCoordinator;
 import org.bukkit.Bukkit;
 import org.bukkit.event.EventHandler;
@@ -109,6 +110,11 @@ public final class MikuXrayNet extends JavaPlugin {
     // 整个装配段放进「重载会话锁」并复位 shuttingDown：若只在锁外复位，一个正排队在 reloadLock 上的
     // 重载可能在复位之后立刻拿到锁，与启用装配并发执行 → 同一次启用里出现两条 ThrottlePipeline，
     // 其中一条既不在字段里也没人 stop（两套改写器同时生效、旧 EntityCuller 藏起的实体无人恢复）。
+    // 玩家世界名快照必须在这里启动，不能挂在反矿透装配里：封包线程上三个出站监听器只查这张表、
+    // 不读 player.getWorld()（Folia 会抛 No currently ticking region，导致变更注销失败、显形发回旧状态），
+    // 而反矿透装配有三处提前 return（未启用 / 未解析到方块配置 / 缺 ProtocolLib）——挂在里面会让
+    // 「反矿透关闭 + 带宽开启」这一受支持形态下带宽静默退化（合批整项失效）。
+    PlayerWorldIndex.start(this);
     reloadCoordinator.runExclusivelyOnEnable(() -> {
       this.runtime = new AntiXrayRuntime(this, occlusionStats);
       // 反矿透装配失败绝不能让整个插件启用失败：带宽模块与命令与它相互独立，必须照常可用。
@@ -180,6 +186,13 @@ public final class MikuXrayNet extends JavaPlugin {
         } catch (Throwable throwable) {
           getLogger().log(Level.WARNING, "停用期停止反矿透模块失败（已置空字段）", throwable);
         }
+      }
+      // 快照同样是进程级静态（registered 标志 + 玩家表）：不注销的话，下一次启用会因 registered=true
+      // 直接 return，玩家表里留下的仍是上一轮的世界名——停用时必须一并清掉。
+      try {
+        PlayerWorldIndex.stop();
+      } catch (Throwable throwable) {
+        getLogger().log(Level.WARNING, "停用期注销玩家世界快照失败（忽略）", throwable);
       }
       // 世界黑名单是**进程级静态实例**（{@code WorldBlacklistConfig#publish} 的一次 volatile 写），
       // 停用时必须复位：否则插件停了、名单还留着，同一 JVM 里下一次启用（/reload confirm、其它插件

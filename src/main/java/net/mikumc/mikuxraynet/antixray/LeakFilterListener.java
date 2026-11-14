@@ -119,11 +119,11 @@ public final class LeakFilterListener extends PacketAdapter {
           position.getX(), position.getY(), position.getZ());
     }
     if (type == PacketType.Play.Server.WORLD_EVENT) {
-      Integer x = packet.getIntegers().readSafely(1);
-      Integer y = packet.getIntegers().readSafely(2);
-      Integer z = packet.getIntegers().readSafely(3);
-      return x != null && y != null && z != null
-          && isHidden(obfuscatedChunkIndex, revealedSet, playerId, worldName, x, y, z);
+      // 2001（方块破坏粒子）的 Data 就是真实方块状态的全局 id，坐标在 Position 字段——该包的整数域只有
+      // Event 与 Data 两个，从 getIntegers 取坐标恒为 null，等于这条泄露通道从不生效。
+      BlockPosition position = packet.getBlockPositionModifier().readSafely(0);
+      return position != null && isHidden(obfuscatedChunkIndex, revealedSet, playerId, worldName,
+          position.getX(), position.getY(), position.getZ());
     }
     if (type == PacketType.Play.Server.NAMED_SOUND_EFFECT
         || type == PacketType.Play.Server.CUSTOM_SOUND_EFFECT) {

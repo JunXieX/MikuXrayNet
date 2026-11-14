@@ -1282,19 +1282,39 @@ public final class DiskCacheStore implements AutoCloseable {
    */
   private static String sanitize(String worldName) {
     StringBuilder builder = new StringBuilder(worldName.length());
+    boolean lossy = false;
     for (int index = 0; index < worldName.length(); index++) {
       char character = worldName.charAt(index);
       boolean safe = character >= 'a' && character <= 'z'
           || character >= 'A' && character <= 'Z'
           || character >= '0' && character <= '9'
           || character == '.' || character == '_' || character == '-';
+      if (!safe) {
+        lossy = true;
+      }
       builder.append(safe ? character : '_');
     }
     String normalized = builder.length() == 0 ? "unknown" : builder.toString().toLowerCase(Locale.ROOT);
+    if (lossy && !"unknown".equals(normalized)) {
+      // 折叠是有损的：「生存世界」与「创造世界」都会变成 "__"，落到同一目录、共用同一批物理文件。
+      // 指纹仍能把两边的条目分开，代价是每次访问都要把对方写下的条目当未命中清掉——命中率归零并产生
+      // 持续的删除 + 重写。补一段原名的稳定哈希即可让两者各占一个目录；纯安全名不加后缀，既有缓存零迁移。
+      normalized = normalized + "-" + shortHash(worldName);
+    }
     // 只由点组成（"." / ".." / "..."）会解析成父目录或自身：pathFor 的 resolve 会逃出缓存根目录，
     // 之后 invalidateWorld 的 Files.deleteIfExists 甚至可能在缓存目录之外删文件。
     // 世界名由服主控制、现实触发面极小，但归一化代价为零，直接兜住。
     return normalized.chars().allMatch(character -> character == '.') ? "unknown" : normalized;
+  }
+
+  /** 世界名的稳定短哈希（FNV-1a 64 位，取 8 位十六进制）：只用于消歧，不作为安全边界。 */
+  private static String shortHash(String value) {
+    long hash = 0xcbf29ce484222325L;
+    for (int index = 0; index < value.length(); index++) {
+      hash ^= value.charAt(index);
+      hash *= 0x100000001b3L;
+    }
+    return Long.toHexString(hash & 0xffffffffL);
   }
 
   // ------------------------------------------------------------------ 调度

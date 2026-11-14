@@ -147,6 +147,9 @@ public final class ZstdSupport {
   private static final AtomicBoolean HASH_MISMATCH_WARNING = new AtomicBoolean();
   /** 「lib 目录里已存在的 jar 与配置的 SHA-256 不符」的 WARN 只打一次（与下载路径的提示分开计）。 */
   private static final AtomicBoolean LOCAL_HASH_MISMATCH_WARNING = new AtomicBoolean();
+
+  /** 拒绝非 https 下载源时的一次性提示（见 {@link #isSecureDownloadSource}）。 */
+  private static final AtomicBoolean INSECURE_SOURCE_WARNING = new AtomicBoolean();
   /** 「自动下载失败」的 WARN 只打一次（同上）。 */
   private static final AtomicBoolean DOWNLOAD_FAILURE_WARNING = new AtomicBoolean();
   /** 「未启用自动下载」的 WARN 只打一次（同上）。 */
@@ -181,6 +184,24 @@ public final class ZstdSupport {
   /** 坐标 → jar 文件名（{@code zstd-jni-1.5.7-15.jar}）。 */
   public static String jarFileName(String artifact, String version) {
     return jarFileName(artifact, version, "");
+  }
+
+  /**
+   * 下载源是否可接受：只认 https（本机回环与 file 用于离线自测/自建镜像）。
+   *
+   * <p>空值可接受——表示回落到 {@link #DEFAULT_DOWNLOAD_URL}（https://repo1.maven.org）。
+   */
+  static boolean isSecureDownloadSource(String baseUrl) {
+    if (baseUrl == null || baseUrl.isBlank()) {
+      return true;
+    }
+    String trimmed = baseUrl.trim().toLowerCase(java.util.Locale.ROOT);
+    return trimmed.startsWith("https://")
+        || trimmed.startsWith("http://127.0.0.1")
+        || trimmed.startsWith("http://localhost")
+        || trimmed.startsWith("[::1]")
+        || trimmed.startsWith("http://[::1]")
+        || trimmed.startsWith("file:");
   }
 
   /**
@@ -498,6 +519,14 @@ public final class ZstdSupport {
 
     // ③ 自动下载（默认开启）
     if (autoDownload) {
+      if (!isSecureDownloadSource(downloadUrl)) {
+        // 明文 http 的 jar 会在本进程里执行静态块（Class.forName(..., true, loader)），
+        // 中间人换包即等价于任意代码执行：非 https 的下载源一律拒绝，回退内置压缩（fail-open）。
+        warnOnce(INSECURE_SOURCE_WARNING, logger, detectionLine()
+            + "；disk-cache.zstd-download-url 不是 https（" + downloadUrl + "），已拒绝自动下载"
+            + "（明文下载源可被替换成任意 jar 并在本进程执行）；请改用 https 或手动把 jar 放进 lib 目录");
+        return;
+      }
       boolean verify = expectedSha256 != null && !expectedSha256.isBlank();
       if (!verify) {
         // 供应链面：未提供期望哈希时无法做完整性校验，至少要一次性明确告知（不静默）。
@@ -910,6 +939,7 @@ public final class ZstdSupport {
       UNVERIFIED_WARNING.set(false);
       HASH_MISMATCH_WARNING.set(false);
       LOCAL_HASH_MISMATCH_WARNING.set(false);
+    INSECURE_SOURCE_WARNING.set(false);
       DOWNLOAD_FAILURE_WARNING.set(false);
       AUTODOWNLOAD_DISABLED_WARNING.set(false);
     }

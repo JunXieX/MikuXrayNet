@@ -1027,10 +1027,12 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private void completeRelease(Player player, PacketEvent event, ChunkBatchGate gate,
       String worldName, int chunkX, int chunkZ, UUID playerId, List<int[]> heldChanges,
       boolean canReadWorld) {
+    // 顺序不能反：先放行区块包，再归还批次计数。归还计数可能立刻把 CHUNK_BATCH_FINISHED 放出去，
+    // 若它排在最后一个区块包之前，客户端会先结束批次、再收到区块——批次速率估计随之后续统计全部错位。
+    asynchronousManager.signalPacketTransmission(event);
     if (gate != null) {
       gate.chunkDone();
     }
-    asynchronousManager.signalPacketTransmission(event);
     if (canReadWorld && !heldChanges.isEmpty()) {
       resendCellsDirectly(player, worldName, chunkX, chunkZ, heldChanges);
     }

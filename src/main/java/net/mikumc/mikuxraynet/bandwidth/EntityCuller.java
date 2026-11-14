@@ -1706,8 +1706,17 @@ public final class EntityCuller implements Listener {
     try {
       int entityId = entity.getEntityId();
       HiddenEntry entry = new HiddenEntry(entity, frustumCulled);
-      player.hideEntity(plugin, entity);
+      // 必须先登记再隐藏：hideEntity 可能同步派发 untrack（Paper/Folia 的 removePlayer 是同步的），
+      // 而 untrack 只有在账本里查到这个 id 时才会把实体重新放回轮转队列——通道②是远距离已隐藏实体
+      // 唯一的再评估入口，登记晚一步它就再也等不到恢复（玩家走近才重新可见）。
       map.put(entityId, entry);
+      try {
+        player.hideEntity(plugin, entity);
+      } catch (RuntimeException hideFailure) {
+        // 隐藏失败则回滚登记，避免账本留下「以为已隐藏」的条目（恢复侧会去 show 一个从未隐藏的实体）
+        map.remove(entityId, entry);
+        throw hideFailure;
+      }
       // 停用竞态收口（Folia：stop() 可能在另一条区域线程上并发执行）：<b>入账之后再读一次</b> volatile
       // stopping。这样保证「本次读到 false ⇒ stop() 尚未置位 ⇒ 其 restoreAll 必然发生在本次入账之后、
       // 一定看得到本条目」；读到 true 则说明 stop() 已在恢复，必须自行回滚本次隐藏——否则该实体既不在

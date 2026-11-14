@@ -1032,11 +1032,25 @@ public final class ObfuscationProcessor {
           // 「只剩一种方块」的节降级为单值调色板、把 ≤256 状态的直接调色板降为间接调色板。
           // 失败只放弃体积优化，绝不回滚已完成的替换（宁可包体大，不可漏伪装）。
           if (paletteOptions.widthBudget()) {
+            // 引用计数在改写前按当时的 paletteSize 建立，而 grow 会按 data 首次出现顺序重排间接调色板
+            // 索引（见 ChunkSection#grow）：长度一旦不等，这份计数描述的就是另一套索引，照用会把仍有
+            // 引用的条目当成失效条目裁掉、其格子被重映射到条目 0——成片错方块，且默认
+            // strict-verify=false 时完全静默。长度不等即交给 compactPalette 自行全量扫描：多一次
+            // 4096 格统计，换正确结果。
+            int[] counts = targetCounts[sectionIndex];
+            if (counts != null && counts.length != section.paletteSize()) {
+              counts = null;
+            }
             try {
-              section.compactPalette(paletteOptions.strictVerify(), targetCounts[sectionIndex]);
+              section.compactPalette(paletteOptions.strictVerify(), counts);
               section.downgradePalette(paletteOptions.strictVerify());
+            } catch (IllegalStateException verificationFailure) {
+              // 自检发现裁剪改变了方块序列：此时 section 已被就地改过，继续编码只会把错方块发给客户端。
+              // 抛出交给外层 fail-open（整块按原字节放行），与 bandwidth.yml 的「不一致即放弃本区块改写」
+              // 承诺一致——宁可这一块不伪装，也不能发出改坏的方块。
+              throw verificationFailure;
             } catch (RuntimeException pruneFailure) {
-              // 裁剪/降级失败：保留替换结果原样（可能已 grow），伪装正确性不受影响
+              // 其余裁剪/降级失败（如位宽下界不满足）：保留替换结果原样（可能已 grow），伪装正确性不受影响
             }
           }
           sectionBits[sectionIndex] = section.bitsPerBlock();
@@ -1379,7 +1393,10 @@ public final class ObfuscationProcessor {
   private int[][] buildSectionTables(ChunkSection section, WorldProfile profile, int[] freeAfterOut) {
     int bandCount = profile.bandIds.length;
     int[][] out = new int[(bandCount + 1) << 1][];
-    if (!paletteOptions.widthBudget()) {
+    boolean direct = section.bitsPerBlock() > 8;
+    // 预算关闭只表示「不做体积优化」，不等于「允许写放不进声明位宽的候选」。直接调色板没有条目表，
+    // 放不下的 id 会被位打包按声明的位宽掩码截断成另一个方块（9 位下 600 → 88），所以它必须照样过滤。
+    if (!paletteOptions.widthBudget() && !direct) {
       sharePrebuiltTables(out, profile);
       freeAfterOut[0] = Integer.MAX_VALUE;
       return out;
@@ -1399,7 +1416,6 @@ public final class ObfuscationProcessor {
     // （paletteContains 对 direct 已按声明位宽如实回答），绝不截断。
     //
     // 另注意 1 << 32 在 Java 里按 32 取模等于 1，故 direct 分支不得用移位算容量。
-    boolean direct = section.bitsPerBlock() > 8;
     if (total > 0) {
       int[] all = new int[total];
       int filled = 0;

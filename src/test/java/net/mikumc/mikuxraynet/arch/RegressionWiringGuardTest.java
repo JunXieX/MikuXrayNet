@@ -121,4 +121,23 @@ class RegressionWiringGuardTest {
     }
     return text.substring(brace);
   }
+
+  @Test
+  void digTargetRevealChecksLineOfSight() throws IOException {
+    String body = methodBody(readSource("antixray/ProximityRevealer.java"), "revealDigTarget");
+    assertTrue(body != null, "revealDigTarget 必须存在");
+    int sight = body.indexOf("rayTraceBlocks");
+    int send = body.indexOf("sendOne(");
+    assertTrue(sight >= 0, "开掘预显形必须先做视线判定：服务端对 START_DESTROY_BLOCK 只校验交互距离，不校验视线");
+    assertTrue(send > sight, "视线判定必须早于发包，否则伪造破坏包就能换到真实方块状态");
+  }
+
+  @Test
+  void digNeighbourRevealIgnoresOwnChangeWindow() throws IOException {
+    String body = methodBody(readSource("antixray/ProximityRevealer.java"), "revealAfterDig");
+    assertTrue(body != null, "revealAfterDig 必须存在");
+    assertTrue(body.contains("occludedBy"), "必须仍然只还原「挖开之后才看得见」的坐标");
+    assertFalse(body.contains("sameSectionAsOwnChange"),
+        "这一段不得再按 section 让开安静窗口：6 邻与正在挖的那一格几乎总在同一 section，会让预显形永不执行");
+  }
 }

@@ -374,6 +374,8 @@ public final class ProximityRevealer implements Listener {
    * 「6 邻索引查询 + 射线判定」。窗口 {@value #DIG_DEDUP_TICKS} tick 内同一格只放行一次。
    */
   private final ConcurrentHashMap<UUID, long[]> digMarks = new ConcurrentHashMap<>();
+  /** 每玩家上次「近处重试」相位所在的 tick（见 nearRetryDue：按间隔推进，不按墙钟取模）。 */
+  private final ConcurrentHashMap<UUID, long[]> nearRetryMarks = new ConcurrentHashMap<>();
   /** 过度显形抽样器（1/N，只计数不改行为；N=0 关闭）。 */
   private final OverRevealSampler overRevealSampler;
   /**
@@ -864,7 +866,7 @@ public final class ProximityRevealer implements Listener {
     // 近处重试的相位按 tick 分散：所有玩家的巡检落在同一 tick 时也只是重扫身边 3×3 区块，
     // 不会因为「全服同时重试」放大成尖峰（每 25 tick 命中一次）。
     // 抽成一个方法是为了让局部变量保持 effectively final（下面的工作线程 lambda 要捕获它）
-    final boolean retryNearbyRevealed = nearRetryPhase();
+    final boolean retryNearbyRevealed = nearRetryPhase(player.getUniqueId());
     List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex,
         revealedSet, player.getUniqueId(), worldName, location.getBlockX(), location.getBlockY(),
         location.getBlockZ(), maxDistance, fetchLimit(budget.remaining()), shard,
@@ -929,12 +931,42 @@ public final class ProximityRevealer implements Listener {
    *
    * <p>离线/测试环境没有 tick 时钟：返回 false（生产环境恒可用，且这只是「更早自愈」的优化）。
    */
-  private static boolean nearRetryPhase() {
+  private boolean nearRetryPhase(UUID playerId) {
     try {
-      return Bukkit.getCurrentTick() % NEAR_RETRY_PERIOD_TICKS == 0;
+      return nearRetryDue(playerId, Bukkit.getCurrentTick());
     } catch (Throwable throwable) {
       return false;
     }
+  }
+
+  /**
+   * 纯数据判定：该玩家距上次近处重试是否已满一个周期（包级可见，便于离线单测）。
+   *
+   * <p><b>为什么不用「tick 取模」</b>：巡检间隔由 {@code interval-ticks}（默认 4）决定，取模判等只在
+   * 恰好命中那一 tick 的巡检上成立；间隔与周期互质时（25 与 4）实际周期被放大到 100 tick，与注释承诺的
+   * 25 tick 差 4 倍。改成「距上次已过 N tick」后与巡检节奏无关：漏 tick、间隔调整都不会放大周期。
+   */
+  boolean nearRetryDue(UUID playerId, long tick) {
+    if (playerId == null) {
+      return false;
+    }
+    long[] mark = nearRetryMarks.computeIfAbsent(playerId, ignored -> new long[] {Long.MIN_VALUE});
+    synchronized (mark) {
+      if (!nearRetryDue(mark[0], tick)) {
+        return false;
+      }
+      mark[0] = tick;
+      return true;
+    }
+  }
+
+  /**
+   * 纯函数口径（包级可见，便于离线单测）：距上次重试是否已满一个周期。
+   *
+   * <p>{@code lastTick == Long.MIN_VALUE} 表示从未重试过；tick 回落（换世界/重启任务）按「未满」处理。
+   */
+  static boolean nearRetryDue(long lastTick, long nowTick) {
+    return lastTick == Long.MIN_VALUE || nowTick - lastTick >= NEAR_RETRY_PERIOD_TICKS;
   }
 
   /** 本轮是否有可用的工作线程来执行纯计算筛选（包级可见，便于离线单测）。 */
@@ -2474,6 +2506,9 @@ public final class ProximityRevealer implements Listener {
   /** 视线即时显形：射线最多看多远（格）。 */
   private static final double LOOK_MAX_DISTANCE = 6.0D;
 
+  /** 开掘预显形的视线判定上限（格）：交互距离 4.5~5.5 格 + 一格余量，超出必是伪造/延迟过期的请求。 */
+  private static final double DIG_MAX_SIGHT_DISTANCE = 6.5D;
+
   /**
    * 视线即时显形：玩家正看着的第一个方块若是伪装坐标，立刻发真实状态。
    *
@@ -2545,8 +2580,10 @@ public final class ProximityRevealer implements Listener {
    * 过程与结果不一致。这里在开始挖（方块尚未破坏）的同 tick 补发一次真实状态，玩家在挖掘动画期间
    * 先看到真方块，破坏后掉落与所见一致。
    *
-   * <p><b>安全边界</b>：只处理「玩家正在挖的那一格」——不扩大半径、不做视线判定（他正在挖它，必然可见），
-   * 因此不会造成隔墙透视；已显形、非伪装坐标、跨 region、未加载区块一律跳过。
+   * <p><b>安全边界</b>：只处理「玩家正在挖的那一格」，并且<b>必须通过视线判定</b>——服务端对
+   * START_DESTROY_BLOCK 不校验视线，只校验区块已加载与交互距离，因此「他正在挖它」并不能推出「他看得见它」：
+   * 不判视线时，伪造破坏包就能把任意伪装坐标换成真实状态。已显形、非伪装坐标、跨 region、
+   * 未加载区块、视线被挡一律跳过。
    */
   private void revealDigTarget(Player player, int x, int y, int z) {
     try {
@@ -2570,6 +2607,26 @@ public final class ProximityRevealer implements Listener {
       }
       if (revealedSet.contains(playerId, key, x, y, z)) {
         return; // 已经显形
+      }
+      // 视线判定：{@link BlockDamageEvent} 只代表客户端「声明」正在挖这一格——服务端对
+      // START_DESTROY_BLOCK 只校验区块已加载与交互距离，不校验视线。少了这一步，伪造破坏包就能把
+      // 任意伪装坐标换成真实状态（隔墙透视，暴露面约一个交互距离）。这里要求眼睛到方块中心的射线
+      // 确实先命中这一格；被挡住就跳过（该坐标仍留在索引里，等玩家真的走到能看见时由巡检补上）。
+      Location eye = player.getEyeLocation();
+      if (!ownsChunk(world, eye.getBlockX() >> 4, eye.getBlockZ() >> 4)) {
+        return;
+      }
+      Vector toBlock = new Vector(x + 0.5D - eye.getX(), y + 0.5D - eye.getY(), z + 0.5D - eye.getZ());
+      double sightDistance = toBlock.length();
+      if (sightDistance > DIG_MAX_SIGHT_DISTANCE) {
+        return;
+      }
+      RayTraceResult sight = world.rayTraceBlocks(eye, toBlock.normalize(), sightDistance + 0.5D,
+          FluidCollisionMode.NEVER, true);
+      if (sight == null || sight.getHitBlock() == null
+          || sight.getHitBlock().getX() != x || sight.getHitBlock().getY() != y
+          || sight.getHitBlock().getZ() != z) {
+        return;
       }
       long tick = Bukkit.getCurrentTick();
       int granted = digQuota.claim(playerId, tick, 1, 1);
@@ -2649,10 +2706,10 @@ public final class ProximityRevealer implements Listener {
           if (!occludedBy(eye, bx, by, bz, x, y, z)) {
             continue;
           }
-          // 正在挖的那一格所在 section 同样让开安静窗口（与逐坐标路径同一口径）。
-          if (sameSectionAsOwnChange(playerId, tick, x, y, z)) {
-            continue;
-          }
+          // 这里<b>不</b>让开安静窗口（与逐坐标路径口径不同，是刻意的）：上面 occludedBy 已经保证这些
+          // 坐标此刻被正在挖的那一格挡住、根本不在画面上，因此不存在「与刚变更的那一格同段重绘导致闪一下」
+          // 的问题；反过来按 section 剔除时，6 邻与正在挖的一格几乎总在同一 section，会把这条预显形整条
+          // 路径变成永不执行（连续挖掘时尤其明显）。
           sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
         }
       } finally {
