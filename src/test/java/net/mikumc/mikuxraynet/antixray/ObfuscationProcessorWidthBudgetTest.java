@@ -307,4 +307,130 @@ class ObfuscationProcessorWidthBudgetTest {
       }
     }
   }
+
+  /**
+   * 回归：改写期间调色板 grow 之后，引用计数必须仍然与新调色板对得上。
+   *
+   * <p>计数在改写前按当时的 paletteSize 建立，而 grow 会按 data 首次出现顺序<b>重排</b>间接调色板索引。
+   * 长度一旦不一致，计数表示的就是「另一套索引」，照用会把仍有引用的条目当成失效条目裁掉、其格子被
+   * 重映射到条目 0——非目标格成片变成别的方块，且默认 strict-verify=false 时完全静默。
+   *
+   * <p>断言口径：除被替换的矿位外，<b>所有位置</b>的方块状态必须与改写前逐一相同。
+   */
+  @Test
+  void grownPaletteMustNotPruneReferencedEntries() {
+    // 两种矿位分布都过一遍：273*k（条目不靠前首次出现）与 5+17*k（靠前首次出现，grow 后索引整体前移，
+    // 是旧实现最容易错位的形态）。
+    int[][] layouts = new int[2][];
+    for (int layout = 0; layout < layouts.length; layout++) {
+      layouts[layout] = new int[15];
+      for (int i = 0; i < 15; i++) {
+        layouts[layout][i] = layout == 0 ? 273 * (i + 1) : 5 + 17 * i;
+      }
+    }
+    for (int[] orePositions : layouts) {
+      int[] indices = new int[4096];
+      int[] palette = fullFourBitPalette(indices);
+      for (int position : orePositions) {
+        indices[position] = 1; // 钻石矿
+      }
+      byte[] source = indirectChunk(4, palette, indices);
+      int[] before;
+      try (Chunk chunk = codec().decode(source, 1)) {
+        before = chunk.getSection(0).readAllBlockStates();
+      }
+
+      ObfuscationProcessor.Result result = processor(targets(DIAMOND_ORE),
+          new int[] {NETHERRACK, GLOWSTONE}, true).rewrite(source, 1, 42L);
+      assertTrue(result.changed(), "矿必须被替换（不漏伪装是红线）");
+
+      int[] after;
+      try (Chunk chunk = codec().decode(result.data(), 1)) {
+        after = chunk.getSection(0).readAllBlockStates();
+      }
+      for (int i = 0; i < after.length; i++) {
+        if (before[i] == DIAMOND_ORE) {
+          assertTrue(after[i] == NETHERRACK || after[i] == GLOWSTONE || after[i] == DIAMOND_ORE,
+              "位置 " + i + " 是矿位，只能被换成候选伪装方块，实际 " + after[i]);
+        } else {
+          assertEquals(before[i], after[i],
+              "矿位分布 " + java.util.Arrays.toString(orePositions) + " 下，非矿位 " + i
+                  + " 的方块状态不得被 grow 或裁剪改动");
+        }
+      }
+    }
+  }
+
+  /**
+   * 回归（strict-verify=true）：裁剪自检失败时必须整块放弃改写，而不是吞掉异常继续产出半改写字节。
+   *
+   * <p>与上一条同源：计数与新调色板错位时，裁剪会改动仍被引用的条目，自检随即抛异常。旧实现捕获后
+   * 什么都不做，于是改坏的 section 照常被编码进封包并进缓存；按带宽配置的对外承诺应当按原包放行。
+   */
+  @Test
+  void strictVerifyFailureMustNotEmitHalfRewrittenChunk() {
+    int[] indices = new int[4096];
+    int[] palette = fullFourBitPalette(indices);
+    int[] orePositions = new int[15];
+    for (int i = 0; i < orePositions.length; i++) {
+      orePositions[i] = 5 + 17 * i;
+      indices[orePositions[i]] = 1;
+    }
+    byte[] source = indirectChunk(4, palette, indices);
+    int[] before;
+    try (Chunk chunk = codec().decode(source, 1)) {
+      before = chunk.getSection(0).readAllBlockStates();
+    }
+
+    ObfuscationProcessor strict = new ObfuscationProcessor(codec(), blockId -> true,
+        targets(DIAMOND_ORE), new int[] {NETHERRACK, GLOWSTONE}, new int[] {1, 2}, false, true,
+        new ObfuscationProcessor.PaletteOptions(true, true), true);
+    ObfuscationProcessor.Result result = strict.rewrite(source, 1, 42L);
+
+    if (!result.changed()) {
+      assertArrayEquals(source, result.data(), "放弃改写时必须原样返回原始字节");
+      return;
+    }
+    int[] after;
+    try (Chunk chunk = codec().decode(result.data(), 1)) {
+      after = chunk.getSection(0).readAllBlockStates();
+    }
+    for (int i = 0; i < after.length; i++) {
+      if (before[i] != DIAMOND_ORE) {
+        assertEquals(before[i], after[i], "自检失败后仍出包时不得改动非矿位 " + i);
+      }
+    }
+  }
+
+  /**
+   * 回归：width-budget=false 只该关掉「体积优化」，不该连带关掉「直接调色板放不下的候选必须剔除」。
+   *
+   * <p>9 位直接调色板可表示 0..511，候选 600/700 放不进去。位打包写入按 9 位掩码截断，结果是
+   * 600 & 511 = 88、700 & 511 = 188 —— 玩家看到一堵由错误方块砌成的墙，统计上却记「替换成功」。
+   * 正确行为是跳过这一格（宁可少伪装一格，也不能写错方块）。
+   */
+  @Test
+  void directSectionSkipsCandidateOutsideDeclaredBits() {
+    int bits = 9;
+    int[] states = new int[4096];
+    java.util.Arrays.fill(states, STONE);
+    int[] orePositions = {273, 546, 819, 1092};
+    for (int position : orePositions) {
+      states[position] = DIAMOND_ORE;
+    }
+    byte[] source = new TestChunkBuilder(MODERN)
+        .directSection(bits, 4096, 0, states, 0, new int[] {1}).build();
+
+    ObfuscationProcessor.Result result = processor(targets(DIAMOND_ORE), new int[] {600, 700}, false)
+        .rewrite(source, 1, 42L);
+    int[] after;
+    try (Chunk chunk = codec().decode(result.data(), 1)) {
+      after = chunk.getSection(0).readAllBlockStates();
+    }
+    for (int position : orePositions) {
+      assertEquals(DIAMOND_ORE, after[position],
+          "9 位直接调色板放不下 600/700：只能跳过这一格，绝不能写成掩码后的 " + (600 & 511)
+              + "/" + (700 & 511));
+    }
+  }
 }
