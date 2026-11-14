@@ -217,7 +217,7 @@ class OcclusionCaptureTest {
 
   /**
    * 混合段用<b>间接</b>调色板（4 位）：codec 明确拒绝 bitsPerBlock 2/3（本项目「非法编码一律拒绝」的约定），
-   * 而直接格式的位宽必须等于注册表位宽——本桩只有 4 个状态（位宽 2）无法走直接格式。
+   * 而直接格式最小声明位宽为 9——本桩只有 4 个状态，用 4 位间接最贴近真实小区块。
    */
   private static byte[] mixed(int[] states) {
     int[] palette = {STONE, GLASS, AIR};

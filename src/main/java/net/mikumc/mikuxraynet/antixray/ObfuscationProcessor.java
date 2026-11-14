@@ -1392,6 +1392,14 @@ public final class ObfuscationProcessor {
     boolean overBudget = false;
     int free = 0;
     int distinctNew = 0;
+    // 直接调色板（位宽 >8）没有条目表，「条目数」不构成限制；但它的**可表示范围由声明位宽决定**
+    // （服务端会按调色板规模下发较窄的位宽，如 9 位 = 0..511）。放不下的候选若直接写进
+    // ChunkSection#setBlockState，会被位打包掩码静默截断成另一个方块——正是本次要杜绝的截断类缺陷。
+    // 因此 direct 的「预算」按「放不下的候选个数」计：只要有一个放不下就走 filterTable 剔除
+    // （paletteContains 对 direct 已按声明位宽如实回答），绝不截断。
+    //
+    // 另注意 1 << 32 在 Java 里按 32 取模等于 1，故 direct 分支不得用移位算容量。
+    boolean direct = section.bitsPerBlock() > 8;
     if (total > 0) {
       int[] all = new int[total];
       int filled = 0;
@@ -1399,7 +1407,7 @@ public final class ObfuscationProcessor {
       for (int[] ids : profile.bandIds) {
         filled = appendAll(all, filled, ids);
       }
-      free = (1 << section.bitsPerBlock()) - section.paletteSize();
+      free = direct ? Integer.MAX_VALUE : (1 << section.bitsPerBlock()) - section.paletteSize();
       for (int i = 0; i < filled; i++) {
         if (section.paletteContains(all[i])) {
           continue;
@@ -1415,13 +1423,17 @@ public final class ObfuscationProcessor {
           distinctNew++;
         }
       }
-      overBudget = distinctNew > free;
+      // direct：distinctNew 即「放不下的候选数」，只要非 0 就必须过滤（free 是 MAX_VALUE，不能靠它判）
+      overBudget = direct ? distinctNew > 0 : distinctNew > free;
     }
 
     if (!overBudget) {
       // 预算充足：调色板装得下所有新状态，共享预构建表即可
       sharePrebuiltTables(out, profile);
-      freeAfterOut[0] = Math.max(0, free - distinctNew);
+      // 直接调色板没有「剩余条目」概念、也不能 grow：能表示的 id 已由 paletteContains 判过，
+      // 放不下的必须由 use-block-below 的回退分支挡住，故余量恒为 0（否则会把放不下的
+      // 下方方块写进位打包数据、被掩码截断成另一个方块）。
+      freeAfterOut[0] = direct ? 0 : Math.max(0, free - distinctNew);
       return out;
     }
 
@@ -1457,19 +1469,29 @@ public final class ObfuscationProcessor {
   }
 
   /**
-   * 剔除表中「不在调色板内」的候选（保持声明顺序与相对权重）。
+   * 剔除表中「本段表示不了」的候选（保持声明顺序与相对权重）。
    *
-   * @return 筛选后的 {@code {ids, cum}}；无候选可留（全被剔除）时原样返回——逃生口：
-   *         调色板内完全无候选才允许 grow，保防护优先于包体
+   * <p>「表示不了」对间接调色板是「不在条目表内」，对直接调色板是「超出声明位宽」。
+   *
+   * @return 筛选后的 {@code {ids, cum}}；全被剔除时间接调色板原样返回（逃生口：允许 grow），
+   *         直接调色板返回空表（不能 grow，保留原表会让 id 被掩码截断）
    */
   private static int[][] filterTable(int[] ids, int[] cum, ChunkSection section) {
+    // 间接调色板剔空时可「保留原表」作逃生口——写入会触发 ChunkSection#grow 升位，语义仍正确；
+    // 直接调色板不能升位（id 即状态 id），保留原表只会把放不下的 id 写进位打包数据、
+    // 被掩码静默截断成另一个方块。故 direct 剔空即返回空表，由改写循环跳过这一格。
+    boolean direct = section.bitsPerBlock() > 8;
     int kept = 0;
     for (int id : ids) {
       if (section.paletteContains(id)) {
         kept++;
       }
     }
-    if (kept == 0 || kept == ids.length) {
+    if (kept == 0) {
+      // 全被剔除：间接调色板保留原表（允许 grow 逃生）；直接调色板返回空表（绝不让截断发生）
+      return direct ? new int[][] {new int[0], new int[0]} : new int[][] {ids, cum};
+    }
+    if (kept == ids.length) {
       return new int[][] {ids, cum};
     }
     int[] outIds = new int[kept];

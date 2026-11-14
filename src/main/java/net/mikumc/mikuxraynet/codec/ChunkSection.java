@@ -18,8 +18,9 @@ import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
  *   <li>bitsPerBlock=0 用单值调色板；读取时位宽 1 保留原值（兼容 FAWE 的非标准区块格式）；
  *       位宽 4..8 为间接调色板（{@code max(4, bitsPerBlock)} 仅对 4..8 是无操作）；
  *       位宽 2..3 视为非法编码并拒绝（旧实现静默归一化为 4 位，见 {@link #setBitsPerBlock} 注释）；
- *       位宽 &gt;8 为 direct（global）格式，声明值必须等于 {@code registryAccessor.getMaxBitsPerBlockState()}
- *       （位打包按声明值写出，声明值与注册表位宽不符同样拒绝，见 {@link #setBitsPerBlock} 注释）；</li>
+ *       位宽 &gt;8 为 direct（global）格式：<b>读取时保留声明位宽</b>（合法 9..{@value #MAX_DIRECT_BITS}，
+ *       服务端按调色板规模选择，不必等于注册表位宽），只有本插件 {@link #grow(int, int)} 升 direct 时
+ *       才取注册表位宽（见 {@link #setBitsPerBlock} 注释里的一手取证）；</li>
  *   <li>{@link #grow(int, int)} 升位时会把旧调色板索引整体重映射到新调色板，因此方块状态语义不变，
  *       但调色板索引顺序可能改变；</li>
  *   <li>元素序号为 {@code y << 8 | z << 4 | x}（共 4096 项）；</li>
@@ -30,6 +31,14 @@ import net.mikumc.mikuxraynet.occlusion.SolidOcclusion;
 public class ChunkSection {
 
   private static final int SECTION_VOLUME = 4096;
+
+  /**
+   * 直接（direct/global）格式声明位宽的合法上界。
+   *
+   * <p>取自服务端 {@code SimpleBitStorage} 构造的 {@code Validate.inclusiveBetween(1, 32, bits)}
+   * （Paper 26.3 字节码实测）。声明位宽由服务端按调色板规模选择，<b>不必等于注册表位宽</b>。
+   */
+  private static final int MAX_DIRECT_BITS = 32;
 
   private final RegistryAccessor registryAccessor;
   private final ChunkVersionFlags versionFlags;
@@ -86,23 +95,32 @@ public class ChunkSection {
       } else if (bitsPerBlock <= 8) {
         this.bitsPerBlock = Math.max(4, bitsPerBlock);
         this.palette = new IndirectPalette(this.bitsPerBlock, this);
+      } else if (grow) {
+        // 升位路径：8 位间接调色板写满（出现第 257 个不同状态）时由本插件自己发起，
+        // 声明位宽取注册表位宽（能表示全部已知状态的最小位宽）。
+        this.bitsPerBlock = registryAccessor.getMaxBitsPerBlockState();
+        this.palette = new DirectPalette(this.bitsPerBlock);
       } else {
-        int registryBits = registryAccessor.getMaxBitsPerBlockState();
-        if (!grow && bitsPerBlock != registryBits) {
-          // 直接（direct/global）格式：**位打包是按声明的位宽写出的**——客户端按声明值解包
-          // （Configuration.Global(bitsInMemory, bitsInStorage)：存储位宽取声明值，读完再重排到内存位宽）。
-          // 声明 9..14（或 >registryBits）时若按注册表位宽重解释，同一段字节会被按错误位宽读出错值、
-          // 多读/少读若干 long，把后续（群系容器 / 下一个 section）的字节吞进方块数据；1.21.5+ 没有
-          // long 数组长度字段可校验（本项目目标 26.2），错位没有任何内建校验能兜住，
-          // 最坏把整块区块按垃圾字节重编码下发。故与位宽 2/3 同一处置：显式拒绝，交由上层解码 fail-open。
-          //
-          // 只对读取路径生效：升位路径 grow(9)（8 位间接调色板写满、出现第 257 个不同状态）是
-          // 本插件自己产生的合法中间态，必须继续按注册表位宽切到直接调色板。
+        // 读取路径：**直接格式的存储位宽由服务端按调色板规模决定，不必等于注册表位宽**。
+        // 一手取证（Paper 26.3 字节码）：
+        //   Strategy#getConfigurationForBitCount(bits)：bits>8 一律 new Configuration.Global(
+        //       globalPaletteBitsInMemory, bits)——bitsInStorage 取声明值，bitsInMemory 才是注册表位宽；
+        //   PalettedContainer#pack → Strategy#getConfigurationForPaletteSize → bitsInStorage，
+        //       即出站封包的声明位宽随实际调色板规模变化（HashMapPalette 满 8 位时 onResize(9)）。
+        // 因此 9..32 都是合法声明值（上界 32 来自 SimpleBitStorage 构造的
+        // Validate.inclusiveBetween(1, 32, bits)）。旧实现要求「必须等于注册表位宽 15」，
+        // 会把服务端合法下发的 16 位等 section 判为非法 → 整块 fail-open → 该区块 24 段全部不伪装，
+        // 矿物以真实状态下发给透视端（真机 dump 实测：bitsPerBlock=16 应为 15）。
+        //
+        // 必须按声明位宽解包并重编码：位打包是按声明值写出的，按别的位宽重解释会读出错值、
+        // 多读/少读若干 long，把后续（群系容器 / 下一个 section）的字节吞进方块数据；
+        // 1.21.5+ 没有 long 数组长度字段可校验，错位没有任何内建校验能兜住。
+        if (bitsPerBlock > MAX_DIRECT_BITS) {
           throw new IllegalArgumentException("非法的直接格式位宽 bitsPerBlock=" + bitsPerBlock
-              + "（应为注册表位宽 " + registryBits + "）");
+              + "（合法上界 " + MAX_DIRECT_BITS + "，见 SimpleBitStorage）");
         }
-        this.bitsPerBlock = registryBits;
-        this.palette = new DirectPalette();
+        this.bitsPerBlock = bitsPerBlock;
+        this.palette = new DirectPalette(this.bitsPerBlock);
       }
 
       if (this.bitsPerBlock == 0) {
@@ -127,7 +145,9 @@ public class ChunkSection {
     // 不 fail-open）。这里显式拒绝，交由上层 rewrite 的 catch 按原包放行（与 bitsPerBlock 2/3、
     // 调色板重复值等非法编码同一处置口径）。
     if (this.palette instanceof DirectPalette) {
-      int stateLimit = 1 << this.bitsPerBlock;
+      // 用 long 计算上界：位宽 32 时 1 << 32 在 Java 里按 32 取模等于 1（本分支当前只由 grow 进入、
+      // 位宽恒为注册表位宽，但上界表达式不应依赖那个前提）。
+      long stateLimit = 1L << this.bitsPerBlock;
       for (int i = 0; i < data.size(); i++) {
         int preBlockId = palette.valueFor(data.get(i));
         if (preBlockId < 0 || preBlockId >= stateLimit) {
@@ -463,7 +483,12 @@ public class ChunkSection {
     return this.palette.size();
   }
 
-  /** 调色板是否已包含某方块状态（预算筛选「替换方块是否已在调色板内」用；直接调色板恒 true）。 */
+  /**
+   * 调色板能否容纳某方块状态（预算筛选「替换方块是否写得进本段」用）。
+   *
+   * <p>间接调色板：已在本段条目表内才返回 true（写进去不升位）。
+   * 直接调色板：按<b>声明位宽</b>判断能否表示（写不进就会被位打包掩码截断，见 {@link DirectPalette}）。
+   */
   public boolean paletteContains(int stateId) {
     return this.palette.contains(stateId);
   }
@@ -647,10 +672,14 @@ public class ChunkSection {
     Palette currentPalette = this.palette;
     int[] states = new int[257];
     int distinct = 0;
-    // 直接调色板的数据值就是状态 id，且位宽来自注册表上限：损坏/伪造数据里的 id 仍可能超出注册表条目数。
+    // 直接调色板的数据值就是状态 id：损坏/伪造数据里的 id 仍可能超出反查表容量。
     // 一旦越界，下面的 idFor 会在「已切换位宽与调色板之后」才抛异常，把这个 section 留成半改写的损坏态。
     // 因此先在收集阶段拦下：越界即放弃降级、不改动任何状态（fail-open 的方向是「保持原表示」）。
-    int stateLimit = direct ? registryAccessor.getUniqueBlockStateCount() : Integer.MAX_VALUE;
+    //
+    // 判据必须与降级目标（IndirectPalette#idFor / read）同口径，即 paletteCapacity()——它覆盖
+    // vanilla 之后追加的自定义方块状态。用 getUniqueBlockStateCount()（仅 vanilla 映射数）会把
+    // 合法的自定义 id 误判为越界，让本该降位宽的 direct 段白占带宽。
+    int stateLimit = direct ? registryAccessor.paletteCapacity() : Integer.MAX_VALUE;
     for (int i = 0; i < SECTION_VOLUME; i++) {
       int state = direct ? this.data.get(i) : currentPalette.valueFor(this.data.get(i));
       if (direct && (state < 0 || state >= stateLimit)) {
