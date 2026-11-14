@@ -1392,6 +1392,14 @@ public final class ObfuscationProcessor {
     boolean overBudget = false;
     int free = 0;
     int distinctNew = 0;
+    // 直接调色板（位宽 >8）没有条目表，「条目数」不构成限制；但它的**可表示范围由声明位宽决定**
+    // （服务端会按调色板规模下发较窄的位宽，如 9 位 = 0..511）。放不下的候选若直接写进
+    // ChunkSection#setBlockState，会被位打包掩码静默截断成另一个方块——正是本次要杜绝的截断类缺陷。
+    // 因此 direct 的「预算」按「放不下的候选个数」计：只要有一个放不下就走 filterTable 剔除
+    // （paletteContains 对 direct 已按声明位宽如实回答），绝不截断。
+    //
+    // 另注意 1 << 32 在 Java 里按 32 取模等于 1，故 direct 分支不得用移位算容量。
+    boolean direct = section.bitsPerBlock() > 8;
     if (total > 0) {
       int[] all = new int[total];
       int filled = 0;
@@ -1399,14 +1407,6 @@ public final class ObfuscationProcessor {
       for (int[] ids : profile.bandIds) {
         filled = appendAll(all, filled, ids);
       }
-      // 直接调色板（位宽 >8）没有条目表，「条目数」不构成限制；但它的**可表示范围由声明位宽决定**
-      // （服务端会按调色板规模下发较窄的位宽，如 9 位 = 0..511）。放不下的候选若直接写进
-      // {@link ChunkSection#setBlockState}，会被位打包掩码静默截断成另一个方块——正是本次要杜绝的
-      // 截断类缺陷。因此 direct 的「预算」按「放不下的候选个数」计：只要有一个放不下就走下面的
-      // filterTable 剔除（paletteContains 对 direct 已按声明位宽如实回答），绝不截断。
-      //
-      // 另注意 1 << 32 在 Java 里按 32 取模等于 1，故 direct 分支不得用移位算容量。
-      boolean direct = section.bitsPerBlock() > 8;
       free = direct ? Integer.MAX_VALUE : (1 << section.bitsPerBlock()) - section.paletteSize();
       for (int i = 0; i < filled; i++) {
         if (section.paletteContains(all[i])) {
