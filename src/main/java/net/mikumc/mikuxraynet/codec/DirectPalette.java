@@ -12,6 +12,20 @@ import io.netty.buffer.ByteBuf;
  */
 public class DirectPalette implements Palette {
 
+  /**
+   * 与 {@link ChunkSection#bitsPerBlock()} 一致的声明位宽。
+   *
+   * <p><b>为什么要持有它</b>：直接格式的可表示范围由声明位宽决定（{@code 0..2^bits-1}），而不是注册表。
+   * 服务端会按调色板规模下发较窄的声明位宽（如 9 位 = 0..511），此时若把一个更大的状态 id 写进位打包
+   * 数据，{@link SimpleVarBitBuffer#set} 会按位宽掩码把它<b>静默截断成另一个状态</b>（方块错乱、不计数）。
+   * 因此 {@link #contains} 必须如实回答「本表示能否容纳该 id」，供位宽预算与 use-block-below 过滤。
+   */
+  private final int bitsPerBlock;
+
+  DirectPalette(int bitsPerBlock) {
+    this.bitsPerBlock = bitsPerBlock;
+  }
+
   @Override
   public int idFor(int value) {
     return value;
@@ -36,9 +50,9 @@ public class DirectPalette implements Palette {
     return 0;
   }
 
-  /** 直接调色板按声明位宽可容纳全部状态 id、不存在「塞不下新状态」，预算筛选对它恒放行。 */
+  /** 本表示能否容纳该状态 id（{@code 0..2^声明位宽-1}）：放不下就会被位打包掩码截断，必须判 false。 */
   @Override
   public boolean contains(int value) {
-    return true;
+    return value >= 0 && (bitsPerBlock >= 32 || value < (1 << bitsPerBlock));
   }
 }

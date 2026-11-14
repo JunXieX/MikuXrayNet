@@ -99,7 +99,7 @@ public class ChunkSection {
         // 升位路径：8 位间接调色板写满（出现第 257 个不同状态）时由本插件自己发起，
         // 声明位宽取注册表位宽（能表示全部已知状态的最小位宽）。
         this.bitsPerBlock = registryAccessor.getMaxBitsPerBlockState();
-        this.palette = new DirectPalette();
+        this.palette = new DirectPalette(this.bitsPerBlock);
       } else {
         // 读取路径：**直接格式的存储位宽由服务端按调色板规模决定，不必等于注册表位宽**。
         // 一手取证（Paper 26.3 字节码）：
@@ -120,7 +120,7 @@ public class ChunkSection {
               + "（合法上界 " + MAX_DIRECT_BITS + "，见 SimpleBitStorage）");
         }
         this.bitsPerBlock = bitsPerBlock;
-        this.palette = new DirectPalette();
+        this.palette = new DirectPalette(this.bitsPerBlock);
       }
 
       if (this.bitsPerBlock == 0) {
