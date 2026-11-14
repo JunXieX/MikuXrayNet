@@ -1399,7 +1399,12 @@ public final class ObfuscationProcessor {
       for (int[] ids : profile.bandIds) {
         filled = appendAll(all, filled, ids);
       }
-      free = (1 << section.bitsPerBlock()) - section.paletteSize();
+      // 直接调色板（位宽 >8）没有调色板段、不存在「塞不下新状态」，预算对它无意义；
+      // 且声明位宽可达 32（见 ChunkSection#setBitsPerBlock），1 << 32 在 Java 里按 32 取模等于 1，
+      // 会把「无限制」误算成「只剩 1 个空位」而错误剔除伪装候选。故 direct 一律按无限制处理。
+      free = section.bitsPerBlock() > 8
+          ? Integer.MAX_VALUE
+          : (1 << section.bitsPerBlock()) - section.paletteSize();
       for (int i = 0; i < filled; i++) {
         if (section.paletteContains(all[i])) {
           continue;

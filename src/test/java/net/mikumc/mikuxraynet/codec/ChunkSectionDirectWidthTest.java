@@ -163,4 +163,65 @@ class ChunkSectionDirectWidthTest {
       assertEquals(customId, section.getBlockState(4095));
     }
   }
+
+  /**
+   * 群系容器与方块 section 同一套 Strategy 语义（一手取证：{@code Strategy$2} 对 {@code bits>3}
+   * 构造 {@code Global(memory, bits)}）。旧实现按「群系只有 64 格、上限 8」拒绝 &gt;8，
+   * 会把自定义群系较多的服务端合法负载判为非法 → 整块 fail-open（与方块位宽误拒同一根因）。
+   */
+  @Test
+  void biomeContainerAcceptsDirectWidthsUpToStorageLimit() {
+    for (int biomeBits : new int[] {4, 6, 8, 9, 16, 32}) {
+      int[] expected = states(5);
+      TestChunkBuilder builder = new TestChunkBuilder(MODERN);
+      builder.directSection(15, 4096, 0, expected, biomeBits, new int[] {7});
+      byte[] raw = builder.build();
+
+      ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+      try (Chunk chunk = codec.decode(raw, 1)) {
+        assertEquals(expected[0], chunk.getSection(0).getBlockState(0),
+            "群系位宽 " + biomeBits + " 不得影响方块解析");
+        assertArrayEquals(raw, chunk.finalizeOutput(),
+            "群系位宽 " + biomeBits + "：未改动必须逐字节往返一致");
+      }
+    }
+  }
+
+  /** 群系声明位宽超出 SimpleBitStorage 上界仍必须拒绝（真错位/损坏数据）。 */
+  @Test
+  void biomeContainerWidthAboveStorageLimitIsRejected() {
+    TestChunkBuilder builder = new TestChunkBuilder(MODERN);
+    builder.directSection(15, 4096, 0, states(5), 33, new int[] {7});
+    byte[] raw = builder.build();
+
+    ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+    assertThrows(IllegalArgumentException.class, () -> codec.decode(raw, 1),
+        "群系位宽 33 超出上界 32，必须显式拒绝");
+  }
+
+  /**
+   * 多 section 区块里混用不同声明位宽（含群系 direct）：边界必须逐段精确，
+   * 否则一段错位会把后续所有 section 的字节吞掉。
+   */
+  @Test
+  void mixedDeclaredWidthsKeepSectionBoundariesExact() {
+    int[] a = states(3);
+    int[] b = states(5);
+    TestChunkBuilder builder = new TestChunkBuilder(MODERN);
+    builder.directSection(16, 4096, 0, a, 9, new int[] {7});
+    builder.directSection(11, 4096, 0, b, 4, new int[] {7});
+    builder.singleValueSection(STONE, 4096, 0, 0, new int[] {7});
+    byte[] raw = builder.build();
+
+    ChunkCodec codec = new ChunkCodec(registry(), MODERN);
+    try (Chunk chunk = codec.decode(raw, 3)) {
+      assertEquals(16, chunk.getSection(0).bitsPerBlock());
+      assertEquals(11, chunk.getSection(1).bitsPerBlock());
+      assertEquals(0, chunk.getSection(2).bitsPerBlock());
+      assertEquals(a[4095], chunk.getSection(0).getBlockState(4095));
+      assertEquals(b[4095], chunk.getSection(1).getBlockState(4095));
+      assertEquals(STONE, chunk.getSection(2).getBlockState(4095));
+      assertArrayEquals(raw, chunk.finalizeOutput(), "混合声明位宽必须逐字节往返一致");
+    }
+  }
 }

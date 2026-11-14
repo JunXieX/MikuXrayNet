@@ -28,6 +28,12 @@ public class Chunk implements AutoCloseable {
   public record SectionRange(int offset, int length) {
   }
 
+  /**
+   * 群系容器声明位宽的合法上界：与方块 section 同源，取自服务端 {@code SimpleBitStorage} 构造的
+   * {@code Validate.inclusiveBetween(1, 32, bits)}（Paper 26.3 字节码实测）。
+   */
+  private static final int MAX_BIOME_BITS = 32;
+
   private final ChunkCodec codec;
 
   private final ChunkSectionHolder[] sections;
@@ -227,16 +233,23 @@ public class Chunk implements AutoCloseable {
   private void skipBiomePalettedContainer() {
     int bitsPerValue = this.inputBuffer.readUnsignedByte();
 
-    // 群系容器只有 4×4×4 = 64 格，位宽上限就是 8（每 long 至少容纳 8 项）。1.18+ 的间接调色板最多
-    // 3 位，4..8 位是直接位打包；再大必然是解析错位或格式漂移。
+    // 群系容器与方块 section 同一套 Strategy 语义（一手取证，Paper 26.3 字节码）：
+    // Strategy$2#getConfigurationForBitCount(bits) 对 bits>3 一律构造
+    // Configuration.Global(globalPaletteBitsInMemory, bits)——0 单值、1..3 间接、<b>4..32 直接</b>。
+    // 上界 32 来自 SimpleBitStorage 构造的 Validate.inclusiveBetween(1, 32, bits)。
     //
-    // 为什么必须在此显式拒绝：目标版本（26.2）已经没有 long 数组长度字段可供交叉校验，若按公式
-    // 「算出长度后静默跳过」，一旦错位就会被跳过错误字节数，后面所有 section 随之错位。而错位处
+    // 旧实现按「群系只有 64 格、位宽上限 8」拒绝 >8，会把装了较多自定义群系的服务端合法下发的
+    // 群系容器判为非法 → 整块 fail-open → 该区块全部 section 都不伪装（与方块 section 的
+    // bitsPerBlock 误拒同一根因，见 ChunkSection#setBitsPerBlock）。
+    //
+    // 仍然必须拒绝真正超界的值：目标版本（26.2）没有 long 数组长度字段可交叉校验，若按公式
+    // 「算出长度后静默跳过」，一旦错位就会跳过错误字节数，后面所有 section 随之错位。而错位处
     // 大多是 0 字节，会被解析成「合法的空 section」——于是整块不抛异常、不改写，矿物原样下发给
     // 透视端，chunksFailed 仍是 0、日志无任何异常，完全不可观测。这是本插件最严重的失效模式。
-    if (bitsPerValue > 8) {
+    if (bitsPerValue > MAX_BIOME_BITS) {
       throw new IllegalArgumentException(
-          "biome paletted container bitsPerValue " + bitsPerValue + " 超出上限 8（疑似解析错位）");
+          "biome paletted container bitsPerValue " + bitsPerValue + " 超出上限 "
+              + MAX_BIOME_BITS + "（疑似解析错位）");
     }
 
     if (bitsPerValue == 0) {

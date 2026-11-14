@@ -145,7 +145,9 @@ public class ChunkSection {
     // 不 fail-open）。这里显式拒绝，交由上层 rewrite 的 catch 按原包放行（与 bitsPerBlock 2/3、
     // 调色板重复值等非法编码同一处置口径）。
     if (this.palette instanceof DirectPalette) {
-      int stateLimit = 1 << this.bitsPerBlock;
+      // 用 long 计算上界：位宽 32 时 1 << 32 在 Java 里按 32 取模等于 1（本分支当前只由 grow 进入、
+      // 位宽恒为注册表位宽，但上界表达式不应依赖那个前提）。
+      long stateLimit = 1L << this.bitsPerBlock;
       for (int i = 0; i < data.size(); i++) {
         int preBlockId = palette.valueFor(data.get(i));
         if (preBlockId < 0 || preBlockId >= stateLimit) {
