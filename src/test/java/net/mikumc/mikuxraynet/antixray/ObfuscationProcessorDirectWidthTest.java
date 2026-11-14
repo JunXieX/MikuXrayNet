@@ -91,7 +91,7 @@ class ObfuscationProcessorDirectWidthTest {
     ObfuscationProcessor.Result result = processor(DEEPSLATE, STONE)
         .rewrite(raw, 1, 42L);
 
-    assertEquals(1, result.positions().length, "该矿必须被伪装（不得整块放弃）");
+    assertEquals(1, result.obfuscatedPositions().length, "该矿必须被伪装（不得整块放弃）");
     int[] rewritten = new int[4096];
     ChunkCodec codec = new ChunkCodec(registry(), MODERN);
     try (Chunk chunk = codec.decode(result.data(), 1)) {
@@ -123,7 +123,7 @@ class ObfuscationProcessorDirectWidthTest {
     ObfuscationProcessor.Result result = processor(DEEPSLATE)
         .rewrite(raw, 1, 42L);
 
-    assertEquals(0, result.positions().length, "全部候选放不下 → 该格跳过（宁可少伪装，绝不写错方块）");
+    assertEquals(0, result.obfuscatedPositions().length, "全部候选放不下 → 该格跳过（宁可少伪装，绝不写错方块）");
     assertArrayEquals(raw, result.data(), "无改动即原字节放行");
   }
 
@@ -140,7 +140,7 @@ class ObfuscationProcessorDirectWidthTest {
     ObfuscationProcessor.Result result = processor(DEEPSLATE)
         .rewrite(raw, 1, 42L);
 
-    assertEquals(1, result.positions().length);
+    assertEquals(1, result.obfuscatedPositions().length);
     ChunkCodec codec = new ChunkCodec(registry(), MODERN);
     try (Chunk chunk = codec.decode(result.data(), 1)) {
       ChunkSection section = chunk.getSection(0);
