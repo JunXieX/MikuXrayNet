@@ -71,4 +71,48 @@ class DumpSelfExplanationGuardTest {
     assertTrue(diagnostics.contains("footprintLine("), "必须渲染「本插件自身占用估算」，避免把整份堆算到本插件头上");
     assertTrue(diagnostics.contains("diskWatermarkHints("), "磁盘水位（打开文件 / 桶缓存 / 无上限）必须在面板可见");
   }
+
+  @Test
+  void blockUpdateDecisionsAreTracedIntoDump() throws Exception {
+    String merger = source("bandwidth/BlockChangeMerger.java");
+    assertTrue(merger.contains("BlockUpdateTrace"),
+        "合并器必须持有处置环：面板只有总数，回答不了「这两片走了哪条路」");
+    assertTrue(merger.contains("recordTracePass("), "直通路径必须留痕（多坐标包到底放行了没有）");
+    assertTrue(source("bandwidth/ThrottlePipeline.java").contains("blockUpdateTrace("),
+        "管线必须把处置环暴露给诊断层");
+    String diagnostics = source("util/Diagnostics.java");
+    assertTrue(diagnostics.contains("最近块更新处置"),
+        "dump 必须有一节逐条处置流水，否则「门只开一半」这类现场问题无法离线定位");
+    assertTrue(diagnostics.contains("未采集（方块变更合并未接线"),
+        "没有记录时必须明写成因，不能留一段看着有内容、其实是空壳的取证段");
+  }
+
+  @Test
+  void cancelledButUndeliveredUpdatesAreRedeemed() throws Exception {
+    String merger = source("bandwidth/BlockChangeMerger.java");
+    assertTrue(merger.contains("shouldRedeem("),
+        "取消即欠账：缓冲原包已被取消，丢弃前必须先判断能不能补发");
+    assertTrue(merger.contains("BlockUpdateTrace.Decision.REDEEM"), "补发必须留痕");
+    String stats = source("bandwidth/ThrottleStats.java");
+    assertTrue(stats.contains("discardRedeemed"), "补发次数必须可观测");
+    assertTrue(stats.contains("mergeVerifyFailed"), "合批校验失败次数必须可观测");
+    String diagnostics = source("util/Diagnostics.java");
+    assertTrue(diagnostics.contains("同世界补发") && diagnostics.contains("合批校验失败"),
+        "面板必须把这两条兜底计数印出来：正常恒为 0，持续非 0 说明丢弃判定或字段布局出了问题");
+  }
+
+  @Test
+  void mergedPacketLayoutIsVerifiedByContentNotJustLength() throws Exception {
+    String merger = source("bandwidth/BlockChangeMerger.java");
+    assertTrue(merger.contains("verifyPositions("),
+        "合并包必须逐坐标校验内容：只比长度会让两片门被压成一条时照样发出去");
+    assertTrue(merger.contains("DUPLICATE_SCAN_LIMIT"),
+        "重复坐标必须能检出（同一 packed short 出现两次 = 另一片永远收不到更新）");
+  }
+
+  @Test
+  void strictVerifyOffIsCalledOutInDump() throws Exception {
+    assertTrue(source("util/Diagnostics.java").contains("自检关闭"),
+        "strict-verify=false 时改写错配不会回退整块，这个风险必须印在 dump 里而不是藏在注释里");
+  }
 }

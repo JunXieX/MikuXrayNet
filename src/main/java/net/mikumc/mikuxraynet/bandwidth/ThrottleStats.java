@@ -55,6 +55,26 @@ public final class ThrottleStats {
   public final LongAdder blockChangesDiscarded = new LongAdder();
 
   /**
+   * 方块变更：本该被丢弃、但「世界并没有变」因而<b>改为补发</b>的原始封包数。
+   *
+   * <p><b>为什么要有这条</b>：{@link #blockChangesDiscarded} 记的是「按旧世界区块会重建处理」的封包——
+   * 只有玩家真的换了世界，客户端才会收到新世界的整列区块，丢弃才不构成丢更新。若世界判定依据的是
+   * 陈旧或错误的世界名，丢弃就是<b>永久丢失方块更新</b>（客户端一直停在旧方块上，门只开一半这类症状
+   * 正是它的表现）。因此「丢弃前先比对世界名，相同即补发」成为一条硬规则，这条计数用于确认规则
+   * 真的在兜：它应当只在「黑名单世界热切换」这类真·同世界丢弃上出现，正常运营恒为 0。
+   */
+  public final LongAdder discardRedeemed = new LongAdder();
+
+  /**
+   * 合并包<b>回读校验失败</b>的次数：坐标内容与意图不一致（不是长度不符），已放弃该合并包并逐条补发。
+   *
+   * <p>旧实现只校验数组长度，不校验 packed 坐标内容——若两个相邻坐标（门的上半/下半）被压成同一个
+   * packed short，或状态与坐标错位一位，校验发现不了，客户端只应用其中一片。持续非 0 说明协议字段
+   * 布局与预期不符，必须查（此时所有合并都退化为逐条补发，功能仍在但带宽收益归零）。
+   */
+  public final LongAdder mergeVerifyFailed = new LongAdder();
+
+  /**
    * 丢弃来源（{@link #blockChangesDiscarded} 的拆分）。
    *
    * <p><b>为什么必须拆</b>：实机 dump 里「丢弃 62.8 万」约占全部方块变更包的四分之一，而四条入口

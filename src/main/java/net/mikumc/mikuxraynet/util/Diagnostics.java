@@ -23,6 +23,7 @@ import net.mikumc.mikuxraynet.antixray.ObfuscatedChunkIndex;
 import net.mikumc.mikuxraynet.antixray.ProximityStats;
 import net.mikumc.mikuxraynet.antixray.RevealedSet;
 import net.mikumc.mikuxraynet.antixray.RewriteStats;
+import net.mikumc.mikuxraynet.bandwidth.BlockUpdateTrace;
 import net.mikumc.mikuxraynet.bandwidth.ThrottlePipeline;
 import net.mikumc.mikuxraynet.bandwidth.ThrottleStats;
 import net.mikumc.mikuxraynet.bootstrap.DependencyGuard;
@@ -93,10 +94,12 @@ public final class Diagnostics {
       AntiXrayConfig antiXray,
       // 附加诊断域（缺失来源拆分、丢弃来源拆分、耗时 p99）：单独成组，避免污染既有字段顺序
       Extras extras,
+      // 取证域：最近若干条块更新处置（多坐标包 / 丢弃 / 补发 / 合批校验失败）
+      Trace trace,
       BandwidthConfig bandwidth) {
 
     /**
-     * 兼容构造：调用方不提供附加诊断时用零值组。
+     * 兼容构造：调用方不提供附加诊断与取证环时用零值组。
      *
      * <p>存在的理由：{@link Snapshot} 的既有调用点（含离线用例）只关心主字段，
      * 不应为了新增一个观测字段而全部改写；附加诊断缺失时按「未采集」渲染，不伪造 0。
@@ -105,7 +108,32 @@ public final class Diagnostics {
         Throttle throttle, Pool pool, DiskCache diskCache, ChunkAccessor chunkAccessor,
         AntiXrayConfig antiXray, BandwidthConfig bandwidth) {
       this(env, rewrite, proximity, index, occlusion, throttle, pool, diskCache, chunkAccessor,
-          antiXray, Extras.EMPTY, bandwidth);
+          antiXray, Extras.EMPTY, Trace.EMPTY, bandwidth);
+    }
+
+    /** 兼容构造：提供附加诊断、但没有取证环的调用点。 */
+    public Snapshot(Env env, Rewrite rewrite, Proximity proximity, Index index, Occlusion occlusion,
+        Throttle throttle, Pool pool, DiskCache diskCache, ChunkAccessor chunkAccessor,
+        AntiXrayConfig antiXray, Extras extras, BandwidthConfig bandwidth) {
+      this(env, rewrite, proximity, index, occlusion, throttle, pool, diskCache, chunkAccessor,
+          antiXray, extras, Trace.EMPTY, bandwidth);
+    }
+
+    /**
+     * 取证域：最近若干条块更新处置的<b>预格式化文本</b>（每行一条，最新在前）。
+     *
+     * <p>为什么不直接持有带宽域的 {@code BlockUpdateTrace.Entry}：诊断层只负责渲染；格式一旦演进
+     * （加字段、改措辞）不必穿透到带宽域，同时保持 {@link Snapshot} 可离线构造与断言。
+     */
+    public record Trace(List<String> lines) {
+
+      /** 未采集时的空环。 */
+      public static final Trace EMPTY = new Trace(List.of());
+
+      /** 是否采到了处置记录。 */
+      public boolean collected() {
+        return !lines.isEmpty();
+      }
     }
 
     /** 配置指纹（取自反矿透配置；无配置时为 0）。 */
@@ -125,11 +153,12 @@ public final class Diagnostics {
      */
     public record Extras(long discardedByDimensionEvent, long discardedByPositionSnapshot,
         long discardedByBlacklist, long discardedByFlushSnapshot, long unknownSectionNoStore,
-        long unknownSectionNoEntry, double viewChangeP99Millis) {
+        long unknownSectionNoEntry, double viewChangeP99Millis, long discardRedeemed,
+        long mergeVerifyFailed) {
 
       /** 未采集附加诊断时的零值兜底。 */
       public static final Extras EMPTY =
-          new Extras(0L, 0L, 0L, 0L, 0L, 0L, Double.NaN);
+          new Extras(0L, 0L, 0L, 0L, 0L, 0L, Double.NaN, 0L, 0L);
 
       /** 是否采到了附加诊断（p99 为 NaN 即未采集，渲染层据此写「未采集」而不是 0 ms）。 */
       public boolean collected() {
@@ -1005,6 +1034,7 @@ public final class Diagnostics {
         chunkAccessorSnapshot(runtime),
         config == null ? null : config.antiXray(),
         extrasSnapshot(throttleStats, occlusionStats, proximityStats),
+        traceSnapshot(pipeline),
         config == null ? null : config.bandwidth());
   }
 
@@ -1013,6 +1043,28 @@ public final class Diagnostics {
    *
    * <p>各计数为 {@code null} 时按 0 处理：字段缺失只影响「拆分」这一层，不能让整份 dump 抛异常。
    */
+  /**
+   * 组装取证域：最近若干条块更新处置（最新在前，上限 32 条）。
+   *
+   * <p>只做渲染，不做判定：合并器未接线（缺 ProtocolLib / 配置关闭）时返回空环，dump 里写
+   * 「未采集」而不是伪造记录——一份看着有内容、其实是空壳的取证段比没有更误导。
+   */
+  private static Snapshot.Trace traceSnapshot(ThrottlePipeline pipeline) {
+    BlockUpdateTrace trace = pipeline == null ? null : pipeline.blockUpdateTrace();
+    if (trace == null) {
+      return Snapshot.Trace.EMPTY;
+    }
+    List<BlockUpdateTrace.Entry> entries = trace.snapshot();
+    if (entries.isEmpty()) {
+      return Snapshot.Trace.EMPTY;
+    }
+    List<String> lines = new ArrayList<>(entries.size());
+    for (BlockUpdateTrace.Entry entry : entries) {
+      lines.add(entry.line());
+    }
+    return new Snapshot.Trace(lines);
+  }
+
   private static Snapshot.Extras extrasSnapshot(ThrottleStats throttle, OcclusionStats occlusion,
       ProximityStats proximity) {
     double p99 = proximity == null ? Double.NaN
@@ -1024,7 +1076,9 @@ public final class Diagnostics {
         throttle == null ? 0L : throttle.discardedByFlushSnapshot.sum(),
         occlusion == null ? 0L : occlusion.unknownSectionNoStore.sum(),
         occlusion == null ? 0L : occlusion.unknownSectionNoEntry.sum(),
-        p99);
+        p99,
+        throttle == null ? 0L : throttle.discardRedeemed.sum(),
+        throttle == null ? 0L : throttle.mergeVerifyFailed.sum());
   }
 
   /**
@@ -1238,6 +1292,10 @@ public final class Diagnostics {
         + " / 快照比对 " + s.extras().discardedByPositionSnapshot()
         + " / 黑名单 " + s.extras().discardedByBlacklist()
         + " / 冲刷前比对 " + s.extras().discardedByFlushSnapshot() + "）"
+        // 取消即欠账的两条兜底：本应丢弃但世界没变 → 改为补发；合并包坐标内容对不上 → 退回逐条补发。
+        // 两者正常运营恒为 0；持续非 0 说明丢弃判定或协议字段布局出了问题。
+        + "｜同世界补发 " + s.extras().discardRedeemed()
+        + "，合批校验失败 " + s.extras().mergeVerifyFailed()
         // 单线程冲刷的「次数 + 累计耗时」：极端配置下的延迟瓶颈靠它观测（累计/次数 = 平均一次的成本）
         + "；单线程冲刷 " + s.throttle().blockMergeFlushes() + " 次（累计 "
         + formatMillis(s.throttle().blockMergeFlushNanos()) + " ms，平均 "
@@ -1631,10 +1689,29 @@ public final class Diagnostics {
     }
     // 位宽直方图（P0-1 可选项）：改写 section 的 bitsPerBlock 分布，观察「封顶+裁剪」的降位效果
     sb.append("调色板位宽分布（改写 section 累计）：").append(s.rewrite().paletteBitsSummary()).append('\n');
+    appendBlockUpdateTrace(sb, s.trace());
     sb.append('\n').append("---- 配置项有效值 ----\n");
     appendAntiXray(sb, s.antiXray());
     appendBandwidth(sb, s.bandwidth());
     return sb.toString();
+  }
+
+  /**
+   * 追加「最近块更新处置」取证段（最多 32 行）。
+   *
+   * <p><b>为什么放在 dump 而不是状态面板</b>：它是逐条流水，面板要保持一眼可读；而排查「门只开一半」
+   * 这类问题时，服主导出一份 dump 就能把「那两片方块各自走了哪条路」一并带走，不必再让人盯着现场
+   * 反复开关门。没有记录时明确写「未采集」并给出成因，不写空段。
+   */
+  private static void appendBlockUpdateTrace(StringBuilder sb, Snapshot.Trace trace) {
+    sb.append('\n').append("---- 最近块更新处置（最新在前，最多 32 条）----\n");
+    if (trace == null || !trace.collected()) {
+      sb.append("未采集（方块变更合并未接线，或窗口内没有多坐标包 / 丢弃 / 补发 / 合批校验失败）\n");
+      return;
+    }
+    for (String line : trace.lines()) {
+      sb.append(line).append('\n');
+    }
   }
 
   private static void appendAntiXray(StringBuilder sb, AntiXrayConfig c) {
@@ -1781,7 +1858,13 @@ public final class Diagnostics {
         .append("，max-pending-entries=").append(c.blockChanges().maxPendingEntries()).append('\n');
     sb.append("palette.enabled=").append(c.palette().enabled())
         .append("，strict-verify=").append(c.palette().strictVerify())
-        .append("，width-budget=").append(c.palette().widthBudget()).append('\n');
+        .append("，width-budget=").append(c.palette().widthBudget());
+    if (!c.palette().strictVerify()) {
+      // 自检关闭时，改写结果里「状态与调色板不匹配」不会回退整块，而是照常编码下发。
+      // 1.34.1 的「成片错方块」正是在这个组合下全程静默——把风险直接印在 dump 里，比藏在注释里有用。
+      sb.append("（注意：自检关闭，改写后状态错配不会回退整块；要最严校验请设 strict-verify=true）");
+    }
+    sb.append('\n');
     sb.append("entity-culling.enabled=").append(c.entityCulling().enabled())
         .append("，raycast=").append(c.entityCulling().raycast())
         .append("，force-visible-distance=").append(c.entityCulling().forceVisibleDistance())

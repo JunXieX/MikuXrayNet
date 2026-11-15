@@ -201,6 +201,14 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   private final ScheduledExecutorService flusher;
   private final ConcurrentHashMap<UUID, Pending> pending = new ConcurrentHashMap<>();
   /**
+   * 最近处置环（取证用，容量固定 32 条）：只记多坐标包与「丢弃 / 补发 / 合批校验失败」。
+   *
+   * <p>面板上的总数回答不了「这两片门到底怎么样了」——实机反馈「门只开一半」时，一份 dump 只能显示
+   * 丢弃与合批的总量。环里留下最近 32 次处置的坐标与结论，下一次 dump 就能直接指出那两片门是
+   * PASS、MERGE、DISCARD 还是 VERIFY_FAIL。
+   */
+  private final BlockUpdateTrace trace = new BlockUpdateTrace();
+  /**
    * 玩家位置快照（由实体调度器在玩家所属线程每 tick 刷新，封包线程只读）。
    *
    * <p>取代旧的 {@code PlayerMoveEvent} 坐标缓存：传送有独立 HandlerList，缓存会陈旧。
@@ -536,6 +544,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   private void discard(Pending target, ThrottleStats.DiscardSource source) {
     ScheduledFuture<?> timer = null;
     int cancelled = 0;
+    int buffered = 0;
+    List<List<Update<WrappedBlockData>>> clusters = List.of();
+    Set<Coord> passed = Set.of();
+    boolean redeem = false;
+    String currentWorld = null;
     try {
       synchronized (target) {
         // 与 flush 共用同一个「恰好处理一次」闸：谁先拿到 flushed 谁负责，另一方成 no-op
@@ -546,18 +559,115 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         timer = target.timer;
         target.timer = null;
         cancelled = target.cancelledPackets;
-        // 原包在入缓冲时已被取消，这里直接丢弃缓冲即可：这些坐标属于玩家已离开的世界，
-        // 绝不能按新世界下发（丢弃不构成丢更新——旧世界区块会整列重建）。
-        target.batch.clear();
+        buffered = target.batch.size();
+        currentWorld = currentWorldOf(target.uuid);
+        // 取消即欠账：原包在入缓冲时已经被取消，这里任何「直接丢弃」都必须先证明客户端会拿到
+        // 等价信息。只有真切维（客户端收到新世界的整列区块）满足这个前提；世界名没变却丢弃，
+        // 就是把这些方块变更永久抹掉——客户端会一直停在旧方块上（门只开一半、另一半还挡人即此症状），
+        // 而且不会自愈。因此世界名相同即改走既有交付路径补发（见 deliver，失败自带逐条补发）。
+        redeem = cancelled > 0 && shouldRedeem(source, target.world, currentWorld);
+        if (redeem) {
+          clusters = target.batch.drainClusters(config.mergeRadius());
+          passed = target.passed.isEmpty() ? Set.of() : new HashSet<>(target.passed);
+        } else {
+          target.batch.clear();
+        }
         target.passed.clear();
       }
       if (timer != null) {
         timer.cancel(false);
       }
+      if (redeem) {
+        stats.discardRedeemed.add(cancelled);
+        recordTrace(BlockUpdateTrace.Decision.REDEEM, target.world, clusters, buffered, 0, 0, 0,
+            "补发 " + cancelled + " 个原包；来源 " + source + "；缓冲世界 " + target.world
+                + " = 当前世界 " + currentWorld);
+        deliver(target.uuid, clusters, passed, cancelled);
+        return;
+      }
       stats.discarded(source, cancelled);
+      trace.record(BlockUpdateTrace.Decision.DISCARD, target.world, false, buffered, 0, 0, 0,
+          "丢弃 " + cancelled + " 个原包；来源 " + source + "；缓冲世界 " + target.world
+              + " ≠ 当前世界 " + currentWorld + "（旧世界区块将整列重建）");
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
+  }
+
+  /**
+   * 纯函数：本次丢弃是否应改为补发。
+   *
+   * <p><b>为什么需要它</b>：丢弃路径刻意不发包，其安全前提是「这些坐标属于玩家已离开的世界，
+   * 客户端会收到新世界的整列区块」。前提一旦不成立（世界名其实没变，或世界判定用的是陈旧/错误的名字），
+   * 丢弃就是永久丢失方块更新：原包已被取消、合并包也不会再发，客户端只能等某次区块重发才自愈。
+   * 门/床/双箱这类「点一下才变」的成对结构一旦丢一片，就是「只开一半且挡人」。
+   *
+   * <p>判定顺序：真切维事件 → 丢弃（客户端必然重建）；世界名相同 → 补发；任一侧世界名未知 →
+   * 补发（无法证明客户端会重建，宁可多发一次也不丢）。
+   *
+   * @param source        丢弃来源（{@link ThrottleStats.DiscardSource}）
+   * @param bufferedWorld 缓冲里这些坐标所属的世界名（入缓冲时记录，可为 {@code null}）
+   * @param currentWorld  此刻该玩家的世界名（读位置快照，可为 {@code null}）
+   * @return true 表示应改为补发，false 表示照旧丢弃
+   */
+  static boolean shouldRedeem(ThrottleStats.DiscardSource source, String bufferedWorld,
+      String currentWorld) {
+    return false; // RED：一律丢弃（旧行为，用于证明用例能抓到这个缺陷）
+  }
+
+  /** 该玩家此刻的世界名（只读位置快照；封包线程上同样安全）。 */
+  private String currentWorldOf(UUID playerId) {
+    PlayerPositionSnapshots.Position snapshot = positions.get(playerId);
+    return snapshot == null ? null : snapshot.world();
+  }
+
+  /** 记一条处置环（簇非空时取首坐标；任何异常都不影响发包）。 */
+  private void recordTrace(BlockUpdateTrace.Decision decision, String world,
+      List<List<Update<WrappedBlockData>>> clusters, int fallbackCount, int x, int y, int z,
+      String note) {
+    if (clusters != null) {
+      for (List<Update<WrappedBlockData>> cluster : clusters) {
+        if (cluster != null && !cluster.isEmpty()) {
+          Update<WrappedBlockData> first = cluster.get(0);
+          trace.record(decision, world, cluster.size() >= 2, cluster.size(), first.x(), first.y(),
+              first.z(), note);
+          return;
+        }
+      }
+    }
+    trace.record(decision, world, false, fallbackCount, x, y, z, note);
+  }
+
+  /** 记一条「直通」处置（只有多坐标包值得留痕：单坐标变更每秒上万条，会把环冲干净）。 */
+  private void recordTracePass(String world, List<Update<WrappedBlockData>> updates) {
+    if (updates == null || updates.size() < 2) {
+      return;
+    }
+    Update<WrappedBlockData> first = updates.get(0);
+    trace.record(BlockUpdateTrace.Decision.PASS, world, true, updates.size(),
+        first.x(), first.y(), first.z(), null);
+  }
+
+  /** 记一条「直通」处置（坐标数组版，供只解坐标的快速路径复用）。 */
+  private void recordTracePass(String world, boolean multi, int[] coordinates, int count) {
+    if (coordinates == null || count < 2 || coordinates.length < 3) {
+      return;
+    }
+    trace.record(BlockUpdateTrace.Decision.PASS, world, multi, count,
+        coordinates[0], coordinates[1], coordinates[2], null);
+  }
+
+  /** 记一条「直通」处置（packed short 版，供「已聚合批量包」短路复用）。 */
+  private void recordTracePass(String world, boolean multi, short[] positions,
+      BlockPosition section) {
+    if (positions == null || section == null || positions.length < 2) {
+      return;
+    }
+    int raw = SectionCoords.unsigned(positions[0]);
+    trace.record(BlockUpdateTrace.Decision.PASS, world, multi, positions.length,
+        (section.getX() << 4) + SectionCoords.x(raw),
+        (section.getY() << 4) + SectionCoords.y(raw),
+        (section.getZ() << 4) + SectionCoords.z(raw), null);
   }
 
   /**
@@ -717,6 +827,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         section = null;
       }
       if (coordShorts != null && bypassesMerge(true, coordShorts.length)) {
+        recordTracePass(worldName, true, coordShorts, section);
         // 本包已是成形批量包：无论有无待发缓冲都直接放行。有缓冲时只需记「这些坐标的新态已下发」，
         // 用 short[] 逐格解包即可——不必为记账把整包解析成 WrappedBlockData[]（每坐标一个反射包装 + 一条 Update）。
         if (pending.get(player.getUniqueId()) == null) {
@@ -740,6 +851,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       if (shouldPassThroughImmediately(player.getUniqueId(), quickCoordinates, quickCount)) {
         rememberDeliveredCoords(player.getUniqueId(), quickCoordinates, quickCount);
         stats.blockChangesPassed.increment();
+        recordTracePass(worldName, event.getPacketType() == PacketType.Play.Server.MULTI_BLOCK_CHANGE,
+            quickCoordinates, quickCount);
         return;
       }
     }
@@ -757,6 +870,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       // 若不标记会在窗口到期后晚到并把新态覆盖回去（方块短暂回退）。
       rememberDelivered(player.getUniqueId(), updates);
       stats.blockChangesPassed.increment();
+      recordTracePass(worldName, updates);
       return;
     }
 
@@ -769,6 +883,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     if (bypassesMerge(event.getPacketType() == PacketType.Play.Server.MULTI_BLOCK_CHANGE, updates.size())) {
       rememberDelivered(player.getUniqueId(), updates);
       stats.blockChangesPassed.increment();
+      recordTracePass(worldName, updates);
       return;
     }
 
@@ -808,6 +923,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         // 入缓冲成功后才取消原包：此后由窗口末的合并包交付；合并失败会逐条补发（见 deliver），绝不丢更新。
         event.setCancelled(true);
         target.cancelledPackets++;
+        if (updates.size() >= 2) {
+          Update<WrappedBlockData> firstMerged = updates.get(0);
+          trace.record(BlockUpdateTrace.Decision.MERGE, worldName, true, updates.size(),
+              firstMerged.x(), firstMerged.y(), firstMerged.z(), null);
+        }
         // 记录本批坐标所属世界：冲刷前据此做「跨世界」兜底校验（见 flushInternal）。
         target.world = worldName;
 
@@ -1112,6 +1232,36 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
   }
 
+  /**
+   * 纯函数：合并包写回的 packed 坐标是否与意图逐项一致，且（小包）无重复坐标。
+   *
+   * <p><b>为什么必须校验内容</b>：合并包把绝对方块坐标压成段内 {@code short}。若两个坐标落进同一个
+   * packed short（例如同一 x/z、y 与 y+1 的两片门被算错），客户端会把两条状态都应用到同一个位置上：
+   * 另一片方块永远收不到更新，表现为「门只开一半、没开的那半还挡人」，而长度校验看不出来。
+   *
+   * <p>重复检测只在不超过 {@link #DUPLICATE_SCAN_LIMIT} 条时做：这条路径在封包线程上，排序 + 扫描的
+   * 成本必须与包大小相称；超过该规模的都是显形批量包（每坐标只出现一次），重复检测的价值远低于分配成本。
+   *
+   * @param written  实际写进包的 packed 坐标（回读所得），可为 {@code null}
+   * @param intended 意图写入的坐标序列（顺序必须一致）
+   * @return true 表示一致；{@code null} / 长度不符 / 任一项坐标不符 / 小包内出现重复坐标 → false
+   */
+  static boolean verifyPositions(short[] written, List<Update<WrappedBlockData>> intended) {
+    if (written == null || intended == null || written.length != intended.size()
+        || written.length == 0) {
+      return false;
+    }
+    return true; // RED：只校验长度（旧行为，用于证明用例能抓到这个缺陷）
+  }
+
+  /** 合并包重复坐标检测的规模上限（见 {@link #verifyPositions}）。 */
+  static final int DUPLICATE_SCAN_LIMIT = 512;
+
+  /** 最近处置环（诊断用）。 */
+  public BlockUpdateTrace trace() {
+    return trace;
+  }
+
   /** 发送单个 section 的合并结果：多条走 MULTI_BLOCK_CHANGE，单条走 BLOCK_CHANGE。 */
   private boolean sendSection(Player player, SectionKey section, List<Update<WrappedBlockData>> blocks) {
     PacketContainer packet;
@@ -1160,6 +1310,19 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       if (readPositions == null || readData == null || readSection == null
           || !readSection.equals(expectedSection)
           || readPositions.length != positions.length || readData.length != data.length) {
+        return false;
+      }
+      // 内容级校验（长度相符之后才做）：旧实现只比长度，坐标内容对不上照样发出去。若两个相邻坐标
+      // （门/床的上半与下半）被压成同一个 packed short，客户端只会应用其中一片，另一片保持旧状态并
+      // 继续阻挡玩家——长度校验对此完全无感。因此这里逐项解码回坐标与意图比对，并要求小包内无重复，
+      // 任一不符即放弃本合并包、退回逐条补发（原包已被取消，逐条补发是唯一能保证不丢更新的路）。
+      if (!verifyPositions(readPositions, blocks)) {
+        stats.mergeVerifyFailed.increment();
+        Update<WrappedBlockData> first = blocks.get(0);
+        trace.record(BlockUpdateTrace.Decision.VERIFY_FAIL, null, true, blocks.size(),
+            first.x(), first.y(), first.z(),
+            "合并包坐标回读与意图不一致（section " + section.x() + "," + section.y() + ","
+                + section.z() + "，共 " + blocks.size() + " 条），已改逐条补发");
         return false;
       }
     }

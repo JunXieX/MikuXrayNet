@@ -396,6 +396,17 @@ public final class ThrottlePipeline {
     return stats;
   }
 
+  /**
+   * 最近块更新处置环（诊断用）；方块变更合并未装配时返回 {@code null}。
+   *
+   * <p>只读快照的包装：{@code blockChangeMerger} 未接线（缺 ProtocolLib / 配置关闭）时为 null，
+   * 调用方按「无环」渲染，绝不因为取证而影响任何路径。
+   */
+  public BlockUpdateTrace blockUpdateTrace() {
+    BlockChangeMerger merger = blockChangeMerger;
+    return merger == null ? null : merger.trace();
+  }
+
   /** 当前处于 AFK 状态的玩家数（诊断用）；未启用 AFK 模块时为 0。 */
   public int afkPlayerCount() {
     AfkTracker tracker = afkTracker;
