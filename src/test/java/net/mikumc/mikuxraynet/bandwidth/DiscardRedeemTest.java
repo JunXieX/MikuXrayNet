@@ -40,6 +40,18 @@ class DiscardRedeemTest {
   }
 
   @Test
+  void flushTimeGuardSharesTheSameTable() {
+    // 冲刷前的第三道守卫此前是一段独立判断，与 discard() 各写一遍；现在两者都走这张表，
+    // 因此这里显式钉住「同一世界不丢、不同世界才丢」，避免以后只改一处。
+    assertTrue(BlockChangeMerger.shouldRedeem(DiscardSource.FLUSH_SNAPSHOT, "world", "world"),
+        "冲刷前比对的缓冲世界与当前世界相同 → 不得丢弃");
+    assertFalse(BlockChangeMerger.shouldRedeem(DiscardSource.FLUSH_SNAPSHOT, "world", "world_nether"),
+        "冲刷前比对确认世界已变 → 与真切维同等处理");
+    assertTrue(BlockChangeMerger.shouldRedeem(DiscardSource.FLUSH_SNAPSHOT, "world", null),
+        "快照缺失 → 无法证明客户端会重建，按不丢处理（fail-open）");
+  }
+
+  @Test
   void unknownWorldOnEitherSideRedeems() {
     assertTrue(BlockChangeMerger.shouldRedeem(DiscardSource.POSITION_SNAPSHOT, null, "world"),
         "缓冲侧世界未知：无法证明客户端会重建 → 宁可多发一次");

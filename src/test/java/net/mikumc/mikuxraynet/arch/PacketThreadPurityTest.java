@@ -35,7 +35,14 @@ class PacketThreadPurityTest {
       "patchMulti",
       "unregisterCoordinate",
       "processChanges",
-      "observeChange");
+      "observeChange",
+      // 合并线程 MikuXrayNet-BlockMerge 与封包线程同源约束：不得读实体世界/位置。
+      // deliver / trySendMerged 就在这条线程上取玩家实例并发送，读实体状态会先打 ERROR 再抛，
+      // 而抛出会让整批已取消的更新随之消失（见 BlockChangeMerger 的「取消即欠账」不变量）。
+      "deliver",
+      "trySendMerged",
+      "flushInternal",
+      "sendSection");
 
   private static final Pattern METHOD = Pattern.compile(
       "\\b(?:void|boolean|int)\\s+(%s)\\s*\\(");

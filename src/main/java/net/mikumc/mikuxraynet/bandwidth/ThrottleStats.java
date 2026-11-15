@@ -75,6 +75,17 @@ public final class ThrottleStats {
   public final LongAdder mergeVerifyFailed = new LongAdder();
 
   /**
+   * 合并失败后<b>逐条补发</b>仍未能发出的方块更新条数（按条计，不按包计）。
+   *
+   * <p><b>为什么必须单列</b>：这条是最后一道防线——原包在入缓冲时就已取消，逐条补发是唯一还能把它们
+   * 送到客户端的手段。旧实现用裸循环补发：中途抛出会让剩下的条目一起消失，而且只留一条限流日志
+   * （{@code MAX_ERROR_LOGS} 之后连日志都没有），于是「仍旧缺几格方块」这件事在面板上完全不可见。
+   * 正常运营恒为 0；非 0 说明协议字段映射失效或连接异常，客户端<b>确实</b>缺这些方块更新（表现为
+   * 方块停在旧状态、门只开一半）。
+   */
+  public final LongAdder sendFailed = new LongAdder();
+
+  /**
    * 丢弃来源（{@link #blockChangesDiscarded} 的拆分）。
    *
    * <p><b>为什么必须拆</b>：实机 dump 里「丢弃 62.8 万」约占全部方块变更包的四分之一，而四条入口

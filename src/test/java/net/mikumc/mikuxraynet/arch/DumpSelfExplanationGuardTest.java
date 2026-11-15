@@ -115,4 +115,35 @@ class DumpSelfExplanationGuardTest {
     assertTrue(source("util/Diagnostics.java").contains("自检关闭"),
         "strict-verify=false 时改写错配不会回退整块，这个风险必须印在 dump 里而不是藏在注释里");
   }
+
+  @Test
+  void lastResortResendGoesThroughTheGuardedHelper() throws Exception {
+    assertTrue(source("bandwidth/BlockChangeMerger.java").contains("deliverEach("),
+        "最后一道防线（逐条补发）必须走 UpdateDelivery：裸循环在中途抛出会把剩余条目一起丢掉");
+    String delivery = source("bandwidth/UpdateDelivery.java");
+    assertTrue(delivery.contains("catch (Throwable"), "逐条投递必须每条独立兜底，方法自身永不抛出");
+    assertTrue(source("bandwidth/ThrottleStats.java").contains("sendFailed"),
+        "逐条补发仍失败的条数必须可观测：正常恒为 0，非 0 代表客户端确实缺了这些方块更新");
+  }
+
+  @Test
+  void flushDiscardReusesTheSinglePredicate() throws Exception {
+    String merger = source("bandwidth/BlockChangeMerger.java");
+    int flush = merger.indexOf("private boolean flushInternal(");
+    assertTrue(flush > 0, "flushInternal 必须仍存在");
+    String body = merger.substring(flush, Math.min(merger.length(), flush + 6000));
+    assertTrue(body.contains("shouldRedeem("),
+        "冲刷前的丢弃判定必须复用 shouldRedeem：此前它与 discard() 各写一遍，测试断言那张表、"
+            + "生产代码却没查它");
+  }
+
+  @Test
+  void flushDiscardIsTracedIntoTheRing() throws Exception {
+    String merger = source("bandwidth/BlockChangeMerger.java");
+    int flush = merger.indexOf("private boolean flushInternal(");
+    String body = merger.substring(flush, Math.min(merger.length(), flush + 6000));
+    assertTrue(body.contains("trace.record("),
+        "四条丢弃入口一律要留痕：只有总数的话，「门只开一半」在现场无法离线定位");
+    assertTrue(body.contains("FLUSH_SNAPSHOT"), "冲刷前比对这条来源必须点名");
+  }
 }

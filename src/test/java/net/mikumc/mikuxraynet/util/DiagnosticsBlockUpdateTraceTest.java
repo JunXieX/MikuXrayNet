@@ -43,8 +43,9 @@ class DiagnosticsBlockUpdateTraceTest {
         null, extras, trace, bandwidth);
   }
 
-  private static Snapshot.Extras extras(long redeemed, long verifyFailed) {
-    return new Snapshot.Extras(0L, 0L, 0L, 0L, 0L, 0L, Double.NaN, redeemed, verifyFailed);
+  private static Snapshot.Extras extras(long redeemed, long verifyFailed, long sendFailed) {
+    return new Snapshot.Extras(0L, 0L, 0L, 0L, 0L, 0L, Double.NaN, redeemed, verifyFailed,
+        sendFailed);
   }
 
   @Test
@@ -52,7 +53,7 @@ class DiagnosticsBlockUpdateTraceTest {
     Snapshot.Trace trace = new Snapshot.Trace(List.of(
         "#12 MERGE  (100,65,-200) 2 个坐标 multi=true 世界 world",
         "#11 PASS  (100,64,-200) 2 个坐标 multi=true 世界 world"));
-    String dump = Diagnostics.formatDump(snapshot(extras(0L, 0L), trace, null), "20261115-000000");
+    String dump = Diagnostics.formatDump(snapshot(extras(0L, 0L, 0L), trace, null), "20261115-000000");
     assertTrue(dump.contains("---- 最近块更新处置（最新在前，最多 32 条）----"),
         "取证段头部必须存在：" + dump);
     assertTrue(dump.contains("#12 MERGE"), "每条流水必须原样渲染：" + dump);
@@ -61,7 +62,7 @@ class DiagnosticsBlockUpdateTraceTest {
 
   @Test
   void emptyTraceExplainsWhyThereIsNoRecord() {
-    String dump = Diagnostics.formatDump(snapshot(extras(0L, 0L), Snapshot.Trace.EMPTY, null),
+    String dump = Diagnostics.formatDump(snapshot(extras(0L, 0L, 0L), Snapshot.Trace.EMPTY, null),
         "20261115-000000");
     assertTrue(dump.contains("未采集（方块变更合并未接线"),
         "空环必须写清成因，不能只留一个空段：" + dump);
@@ -69,10 +70,18 @@ class DiagnosticsBlockUpdateTraceTest {
 
   @Test
   void redeemedAndVerifyFailedCountersAreRendered() {
-    String dump = Diagnostics.formatDump(snapshot(extras(1234L, 7L), Snapshot.Trace.EMPTY, null),
+    String dump = Diagnostics.formatDump(snapshot(extras(1234L, 7L, 0L), Snapshot.Trace.EMPTY, null),
         "20261115-000000");
     assertTrue(dump.contains("同世界补发 1234"), "补发次数必须印出来：" + dump);
     assertTrue(dump.contains("合批校验失败 7"), "合批校验失败次数必须印出来：" + dump);
+  }
+
+  @Test
+  void sendFailedCounterIsRendered() {
+    String dump = Diagnostics.formatDump(snapshot(extras(0L, 0L, 5L), Snapshot.Trace.EMPTY, null),
+        "20261115-000000");
+    assertTrue(dump.contains("单条补发失败 5"),
+        "逐条补发仍失败的条数必须可见——它代表客户端确实缺了这些方块更新：" + dump);
   }
 
   @Test
