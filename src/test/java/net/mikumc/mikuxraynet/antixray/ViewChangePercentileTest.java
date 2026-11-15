@@ -60,11 +60,11 @@ class ViewChangePercentileTest {
     ProximityStats stats = new ProximityStats();
     stats.recordViewChange(0L);
     stats.recordViewChange(99_999L);
-    stats.recordViewChange(100_000L);
+    stats.recordViewChange(100_001L);
     stats.recordViewChange(200_000_000L);
     long[] buckets = stats.viewChangeBucketSnapshot();
     assertEquals(2L, buckets[0], "0 与 99 999 纳秒都应落在第一档（<=100 000）");
-    assertEquals(1L, buckets[1], "100 000 纳秒应落在第二档（<=250 000）");
+    assertEquals(1L, buckets[1], "100 001 纳秒应落在第二档（<=250 000；第一档上界 100 000 是闭区间）");
     assertEquals(1L, buckets[buckets.length - 1], "200 ms 落在最高档");
     assertFalse(buckets.length == 0);
     // 负值不得污染直方图

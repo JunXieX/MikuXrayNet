@@ -1265,12 +1265,13 @@ public final class Diagnostics {
         // 判定异常单列：单条判定抛异常被就地吞掉（不改变显示状态，方向安全），但持续非 0 说明射线链路
         // 收到越界/畸形坐标等异常输入，会导致部分判定静默丢失——必须可见才能定位。
         + "，判定异常 " + s.occlusion().computeFailures()
-        + "，缺遮挡数据 " + s.occlusion().unknownSection()
+        + "，缺遮挡数据 " + s.occlusion().unknownSection() + " 次"
         // 两类来源：世界级（整张表为空：世界刚加载 / 已卸载）与段级（该段没建表或被补丁跳过）。
-        // 前者应随运行时间趋零，后者会稳定存在——只给总数时无法判断「该等」还是「该查」
+        // 前者应随运行时间趋零，后者会稳定存在——只给总数时无法判断「该等」还是「该查」。
+        // 括号刻意放在「次」之后：既有的「缺遮挡数据 N 次」口径必须保持连续（面板对账脚本与用例都靠它）
         + "（世界无表 " + s.extras().unknownSectionNoStore()
         + " / 段无条目 " + s.extras().unknownSectionNoEntry() + "）"
-        + " 次，方块补丁 " + s.occlusion().patched() + " 格（失败 " + s.occlusion().patchFailures()
+        + "，方块补丁 " + s.occlusion().patched() + " 格（失败 " + s.occlusion().patchFailures()
         // 补丁的「状态id回落」单列：>0 说明补丁暂时拿不到逐状态 id、退回了 Material 级近似，此时
         // 补丁与位图可能对「同方块不同状态」结论不同——必须可见，否则该残余差异无从察觉。
         + " 格，状态id回落 " + s.occlusion().stateIdFallbacks()
