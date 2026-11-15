@@ -68,6 +68,13 @@ import org.bukkit.plugin.Plugin;
  * 字段做结构校验（单条与多条的路径都做）。校验不过即放弃本次合并结果、按 section 逐条补发原更新——
  * 原包此时已被取消，退化成逐条补发是唯一能保证「不丢更新」的做法。
  *
+ * <p><b>不变量（取消即欠账）</b>：凡本类 {@code event.setCancelled(true)} 过的包，<b>必须</b>经
+ * {@link #deliver} 的合并包或 {@link UpdateDelivery#deliverEach} 的逐条补发之一离开本模块；
+ * 整批丢弃只允许在「已证明玩家换到了别的世界、客户端会整列重建该世界区块」时发生（四条入口共用
+ * {@link #shouldRedeem} 这一张判定表）。交付末段的任何一步都不允许把异常当成「玩家已离线」：
+ * 探测失败按「未知、照常发送」处理，单条失败只损失该条并计入 {@code ThrottleStats#sendFailed}。
+ * 违反这条不变量的表现就是「门只开一半、另一半永远不动」。
+ *
  * <p><b>已聚合的批量包直接放行</b>：{@code MULTI_BLOCK_CHANGE} 若携带的坐标数达到
  * {@link #MULTI_BLOCK_BATCH_THRESHOLD}，视为「本已是一次批量下发」（反矿透的邻近显形正是
  * 由 Paper 原生 {@code sendMultiBlockChange} 按区块段一次性发出），直接放行原包——不进 Pending、
@@ -1069,6 +1076,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     int cancelled = 0;
     int discarded = 0;
     boolean worldChanged = false;
+    String bufferedWorld = null;
+    String currentWorld = null;
     ScheduledFuture<?> timer = null;
     try {
       synchronized (target) {
@@ -1082,11 +1091,16 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         // 第三道跨世界守卫：缓冲内的坐标属于 target.world（入缓冲时的世界）；玩家此刻若已在别的世界，
         // 整批丢弃——旧世界坐标按新世界下发会在客户端留下「鬼影方块」。旧世界区块会整列重建，
         // 丢弃不构成丢更新。快照缺失（刚登录 / 刚重置）时无法判断，保持原行为（照常合并，fail-open）。
-        String bufferedWorld = target.world;
+        bufferedWorld = target.world;
         if (bufferedWorld != null) {
           PlayerPositionSnapshots.Position snapshot = positions.get(target.uuid);
-          worldChanged = snapshot != null && snapshot.world() != null
-              && !snapshot.world().equals(bufferedWorld);
+          currentWorld = snapshot == null ? null : snapshot.world();
+          // 丢弃判定与其余三源共用同一张表（见 shouldRedeem）：只有「证据充分」地确认玩家已换世界
+          // （缓冲世界与当前世界都非 null 且不同）才允许整批丢弃；快照缺失按 fail-open 照常合并。
+          // 之前这里是一段独立的条件判断，与 discard() 各写一遍——同一件事两种写法，测试断言的是
+          // 那张表，而生产代码在这个点根本没查它。
+          worldChanged = !shouldRedeem(ThrottleStats.DiscardSource.FLUSH_SNAPSHOT, bufferedWorld,
+              currentWorld);
         }
         if (worldChanged) {
           discarded = target.cancelledPackets;
@@ -1104,6 +1118,10 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       }
       if (worldChanged) {
         stats.discarded(ThrottleStats.DiscardSource.FLUSH_SNAPSHOT, discarded);
+        // 四条丢弃入口一律留痕：这是「门只开一半」排查里最先要看的东西，不能只有总数
+        trace.record(BlockUpdateTrace.Decision.DISCARD, bufferedWorld, false, discarded, 0, 0, 0,
+            "冲刷前比对：缓冲世界 " + bufferedWorld + " ≠ 当前世界 " + currentWorld
+                + "（旧世界区块将整列重建）");
         return false; // 旧世界的被延迟包按丢弃处理：既未下发、也未合并
       }
       if (cancelled <= 0) {
@@ -1124,9 +1142,21 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    */
   private void deliver(UUID playerId, List<List<Update<WrappedBlockData>>> clusters,
       Set<Coord> passed, int cancelled) {
-    Player player = Bukkit.getPlayer(playerId);
-    if (player == null || !player.isOnline()) {
-      // 玩家已离线：客户端不存在了，取消原包不构成丢更新
+    Player player;
+    try {
+      player = Bukkit.getPlayer(playerId);
+    } catch (Throwable throwable) {
+      // 连玩家实例都取不到：这批已取消的更新无法投递。历史实现同样投不了，但那时它被当成
+      // 「玩家已离线」静默吞掉；这里改成显式计数 + 留痕，绝不把一次异常伪装成正常离线。
+      stats.sendFailed.add(cancelled);
+      trace.record(BlockUpdateTrace.Decision.VERIFY_FAIL, null, false, cancelled, 0, 0, 0,
+          "取玩家实例失败，整批未投递（" + cancelled + " 个原包）：" + throwable);
+      return;
+    }
+    if (player == null || Boolean.FALSE.equals(onlineOf(player))) {
+      // 客户端不存在（玩家已离线 / 已断连）：取消原包不构成丢更新。
+      // 注意 onlineOf 返回 null 表示「探测失败」而非离线——那种情况会继续往下发送，
+      // 因为「探测抛异常」绝不能等价于「客户端不需要这批更新」。
       stats.blockChangesMerged.add(cancelled);
       return;
     }
@@ -1150,21 +1180,56 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       return;
     }
     // 合并包构造/发送失败：逐条补发。原包入缓冲时已取消，这里必须把变更交付出去（幂等重发）。
+    // 逐条投递由 UpdateDelivery 承担：每条独立兜底，任一条抛出或失败都不影响其余条目——
+    // 裸循环在中途抛出会把剩下的条目一起丢掉，而那正是「门只开一半」的最后一条成因。
     int total = 0;
-    int resent = 0;
     for (List<Update<WrappedBlockData>> cluster : survivors) {
-      for (Update<WrappedBlockData> update : cluster) {
-        total++;
-        SectionKey key = new SectionKey(update.x() >> 4, update.y() >> 4, update.z() >> 4);
-        if (sendSection(player, key, List.of(update))) {
-          resent++;
-        }
+      total += cluster.size();
+    }
+    int resent = UpdateDelivery.deliverEach(survivors,
+        update -> sendSection(player,
+            new SectionKey(update.x() >> 4, update.y() >> 4, update.z() >> 4), List.of(update)),
+        stats.sendFailed);
+    stats.blockChangesMerged.add(cancelled);
+    if (resent < total) {
+      Update<WrappedBlockData> first = firstUpdate(survivors);
+      trace.record(BlockUpdateTrace.Decision.VERIFY_FAIL, null, false, total - resent,
+          first == null ? 0 : first.x(), first == null ? 0 : first.y(), first == null ? 0 : first.z(),
+          "逐条补发失败 " + (total - resent) + " 条（客户端已确实缺这些方块更新）");
+      if (errorCounter.getAndIncrement() < Constants.MAX_ERROR_LOGS) {
+        plugin.getLogger().warning("合并包构造失败后逐条补发仍有 " + (total - resent)
+            + " 条未发出（这些方块更新已丢失，客户端会停在旧方块上）");
       }
     }
-    stats.blockChangesMerged.add(cancelled);
-    if (resent < total && errorCounter.getAndIncrement() < Constants.MAX_ERROR_LOGS) {
-      plugin.getLogger().warning("合并包构造失败后逐条补发仍有 " + (total - resent)
-          + " 条未发出（客户端可能短暂缺少这些方块更新）");
+  }
+
+  /** 取第一批非空簇的第一条更新（仅用于取证记录首坐标）；没有时返回 {@code null}。 */
+  private static Update<WrappedBlockData> firstUpdate(
+      List<List<Update<WrappedBlockData>>> clusters) {
+    for (List<Update<WrappedBlockData>> cluster : clusters) {
+      if (cluster != null && !cluster.isEmpty()) {
+        return cluster.get(0);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 玩家是否仍在线；{@code null} = <b>探测失败</b>（不等于离线）。
+   *
+   * <p>为什么要包一层：本方法在合并线程 {@code MikuXrayNet-BlockMerge} 上被调用，而 Folia 对「在非该实体
+   * 所属区域线程上读实体状态」是先打 ERROR 再抛异常。探测一旦抛出，旧实现会让整批已取消的更新随着
+   * {@code flushInternal} 的兜底 catch 一起消失；这里把异常折成「未知」，调用方按「照常发送」处理——
+   * 对已断开的连接发送会被 Netty 直接丢弃，代价只是一个无副作用的写操作。
+   */
+  private static Boolean onlineOf(Player player) {
+    if (player == null) {
+      return Boolean.FALSE;
+    }
+    try {
+      return player.isOnline();
+    } catch (Throwable ignored) {
+      return null;
     }
   }
 
@@ -1206,7 +1271,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    */
   private boolean trySendMerged(Player player, List<List<Update<WrappedBlockData>>> clusters) {
     try {
-      if (player == null || !player.isOnline()) {
+      if (player == null || Boolean.FALSE.equals(onlineOf(player))) {
+        // 探测失败（null）按「仍在线」继续发送：见 onlineOf 的说明，绝不把异常当离线。
         return false;
       }
       boolean sentAny = false;
