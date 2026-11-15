@@ -612,7 +612,16 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    */
   static boolean shouldRedeem(ThrottleStats.DiscardSource source, String bufferedWorld,
       String currentWorld) {
-    return false; // RED：一律丢弃（旧行为，用于证明用例能抓到这个缺陷）
+    if (source == ThrottleStats.DiscardSource.DIMENSION_EVENT) {
+      // 真切维：事件在 setServerLevel 之后同步触发，此刻缓冲里的坐标必然属于旧世界，
+      // 而客户端会收到新世界的整列区块——丢弃不构成丢更新，这正是本路径存在的理由。
+      return false;
+    }
+    if (bufferedWorld == null || currentWorld == null) {
+      // 任意一侧未知：无法证明「客户端会重建这些坐标」，按不丢处理。
+      return true;
+    }
+    return currentWorld.equals(bufferedWorld);
   }
 
   /** 该玩家此刻的世界名（只读位置快照；封包线程上同样安全）。 */
@@ -1251,7 +1260,25 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         || written.length == 0) {
       return false;
     }
-    return true; // RED：只校验长度（旧行为，用于证明用例能抓到这个缺陷）
+    for (int i = 0; i < written.length; i++) {
+      int raw = SectionCoords.unsigned(written[i]);
+      Update<WrappedBlockData> update = intended.get(i);
+      if ((update.x() & SectionCoords.LOCAL_MASK) != SectionCoords.x(raw)
+          || (update.y() & SectionCoords.LOCAL_MASK) != SectionCoords.y(raw)
+          || (update.z() & SectionCoords.LOCAL_MASK) != SectionCoords.z(raw)) {
+        return false;
+      }
+    }
+    if (written.length <= DUPLICATE_SCAN_LIMIT) {
+      short[] sorted = written.clone();
+      java.util.Arrays.sort(sorted);
+      for (int i = 1; i < sorted.length; i++) {
+        if (sorted[i] == sorted[i - 1]) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   /** 合并包重复坐标检测的规模上限（见 {@link #verifyPositions}）。 */

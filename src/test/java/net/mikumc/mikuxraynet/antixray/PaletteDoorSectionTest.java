@@ -192,7 +192,10 @@ class PaletteDoorSectionTest {
     assertTrue(result.changed());
     assertDoorsIntact(result.data());
     for (int i = 0; i < 4; i++) {
-      assertEquals(STONE, decodedState(result.data(), index(i, ORE_Y, ORE_Z)));
+      int state = decodedState(result.data(), index(i, ORE_Y, ORE_Z));
+      // 关闭位宽预算时允许扩大调色板，两个候选都可能被选中：只要求「不再是矿、且是候选之一」。
+      assertNotEquals(DIAMOND_ORE, state, "矿位不得漏伪装");
+      assertTrue(state == STONE || state == GLOWSTONE, "伪装方块必须是候选之一：" + state);
     }
   }
 

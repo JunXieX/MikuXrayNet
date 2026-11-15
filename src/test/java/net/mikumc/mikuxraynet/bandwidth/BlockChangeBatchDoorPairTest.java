@@ -79,8 +79,8 @@ class BlockChangeBatchDoorPairTest {
     int lowerPacked = SectionCoords.pack(x, lowerY, z);
     int upperPacked = SectionCoords.pack(x, upperY, z);
     assertNotEquals(lowerPacked, upperPacked, "段内打包必须区分 y 与 y+1");
-    assertEquals(1, SectionCoords.y(lowerPacked) - SectionCoords.y(upperPacked) + 1,
-        "解码回段内 y 的相对关系也必须正确");
+    assertEquals(0, SectionCoords.y(lowerPacked), "64 的段内 y 为 0");
+    assertEquals(1, SectionCoords.y(upperPacked), "65 的段内 y 为 1");
   }
 
   @Test
@@ -90,7 +90,7 @@ class BlockChangeBatchDoorPairTest {
     int upperPacked = SectionCoords.pack(3, 16, 4);
     assertNotEquals(15 >> 4, 16 >> 4, "跨段：分组键不同");
     assertNotEquals(lowerPacked, upperPacked);
-    assertEquals(0, SectionCoords.y(lowerPacked), "段内 y=0");
-    assertEquals(15, SectionCoords.y(upperPacked), "段内 y=15");
+    assertEquals(15, SectionCoords.y(lowerPacked), "y=15 的段内 y 仍为 15");
+    assertEquals(0, SectionCoords.y(upperPacked), "y=16 落在下一段，段内 y=0");
   }
 }
