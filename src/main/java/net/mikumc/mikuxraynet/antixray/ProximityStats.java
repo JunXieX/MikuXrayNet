@@ -78,6 +78,75 @@ public final class ProximityStats {
   /** 视野变化增量巡检单次最大耗时（纳秒，CAS 更新）；用于识别毛刺。 */
   public final AtomicLong viewChangeMaxNanos = new AtomicLong();
 
+  /**
+   * 视野变化增量巡检耗时的定长直方图（11 档，单位纳秒边界见 {@link #VIEW_CHANGE_BUCKET_UPPER_NANOS}）。
+   *
+   * <p><b>为什么需要它</b>：实机 dump 里「最大 63.7 ms」而预算是 0.3 ms——单次最大值天然被
+   * GC / 线程调度抖动污染，用它判断「预算是否配小」会得出完全错误的结论。p99 才是判断
+   * 「算法超支」的口径，而存全量样本会长期占用内存，故用定长直方图（11 个 long，共 88 字节）。
+   */
+  private final long[] viewChangeBuckets = new long[11];
+
+  /** {@link #viewChangeBuckets} 各档的上界（纳秒）；最后一档为 {@link Long#MAX_VALUE}（无上界）。 */
+  public static final long[] VIEW_CHANGE_BUCKET_UPPER_NANOS = {
+      100_000L, 250_000L, 500_000L, 1_000_000L, 2_000_000L, 5_000_000L,
+      10_000_000L, 25_000_000L, 50_000_000L, 100_000_000L, Long.MAX_VALUE
+  };
+
+  /** 记录一次视野增量巡检耗时到直方图（线程安全；与 {@link #viewChangeMaxNanos} 并列记录，互不替代）。 */
+  public void recordViewChange(long nanos) {
+    if (nanos < 0L) {
+      return;
+    }
+    for (int i = 0; i < VIEW_CHANGE_BUCKET_UPPER_NANOS.length; i++) {
+      if (nanos <= VIEW_CHANGE_BUCKET_UPPER_NANOS[i]) {
+        synchronized (this.viewChangeBuckets) {
+          this.viewChangeBuckets[i]++;
+        }
+        return;
+      }
+    }
+  }
+
+  /** 直方图快照（副本，供诊断渲染）。 */
+  public long[] viewChangeBucketSnapshot() {
+    synchronized (this.viewChangeBuckets) {
+      return this.viewChangeBuckets.clone();
+    }
+  }
+
+  /**
+   * 按直方图求分位耗时（毫秒）；样本为空时返回 {@code -1}。
+   *
+   * <p>返回的是「命中档的上界」：{@code p=0.99} 表示 99% 的样本不超过该值。最后一档无上界时
+   * 返回 {@link Double#POSITIVE_INFINITY}，渲染层据此打印「≥100 ms」，绝不伪造一个具体数字。
+   */
+  public static double percentileMillis(long[] buckets, double percentile) {
+    if (buckets == null || buckets.length != VIEW_CHANGE_BUCKET_UPPER_NANOS.length
+        || percentile <= 0.0D || percentile > 1.0D) {
+      return -1.0D;
+    }
+    long total = 0L;
+    for (long bucket : buckets) {
+      if (bucket > 0L) {
+        total += bucket;
+      }
+    }
+    if (total == 0L) {
+      return -1.0D;
+    }
+    long threshold = Math.max(1L, (long) Math.ceil(total * percentile));
+    long cumulative = 0L;
+    for (int i = 0; i < buckets.length; i++) {
+      cumulative += Math.max(0L, buckets[i]);
+      if (cumulative >= threshold) {
+        long upper = VIEW_CHANGE_BUCKET_UPPER_NANOS[i];
+        return upper == Long.MAX_VALUE ? Double.POSITIVE_INFINITY : upper / 1_000_000.0D;
+      }
+    }
+    return Double.POSITIVE_INFINITY;
+  }
+
   /** 视野变化增量巡检因时间预算耗尽而提前结束的次数（持续偏高说明预算配小或候选过多）。 */
   public final LongAdder viewChangeBudgetExhausted = new LongAdder();
 

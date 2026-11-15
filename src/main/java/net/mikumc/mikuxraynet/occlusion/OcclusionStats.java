@@ -34,6 +34,16 @@ public final class OcclusionStats {
    * 该计数是覆盖率的核心观测点：持续偏高说明大量区块没被建过表。
    */
   public final LongAdder unknownSection = new LongAdder();
+
+  /**
+   * {@link #unknownSection} 的两类来源，用于区分「世界根本没建过表」与「该段没有位图条目」。
+   *
+   * <p><b>为什么要拆</b>：实机 dump 里「缺遮挡数据 60 万」持续增长（约 372 次/秒），但单看一个总数
+   * 无法判断是「世界级问题」（世界刚加载/已卸载，整张表为空——射线一律按遮挡处理，安全但会少显形）
+   * 还是「段级问题」（个别段没建表或被补丁跳过）。前者随运行时间应趋零，后者会稳定存在。
+   */
+  public final LongAdder unknownSectionNoStore = new LongAdder();
+  public final LongAdder unknownSectionNoEntry = new LongAdder();
   /** 射线计算累计耗时（纳秒），用于与「时间预算」对账。 */
   public final LongAdder nanosTotal = new LongAdder();
   /**

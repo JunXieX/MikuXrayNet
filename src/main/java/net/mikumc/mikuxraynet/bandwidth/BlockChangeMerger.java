@@ -327,7 +327,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    */
   @EventHandler(ignoreCancelled = true)
   public void onChangedWorld(PlayerChangedWorldEvent event) {
-    discardPending(event.getPlayer().getUniqueId());
+    discardPending(event.getPlayer().getUniqueId(), ThrottleStats.DiscardSource.DIMENSION_EVENT);
   }
 
   @EventHandler(ignoreCancelled = true)
@@ -391,7 +391,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       // 跨世界切换：立即丢弃旧世界的待发缓冲。只靠封包路径的跨世界守卫会漏掉「切维之后不再有旧世界
       // 方块包到达」的情形——那种情形下窗口定时器到期仍会把旧世界坐标发进新世界（鬼影方块）。
       if (previousWorld != null && !previousWorld.equals(worldName)) {
-        discardPending(playerId);
+        discardPending(playerId, ThrottleStats.DiscardSource.POSITION_SNAPSHOT);
       }
     } catch (Throwable throwable) {
       positions.discard(playerId);
@@ -512,12 +512,12 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    *
    * @return 是否确有缓冲被丢弃
    */
-  boolean discardPending(UUID playerId) {
+  boolean discardPending(UUID playerId, ThrottleStats.DiscardSource source) {
     Pending target = pending.get(playerId);
     if (target == null) {
       return false;
     }
-    discard(target);
+    discard(target, source);
     return true;
   }
 
@@ -533,7 +533,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * 没有 {@link #flushInternal} 那种阻塞封包线程的风险；而内联才能保证取消发生在任何定时冲刷之前
    * （异步投递会重新打开「旧世界数据落在切维包之后」的窗口）。
    */
-  private void discard(Pending target) {
+  private void discard(Pending target, ThrottleStats.DiscardSource source) {
     ScheduledFuture<?> timer = null;
     int cancelled = 0;
     try {
@@ -554,7 +554,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       if (timer != null) {
         timer.cancel(false);
       }
-      stats.blockChangesDiscarded.add(cancelled);
+      stats.discarded(source, cancelled);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
@@ -691,7 +691,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       // 黑名单世界不做任何带宽优化；同时丢弃可能来自「上一个非黑名单世界」的待发缓冲——
       // 否则窗口到期会把旧世界坐标发进黑名单世界（同样是鬼影方块）。
-      discardPending(player.getUniqueId());
+      discardPending(player.getUniqueId(), ThrottleStats.DiscardSource.BLACKLIST);
       return;
     }
     // 跨世界守卫（三道）：① PlayerChangedWorldEvent 零窗口丢弃；② refreshPosition 的每 tick 快照比对；
@@ -974,7 +974,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         timer.cancel(false);
       }
       if (worldChanged) {
-        stats.blockChangesDiscarded.add(discarded);
+        stats.discarded(ThrottleStats.DiscardSource.FLUSH_SNAPSHOT, discarded);
         return false; // 旧世界的被延迟包按丢弃处理：既未下发、也未合并
       }
       if (cancelled <= 0) {

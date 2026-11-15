@@ -57,6 +57,39 @@ public final class ThrottlePipeline {
   }
 
   /**
+   * 零位移取消「为什么不注册」的中文原因；会注册时返回 {@code null}。
+   *
+   * <p><b>为什么要这个入口</b>：实机 dump 只写了「实际未注册：零位移取消（原因见启动日志）」，
+   * 而启动日志会滚动、服主手里往往只剩 dump——一个「配了 true 却一项都没注册」的模块，
+   * 排查起点必须是面板自己能说清原因。原因串由 {@link #plan} 的同一组条件反推，不会与决策漂移。
+   */
+  public static String entityPacketsDisabledReason(BandwidthConfig config) {
+    return entityPacketsDisabledReason(config, isFoliaSafe());
+  }
+
+  /** 同 {@link #entityPacketsDisabledReason(BandwidthConfig)}，平台由调用方给出（便于离线用例覆盖 Folia 分支）。 */
+  static String entityPacketsDisabledReason(BandwidthConfig config, boolean folia) {
+    if (plan(config, folia).entityPackets()) {
+      return null;
+    }
+    if (!config.enabled()) {
+      return "带宽总开关关闭";
+    }
+    if (!config.entityPackets().enabled()) {
+      return "entity-packets.enabled=false";
+    }
+    if (!config.entityPackets().skipZeroMovement()) {
+      return "skip-zero-movement=false";
+    }
+    if (folia && !config.entityPackets().whitelist().isEmpty()) {
+      return "Folia 上无法枚举全服实体建立「实体 id → 类型」索引，故非空白名单（"
+          + config.entityPackets().whitelist().size() + " 项）时整项不注册；"
+          + "清空 whitelist 才会启用，代价是盔甲架 / 展示实体的姿态更新靠位置包驱动，取消零位移包后会停住";
+    }
+    return "按配置与平台推导为不注册";
+  }
+
+  /**
    * 当前平台是否 Folia 系；判定不可用时按 Paper 处理（离线单测没有服务端实例；且 Paper 分支是
    * 「全部功能可用」的保守方向，绝不因探测失败把模块静默关掉）。
    */

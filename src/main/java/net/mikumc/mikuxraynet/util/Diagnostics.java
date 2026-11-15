@@ -91,11 +91,50 @@ public final class Diagnostics {
       // 区块取数域：反矿透区块封包字段定位状态（fail-open 口径可见）
       ChunkAccessor chunkAccessor,
       AntiXrayConfig antiXray,
+      // 附加诊断域（缺失来源拆分、丢弃来源拆分、耗时 p99）：单独成组，避免污染既有字段顺序
+      Extras extras,
       BandwidthConfig bandwidth) {
+
+    /**
+     * 兼容构造：调用方不提供附加诊断时用零值组。
+     *
+     * <p>存在的理由：{@link Snapshot} 的既有调用点（含离线用例）只关心主字段，
+     * 不应为了新增一个观测字段而全部改写；附加诊断缺失时按「未采集」渲染，不伪造 0。
+     */
+    public Snapshot(Env env, Rewrite rewrite, Proximity proximity, Index index, Occlusion occlusion,
+        Throttle throttle, Pool pool, DiskCache diskCache, ChunkAccessor chunkAccessor,
+        AntiXrayConfig antiXray, BandwidthConfig bandwidth) {
+      this(env, rewrite, proximity, index, occlusion, throttle, pool, diskCache, chunkAccessor,
+          antiXray, Extras.EMPTY, bandwidth);
+    }
 
     /** 配置指纹（取自反矿透配置；无配置时为 0）。 */
     public int configFingerprint() {
       return antiXray == null ? 0 : antiXray.configHash();
+    }
+
+    /**
+     * 附加诊断域：把「一个大数字拆开」的三组来源与耗时分位放进同一处，避免继续膨胀主字段。
+     *
+     * <p>为什么这些必须拆：实机 dump（45 人 / 16 小时）里「丢弃 62.8 万」「缺遮挡数据 60.2 万」
+     * 各只有一个总数，无法判断是正常运营（真切维 / 世界刚加载）还是缺陷（守卫误判 / 段未建表）；
+     * 而「视野增量 最大 63.7 ms」与 0.3 ms 预算差两个数量级，单看最大值只会得出错误结论——
+     * 最大值被 GC 与线程调度污染，p99 才是算法口径。
+     *
+     * @param viewChangeP99Millis 视野增量巡检耗时的 p99（毫秒）；{@code NaN} = 无样本，{@code Infinity} = 落在最高档
+     */
+    public record Extras(long discardedByDimensionEvent, long discardedByPositionSnapshot,
+        long discardedByBlacklist, long discardedByFlushSnapshot, long unknownSectionNoStore,
+        long unknownSectionNoEntry, double viewChangeP99Millis) {
+
+      /** 未采集附加诊断时的零值兜底。 */
+      public static final Extras EMPTY =
+          new Extras(0L, 0L, 0L, 0L, 0L, 0L, Double.NaN);
+
+      /** 是否采到了附加诊断（p99 为 NaN 即未采集，渲染层据此写「未采集」而不是 0 ms）。 */
+      public boolean collected() {
+        return !Double.isNaN(viewChangeP99Millis);
+      }
     }
 
     /**
@@ -965,7 +1004,27 @@ public final class Diagnostics {
         diskCacheSnapshot,
         chunkAccessorSnapshot(runtime),
         config == null ? null : config.antiXray(),
+        extrasSnapshot(throttleStats, occlusionStats, proximityStats),
         config == null ? null : config.bandwidth());
+  }
+
+  /**
+   * 组装附加诊断域（丢弃/缺数据的来源拆分 + 视野增量 p99）。
+   *
+   * <p>各计数为 {@code null} 时按 0 处理：字段缺失只影响「拆分」这一层，不能让整份 dump 抛异常。
+   */
+  private static Snapshot.Extras extrasSnapshot(ThrottleStats throttle, OcclusionStats occlusion,
+      ProximityStats proximity) {
+    double p99 = proximity == null ? Double.NaN
+        : ProximityStats.percentileMillis(proximity.viewChangeBucketSnapshot(), 0.99D);
+    return new Snapshot.Extras(
+        throttle == null ? 0L : throttle.discardedByDimensionEvent.sum(),
+        throttle == null ? 0L : throttle.discardedByPositionSnapshot.sum(),
+        throttle == null ? 0L : throttle.discardedByBlacklist.sum(),
+        throttle == null ? 0L : throttle.discardedByFlushSnapshot.sum(),
+        occlusion == null ? 0L : occlusion.unknownSectionNoStore.sum(),
+        occlusion == null ? 0L : occlusion.unknownSectionNoEntry.sum(),
+        p99);
   }
 
   /**
@@ -1083,6 +1142,7 @@ public final class Diagnostics {
     // 字节口径（P0-1）：只统计真正改写的区块（未改动/失败放行的原样字节不采样，避免稀释比例）。
     // 节省比例 = 节省字节 / 原始字节；开启 palette.width-budget 后这一行应体现「封顶+裁剪」的收益。
     lines.add(bytesLine(s.rewrite()));
+    lines.add(footprintLine(s));
     // 注意「坐标跳过」与「整块跳过」是两件事：前者是候选坐标因区块未加载 / 发包失败被跳过，
     // 后者是「整块都已显形」的区块被整体略过（只出现在一次性「首次显形诊断」日志里）。
     // 只写「跳过」会被误读成「整块跳过为 0 → 整块跳过没生效」，故此处写明「坐标跳过」。
@@ -1098,8 +1158,11 @@ public final class Diagnostics {
         + "｜视野增量 扫描 " + s.proximity().viewChangeScans()
         + "，平均 " + averageFlushMillis(s.proximity().viewChangeScans(),
             s.proximity().viewChangeNanos())
-        + " ms，最大 " + formatMillis(s.proximity().viewChangeMaxNanos())
-        + " ms，预算耗尽 " + s.proximity().viewChangeBudgetExhausted() + " 次"
+        // 最大值的口径必须写明：它是墙钟，天然被 GC / 调度抖动污染（实机 dump 里 63.7 ms vs 预算 0.3 ms），
+        // 判断「预算是否配小、算法是否超支」只能看 p99；两者并列显示，避免用最大值下错结论。
+        + " ms，p99 " + p99Text(s.extras().viewChangeP99Millis())
+        + "，最大 " + formatMillis(s.proximity().viewChangeMaxNanos()) + " ms（墙钟，含 GC 抖动）"
+        + "，预算耗尽 " + s.proximity().viewChangeBudgetExhausted() + " 次"
         // 工作池无容量时周期巡检会整轮跳过（显形完全不发生）；必须可见，否则「什么都不还原」无法归因。
         + "｜整轮跳过（工作池满） " + s.proximity().passesSkippedNoCapacity());
     // 口径说明：这里刻意分列「实时坐标数」与「累计登记数」——前者随登出 / 过期 / 区块失效归零，
@@ -1145,6 +1208,13 @@ public final class Diagnostics {
         // 该计数混合了「读超时按未命中降级」（属于设计内的 fail-open，不代表故障）与真实读写异常，
         // 只看数字会把正常的超时降级当成故障，故在文案里写明口径。
         + "，异常 " + s.diskCache().errors() + "（含读超时降级与真实异常）");
+    List<String> diskHints = s.antiXray() == null ? List.of()
+        : diskWatermarkHints(s.diskCache().openFiles(), s.antiXray().diskCache().maxOpenFiles(),
+            s.antiXray().diskCache().bucketCacheSize(), s.antiXray().diskCache().maxEntries(),
+            s.antiXray().diskCache().maxRegionFiles());
+    if (!diskHints.isEmpty()) {
+      lines.add("磁盘缓存提示：" + String.join("；", diskHints));
+    }
     lines.add("带宽：零位移取消 " + s.throttle().entityPacketsCancelled()
         // 括号内先给「放行」总数（与旧口径兼容），再给到达口径三分 + 字段形态口径：
         // 「取消 0」必须能区分「没有纯位移包」「位移从不为 0」「包没到达」「字段布局变了」四种成因，
@@ -1161,7 +1231,13 @@ public final class Diagnostics {
         + s.throttle().blockChangesPassed()
         // 丢弃单列：切维 / 进黑名单世界时整批原包被刻意丢弃（既不合并也不放行，客户端暂时收不到
         // 那几次变更）。不计数就等于「这些包从未存在」，排查「切维后方块不更新」时没有依据。
-        + "，丢弃（切维/黑名单）" + s.throttle().blockChangesDiscarded() + "）"
+        + "，丢弃（切维/黑名单）" + s.throttle().blockChangesDiscarded()
+        // 四源拆分：只有一个总数时无法区分「玩家真的切了世界」与「守卫误判」——后者会让客户端停在
+        // 旧方块上直到区块重发。正常态「切维事件」应占绝对多数；若「快照比对 / 冲刷前比对」占比高即为缺陷
+        + "（切维事件 " + s.extras().discardedByDimensionEvent()
+        + " / 快照比对 " + s.extras().discardedByPositionSnapshot()
+        + " / 黑名单 " + s.extras().discardedByBlacklist()
+        + " / 冲刷前比对 " + s.extras().discardedByFlushSnapshot() + "）"
         // 单线程冲刷的「次数 + 累计耗时」：极端配置下的延迟瓶颈靠它观测（累计/次数 = 平均一次的成本）
         + "；单线程冲刷 " + s.throttle().blockMergeFlushes() + " 次（累计 "
         + formatMillis(s.throttle().blockMergeFlushNanos()) + " ms，平均 "
@@ -1190,6 +1266,10 @@ public final class Diagnostics {
         // 收到越界/畸形坐标等异常输入，会导致部分判定静默丢失——必须可见才能定位。
         + "，判定异常 " + s.occlusion().computeFailures()
         + "，缺遮挡数据 " + s.occlusion().unknownSection()
+        // 两类来源：世界级（整张表为空：世界刚加载 / 已卸载）与段级（该段没建表或被补丁跳过）。
+        // 前者应随运行时间趋零，后者会稳定存在——只给总数时无法判断「该等」还是「该查」
+        + "（世界无表 " + s.extras().unknownSectionNoStore()
+        + " / 段无条目 " + s.extras().unknownSectionNoEntry() + "）"
         + " 次，方块补丁 " + s.occlusion().patched() + " 格（失败 " + s.occlusion().patchFailures()
         // 补丁的「状态id回落」单列：>0 说明补丁暂时拿不到逐状态 id、退回了 Material 级近似，此时
         // 补丁与位图可能对「同方块不同状态」结论不同——必须可见，否则该残余差异无从察觉。
@@ -1300,6 +1380,77 @@ public final class Diagnostics {
     return s.diskCache().openFiles() > 0 || s.diskCache().entries() > 0 ? "已启用" : "已启用（尚无数据）";
   }
 
+  /** 视野增量 p99 的渲染：未采集写「未采集」，落在最高档写「≥100 ms」，绝不伪造具体数字。 */
+  private static String p99Text(double millis) {
+    if (Double.isNaN(millis)) {
+      return "未采集";
+    }
+    if (Double.isInfinite(millis)) {
+      return "≥100 ms";
+    }
+    return (Math.round(millis * 100.0D) / 100.0D) + " ms";
+  }
+
+  /** 每个伪装坐标在索引里的估算字节（打包 long + 每区块条目数组的摊销头）。 */
+  static final long FOOTPRINT_BYTES_PER_INDEX_POSITION = 8L;
+  /** 每个驻留位图段的估算字节（4096 位 = 512 B，另加段对象与键的开销）。 */
+  static final long FOOTPRINT_BYTES_PER_BITMAP_SECTION = 576L;
+  /** 每个已显形标记的估算字节（玩家 × 区块的标记对象 + 坐标数组摊销）。 */
+  static final long FOOTPRINT_BYTES_PER_REVEALED_MARK = 48L;
+
+  /**
+   * 本插件自身常驻内存的粗估（字节）：只算能归因到本插件的四块，绝不算其它插件。
+   *
+   * <p><b>为什么需要</b>：实机 dump 只报了「堆已用 14.2 GB / 上限 24.6 GB」，而本插件可归因的部分
+   * 只有改写缓存 263.9 MB + 133 万坐标 + 8.2 万位图段——把整份堆都算到本插件头上，会让人去调错对象。
+   * 这里是<b>估算</b>：按每坐标/每段/每标记的固定摊销值折算，用于「同一台服前后对比」，
+   * 不作为精确内存测量（精确值要看 JFR 或 heap dump）。
+   */
+  static long estimatePluginHeapBytes(long cacheBytes, long indexPositions, long bitmapSections,
+      long revealedPositions) {
+    long cache = Math.max(0L, cacheBytes);
+    long index = Math.max(0L, indexPositions) * FOOTPRINT_BYTES_PER_INDEX_POSITION;
+    long bitmaps = Math.max(0L, bitmapSections) * FOOTPRINT_BYTES_PER_BITMAP_SECTION;
+    long revealed = Math.max(0L, revealedPositions) * FOOTPRINT_BYTES_PER_REVEALED_MARK;
+    return cache + index + bitmaps + revealed;
+  }
+
+  /** 自身占用估算的一行渲染（含四块拆分，便于判断是哪一块在涨）。 */
+  private static String footprintLine(Snapshot s) {
+    long cache = s.rewrite().cacheBytes();
+    long index = s.index().obfuscatedPositionCount();
+    long bitmaps = s.occlusion().sectionsResident();
+    long revealed = s.index().revealedPositionCount();
+    long total = estimatePluginHeapBytes(cache, index, bitmaps, revealed);
+    return "自身占用估算：约 " + bytesHuman(total) + "（改写缓存 " + bytesHuman(cache)
+        + " / 显形索引 " + bytesHuman(index * FOOTPRINT_BYTES_PER_INDEX_POSITION)
+        + " / 遮挡位图 " + bytesHuman(bitmaps * FOOTPRINT_BYTES_PER_BITMAP_SECTION)
+        + " / 已显形标记 " + bytesHuman(revealed * FOOTPRINT_BYTES_PER_REVEALED_MARK)
+        + "；不含其它插件，仅供参考趋势）";
+  }
+
+  /**
+   * 磁盘缓存水位提示（纯函数）：只在「已经会明显掉收益」或「完全没有上限」时各给一条，
+   * 正常态返回空列表（面板不增长）。
+   */
+  static List<String> diskWatermarkHints(int openFiles, int maxOpenFiles, int bucketCacheSize,
+      int maxEntries, int maxRegionFiles) {
+    List<String> hints = new ArrayList<>();
+    if (maxOpenFiles > 0 && openFiles * 10 >= maxOpenFiles * 9) {
+      hints.add("打开区域文件 " + openFiles + "/" + maxOpenFiles + " 已到 90% 水位：再涨会开始逐出重开，"
+          + "磁盘命中率随之下降，建议把 max-open-files 调到 " + Math.max(maxOpenFiles * 2, 128));
+    }
+    if (bucketCacheSize > 0 && maxOpenFiles > 0 && bucketCacheSize < maxOpenFiles) {
+      hints.add("bucket-cache-size(" + bucketCacheSize + ") 小于 max-open-files(" + maxOpenFiles
+          + ")：桶索引会被反复重读，建议取同值或更大");
+    }
+    if (maxEntries <= 0 && maxRegionFiles <= 0) {
+      hints.add("max-entries 与 max-region-files 均为 0（不限制）：磁盘只能靠 expire-seconds 过期回收，"
+          + "建议按盘容量设上限");
+    }
+    return hints;
+  }
+
   /** 带宽各模块开关回显（一行，供 status/dump 看出每个开关的实际取值）。 */
   private static String bandwidthSwitches(BandwidthConfig c) {
     if (c == null) {
@@ -1347,8 +1498,15 @@ public final class Diagnostics {
     if (protocolLibMissing()) {
       return configured + "｜实际未注册：全部子模块（缺少 ProtocolLib）";
     }
-    return notRegistered.isEmpty() ? configured
-        : configured + "｜实际未注册：" + String.join("/", notRegistered) + "（原因见启动日志）";
+    if (notRegistered.isEmpty()) {
+      return configured;
+    }
+    // 原因直接写进面板：实机 dump 里只有「（原因见启动日志）」，而日志会滚动、服主手上常常只剩 dump——
+    // 一个配了 true 却整项未注册的模块，排查起点必须是面板自己能说清为什么。
+    String reason = notRegistered.contains("零位移取消")
+        ? ThrottlePipeline.entityPacketsDisabledReason(c) : null;
+    return configured + "｜实际未注册：" + String.join("/", notRegistered)
+        + (reason == null ? "（原因见启动日志）" : "（原因：" + reason + "）");
   }
 
   /**

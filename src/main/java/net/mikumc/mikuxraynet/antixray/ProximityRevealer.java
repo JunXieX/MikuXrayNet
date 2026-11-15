@@ -2985,6 +2985,8 @@ public final class ProximityRevealer implements Listener {
       long elapsed = System.nanoTime() - start;
       stats.viewChangeScans.increment();
       stats.viewChangeNanos.add(elapsed);
+      // 直方图与 max 并列记录：max 只用于「有没有毛刺」的粗判，p99 才用于「预算是否配小」的判定
+      stats.recordViewChange(elapsed);
       long current = stats.viewChangeMaxNanos.get();
       while (elapsed > current && !stats.viewChangeMaxNanos.compareAndSet(current, elapsed)) {
         current = stats.viewChangeMaxNanos.get();

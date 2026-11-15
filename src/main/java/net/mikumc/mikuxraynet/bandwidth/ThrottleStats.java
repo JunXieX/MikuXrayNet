@@ -55,6 +55,46 @@ public final class ThrottleStats {
   public final LongAdder blockChangesDiscarded = new LongAdder();
 
   /**
+   * 丢弃来源（{@link #blockChangesDiscarded} 的拆分）。
+   *
+   * <p><b>为什么必须拆</b>：实机 dump 里「丢弃 62.8 万」约占全部方块变更包的四分之一，而四条入口
+   * 共用一个计数时完全无法区分「玩家真的切了世界」（正常）与「守卫误判」（缺陷：玩家没切世界却被
+   * 丢掉在途方块更新，客户端会停在旧方块上直到区块重发）。拆开后「切维事件」「黑名单」应占绝对多数；
+   * 若「快照比对」或「冲刷前比对」占比高，说明判定用的是陈旧/错误的世界名，必须查。
+   */
+  public enum DiscardSource {
+    /** {@code PlayerChangedWorldEvent}：切维瞬间丢弃。 */
+    DIMENSION_EVENT,
+    /** 每 tick 位置快照比对发现世界名变化。 */
+    POSITION_SNAPSHOT,
+    /** 进入黑名单世界（该世界不做优化，旧世界缓冲一并丢弃）。 */
+    BLACKLIST,
+    /** 冲刷前比对「缓冲世界」与此刻快照世界（兜住前几道都漏接的极端情形）。 */
+    FLUSH_SNAPSHOT
+  }
+
+  /** 各丢弃来源的原始封包数（四者之和恒等于 {@link #blockChangesDiscarded}）。 */
+  public final LongAdder discardedByDimensionEvent = new LongAdder();
+  public final LongAdder discardedByPositionSnapshot = new LongAdder();
+  public final LongAdder discardedByBlacklist = new LongAdder();
+  public final LongAdder discardedByFlushSnapshot = new LongAdder();
+
+  /** 按来源登记一次丢弃（同时累加总数，保证两者恒等）；{@code packets <= 0} 时不做任何事。 */
+  public void discarded(DiscardSource source, long packets) {
+    if (source == null || packets <= 0L) {
+      return;
+    }
+    blockChangesDiscarded.add(packets);
+    switch (source) {
+      case DIMENSION_EVENT -> discardedByDimensionEvent.add(packets);
+      case POSITION_SNAPSHOT -> discardedByPositionSnapshot.add(packets);
+      case BLACKLIST -> discardedByBlacklist.add(packets);
+      case FLUSH_SNAPSHOT -> discardedByFlushSnapshot.add(packets);
+      default -> { }
+    }
+  }
+
+  /**
    * 方块变更合并的<b>冲刷诊断</b>：冲刷次数与累计冲刷耗时（纳秒）。
    *
    * <p><b>为什么单列</b>：合并冲刷跑在单线程 {@code MikuXrayNet-BlockMerge} 上，极端配置（大时间窗 +

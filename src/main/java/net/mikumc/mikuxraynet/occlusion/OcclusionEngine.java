@@ -328,6 +328,13 @@ public final class OcclusionEngine implements AutoCloseable {
       SectionOcclusion section = current == null ? null : current.section(chunkX, sectionY, chunkZ);
       if (section == null) {
         stats.unknownSection.increment();
+        // 分两类：世界级（store 缺失）与段级（store 在但该段没有条目）——前者是「世界刚加载/已卸载」，
+        // 后者是「该段没建表或被补丁跳过」，两者的处置完全不同，合在一个数里等于没有信息。
+        if (current == null) {
+          stats.unknownSectionNoStore.increment();
+        } else {
+          stats.unknownSectionNoEntry.increment();
+        }
       }
       return section;
     }
