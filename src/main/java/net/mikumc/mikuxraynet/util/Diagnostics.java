@@ -154,11 +154,11 @@ public final class Diagnostics {
     public record Extras(long discardedByDimensionEvent, long discardedByPositionSnapshot,
         long discardedByBlacklist, long discardedByFlushSnapshot, long unknownSectionNoStore,
         long unknownSectionNoEntry, double viewChangeP99Millis, long discardRedeemed,
-        long mergeVerifyFailed, long sendFailed) {
+        long mergeVerifyFailed, long sendFailed, long snapshotResync) {
 
       /** 未采集附加诊断时的零值兜底。 */
       public static final Extras EMPTY =
-          new Extras(0L, 0L, 0L, 0L, 0L, 0L, Double.NaN, 0L, 0L, 0L);
+          new Extras(0L, 0L, 0L, 0L, 0L, 0L, Double.NaN, 0L, 0L, 0L, 0L);
 
       /** 是否采到了附加诊断（p99 为 NaN 即未采集，渲染层据此写「未采集」而不是 0 ms）。 */
       public boolean collected() {
@@ -1079,7 +1079,8 @@ public final class Diagnostics {
         p99,
         throttle == null ? 0L : throttle.discardRedeemed.sum(),
         throttle == null ? 0L : throttle.mergeVerifyFailed.sum(),
-        throttle == null ? 0L : throttle.sendFailed.sum());
+        throttle == null ? 0L : throttle.sendFailed.sum(),
+        throttle == null ? 0L : throttle.snapshotResync.sum());
   }
 
   /**
@@ -1300,6 +1301,9 @@ public final class Diagnostics {
         // 最后一道防线：逐条补发仍失败的条数。它与「合批校验失败」不同——后者已被逐条补发救回，
         // 而这个数字代表客户端<b>确实</b>缺了这些方块更新，非 0 必须查协议字段与连接状态。
         + "，单条补发失败 " + s.extras().sendFailed()
+        // 快照与索引矛盾：不丢更新（照常交付），但说明位置刷新任务已停——冻结快照会让近身判定
+        // 把所有变更判成「远」，是「假方块挖不掉」的直接成因。正常运营恒为 0。
+        + "，快照重同步 " + s.extras().snapshotResync()
         // 单线程冲刷的「次数 + 累计耗时」：极端配置下的延迟瓶颈靠它观测（累计/次数 = 平均一次的成本）
         + "；单线程冲刷 " + s.throttle().blockMergeFlushes() + " 次（累计 "
         + formatMillis(s.throttle().blockMergeFlushNanos()) + " ms，平均 "

@@ -138,6 +138,44 @@ class DumpSelfExplanationGuardTest {
   }
 
   @Test
+  void flushDiscardRequiresWorldIndexCorroboration() throws Exception {
+    String merger = source("bandwidth/BlockChangeMerger.java");
+    int flush = merger.indexOf("private boolean flushInternal(");
+    assertTrue(flush > 0, "flushInternal 必须仍存在");
+    String body = merger.substring(flush, Math.min(merger.length(), flush + 7000));
+    assertTrue(body.contains("shouldDiscardAtFlush("),
+        "冲刷守卫必须走 shouldDiscardAtFlush：位置快照会冻结（Folia 实体调度器随切维退役且不保证回调），"
+            + "拿它当「玩家已换世界」的证据会整批丢掉在途更新（实测 69.5 万包）");
+    assertTrue(body.contains("PlayerWorldIndex.worldName"),
+        "守卫必须读世界索引这条与打标同源的证据，不能只看快照");
+  }
+
+  @Test
+  void positionRefreshIsRescheduledOnWorldChangeAndRespawn() throws Exception {
+    String merger = source("bandwidth/BlockChangeMerger.java");
+    int changed = merger.indexOf("public void onChangedWorld(");
+    assertTrue(changed > 0, "切维处理器必须存在");
+    String changedBody = merger.substring(changed, Math.min(merger.length(), changed + 1200));
+    assertTrue(changedBody.contains("schedulePositionRefresh("),
+        "切维后必须重排位置刷新任务：实体调度器任务会随实体移出旧 world 退役，不重排则快照永久冻结");
+    int respawn = merger.indexOf("public void onRespawn(");
+    assertTrue(respawn > 0, "必须处理重生：Folia 上重生会重建实体，调度器任务同样退役");
+    String respawnBody = merger.substring(respawn, Math.min(merger.length(), respawn + 800));
+    assertTrue(respawnBody.contains("schedulePositionRefresh("), "重生后同样要重排刷新任务");
+  }
+
+  @Test
+  void staleSnapshotIsTreatedAsUnknown() throws Exception {
+    assertTrue(source("bandwidth/PlayerPositionSnapshots.java").contains("isStale("),
+        "快照必须能自报心跳过期：冻结快照的内容看起来完全正常，只盯内容发现不了它已经死了");
+    String merger = source("bandwidth/BlockChangeMerger.java");
+    assertTrue(merger.contains("positions.isStale("),
+        "近身判定与冲刷守卫都必须看心跳，过期即按未知处理（fail-open）");
+    assertTrue(source("bandwidth/ThrottleStats.java").contains("snapshotResync"),
+        "「快照与索引矛盾」的次数必须可观测：它是刷新任务已停的唯一早期信号");
+  }
+
+  @Test
   void flushDiscardIsTracedIntoTheRing() throws Exception {
     String merger = source("bandwidth/BlockChangeMerger.java");
     int flush = merger.indexOf("private boolean flushInternal(");

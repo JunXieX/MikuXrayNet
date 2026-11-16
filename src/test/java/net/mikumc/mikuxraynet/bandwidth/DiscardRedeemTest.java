@@ -40,15 +40,23 @@ class DiscardRedeemTest {
   }
 
   @Test
-  void flushTimeGuardSharesTheSameTable() {
-    // 冲刷前的第三道守卫此前是一段独立判断，与 discard() 各写一遍；现在两者都走这张表，
-    // 因此这里显式钉住「同一世界不丢、不同世界才丢」，避免以后只改一处。
+  void eventDrivenSourcesShareOneTable() {
+    // 三个事件驱动入口（切维事件 / 快照比对 / 黑名单）共用这一张表；
+    // 冲刷前那条守卫另有一套「索引互证」规则，见 FlushWorldGuardTest（它曾被冻结快照误导，
+    // 在 4 小时里丢掉 69.5 万个原包）。
+    for (DiscardSource source : new DiscardSource[] {DiscardSource.POSITION_SNAPSHOT,
+        DiscardSource.BLACKLIST}) {
+      assertTrue(BlockChangeMerger.shouldRedeem(source, "world", "world"),
+          source + "：世界未变 → 必须补发");
+      assertFalse(BlockChangeMerger.shouldRedeem(source, "world", "world_nether"),
+          source + "：世界已变 → 照旧丢弃");
+      assertTrue(BlockChangeMerger.shouldRedeem(source, "world", null),
+          source + "：世界未知 → 按不丢处理");
+    }
+    assertFalse(BlockChangeMerger.shouldRedeem(DiscardSource.DIMENSION_EVENT, "world", "world_nether"),
+        "真切维事件 → 丢弃（客户端会收到新世界的整列区块）");
     assertTrue(BlockChangeMerger.shouldRedeem(DiscardSource.FLUSH_SNAPSHOT, "world", "world"),
-        "冲刷前比对的缓冲世界与当前世界相同 → 不得丢弃");
-    assertFalse(BlockChangeMerger.shouldRedeem(DiscardSource.FLUSH_SNAPSHOT, "world", "world_nether"),
-        "冲刷前比对确认世界已变 → 与真切维同等处理");
-    assertTrue(BlockChangeMerger.shouldRedeem(DiscardSource.FLUSH_SNAPSHOT, "world", null),
-        "快照缺失 → 无法证明客户端会重建，按不丢处理（fail-open）");
+        "该枚举值仍参与统计口径；其判定已改由 shouldDiscardAtFlush 承担");
   }
 
   @Test

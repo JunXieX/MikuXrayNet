@@ -86,6 +86,15 @@ public final class ThrottleStats {
   public final LongAdder sendFailed = new LongAdder();
 
   /**
+   * 「位置快照与世界索引互相矛盾」的次数：冲刷前发现快照说换了世界、索引说没换。
+   *
+   * <p><b>为什么必须单列</b>：矛盾本身不丢更新（照常交付），但它说明<b>位置刷新任务已经停了</b>——
+   * 快照冻结在切维/重生那一刻，此后近身判定把所有变更判成「远」。这一条是那个故障的唯一早期信号：
+   * 有它就该查任务为何没重排，而不是等玩家反馈「假方块挖不掉」。正常运营恒为 0。
+   */
+  public final LongAdder snapshotResync = new LongAdder();
+
+  /**
    * 丢弃来源（{@link #blockChangesDiscarded} 的拆分）。
    *
    * <p><b>为什么必须拆</b>：实机 dump 里「丢弃 62.8 万」约占全部方块变更包的四分之一，而四条入口

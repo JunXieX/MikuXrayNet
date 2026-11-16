@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongSupplier;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 
 /**
@@ -60,7 +61,37 @@ final class PlayerPositionSnapshots {
   record Position(String world, double x, double y, double z, boolean positionKnown) {
   }
 
+  /**
+   * 快照「心跳」阈值：刷新任务是每 tick 执行的，超过这个时长没有心跳就说明它已经不再运行。
+   *
+   * <p><b>为什么需要心跳</b>：Folia 的实体调度器任务会随实体被移出旧 world（切维、重生）而退役，
+   * 而退役并<b>不保证</b>回调到我们的清理入口——结果就是快照被冻结在切换前的那一刻，并且看起来一切正常：
+   * 世界名还是旧世界、坐标还是旧坐标。冻结的快照比「没有快照」危险得多：近身判定会把所有变更判成「远」
+   * （全部进合并窗口），跨世界守卫则会拿旧世界名与真实世界名比较，把每一批都当成「玩家已切维」整批丢弃。
+   * 实测（29 人 / 4 小时的 dump）仅这一条就丢了 69.5 万个原包，玩家侧表现是假方块挖不掉、右键才消失。
+   */
+  static final long STALE_NANOS = 5_000_000_000L;
+
   private final ConcurrentHashMap<UUID, Position> positions = new ConcurrentHashMap<>();
+
+  /**
+   * 每玩家最后刷新时刻（{@link System#nanoTime()}）。
+   *
+   * <p>用「原地改写 {@code long[]}」而不是每次发布新值：刷新是每 tick 每玩家一次的热路径，
+   * 这里既不想分配记录（快照本身有「同一方块不重发」的优化，见类注释），也不想每 tick 写一次 CHM。
+   */
+  private final ConcurrentHashMap<UUID, long[]> stamps = new ConcurrentHashMap<>();
+
+  /** 时钟（测试可注入，生产即 {@link System#nanoTime}）。 */
+  private final LongSupplier clock;
+
+  PlayerPositionSnapshots() {
+    this(System::nanoTime);
+  }
+
+  PlayerPositionSnapshots(LongSupplier clock) {
+    this.clock = clock == null ? System::nanoTime : clock;
+  }
 
   /**
    * 刷新某玩家快照（必须在拥有该玩家的线程调用）。方块坐标与世界均未变时不发布，见类注释。
@@ -73,6 +104,7 @@ final class PlayerPositionSnapshots {
     if (playerId == null) {
       return null;
     }
+    touch(playerId);
     Position current = positions.get(playerId);
     // positionKnown 必须一起判：黑名单世界留下的「世界名相同但坐标未知」快照不能被当成「坐标未变」而
     // 跳过发布，否则切出黑名单世界后坐标会一直是未知、近身判定永远 fail-open。
@@ -100,6 +132,7 @@ final class PlayerPositionSnapshots {
     if (playerId == null) {
       return null;
     }
+    touch(playerId);
     Position current = positions.get(playerId);
     if (current != null && !current.positionKnown() && Objects.equals(current.world(), world)) {
       return current.world();
@@ -113,16 +146,38 @@ final class PlayerPositionSnapshots {
     return playerId == null ? null : positions.get(playerId);
   }
 
-  /** 丢弃某玩家快照（玩家退出 / 实体退役）：此后读取侧一律 fail-open。 */
+  /**
+   * 该玩家的快照是否已经<b>过期</b>（没有快照也算过期）。
+   *
+   * <p>过期即视为「未知」：近身判定按立即放行（fail-open），跨世界守卫按「无法证明玩家已换世界」
+   * 处理（照常合并/补发，绝不整批丢弃）。判据是心跳而不是内容——内容看起来完全正常恰恰是冻结点最
+   * 会骗人的地方（世界名与坐标都停留在切换前）。
+   */
+  boolean isStale(UUID playerId) {
+    if (playerId == null) {
+      return true;
+    }
+    long[] stamp = stamps.get(playerId);
+    return stamp == null || clock.getAsLong() - stamp[0] > STALE_NANOS;
+  }
+
+  /** 记录一次刷新心跳（原地改写，零分配）。 */
+  private void touch(UUID playerId) {
+    stamps.computeIfAbsent(playerId, ignored -> new long[1])[0] = clock.getAsLong();
+  }
+
+  /** 丢弃某玩家快照（玩家退出 / 实体退役 / 守卫发现不一致）：此后读取侧一律 fail-open。 */
   void discard(UUID playerId) {
     if (playerId != null) {
       positions.remove(playerId);
+      stamps.remove(playerId);
     }
   }
 
   /** 清空全部快照（插件停用）。 */
   void clear() {
     positions.clear();
+    stamps.clear();
   }
 
   /**

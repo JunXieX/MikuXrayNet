@@ -44,8 +44,13 @@ class DiagnosticsBlockUpdateTraceTest {
   }
 
   private static Snapshot.Extras extras(long redeemed, long verifyFailed, long sendFailed) {
+    return extras(redeemed, verifyFailed, sendFailed, 0L);
+  }
+
+  private static Snapshot.Extras extras(long redeemed, long verifyFailed, long sendFailed,
+      long snapshotResync) {
     return new Snapshot.Extras(0L, 0L, 0L, 0L, 0L, 0L, Double.NaN, redeemed, verifyFailed,
-        sendFailed);
+        sendFailed, snapshotResync);
   }
 
   @Test
@@ -82,6 +87,14 @@ class DiagnosticsBlockUpdateTraceTest {
         "20261115-000000");
     assertTrue(dump.contains("单条补发失败 5"),
         "逐条补发仍失败的条数必须可见——它代表客户端确实缺了这些方块更新：" + dump);
+  }
+
+  @Test
+  void snapshotResyncCounterIsRendered() {
+    String dump = Diagnostics.formatDump(snapshot(extras(0L, 0L, 0L, 42L), Snapshot.Trace.EMPTY, null),
+        "20261116-000000");
+    assertTrue(dump.contains("快照重同步 42"),
+        "快照与索引矛盾的次数必须可见——它是「位置刷新任务已停」的唯一早期信号：" + dump);
   }
 
   @Test

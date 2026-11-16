@@ -631,6 +631,31 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     return currentWorld.equals(bufferedWorld);
   }
 
+  /**
+   * 纯函数：冲刷前是否允许「整批丢弃」。
+   *
+   * <p><b>为什么只认世界索引</b>：缓冲里的坐标在入缓冲时按索引世界打标，索引由玩家事件驱动
+   * （{@code PlayerJoinEvent} / {@code PlayerChangedWorldEvent}）随真实切维一起前进；而位置快照由
+   * 实体调度器的每 tick 任务维护，任务在 Folia 上会随实体被移出旧 world（切维 / 重生）退役，
+   * 且退役不保证回调我们的清理入口——快照于是<b>冻结</b>在切换前那一刻，内容看起来完全正常。
+   * 用冻结快照判定「玩家已换世界」，就会把每一批在途变更都当成跨世界整批丢掉（实测 69.5 万包）。
+   *
+   * <p>因此这里改成两源互证：索引（同源、随事件前进）说<b>世界真的变了</b>才丢；索引未变、只有快照
+   * 不同时，按「无法证明」处理——照常交付（客户端即使收到旧世界坐标也只是短暂的鬼影方块，
+   * 会随区块重建自愈，绝不会像丢弃那样永久缺格）。
+   *
+   * @param bufferedWorld 缓冲里这些坐标所属的世界名（入缓冲时按索引打标），可为 {@code null}
+   * @param indexWorld    此刻索引里的世界名，可为 {@code null}
+   * @return true 表示允许整批丢弃
+   */
+  static boolean shouldDiscardAtFlush(String bufferedWorld, String indexWorld) {
+    if (bufferedWorld == null || indexWorld == null) {
+      // 任一侧未知：无法证明客户端会重建这些坐标 → 不丢（取消即欠账）
+      return false;
+    }
+    return !indexWorld.equals(bufferedWorld);
+  }
+
   /** 该玩家此刻的世界名（只读位置快照；封包线程上同样安全）。 */
   private String currentWorldOf(UUID playerId) {
     PlayerPositionSnapshots.Position snapshot = positions.get(playerId);

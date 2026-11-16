@@ -194,4 +194,53 @@ class PlayerPositionSnapshotsTest {
     assertFalse(PlayerPositionSnapshots.immediatePass(snapshots.get(player), updates, 8),
         "方块 -2 距变更 9 格 → 判定必须更新为「远」");
   }
+
+  /**
+   * 心跳回归：冻结快照必须被判成「过期」，从而按未知处理（fail-open），绝不能继续当作可靠依据。
+   *
+   * <p>事故形态：Folia 实体调度器任务随实体被移出旧 world 退役后不再刷新（退役不保证回调清理入口），
+   * 快照保持「旧世界 + 旧坐标」且内容完全正常——只盯内容的话永远发现不了它已经死了。因此判据必须是
+   * 「多久没刷新」，而不是「内容看起来对不对」。
+   */
+  @Test
+  @DisplayName("心跳过期 → isStale 为真，近身判定按未知 fail-open")
+  void staleSnapshotIsReportedAndFailsOpen() {
+    long[] now = {1_000_000_000L};
+    PlayerPositionSnapshots snapshots = new PlayerPositionSnapshots(() -> now[0]);
+    UUID player = UUID.randomUUID();
+    List<Update<Integer>> far = List.of(new Update<>(200, 64, 200, 1));
+
+    snapshots.refresh(player, "world", 0.5D, 64.0D, 0.5D);
+    assertFalse(snapshots.isStale(player), "刚刷新过 → 心跳新鲜");
+    assertFalse(PlayerPositionSnapshots.immediatePass(snapshots.get(player), far, 8),
+        "心跳新鲜时按真实距离判定（200 格外 → 不近身）");
+
+    now[0] += PlayerPositionSnapshots.STALE_NANOS + 1L;
+    assertTrue(snapshots.isStale(player), "超过阈值没有心跳 → 必须判过期");
+
+    snapshots.refresh(player, "world", 0.5D, 64.0D, 0.5D);
+    assertFalse(snapshots.isStale(player), "重新刷新后心跳恢复");
+
+    snapshots.discard(player);
+    assertTrue(snapshots.isStale(player), "没有快照也算过期");
+    assertNull(snapshots.get(player));
+  }
+
+  @Test
+  @DisplayName("同一方块内不重发记录，但心跳必须每次刷新都更新")
+  void heartbeatUpdatesEvenWhenRecordIsReused() {
+    long[] now = {5_000_000_000L};
+    PlayerPositionSnapshots snapshots = new PlayerPositionSnapshots(() -> now[0]);
+    UUID player = UUID.randomUUID();
+    snapshots.refresh(player, "world", 0.3D, 64.2D, 0.7D);
+    PlayerPositionSnapshots.Position first = snapshots.get(player);
+
+    now[0] += PlayerPositionSnapshots.STALE_NANOS + 1L;
+    assertTrue(snapshots.isStale(player));
+
+    // 同一方块坐标：记录被复用（不 new），但心跳必须更新——否则「活着但静止」的玩家会被误判成任务已停
+    snapshots.refresh(player, "world", 0.4D, 64.3D, 0.8D);
+    assertSame(first, snapshots.get(player), "同一方块内不重发记录");
+    assertFalse(snapshots.isStale(player), "心跳必须随每次刷新更新");
+  }
 }
