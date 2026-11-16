@@ -39,6 +39,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.plugin.Plugin;
 
 /**
@@ -67,6 +68,12 @@ import org.bukkit.plugin.Plugin;
  * <p><b>结构自检是「每次发送」而非「首包」</b>：{@code sendSection} 每次构造完合并包都会回读刚写入的
  * 字段做结构校验（单条与多条的路径都做）。校验不过即放弃本次合并结果、按 section 逐条补发原更新——
  * 原包此时已被取消，退化成逐条补发是唯一能保证「不丢更新」的做法。
+ *
+ * <p><b>跨世界丢弃只认世界索引</b>：缓冲坐标按 {@link PlayerWorldIndex} 打标，索引由玩家事件驱动、
+ * 随真实切维前进；而位置快照由实体调度器的每 tick 任务维护，任务在 Folia 上会随实体被移出旧 world
+ * （切维 / 重生）退役且不保证回调清理入口，快照于是可能<b>冻结</b>而看起来一切正常。
+ * 因此冲刷守卫改成「索引也说变了才丢」，冻结快照只会触发一次重同步（{@code snapshotResync}），
+ * 绝不据此整批丢弃。
  *
  * <p><b>不变量（取消即欠账）</b>：凡本类 {@code event.setCancelled(true)} 过的包，<b>必须</b>经
  * {@link #deliver} 的合并包或 {@link UpdateDelivery#deliverEach} 的逐条补发之一离开本模块；
@@ -343,6 +350,20 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   @EventHandler(ignoreCancelled = true)
   public void onChangedWorld(PlayerChangedWorldEvent event) {
     discardPending(event.getPlayer().getUniqueId(), ThrottleStats.DiscardSource.DIMENSION_EVENT);
+    // 重排刷新任务：Folia 的实体调度器任务会随实体被移出旧 world 而退役，退役不保证回调到
+    // discardPositionSnapshot。不重排的话，那个玩家的位置快照就永远停在切维前那一刻——近身判定把
+    // 所有变更判成「远」，跨世界守卫又拿旧世界名比对新世界名，每一批在途变更都会被整批丢掉。
+    schedulePositionRefresh(event.getPlayer());
+  }
+
+  /**
+   * 重生：Folia 上玩家重生会重建实体，旧实体的调度器随之退役，位置刷新任务同样需要重排。
+   *
+   * <p>没有这条时，死亡一次就等于该玩家此后所有方块变更都按「冻结快照」判定（见上）。
+   */
+  @EventHandler(ignoreCancelled = true)
+  public void onRespawn(PlayerRespawnEvent event) {
+    schedulePositionRefresh(event.getPlayer());
   }
 
   @EventHandler(ignoreCancelled = true)
@@ -766,6 +787,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       PlayerPositionSnapshots.Position position = positions.get(playerId);
       if (position == null) {
         noticeSnapshotFailOpen(null);
+      } else if (positions.isStale(playerId)) {
+        // 冻结的快照比没有快照更危险：坐标停在切维前的位置，会把玩家脚下的变更判成「远」而全部塞进
+        // 合并窗口。心跳过期即按未知处理（fail-open），与快照缺失同一条路。
+        noticeSnapshotFailOpen(null);
+        position = null;
       }
       return PlayerPositionSnapshots.immediatePass(position, updates, radius);
     } catch (Throwable throwable) {
@@ -784,6 +810,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       PlayerPositionSnapshots.Position position = positions.get(playerId);
       if (position == null) {
         noticeSnapshotFailOpen(null);
+      } else if (positions.isStale(playerId)) {
+        noticeSnapshotFailOpen(null);
+        position = null;
       }
       return PlayerPositionSnapshots.immediatePass(position, coordinates, count, radius);
     } catch (Throwable throwable) {
@@ -1103,6 +1132,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     boolean worldChanged = false;
     String bufferedWorld = null;
     String currentWorld = null;
+    boolean snapshotResync = false;
     ScheduledFuture<?> timer = null;
     try {
       synchronized (target) {
@@ -1119,13 +1149,29 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         bufferedWorld = target.world;
         if (bufferedWorld != null) {
           PlayerPositionSnapshots.Position snapshot = positions.get(target.uuid);
-          currentWorld = snapshot == null ? null : snapshot.world();
-          // 丢弃判定与其余三源共用同一张表（见 shouldRedeem）：只有「证据充分」地确认玩家已换世界
-          // （缓冲世界与当前世界都非 null 且不同）才允许整批丢弃；快照缺失按 fail-open 照常合并。
-          // 之前这里是一段独立的条件判断，与 discard() 各写一遍——同一件事两种写法，测试断言的是
-          // 那张表，而生产代码在这个点根本没查它。
-          worldChanged = !shouldRedeem(ThrottleStats.DiscardSource.FLUSH_SNAPSHOT, bufferedWorld,
-              currentWorld);
+          if (snapshot == null || positions.isStale(target.uuid)) {
+            // 快照缺失或心跳过期：视为未知（fail-open）。过期意味着那份快照是死的——顺手丢掉，
+            // 让近身判定立刻回到「立即放行」，不必等下一次重排。
+            if (snapshot != null) {
+              positions.discard(target.uuid);
+              snapshotResync = true;
+            }
+            currentWorld = null;
+          } else {
+            currentWorld = snapshot.world();
+          }
+          // 丢弃判定只认一件事：<b>世界索引也已经变了</b>。索引由玩家事件驱动（加入 / 切维），
+          // 与入缓冲时打标的来源同源，但它会随真实切维一起前进；而位置快照可能<b>冻结</b>在切维前
+          // （Folia 上实体调度器任务随实体被移出旧 world 退役，退役不保证回调清理入口）。
+          // 拿一份可能冻结的快照当作「玩家已换世界」的证据，代价是整批已取消的更新永久丢失——
+          // 实测 29 人 4 小时丢了 69.5 万个原包，玩家侧看到的就是挖不掉的假方块。
+          worldChanged = shouldDiscardAtFlush(bufferedWorld, PlayerWorldIndex.worldName(target.uuid));
+          if (!worldChanged && currentWorld != null && !currentWorld.equals(bufferedWorld)) {
+            // 两源互相矛盾：索引说没换、快照说换过。以索引为准（不丢），并把这份不可信的快照丢掉，
+            // 让近身判定立即回到 fail-open —— 冻结快照会持续把每批变更判成「远」，只补发一次没用。
+            positions.discard(target.uuid);
+            snapshotResync = true;
+          }
         }
         if (worldChanged) {
           discarded = target.cancelledPackets;
@@ -1145,12 +1191,19 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         stats.discarded(ThrottleStats.DiscardSource.FLUSH_SNAPSHOT, discarded);
         // 四条丢弃入口一律留痕：这是「门只开一半」排查里最先要看的东西，不能只有总数
         trace.record(BlockUpdateTrace.Decision.DISCARD, bufferedWorld, false, discarded, 0, 0, 0,
-            "冲刷前比对：缓冲世界 " + bufferedWorld + " ≠ 当前世界 " + currentWorld
-                + "（旧世界区块将整列重建）");
+            "冲刷前比对：缓冲世界 " + bufferedWorld + " ≠ 索引世界 "
+                + PlayerWorldIndex.worldName(target.uuid) + "（旧世界区块将整列重建）");
         return false; // 旧世界的被延迟包按丢弃处理：既未下发、也未合并
       }
       if (cancelled <= 0) {
         return false; // 只有清理、没有实包：不计入「冲刷次数/耗时」
+      }
+      if (snapshotResync) {
+        // 快照与索引矛盾：这批照常交付，但必须留痕——它意味着位置刷新任务已经停了。
+        stats.snapshotResync.increment();
+        trace.record(BlockUpdateTrace.Decision.REDEEM, bufferedWorld, false, cancelled, 0, 0, 0,
+            "位置快照（" + currentWorld + "）与索引（" + bufferedWorld
+                + "）矛盾，已按不丢处理并重置快照");
       }
       deliver(target.uuid, clusters, passed, cancelled);
     } catch (Throwable throwable) {

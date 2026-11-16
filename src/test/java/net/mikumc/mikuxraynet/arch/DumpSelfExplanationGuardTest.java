@@ -127,22 +127,39 @@ class DumpSelfExplanationGuardTest {
   }
 
   @Test
-  void flushDiscardReusesTheSinglePredicate() throws Exception {
-    String merger = source("bandwidth/BlockChangeMerger.java");
-    int flush = merger.indexOf("private boolean flushInternal(");
-    assertTrue(flush > 0, "flushInternal 必须仍存在");
-    String body = merger.substring(flush, Math.min(merger.length(), flush + 6000));
-    assertTrue(body.contains("shouldRedeem("),
-        "冲刷前的丢弃判定必须复用 shouldRedeem：此前它与 discard() 各写一遍，测试断言那张表、"
-            + "生产代码却没查它");
+  void flushDiscardDecisionStaysInOnePredicate() throws Exception {
+    // 这条守门的原意是「丢弃判定只许有一份实现」：1.34.6 之前 flushInternal 自己写了一遍世界比较，
+    // 与 discard() 各写一份，测试断言那张表而生产代码在那个点根本没查它。
+    // 1.34.7 把冲刷这条改成「只认世界索引」（快照会冻结，见 FlushWorldGuardTest），判定仍在唯一的
+    // 纯函数里，因此守门改为：flushInternal 必须调用该纯函数，且不得再自己拼世界比较去决定丢弃。
+    String body = methodBody(source("bandwidth/BlockChangeMerger.java"), "private boolean flushInternal(");
+    assertTrue(body.length() > 200, "flushInternal 必须仍存在");
+    assertTrue(body.contains("shouldDiscardAtFlush("),
+        "冲刷前的丢弃判定必须落在唯一的纯函数里（shouldDiscardAtFlush）");
+    assertTrue(!body.contains("worldChanged = !"), "丢弃判定不得再在方法体内就地拼表达式");
+  }
+
+  /**
+   * 取某个方法/处理器的<b>方法体</b>：从签名处截到其后第一个「两空格缩进的右花括号」。
+   *
+   * <p>早期版本用「签名后固定 N 个字符」当窗口，窗口偏大时会把下一个方法的声明也圈进来——
+   * 于是「A 方法里必须有 X」这种断言会被下一个方法里的 {@code X} 满足，红版也可能意外通过。
+   * 这里改成按方法边界截断，断言必须落在真正被执行的那段代码里。
+   */
+  private static String methodBody(String source, String signature) {
+    int start = source.indexOf(signature);
+    if (start < 0) {
+      return "";
+    }
+    int end = source.indexOf("\n  }", start);
+    return end < 0 ? source.substring(start) : source.substring(start, end);
   }
 
   @Test
   void flushDiscardRequiresWorldIndexCorroboration() throws Exception {
     String merger = source("bandwidth/BlockChangeMerger.java");
-    int flush = merger.indexOf("private boolean flushInternal(");
-    assertTrue(flush > 0, "flushInternal 必须仍存在");
-    String body = merger.substring(flush, Math.min(merger.length(), flush + 7000));
+    String body = methodBody(merger, "private boolean flushInternal(");
+    assertTrue(body.length() > 200, "flushInternal 必须仍存在且能取到方法体");
     assertTrue(body.contains("shouldDiscardAtFlush("),
         "冲刷守卫必须走 shouldDiscardAtFlush：位置快照会冻结（Folia 实体调度器随切维退役且不保证回调），"
             + "拿它当「玩家已换世界」的证据会整批丢掉在途更新（实测 69.5 万包）");
@@ -153,14 +170,12 @@ class DumpSelfExplanationGuardTest {
   @Test
   void positionRefreshIsRescheduledOnWorldChangeAndRespawn() throws Exception {
     String merger = source("bandwidth/BlockChangeMerger.java");
-    int changed = merger.indexOf("public void onChangedWorld(");
-    assertTrue(changed > 0, "切维处理器必须存在");
-    String changedBody = merger.substring(changed, Math.min(merger.length(), changed + 1200));
+    String changedBody = methodBody(merger, "public void onChangedWorld(");
+    assertTrue(changedBody.length() > 100, "切维处理器必须存在");
     assertTrue(changedBody.contains("schedulePositionRefresh("),
         "切维后必须重排位置刷新任务：实体调度器任务会随实体移出旧 world 退役，不重排则快照永久冻结");
-    int respawn = merger.indexOf("public void onRespawn(");
-    assertTrue(respawn > 0, "必须处理重生：Folia 上重生会重建实体，调度器任务同样退役");
-    String respawnBody = merger.substring(respawn, Math.min(merger.length(), respawn + 800));
+    String respawnBody = methodBody(merger, "public void onRespawn(");
+    assertTrue(respawnBody.length() > 40, "必须处理重生：Folia 上重生会重建实体，调度器任务同样退役");
     assertTrue(respawnBody.contains("schedulePositionRefresh("), "重生后同样要重排刷新任务");
   }
 
