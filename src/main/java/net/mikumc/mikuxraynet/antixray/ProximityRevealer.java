@@ -944,7 +944,7 @@ public final class ProximityRevealer implements Listener {
     List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex,
         revealedSet, player.getUniqueId(), worldName, location.getBlockX(), location.getBlockY(),
         location.getBlockZ(), maxDistance, fetchLimit(budget.remaining()), shard,
-        SCAN_SHARDS, scanTally, retryNearbyRevealed, prefilter);
+        SCAN_SHARDS, scanTally, Long.MAX_VALUE, retryNearbyRevealed, prefilter);
     recordScanTally(scanTally);
     if (candidates.isEmpty()) {
       return;
