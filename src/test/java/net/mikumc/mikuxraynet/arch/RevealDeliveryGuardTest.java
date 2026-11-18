@@ -83,7 +83,8 @@ class RevealDeliveryGuardTest {
 
   @Test
   void successfulBreakQueuesSweepAndDoesNotReplaceLegacyAirUpdates() throws IOException {
-    String source = stripComments(readSource("antixray/ProximityRevealer.java"));
+    String source = stripComments(readSource("antixray/ProximityRevealer.java"))
+        .replace("\r\n", "\n");
     assertTrue(source.contains("@EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)"
         + "\n  public void onBlockBreak(BlockBreakEvent event)"));
     String entry = methodBody(source, "onBlockBreak");
