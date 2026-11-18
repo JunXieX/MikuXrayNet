@@ -186,7 +186,13 @@ public final class ChunkChangeJournal {
 
   Ticket poll(Receiver receiver) {
     synchronized (receiver) {
-      return receiver.ready.pollFirst();
+      java.util.Iterator<Ticket> iterator = receiver.ready.iterator();
+      if (!iterator.hasNext()) {
+        return null;
+      }
+      Ticket next = iterator.next();
+      iterator.remove();
+      return next;
     }
   }
 
@@ -260,9 +266,10 @@ public final class ChunkChangeJournal {
 
   void abandonDrain(Receiver receiver) {
     synchronized (receiver) {
-      for (Ticket ticket; (ticket = receiver.ready.pollFirst()) != null; ) {
+      for (Ticket ticket : new java.util.ArrayList<>(receiver.ready)) {
         remove(ticket);
       }
+      receiver.ready.clear();
       receiver.draining = false;
     }
   }
