@@ -50,20 +50,32 @@ class ChunkChangeJournalTest {
     assertEquals(1, cells.size(), "同一格反复变更只补发一次（补发的是当前状态，重复没有意义）");
   }
 
+  /**
+   * 单次放行的补发上限必须能覆盖「一个 section 在同一窗口内的全部变更」。
+   *
+   * <p>旧值 16 是随手取的：一次爆炸 / 大范围施工在同一段内改掉几十上百格时，超出部分既不补发、
+   * 也没有任何别的路径会来纠正——客户端就永久保留旧区块字节（真机表现：整段幽匿脉络等附着方块
+   * 卡在空中，右键被服务端纠正后才消失）。上限只该由环形容量兜底，不该是任意小值。
+   */
   @Test
-  void replayIsCappedSoOnePacketCanNeverFlood() {
+  void replayCoversAWholeSectionOfSimultaneousChanges() {
     ChunkChangeJournal journal = new ChunkChangeJournal();
     for (int i = 0; i < 200; i++) {
-      journal.record("world", i, 64, 0);
+      // 全部落在同一区块 (0,0)：x/z 取 0..15，y 递增避免同格去重
+      journal.record("world", i & 15, 64 + (i >> 4), i & 15);
     }
     List<int[]> cells = journal.changedSince(0L, "world", 0, 0);
-    assertEquals(ChunkChangeJournal.MAX_REPLAY, cells.size(), "单次补发必须有上限");
+    assertEquals(200, cells.size(),
+        "同一段内的一次性批量变更必须整批补发；上限只该是环形容量，不能是 16");
+    assertTrue(ChunkChangeJournal.MAX_REPLAY >= 4096,
+        "单次补发上限至少覆盖一个 section 的 4096 格（爆炸/大范围施工的真实量级）");
   }
 
   @Test
   void ringWrapKeepsServingTheNewestChanges() {
     ChunkChangeJournal journal = new ChunkChangeJournal();
-    for (int i = 0; i < 2000; i++) {
+    // 录制量必须显著大于环形容量（否则「覆盖之后仍能取到最新一条」根本没被验证）
+    for (int i = 0; i < 20_000; i++) {
       journal.record("world", i & 15, 64, 0);
     }
     long mark = journal.sequence();
