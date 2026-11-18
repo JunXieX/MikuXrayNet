@@ -457,33 +457,22 @@ class ConfigDefaultsTest {
 
     // 破坏邻域显形：半径与事件显形共用 1..8 的钳制区间；max-per-tick=0 表示关闭本项（不是钳到 1）
     AntiXrayConfig sweep = AntiXrayConfig.from(yaml(
-        "proximity:
-"
-        + "  instant-reveal:
-"
-        + "    break-sweep:
-"
-        + "      enabled: false
-"
-        + "      radius: 99
-"
-        + "      max-per-tick: 0
-"));
+        "proximity:\n"
+        + "  instant-reveal:\n"
+        + "    break-sweep:\n"
+        + "      enabled: false\n"
+        + "      radius: 99\n"
+        + "      max-per-tick: 0\n"));
     assertFalse(sweep.proximity().instantReveal().breakSweep().enabled(), "破坏邻域显形可显式关闭");
     assertEquals(8, sweep.proximity().instantReveal().breakSweep().radius(), "半径超限钳制到 8");
     assertEquals(0, sweep.proximity().instantReveal().breakSweep().maxPerTick(),
         "max-per-tick=0 表示关闭本项");
     AntiXrayConfig sweepNegative = AntiXrayConfig.from(yaml(
-        "proximity:
-"
-        + "  instant-reveal:
-"
-        + "    break-sweep:
-"
-        + "      radius: -5
-"
-        + "      max-per-tick: 9999
-"));
+        "proximity:\n"
+        + "  instant-reveal:\n"
+        + "    break-sweep:\n"
+        + "      radius: -5\n"
+        + "      max-per-tick: 9999\n"));
     assertEquals(1, sweepNegative.proximity().instantReveal().breakSweep().radius(), "半径负值钳制到 1");
     assertEquals(AntiXrayConfig.PROXIMITY_BREAK_SWEEP_MAX_PER_TICK_MAX,
         sweepNegative.proximity().instantReveal().breakSweep().maxPerTick(),
