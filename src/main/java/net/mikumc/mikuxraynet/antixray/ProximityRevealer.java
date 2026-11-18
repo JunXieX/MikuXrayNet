@@ -129,8 +129,15 @@ public final class ProximityRevealer implements Listener {
    * {@link #effectiveRevealCeiling(int)} 钳制并在启动时 WARN 一次（绝不静默改配置）。
    *
    * <p>包级可见：单测据此断言「三个上限一致」，避免日后再次漂移。
+   *
+   * <p><b>为什么是 1024</b>：窗口是「本周期最多评估/发包多少个候选」的唯一硬顶。真机 dump 显示
+   * 伪装坐标密度可达 407 个/区块（≈10%），512 个名额只覆盖最近约 9 格——开阔洞穴里 10 格外的矿
+   * 永远轮不到，玩家只能靠准星对准（视线显形走的是另一条路径）。配合候选预筛（六面全遮挡直接丢弃，
+   * 见 {@code ProximityScanner.Prefilter}）把名额全部发给「可能可见」的坐标后，同一窗口的覆盖半径
+   * 扩大到约 2~3 倍；再把硬顶翻倍到 1024，覆盖半径再抬约 26%。代价是工作线程上的射线判定次数翻倍
+   * （真机 dump 约 2 万次/秒 → 4 万次/秒，四线程分摊），换的是「看得见的矿不再排队等准星」。
    */
-  static final int MAX_CANDIDATES = 512;
+  static final int MAX_CANDIDATES = 1024;
   /**
    * <b>事件即时显形</b>（单次事件）的评估次数上限，与周期巡检的窗口无关。
    *
@@ -267,6 +274,10 @@ public final class ProximityRevealer implements Listener {
     private int positionsEvaluated;
     private int rayCulled;
     private int sent;
+    /** 被语义等价预筛丢弃的候选数（见 {@code ProximityScanner.Prefilter}）。 */
+    private int prefiltered;
+    /** 本周期窗口内最远候选的距离平方（0 = 没有候选）。 */
+    private long farthestDistanceSquared;
   }
 
   /**
@@ -922,16 +933,22 @@ public final class ProximityRevealer implements Listener {
     // 不会因为「全服同时重试」放大成尖峰（每 25 tick 命中一次）。
     // 抽成一个方法是为了让局部变量保持 effectively final（下面的工作线程 lambda 要捕获它）
     final boolean retryNearbyRevealed = nearRetryPhase(player.getUniqueId());
+    boolean frustum = proximity.frustumEnabled();
+    boolean visibility = proximity.raycastEnabled();
+    // 语义等价预筛：六面全被遮挡的坐标在任何射线判定下都必然不可见（见 BitmapVisibility#hasExposedFace），
+    // 提前丢弃只缩小评估量、不改变任何显形结论。只在射线判定开启时挂：关掉射线时窗口里每条候选都会
+    // 直接发包，此时按暴露面丢弃就变成「改变行为」了。
+    BitmapVisibility faceProbe = visibility ? BitmapVisibility.local() : null;
+    ProximityScanner.Prefilter prefilter = faceProbe == null ? null
+        : (px, py, pz) -> faceProbe.hasExposedFace(occlusionStores, worldName, px, py, pz);
     List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex,
         revealedSet, player.getUniqueId(), worldName, location.getBlockX(), location.getBlockY(),
         location.getBlockZ(), maxDistance, fetchLimit(budget.remaining()), shard,
-        SCAN_SHARDS, scanTally, retryNearbyRevealed);
+        SCAN_SHARDS, scanTally, retryNearbyRevealed, prefilter);
+    recordScanTally(scanTally);
     if (candidates.isEmpty()) {
       return;
     }
-
-    boolean frustum = proximity.frustumEnabled();
-    boolean visibility = proximity.raycastEnabled();
     // 周期/事件显形的候选可见性判定走遮挡位图（视线即时显形是独立的 6 格方块射线，不经过这里）。
     // 位图缺失（罕见故障）时 BitmapVisibility 按「遮挡」处理（严格方向：不显形），绝不裸发——
     // 「无数据 ≠ 通畅」是显形侧的既定安全方向。
@@ -1022,6 +1039,22 @@ public final class ProximityRevealer implements Listener {
    */
   static boolean nearRetryDue(long lastTick, long nowTick) {
     return lastTick == Long.MIN_VALUE || nowTick - lastTick >= NEAR_RETRY_PERIOD_TICKS;
+  }
+
+  /**
+   * 记下本轮候选窗口的两个诊断量：预筛丢弃数、窗口覆盖距离（格）。
+   *
+   * <p>放在「候选为空就返回」之前：空窗口同样是有价值的读数（说明身边确实没有可显形坐标），
+   * 而且「预筛丢弃很多、窗口却空」正是需要被看见的失效形态。
+   */
+  private void recordScanTally(ProximityScanner.Tally scanTally) {
+    if (scanTally == null) {
+      return;
+    }
+    if (scanTally.prefiltered > 0) {
+      stats.prefilterDropped.add(scanTally.prefiltered);
+    }
+    stats.recordWindowReach(scanTally.farthestDistanceSquared);
   }
 
   /** 本轮是否有可用的工作线程来执行纯计算筛选（包级可见，便于离线单测）。 */
@@ -1125,6 +1158,8 @@ public final class ProximityRevealer implements Listener {
     tally.chunksSkipped = scanTally.chunksSkipped;
     tally.chunksDeferred = scanTally.chunksDeferred;
     tally.positionsEvaluated = scanTally.positionsEvaluated;
+    tally.prefiltered = scanTally.prefiltered;
+    tally.farthestDistanceSquared = scanTally.farthestDistanceSquared;
     // 位图可见性的剔除发生在 computePlan（见其 rayCulled）；未走计划的路径在 sendOne 里累计
     tally.rayCulled = plan != null ? plan.rayCulled : 0;
     int candidateCount = plan != null
@@ -1726,8 +1761,10 @@ public final class ProximityRevealer implements Listener {
     // 一次性就绪诊断（正常运营信息，降为 FINE）：开服/运行日志只保留必要内容与异常提示。
     plugin.getLogger().fine("首次显形诊断：扫描区块 " + tally.chunksScanned + " 个（整块跳过 "
         + tally.chunksSkipped + "，分片推迟 " + tally.chunksDeferred + "／共 " + SCAN_SHARDS
-        + " 片），坐标评估 " + tally.positionsEvaluated + " 个，候选 " + candidateCount
-        + " 个，视锥剔除 " + frustumCulled + "，射线剔除 " + tally.rayCulled
+        + " 片），坐标评估 " + tally.positionsEvaluated + " 个，其中预筛丢弃 " + tally.prefiltered
+        + " 个，候选 " + candidateCount + " 个，窗口覆盖 "
+        + (tally.farthestDistanceSquared <= 0L ? 0L : (long) Math.sqrt(tally.farthestDistanceSquared))
+        + " 格，视锥剔除 " + frustumCulled + "，射线剔除 " + tally.rayCulled
         + "，实际发送 " + tally.sent);
   }
 

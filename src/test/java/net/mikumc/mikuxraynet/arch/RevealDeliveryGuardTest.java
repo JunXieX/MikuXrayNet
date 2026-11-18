@@ -84,6 +84,25 @@ class RevealDeliveryGuardTest {
         "变更日志必须先于后台投递落库：区块放行与 BlockUndo 线程竞速，晚一步落库就等于该格永不补发");
   }
 
+  /**
+   * 周期候选窗口必须挂「语义等价预筛」（六面全遮挡直接丢弃）。
+   *
+   * <p>没有它时，高矿密度世界的窗口名额会被最近的全埋矿占满（真机 dump：407 个伪装坐标/区块），
+   * 看得见的矿排在窗口外，玩家只能靠准星对准才看到真方块。
+   */
+  @Test
+  void periodicScanWiresTheSemanticPrefilter() throws IOException {
+    String source = stripComments(readSource("antixray/ProximityRevealer.java"));
+    String body = methodBody(source, "reveal");
+    assertTrue(body != null, "reveal 必须存在");
+    assertTrue(body.contains("hasExposedFace("),
+        "周期巡检必须挂语义等价预筛：窗口名额只该发给可能可见的坐标");
+    assertTrue(body.contains("prefilter)") || body.contains("prefilter,"),
+        "预筛必须真的传进 ProximityScanner.candidates（只建对象不传等于没挂）");
+    assertTrue(body.contains("recordScanTally("),
+        "窗口覆盖距离与预筛丢弃数必须记账，否则「覆盖够不够」无法从 dump 判断");
+  }
+
   private static String readSource(String relativePath) throws IOException {
     return Files.readString(MAIN.resolve(relativePath));
   }

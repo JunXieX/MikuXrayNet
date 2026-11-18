@@ -66,6 +66,74 @@ class ProximityScannerTest {
         shard, shards, tally);
   }
 
+  /** 带语义等价预筛的扫描（不分片，与 {@link #scan} 同口径）。 */
+  private static List<ObfuscatedChunkIndex.Position> scanFiltered(ObfuscatedChunkIndex index,
+      RevealedSet revealed, UUID player, double distance, int limit, ProximityScanner.Tally tally,
+      ProximityScanner.Prefilter prefilter) {
+    return ProximityScanner.candidates(index, revealed, player, WORLD, 8, 64, 8, distance, limit,
+        0, 1, tally, Long.MAX_VALUE, false, prefilter);
+  }
+
+  // ------------------------------------------------------------------ 语义等价预筛（窗口覆盖度）
+
+  /**
+   * 窗口名额必须优先发给「可能可见」的坐标。
+   *
+   * <p>真机 dump 里伪装坐标密度可达 407 个/区块（≈10%）：纯按距离取窗口时，最近几百个几乎全是埋在岩层
+   * 里的矿，看得见的矿排在窗口外，只能等准星对准（视线显形走的是另一条路径）。预筛把它们剔掉之后，
+   * 同样的窗口名额才能轮到远处的候选。
+   */
+  @Test
+  void prefilterKeepsBuriedCandidatesOutOfTheWindow() {
+    ObfuscatedChunkIndex index = index();
+    RevealedSet revealed = revealed();
+    int[] near = new int[600];
+    int filled = 0;
+    for (int y = 64; y <= 66 && filled < near.length; y++) {
+      for (int z = 0; z < 16 && filled < near.length; z++) {
+        for (int x = 0; x < 16 && filled < near.length; x++) {
+          near[filled++] = local(x, y, z);
+        }
+      }
+    }
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, java.util.Arrays.copyOf(near, filled));
+    index.recordChunkWithRemovals(WORLD, 2, 0, MIN_HEIGHT,
+        new int[] {local(40, 64, 8), local(40, 64, 9), local(40, 64, 10), local(40, 64, 11),
+            local(40, 64, 12)});
+
+    ProximityScanner.Tally plain = new ProximityScanner.Tally();
+    List<ObfuscatedChunkIndex.Position> withoutFilter = scan(index, revealed, PLAYER, 64.0D, 10, plain);
+    assertEquals(10, withoutFilter.size(), "不挂预筛时窗口被最近的 10 个坐标（全是全埋矿）占满");
+    assertTrue(withoutFilter.stream().noneMatch(position -> position.x() == 40),
+        "不挂预筛时远处的可见坐标根本进不了窗口——这就是覆盖不足的成因");
+
+    ProximityScanner.Tally filtered = new ProximityScanner.Tally();
+    List<ObfuscatedChunkIndex.Position> withFilter = scanFiltered(index, revealed, PLAYER, 64.0D, 10,
+        filtered, (x, y, z) -> x >= 32);
+    assertEquals(5, withFilter.size(), "挂预筛后窗口名额全部让给可能可见的坐标");
+    assertTrue(withFilter.stream().allMatch(position -> position.x() == 40),
+        "留下的必须是远处那批可见坐标");
+    assertTrue(filtered.prefiltered >= 500, "被丢弃的全埋候选必须计数（诊断口径）");
+    assertEquals(32L, (long) Math.sqrt(filtered.farthestDistanceSquared),
+        "窗口覆盖距离必须可读：预筛后覆盖到 32 格，而不是被埋在 8 格内");
+  }
+
+  /** 预筛只做等价剪枝：全部候选都有暴露面时，结果必须与不挂预筛逐条一致。 */
+  @Test
+  void prefilterNeverChangesTheVerdictWhenEveryCandidateHasAnExposedFace() {
+    ObfuscatedChunkIndex index = index();
+    RevealedSet revealed = revealed();
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT, new int[] {
+        local(8, 64, 8), local(8, 66, 8), local(12, 64, 12), local(2, 70, 3)});
+
+    List<ObfuscatedChunkIndex.Position> plain = scan(index, revealed, PLAYER, 64.0D, 16,
+        new ProximityScanner.Tally());
+    List<ObfuscatedChunkIndex.Position> filtered = scanFiltered(index, revealed, PLAYER, 64.0D, 16,
+        new ProximityScanner.Tally(), (x, y, z) -> true);
+
+    assertEquals(plain, filtered, "预筛返回 true 时必须与不挂预筛逐条一致（纯剪枝，不改结论）");
+  }
+
   // ------------------------------------------------------------------ 局部扫描边界
 
   @Test

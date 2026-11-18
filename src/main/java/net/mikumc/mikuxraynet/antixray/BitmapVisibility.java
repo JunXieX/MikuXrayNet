@@ -136,6 +136,31 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
   }
 
   /**
+   * 语义等价预筛：该坐标是否至少有一个「朝向非遮挡方块」的面。
+   *
+   * <p>与 {@link #isVisible} 的 {@code faces == 0} 早退<b>逐条等价</b>（同一严格查询、同一六面语义），
+   * 因此调用方可以在候选窗口内提前丢弃——丢弃只减少评估量，不会让任何一个本该显形的坐标漏显形：
+   * 六面全被遮挡的方块从任何方向都不可能被看到（含「缺数据按遮挡」的严格口径）。
+   *
+   * <p>线程：本实例是 {@link ThreadLocal} 的，供玩家线程（周期候选窗口）与工作线程各自复用；
+   * 判定结束后同样清空 {@code store} 引用，避免钉住世界位图（理由见 {@link #isVisible}）。
+   */
+  boolean hasExposedFace(OcclusionStores stores, String worldName, int x, int y, int z) {
+    this.store = stores == null ? null : stores.lookup(worldName);
+    if (this.store == null) {
+      // 与 isVisible 一致：该世界没有位图表 ⇒ 一切都按遮挡 ⇒ 没有暴露面
+      return false;
+    }
+    try {
+      return !isOccluding(x + 1, y, z) || !isOccluding(x - 1, y, z)
+          || !isOccluding(x, y + 1, z) || !isOccluding(x, y - 1, z)
+          || !isOccluding(x, y, z + 1) || !isOccluding(x, y, z - 1);
+    } finally {
+      this.store = null;
+    }
+  }
+
+  /**
    * 开始一次「把该方块视为空气」的可见性判定（挖掘预显形，见 {@code ProximityRevealer#revealAfterDig}）。
    *
    * <p>语义：该格在暴露面判定与步进射线上都按「不遮挡」处理（等同于它已经被挖掉），

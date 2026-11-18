@@ -64,10 +64,42 @@ final class ProximityScanner {
      * 需要调用方顺延」。视野增量巡检（M3）据此判断是否真的完成了一趟扫描。
      */
     boolean deadlineTruncated;
+    /**
+     * 被语义等价预筛（{@link Prefilter}）丢弃的候选数：它们在任何射线判定下都必然不可见。
+     *
+     * <p>与 {@link #positionsEvaluated} 是<b>包含</b>关系（预筛只对「本来要进窗口」的候选调用）。
+     * 该值相对 {@code positionsEvaluated} 的占比，就是「窗口名额有多少本来会浪费在全埋矿上」的直接证据。
+     */
+    int prefiltered;
+    /**
+     * 本次窗口内最远候选的距离平方（没有候选时为 0）：换算成格数即「本周期窗口实际覆盖到多远」。
+     *
+     * <p>这是覆盖度的唯一直接读数——调大窗口 / 加预筛是否真的把覆盖半径推远，看它就够，
+     * 不需要再靠玩家反馈猜。
+     */
+    long farthestDistanceSquared;
   }
 
   /** 带距离与到达序号的候选（堆选择需要次级键来保持「等距候选先到者在前」的稳定顺序）。 */
   private record Scored(ObfuscatedChunkIndex.Position position, long distanceSquared, int sequence) {
+  }
+
+  /**
+   * 候选预筛（可空）：返回 {@code false} 表示该坐标<b>在任何射线判定下都必然不可见</b>，
+   * 可以在进入窗口前直接丢弃——只减少评估量，不改变任何一个坐标的显形结论。
+   *
+   * <p><b>生产实现</b>是 {@code BitmapVisibility#hasExposedFace}：六面全被遮挡的方块，{@code isVisible}
+   * 会在取候选点之前就早退为「不可见」（{@code ProximitySelector#isVisible} 的 {@code faces == 0} 分支），
+   * 因此这里先剔掉它们与后面的判定逐条等价。这正是「窗口被全埋矿占满、看得见的矿排不进来」的解药：
+   * 窗口名额只发给本来就可能可见的坐标，覆盖半径随之扩大数倍。
+   *
+   * <p><b>只在窗口距离守卫之后调用</b>：注定进不了窗口的候选不值得付这 6 次位图读（见调用点）。
+   */
+  @FunctionalInterface
+  interface Prefilter {
+
+    /** 该坐标是否「有可能可见」（false = 必然不可见，可安全丢弃）。 */
+    boolean test(int x, int y, int z);
   }
 
   /**
@@ -126,6 +158,20 @@ final class ProximityScanner {
       RevealedSet revealed, UUID playerId, String worldName, int x, int y, int z,
       double maxDistance, int limit, int shard, int shards, Tally tally, long deadlineNanos,
       boolean retryNearbyRevealed) {
+    return candidates(index, revealed, playerId, worldName, x, y, z, maxDistance, limit, shard,
+        shards, tally, deadlineNanos, retryNearbyRevealed, null);
+  }
+
+  /**
+   * 同上，并带<b>语义等价预筛</b>（{@link Prefilter}，可为 {@code null}）。
+   *
+   * <p>预筛只负责「这条候选有没有可能可见」，不改变任何判定结果；它放在窗口距离守卫<b>之后</b>，
+   * 因此每个坐标最多付一次 6 面位图读，且只对本来就会进入窗口的候选付。
+   */
+  static List<ObfuscatedChunkIndex.Position> candidates(ObfuscatedChunkIndex index,
+      RevealedSet revealed, UUID playerId, String worldName, int x, int y, int z,
+      double maxDistance, int limit, int shard, int shards, Tally tally, long deadlineNanos,
+      boolean retryNearbyRevealed, Prefilter prefilter) {
     if (index == null || revealed == null || playerId == null || worldName == null
         || limit <= 0 || maxDistance < 0.0D) {
       return List.of();
@@ -221,6 +267,14 @@ final class ProximityScanner {
               continue;
             }
           }
+          // 语义等价预筛（见 Prefilter 的注释）：六面全被遮挡的坐标在任何射线判定下都必然不可见，
+          // 放它进窗口只会白占名额、把真正看得见的矿挤到窗口外。放在距离守卫之后，代价有界。
+          if (prefilter != null && !prefilter.test(blockX, blockY, blockZ)) {
+            if (tally != null) {
+              tally.prefiltered++;
+            }
+            continue;
+          }
           if (revealed.contains(playerId, worldName, chunkX, chunkZ, blockX, blockY, blockZ)
               && !(retryNearbyRevealed && distanceSq <= NEAR_RETRY_DISTANCE_SQUARED)) {
             continue;
@@ -240,6 +294,10 @@ final class ProximityScanner {
     List<ObfuscatedChunkIndex.Position> result = new ArrayList<>(ordered.length);
     for (Scored scored : ordered) {
       result.add(scored.position());
+    }
+    if (tally != null && ordered.length > 0) {
+      // 排序后末位即最远：这就是本周期窗口实际覆盖到的距离（诊断口径，见 Tally#farthestDistanceSquared）
+      tally.farthestDistanceSquared = ordered[ordered.length - 1].distanceSquared();
     }
     return result;
   }

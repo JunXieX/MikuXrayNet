@@ -151,6 +151,37 @@ public final class ProximityStats {
   public final LongAdder viewChangeBudgetExhausted = new LongAdder();
 
   /**
+   * 被「语义等价预筛」丢弃的候选数：六面全遮挡，任何射线判定下都必然不可见（见
+   * {@code ProximityScanner.Prefilter}）。
+   *
+   * <p><b>为什么必须可观测</b>：它是「窗口名额有多少本来会浪费在全埋矿上」的唯一直接证据。
+   * 该值 ≫ {@code 显形发送} 说明窗口确实长期被埋住的矿占满——这正是「看得见的矿排不进窗口、
+   * 只有准星对准才还原」的成因；加预筛之后它仍会很大（预筛本身就在丢弃它们），但窗口覆盖半径
+   * （{@link #windowFarthestBlocks()}）应随之明显变大。
+   */
+  public final LongAdder prefilterDropped = new LongAdder();
+
+  /** 周期巡检窗口内最远候选的距离（格，单调取历史最大值；0 = 尚未取到候选）。 */
+  private final AtomicLong windowFarthestBlocks = new AtomicLong();
+
+  /** 记录一次窗口覆盖距离（入参是距离平方；诊断口径见 {@link #windowFarthestBlocks()}）。 */
+  void recordWindowReach(long distanceSquared) {
+    if (distanceSquared <= 0L) {
+      return;
+    }
+    long blocks = (long) Math.sqrt((double) distanceSquared);
+    long current = windowFarthestBlocks.get();
+    while (blocks > current && !windowFarthestBlocks.compareAndSet(current, blocks)) {
+      current = windowFarthestBlocks.get();
+    }
+  }
+
+  /** 窗口内最远候选的距离（格）：调窗口大小 / 加预筛是否真的把覆盖推远，看这一个数就够。 */
+  public long windowFarthestBlocks() {
+    return windowFarthestBlocks.get();
+  }
+
+  /**
    * 生成中文可读快照（顺序稳定，便于命令输出）。
    *
    * <p>测试专用豁免：生产诊断直接逐字段读取（见 {@code Diagnostics}），

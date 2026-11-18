@@ -251,11 +251,12 @@ public final class Diagnostics {
     public record Proximity(long revealsSent, long revealsSkipped, long revealsUnregistered,
         long frustumCulled, long rayCulled, long rayCulledMissingData, long overRevealSampled,
         long overRevealWasted, long viewChangeScans, long viewChangeNanos, long viewChangeMaxNanos,
-        long viewChangeBudgetExhausted, long passesSkippedNoCapacity) {
+        long viewChangeBudgetExhausted, long passesSkippedNoCapacity, long prefilterDropped,
+        long windowFarthestBlocks) {
 
       /** 邻近显形未启用时的零值兜底。 */
       public static final Proximity EMPTY =
-          new Proximity(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+          new Proximity(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     /** 显形索引域：伪装区块索引（按区块共享）与按玩家的已显形集合的持有量与安全阀计数。 */
@@ -411,6 +412,7 @@ public final class Diagnostics {
         + "｜区块改写 " + s.rewrite().chunksRewritten() + "（异常 " + s.rewrite().chunksFailed()
         + "，超时放行 " + s.rewrite().chunksTimedOut() + "）"
         + "｜显形发送 " + s.proximity().revealsSent() + "，坐标跳过 " + s.proximity().revealsSkipped()
+        + "，窗口覆盖 " + s.proximity().windowFarthestBlocks() + " 格"
         // 与状态面板/转储用同一口径：合并计的是「原包数」而非「合并结果的条数」
         + "｜变更合并 " + s.throttle().blockMergeBatches()
         + "（合并 " + s.throttle().blockChangesMerged() + " 个原包）"
@@ -975,7 +977,8 @@ public final class Diagnostics {
             proximityStats.overRevealSampled.sum(), proximityStats.overRevealWasted.sum(),
             proximityStats.viewChangeScans.sum(), proximityStats.viewChangeNanos.sum(),
             proximityStats.viewChangeMaxNanos.get(), proximityStats.viewChangeBudgetExhausted.sum(),
-            proximityStats.passesSkippedNoCapacity.sum());
+            proximityStats.passesSkippedNoCapacity.sum(), proximityStats.prefilterDropped.sum(),
+            proximityStats.windowFarthestBlocks());
     Snapshot.Index index = chunkIndex == null && revealedSet == null ? Snapshot.Index.EMPTY
         : new Snapshot.Index(
             chunkIndex == null ? 0 : chunkIndex.chunkCount(),
@@ -1220,7 +1223,11 @@ public final class Diagnostics {
         + "，最大 " + formatMillis(s.proximity().viewChangeMaxNanos()) + " ms（墙钟，含 GC 抖动）"
         + "，预算耗尽 " + s.proximity().viewChangeBudgetExhausted() + " 次"
         // 工作池无容量时周期巡检会整轮跳过（显形完全不发生）；必须可见，否则「什么都不还原」无法归因。
-        + "｜整轮跳过（工作池满） " + s.proximity().passesSkippedNoCapacity());
+        + "｜整轮跳过（工作池满） " + s.proximity().passesSkippedNoCapacity()
+        // 覆盖度：窗口是「本周期最多评估多少个候选」的硬顶，覆盖格数才是玩家能看到的范围。
+        // 预筛丢弃是「窗口名额有多少本来会浪费在全埋矿上」的直接证据（见 ProximityStats）。
+        + "｜窗口覆盖 " + s.proximity().windowFarthestBlocks() + " 格，预筛丢弃 "
+        + s.proximity().prefilterDropped());
     // 口径说明：这里刻意分列「实时坐标数」与「累计登记数」——前者随登出 / 过期 / 区块失效归零，
     // 后者只增不减。若只显示实时值，玩家中途重登或走远后被清理时会看到「发送 N 但已显形 0」，
     // 极易被误读成「显形路径没有登记」（实际登记在发包成功后必然发生）。
