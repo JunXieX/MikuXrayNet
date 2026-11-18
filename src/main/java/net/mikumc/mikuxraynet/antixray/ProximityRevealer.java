@@ -33,9 +33,11 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
 import org.bukkit.event.world.WorldUnloadEvent;
 import org.bukkit.plugin.Plugin;
@@ -642,6 +644,53 @@ public final class ProximityRevealer implements Listener {
       return;
     }
     scheduleEntityTask(event.getPlayer(), Math.max(1, proximity.intervalTicks()));
+  }
+
+  /**
+   * 重生：Folia 上玩家重生会重建实体，旧实体的实体调度器任务随之退役。
+   *
+   * <p>本类的周期巡检与视线即时显形都是「每玩家一条实体调度任务」；不重排的话，玩家死亡一次之后
+   * 这两条路径对该玩家永久停摆，此后只有事件路径（挖掘 / 方块变更 / 区块下发 / 视野变化）还能还原
+   * 假矿——真机表现就是「矿物一直是假方块，转身或挖一下才变回来」。
+   *
+   * <p>与 {@code BlockChangeMerger#onRespawn} 同一课（1.34.7 已为位置快照修过同因缺陷）。
+   */
+  @EventHandler(ignoreCancelled = true)
+  public void onRespawn(PlayerRespawnEvent event) {
+    rescheduleEntityTasks(event.getPlayer());
+  }
+
+  /**
+   * 切维：Folia 上跨世界同样会重建实体（等同一次重生），两条实体调度任务必须重排。
+   *
+   * <p>对「主城 ↔ 矿区」这种多世界服务器尤其关键：玩家进矿区的第一件事就是切维，切完恰好是
+   * 最需要周期巡检生效的地方。
+   */
+  @EventHandler(ignoreCancelled = true)
+  public void onChangedWorld(PlayerChangedWorldEvent event) {
+    rescheduleEntityTasks(event.getPlayer());
+  }
+
+  /**
+   * 重排该玩家的两条实体调度任务（周期巡检 + 视线即时显形）。
+   *
+   * <p>只在 Folia 需要：Paper 的周期巡检与视线显形是两条全局任务（见 {@link #start()}），与实体退役
+   * 无关。旧句柄先摘后取消，避免重复任务空转；调度再次失败（实体尚未就位）时由下一次事件兜底。
+   */
+  private void rescheduleEntityTasks(Player player) {
+    if (stopping || player == null || !PlatformSupport.isFolia()) {
+      return;
+    }
+    UUID playerId = player.getUniqueId();
+    ScheduledTask previousLook = lookScans.remove(playerId);
+    if (previousLook != null) {
+      cancelQuietly(previousLook);
+    }
+    EntityScan previousScan = entityScans.remove(playerId);
+    if (previousScan != null) {
+      cancelQuietly(previousScan.task());
+    }
+    scheduleEntityTask(player, Math.max(1, proximity.intervalTicks()));
   }
 
   /** 玩家登出：取消其巡检任务句柄，并清理其已显形标记，避免为离线玩家保留坐标。 */
@@ -2616,22 +2665,13 @@ public final class ProximityRevealer implements Listener {
       }
       // 视线判定：{@link BlockDamageEvent} 只代表客户端「声明」正在挖这一格——服务端对
       // START_DESTROY_BLOCK 只校验区块已加载与交互距离，不校验视线。少了这一步，伪造破坏包就能把
-      // 任意伪装坐标换成真实状态（隔墙透视，暴露面约一个交互距离）。这里要求眼睛到方块中心的射线
-      // 确实先命中这一格；被挡住就跳过（该坐标仍留在索引里，等玩家真的走到能看见时由巡检补上）。
+      // 任意伪装坐标换成真实状态（隔墙透视，暴露面约一个交互距离）。
+      // 判定本身见 {@link #canSeeDugBlock}：两条射线（中心 + 真实视线），斜着挖也不会被相邻方块挡掉。
       Location eye = player.getEyeLocation();
       if (!ownsChunk(world, eye.getBlockX() >> 4, eye.getBlockZ() >> 4)) {
         return;
       }
-      Vector toBlock = new Vector(x + 0.5D - eye.getX(), y + 0.5D - eye.getY(), z + 0.5D - eye.getZ());
-      double sightDistance = toBlock.length();
-      if (sightDistance > DIG_MAX_SIGHT_DISTANCE) {
-        return;
-      }
-      RayTraceResult sight = world.rayTraceBlocks(eye, toBlock.normalize(), sightDistance + 0.5D,
-          FluidCollisionMode.NEVER, true);
-      if (sight == null || sight.getHitBlock() == null
-          || sight.getHitBlock().getX() != x || sight.getHitBlock().getY() != y
-          || sight.getHitBlock().getZ() != z) {
+      if (!canSeeDugBlock(world, eye, x, y, z)) {
         return;
       }
       long tick = Bukkit.getCurrentTick();
@@ -2650,6 +2690,40 @@ public final class ProximityRevealer implements Listener {
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
+  }
+
+  /**
+   * 玩家是否真的看得见这一格（开掘预显形的视线判定，见 {@link #revealDigTarget}）。
+   *
+   * <p><b>为什么是两条射线</b>：{@link BlockDamageEvent} 只代表客户端「声明」正在挖这一格——服务端对
+   * START_DESTROY_BLOCK 只校验区块已加载与交互距离，不校验视线；少了这一层，伪造破坏包就能把任意
+   * 伪装坐标换成真实状态（隔墙透视，暴露面约一个交互距离）。
+   *
+   * <p>先判「眼睛 → 方块中心」：命中即通过。斜着挖（准星落在方块边缘 / 角上，或与目标隔着拐角）时，
+   * 这条射线可能先穿过相邻方块——历史上这里直接判不可见，于是玩家整段挖掘都看着伪装方块，
+   * 破坏后却掉真实矿物（真机反馈：「挖石头贴图的方块掉矿物」）。此时退回「玩家真实视线方向」的短射线：
+   * 客户端能挖到它，视线必然命中它；伪造的破坏包仍然过不了这一关（视线打不到目标格）。
+   */
+  private static boolean canSeeDugBlock(World world, Location eye, int x, int y, int z) {
+    Vector toBlock = new Vector(x + 0.5D - eye.getX(), y + 0.5D - eye.getY(), z + 0.5D - eye.getZ());
+    double sightDistance = toBlock.length();
+    if (sightDistance > DIG_MAX_SIGHT_DISTANCE) {
+      return false;
+    }
+    RayTraceResult center = world.rayTraceBlocks(eye, toBlock.normalize(), sightDistance + 0.5D,
+        FluidCollisionMode.NEVER, true);
+    if (hitsBlock(center, x, y, z)) {
+      return true;
+    }
+    RayTraceResult view = world.rayTraceBlocks(eye, eye.getDirection(), LOOK_MAX_DISTANCE,
+        FluidCollisionMode.NEVER, true);
+    return hitsBlock(view, x, y, z);
+  }
+
+  /** 射线结果是否正好命中指定方块坐标（{@code null} 或别的方块都算未命中）。 */
+  private static boolean hitsBlock(RayTraceResult hit, int x, int y, int z) {
+    return hit != null && hit.getHitBlock() != null && hit.getHitBlock().getX() == x
+        && hit.getHitBlock().getY() == y && hit.getHitBlock().getZ() == z;
   }
 
   /**

@@ -125,12 +125,17 @@ class RegressionWiringGuardTest {
 
   @Test
   void digTargetRevealChecksLineOfSight() throws IOException {
-    String body = methodBody(readSource("antixray/ProximityRevealer.java"), "revealDigTarget");
+    String source = readSource("antixray/ProximityRevealer.java");
+    String body = methodBody(source, "revealDigTarget");
     assertTrue(body != null, "revealDigTarget 必须存在");
-    int sight = body.indexOf("rayTraceBlocks");
+    int sight = body.indexOf("canSeeDugBlock(");
     int send = body.indexOf("sendOne(");
     assertTrue(sight >= 0, "开掘预显形必须先做视线判定：服务端对 START_DESTROY_BLOCK 只校验交互距离，不校验视线");
     assertTrue(send > sight, "视线判定必须早于发包，否则伪造破坏包就能换到真实方块状态");
+    // 判定实现本身仍必须是方块射线（不能退化成「按距离/按声明」），见 RevealDeliveryGuardTest 的双射线要求
+    String sightBody = methodBody(source, "canSeeDugBlock");
+    assertTrue(sightBody != null && sightBody.contains("rayTraceBlocks"),
+        "canSeeDugBlock 必须用方块射线判定视线");
   }
 
   @Test

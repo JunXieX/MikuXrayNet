@@ -6,10 +6,12 @@ import com.comphenix.protocol.async.AsyncMarker;
 import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketEvent;
+import io.papermc.paper.math.Position;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -28,6 +30,7 @@ import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
@@ -245,6 +248,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final ConcurrentHashMap<String, AtomicInteger> errorLogCounters = new ConcurrentHashMap<>();
   /** 「首次改写诊断」只打一次（CAS 抢占），避免每区块刷屏。 */
   private final AtomicBoolean firstRewriteDiagnosed = new AtomicBoolean();
+  /** 「在途变更溢出补发窗口」的一次性提示闸门（正常运营下永远不该触发）。 */
+  private final AtomicBoolean replayOverflowWarned = new AtomicBoolean();
   /**
    * 停用中标记：{@link #unregisterBukkitHooks()} 首行置位（{@code ProtocolLibHook.unregister} 会在注销
    * 异步处理器之前先调它）。
@@ -545,16 +550,19 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 完成（1~10ms 后）真正放行时再查，才能拿到持包期间被改过的格子。有变更时切到玩家线程连续
       // 执行「放行 + 补发」（两包同一 tick 到达，客户端只渲染一次），无变更时在封包线程直接放行。
       Runnable delivery = () -> {
-        List<int[]> heldChanges = changeJournal.changedSince(capturedChanges, releaseWorld,
-            releaseChunkX, releaseChunkZ);
+        ChunkChangeJournal.Replay replay = changeJournal.changedSinceReplay(capturedChanges,
+            releaseWorld, releaseChunkX, releaseChunkZ);
+        List<int[]> heldChanges = replay.cells();
+        // 环形日志已被后来的变更覆盖：逐格补发补不全，必须整块重发（见 refreshChunkAfterOverflow）。
+        boolean replayTruncated = replay.truncated();
         Runnable releaseOnPacketThread = () -> completeRelease(player, event, gate, releaseWorld,
-            releaseChunkX, releaseChunkZ, releasePlayerId, heldChanges, false);
-        if (heldChanges.isEmpty()) {
+            releaseChunkX, releaseChunkZ, releasePlayerId, heldChanges, false, replayTruncated);
+        if (heldChanges.isEmpty() && !replayTruncated) {
           releaseOnPacketThread.run();
           return;
         }
         Runnable releaseOnPlayerThread = () -> completeRelease(player, event, gate, releaseWorld,
-            releaseChunkX, releaseChunkZ, releasePlayerId, heldChanges, true);
+            releaseChunkX, releaseChunkZ, releasePlayerId, heldChanges, true, replayTruncated);
         // 调度失败（实体退役 / 停用竞态）时退化为立即放行、不补发：绝不因为补发卡住区块包。
         if (!Schedulers.onEntity(plugin, player, releaseOnPlayerThread)) {
           releaseOnPacketThread.run();
@@ -1033,7 +1041,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    */
   private void completeRelease(Player player, PacketEvent event, ChunkBatchGate gate,
       String worldName, int chunkX, int chunkZ, UUID playerId, List<int[]> heldChanges,
-      boolean canReadWorld) {
+      boolean canReadWorld, boolean replayTruncated) {
     // 顺序不能反：先放行区块包，再归还批次计数。归还计数可能立刻把 CHUNK_BATCH_FINISHED 放出去，
     // 若它排在最后一个区块包之前，客户端会先结束批次、再收到区块——批次速率估计随之后续统计全部错位。
     asynchronousManager.signalPacketTransmission(event);
@@ -1042,6 +1050,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
     if (canReadWorld && !heldChanges.isEmpty()) {
       resendCellsDirectly(player, worldName, chunkX, chunkZ, heldChanges);
+    }
+    if (canReadWorld && replayTruncated) {
+      // 逐格补发已补不全：剩下的格没有任何第二条路径会来纠正（附着方块会一直卡到区块重发），
+      // 只能整块重发一次——它会重新走改写链路，客户端拿到的是当前世界的正确内容。
+      refreshChunkAfterOverflow(player, worldName, chunkX, chunkZ);
     }
     clearRevealedOnDelivery(worldName, chunkX, chunkZ, playerId);
     // 区块包已写出：紧接着把「该区块中玩家当前可见」的坐标显形（区块下发即显形）。
@@ -1069,14 +1082,70 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     if (world == null || !worldName.equals(world.getName()) || !world.isChunkLoaded(chunkX, chunkZ)) {
       return;
     }
+    // 按 section 分组：一次爆炸 / 大范围施工改掉的上百格通常在同一段里，逐格一个 BLOCK_CHANGE 会把
+    // 玩家线程与连接队列压满（补发上限已提到 4096）。同段多格走一次 MULTI_BLOCK_CHANGE，跨段各自成包。
+    Map<Integer, List<int[]>> bySection = new LinkedHashMap<>();
     for (int[] cell : cells) {
-      try {
-        player.sendBlockChange(new Location(world, cell[0], cell[1], cell[2]),
+      bySection.computeIfAbsent(cell[1] >> 4, ignored -> new ArrayList<>(4)).add(cell);
+    }
+    for (List<int[]> group : bySection.values()) {
+      if (group.size() > 1 && sendSectionCells(player, world, group)) {
+        continue;
+      }
+      for (int[] cell : group) {
+        try {
+          player.sendBlockChange(new Location(world, cell[0], cell[1], cell[2]),
+              world.getBlockData(cell[0], cell[1], cell[2]));
+        } catch (Throwable throwable) {
+          logThrottled("区块放行时补发在途方块变更失败（已忽略，下一次显形或区块重发会纠正）", throwable);
+          return;
+        }
+      }
+    }
+  }
+
+  /**
+   * 同段多格补发走一次 {@code sendMultiBlockChange}；构建失败或平台拒绝时返回 false，调用方退化逐格。
+   *
+   * <p>这些坐标全在同一区块内（{@code chunkX/chunkZ} 已确定），按 sectionY 分组后每组的 section 必然一致；
+   * Paper 的该 API 一个包只承载一个段，跨段调用会被整包拒绝。
+   */
+  private boolean sendSectionCells(Player player, World world, List<int[]> group) {
+    Map<Position, BlockData> payload = new LinkedHashMap<>(group.size() * 2);
+    try {
+      for (int[] cell : group) {
+        payload.put(Position.block(cell[0], cell[1], cell[2]),
             world.getBlockData(cell[0], cell[1], cell[2]));
-      } catch (Throwable throwable) {
-        logThrottled("区块放行时补发在途方块变更失败（已忽略，下一次显形或区块重发会纠正）", throwable);
+      }
+      player.sendMultiBlockChange(payload);
+      return true;
+    } catch (Throwable throwable) {
+      return false; // 退化为逐格 sendBlockChange（同一条原生通道）
+    }
+  }
+
+  /**
+   * 在途变更超出补发窗口时的兜底：对<b>该接收者所在世界</b>整块重发一次。
+   *
+   * <p>为什么必须整块：逐格补发只能覆盖环形日志里还在的那一部分，而客户端手里已经被改写时刻的旧区块
+   * 字节覆盖；剩下那些格（典型是爆炸后整段消失的附着方块——幽匿脉络 / 发光地衣）没有任何第二条路径
+   * 会来纠正，会一直卡到区块重发。整块重发会重新走一次改写链路，客户端拿到的就是当前世界的正确内容。
+   *
+   * <p>只在环形溢出这种极端突发下执行，且一次性 WARN 留痕（正常运营下永远不该出现）。
+   */
+  private void refreshChunkAfterOverflow(Player player, String worldName, int chunkX, int chunkZ) {
+    try {
+      World world = player.getWorld();
+      if (world == null || !worldName.equals(world.getName()) || !world.isChunkLoaded(chunkX, chunkZ)) {
         return;
       }
+      world.refreshChunk(chunkX, chunkZ);
+      if (replayOverflowWarned.compareAndSet(false, true)) {
+        getPlugin().getLogger().warning("区块在途变更超出补发窗口（环形日志已被覆盖），已对该区块整块重发一次；"
+            + "本条只提示一次，反复出现说明突发变更量超出单区块窗口容量");
+      }
+    } catch (Throwable throwable) {
+      logThrottled("在途变更溢出后整块重发失败（已忽略，下一次区块重发会纠正）", throwable);
     }
   }
 

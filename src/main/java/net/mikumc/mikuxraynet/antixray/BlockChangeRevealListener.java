@@ -68,12 +68,10 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   /**
    * 最近方块变更日志（可为 {@code null}）：区块包在途期间被改过的格子由它记录，放行后补发。
    *
-   * <p>只记**真实**变更（回显已在 {@link #observeChange} / {@link #processSection} 剔除）：回显不改变服务端内容，记进去只会
-   * 让放行后多补发一次同样的状态。
+   * <p>只记**真实**变更（回显已在 {@link #observeChange} / {@link #unregisterMulti} 就地剔除）：
+   * 回显不改变服务端内容，记进去只会让放行后多补发一次同样的状态。
    */
   private final ChunkChangeJournal changeJournal;
-  /** 单个多方块变更包最多记多少条（超出只少补发几格，不影响正确性）。 */
-  private static final int MAX_JOURNAL_RECORDS_PER_PACKET = 64;
   private final AtomicInteger errorCounter = new AtomicInteger();
 
   /** 是否已注册（同步监听器没有句柄，用标志位保证 start/stop 幂等）。 */
@@ -238,11 +236,31 @@ public final class BlockChangeRevealListener extends PacketAdapter {
         coordinates[i * 3 + 2] = baseZ + SectionCoords.z(raw);
       }
 
-      // 回显判定绑定「本包的接收者」：显形回显只发给了这个玩家，因此也只会在他名下命中
-      RevealEchoCheck echoCheck = instantRevealer == null || player == null
-          ? null : (world, x, y, z) -> isOurRevealEcho(player, world, x, y, z);
+      // 回显过滤与变更日志必须在封包线程同步完成：
+      // ① 变更日志是「区块包放行后补发」的唯一依据，而放行动作可能在改写一完成后立刻在封包线程 /
+      //    玩家线程执行——投递到 BlockUndo 后台线程会与它竞速，晚一步落库就等于该格被旧区块字节
+      //    盖回去且永不补发（真机表现：整段附着方块与墙面卡在旧状态，右键被服务端纠正后才消失）；
+      // ② 回显记号留到后台线程才消费时，紧接着的真实变更会被误判成回显，整批漏摘索引、漏记日志。
+      // 回显判定绑定「本包的接收者」：显形回显只发给了这个玩家，因此也只会在他名下命中。
+      int kept = 0;
+      for (int i = 0; i < positions.length; i++) {
+        int blockX = coordinates[i * 3];
+        int blockY = coordinates[i * 3 + 1];
+        int blockZ = coordinates[i * 3 + 2];
+        if (instantRevealer != null && player != null
+            && isOurRevealEcho(player, worldName, blockX, blockY, blockZ)) {
+          continue; // 本插件刚发出的显形回显：服务端内容未变，不记日志
+        }
+        recordChange(worldName, blockX, blockY, blockZ);
+        coordinates[kept * 3] = blockX;
+        coordinates[kept * 3 + 1] = blockY;
+        coordinates[kept * 3 + 2] = blockZ;
+        kept++;
+      }
+      if (kept == 0) {
+        return; // 整段都是回显：不摘索引、不记日志、不触发事件显形
+      }
       SectionDispatch dispatch = (changed, changedCount) -> {
-        recordChanges(worldName, changed, changedCount);
         if (instantRevealer != null && changedCount > 0) {
           // 投递到玩家线程：onSectionChangeObserved 内部要读 Bukkit.getCurrentTick()，本回调跑在
           // BlockUndo 后台线程，Folia 上非区域线程读会抛 No currently ticking region（与单方块路径
@@ -251,11 +269,11 @@ public final class BlockChangeRevealListener extends PacketAdapter {
               () -> instantRevealer.onSectionChangeObserved(player, worldName, changed, changedCount));
         }
       };
-      // 同上：批量摘除在几十人在线时可能与解码/显形抢锁，必须离开封包线程。
-      // coordinates 来自池化复用缓冲，投递前先交出精确长度的独立快照。
-      int[] snapshot = java.util.Arrays.copyOf(coordinates, positions.length * 3);
-      int count = positions.length;
-      submitUndo(() -> processChanges(worldName, snapshot, count, book, stats, dispatch, echoCheck));
+      // 批量摘除在几十人在线时可能与解码/显形抢锁，必须离开封包线程。
+      // coordinates 来自池化复用缓冲，投递前先交出精确长度的独立快照（回显已在上面就地剔除）。
+      int[] snapshot = java.util.Arrays.copyOf(coordinates, kept * 3);
+      int count = kept;
+      submitUndo(() -> processChanges(worldName, snapshot, count, book, stats, dispatch, null));
     } finally {
       ParseScratch.release(parse);
     }
@@ -675,18 +693,6 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     ChunkChangeJournal journal = changeJournal;
     if (journal != null) {
       journal.record(worldName, x, y, z);
-    }
-  }
-
-  /** 记录一个 section 的真实变更（上限 {@link #MAX_JOURNAL_RECORDS_PER_PACKET} 条）。 */
-  private void recordChanges(String worldName, int[] coordinates, int count) {
-    ChunkChangeJournal journal = changeJournal;
-    if (journal == null || coordinates == null || count <= 0) {
-      return;
-    }
-    int limit = Math.min(count, MAX_JOURNAL_RECORDS_PER_PACKET);
-    for (int i = 0; i < limit; i++) {
-      journal.record(worldName, coordinates[i * 3], coordinates[i * 3 + 1], coordinates[i * 3 + 2]);
     }
   }
 
