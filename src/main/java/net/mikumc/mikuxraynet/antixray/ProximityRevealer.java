@@ -106,7 +106,12 @@ import org.bukkit.util.Vector;
  * 周期末按 16³ 区块段分组、逐段 {@code sendMultiBlockChange} 发出（该 API 的一个包只承载一个段，
  * 跨段调用会被整包拒绝），某段失败时该段退化为逐坐标 {@code sendBlockChange}；
  * 关闭时逐坐标发单方块变更包（旧行为，供 A/B 与回退）。
- * 同一坐标只显形一次（<b>先写入该玩家的 {@link RevealedSet} 标记、再发包，发送失败则回滚标记</b>，
+ * <p><b>破坏邻域强制显形</b>（{@code proximity.instant-reveal.break-sweep}，默认开）：方块被挖掉 /
+ * 炸掉 / 烧掉时，把破坏点半径内的伪装坐标整片过一遍（见 {@link #revealSweep}）——它不受候选窗口、
+ * 分片轮转、同段安静窗口与「是否被这一格挡住」的张角判定限制，只保留遮挡位图射线这一道可见性硬门。
+ * 目的是让「挖开一块之后身边立刻都是真方块」成为保证，而不是「等窗口轮到它」。
+ *
+ * <p>同一坐标只显形一次（<b>先写入该玩家的 {@link RevealedSet} 标记、再发包，发送失败则回滚标记</b>，
  * 理由见 {@link #markThenSend}）；区块被重新下发或被卸载时
  * 该区块的已显形标记一并失效（客户端又会看到伪装结果，必须重新显形）。单个坐标失败只记日志并跳过，
  * 绝不中断整体。
@@ -324,6 +329,8 @@ public final class ProximityRevealer implements Listener {
   // 构造参数只用于一次性快照 proximity / instant / batchRevealSends。
   private final AntiXrayConfig.Proximity proximity;
   private final AntiXrayConfig.InstantReveal instant;
+  /** 破坏方块后的邻域强制显形（配置见 {@link AntiXrayConfig.BreakSweep}）。 */
+  private final AntiXrayConfig.BreakSweep breakSweep;
   /** 是否把同一周期的显形合并成一个 Paper 原生多方块变更包发出（{@code proximity.batch-reveal-sends}）。 */
   private final boolean batchRevealSends;
   private final ObfuscatedChunkIndex chunkIndex;
@@ -366,6 +373,8 @@ public final class ProximityRevealer implements Listener {
   private final AtomicBoolean noCapacityWarned = new AtomicBoolean();
   /** 事件显形的每玩家每 tick 限额（默认 16，防爆刷；见 {@link TickQuota}）。 */
   private final TickQuota instantQuota = new TickQuota();
+  /** 破坏邻域显形的独立额度：不能被其它即时显形路径挤占（否则「挖开一块」这一下可能一格都发不出去）。 */
+  private final TickQuota breakSweepQuota = new TickQuota();
   /**
    * 视线即时显形的独立额度（每玩家每 tick 1 个）。
    *
@@ -488,6 +497,7 @@ public final class ProximityRevealer implements Listener {
     this.plugin = plugin;
     this.proximity = config.proximity();
     this.instant = proximity.instantReveal();
+    this.breakSweep = instant.breakSweep();
     this.batchRevealSends = proximity.batchRevealSends();
     this.overRevealSampler = new OverRevealSampler(Math.max(0, proximity.overRevealSampling()));
     this.chunkIndex = chunkIndex;
@@ -722,6 +732,7 @@ public final class ProximityRevealer implements Listener {
     }
     book.clearPlayer(event.getPlayer().getUniqueId());
     instantQuota.clear(event.getPlayer().getUniqueId());
+    breakSweepQuota.clear(event.getPlayer().getUniqueId());
     chunkDeliveryQuota.clear(event.getPlayer().getUniqueId());
     digMarks.remove(event.getPlayer().getUniqueId());
     nearRetryMarks.remove(event.getPlayer().getUniqueId());
@@ -1997,6 +2008,33 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
+   * 破坏方块后的邻域强制显形入口（{@link BlockChangeRevealListener} 在「新状态是空气」时调用，封包线程）。
+   *
+   * <p><b>与 {@link #onBlockChangeObserved} 的分工</b>：那个入口服务于放置与其它暴露类变更，只还原
+   * 「本来被这一格挡住」的坐标，避免一次动作改掉十几个方块的外观；本入口服务于真正的<b>破坏</b>，
+   * 把破坏点邻域整片过一遍（见 {@link AntiXrayConfig.BreakSweep}）——「挖开一块之后身边立刻都是真方块」
+   * 因此成为硬保证，而不是「等候选窗口轮到它」。
+   *
+   * <p>初筛在封包线程完成（只查伪装索引、不读世界）：邻域内没有伪装坐标时不产生任何调度。
+   */
+  public void onBreakObserved(Player player, String worldName, int x, int y, int z) {
+    if (player == null || worldName == null || stopping) {
+      return;
+    }
+    if (!instant.enabled() || instant.maxPerTick() <= 0
+        || !breakSweep.enabled() || breakSweep.maxPerTick() <= 0) {
+      return;
+    }
+    if (WorldBlacklistConfig.isBlacklistedNow(worldName) || chunkIndex == null || revealedSet == null) {
+      return;
+    }
+    int radius = breakSweep.radius();
+    if (hasDisguisedNearby(chunkIndex, worldName, x, y, z, radius)) {
+      Schedulers.onEntity(plugin, player, () -> revealSweep(player, x, y, z, radius));
+    }
+  }
+
+  /**
    * 初筛（纯函数，可离线单测）：变更坐标的曼哈顿邻域内是否仍有伪装坐标。
    * 只读并发索引，供封包线程在调度前过滤「邻域内全是非伪装方块」的无效变更。
    */
@@ -2178,6 +2216,78 @@ public final class ProximityRevealer implements Listener {
       }
       flushBatch(player, batch, tally);
       instantQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+    }
+  }
+
+  /**
+   * 玩家所属线程：把刚被破坏的那一格邻域里「仍伪装 + 未显形 + 视线可见」的坐标一次性发回真实状态。
+   *
+   * <p><b>不受任何调度限制</b>：不走候选窗口、不走分片轮转、不让开同段安静窗口、不做「是否被这一格
+   * 挡住」的张角判定——这些限制都是为「少发几个包」服务的，代价是玩家眼前的假方块要排队。
+   * <b>但可见性判定照旧</b>（遮挡位图射线）：去掉它等于把透视端要的东西直接发过去。
+   *
+   * <p>额度独立（{@link #breakSweepQuota}）：否则一次爆炸事件就可能把当 tick 的即时显形额度吃光，
+   * 让紧随其后的挖掘一格都发不出去。耗尽时计数留痕，剩余坐标由周期巡检兜底。
+   */
+  private void revealSweep(Player player, int cx, int cy, int cz, int radius) {
+    try {
+      if (!gateOpen(player)) {
+        return;
+      }
+      World world = player.getWorld();
+      String liveWorld = revealWorld(player);
+      if (liveWorld == null) {
+        return;
+      }
+      Location location = player.getLocation();
+      if (!withinManhattanRadius(location.getBlockX(), location.getBlockY(), location.getBlockZ(),
+          cx, cy, cz, radius)) {
+        return;
+      }
+      // 与其它路径同一 Folia 纪律：先判 region 归属，再问区块是否加载（跨区读会触发 TickThread 校验）
+      if (!ownsChunk(world, cx >> 4, cz >> 4) || !world.isChunkLoaded(cx >> 4, cz >> 4)) {
+        return;
+      }
+      UUID playerId = player.getUniqueId();
+      long tick = Bukkit.getCurrentTick();
+      int maxPerTick = Math.max(1, breakSweep.maxPerTick());
+      int granted = breakSweepQuota.claim(playerId, tick, maxPerTick, maxPerTick);
+      Budget budget = new Budget(granted);
+      if (budget.remaining() <= 0) {
+        stats.breakSweepBudgetExhausted.increment();
+        return;
+      }
+      ProximitySelector.Eye eye = proximity.raycastEnabled() ? eyeOf(player) : null;
+      PassTally tally = new PassTally();
+      RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
+      boolean truncated = false;
+      for (int[] offset : instantOffsets(radius)) {
+        if (budget.remaining() <= 0) {
+          truncated = true;
+          break;
+        }
+        int x = cx + offset[0];
+        int y = cy + offset[1];
+        int z = cz + offset[2];
+        if (x == cx && y == cy && z == cz) {
+          continue; // 刚变更的那一格客户端已经有新状态，再发一次只会同格重绘
+        }
+        if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
+          continue;
+        }
+        // visibilityInPlan=false：在当前线程用遮挡位图判定（被墙挡住的候选不发）
+        sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
+      }
+      flushBatch(player, batch, tally);
+      if (tally.sent > 0) {
+        stats.breakSweepSent.add(tally.sent);
+      }
+      if (truncated) {
+        stats.breakSweepBudgetExhausted.increment();
+      }
+      breakSweepQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }

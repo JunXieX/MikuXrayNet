@@ -536,6 +536,14 @@ public final class AntiXrayConfig {
   public static final int PROXIMITY_EXPIRE_SECONDS_MAX = 86_400;
   /** {@code proximity.instant-reveal.max-per-tick} 上限：事件即时显形的每 tick 限额。 */
   public static final int PROXIMITY_INSTANT_MAX_PER_TICK_MAX = 100_000;
+
+  /**
+   * {@code proximity.instant-reveal.break-sweep.max-per-tick} 上限：一次破坏邻域显形的每 tick 限额。
+   *
+   * <p>取 256 而不是沿用 100000：本项是「每次破坏都整片过一遍邻域」，半径 4 的邻域只有 129 格、
+   * 其中伪装坐标约十几格；上限存在的意义只是防「范围工具一次破几十格」时的瞬时刷包，不是性能开关。
+   */
+  public static final int PROXIMITY_BREAK_SWEEP_MAX_PER_TICK_MAX = 256;
   /** {@code proximity.over-reveal-sampling} 上限（抽样分母）：只影响诊断计数，防溢出即可。 */
   public static final int PROXIMITY_OVER_REVEAL_SAMPLING_MAX = 1_000_000;
   /** {@code disk-cache.idle-close-seconds} 上限（秒，1 天）：再长等于区域文件句柄永不回收。 */
@@ -613,8 +621,31 @@ public final class AntiXrayConfig {
    * @param enabled    总开关（默认开启）
    * @param radius     曼哈顿半径（格），变更必须落在玩家身边该半径内才触发（默认 4）
    * @param maxPerTick 每玩家每 tick 事件显形限额（防爆刷；默认 16，0 表示关闭事件显形）
+   * @param breakSweep 破坏方块后的邻域强制显形（见 {@link BreakSweep}）
    */
-  public record InstantReveal(boolean enabled, int radius, int maxPerTick) {
+  public record InstantReveal(boolean enabled, int radius, int maxPerTick, BreakSweep breakSweep) {
+  }
+
+  /**
+   * 破坏方块后的邻域强制显形：一方块被挖掉 / 炸掉 / 烧掉（新状态是空气）时，把该方块曼哈顿
+   * {@code radius} 格内「仍在伪装、玩家尚未显形过、且当前视线可见」的坐标一次性发回真实状态。
+   *
+   * <p><b>与事件即时显形的区别</b>：事件路径只还原「本来被这一格挡住」的坐标（按变更格对眼睛的张角
+   * 判定），并把「身边本来就看得见的伪装方块」留给周期巡检——那批坐标要等窗口轮转才轮到，玩家侧就是
+   * 「我站在这儿看着它，它还是石头」。本项把破坏点邻域<b>整片</b>过一遍（不受候选窗口、分片轮转、
+   * 同段安静窗口与张角判定限制），让「挖开一块之后身边立刻都是真方块」成为硬保证。
+   *
+   * <p><b>「强制」不等于「无视可见性」</b>：每格仍必须过遮挡位图射线（{@code raycast.enabled=true} 时）。
+   * 无视可见性就等于把透视端要的东西直接发过去；这里去掉的只是「窗口/轮转/启发式」这类<b>调度</b>限制。
+   *
+   * <p><b>触发口径只用空气</b>：放置火把 / 玻璃等同样会「露出后面的方块」，但并没有打开新的视线，
+   * 而且放置是高频动作；只认空气可避免「插一个火把刷一片显形」的观感与开销。
+   *
+   * @param enabled    总开关（默认开启）
+   * @param radius     曼哈顿半径（格，1~8，默认 4）：判定量随半径三次方增长，不建议调到 8
+   * @param maxPerTick 每玩家每 tick 的发包上限（默认 32，0 = 关闭本项）；未轮到的坐标由周期巡检兜底
+   */
+  public record BreakSweep(boolean enabled, int radius, int maxPerTick) {
   }
 
   /**
@@ -1145,7 +1176,19 @@ public final class AntiXrayConfig {
                     ceilingAdjustments),
                 clampCeiling(root.getInt("proximity.instant-reveal.max-per-tick", 16), 0,
                     PROXIMITY_INSTANT_MAX_PER_TICK_MAX, "proximity.instant-reveal.max-per-tick",
-                    floorAdjustments, ceilingAdjustments)),
+                    floorAdjustments, ceilingAdjustments),
+                // 破坏方块后的邻域强制显形（见 BreakSweep）：默认半径 4、每 tick 32 个发包上限。
+                // radius 与 instant-reveal.radius 共用 1..8 的钳制区间；max-per-tick 的 0 表示关闭本项。
+                new BreakSweep(
+                    lenientBoolean(root, "proximity.instant-reveal.break-sweep.enabled", true,
+                        typeAdjustments),
+                    clampCeiling(root.getInt("proximity.instant-reveal.break-sweep.radius", 4), 1,
+                        PROXIMITY_INSTANT_RADIUS_MAX, "proximity.instant-reveal.break-sweep.radius",
+                        floorAdjustments, ceilingAdjustments),
+                    clampCeiling(root.getInt("proximity.instant-reveal.break-sweep.max-per-tick", 32),
+                        0, PROXIMITY_BREAK_SWEEP_MAX_PER_TICK_MAX,
+                        "proximity.instant-reveal.break-sweep.max-per-tick", floorAdjustments,
+                        ceilingAdjustments))),
             clampCeiling(root.getInt("proximity.over-reveal-sampling", 20), 0,
                 PROXIMITY_OVER_REVEAL_SAMPLING_MAX, "proximity.over-reveal-sampling",
                 floorAdjustments, ceilingAdjustments),

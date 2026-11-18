@@ -103,6 +103,43 @@ class RevealDeliveryGuardTest {
         "窗口覆盖距离与预筛丢弃数必须记账，否则「覆盖够不够」无法从 dump 判断");
   }
 
+  /**
+   * 破坏方块后的邻域强制显形：<b>去掉调度限制、保留可见性判定</b>。
+   *
+   * <p>去掉的是窗口/分片/同段安静窗口/张角判定（它们服务的是「少发包」，代价是玩家眼前的假方块排队）；
+   * 保留的是遮挡位图射线（去掉它等于把透视端要的东西直接发过去）。额度必须独立，否则一次爆炸事件
+   * 就能把当 tick 的即时显形额度吃光，紧随其后的挖掘一格都发不出去。
+   */
+  @Test
+  void breakSweepBypassesSchedulingFiltersButKeepsVisibility() throws IOException {
+    String source = stripComments(readSource("antixray/ProximityRevealer.java"));
+    String entry = methodBody(source, "onBreakObserved");
+    assertTrue(entry != null, "onBreakObserved 必须存在（破坏方块后的邻域强制显形入口）");
+    assertTrue(entry.contains("breakSweep"), "入口必须读 break-sweep 配置（可关闭、可调半径）");
+    assertTrue(entry.contains("hasDisguisedNearby("), "封包线程必须先做邻域初筛，避免无谓调度");
+
+    String sweep = methodBody(source, "revealSweep");
+    assertTrue(sweep != null, "revealSweep 必须存在");
+    assertFalse(sweep.contains("occludedBy"), "不得再做「只还原被这一格挡住」的张角判定");
+    assertFalse(sweep.contains("sameSectionAsOwnChange"), "不得让开同段安静窗口（否则整条路径几乎永不执行）");
+    assertTrue(sweep.contains("sendOne("), "必须复用既有发包链路（标记/额度/统计单点）");
+    assertTrue(sweep.contains("batch, false)"), "必须保留遮挡位图可见性判定（visibilityInPlan=false）");
+    assertTrue(sweep.contains("breakSweepQuota"), "必须用独立额度，不能被其它即时显形路径挤占");
+  }
+
+  /** 「变成空气」与一般暴露类变更必须分流：前者整片扫邻域，后者保持旧的「只还原被挡住的」。 */
+  @Test
+  void airChangesRouteToBreakSweep() throws IOException {
+    String source = stripComments(readSource("antixray/BlockChangeRevealListener.java"));
+    assertTrue(source.contains("clearedToAir("), "必须区分「新状态是空气」与一般暴露类变更");
+    String body = methodBody(source, "observeChange");
+    assertTrue(body != null, "observeChange 必须存在");
+    int sweep = body.indexOf("onBreakObserved(");
+    int legacy = body.indexOf("onBlockChangeObserved(");
+    assertTrue(sweep >= 0, "破坏（新状态是空气）必须走邻域强制显形");
+    assertTrue(legacy > sweep, "非空气的暴露类变更（火把/玻璃）仍走旧的「只还原被挡住」路径");
+  }
+
   private static String readSource(String relativePath) throws IOException {
     return Files.readString(MAIN.resolve(relativePath));
   }

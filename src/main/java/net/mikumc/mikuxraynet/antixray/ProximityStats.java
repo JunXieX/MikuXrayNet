@@ -161,6 +161,17 @@ public final class ProximityStats {
    */
   public final LongAdder prefilterDropped = new LongAdder();
 
+  /**
+   * 破坏方块后的邻域强制显形（{@code proximity.instant-reveal.break-sweep}）累计发包数。
+   *
+   * <p><b>为什么单独计</b>：这条路径与事件即时显形共用 {@code revealsSent}，但它的语义是「挖开一块，
+   * 身边立刻都是真方块」。真机核对「挖矿不出错」是否成立时，只看它与破坏次数的比值就够。
+   */
+  public final LongAdder breakSweepSent = new LongAdder();
+
+  /** 破坏邻域显形因每 tick 额度耗尽被截断的次数（持续偏高说明额度太小或范围工具在连破）。 */
+  public final LongAdder breakSweepBudgetExhausted = new LongAdder();
+
   /** 周期巡检窗口内最远候选的距离（格，单调取历史最大值；0 = 尚未取到候选）。 */
   private final AtomicLong windowFarthestBlocks = new AtomicLong();
 

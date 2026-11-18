@@ -252,11 +252,11 @@ public final class Diagnostics {
         long frustumCulled, long rayCulled, long rayCulledMissingData, long overRevealSampled,
         long overRevealWasted, long viewChangeScans, long viewChangeNanos, long viewChangeMaxNanos,
         long viewChangeBudgetExhausted, long passesSkippedNoCapacity, long prefilterDropped,
-        long windowFarthestBlocks) {
+        long windowFarthestBlocks, long breakSweepSent, long breakSweepBudgetExhausted) {
 
       /** 邻近显形未启用时的零值兜底。 */
       public static final Proximity EMPTY =
-          new Proximity(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+          new Proximity(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     /** 显形索引域：伪装区块索引（按区块共享）与按玩家的已显形集合的持有量与安全阀计数。 */
@@ -978,7 +978,8 @@ public final class Diagnostics {
             proximityStats.viewChangeScans.sum(), proximityStats.viewChangeNanos.sum(),
             proximityStats.viewChangeMaxNanos.get(), proximityStats.viewChangeBudgetExhausted.sum(),
             proximityStats.passesSkippedNoCapacity.sum(), proximityStats.prefilterDropped.sum(),
-            proximityStats.windowFarthestBlocks());
+            proximityStats.windowFarthestBlocks(), proximityStats.breakSweepSent.sum(),
+            proximityStats.breakSweepBudgetExhausted.sum());
     Snapshot.Index index = chunkIndex == null && revealedSet == null ? Snapshot.Index.EMPTY
         : new Snapshot.Index(
             chunkIndex == null ? 0 : chunkIndex.chunkCount(),
@@ -1227,7 +1228,10 @@ public final class Diagnostics {
         // 覆盖度：窗口是「本周期最多评估多少个候选」的硬顶，覆盖格数才是玩家能看到的范围。
         // 预筛丢弃是「窗口名额有多少本来会浪费在全埋矿上」的直接证据（见 ProximityStats）。
         + "｜窗口覆盖 " + s.proximity().windowFarthestBlocks() + " 格，预筛丢弃 "
-        + s.proximity().prefilterDropped());
+        + s.proximity().prefilterDropped()
+        // 破坏邻域显形：诊断条目直接对「挖开一块之后身边还有没有假方块」负责。
+        + "｜破坏邻域 发送 " + s.proximity().breakSweepSent() + "，额度耗尽 "
+        + s.proximity().breakSweepBudgetExhausted() + " 次");
     // 口径说明：这里刻意分列「实时坐标数」与「累计登记数」——前者随登出 / 过期 / 区块失效归零，
     // 后者只增不减。若只显示实时值，玩家中途重登或走远后被清理时会看到「发送 N 但已显形 0」，
     // 极易被误读成「显形路径没有登记」（实际登记在发包成功后必然发生）。
@@ -1780,6 +1784,11 @@ public final class Diagnostics {
         .append("，radius=").append(c.proximity().instantReveal().radius())
         .append("，max-per-tick=").append(c.proximity().instantReveal().maxPerTick())
         .append("，pre-reveal-on-dig=").append(c.proximity().preRevealOnDig()).append('\n');
+    sb.append("proximity.instant-reveal.break-sweep.enabled=")
+        .append(c.proximity().instantReveal().breakSweep().enabled())
+        .append("，radius=").append(c.proximity().instantReveal().breakSweep().radius())
+        .append("，max-per-tick=").append(c.proximity().instantReveal().breakSweep().maxPerTick())
+        .append('\n');
     sb.append("proximity.view-change.enabled=").append(c.proximity().viewChange().enabled())
         .append("，budget-ms=").append(c.proximity().viewChange().budgetMs())
         .append("，cooldown-ticks=").append(c.proximity().viewChange().cooldownTicks())

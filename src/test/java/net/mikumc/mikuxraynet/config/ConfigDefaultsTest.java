@@ -192,7 +192,7 @@ class ConfigDefaultsTest {
     assertEquals(fallback.proximity().raycastSamples(), packed.proximity().raycastSamples(),
         "打包 yml 的 proximity.raycast.samples 必须等于代码回落值");
     assertEquals(fallback.proximity().instantReveal(), packed.proximity().instantReveal(),
-        "打包 yml 的 instant-reveal 三键必须等于代码回落值");
+        "打包 yml 的 instant-reveal 三键与 break-sweep 三键都必须等于代码回落值");
     assertEquals(fallback.cacheMaximumMb(), packed.cacheMaximumMb(),
         "打包 yml 的 cache.maximum-mb 必须等于代码回落值");
     assertTrue(packed.floorAdjustments().isEmpty(),
@@ -419,6 +419,12 @@ class ConfigDefaultsTest {
     assertEquals(20, config.proximity().overRevealSampling(), "过度显形抽样默认 1/20");
     assertFalse(config.proximity().instantReveal().enabled()
         && config.proximity().instantReveal().maxPerTick() <= 0, "开启时限额必须为正");
+    // 破坏邻域强制显形：默认开、半径 4（= 半个区块）、每 tick 32 个发包上限
+    assertTrue(config.proximity().instantReveal().breakSweep().enabled(), "破坏邻域显形默认开启");
+    assertEquals(4, config.proximity().instantReveal().breakSweep().radius(),
+        "破坏邻域半径默认 4 格（曼哈顿距离）");
+    assertEquals(32, config.proximity().instantReveal().breakSweep().maxPerTick(),
+        "破坏邻域每玩家每 tick 发包上限默认 32");
   }
 
   /** use-block-below / 事件显形等配置可显式解析，非法/极端值被钳制。 */
@@ -448,6 +454,40 @@ class ConfigDefaultsTest {
         + "  over-reveal-sampling: -3\n"));
     assertEquals(1, negative.proximity().instantReveal().radius(), "radius 负值钳制到 1");
     assertEquals(0, negative.proximity().overRevealSampling(), "抽样负值归 0（关闭）");
+
+    // 破坏邻域显形：半径与事件显形共用 1..8 的钳制区间；max-per-tick=0 表示关闭本项（不是钳到 1）
+    AntiXrayConfig sweep = AntiXrayConfig.from(yaml(
+        "proximity:
+"
+        + "  instant-reveal:
+"
+        + "    break-sweep:
+"
+        + "      enabled: false
+"
+        + "      radius: 99
+"
+        + "      max-per-tick: 0
+"));
+    assertFalse(sweep.proximity().instantReveal().breakSweep().enabled(), "破坏邻域显形可显式关闭");
+    assertEquals(8, sweep.proximity().instantReveal().breakSweep().radius(), "半径超限钳制到 8");
+    assertEquals(0, sweep.proximity().instantReveal().breakSweep().maxPerTick(),
+        "max-per-tick=0 表示关闭本项");
+    AntiXrayConfig sweepNegative = AntiXrayConfig.from(yaml(
+        "proximity:
+"
+        + "  instant-reveal:
+"
+        + "    break-sweep:
+"
+        + "      radius: -5
+"
+        + "      max-per-tick: 9999
+"));
+    assertEquals(1, sweepNegative.proximity().instantReveal().breakSweep().radius(), "半径负值钳制到 1");
+    assertEquals(AntiXrayConfig.PROXIMITY_BREAK_SWEEP_MAX_PER_TICK_MAX,
+        sweepNegative.proximity().instantReveal().breakSweep().maxPerTick(),
+        "max-per-tick 超限钳制到上限（不留 100000 这类能一 tick 刷满的配置）");
   }
 
   /** 配置指纹：影响改写结果的 use-block-below 切换必须使指纹变化（缓存不得复用）。 */
