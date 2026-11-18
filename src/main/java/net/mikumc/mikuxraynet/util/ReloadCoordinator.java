@@ -135,7 +135,7 @@ public final class ReloadCoordinator {
       // neighbors.enabled 是**单向**热生效的：关闭后下一次区块改写即停止抓取（ProtocolLibAsyncListener
       // 的 neighborsNeeded 实时读 live().neighbors().enabled()）；但「启动时为 false」时 NeighborChunkProvider
       // 根本没创建，本进程内改成 true 也不会再抓取——该方向的说明放 RESTART_REQUIRED，避免误报。
-      "邻块快照启用开关（neighbors.enabled，适用于后续区块）",
+      "邻块快照启用开关（neighbors.enabled=false 立即生效，适用于后续区块）",
       "全部配置文件的读取值");
 
   /** 需要重启服务端才生效的配置项（在启动期已固化的部分）。 */
