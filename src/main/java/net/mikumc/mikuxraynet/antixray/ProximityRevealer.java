@@ -17,6 +17,7 @@ import net.mikumc.mikuxraynet.bootstrap.PlatformSupport;
 import net.mikumc.mikuxraynet.concurrency.MikuWorkPool;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
+import net.mikumc.mikuxraynet.occlusion.OcclusionStore;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
@@ -938,9 +939,12 @@ public final class ProximityRevealer implements Listener {
     // 语义等价预筛：六面全被遮挡的坐标在任何射线判定下都必然不可见（见 BitmapVisibility#hasExposedFace），
     // 提前丢弃只缩小评估量、不改变任何显形结论。只在射线判定开启时挂：关掉射线时窗口里每条候选都会
     // 直接发包，此时按暴露面丢弃就变成「改变行为」了。
-    BitmapVisibility faceProbe = visibility ? BitmapVisibility.local() : null;
+    // 仓库只查一次（一趟扫描内世界不变）；没有位图表时干脆不挂预筛：那属于「遮挡子系统整体缺失」，
+    // 交给后续的可见性判定按既定方向处理，预筛不替它做决定。
+    OcclusionStore worldStore = occlusionStores == null ? null : occlusionStores.lookup(worldName);
+    BitmapVisibility faceProbe = visibility && worldStore != null ? BitmapVisibility.local() : null;
     ProximityScanner.Prefilter prefilter = faceProbe == null ? null
-        : (px, py, pz) -> faceProbe.hasExposedFace(occlusionStores, worldName, px, py, pz);
+        : (px, py, pz) -> faceProbe.hasExposedFace(worldStore, px, py, pz);
     List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex,
         revealedSet, player.getUniqueId(), worldName, location.getBlockX(), location.getBlockY(),
         location.getBlockZ(), maxDistance, fetchLimit(budget.remaining()), shard,

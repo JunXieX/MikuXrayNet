@@ -144,13 +144,16 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
    *
    * <p>线程：本实例是 {@link ThreadLocal} 的，供玩家线程（周期候选窗口）与工作线程各自复用；
    * 判定结束后同样清空 {@code store} 引用，避免钉住世界位图（理由见 {@link #isVisible}）。
+   *
+   * <p><b>仓库由调用方传入</b>：扫描一趟要判定上千个候选，每个都做一次按世界名的 CHM 查找是白费功夫；
+   * 调用方在进循环前查一次即可（世界不会在一趟扫描内变化）。
    */
-  boolean hasExposedFace(OcclusionStores stores, String worldName, int x, int y, int z) {
-    this.store = stores == null ? null : stores.lookup(worldName);
-    if (this.store == null) {
+  boolean hasExposedFace(OcclusionStore store, int x, int y, int z) {
+    if (store == null) {
       // 与 isVisible 一致：该世界没有位图表 ⇒ 一切都按遮挡 ⇒ 没有暴露面
       return false;
     }
+    this.store = store;
     try {
       return !isOccluding(x + 1, y, z) || !isOccluding(x - 1, y, z)
           || !isOccluding(x, y + 1, z) || !isOccluding(x, y - 1, z)
