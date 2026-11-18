@@ -389,7 +389,7 @@ public final class OcclusionPatchListener extends PacketAdapter {
   /**
    * 多方块变更：section 坐标 + 区块内相对坐标（与本插件合并包一致的位置编码）。
    *
-   * <p>打包方式与协议一致：{@code (y & 15) << 8 | (z & 15) << 4 | (x & 15)}（见
+   * <p>打包方式与协议一致：{@code (x & 15) << 8 | (z & 15) << 4 | (y & 15)}（见
    * {@code BlockChangeMerger#sendSection}）。
    */
   private void patchMulti(OcclusionStore store, PacketContainer packet) {
@@ -424,18 +424,13 @@ public final class OcclusionPatchListener extends PacketAdapter {
    * 把 MULTI_BLOCK_CHANGE 的「section 基准坐标 + 打包相对坐标」展开为绝对方块坐标三元组
    * （包可见，供离线单测）。
    *
-   * <p>打包方式与协议一致：{@code (y & 15) << 8 | (z & 15) << 4 | (x & 15)}（见
+   * <p>打包方式与协议一致：{@code (x & 15) << 8 | (z & 15) << 4 | (y & 15)}（见
    * {@code BlockChangeMerger#sendSection}）。
    *
    * @param coords 输出数组，长度必须为 {@code positions.length * 3}
    */
   static void unpackMultiCoords(int baseX, int baseY, int baseZ, short[] positions, int[] coords) {
-    for (int i = 0; i < positions.length; i++) {
-      int raw = SectionCoords.unsigned(positions[i]);
-      coords[i * 3] = baseX + SectionCoords.x(raw);
-      coords[i * 3 + 1] = baseY + SectionCoords.y(raw);
-      coords[i * 3 + 2] = baseZ + SectionCoords.z(raw);
-    }
+    SectionCoords.unpack(baseX, baseY, baseZ, positions, coords);
   }
 
   /**

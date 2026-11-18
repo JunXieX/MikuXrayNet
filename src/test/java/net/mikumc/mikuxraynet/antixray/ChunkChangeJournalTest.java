@@ -3,85 +3,108 @@ package net.mikumc.mikuxraynet.antixray;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.util.List;
+import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
-/**
- * 方块变更日志：区块包放行后「补发在途变更」的依据（真机反馈：边走边放方块时，刚放的那一格闪一下）。
- *
- * <p>纯数据结构，不依赖 Bukkit：断言四条契约——只取持包之后、只取同一区块、同格去重、单次补发有上限。
- */
 class ChunkChangeJournalTest {
 
-  @Test
-  void changedSinceReturnsOnlyNewerChangesInsideTheSameChunk() {
-    ChunkChangeJournal journal = new ChunkChangeJournal();
-    journal.record("world", 0, 64, 0);
-    long mark = journal.sequence();
-    journal.record("world", 5, 64, 5);      // 同一区块（chunk 0,0）
-    journal.record("world", 40, 64, 40);    // 另一区块（chunk 2,2）
-    journal.record("world_nether", 6, 64, 6); // 同名坐标、不同世界
+  private static final UUID FIRST = UUID.randomUUID();
+  private static final UUID SECOND = UUID.randomUUID();
 
-    List<int[]> cells = journal.changedSince(mark, "world", 0, 0);
-    assertEquals(1, cells.size(), "只补发同一世界、同一区块、且序号在持包之后的变更");
-    assertArrayEquals(new int[] {5, 64, 5}, cells.get(0));
+  @Test
+  void onlyActualWriteMakesThatRecipientsChangesReady() {
+    ChunkChangeJournal journal = new ChunkChangeJournal();
+    var a = journal.open(FIRST, "world", -1, 0);
+    var b = journal.open(SECOND, "world", -1, 0);
+    journal.record(FIRST, "world", -15, -62, 3);
+    assertNull(journal.poll(a.receiver));
+    // 改写已计算好却还在连接队列：这时发生的批量变化也必须留下。
+    journal.recordSection(FIRST, "world", new int[] {-15, -62, 3, -14, -61, 3}, 2);
+    journal.record(FIRST, "other", -15, -62, 3);
+    journal.record(FIRST, "world", 1, -62, 3);
+    assertTrue(journal.written(FIRST, a).schedule());
+    assertFalse(journal.written(SECOND, b).dirty());
+    journal.record(FIRST, "world", -13, -60, 3); // 区块写出之后的更新已在正确顺序，不应再补。
+    assertSame(a, journal.poll(a.receiver));
+    int[] cells = new int[6];
+    assertEquals(2, journal.take(a, 2, cells));
+    assertArrayEquals(new int[] {-15, -62, 3, -14, -61, 3}, cells);
+    journal.acknowledge(a, cells, 2);
+    assertTrue(journal.finish(a, true));
+    assertFalse(journal.continueDrain(a.receiver));
   }
 
   @Test
-  void changedSinceIsEmptyWhenNothingHappenedAfterTheMark() {
+  void burstContinuesInBoundedSlicesWithoutForgettingOtherSections() {
     ChunkChangeJournal journal = new ChunkChangeJournal();
-    journal.record("world", 0, 64, 0);
-    long mark = journal.sequence();
-    assertTrue(journal.changedSince(mark, "world", 0, 0).isEmpty(), "持包之后没有变更：一次都不补发");
-
-    journal.record("world", 1, 64, 1);
-    assertFalse(journal.changedSince(mark, "world", 0, 0).isEmpty(), "持包之后有变更：必须补发");
-  }
-
-  @Test
-  void repeatedChangesToTheSameCellAreReplayedOnce() {
-    ChunkChangeJournal journal = new ChunkChangeJournal();
-    for (int i = 0; i < 40; i++) {
-      journal.record("world", 1, 64, 1);
+    var ticket = journal.open(FIRST, "world", 0, 0);
+    for (int i = 0; i < 5000; i++) {
+      journal.record(FIRST, "world", i & 15, (i >> 8) - 64, (i >> 4) & 15);
     }
-    List<int[]> cells = journal.changedSince(0L, "world", 0, 0);
-    assertEquals(1, cells.size(), "同一格反复变更只补发一次（补发的是当前状态，重复没有意义）");
-  }
-
-  /**
-   * 单次放行的补发上限必须能覆盖「一个 section 在同一窗口内的全部变更」。
-   *
-   * <p>旧值 16 是随手取的：一次爆炸 / 大范围施工在同一段内改掉几十上百格时，超出部分既不补发、
-   * 也没有任何别的路径会来纠正——客户端就永久保留旧区块字节（真机表现：整段幽匿脉络等附着方块
-   * 卡在空中，右键被服务端纠正后才消失）。上限只该由环形容量兜底，不该是任意小值。
-   */
-  @Test
-  void replayCoversAWholeSectionOfSimultaneousChanges() {
-    ChunkChangeJournal journal = new ChunkChangeJournal();
-    for (int i = 0; i < 200; i++) {
-      // 全部落在同一区块 (0,0)：x/z 取 0..15，y 递增避免同格去重
-      journal.record("world", i & 15, 64 + (i >> 4), i & 15);
+    assertFalse(journal.written(FIRST, ticket).truncated());
+    int[] cells = new int[128 * 3];
+    int seen = 0;
+    while (journal.continueDrain(ticket.receiver)) {
+      assertSame(ticket, journal.poll(ticket.receiver));
+      int count = journal.take(ticket, 128, cells);
+      assertTrue(count > 0 && count <= 128);
+      seen += count;
+      assertTrue(seen <= 5000);
+      journal.acknowledge(ticket, cells, count);
+      journal.finish(ticket, true);
     }
-    List<int[]> cells = journal.changedSince(0L, "world", 0, 0);
-    assertEquals(200, cells.size(),
-        "同一段内的一次性批量变更必须整批补发；上限只该是环形容量，不能是 16");
-    assertTrue(ChunkChangeJournal.MAX_REPLAY >= 4096,
-        "单次补发上限至少覆盖一个 section 的 4096 格（爆炸/大范围施工的真实量级）");
+    assertEquals(5000, seen);
   }
 
   @Test
-  void ringWrapKeepsServingTheNewestChanges() {
+  void newSnapshotInheritsUnacknowledgedCoordsAndRejectsOldCallbacks() {
     ChunkChangeJournal journal = new ChunkChangeJournal();
-    // 录制量必须显著大于环形容量（否则「覆盖之后仍能取到最新一条」根本没被验证）
-    for (int i = 0; i < 20_000; i++) {
-      journal.record("world", i & 15, 64, 0);
-    }
-    long mark = journal.sequence();
-    journal.record("world", 3, 70, 3);
-    List<int[]> cells = journal.changedSince(mark, "world", 0, 0);
-    assertEquals(1, cells.size(), "环形覆盖之后仍能取到最新一条");
-    assertArrayEquals(new int[] {3, 70, 3}, cells.get(0));
+    var old = journal.open(FIRST, "world", 0, 0);
+    journal.record(FIRST, "world", 1, 2, 3);
+    assertTrue(journal.written(FIRST, old).schedule());
+    assertSame(old, journal.poll(old.receiver));
+    int[] cells = new int[3];
+    assertEquals(1, journal.take(old, 1, cells));
+    var newer = journal.open(FIRST, "world", 0, 0);
+    journal.acknowledge(old, cells, 1);
+    assertFalse(journal.written(FIRST, old).current());
+    assertTrue(journal.written(FIRST, newer).dirty());
+    assertSame(newer, journal.poll(newer.receiver));
+    assertEquals(1, journal.take(newer, 1, cells));
+    assertArrayEquals(new int[] {1, 2, 3}, cells);
+  }
+
+  @Test
+  void worldSwitchAndReconnectInvalidateStaleTickets() {
+    ChunkChangeJournal journal = new ChunkChangeJournal();
+    var old = journal.open(FIRST, "old", 0, 0);
+    var next = journal.open(FIRST, "next", 0, 0);
+    journal.clearOtherWorlds(FIRST, "next");
+    assertFalse(journal.written(FIRST, old).current());
+    assertTrue(journal.isCurrent(FIRST, next));
+    journal.clear(FIRST);
+    assertFalse(journal.written(FIRST, next).current());
+  }
+  @Test
+  void dirtySectionLimitIsSharedAcrossColumnsAndReleasedOnAcknowledgement() {
+    ChunkChangeJournal journal = new ChunkChangeJournal(2, () -> { });
+    var first = journal.open(FIRST, "world", 0, 0);
+    var second = journal.open(FIRST, "world", 1, 0);
+    journal.record(FIRST, "world", 1, 2, 3);
+    journal.record(FIRST, "world", 17, 2, 3);
+    journal.record(FIRST, "world", 17, 16, 3);
+    assertTrue(journal.written(FIRST, second).truncated());
+    assertTrue(journal.written(FIRST, first).dirty());
+    int[] cells = new int[3];
+    assertEquals(1, journal.take(first, 1, cells));
+    journal.acknowledge(first, cells, 1);
+    var later = journal.open(FIRST, "world", 2, 0);
+    journal.record(FIRST, "world", 33, 16, 3);
+    assertFalse(journal.written(FIRST, later).truncated());
+    assertEquals(1, journal.take(later, 1, cells));
   }
 }

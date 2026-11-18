@@ -795,6 +795,12 @@ public final class AntiXrayRuntime {
     return protocolLibHook;
   }
 
+  /** -1 表示当前玩家没有已登记的实体显形任务。 */
+  public long proximityHeartbeatAgeMillis(java.util.UUID playerId) {
+    ProximityRevealer current = proximityRevealer;
+    return current == null ? -1L : current.taskHeartbeatAgeMillis(playerId);
+  }
+
   /** 反矿透工作线程池；未启用时为 null。 */
   public MikuWorkPool workPool() {
     return workPool;

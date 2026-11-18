@@ -80,6 +80,10 @@ public final class RewriteStats {
    */
   public final LongAdder cacheContentRejected = new LongAdder();
 
+  /** 已在区块出站后定向补发的方块数，以及补发放弃/登记失败次数。 */
+  public final LongAdder replayCells = new LongAdder();
+  public final LongAdder replaySkipped = new LongAdder();
+
   /**
    * 磁盘缓存「读到了负载但被拒」的次数：负载里的原始区块字节指纹与本次要改写的字节不符（或信封损坏）。
    *

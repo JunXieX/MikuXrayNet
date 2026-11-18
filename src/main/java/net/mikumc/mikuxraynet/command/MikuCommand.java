@@ -376,6 +376,11 @@ public final class MikuCommand {
         ? ProximitySelector.MAX_SAMPLE_POINTS : config.proximity().raycastSamples();
     Location eye = player.getEyeLocation();
     Vector direction = eye.getDirection();
+    if (net.mikumc.mikuxraynet.bootstrap.PlatformSupport.isFolia()) {
+      long heartbeat = runtime.proximityHeartbeatAgeMillis(player.getUniqueId());
+      message(sender, heartbeat < 0L ? "显形任务心跳：未登记"
+          : "显形任务最近心跳：" + heartbeat + " ms 前");
+    }
     List<String> lines = RevealProbe.probe(player.getWorld().getName(), player.getUniqueId(),
         ProximitySelector.eye(eye.getX(), eye.getY(), eye.getZ(),
             direction.getX(), direction.getY(), direction.getZ()),

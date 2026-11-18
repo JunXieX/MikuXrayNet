@@ -139,11 +139,15 @@ class RegressionWiringGuardTest {
   }
 
   @Test
-  void digNeighbourRevealIgnoresOwnChangeWindow() throws IOException {
-    String body = methodBody(readSource("antixray/ProximityRevealer.java"), "revealAfterDig");
-    assertTrue(body != null, "revealAfterDig 必须存在");
-    assertTrue(body.contains("occludedBy"), "必须仍然只还原「挖开之后才看得见」的坐标");
-    assertFalse(body.contains("sameSectionAsOwnChange"),
-        "这一段不得再按 section 让开安静窗口：6 邻与正在挖的那一格几乎总在同一 section，会让预显形永不执行");
+  void miningFrontUsesLiveGeometryInsteadOfLastTicksBitmap() throws IOException {
+    String source = readSource("antixray/ProximityRevealer.java");
+    String body = methodBody(source, "revealMiningFront");
+    int trace = body.indexOf("visibleMiningFace(");
+    assertTrue(trace >= 0 && trace < body.indexOf("sendOne("));
+    assertTrue(body.contains("block.getX() != bx") && body.contains("block.getY() != by")
+        && body.contains("block.getZ() != bz"), "仅忽略即将破坏的一格");
+    assertFalse(body.contains("sameSectionAsOwnChange"));
+    String visibility = methodBody(source, "visibleMiningFace");
+    assertTrue(visibility.contains("rayChunksAvailable(") && visibility.contains("hitsBlock("));
   }
 }

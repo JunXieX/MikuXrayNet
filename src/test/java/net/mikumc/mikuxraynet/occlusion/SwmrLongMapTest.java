@@ -50,6 +50,24 @@ class SwmrLongMapTest {
   }
 
   @Test
+  void changingChunksDoesNotGrowATableWithFewLiveEntries() throws Exception {
+    SwmrLongMap<String> map = new SwmrLongMap<>(4);
+    var table = SwmrLongMap.class.getDeclaredField("table");
+    table.setAccessible(true);
+    var keys = table.get(map).getClass().getDeclaredField("keys");
+    keys.setAccessible(true);
+    int initial = ((long[]) keys.get(table.get(map))).length;
+    map.put(Long.MIN_VALUE, "retained");
+    for (int i = 0; i < 10_000; i++) {
+      map.put(i, "temporary");
+      assertEquals("temporary", map.remove(i));
+    }
+    assertEquals(1, map.size());
+    assertEquals("retained", map.get(Long.MIN_VALUE));
+    assertEquals(initial, ((long[]) keys.get(table.get(map))).length);
+  }
+
+  @Test
   void clearEmptiesEntriesAndSlots() {
     SwmrLongMap<String> map = new SwmrLongMap<>(16);
     for (int i = 0; i < 100; i++) {

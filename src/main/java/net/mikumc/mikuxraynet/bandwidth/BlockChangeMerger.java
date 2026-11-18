@@ -17,8 +17,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -144,8 +143,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * 该坐标从本集合移除（此刻缓冲条目才是最新的）——因此它不会把「更新的变更」当旧态误删。
    * 只在持有该 {@code Pending} 的锁内读写。
    *
-   * <p><b>有界</b>：条目上限见 {@link #passedLimit}。窗口期若持续有近身直通 / 批量直通包（大规模显形、
-   * 流水、爆炸连续发生），集合会一直增长；没有上限就等于让「内存有界」这条约束失效。
+   * <p>只记当前缓冲坐标与直通坐标的交集。无关的大包不会挤掉抑制旧态所需的记号。
    */
   private static final class Pending {
     private final UUID uuid;
@@ -161,34 +159,18 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
      * （旧世界区块会整列重建，丢弃不构成丢更新）。
      */
     private volatile String world;
+    private final Set<Coord> buffered = new HashSet<>();
     private final Set<Coord> passed = new HashSet<>();
-    /**
-     * {@link #passed} 的条目上限；超限即整体清空（见 {@link #rememberDelivered}）。
-     *
-     * <p><b>为什么按 {@code maxPendingEntries × 4}</b>：正常窗口里「已直通坐标」与「缓冲条目」同量级
-     * （每条被直通的变更至多对应一条缓冲条目），4 倍缓冲上限留足余量，不至于让正常流量频繁触发清空；
-     * 同时保证上限随配置缩放，且不低于 {@link #MIN_PASSED_LIMIT} 这一「极小缓冲配置下也不至于每包清空」的下限。
-     */
-    private final int passedLimit;
     private final BlockChangeBatch<WrappedBlockData> batch;
     private ScheduledFuture<?> timer;
 
-    /** {@link #passed} 的条目下限（极小缓冲配置下也不至于每包都触发清空）。 */
-    private static final int MIN_PASSED_LIMIT = 1024;
-
-    /**
-     * 由缓冲条目上限推出「已直通坐标」上限：{@code maxPendingEntries × 4}，并不低于
-     * {@link #MIN_PASSED_LIMIT}。
-     *
-     * <p><b>为什么需要上限</b>：{@link #passed} 是本窗口内「已直通下发」的坐标集合。窗口期内若持续有
-     * 近身直通包或远距离批量直通包（大规模显形、爆炸、流水），它会一直增长——违反「内存有界」不变量。
-     * 超限时整体清空：代价只是窗口到期时可能把某个坐标的<b>旧态</b>再下发一次（客户端短暂回退一格，
-     * 下一次变更即修正），绝不影响正确性；这与 {@code revealEcho} 满即清空是同一策略。
-     */
-    private static int passedLimit(int maxPendingEntries) {
-      long scaled = (long) Math.max(1, maxPendingEntries) * 4L;
-      return (int) Math.min(Integer.MAX_VALUE, Math.max(MIN_PASSED_LIMIT, scaled));
+    private void rememberPass(int x, int y, int z) {
+      Coord coord = new Coord(x, y, z);
+      if (buffered.contains(coord)) {
+        passed.add(coord);
+      }
     }
+
     private final AtomicBoolean flushed = new AtomicBoolean();
     /**
      * 溢出冲刷是否已排入冲刷线程（只在 {@code synchronized (target)} 内读写）。
@@ -203,7 +185,6 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     private Pending(UUID uuid, int maxEntries) {
       this.uuid = uuid;
       this.batch = new BlockChangeBatch<>(maxEntries);
-      this.passedLimit = passedLimit(maxEntries);
     }
   }
 
@@ -212,7 +193,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   private final ProtocolManager protocolManager;
   private final BandwidthConfig.BlockChanges config;
   private final ThrottleStats stats;
-  private final ScheduledExecutorService flusher;
+  private final ScheduledThreadPoolExecutor flusher;
   private final ConcurrentHashMap<UUID, Pending> pending = new ConcurrentHashMap<>();
   /**
    * 最近处置环（取证用，容量固定 32 条）：只记多坐标包与「丢弃 / 补发 / 合批校验失败」。
@@ -264,11 +245,12 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     this.protocolManager = protocolManager;
     this.config = config;
     this.stats = stats;
-    this.flusher = Executors.newSingleThreadScheduledExecutor(runnable -> {
+    this.flusher = new ScheduledThreadPoolExecutor(1, runnable -> {
       Thread thread = new Thread(runnable, "MikuXrayNet-BlockMerge");
       thread.setDaemon(true);
       return thread;
     });
+    this.flusher.setRemoveOnCancelPolicy(true);
   }
 
   /**
@@ -349,7 +331,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    */
   @EventHandler(ignoreCancelled = true)
   public void onChangedWorld(PlayerChangedWorldEvent event) {
-    discardPending(event.getPlayer().getUniqueId(), ThrottleStats.DiscardSource.DIMENSION_EVENT);
+    Player player = event.getPlayer();
+    Pending target = pending.get(player.getUniqueId());
+    if (target != null) {
+      discard(target, ThrottleStats.DiscardSource.DIMENSION_EVENT, player.getWorld().getName());
+    }
     // 重排刷新任务：Folia 的实体调度器任务会随实体被移出旧 world 而退役，退役不保证回调到
     // discardPositionSnapshot。不重排的话，那个玩家的位置快照就永远停在切维前那一刻——近身判定把
     // 所有变更判成「远」，跨世界守卫又拿旧世界名比对新世界名，每一批在途变更都会被整批丢掉。
@@ -570,6 +556,10 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * （异步投递会重新打开「旧世界数据落在切维包之后」的窗口）。
    */
   private void discard(Pending target, ThrottleStats.DiscardSource source) {
+    discard(target, source, null);
+  }
+
+  private void discard(Pending target, ThrottleStats.DiscardSource source, String destination) {
     ScheduledFuture<?> timer = null;
     int cancelled = 0;
     int buffered = 0;
@@ -588,12 +578,12 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         target.timer = null;
         cancelled = target.cancelledPackets;
         buffered = target.batch.size();
-        currentWorld = currentWorldOf(target.uuid);
+        currentWorld = destination == null ? PlayerWorldIndex.worldName(target.uuid) : destination;
         // 取消即欠账：原包在入缓冲时已经被取消，这里任何「直接丢弃」都必须先证明客户端会拿到
         // 等价信息。只有真切维（客户端收到新世界的整列区块）满足这个前提；世界名没变却丢弃，
         // 就是把这些方块变更永久抹掉——客户端会一直停在旧方块上（门只开一半、另一半还挡人即此症状），
         // 而且不会自愈。因此世界名相同即改走既有交付路径补发（见 deliver，失败自带逐条补发）。
-        redeem = cancelled > 0 && shouldRedeem(source, target.world, currentWorld);
+        redeem = cancelled > 0 && shouldRedeem(target.world, currentWorld);
         if (redeem) {
           clusters = target.batch.drainClusters(config.mergeRadius());
           passed = target.passed.isEmpty() ? Set.of() : new HashSet<>(target.passed);
@@ -622,34 +612,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
   }
 
-  /**
-   * 纯函数：本次丢弃是否应改为补发。
-   *
-   * <p><b>为什么需要它</b>：丢弃路径刻意不发包，其安全前提是「这些坐标属于玩家已离开的世界，
-   * 客户端会收到新世界的整列区块」。前提一旦不成立（世界名其实没变，或世界判定用的是陈旧/错误的名字），
-   * 丢弃就是永久丢失方块更新：原包已被取消、合并包也不会再发，客户端只能等某次区块重发才自愈。
-   * 门/床/双箱这类「点一下才变」的成对结构一旦丢一片，就是「只开一半且挡人」。
-   *
-   * <p>判定顺序：真切维事件 → 丢弃（客户端必然重建）；世界名相同 → 补发；任一侧世界名未知 →
-   * 补发（无法证明客户端会重建，宁可多发一次也不丢）。
-   *
-   * @param source        丢弃来源（{@link ThrottleStats.DiscardSource}）
-   * @param bufferedWorld 缓冲里这些坐标所属的世界名（入缓冲时记录，可为 {@code null}）
-   * @param currentWorld  此刻该玩家的世界名（读位置快照，可为 {@code null}）
-   * @return true 表示应改为补发，false 表示照旧丢弃
-   */
-  static boolean shouldRedeem(ThrottleStats.DiscardSource source, String bufferedWorld,
-      String currentWorld) {
-    if (source == ThrottleStats.DiscardSource.DIMENSION_EVENT) {
-      // 真切维：事件在 setServerLevel 之后同步触发，此刻缓冲里的坐标必然属于旧世界，
-      // 而客户端会收到新世界的整列区块——丢弃不构成丢更新，这正是本路径存在的理由。
-      return false;
-    }
-    if (bufferedWorld == null || currentWorld == null) {
-      // 任意一侧未知：无法证明「客户端会重建这些坐标」，按不丢处理。
-      return true;
-    }
-    return currentWorld.equals(bufferedWorld);
+  /** 当前世界与缓冲世界均已知且不同时，才允许丢弃已取消的原包。 */
+  static boolean shouldRedeem(String bufferedWorld, String currentWorld) {
+    return !shouldDiscardAtFlush(bufferedWorld, currentWorld);
   }
 
   /**
@@ -675,12 +640,6 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       return false;
     }
     return !indexWorld.equals(bufferedWorld);
-  }
-
-  /** 该玩家此刻的世界名（只读位置快照；封包线程上同样安全）。 */
-  private String currentWorldOf(UUID playerId) {
-    PlayerPositionSnapshots.Position snapshot = positions.get(playerId);
-    return snapshot == null ? null : snapshot.world();
   }
 
   /** 记一条处置环（簇非空时取首坐标；任何异常都不影响发包）。 */
@@ -821,23 +780,23 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
   }
 
+  static boolean fitsPendingWindow(int pending, int incoming, int limit) {
+    return pending >= 0 && incoming > 0 && pending <= limit && incoming <= limit - pending;
+  }
+
   /** 记录「这些绝对坐标已有新态下发」（快速路径用，不经过 {@code Update} 列表）。 */
-  private void rememberDeliveredCoords(UUID playerId, int[] coordinates, int count) {
+  private void rememberDeliveredCoords(UUID playerId, String worldName, int[] coordinates, int count) {
     Pending target = pending.get(playerId);
     if (target == null) {
       return;
     }
     synchronized (target) {
-      if (target.flushed.get()) {
+      if (target.flushed.get() || !worldName.equals(target.world)) {
         return;
-      }
-      if (target.passed.size() + count > target.passedLimit) {
-        target.passed.clear();
       }
       int usable = Math.min(count, coordinates.length / 3);
       for (int i = 0; i < usable; i++) {
-        target.passed.add(new Coord(coordinates[i * 3], coordinates[i * 3 + 1],
-            coordinates[i * 3 + 2]));
+        target.rememberPass(coordinates[i * 3], coordinates[i * 3 + 1], coordinates[i * 3 + 2]);
       }
     }
   }
@@ -905,7 +864,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
           return;
         }
         if (section != null) {
-          rememberDeliveredCoords(player.getUniqueId(), section, coordShorts);
+          rememberDeliveredCoords(player.getUniqueId(), worldName, section, coordShorts);
           stats.blockChangesPassed.increment();
           return;
         }
@@ -919,7 +878,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     if (quickCoordinates != null) {
       int quickCount = quickCoordinates.length / 3;
       if (shouldPassThroughImmediately(player.getUniqueId(), quickCoordinates, quickCount)) {
-        rememberDeliveredCoords(player.getUniqueId(), quickCoordinates, quickCount);
+        rememberDeliveredCoords(player.getUniqueId(), worldName, quickCoordinates, quickCount);
         stats.blockChangesPassed.increment();
         recordTracePass(worldName, event.getPacketType() == PacketType.Play.Server.MULTI_BLOCK_CHANGE,
             quickCoordinates, quickCount);
@@ -938,7 +897,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     if (shouldPassThroughImmediately(player.getUniqueId(), updates)) {
       // 记录本窗口内已有更新下发的坐标：合并窗口内可能有同一方块的旧状态仍在缓冲，
       // 若不标记会在窗口到期后晚到并把新态覆盖回去（方块短暂回退）。
-      rememberDelivered(player.getUniqueId(), updates);
+      rememberDelivered(player.getUniqueId(), worldName, updates);
       stats.blockChangesPassed.increment();
       recordTracePass(worldName, updates);
       return;
@@ -951,12 +910,18 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     // 窗口到期会把旧态写回客户端，覆盖刚由本包下发的<b>新态</b>（方块回退）。
     // 不必担心误删新态：同坐标若之后又被重新缓冲，缓冲循环会撤销该标记（见上面的 remove）。
     if (bypassesMerge(event.getPacketType() == PacketType.Play.Server.MULTI_BLOCK_CHANGE, updates.size())) {
-      rememberDelivered(player.getUniqueId(), updates);
+      rememberDelivered(player.getUniqueId(), worldName, updates);
       stats.blockChangesPassed.increment();
       recordTracePass(worldName, updates);
       return;
     }
 
+    int maxPending = config.maxPendingEntries();
+    if (!fitsPendingWindow(0, updates.size(), maxPending)) {
+      rememberDelivered(player.getUniqueId(), worldName, updates);
+      stats.blockChangesPassed.increment();
+      return;
+    }
     Pending target;
     boolean scheduleOverflowFlush = false;
     // 与 flush() 在同一把锁内判定「缓冲是否已被冲刷」：若已冲刷则重取新缓冲，
@@ -967,6 +932,18 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       synchronized (target) {
         if (target.flushed.get()) {
           continue;
+        }
+        if (shouldDiscardAtFlush(target.world, worldName)) {
+          // 旧世界还有独立窗口。当前原包直接发，绝不覆盖旧窗口的世界键再混合两批。
+          stats.blockChangesPassed.increment();
+          return;
+        }
+        if (!fitsPendingWindow(target.batch.size(), updates.size(), maxPending)) {
+          for (Update<WrappedBlockData> update : updates) {
+            target.rememberPass(update.x(), update.y(), update.z());
+          }
+          stats.blockChangesPassed.increment();
+          return;
         }
         boolean overflow = false;
         // 先确保窗口定时器在位：排不上就<b>不取消</b>原包（它照常流出），绝不因合并链路不可用而丢更新。
@@ -980,15 +957,12 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
             return;
           }
         }
-        boolean hasPassed = !target.passed.isEmpty();
         for (Update<WrappedBlockData> update : updates) {
           // 直接复用解析阶段已构造的 Update 实例（避免同一坐标再造一个等值 record）
           overflow |= target.batch.add(update);
-          // 本坐标刚被重新缓冲：此刻缓冲条目才是最新的，必须撤销「已被更新下发覆盖」的标记。
-          // 否则上一轮「立即放行 / 直通批量包」留下的标记会在冲刷时把这条更新当旧态误删（丢更新）。
-          if (hasPassed) {
-            target.passed.remove(new Coord(update.x(), update.y(), update.z()));
-          }
+          Coord coord = new Coord(update.x(), update.y(), update.z());
+          target.buffered.add(coord);
+          target.passed.remove(coord);
         }
         // 入缓冲成功后才取消原包：此后由窗口末的合并包交付；合并失败会逐条补发（见 deliver），绝不丢更新。
         event.setCancelled(true);
@@ -1040,23 +1014,18 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * <p>只在已有待发缓冲时记录：没有缓冲就不可能有会被旧态覆盖的条目。与 {@code flush}
    * 共用同一把锁，保证「记录」与「冲刷时读取」不交错。
    */
-  private void rememberDelivered(UUID playerId, List<Update<WrappedBlockData>> updates) {
+  private void rememberDelivered(UUID playerId, String worldName, List<Update<WrappedBlockData>> updates) {
     Pending target = pending.get(playerId);
     if (target == null) {
       return;
     }
     synchronized (target) {
-      if (target.flushed.get()) {
+      if (target.flushed.get() || !worldName.equals(target.world)) {
         // 窗口已冲刷：缓冲内容已定型（本次记录再无处生效），跳过
         return;
       }
-      // 上限闸：超限即整体清空重来（只可能让窗口到期时把某个坐标的旧态再下发一次，不影响正确性）。
-      // 近似有界：单批 updates 本身可能远超上限，清空后整批加入仍会瞬时超额，下一次调用才再清。
-      if (target.passed.size() + updates.size() > target.passedLimit) {
-        target.passed.clear();
-      }
       for (Update<WrappedBlockData> update : updates) {
-        target.passed.add(new Coord(update.x(), update.y(), update.z()));
+        target.rememberPass(update.x(), update.y(), update.z());
       }
     }
   }
@@ -1072,25 +1041,21 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * <p>上限闸与 {@link #rememberDelivered} 同口径：超限即整体清空（最多让窗口到期时把某个坐标的旧态再下发
    * 一次，不影响正确性）。与 {@code flush} 共用 {@code synchronized(target)}。
    */
-  private void rememberDeliveredCoords(UUID playerId, BlockPosition section, short[] positions) {
+  private void rememberDeliveredCoords(UUID playerId, String worldName, BlockPosition section, short[] positions) {
     Pending target = pending.get(playerId);
     if (target == null) {
       return;
     }
     synchronized (target) {
-      if (target.flushed.get()) {
+      if (target.flushed.get() || !worldName.equals(target.world)) {
         return;
-      }
-      if (target.passed.size() + positions.length > target.passedLimit) {
-        target.passed.clear();
       }
       int baseX = section.getX() << 4;
       int baseY = section.getY() << 4;
       int baseZ = section.getZ() << 4;
       for (short packed : positions) {
         int raw = SectionCoords.unsigned(packed);
-        target.passed.add(new Coord(baseX + SectionCoords.x(raw),
-            baseY + SectionCoords.y(raw), baseZ + SectionCoords.z(raw)));
+        target.rememberPass(baseX + SectionCoords.x(raw), baseY + SectionCoords.y(raw), baseZ + SectionCoords.z(raw));
       }
     }
   }
@@ -1458,7 +1423,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       for (int i = 0; i < blocks.size(); i++) {
         Update<WrappedBlockData> update = blocks.get(i);
         data[i] = update.value();
-        // 与协议一致：section 内相对坐标打包为 (y & 15) << 8 | (z & 15) << 4 | (x & 15)。
+        // 与协议一致：section 内相对坐标打包为 (x & 15) << 8 | (z & 15) << 4 | (y & 15)。
         // 早前把 x 与 y 放反了——合并包会把方块画到错误高度，客户端表现为方块错位/闪一下。
         positions[i] = (short) SectionCoords.pack(update.x(), update.y(), update.z());
       }
@@ -1510,7 +1475,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       if (type == PacketType.Play.Server.BLOCK_CHANGE) {
         BlockPosition position = packet.getBlockPositionModifier().read(0);
         WrappedBlockData data = packet.getBlockData().read(0);
-        if (position == null || data == null) {
+        if (position == null || data == null || data.getHandle() == null) {
           return null;
         }
         updates.add(new Update<>(position.getX(), position.getY(), position.getZ(), data));
@@ -1527,13 +1492,17 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       int baseY = section.getY() << 4;
       int baseZ = section.getZ() << 4;
       for (int i = 0; i < positions.length; i++) {
-        // 协议：(y & 15) << 8 | (z & 15) << 4 | (x & 15)，唯一实现在 SectionCoords。
+        // 协议：(x & 15) << 8 | (z & 15) << 4 | (y & 15)，唯一实现在 SectionCoords。
         // 早前这里把 bit8..11 当 x、低 4 位当 y（x/y 对调），与 sendSection 的对调恰好抵消才没有暴露。
         int raw = SectionCoords.unsigned(positions[i]);
         int x = baseX + SectionCoords.x(raw);
         int z = baseZ + SectionCoords.z(raw);
         int y = baseY + SectionCoords.y(raw);
-        updates.add(new Update<>(x, y, z, data[i]));
+        WrappedBlockData state = data[i];
+        if (state == null || state.getHandle() == null) {
+          return null; // 无法完整接管时保留本来的包。
+        }
+        updates.add(new Update<>(x, y, z, state));
       }
       return updates;
     } catch (Throwable throwable) {

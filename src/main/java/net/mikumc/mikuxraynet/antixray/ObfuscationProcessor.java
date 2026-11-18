@@ -170,6 +170,7 @@ public final class ObfuscationProcessor {
     final int minY;
     final int maxY;
     final boolean obfuscateAll;
+    final BitSet keepExposedTargets;
     /** use-block-below：命中伪装时优先用「下方紧邻方块」当伪装方块（按档案独立，逐维度可不同）。 */
     final boolean useBlockBelow;
 
@@ -183,7 +184,15 @@ public final class ObfuscationProcessor {
     WorldProfile(BitSet targets, int[] replacementIds, int[] replacementCum,
         int[] bandMinY, int[] bandMaxY, int[][] bandIds, int[][] bandCum,
         int minY, int maxY, boolean obfuscateAll, boolean useBlockBelow) {
+      this(targets, replacementIds, replacementCum, bandMinY, bandMaxY, bandIds, bandCum,
+          minY, maxY, obfuscateAll, useBlockBelow, new BitSet());
+    }
+
+    WorldProfile(BitSet targets, int[] replacementIds, int[] replacementCum,
+        int[] bandMinY, int[] bandMaxY, int[][] bandIds, int[][] bandCum,
+        int minY, int maxY, boolean obfuscateAll, boolean useBlockBelow, BitSet keepExposedTargets) {
       this.targets = targets;
+      this.keepExposedTargets = (BitSet) keepExposedTargets.clone();
       this.replacementIds = replacementIds.clone();
       this.replacementCum = replacementCum.clone();
       this.bandMinY = bandMinY.clone();
@@ -207,10 +216,14 @@ public final class ObfuscationProcessor {
         return this;
       }
       return new WorldProfile(targets, replacementIds, replacementCum, bandMinY, bandMaxY,
-          bandIds, bandCum, minY, maxY, obfuscateAll, value);
+          bandIds, bandCum, minY, maxY, obfuscateAll, value, keepExposedTargets);
     }
 
     /** 是否具备生效条件（有目标方块，且回落表或任一 band 表有候选）。 */
+    boolean requiresFaces() {
+      return !obfuscateAll || !keepExposedTargets.isEmpty();
+    }
+
     boolean active() {
       return !targets.isEmpty() && (replacementIds.length > 0 || bandIds.length > 0);
     }
@@ -221,13 +234,15 @@ public final class ObfuscationProcessor {
      * @param label 日志前缀（如「反矿透」或「反矿透（世界覆盖 world_nether）」）
      */
     static WorldProfile resolve(BlockStateRegistry registry, AntiXrayConfig.EffectiveObfuscation effective,
-        Logger logger, String label) {
+        Logger logger, String label, boolean keepExposedOres) {
       BitSet targets = new BitSet(registry.paletteCapacity());
+      BitSet keepExposedTargets = new BitSet();
       List<String> resolvedTargets = new ArrayList<>();
       for (String name : effective.hideBlocks()) {
         // hide-blocks 填的是「方块注册名」，语义上要隐藏该方块的**全部状态**（箱子有 24 种朝向/含水
         // 组合、楼梯/台阶/含水方块同理）。旧实现只取「默认状态」一个 id，其余状态照旧下发给客户端——
         // 透视端仍能看到它们，而诊断面板完全看不出来（被藏的那一个默认态仍在正常计数）。
+        boolean keepExposed = keepExposedOres && isOreTarget(name);
         int[] stateIds = registry.allStateIds(name);
         if (stateIds.length == 0) {
           // 注册表里没有该名称（探测未收录等极端情况）：退回单状态解析，保持旧行为
@@ -237,11 +252,17 @@ public final class ObfuscationProcessor {
             continue;
           }
           targets.set(stateId);
+          if (keepExposed) {
+            keepExposedTargets.set(stateId);
+          }
           resolvedTargets.add(name);
           continue;
         }
         for (int stateId : stateIds) {
           targets.set(stateId);
+          if (keepExposed) {
+            keepExposedTargets.set(stateId);
+          }
         }
         resolvedTargets.add(name);
       }
@@ -301,7 +322,13 @@ public final class ObfuscationProcessor {
       boolean obfuscateAll = effective.mode() == AntiXrayConfig.ObfuscationMode.ALL;
       return new WorldProfile(targets, fallback[0], fallback[1], bandMinY, bandMaxY,
           bandIds, bandCum, effective.minY(), effective.maxY(), obfuscateAll,
-          effective.useBlockBelow());
+          effective.useBlockBelow(), keepExposedTargets);
+    }
+
+    private static boolean isOreTarget(String name) {
+      String path = name.substring(name.indexOf(':') + 1);
+      return path.endsWith("_ore") || path.equals("ancient_debris")
+          || path.equals("raw_iron_block") || path.equals("raw_copper_block") || path.equals("raw_gold_block");
     }
 
     /**
@@ -627,7 +654,7 @@ public final class ObfuscationProcessor {
       // 维度整体关闭（如默认关闭的末地）→ 空档案（该维度任何方块都不伪装），但仍打印一行以便核对
       dimensionProfiles[dimension.ordinal()] = config.dimensionEnabled(dimension)
           ? WorldProfile.resolve(registry, config.dimensionEffective(dimension), logger,
-              "反矿透（" + dimension.label() + "）")
+              "反矿透（" + dimension.label() + "）", config.proximity().keepExposedOres())
           : WorldProfile.EMPTY;
     }
     List<AntiXrayConfig.WorldOverride> overrides = config.worldOverrides();
@@ -637,7 +664,8 @@ public final class ObfuscationProcessor {
         // 覆盖段是最高优先级的手动出口：即便该维度整体关闭也照常解析（用户显式配置的世界应当生效）
         overrideProfiles[i][dimension.ordinal()] = WorldProfile.resolve(registry,
             config.overrideEffective(i, dimension), logger,
-            "反矿透（世界覆盖 " + overrides.get(i).pattern() + " / " + dimension.label() + "）");
+            "反矿透（世界覆盖 " + overrides.get(i).pattern() + " / " + dimension.label() + "）",
+            config.proximity().keepExposedOres());
       }
     }
 
@@ -891,7 +919,7 @@ public final class ObfuscationProcessor {
         // 直接读实时状态即可（等价于原始状态）。
         // 位图只覆盖「目标密集」的段；undo log 仍要为所有 enclosed 段维护——稀疏段命中时
         // 6 面判定可能回落到相邻的密集段（它已被改写），必须能查回原始状态。
-        UndoLog undoLog = profile.obfuscateAll ? null : new UndoLog();
+        UndoLog undoLog = profile.requiresFaces() ? new UndoLog() : null;
         previousUndoLog = undoLog;
 
         int baseY = sectionIndex << 4;
@@ -922,14 +950,13 @@ public final class ObfuscationProcessor {
           }
 
           // mode=all：所有目标矿一律伪装（不看 6 面遮挡）；mode=enclosed：只伪装 6 面全遮挡的掩埋矿。
-          if (antiColumn != null && antiColumn[sectionIndex] != null) {
-            if (!isFullyOccludedByBitmap(chunk, antiColumn, baseY, index, neighbors)) {
+          if (!profile.obfuscateAll || profile.keepExposedTargets.get(state)) {
+            boolean covered = antiColumn != null && antiColumn[sectionIndex] != null
+                ? isFullyOccludedByBitmap(chunk, antiColumn, baseY, index, neighbors)
+                : isFullyOccluded(chunk, sectionIndex, undoLog, previousUndoLogSnapshot, baseY, index, neighbors);
+            if (!covered) {
               continue;
             }
-          } else if (undoLog != null
-              && !isFullyOccluded(chunk, sectionIndex, undoLog, previousUndoLogSnapshot, baseY, index,
-                  neighbors)) {
-            continue;
           }
 
           if (sectionTables == null) {
@@ -1169,7 +1196,7 @@ public final class ObfuscationProcessor {
       // 未启用遮挡位图：仍要在一遍遍历里收集目标（替代旧实现的逐格扫描），只是不建位图。
       collectTargetsOnly(chunk, sectionCandidates, targetLists, targetCounts,
           paletteOptions.widthBudget(), targetTest);
-      if (profile.obfuscateAll) {
+      if (!profile.requiresFaces()) {
         return new Prepared(null, null);
       }
       // enclosed：目标收集完成后再按密度决定哪些段建「改写前几何」位图。
@@ -1234,8 +1261,8 @@ public final class ObfuscationProcessor {
       }
       // enclosed 模式再建一份「反矿透视觉口径」的位图列（实体位图口径不同，不能混用）：
       // 它只用于 6 面判定，反映改写前几何；全伪装模式完全不需要。
-      SectionOcclusion[] anti = profile.obfuscateAll ? null
-          : buildAntiColumn(chunk, sectionCandidates, targetLists);
+      SectionOcclusion[] anti = profile.requiresFaces()
+          ? buildAntiColumn(chunk, sectionCandidates, targetLists) : null;
       // 同时返回编码后的负载：调用方把它随改写结果一并缓存，使缓存命中路径也能恢复遮挡数据
       return new Prepared(payload, anti);
     } catch (RuntimeException | LinkageError failure) {
@@ -1350,7 +1377,7 @@ public final class ObfuscationProcessor {
   public boolean needsNeighbors(String worldName, AntiXrayConfig.Dimension dimension) {
     WorldProfile profile = profileFor(worldName,
         dimension == null ? AntiXrayConfig.Dimension.NORMAL : dimension);
-    return profile.active() && !profile.obfuscateAll;
+    return profile.active() && profile.requiresFaces();
   }
 
   /**

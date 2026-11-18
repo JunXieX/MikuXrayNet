@@ -166,4 +166,17 @@ class MikuWorkPoolCloseTest {
     assertEquals(1, deliveries.get(), "尚未开始写的任务必须被兜底放行恰好一次");
     assertFalse(wrote.get(), "已被兜底放行的任务不得再取得写入权（否则包已发出却仍在改写）");
   }
+  @Test
+  @Timeout(10)
+  void cancelledWatchdogTimersLeaveQueueImmediately() throws Exception {
+    try (MikuWorkPool pool = new MikuWorkPool(1, 32)) {
+      var field = MikuWorkPool.class.getDeclaredField("watchdog");
+      field.setAccessible(true);
+      var watchdog = (java.util.concurrent.ScheduledThreadPoolExecutor) field.get(pool);
+      for (int i = 0; i < 128; i++) {
+        pool.scheduleTimeout(() -> { }, 60_000L).cancel(false);
+      }
+      assertEquals(0, watchdog.getQueue().size());
+    }
+  }
 }

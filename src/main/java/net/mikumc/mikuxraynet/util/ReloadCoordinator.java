@@ -124,6 +124,7 @@ public final class ReloadCoordinator {
       "高延迟降视距（阈值/幅度/下限/巡检周期）",
       "带宽全部子模块（零位移/变更合并/实体剔除）",
       "方块实体剔除开关（remove-block-entities，写回时实时施加，不影响缓存）",
+      "新区块任务的超时（advanced.timeout-millis）",
       // 异步遮挡的调优键随「停旧管线、建新管线」即时生效（新管线会按新配置重建引擎与线程池）。
       // 注意「开关本身」不在此列，见 RESTART_REQUIRED。
       "实体剔除异步遮挡调优（occlusion-time-budget-ms / occlusion-threads / max-occluding-blocks / "
@@ -134,21 +135,20 @@ public final class ReloadCoordinator {
       // neighbors.enabled 是**单向**热生效的：关闭后下一次区块改写即停止抓取（ProtocolLibAsyncListener
       // 的 neighborsNeeded 实时读 live().neighbors().enabled()）；但「启动时为 false」时 NeighborChunkProvider
       // 根本没创建，本进程内改成 true 也不会再抓取——该方向的说明放 RESTART_REQUIRED，避免误报。
-      "邻块快照开关关闭（neighbors.enabled=false 立即停止边界抓取）",
+      "邻块快照启用开关（neighbors.enabled，适用于后续区块）",
       "全部配置文件的读取值");
 
   /** 需要重启服务端才生效的配置项（在启动期已固化的部分）。 */
   public static final List<String> RESTART_REQUIRED = List.of(
-      "隐藏方块表与伪装权重",
+      "隐藏方块表与伪装权重、首包保留露矿（proximity.keep-exposed-ores）",
       "层状混淆（layer-obfuscation）",
       // 只有「关闭」是热生效的（见 APPLIED）：启动时 neighbors.enabled=false 时提供者为 null，
       // 本进程内不再抓取；missing-policy 与 cache-maximum-size 在启动期固化进 NeighborChunkProvider。
-      "邻块快照启用 / 缺失策略 / 容量（neighbors.enabled 启动时为 false 则本进程内不再抓取；"
-          + "missing-policy / cache-maximum-size）",
+      "邻块快照缺失策略和容量（neighbors.missing-policy / cache-maximum-size）",
       "反矿透工作线程数与队列容量",
       // cache.maximum-mb 与 cache.maximum-size 同属「启动期固化的改写缓存预算」：RewriteCache
       // 只在 startAntiXray 里构造一次，reload 不重建它，故字节上限改了也只有重启才生效。
-      "区块改写超时与改写缓存容量/内存上限/过期（cache.maximum-size / cache.maximum-mb）",
+      "改写缓存容量、内存上限和过期窗口（cache.maximum-size / cache.maximum-mb）",
       // 调色板两键在启动期被固化为编码链路的 PaletteOptions（见 AntiXrayRuntime.startAntiXray），
       // reload 只重启显形/带宽任务、不重建编码器，故这两键改了必须重启（含 width-budget / strict-verify）。
       "调色板压缩 / 位宽预算封顶 / 严格自检（palette.width-budget / strict-verify）",

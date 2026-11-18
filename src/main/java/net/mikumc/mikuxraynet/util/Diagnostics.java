@@ -212,7 +212,7 @@ public final class Diagnostics {
         long writeBackFailures, long chunksTimedOut, long chunksSkippedQueueFull,
         long bytesOriginal, long bytesOutput, long bytesSaved, String paletteBitsSummary,
         long indexSkippedOnWriteBackFailure, long occlusionCaptureFailures,
-        long occlusionPublishSkipped) {
+        long occlusionPublishSkipped, long replayCells, long replaySkipped) {
 
       /**
        * 兼容构造（不含三项新增的「静默路径」计数，等价于全 0）。
@@ -227,13 +227,13 @@ public final class Diagnostics {
         this(cacheHits, cacheMisses, cacheEntries, 0L, cacheContentRejected, chunksRewritten,
             blocksReplaced, chunksSkipped, chunksFailed, writeBackFailures, chunksTimedOut,
             chunksSkippedQueueFull, bytesOriginal, bytesOutput, bytesSaved, paletteBitsSummary,
-            0L, 0L, 0L);
+            0L, 0L, 0L, 0L, 0L);
       }
 
       /** 反矿透未启用时的零值兜底。 */
       public static final Rewrite EMPTY =
           new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, "无采样",
-              0L, 0L, 0L);
+              0L, 0L, 0L, 0L, 0L);
 
       /** 真正用上的命中数（键命中且内容指纹一致）；被 {@code cacheContentRejected} 作废的不计入。 */
       public long effectiveCacheHits() {
@@ -252,11 +252,14 @@ public final class Diagnostics {
         long frustumCulled, long rayCulled, long rayCulledMissingData, long overRevealSampled,
         long overRevealWasted, long viewChangeScans, long viewChangeNanos, long viewChangeMaxNanos,
         long viewChangeBudgetExhausted, long passesSkippedNoCapacity, long prefilterDropped,
-        long windowFarthestBlocks, long breakSweepSent, long breakSweepBudgetExhausted) {
+        long windowFarthestBlocks, long breakSweepSent, long breakSweepBudgetExhausted,
+        long periodicVisited, long periodicContinued, long taskRestarts, long breakSweepQueueDropped,
+        long miningTargetCorrections, long miningLiveReveals) {
 
       /** 邻近显形未启用时的零值兜底。 */
       public static final Proximity EMPTY =
-          new Proximity(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+          new Proximity(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L,
+              0L, 0L, 0L, 0L, 0L, 0L);
     }
 
     /** 显形索引域：伪装区块索引（按区块共享）与按玩家的已显形集合的持有量与安全阀计数。 */
@@ -412,7 +415,7 @@ public final class Diagnostics {
         + "｜区块改写 " + s.rewrite().chunksRewritten() + "（异常 " + s.rewrite().chunksFailed()
         + "，超时放行 " + s.rewrite().chunksTimedOut() + "）"
         + "｜显形发送 " + s.proximity().revealsSent() + "，坐标跳过 " + s.proximity().revealsSkipped()
-        + "，窗口覆盖 " + s.proximity().windowFarthestBlocks() + " 格"
+        + "，周期续扫 " + s.proximity().periodicContinued()
         // 与状态面板/转储用同一口径：合并计的是「原包数」而非「合并结果的条数」
         + "｜变更合并 " + s.throttle().blockMergeBatches()
         + "（合并 " + s.throttle().blockChangesMerged() + " 个原包）"
@@ -969,7 +972,8 @@ public final class Diagnostics {
             rewriteStats.bytesSaved.sum(), rewriteStats.paletteBitsSummary(),
             rewriteStats.indexSkippedOnWriteBackFailure.sum(),
             rewriteStats.occlusionCaptureFailures.sum(),
-            rewriteStats.occlusionPublishSkipped.sum());
+            rewriteStats.occlusionPublishSkipped.sum(), rewriteStats.replayCells.sum(),
+            rewriteStats.replaySkipped.sum());
     Snapshot.Proximity proximity = proximityStats == null ? Snapshot.Proximity.EMPTY
         : new Snapshot.Proximity(proximityStats.revealsSent.sum(), proximityStats.revealsSkipped.sum(),
             proximityStats.unregistered.sum(), proximityStats.revealsFrustumCulled.sum(),
@@ -979,7 +983,10 @@ public final class Diagnostics {
             proximityStats.viewChangeMaxNanos.get(), proximityStats.viewChangeBudgetExhausted.sum(),
             proximityStats.passesSkippedNoCapacity.sum(), proximityStats.prefilterDropped.sum(),
             proximityStats.windowFarthestBlocks(), proximityStats.breakSweepSent.sum(),
-            proximityStats.breakSweepBudgetExhausted.sum());
+            proximityStats.breakSweepBudgetExhausted.sum(), proximityStats.periodicVisited.sum(),
+            proximityStats.periodicContinued.sum(), proximityStats.taskRestarts.sum(),
+            proximityStats.breakSweepQueueDropped.sum(), proximityStats.miningTargetCorrections.sum(),
+            proximityStats.miningLiveReveals.sum());
     Snapshot.Index index = chunkIndex == null && revealedSet == null ? Snapshot.Index.EMPTY
         : new Snapshot.Index(
             chunkIndex == null ? 0 : chunkIndex.chunkCount(),
@@ -1188,6 +1195,8 @@ public final class Diagnostics {
         + " 次（该区块无位图：矿可能一直显示假方块，且每次重发都要重算）"
         + "，发布跳过 " + s.rewrite().occlusionPublishSkipped()
         + " 段（期间有方块补丁，保留活位图）");
+    lines.add("在途更新：区块写出后定向补发 " + s.rewrite().replayCells()
+        + " 格，登记或补发未完成 " + s.rewrite().replaySkipped() + " 次");
     // 「未改写」按原始计数器分列，并写明各自的归属关系：chunksSkipped 是「已处理但原包放行」的<b>总量</b>，
     // chunksFailed 是它的子集；而「队列满」与「超时放行」都在各自的提前返回分支里计数、并不计入
     // chunksSkipped。任何用减法（如 跳过 − 异常）去推算「本来就无需改写」的写法都会漏掉这两条路径，
@@ -1225,13 +1234,15 @@ public final class Diagnostics {
         + "，预算耗尽 " + s.proximity().viewChangeBudgetExhausted() + " 次"
         // 工作池无容量时周期巡检会整轮跳过（显形完全不发生）；必须可见，否则「什么都不还原」无法归因。
         + "｜整轮跳过（工作池满） " + s.proximity().passesSkippedNoCapacity()
-        // 覆盖度：窗口是「本周期最多评估多少个候选」的硬顶，覆盖格数才是玩家能看到的范围。
-        // 预筛丢弃是「窗口名额有多少本来会浪费在全埋矿上」的直接证据（见 ProximityStats）。
-        + "｜窗口覆盖 " + s.proximity().windowFarthestBlocks() + " 格，预筛丢弃 "
-        + s.proximity().prefilterDropped()
-        // 破坏邻域显形：诊断条目直接对「挖开一块之后身边还有没有假方块」负责。
-        + "｜破坏邻域 发送 " + s.proximity().breakSweepSent() + "，额度耗尽 "
-        + s.proximity().breakSweepBudgetExhausted() + " 次");
+        + "｜周期巡检 访问 " + s.proximity().periodicVisited() + " 格，续扫 "
+        + s.proximity().periodicContinued() + " 轮，预筛排除 " + s.proximity().prefilterDropped()
+        + "，历史最远入选候选 " + s.proximity().windowFarthestBlocks() + " 格（非覆盖率）"
+        + "｜Folia 任务换新 " + s.proximity().taskRestarts() + " 次"
+        + "｜破坏邻域 发送 " + s.proximity().breakSweepSent() + " 格，顺延 "
+        + s.proximity().breakSweepBudgetExhausted() + " 次，淘汰破坏点 "
+        + s.proximity().breakSweepQueueDropped() + " 个"
+        + "｜挖掘目标纠正 " + s.proximity().miningTargetCorrections() + " 次，破口预显 "
+        + s.proximity().miningLiveReveals() + " 格");
     // 口径说明：这里刻意分列「实时坐标数」与「累计登记数」——前者随登出 / 过期 / 区块失效归零，
     // 后者只增不减。若只显示实时值，玩家中途重登或走远后被清理时会看到「发送 N 但已显形 0」，
     // 极易被误读成「显形路径没有登记」（实际登记在发包成功后必然发生）。
@@ -1780,6 +1791,7 @@ public final class Diagnostics {
     sb.append("neighbors.enabled=").append(c.neighbors().enabled())
         .append("，missing-policy=").append(c.neighbors().missingPolicy())
         .append("，cache-maximum-size=").append(c.neighbors().cacheMaximumSize()).append('\n');
+    sb.append("proximity.keep-exposed-ores=").append(c.proximity().keepExposedOres()).append('\n');
     sb.append("proximity.instant-reveal.enabled=").append(c.proximity().instantReveal().enabled())
         .append("，radius=").append(c.proximity().instantReveal().radius())
         .append("，max-per-tick=").append(c.proximity().instantReveal().maxPerTick())

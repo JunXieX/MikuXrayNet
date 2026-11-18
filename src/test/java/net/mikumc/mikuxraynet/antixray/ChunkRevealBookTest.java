@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.UUID;
+import net.mikumc.mikuxraynet.occlusion.SectionOcclusion;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -25,7 +26,7 @@ class ChunkRevealBookTest {
     RevealedSet marks = new RevealedSet(1000, 60);
     ChunkRevealBook book = book(index, marks);
     ChunkKey key = new ChunkKey("w", 0, 0);
-    book.recordChunk("w", 0, 0, 0, new int[] {SectionCoords.pack(1, 0, 0)});
+    book.recordChunk("w", 0, 0, 0, new int[] {SectionOcclusion.packLocal(1, 0, 0)});
     assertTrue(marks.markIfAbsent(PLAYER, key, 1, 0, 0));
 
     assertEquals(1, book.removePosition("w", 1, 0, 0) ? 1 : 0);
@@ -39,10 +40,10 @@ class ChunkRevealBookTest {
     ChunkRevealBook book = book(index, marks);
     ChunkKey key = new ChunkKey("w", 0, 0);
     book.recordChunk("w", 0, 0, 0,
-        new int[] {SectionCoords.pack(1, 0, 0), SectionCoords.pack(2, 0, 0)});
+        new int[] {SectionOcclusion.packLocal(1, 0, 0), SectionOcclusion.packLocal(2, 0, 0)});
     assertTrue(marks.markIfAbsent(PLAYER, key, 1, 0, 0));
 
-    int[] removed = book.recordChunk("w", 0, 0, 0, new int[] {SectionCoords.pack(2, 0, 0)});
+    int[] removed = book.recordChunk("w", 0, 0, 0, new int[] {SectionOcclusion.packLocal(2, 0, 0)});
     assertEquals(1, removed.length);
     assertFalse(marks.contains(PLAYER, key, 1, 0, 0), "被移出清单的坐标必须摘标记");
   }
@@ -64,7 +65,7 @@ class ChunkRevealBookTest {
     RevealedSet marks = new RevealedSet(1000, 60);
     ChunkRevealBook book = book(index, marks);
     ChunkKey key = new ChunkKey("w", 0, 0);
-    book.recordChunk("w", 0, 0, 0, new int[] {SectionCoords.pack(1, 1, 1)});
+    book.recordChunk("w", 0, 0, 0, new int[] {SectionOcclusion.packLocal(1, 1, 1)});
     assertTrue(marks.markIfAbsent(PLAYER, key, 1, 1, 1));
 
     book.invalidateWorld("w");
@@ -79,18 +80,18 @@ class ChunkRevealBookTest {
     ChunkRevealBook book = book(index, marks);
     ChunkKey first = new ChunkKey("w", 0, 0);
     book.recordChunk("w", 0, 0, 0,
-        new int[] {SectionCoords.pack(1, 0, 0), SectionCoords.pack(2, 0, 0)});
+        new int[] {SectionOcclusion.packLocal(1, 0, 0), SectionOcclusion.packLocal(2, 0, 0)});
     assertTrue(marks.markIfAbsent(PLAYER, first, 1, 0, 0));
 
     // 第二个区块使坐标总量触顶 → 安全阀按最旧优先淘汰第一个区块
     book.recordChunk("w", 1, 0, 0,
-        new int[] {SectionCoords.pack(1, 0, 0), SectionCoords.pack(2, 0, 0)});
+        new int[] {SectionOcclusion.packLocal(1, 0, 0), SectionOcclusion.packLocal(2, 0, 0)});
     assertFalse(marks.contains(PLAYER, first, 1, 0, 0), "被容量淘汰的区块必须摘标记");
   }
 
   @Test
   void absoluteConversionMatchesRelativeEncoding() {
-    int[] locals = {SectionCoords.pack(3, 5, 7), SectionCoords.pack(15, 0, 1)};
+    int[] locals = {SectionOcclusion.packLocal(3, 5, 7), SectionOcclusion.packLocal(15, 0, 1)};
     int[] absolute = ChunkRevealBook.toAbsolute(-2, 3, -64, locals);
     assertEquals(6, absolute.length);
     assertEquals((-2 << 4) | 3, absolute[0]);

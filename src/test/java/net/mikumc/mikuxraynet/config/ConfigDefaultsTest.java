@@ -165,7 +165,13 @@ class ConfigDefaultsTest {
     assertEquals(fallback.proximity().maxRevealsPerTick(), packed.proximity().maxRevealsPerTick(),
         "打包 yml 的 proximity.max-reveals-per-tick 必须等于代码回落值");
     assertTrue(fallback.proximity().revealOnChunkSend(), "区块下发即显形默认开启（M2）");
-    assertTrue(fallback.proximity().preRevealOnDig(), "开掘即预显形默认开启（M1a）");
+    assertTrue(fallback.proximity().preRevealOnDig(), "破坏前预显形默认开启");
+    assertTrue(fallback.proximity().keepExposedOres(), "区块首包默认保留已露面的矿");
+    assertEquals(fallback.proximity().keepExposedOres(), packed.proximity().keepExposedOres());
+    AntiXrayConfig hideExposed = AntiXrayConfig.from(yaml("proximity:\n  keep-exposed-ores: false\n"));
+    assertFalse(hideExposed.proximity().keepExposedOres());
+    assertNotEquals(AntiXrayConfig.from(yaml("")).configHash(), hideExposed.configHash(),
+        "影响首包方块状态的选项必须让旧缓存失效");
     assertEquals(fallback.proximity().revealOnChunkSend(), packed.proximity().revealOnChunkSend(),
         "打包 yml 的 proximity.reveal-on-chunk-send 必须等于代码回落值");
     assertEquals(fallback.proximity().preRevealOnDig(), packed.proximity().preRevealOnDig(),

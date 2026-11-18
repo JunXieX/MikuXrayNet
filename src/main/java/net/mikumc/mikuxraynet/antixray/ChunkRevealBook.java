@@ -137,9 +137,9 @@ public final class ChunkRevealBook {
     int[] absolute = new int[localPositions.length * 3];
     for (int i = 0; i < localPositions.length; i++) {
       int local = localPositions[i];
-      absolute[i * 3] = (chunkX << 4) | SectionCoords.x(local);
+      absolute[i * 3] = (chunkX << 4) | (local & 15);
       absolute[i * 3 + 1] = minHeight + (local >> 8);
-      absolute[i * 3 + 2] = (chunkZ << 4) | SectionCoords.z(local);
+      absolute[i * 3 + 2] = (chunkZ << 4) | ((local >>> 4) & 15);
     }
     return absolute;
   }

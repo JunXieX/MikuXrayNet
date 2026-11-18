@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.bandwidth.Schedulers;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
+import net.mikumc.mikuxraynet.occlusion.SectionOcclusion;
 import net.mikumc.mikuxraynet.util.Constants;
 import net.mikumc.mikuxraynet.util.PlayerWorldIndex;
 import org.bukkit.Material;
@@ -189,18 +190,13 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     // 只有「变更后不再是遮挡方块」才可能露出后面的伪装矿；放置石头/泥土不会，
     // 此时再触发事件显形只会把同一格重绘一次（真机观感：放置时闪一下）。
     boolean exposes = true;
-    boolean cleared = false;
     try {
-      WrappedBlockData data = packet.getBlockData().readSafely(0);
-      exposes = exposes(data);
-      cleared = clearedToAir(data);
+      exposes = exposes(packet.getBlockData().readSafely(0));
     } catch (Throwable ignored) {
-      // 读不到状态（协议差异）：按「可能暴露」处理（与旧行为一致），但不做「破坏邻域显形」——未知不猜
+      // 不影响原包；可见性仍由显形侧判定。
     }
-    observeChange(player, worldName, position.getX(), position.getY(), position.getZ(), exposes,
-        cleared);
+    observeChange(player, worldName, position.getX(), position.getY(), position.getZ(), exposes);
   }
-
   /**
    * 多方块变更：section 坐标 + 区块内相对坐标（与本插件合并包一致的位置编码）。
    *
@@ -230,15 +226,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     ParseScratch parse = ParseScratch.acquire();
     try {
       int[] coordinates = parse.coordinates(positions.length * 3);
-      for (int i = 0; i < positions.length; i++) {
-        short packed = positions[i];
-        // 协议编码（ClientboundSectionBlocksUpdatePacket）：(y << 8) | (z << 4) | x。
-        // 早前这里把低 4 位当成了 y、把 bit8..11 当成了 x——x/y 对调，注销的是另一个坐标。
-        int raw = SectionCoords.unsigned(packed);
-        coordinates[i * 3] = baseX + SectionCoords.x(raw);
-        coordinates[i * 3 + 1] = baseY + SectionCoords.y(raw);
-        coordinates[i * 3 + 2] = baseZ + SectionCoords.z(raw);
-      }
+      SectionCoords.unpack(baseX, baseY, baseZ, positions, coordinates);
 
       // 回显过滤与变更日志必须在封包线程同步完成：
       // ① 变更日志是「区块包放行后补发」的唯一依据，而放行动作可能在改写一完成后立刻在封包线程 /
@@ -255,7 +243,6 @@ public final class BlockChangeRevealListener extends PacketAdapter {
             && isOurRevealEcho(player, worldName, blockX, blockY, blockZ)) {
           continue; // 本插件刚发出的显形回显：服务端内容未变，不记日志
         }
-        recordChange(worldName, blockX, blockY, blockZ);
         coordinates[kept * 3] = blockX;
         coordinates[kept * 3 + 1] = blockY;
         coordinates[kept * 3 + 2] = blockZ;
@@ -263,6 +250,9 @@ public final class BlockChangeRevealListener extends PacketAdapter {
       }
       if (kept == 0) {
         return; // 整段都是回显：不摘索引、不记日志、不触发事件显形
+      }
+      if (changeJournal != null) {
+        changeJournal.recordSection(player.getUniqueId(), worldName, coordinates, kept);
       }
       SectionDispatch dispatch = (changed, changedCount) -> {
         if (instantRevealer != null && changedCount > 0) {
@@ -342,7 +332,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     }
 
     private void add(int x, int y, int z) {
-      int slot = SectionCoords.pack(x, y, z);
+      int slot = SectionOcclusion.packLocal(x, y, z);
       if (!scratch.mark(slot, generation)) {
         return;
       }
@@ -607,7 +597,7 @@ public final class BlockChangeRevealListener extends PacketAdapter {
    * 仍照常触发邻域显形。
    */
   private void observeChange(Player player, String worldName, int x, int y, int z,
-      boolean exposes, boolean cleared) {
+      boolean exposes) {
     // 黑名单世界不做任何反矿透工作：不注销显形、不触发事件即时显形。
     if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       return;
@@ -621,34 +611,11 @@ public final class BlockChangeRevealListener extends PacketAdapter {
     if (isOurRevealEcho(player, worldName, x, y, z)) {
       return; // 回显：服务端内容未变，不产生新的观察事件（理由见方法注释）
     }
-    recordChange(worldName, x, y, z);
+    recordChange(player.getUniqueId(), worldName, x, y, z);
     submitUndo(() -> removeFromIndexAndMarks(worldName, x, y, z));
-    if (cleared && instantRevealer != null) {
-      // 破坏（新状态是空气）：走邻域强制显形——半径内「仍伪装 + 未显形 + 看得见」的全部还原，
-      // 不再只挑「本来被这一格挡住」的那几格（那是会让身边假方块排队等窗口的根源）。
-      // 投递到玩家线程：入口内部要读 Bukkit.getCurrentTick()，Folia 上在封包线程读会抛
-      // No currently ticking region——整条注销包被外层 catch 后 fail-open 放行，坐标就留在伪装索引里。
-      // 投递失败（玩家离线/区域关闭）只放弃这次显形，周期巡检会兜底。
-      Schedulers.onEntity(plugin, player,
-          () -> instantRevealer.onBreakObserved(player, worldName, x, y, z));
-    } else if (exposes && instantRevealer != null) {
-      // 非空气的「暴露类」变更（火把、玻璃、水……）：保持旧行为——只还原「本来被这一格挡住」的坐标。
-      // 这类动作并没有打开新的视线，整片扫一遍只会让插火把/铺玻璃也刷一片显形。
+    if (exposes && instantRevealer != null) {
       Schedulers.onEntity(plugin, player,
           () -> instantRevealer.onBlockChangeObserved(player, worldName, x, y, z));
-    }
-  }
-
-  /** 该变更是否把格子变成了空气（破坏 / 爆炸 / 烧毁）：只有这种情况才做邻域强制显形。 */
-  private static boolean clearedToAir(WrappedBlockData data) {
-    if (data == null) {
-      return false;
-    }
-    try {
-      Material material = data.getType();
-      return material != null && material.isAir();
-    } catch (Throwable throwable) {
-      return false;
     }
   }
 
@@ -713,10 +680,10 @@ public final class BlockChangeRevealListener extends PacketAdapter {
   }
 
   /** 记录一条真实方块变更（供区块包放行后补发；日志缺失时零开销）。 */
-  private void recordChange(String worldName, int x, int y, int z) {
+  private void recordChange(java.util.UUID playerId, String worldName, int x, int y, int z) {
     ChunkChangeJournal journal = changeJournal;
     if (journal != null) {
-      journal.record(worldName, x, y, z);
+      journal.record(playerId, worldName, x, y, z);
     }
   }
 

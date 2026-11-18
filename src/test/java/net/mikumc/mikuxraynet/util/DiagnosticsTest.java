@@ -40,7 +40,7 @@ class DiagnosticsTest {
             0L, 0L, 0L, "无采样"),
         new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 1L, 40L, 6L, 11L, 2_200_000L, 900_000L, 1L, 2L,
             // 窗口覆盖 / 预筛丢弃：dump 与运行摘要都必须渲染（覆盖度是「看得见的矿排不进窗口」的唯一读数）
-            55L, 9_000L, 12L, 0L),
+            55L, 9_000L, 12L, 0L, 64L, 7L, 2L, 3L, 5L, 9L),
         // 8 参完整构造：末两项是「累计登记 / 卸载清理」，面板必须把它们与实时驻留量一起显示
         new Diagnostics.Snapshot.Index(7, 41, 12, 108L, 3L, 2L, 5L, 2L),
         new Diagnostics.Snapshot.Occlusion(true, 4096, 3, 200L, 190L, 2L, 1L, 9L, 55L, 4_200_000L, 88L, 4L,
@@ -216,7 +216,7 @@ class DiagnosticsTest {
     Diagnostics.Snapshot.Rewrite rewrite = new Diagnostics.Snapshot.Rewrite(
         90L, 10L, 42, 4096L, 30L, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
         0L, 0L, 0L, "无采样",
-        3L, 7L, 11L);
+        3L, 7L, 11L, 23L, 1L);
     Diagnostics.Snapshot withCounters = new Diagnostics.Snapshot(base.env(), rewrite,
         base.proximity(), base.index(), base.occlusion(), base.throttle(), base.pool(),
         base.diskCache(), base.chunkAccessor(), base.antiXray(), base.bandwidth());
@@ -226,6 +226,7 @@ class DiagnosticsTest {
         "写回未确认生效时必须回显「连旧索引一起作废」的次数（与写回失败同源、口径为其子集）：" + status);
     assertTrue(status.contains("遮挡建表：失败 7 次"),
         "遮挡建表失败必须可见（否则「矿挖不掉」无从归因）：" + status);
+    assertTrue(status.contains("定向补发 23 格，登记或补发未完成 1 次"), status);
     assertTrue(status.contains("，发布跳过 11 段"),
         "发布时跳过覆盖的段数必须可见（该值偏高说明建表窗口内方块变更频繁）：" + status);
 

@@ -2,10 +2,12 @@ package net.mikumc.mikuxraynet.antixray;
 
 import com.comphenix.protocol.AsynchronousManager;
 import com.comphenix.protocol.PacketType;
+import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.async.AsyncMarker;
 import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.events.PacketPostAdapter;
 import io.papermc.paper.math.Position;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -27,14 +29,16 @@ import net.mikumc.mikuxraynet.concurrency.RewriteTask;
 import net.mikumc.mikuxraynet.config.AntiXrayConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
+import net.mikumc.mikuxraynet.util.PlayerWorldIndex;
+import org.bukkit.Chunk;
 import org.bukkit.Bukkit;
-import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 
@@ -221,7 +225,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 若持包期间该区块被改过，就补发那几格的当前状态——否则客户端先收到的方块变更会被随后到达的
    * 「改写时刻的旧区块字节」盖回去（真机观感：边走边放方块时，刚放的那一格闪一下）。
    */
-  private final ChunkChangeJournal changeJournal = new ChunkChangeJournal();
+  private final ChunkChangeJournal changeJournal = new ChunkChangeJournal(stats.replaySkipped::increment);
   private final BatchTable batches;
   /**
    * 玩家退出清理批次闸门的 Bukkit 监听。
@@ -233,7 +237,15 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final Listener quitListener = new Listener() {
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
-      batches.remove(event.getPlayer().getUniqueId());
+      UUID playerId = event.getPlayer().getUniqueId();
+      batches.remove(playerId);
+      changeJournal.clear(playerId);
+    }
+
+    @EventHandler
+    public void onChangedWorld(PlayerChangedWorldEvent event) {
+      Player player = event.getPlayer();
+      changeJournal.clearOtherWorlds(player.getUniqueId(), player.getWorld().getName());
     }
   };
   /** 退出监听是否已注册（注册/注销必须配对）。 */
@@ -248,8 +260,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final ConcurrentHashMap<String, AtomicInteger> errorLogCounters = new ConcurrentHashMap<>();
   /** 「首次改写诊断」只打一次（CAS 抢占），避免每区块刷屏。 */
   private final AtomicBoolean firstRewriteDiagnosed = new AtomicBoolean();
-  /** 「在途变更溢出补发窗口」的一次性提示闸门（正常运营下永远不该触发）。 */
-  private final AtomicBoolean replayOverflowWarned = new AtomicBoolean();
+  private ProtocolManager deliveryManager;
+  private PacketAdapter deliveryObserver;
+  private static final int MAX_REPLAY_CELLS_PER_TICK = 256;
+  private static final int MAX_REPLAY_COLUMNS_PER_TICK = 8;
+  private static final int MAX_REPLAY_WAIT_TICKS = 4;
   /**
    * 停用中标记：{@link #unregisterBukkitHooks()} 首行置位（{@code ProtocolLibHook.unregister} 会在注销
    * 异步处理器之前先调它）。
@@ -296,6 +311,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 停用（{@link #unregisterBukkitHooks()}）会遍历本集合主动放行。
    */
   private final Set<RewriteTask> pendingCaptures = ConcurrentHashMap.newKeySet();
+  private final Set<ChunkBatchGate> pendingFinishes = ConcurrentHashMap.newKeySet();
 
   /**
    * @param liveConfig       实时配置源（读取「当前」配置，保证热重载后世界黑名单即时生效）；可为 null（回落 config）
@@ -398,6 +414,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       pending.releaseOnTimeout();
     }
     pendingCaptures.clear();
+    for (ChunkBatchGate gate : pendingFinishes) {
+      gate.forceRelease();
+    }
     if (quitHookRegistered) {
       quitHookRegistered = false;
       try {
@@ -407,6 +426,82 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       }
     }
     batches.clear();
+    changeJournal.clear();
+    if (deliveryObserver != null) {
+      try {
+        deliveryManager.removePacketListener(deliveryObserver);
+      } catch (Throwable throwable) {
+        logThrottled("区块写出观察监听注销失败", throwable);
+      } finally {
+        deliveryObserver = null;
+        deliveryManager = null;
+      }
+    }
+  }
+
+  /** 在异步改写排队前开窗，实际出站之后才关闭。原包的放行不依赖这个观察器。 */
+  public void registerDeliveryObserver(ProtocolManager manager) {
+    deliveryManager = manager;
+    deliveryObserver = new PacketAdapter(getPlugin(), ListenerPriority.MONITOR,
+        PacketType.Play.Server.MAP_CHUNK, PacketType.Play.Server.BLOCK_CHANGE, PacketType.Play.Server.MULTI_BLOCK_CHANGE) {
+      @Override
+      public void onPacketSending(PacketEvent event) {
+        Player player = event.getPlayer();
+        if (stopping || player == null || event.isCancelled()) {
+          return;
+        }
+        UUID playerId = player.getUniqueId();
+        String world = PlayerWorldIndex.worldName(playerId);
+        if (world == null || !worldAllowed(live(), world)
+            || (bypassRegistry != null && bypassRegistry.isBypassed(playerId))) {
+          return;
+        }
+        try {
+          if (event.getPacketType() != PacketType.Play.Server.MAP_CHUNK) {
+            if (chunkDeliveryHook == null) {
+              observeUpdatesWithoutRevealer(event, playerId, world);
+            }
+            return;
+          }
+          var coords = event.getPacket().getIntegers();
+          Integer x = coords.readSafely(0);
+          Integer z = coords.readSafely(1);
+          if (x == null || z == null) {
+            return;
+          }
+          ChunkChangeJournal.Ticket ticket = changeJournal.open(playerId, world, x, z);
+          event.getNetworkMarker().addPostListener(new PacketPostAdapter(getPlugin()) {
+            @Override
+            public void onPostEvent(PacketEvent sent) {
+              onChunkWritten(player, playerId, ticket);
+            }
+          });
+        } catch (Throwable throwable) {
+          stats.replaySkipped.increment();
+          logThrottled("区块在途更新观察登记失败（原包不受影响）", throwable);
+        }
+      }
+    };
+    manager.addPacketListener(deliveryObserver);
+  }
+
+  private void observeUpdatesWithoutRevealer(PacketEvent event, UUID playerId, String world) {
+    var packet = event.getPacket();
+    if (event.getPacketType() == PacketType.Play.Server.BLOCK_CHANGE) {
+      var position = packet.getBlockPositionModifier().readSafely(0);
+      if (position != null) {
+        changeJournal.record(playerId, world, position.getX(), position.getY(), position.getZ());
+      }
+      return;
+    }
+    var section = packet.getSectionPositions().readSafely(0);
+    short[] positions = packet.getShortArrays().readSafely(0);
+    if (section != null && positions != null && positions.length > 0
+        && changeJournal.isWatching(playerId, world, section.getX(), section.getZ())) {
+      int[] cells = new int[positions.length * 3];
+      SectionCoords.unpack(section.getX() << 4, section.getY() << 4, section.getZ() << 4, positions, cells);
+      changeJournal.recordSection(playerId, world, cells, positions.length);
+    }
   }
 
   /** 与 MAP_CHUNK 同列白名单，才能让批次包走同一条「每玩家有序发送队列」。 */
@@ -531,43 +626,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 这段（排队 + 区域线程 hop + 解码，常态 1~10 ms）内落库的方块补丁一并收编，随后建表发布时
       // 用「解码时刻的旧几何」把它们覆盖掉（该显示却多藏）。持包时刻取快照后只剩亚毫秒级窗口。
       // 未启用遮挡建表时返回 null（零开销），worker 侧会退化为自行取快照。
-      // 放行动作：先归还批次计数 → 再放行封包 → **最后**才作废「本接收者在该区块的已显形标记」。
-      //
-      // 为什么标记作废必须排在「放行封包」之后（旧实现放在 worker 的 writeBack 里，即放行之前）：
-      // 区块封包在异步管线里是被扣住的，真正写入由这里的 signalPacketTransmission 触发；而周期显形在
-      // 区域线程上独立跑。若在放行之前就清标记，那么「清完之后、封包真正写出之前」落下的一次显形会把
-      // 标记重新写上，而该显形包排在区块包之前 → 客户端按「区块未加载」丢弃它、标记却留着 → 该坐标直到
-      // 区块重发 / 标记过期都不会再显形（偶发、数分钟后自愈的假方块，与「写着告示牌的箱子不还原」一致）。
-      // 挪到放行之后再清：落在放行之前的显形标记会在这一步被作废，下一轮巡检立即补发。
-      UUID releasePlayerId = player.getUniqueId();
-      String releaseWorld = world.getName();
-      int releaseChunkX = accessor.chunkX();
-      int releaseChunkZ = accessor.chunkZ();
-      // 持包时刻的变更序号：放行时若已前进，说明这段时间该区块可能又被改过，需要补发（见 changeJournal）。
-      long capturedChanges = changeJournal.sequence();
-      // 放行动作本身（由 RewriteTask 在改写完成 / 超时 / 失败时触发一次）：
-      // 在途变更必须在「放行时」求值——建任务时序号刚取完，changedSince 此刻恒为空；只有等改写
-      // 完成（1~10ms 后）真正放行时再查，才能拿到持包期间被改过的格子。有变更时切到玩家线程连续
-      // 执行「放行 + 补发」（两包同一 tick 到达，客户端只渲染一次），无变更时在封包线程直接放行。
-      Runnable delivery = () -> {
-        ChunkChangeJournal.Replay replay = changeJournal.changedSinceReplay(capturedChanges,
-            releaseWorld, releaseChunkX, releaseChunkZ);
-        List<int[]> heldChanges = replay.cells();
-        // 环形日志已被后来的变更覆盖：逐格补发补不全，必须整块重发（见 refreshChunkAfterOverflow）。
-        boolean replayTruncated = replay.truncated();
-        Runnable releaseOnPacketThread = () -> completeRelease(player, event, gate, releaseWorld,
-            releaseChunkX, releaseChunkZ, releasePlayerId, heldChanges, false, replayTruncated);
-        if (heldChanges.isEmpty() && !replayTruncated) {
-          releaseOnPacketThread.run();
-          return;
-        }
-        Runnable releaseOnPlayerThread = () -> completeRelease(player, event, gate, releaseWorld,
-            releaseChunkX, releaseChunkZ, releasePlayerId, heldChanges, true, replayTruncated);
-        // 调度失败（实体退役 / 停用竞态）时退化为立即放行、不补发：绝不因为补发卡住区块包。
-        if (!Schedulers.onEntity(plugin, player, releaseOnPlayerThread)) {
-          releaseOnPacketThread.run();
-        }
-      };
+      // 原包放行不依赖玩家任务；更新只在出站回调后另行补发。
+      Runnable delivery = () -> completeRelease(event, gate);
       task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
           world.getName(), dimension, minHeight, sectionCount, timeoutMillis, delivery,
           processor.capturePatchStamps(world.getName(), accessor.chunkX(), accessor.chunkZ(),
@@ -685,6 +745,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
     // 先登记额外延迟，再注册放行动作：保证放行永远发生在延迟登记之后
     marker.incrementProcessingDelay();
+    pendingFinishes.add(gate);
     try {
       // 超时实时读「当前」配置（reload 立即生效），与区块路径一致。
       ScheduledFuture<?> timeout = workPool.scheduleTimeout(gate::forceRelease, live().timeoutMillis());
@@ -698,10 +759,15 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
           logThrottled("CHUNK_BATCH_FINISHED 放行失败（连接可能已销毁），不再重试", throwable);
         } finally {
           // 取消看门狗只是收尾：即便取消失败，兜底再触发也只会因闸门已置位而空转，不影响放行语义。
+          pendingFinishes.remove(gate);
           cancelQuietly(timeout);
         }
       });
+      if (stopping) {
+        gate.forceRelease();
+      }
     } catch (Throwable throwable) {
+      pendingFinishes.remove(gate);
       // 登记失败（例如插件正在停用）：立即归还这次延迟，绝不把批次结束包卡住
       logThrottled("批次闸门登记失败，已立即放行 CHUNK_BATCH_FINISHED", throwable);
       asynchronousManager.signalPacketTransmission(event);
@@ -711,66 +777,62 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** 工作线程：缓存命中 → 直接回填；未命中 → 解码/判定/重编码（邻块快照此时已就绪或按缺失策略处理）。 */
   private void handleAsync(RewriteTask task, ChunkPacketAccessor accessor,
       ScheduledFuture<?> timeout) {
-    if (!task.tryBeginWrite()) {
-      // 已被看门狗超时放行：原包已发出，绝不能再改写
-      timeout.cancel(false);
-      return;
-    }
-
-    // 放行必须落在 finally 里兜底：写入权一旦被本线程取得（gate=WRITING），看门狗与 close() 的兜底
-    // CAS(OPEN→DONE) 就再也抢不到——此时只有本线程能调 signalPacketTransmission。因此在取得写入权
-    // 之后，任何一步抛异常（live() 取配置、logThrottled、cancel）都不允许跳过放行，否则该区块封包
-    // 永久卡住（客户端卡在加载界面）。这与 MikuWorkPool 声明的「payload 必须自行保证恰好放行一次」一致。
+    byte[] source = null;
+    ObfuscationProcessor.Result diagnostic = null;
     try {
-      rewriteOnWorker(task, accessor);
+      if (!canPrepareRewrite(task)) {
+        return;
+      }
+      source = accessor.buffer();
+      RewritePipeline.Outcome outcome = pipeline.rewrite(new RewritePipeline.Request(
+          task.worldName(), task.chunkX(), task.chunkZ(), task.minHeight(), task.sectionCount(),
+          task.dimension(), source, hash(source), task.occlusionStamps()));
+      if (outcome.diskRejected()) {
+        stats.diskPayloadRejected.increment();
+      }
+      if (outcome.contentRejected() > 0) {
+        stats.cacheContentRejected.add(outcome.contentRejected());
+      }
+      if (!canPrepareRewrite(task)) {
+        return;
+      }
+      if (outcome.hit()) {
+        processor.restoreOcclusion(outcome.cached().occlusion(), task.worldName(), task.chunkX(),
+            task.minHeight() >> 4, task.chunkZ());
+      }
+      AntiXrayConfig current = live();
+      if (!worldAllowed(current, task.worldName()) || !canPrepareRewrite(task)
+          || !task.tryBeginWrite()) {
+        return;
+      }
+      // 只有已经准备完毕的回写才能与看门狗争用提交权。此前的磁盘读取、解码和重编码都可超时。
+      if (outcome.hit()) {
+        writeBack(accessor, task, outcome.cached().data(), outcome.cached().positions(), current);
+      } else {
+        finishRewrite(task, accessor, source, outcome.result(), current);
+        diagnostic = outcome.result();
+      }
+    } catch (Throwable throwable) {
+      logThrottled("区块改写失败，已放行", throwable);
     } finally {
       cancelQuietly(timeout);
       task.signalOnce();
     }
-  }
-
-  /**
-   * 工作线程的改写主体：缓存命中 → 直接回填；未命中 → 解码/判定/重编码
-   * （邻块快照此时已就绪，或按缺失策略处理）。
-   *
-   * <p>异常一律 fail-open（记日志后按原包放行）；<b>放行由调用方在 {@code finally} 中完成</b>，
-   * 本方法不自行放行，也不允许把异常抛给调用方之外的任何路径。
-   */
-  private void rewriteOnWorker(RewriteTask task, ChunkPacketAccessor accessor) {
-    // 实时读「当前」配置并固定在本轮改写内使用：remove-block-entities 必须随 reload 生效
-    // （本监听器不随热重载重建），且同一轮里缓存键与写回必须用同一份取值。
-    AntiXrayConfig current = live();
-
-    try {
-      if (!task.expired()) {
-        byte[] source = accessor.buffer();
-        long sourceHash = hash(source);
-        // 缓存查询 / 磁盘回填 / 改写 / 回填缓存全部交给 RewritePipeline（纯编排，可离线测）；
-        // 本方法只负责「取源字节 → 计数 → 写回」。
-        RewritePipeline.Outcome outcome = pipeline.rewrite(new RewritePipeline.Request(
-            task.worldName(), task.chunkX(), task.chunkZ(), task.minHeight(), task.sectionCount(),
-            task.dimension(), source, sourceHash, task.occlusionStamps()));
-        if (outcome.diskRejected()) {
-          stats.diskPayloadRejected.increment();
-        }
-        if (outcome.contentRejected() > 0) {
-          // 键命中但内容已变 / 缺遮挡位图：命中率不能算作有效命中，必须单列
-          stats.cacheContentRejected.add(outcome.contentRejected());
-        }
-        if (outcome.hit()) {
-          // 命中路径不解码，遮挡位图只能来自随负载一起缓存的副本（方案 b）：
-          // 未启用该功能时 occlusion 为 null、restoreOcclusion 为 no-op，零开销。
-          processor.restoreOcclusion(outcome.cached().occlusion(), task.worldName(), task.chunkX(),
-              task.minHeight() >> 4, task.chunkZ());
-          writeBack(accessor, task, outcome.cached().data(), outcome.cached().positions(), current);
-        } else {
-          finishRewrite(task, accessor, source, outcome.result(), current);
-        }
-      }
-    } catch (Throwable throwable) {
-      logThrottled("区块改写失败，已按原包放行", throwable);
+    if (diagnostic != null && !diagnostic.failed()) {
+      logFirstRewriteDiagnostic(task, source, diagnostic);
     }
   }
+
+  private boolean canPrepareRewrite(RewriteTask task) {
+    if (task.expired()) {
+      if (task.releaseOnTimeout()) {
+        stats.chunksTimedOut.increment();
+      }
+      return false;
+    }
+    return !stopping && task.isOpen();
+  }
+
 
   /** 取消看门狗；失败不得阻断放行（看门狗稍后空跑一次，releaseOnTimeout 的 CAS 必然失败）。 */
   private static void cancelQuietly(ScheduledFuture<?> timeout) {
@@ -822,7 +884,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       stats.chunksSkipped.increment();
     }
 
-    logFirstRewriteDiagnostic(task, source, result);
 
     // 缓存回填（内存 + 磁盘）已由 RewritePipeline 在返回前完成；此处只负责写回与索引维护。
     // 失败结果：data == source 且伪装位置为空 → writeBack 直接返回，原包照常下发（fail-open 语义不变）。
@@ -880,7 +941,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    */
   private void logFirstRewriteDiagnostic(RewriteTask task, byte[] source,
       ObfuscationProcessor.Result result) {
-    if (!firstRewriteDiagnosed.compareAndSet(false, true)) {
+    if (!getPlugin().getLogger().isLoggable(Level.FINE)
+        || !firstRewriteDiagnosed.compareAndSet(false, true)) {
       return;
     }
     try {
@@ -1033,121 +1095,135 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 抢跑，显形包排在区块包之前被客户端丢弃、标记却留下，该坐标直到区块重发才再显形。
   }
 
-  /**
-   * 区块包放行的统一收尾：归还批次计数 → 放行封包 →（玩家线程时）补发在途变更 → 作废标记 → 区块下发即显形。
-   *
-   * @param canReadWorld 当前线程是否能安全读世界（玩家线程才为 true）。补发要读当前方块状态，
-   *                     因此只在玩家线程执行；封包线程上的退化路径只做放行与清理，绝不跨线程读世界。
-   */
-  private void completeRelease(Player player, PacketEvent event, ChunkBatchGate gate,
-      String worldName, int chunkX, int chunkZ, UUID playerId, List<int[]> heldChanges,
-      boolean canReadWorld, boolean replayTruncated) {
-    // 顺序不能反：先放行区块包，再归还批次计数。归还计数可能立刻把 CHUNK_BATCH_FINISHED 放出去，
-    // 若它排在最后一个区块包之前，客户端会先结束批次、再收到区块——批次速率估计随之后续统计全部错位。
-    asynchronousManager.signalPacketTransmission(event);
-    if (gate != null) {
-      gate.chunkDone();
-    }
-    if (canReadWorld && !heldChanges.isEmpty()) {
-      resendCellsDirectly(player, worldName, chunkX, chunkZ, heldChanges);
-    }
-    if (canReadWorld && replayTruncated) {
-      // 逐格补发已补不全：剩下的格没有任何第二条路径会来纠正（附着方块会一直卡到区块重发），
-      // 只能整块重发一次——它会重新走改写链路，客户端拿到的是当前世界的正确内容。
-      refreshChunkAfterOverflow(player, worldName, chunkX, chunkZ);
-    }
-    clearRevealedOnDelivery(worldName, chunkX, chunkZ, playerId);
-    // 区块包已写出：紧接着把「该区块中玩家当前可见」的坐标显形（区块下发即显形）。
-    // 必须排在放行之后：客户端会按顺序应用，显形包跟着区块包落到同一次收包批次里。
+  /** 改写完成、超时、停用均可归还发包延迟，不等实体或区域任务。 */
+  private void completeRelease(PacketEvent event, ChunkBatchGate gate) {
     try {
-      ChunkDeliveryHook hook = chunkDeliveryHook;
-      if (hook != null) {
-        hook.onChunkDelivered(player, worldName, chunkX, chunkZ);
+      asynchronousManager.signalPacketTransmission(event);
+    } finally {
+      if (gate != null) {
+        gate.chunkDone();
       }
-    } catch (Throwable throwable) {
-      // 本回调只是优化项：失败只影响「更早显形」，周期巡检仍会兜底，绝不影响封包放行
-      logThrottled("区块下发后立即显形调度失败（已忽略，周期巡检仍会兜底）", throwable);
     }
   }
 
-  /**
-   * 在玩家线程上把「持包期间被改过」的格子按当前状态补发一次（{@link #completeRelease} 调用）。
-   *
-   * <p>必须紧跟 {@code signalPacketTransmission} 执行：客户端按连接上的写入顺序处理，
-   * 先应用区块字节、再应用这几格，同一 tick 内完成，不会渲染出中间的旧状态。
-   */
-  private void resendCellsDirectly(Player player, String worldName, int chunkX, int chunkZ,
-      List<int[]> cells) {
-    World world = player.getWorld();
-    if (world == null || !worldName.equals(world.getName()) || !world.isChunkLoaded(chunkX, chunkZ)) {
+  private void onChunkWritten(Player player, UUID playerId, ChunkChangeJournal.Ticket ticket) {
+    ChunkChangeJournal.Column column = ticket.column;
+    if (stopping || !column.world().equals(PlayerWorldIndex.worldName(playerId))) {
+      changeJournal.finish(ticket, false);
       return;
     }
-    // 按 section 分组：一次爆炸 / 大范围施工改掉的上百格通常在同一段里，逐格一个 BLOCK_CHANGE 会把
-    // 玩家线程与连接队列压满（补发上限已提到 4096）。同段多格走一次 MULTI_BLOCK_CHANGE，跨段各自成包。
-    Map<Integer, List<int[]>> bySection = new LinkedHashMap<>();
-    for (int[] cell : cells) {
-      bySection.computeIfAbsent(cell[1] >> 4, ignored -> new ArrayList<>(4)).add(cell);
+    ChunkChangeJournal.Written written = changeJournal.written(playerId, ticket);
+    if (!written.current()) {
+      return; // 更新的区块快照接手了该列。
     }
-    for (List<int[]> group : bySection.values()) {
-      if (group.size() > 1 && sendSectionCells(player, world, group)) {
-        continue;
-      }
-      for (int[] cell : group) {
-        try {
-          player.sendBlockChange(new Location(world, cell[0], cell[1], cell[2]),
-              world.getBlockData(cell[0], cell[1], cell[2]));
-        } catch (Throwable throwable) {
-          logThrottled("区块放行时补发在途方块变更失败（已忽略，下一次显形或区块重发会纠正）", throwable);
-          return;
-        }
-      }
+    clearRevealedOnDelivery(column.world(), column.x(), column.z(), playerId);
+    if (written.truncated()) {
+      stats.replaySkipped.increment();
+    }
+    if (!written.dirty()) {
+      notifyChunkWritten(player, column);
+    } else if (written.schedule()) {
+      scheduleReplay(player, playerId, ticket.receiver);
     }
   }
 
-  /**
-   * 同段多格补发走一次 {@code sendMultiBlockChange}；构建失败或平台拒绝时返回 false，调用方退化逐格。
-   *
-   * <p>这些坐标全在同一区块内（{@code chunkX/chunkZ} 已确定），按 sectionY 分组后每组的 section 必然一致；
-   * Paper 的该 API 一个包只承载一个段，跨段调用会被整包拒绝。
-   */
-  private boolean sendSectionCells(Player player, World world, List<int[]> group) {
-    Map<Position, BlockData> payload = new LinkedHashMap<>(group.size() * 2);
+  private void notifyChunkWritten(Player player, ChunkChangeJournal.Column column) {
     try {
-      for (int[] cell : group) {
-        payload.put(Position.block(cell[0], cell[1], cell[2]),
-            world.getBlockData(cell[0], cell[1], cell[2]));
+      ChunkDeliveryHook hook = chunkDeliveryHook;
+      if (!stopping && hook != null) {
+        hook.onChunkDelivered(player, column.world(), column.x(), column.z());
       }
-      player.sendMultiBlockChange(payload);
-      return true;
     } catch (Throwable throwable) {
-      return false; // 退化为逐格 sendBlockChange（同一条原生通道）
+      logThrottled("区块写出后显形调度失败（周期巡检仍会兜底）", throwable);
     }
   }
 
-  /**
-   * 在途变更超出补发窗口时的兜底：对<b>该接收者所在世界</b>整块重发一次。
-   *
-   * <p>为什么必须整块：逐格补发只能覆盖环形日志里还在的那一部分，而客户端手里已经被改写时刻的旧区块
-   * 字节覆盖；剩下那些格（典型是爆炸后整段消失的附着方块——幽匿脉络 / 发光地衣）没有任何第二条路径
-   * 会来纠正，会一直卡到区块重发。整块重发会重新走一次改写链路，客户端拿到的就是当前世界的正确内容。
-   *
-   * <p>只在环形溢出这种极端突发下执行，且一次性 WARN 留痕（正常运营下永远不该出现）。
-   */
-  private void refreshChunkAfterOverflow(Player player, String worldName, int chunkX, int chunkZ) {
+  private void scheduleReplay(Player player, UUID playerId, ChunkChangeJournal.Receiver receiver) {
+    Runnable abandon = () -> {
+      changeJournal.abandonDrain(receiver);
+      stats.replaySkipped.increment();
+    };
     try {
-      World world = player.getWorld();
-      if (world == null || !worldName.equals(world.getName()) || !world.isChunkLoaded(chunkX, chunkZ)) {
+      if (!stopping && player.getScheduler().run(getPlugin(),
+          task -> drainReplay(player, playerId, receiver), abandon) != null) {
         return;
       }
-      world.refreshChunk(chunkX, chunkZ);
-      if (replayOverflowWarned.compareAndSet(false, true)) {
-        getPlugin().getLogger().warning("区块在途变更超出补发窗口（环形日志已被覆盖），已对该区块整块重发一次；"
-            + "本条只提示一次，反复出现说明突发变更量超出单区块窗口容量");
+    } catch (RuntimeException ex) {
+      logThrottled("区块写出后补发调度失败（原包已放行）", ex);
+    }
+    abandon.run();
+  }
+
+  private void drainReplay(Player player, UUID playerId, ChunkChangeJournal.Receiver receiver) {
+    try {
+      if (stopping || !player.isOnline()) {
+        changeJournal.abandonDrain(receiver);
+        return;
       }
-    } catch (Throwable throwable) {
-      logThrottled("在途变更溢出后整块重发失败（已忽略，下一次区块重发会纠正）", throwable);
+      World world = player.getWorld();
+      int budget = MAX_REPLAY_CELLS_PER_TICK;
+      int[] cells = new int[budget * 3];
+      // 顺延项放到本轮最后才入队，防止同一列在一个 tick 内耗尽所有重试。
+      List<ChunkChangeJournal.Ticket> deferred = new ArrayList<>(MAX_REPLAY_COLUMNS_PER_TICK);
+      for (int i = 0; i < MAX_REPLAY_COLUMNS_PER_TICK && budget > 0; i++) {
+        ChunkChangeJournal.Ticket ticket = changeJournal.poll(receiver);
+        if (ticket == null) {
+          break;
+        }
+        ChunkChangeJournal.Column column = ticket.column;
+        if (!world.getName().equals(column.world()) || !changeJournal.isCurrent(playerId, ticket)) {
+          changeJournal.finish(ticket, false);
+          continue;
+        }
+        try {
+          if (!Bukkit.isOwnedByCurrentRegion(world, column.x(), column.z())
+              || !world.isChunkLoaded(column.x(), column.z())
+              || !player.isChunkSent(Chunk.getChunkKey(column.x(), column.z()))) {
+            if (++ticket.retries < MAX_REPLAY_WAIT_TICKS) {
+              deferred.add(ticket);
+              continue;
+            }
+            stats.replaySkipped.increment();
+          } else {
+            ticket.retries = 0;
+            int count = changeJournal.take(ticket, budget, cells);
+            budget -= count;
+            if (count > 0) {
+              Map<Position, BlockData> changes = new LinkedHashMap<>();
+              for (int c = 0; c < count * 3; c += 3) {
+                changes.put(Position.block(cells[c], cells[c + 1], cells[c + 2]),
+                    world.getBlockData(cells[c], cells[c + 1], cells[c + 2]));
+              }
+              if (changeJournal.isCurrent(playerId, ticket)) {
+                // Paper API 自行按区块段分组；只发给该区块包的接收者。
+                player.sendMultiBlockChange(changes);
+                changeJournal.acknowledge(ticket, cells, count);
+                stats.replayCells.add(count);
+              }
+              deferred.add(ticket);
+              continue;
+            }
+          }
+        } catch (RuntimeException ex) {
+          stats.replaySkipped.increment();
+          logThrottled("区块写出后方块补发失败（原包不受影响）", ex);
+        }
+        if (changeJournal.finish(ticket, false)) {
+          notifyChunkWritten(player, column);
+        }
+      }
+      for (ChunkChangeJournal.Ticket ticket : deferred) {
+        if (changeJournal.finish(ticket, true)) {
+          notifyChunkWritten(player, ticket.column);
+        }
+      }
+    } finally {
+      if (changeJournal.continueDrain(receiver)) {
+        scheduleReplay(player, playerId, receiver);
+      }
     }
   }
+
 
   /**
    * 区块封包<b>真正放行之后</b>，作废「该接收者在这个区块」的已显形标记。

@@ -1,127 +1,323 @@
 package net.mikumc.mikuxraynet.antixray;
 
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.BitSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
-/**
- * 最近方块变更的环形日志：用于「区块包在途期间该区块被改过」时的**放行后补发**。
- *
- * <p><b>为什么需要它</b>：反矿透的区块包是在异步管线上被扣住改写的（重编码 + 可能等待邻块，常态 1~10 ms，
- * 超时上限 2.5 秒）。这段时间里服务端若又对该区块下发了方块变更（最典型：玩家边走边铺路、边放边挖，
- * 或别人在同一区块施工、爆炸），客户端会先收到那条**新的方块变更**，随后才收到**改写时刻生成的旧区块字节**
- * ——后者把刚放/刚挖的那一格盖回旧状态，观感就是「方块闪一下」，直到下一次区块下发才自愈。
- *
- * <p><b>容量必须覆盖「一次批量施工」</b>：爆炸 / 大范围施工会把同一段的几十上百格在同一个 tick 里改掉，
- * 服务端按 section 打包成一条 {@code MULTI_BLOCK_CHANGE}（最多 4096 格）。补发上限若小于这个量级，
- * 超出部分既不补发、也没有别的路径会来纠正：客户端永久保留旧区块字节，真机表现是整段幽匿脉络等
- * <b>附着方块卡在空中</b>（右键被服务端纠正后才消失）。因此容量与单次补发上限都按「一整段」定，
- * 且环形溢出会被显式标记（{@link Replay#truncated()}），由调用方改用整块重发的兜底。
- *
- * <p><b>做法</b>：每条出站方块变更按顺序记一条（世界 + 区块 + 方块坐标），环形容量固定；区块包放行后，
- * 若全局序号比「持包时刻」前进了，就把该区块在这段时间里被改过的坐标取出来（去重、上限 {@link #MAX_REPLAY}），
- * 在玩家所属线程上补发一次当前状态。补发的是**当前**方块状态（与显形包同源），不会把伪装后的状态写回客户端：
- * 被改过的坐标在 {@code BlockChangeRevealListener} 里已从伪装索引注销。
- *
- * <p><b>线程</b>：{@link #record} 在封包 / 网络线程调用（<b>必须同步</b>：投递到后台线程会与区块放行竞速，
- * 晚一步落库就等于该格永不补发），{@link #changedSince} 在放行线程调用，两者都只做无锁的原子数组读写；
- * 绝不触碰 Bukkit。
- */
+/** 每个接收者的在途区块变更。只保留坐标；状态在区块写出后由拥有区块的线程读取。 */
 public final class ChunkChangeJournal {
 
-  /**
-   * 环形容量（必须是 2 的幂）。8192 条 ≈ 0.5 MB，足以覆盖「一个 tick 内一整段被改完（4096 格）」
-   * 这种最坏批量施工，也不会被随后几百毫秒的零散变更挤掉。
-   */
-  private static final int CAPACITY = 8192;
-  private static final int MASK = CAPACITY - 1;
-  /**
-   * 单次放行最多补发多少格：取一个 section 的上限（4096），不设更小的任意值——超出部分没有第二条
-   * 补救路径（见类注释）。真正的上界仍由环形容量兜底。
-   */
-  public static final int MAX_REPLAY = 4096;
+  private static final int MAX_COLUMNS = 256;
+  private static final int MAX_SECTIONS = 256;
+  private static final int MAX_DIRTY_SECTIONS_PER_RECEIVER = 1024;
+  private static final long EXPIRY_NANOS = TimeUnit.SECONDS.toNanos(35);
 
-  private final AtomicLong sequence = new AtomicLong();
-  private final AtomicReferenceArray<Entry> ring = new AtomicReferenceArray<>(CAPACITY);
-
-  /** 一条方块变更记录（不可变）。 */
-  private record Entry(long seq, String world, int chunkX, int chunkZ, int x, int y, int z) {
+  record Column(String world, int x, int z) {
   }
 
-  /**
-   * 一次「放行后补发」的查询结果。
-   *
-   * @param cells     需要补发的坐标（{@code {x, y, z}}，已去重、按新到旧）
-   * @param truncated 窗口内是否还有没能取到的变更（环形已被后来的变更覆盖，或触到 {@link #MAX_REPLAY}）。
-   *                  为 true 时调用方必须改用<b>整块重发</b>兜底：逐格补发已经补不全，而客户端手里
-   *                  还是旧区块字节。
-   */
-  public record Replay(List<int[]> cells, boolean truncated) {
+  static final class Receiver {
+    private final LinkedHashMap<Column, Ticket> columns = new LinkedHashMap<>();
+    private final LinkedHashSet<Ticket> ready = new LinkedHashSet<>();
+    private boolean draining;
+    private int dirtySections;
   }
 
-  /** 当前序号（持包时取一次，放行时再比一次；相等即这段时间没有任何方块变更）。 */
-  public long sequence() {
-    return sequence.get();
+  static final class Ticket {
+    final Receiver receiver;
+    final Column column;
+    private final long started = System.nanoTime();
+    private TreeMap<Integer, BitSet> dirty;
+    private boolean written;
+    private boolean truncated;
+    int retries;
+
+    private Ticket(Receiver receiver, Column column) {
+      this.receiver = receiver;
+      this.column = column;
+    }
   }
 
-  /** 记录一条方块变更（绝对坐标）。{@code world} 为 {@code null} 时忽略。 */
-  public void record(String world, int x, int y, int z) {
-    if (world == null) {
+  record Written(boolean current, boolean dirty, boolean schedule, boolean truncated) {
+    private static final Written STALE = new Written(false, false, false, false);
+  }
+
+  private final ConcurrentHashMap<UUID, Receiver> recipients = new ConcurrentHashMap<>();
+  private final int maxDirtySections;
+  private final Runnable onEvicted;
+
+  public ChunkChangeJournal() {
+    this(MAX_DIRTY_SECTIONS_PER_RECEIVER, () -> { });
+  }
+
+  ChunkChangeJournal(Runnable onEvicted) {
+    this(MAX_DIRTY_SECTIONS_PER_RECEIVER, onEvicted);
+  }
+
+  ChunkChangeJournal(int maxDirtySections, Runnable onEvicted) {
+    this.maxDirtySections = maxDirtySections;
+    this.onEvicted = onEvicted;
+  }
+
+  Ticket open(UUID player, String world, int x, int z) {
+    Receiver receiver = recipients.computeIfAbsent(player, ignored -> new Receiver());
+    Column column = new Column(world, x, z);
+    Ticket next = new Ticket(receiver, column);
+    synchronized (receiver) {
+      Ticket previous = receiver.columns.remove(column);
+      if (previous != null) {
+        receiver.ready.remove(previous);
+        // 尚未修复的格子也要跟随后一个区块快照；旧回调不再有权补发。
+        next.dirty = previous.dirty;
+        next.truncated = previous.truncated;
+        previous.dirty = null;
+      }
+      while (!receiver.columns.isEmpty()) {
+        Ticket head = receiver.columns.firstEntry().getValue();
+        if (receiver.columns.size() < MAX_COLUMNS && next.started - head.started < EXPIRY_NANOS) {
+          break;
+        }
+        if (hasDirty(head) || head.truncated) {
+          onEvicted.run();
+        }
+        remove(head);
+      }
+      receiver.columns.put(column, next);
+    }
+    return next;
+  }
+
+  boolean isWatching(UUID player, String world, int x, int z) {
+    Receiver receiver = recipients.get(player);
+    if (receiver == null) {
+      return false;
+    }
+    synchronized (receiver) {
+      if (receiver.columns.isEmpty()) {
+        return false;
+      }
+      Ticket ticket = receiver.columns.get(new Column(world, x, z));
+      return ticket != null && !ticket.written;
+    }
+  }
+
+  void record(UUID player, String world, int x, int y, int z) {
+    Receiver receiver = recipients.get(player);
+    if (receiver != null) {
+      synchronized (receiver) {
+        if (!receiver.columns.isEmpty()) {
+          set(receiver.columns.get(new Column(world, x >> 4, z >> 4)), x, y, z);
+        }
+      }
+    }
+  }
+
+  /** 多格更新总在同一个区块段内，只取一次锁。 */
+  void recordSection(UUID player, String world, int[] coordinates, int count) {
+    Receiver receiver = recipients.get(player);
+    if (receiver != null && count > 0) {
+      synchronized (receiver) {
+        if (receiver.columns.isEmpty()) {
+          return;
+        }
+        Ticket ticket = receiver.columns.get(new Column(world, coordinates[0] >> 4, coordinates[2] >> 4));
+        if (ticket == null || ticket.written) {
+          return;
+        }
+        for (int i = 0; i < count; i++) {
+          set(ticket, coordinates[i * 3], coordinates[i * 3 + 1], coordinates[i * 3 + 2]);
+        }
+      }
+    }
+  }
+
+  private void set(Ticket ticket, int x, int y, int z) {
+    if (ticket == null || ticket.written) {
       return;
     }
-    long seq = sequence.incrementAndGet();
-    ring.set((int) (seq & MASK), new Entry(seq, world, x >> 4, z >> 4, x, y, z));
-  }
-
-  /**
-   * 取出「序号大于 {@code sinceSeq}、且属于该区块」的方块坐标（去重、按新到旧、最多 {@link #MAX_REPLAY} 个）。
-   *
-   * @return 每个元素是 {@code {x, y, z}}；没有则返回空列表
-   */
-  public List<int[]> changedSince(long sinceSeq, String world, int chunkX, int chunkZ) {
-    return changedSinceReplay(sinceSeq, world, chunkX, chunkZ).cells();
-  }
-
-  /**
-   * 同 {@link #changedSince}，但额外报告「是否补不全」（见 {@link Replay#truncated()}）。
-   *
-   * <p>补不全有两条来源：① 序号跨度超过环形容量，窗口内最早的一段已被覆盖；② 命中去重后的坐标数触到
-   * {@link #MAX_REPLAY}。两者都不能靠逐格补发解决，必须由调用方整块重发。
-   */
-  public Replay changedSinceReplay(long sinceSeq, String world, int chunkX, int chunkZ) {
-    long newest = sequence.get();
-    if (world == null || newest <= sinceSeq) {
-      return new Replay(List.of(), false);
+    int section = y >> 4;
+    BitSet cells = ticket.dirty == null ? null : ticket.dirty.get(section);
+    if (cells == null) {
+      if (ticket.receiver.dirtySections >= maxDirtySections
+          || (ticket.dirty != null && ticket.dirty.size() >= MAX_SECTIONS)) {
+        ticket.truncated = true;
+        return;
+      }
+      if (ticket.dirty == null) {
+        ticket.dirty = new TreeMap<>();
+      }
+      cells = new BitSet(4096);
+      ticket.dirty.put(section, cells);
+      ticket.receiver.dirtySections++;
     }
-    boolean truncated = newest - sinceSeq > CAPACITY;
-    List<int[]> cells = new ArrayList<>(4);
-    Set<Long> seen = new HashSet<>(8);
-    int slots = (int) Math.min(CAPACITY, newest - sinceSeq);
-    for (int i = 0; i < slots; i++) {
-      Entry entry = ring.get((int) ((newest - i) & MASK));
-      if (entry == null || entry.seq() <= sinceSeq) {
-        continue;
-      }
-      if (!world.equals(entry.world()) || entry.chunkX() != chunkX || entry.chunkZ() != chunkZ) {
-        continue;
-      }
-      if (!seen.add(pack(entry.x(), entry.y(), entry.z()))) {
-        continue;
-      }
-      if (cells.size() >= MAX_REPLAY) {
-        truncated = true;
-        break;
-      }
-      cells.add(new int[] {entry.x(), entry.y(), entry.z()});
-    }
-    return new Replay(cells, truncated);
+    cells.set(((y & 15) << 8) | ((z & 15) << 4) | (x & 15));
   }
 
-  /** 坐标打包（仅用于本次查询内去重）。 */
-  private static long pack(int x, int y, int z) {
-    return ((long) (x & 0x3FFFFFF) << 38) | ((long) (y & 0xFFF) << 26) | (z & 0x3FFFFFF);
+  /** 只有出站写回调才能封存快照；改写任务声明 ready 并不是这个时点。 */
+  Written written(UUID player, Ticket ticket) {
+    Receiver receiver = ticket.receiver;
+    synchronized (receiver) {
+      if (recipients.get(player) != receiver || !current(ticket) || ticket.written) {
+        return Written.STALE;
+      }
+      ticket.written = true;
+      if (!hasDirty(ticket)) {
+        remove(ticket);
+        return new Written(true, false, false, ticket.truncated);
+      }
+      receiver.ready.add(ticket);
+      if (receiver.draining) {
+        return new Written(true, true, false, ticket.truncated);
+      }
+      receiver.draining = true;
+      return new Written(true, true, true, ticket.truncated);
+    }
+  }
+
+  boolean isCurrent(UUID player, Ticket ticket) {
+    Receiver receiver = ticket.receiver;
+    synchronized (receiver) {
+      return recipients.get(player) == receiver && current(ticket);
+    }
+  }
+
+  Ticket poll(Receiver receiver) {
+    synchronized (receiver) {
+      return receiver.ready.pollFirst();
+    }
+  }
+
+  /** 读出下一批坐标，保留余下的位，避免大批变化在同一个 tick 集中读世界。 */
+  int take(Ticket ticket, int max, int[] out) {
+    synchronized (ticket.receiver) {
+      if (!current(ticket) || !ticket.written || !hasDirty(ticket)) {
+        return 0;
+      }
+      int count = 0;
+      for (var section : ticket.dirty.entrySet()) {
+        if (count >= max) {
+          break;
+        }
+        BitSet cells = section.getValue();
+        for (int bit = cells.nextSetBit(0); bit >= 0 && count < max; bit = cells.nextSetBit(bit + 1)) {
+          out[count * 3] = (ticket.column.x() << 4) | (bit & 15);
+          out[count * 3 + 1] = (section.getKey() << 4) | ((bit >>> 8) & 15);
+          out[count * 3 + 2] = (ticket.column.z() << 4) | ((bit >>> 4) & 15);
+          count++;
+        }
+      }
+      return count;
+    }
+  }
+
+  /** 只有补发提交成功后才移除坐标，让取样之后到达的新区块能完整接手。 */
+  void acknowledge(Ticket ticket, int[] cells, int count) {
+    synchronized (ticket.receiver) {
+      if (!current(ticket) || ticket.dirty == null) {
+        return;
+      }
+      for (int i = 0; i < count * 3; i += 3) {
+        int section = cells[i + 1] >> 4;
+        BitSet bits = ticket.dirty.get(section);
+        if (bits != null) {
+          bits.clear(((cells[i + 1] & 15) << 8) | ((cells[i + 2] & 15) << 4) | (cells[i] & 15));
+          if (bits.isEmpty()) {
+            ticket.dirty.remove(section);
+            ticket.receiver.dirtySections--;
+          }
+        }
+      }
+    }
+  }
+
+  /** 把有余量的区块放回队尾；完成或明确失效时收账。 */
+  boolean finish(Ticket ticket, boolean retry) {
+    synchronized (ticket.receiver) {
+      if (!current(ticket)) {
+        return false;
+      }
+      if (retry && hasDirty(ticket)) {
+        ticket.receiver.ready.add(ticket);
+        return false;
+      }
+      remove(ticket);
+      return true;
+    }
+  }
+
+  boolean continueDrain(Receiver receiver) {
+    synchronized (receiver) {
+      if (!receiver.ready.isEmpty()) {
+        return true;
+      }
+      receiver.draining = false;
+      return false;
+    }
+  }
+
+  void abandonDrain(Receiver receiver) {
+    synchronized (receiver) {
+      for (Ticket ticket; (ticket = receiver.ready.pollFirst()) != null; ) {
+        remove(ticket);
+      }
+      receiver.draining = false;
+    }
+  }
+
+  void clearOtherWorlds(UUID player, String world) {
+    Receiver receiver = recipients.get(player);
+    if (receiver != null) {
+      synchronized (receiver) {
+        receiver.columns.values().removeIf(ticket -> {
+          if (ticket.column.world().equals(world)) {
+            return false;
+          }
+          releaseDirty(ticket);
+          return true;
+        });
+        receiver.ready.removeIf(ticket -> !ticket.column.world().equals(world));
+      }
+    }
+  }
+
+  void clear(UUID player) {
+    Receiver receiver = recipients.remove(player);
+    if (receiver != null) {
+      synchronized (receiver) {
+        receiver.columns.values().forEach(ChunkChangeJournal::releaseDirty);
+        receiver.columns.clear();
+        receiver.ready.clear();
+      }
+    }
+  }
+
+  void clear() {
+    for (UUID player : recipients.keySet()) {
+      clear(player);
+    }
+  }
+
+  private static boolean current(Ticket ticket) {
+    return ticket.receiver.columns.get(ticket.column) == ticket;
+  }
+
+  private static boolean hasDirty(Ticket ticket) {
+    return ticket.dirty != null && !ticket.dirty.isEmpty();
+  }
+
+  private static void remove(Ticket ticket) {
+    ticket.receiver.columns.remove(ticket.column, ticket);
+    ticket.receiver.ready.remove(ticket);
+    releaseDirty(ticket);
+  }
+
+  private static void releaseDirty(Ticket ticket) {
+    if (ticket.dirty != null) {
+      ticket.receiver.dirtySections -= ticket.dirty.size();
+      ticket.dirty = null;
+    }
   }
 }

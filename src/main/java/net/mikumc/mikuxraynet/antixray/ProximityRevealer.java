@@ -1,6 +1,7 @@
 package net.mikumc.mikuxraynet.antixray;
 
 import io.papermc.paper.math.Position;
+import io.papermc.paper.threadedregions.scheduler.EntityScheduler;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -25,10 +26,12 @@ import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.FluidCollisionMode;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Player;
+import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockDamageEvent;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -106,10 +109,7 @@ import org.bukkit.util.Vector;
  * 周期末按 16³ 区块段分组、逐段 {@code sendMultiBlockChange} 发出（该 API 的一个包只承载一个段，
  * 跨段调用会被整包拒绝），某段失败时该段退化为逐坐标 {@code sendBlockChange}；
  * 关闭时逐坐标发单方块变更包（旧行为，供 A/B 与回退）。
- * <p><b>破坏邻域强制显形</b>（{@code proximity.instant-reveal.break-sweep}，默认开）：方块被挖掉 /
- * 炸掉 / 烧掉时，把破坏点半径内的伪装坐标整片过一遍（见 {@link #revealSweep}）——它不受候选窗口、
- * 分片轮转、同段安静窗口与「是否被这一格挡住」的张角判定限制，只保留遮挡位图射线这一道可见性硬门。
- * 目的是让「挖开一块之后身边立刻都是真方块」成为保证，而不是「等窗口轮到它」。
+ * <p>破坏邻域显形由实际破坏触发，在玩家所属线程核实结果并限额续扫；只还原可见坐标。
  *
  * <p>同一坐标只显形一次（<b>先写入该玩家的 {@link RevealedSet} 标记、再发包，发送失败则回滚标记</b>，
  * 理由见 {@link #markThenSend}）；区块被重新下发或被卸载时
@@ -136,12 +136,6 @@ public final class ProximityRevealer implements Listener {
    *
    * <p>包级可见：单测据此断言「三个上限一致」，避免日后再次漂移。
    *
-   * <p><b>为什么是 1024</b>：窗口是「本周期最多评估/发包多少个候选」的唯一硬顶。真机 dump 显示
-   * 伪装坐标密度可达 407 个/区块（≈10%），512 个名额只覆盖最近约 9 格——开阔洞穴里 10 格外的矿
-   * 永远轮不到，玩家只能靠准星对准（视线显形走的是另一条路径）。配合候选预筛（六面全遮挡直接丢弃，
-   * 见 {@code ProximityScanner.Prefilter}）把名额全部发给「可能可见」的坐标后，同一窗口的覆盖半径
-   * 扩大到约 2~3 倍；再把硬顶翻倍到 1024，覆盖半径再抬约 26%。代价是工作线程上的射线判定次数翻倍
-   * （真机 dump 约 2 万次/秒 → 4 万次/秒，四线程分摊），换的是「看得见的矿不再排队等准星」。
    */
   static final int MAX_CANDIDATES = 1024;
   /**
@@ -331,6 +325,7 @@ public final class ProximityRevealer implements Listener {
   private final AntiXrayConfig.InstantReveal instant;
   /** 破坏方块后的邻域强制显形（配置见 {@link AntiXrayConfig.BreakSweep}）。 */
   private final AntiXrayConfig.BreakSweep breakSweep;
+  private final boolean breakSweepHasOcclusionOverrides;
   /** 是否把同一周期的显形合并成一个 Paper 原生多方块变更包发出（{@code proximity.batch-reveal-sends}）。 */
   private final boolean batchRevealSends;
   private final ObfuscatedChunkIndex chunkIndex;
@@ -352,7 +347,7 @@ public final class ProximityRevealer implements Listener {
    * <p>Paper 只有一条全局任务（{@code passAll}），因此一个全局轮次计数即可；Folia 各玩家任务独立，
    * 分片计数必须<b>按玩家</b>保存在 {@link #entityScans} 里（原因见 {@link #pass}）。
    */
-  private final AtomicLong globalPasses = new AtomicLong();
+
   /**
    * 上一次过期清理的纳秒时刻（过期清理的时间门控；见 {@link #maybeExpire}）。
    *
@@ -374,7 +369,34 @@ public final class ProximityRevealer implements Listener {
   /** 事件显形的每玩家每 tick 限额（默认 16，防爆刷；见 {@link TickQuota}）。 */
   private final TickQuota instantQuota = new TickQuota();
   /** 破坏邻域显形的独立额度：不能被其它即时显形路径挤占（否则「挖开一块」这一下可能一格都发不出去）。 */
-  private final TickQuota breakSweepQuota = new TickQuota();
+  private final ConcurrentHashMap<UUID, PendingBreaks> pendingBreaks = new ConcurrentHashMap<>();
+  private static final int MAX_PENDING_BREAKS = 64;
+  private static final int MAX_BREAK_CENTERS_PER_TICK = 8;
+  private static final int MAX_BREAK_PROBES_PER_TICK = 256;
+
+  private static final class BreakCenter {
+    private final int x, y, z;
+    private final Material original;
+    private int nextOffset = 1; // 偏移表第 0 项是破坏点本身。
+
+    private BreakCenter(int x, int y, int z, Material original) {
+      this.x = x;
+      this.y = y;
+      this.z = z;
+      this.original = original;
+    }
+  }
+
+  // 仅由玩家所属线程使用；退役回调只从外层并发映射摘除整条队列。
+  private static final class PendingBreaks {
+    private final World world;
+    private final LinkedHashMap<Long, BreakCenter> centers = new LinkedHashMap<>();
+    private boolean scheduled;
+
+    private PendingBreaks(World world) {
+      this.world = world;
+    }
+  }
   /**
    * 视线即时显形的独立额度（每玩家每 tick 1 个）。
    *
@@ -384,6 +406,7 @@ public final class ProximityRevealer implements Listener {
   private final TickQuota lookQuota = new TickQuota();
   /** 挖掘兜底的独立额度（每玩家每 tick 1 个），理由同上。 */
   private final TickQuota digQuota = new TickQuota();
+  private final TickQuota miningFrontQuota = new TickQuota();
   /** 视野变化增量巡检的每玩家每 tick 发包限额（与事件显形分开，避免互相挤占）。 */
   private final TickQuota viewChangeQuota = new TickQuota();
   /** 区块下发即显形的每玩家每 tick 发包限额（与事件显形分开，避免区块集中下发吃光即时显形额度）。 */
@@ -449,12 +472,27 @@ public final class ProximityRevealer implements Listener {
    * 全局任务，Folia 上各玩家的区域任务会在插件停用后继续跑到实体退役为止——句柄泄漏 + 停用后
    * 仍在发包。这里逐一保存，停用与玩家退出时全部取消。
    */
-  private record EntityScan(ScheduledTask task, AtomicLong passes) {
+  private static final long TASK_STALE_NANOS = 5_000_000_000L;
+
+  private static final class EntityScan {
+    private final EntityScheduler owner;
+    private volatile ScheduledTask task;
+    private volatile boolean retired;
+    private volatile long heartbeat = System.nanoTime();
+    private long ticks;
+
+    private EntityScan(EntityScheduler owner) {
+      this.owner = owner;
+    }
+
+    private boolean isLive(EntityScheduler scheduler, long now) {
+      return owner == scheduler && !retired && task != null && !task.isCancelled()
+          && now - heartbeat < TASK_STALE_NANOS;
+    }
   }
 
   private final ConcurrentHashMap<UUID, EntityScan> entityScans = new ConcurrentHashMap<>();
-  /** 视线即时显形的每 tick 任务句柄（Folia：每玩家一条；Paper：一条全局任务）。 */
-  private final ConcurrentHashMap<UUID, ScheduledTask> lookScans = new ConcurrentHashMap<>();
+  private ScheduledTask entityHealthTask;
   private ScheduledTask lookTask;
 
   /**
@@ -498,6 +536,7 @@ public final class ProximityRevealer implements Listener {
     this.proximity = config.proximity();
     this.instant = proximity.instantReveal();
     this.breakSweep = instant.breakSweep();
+    this.breakSweepHasOcclusionOverrides = !config.occlusion().extraOccluding().isEmpty();
     this.batchRevealSends = proximity.batchRevealSends();
     this.overRevealSampler = new OverRevealSampler(Math.max(0, proximity.overRevealSampling()));
     this.chunkIndex = chunkIndex;
@@ -525,6 +564,13 @@ public final class ProximityRevealer implements Listener {
       for (Player player : Bukkit.getOnlinePlayers()) {
         scheduleEntityTask(player, interval);
       }
+      entityHealthTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, task -> {
+        if (!stopping) {
+          for (Player player : Bukkit.getOnlinePlayers()) {
+            scheduleEntityTask(player, interval);
+          }
+        }
+      }, 40L, 40L);
     } else {
       // Paper：单条全局任务（延迟与周期都以 tick 计）。额度本来就「每名玩家人手一份」（见 passAll），
       // 因此逐玩家建任务不会改变额度语义，只会把一次遍历拆成 N 次调度——在主线程上纯属额外开销，故保持单任务。
@@ -588,13 +634,13 @@ public final class ProximityRevealer implements Listener {
     }
     // Folia 每玩家任务句柄全部取消：句柄若被丢弃，区域任务会在停用后继续跑到实体退役（泄漏）
     for (EntityScan scan : entityScans.values()) {
-      cancelQuietly(scan.task());
+      cancelQuietly(scan.task);
     }
     entityScans.clear();
-    for (ScheduledTask look : lookScans.values()) {
-      cancelQuietly(look);
+    if (entityHealthTask != null) {
+      cancelQuietly(entityHealthTask);
+      entityHealthTask = null;
     }
-    lookScans.clear();
     if (lookTask != null) {
       cancelQuietly(lookTask);
       lookTask = null;
@@ -605,6 +651,8 @@ public final class ProximityRevealer implements Listener {
     ownChanges.clear();
     viewMarks.clear();
     pendingChunkReveals.clear();
+    pendingBreaks.clear();
+    periodicWindows.clear();
     HandlerList.unregisterAll(this);
     if (clearIndexes) {
       chunkIndex.clear();
@@ -613,45 +661,63 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
-  /** 在玩家所属线程上启动周期巡检并保存句柄与分片计数（调度失败则无句柄可存）。 */
+  /** 调度器以实体为所有者；跨区移动不会自行判成任务退役。 */
   private void scheduleEntityTask(Player player, long interval) {
-    if (stopping) {
+    if (stopping || !player.isOnline()) {
       return;
     }
-    ScheduledTask task = Schedulers.repeatOnEntity(plugin, player, interval, interval, () -> pass(player));
-    if (task == null) {
+    UUID id = player.getUniqueId();
+    EntityScheduler scheduler = player.getScheduler();
+    EntityScan previous = entityScans.get(id);
+    if (previous != null && previous.isLive(scheduler, System.nanoTime())) {
       return;
     }
-    // 计数随句柄一起建：任务首次执行至少在一个周期之后，故 pass() 读到的一定是本条目
-    ScheduledTask look = Schedulers.repeatOnEntity(plugin, player, 1L, 1L,
-        () -> revealLookedAt(player));
-    if (look != null) {
-      ScheduledTask previousLook = lookScans.put(player.getUniqueId(), look);
-      if (previousLook != null) {
-        cancelQuietly(previousLook);
+    EntityScan next = new EntityScan(scheduler);
+    try {
+      next.task = scheduler.runAtFixedRate(plugin, task -> {
+        if (stopping || entityScans.get(id) != next) {
+          return; // 调度可能先于登记完成；只允许已登记的任务读玩家状态。
+        }
+        next.heartbeat = System.nanoTime();
+        revealLookedAt(player);
+        if (++next.ticks >= interval) {
+          next.ticks = 0L;
+          pass(player);
+        }
+      }, () -> {
+        next.retired = true;
+        entityScans.remove(id, next);
+      }, 1L, 1L);
+    } catch (RuntimeException ex) {
+      if (!stopping) {
+        logThrottled(ex);
       }
-      // 入账后复查停用闸（与下方 entityScans 同一处理）：stop() 可能已清完 lookScans，
-      // 这条晚到的视线任务句柄不会有人取消，会空转到实体退役并钉住旧实例。
-      if (stopping && lookScans.remove(player.getUniqueId(), look)) {
-        cancelQuietly(look);
-      }
+      return;
     }
-    EntityScan mine = new EntityScan(task, new AtomicLong());
-    EntityScan previous = entityScans.put(player.getUniqueId(), mine);
+    if (next.task == null) {
+      return; // 新调度被拒时保留旧任务，不把两条显形路径一起切断。
+    }
+    boolean installed = !stopping && !next.retired && (previous == null
+        ? entityScans.putIfAbsent(id, next) == null : entityScans.replace(id, previous, next));
+    if (!installed) {
+      cancelQuietly(next.task);
+      return;
+    }
     if (previous != null) {
-      // 同一玩家重复调度（重复的加入事件等）：旧句柄留着就会空转到实体退役
-      cancelQuietly(previous.task());
+      cancelQuietly(previous.task);
+      stats.taskRestarts.increment();
     }
-    if (stopping) {
-      // 入账后复查停用闸：stop() 可能已清完表，这条晚到的句柄不会有人取消。
-      // 只按「本条目」精确移除并取消，绝不 remove(key) 后盲取消——那会把并发中
-      // 另一个线程刚为同一玩家换上的新句柄一并摘掉（随后它既无人取消、也不再被 pass() 读到）。
-      if (entityScans.remove(player.getUniqueId(), mine)) {
-        cancelQuietly(task);
-      }
+    if (stopping || next.retired || !player.isOnline()) {
+      entityScans.remove(id, next);
+      cancelQuietly(next.task);
     }
   }
 
+  /** -1 = Folia 任务未登记；Paper 使用全局任务。 */
+  public long taskHeartbeatAgeMillis(UUID playerId) {
+    EntityScan scan = entityScans.get(playerId);
+    return scan == null || scan.retired ? -1L : Math.max(0L, (System.nanoTime() - scan.heartbeat) / 1_000_000L);
+  }
   private static void cancelQuietly(ScheduledTask task) {
     try {
       task.cancel();
@@ -669,70 +735,43 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 重生：Folia 上玩家重生会重建实体，旧实体的实体调度器任务随之退役。
-   *
-   * <p>本类的周期巡检与视线即时显形都是「每玩家一条实体调度任务」；不重排的话，玩家死亡一次之后
-   * 这两条路径对该玩家永久停摆，此后只有事件路径（挖掘 / 方块变更 / 区块下发 / 视野变化）还能还原
-   * 假矿——真机表现就是「矿物一直是假方块，转身或挖一下才变回来」。
-   *
-   * <p>与 {@code BlockChangeMerger#onRespawn} 同一课（1.34.7 已为位置快照修过同因缺陷）。
+   * 重生或换世界作废待发的旧视野结果；现有调度器仍活跃时原样保留。
    */
   @EventHandler(ignoreCancelled = true)
   public void onRespawn(PlayerRespawnEvent event) {
     rescheduleEntityTasks(event.getPlayer());
   }
 
-  /**
-   * 切维：Folia 上跨世界同样会重建实体（等同一次重生），两条实体调度任务必须重排。
-   *
-   * <p>对「主城 ↔ 矿区」这种多世界服务器尤其关键：玩家进矿区的第一件事就是切维，切完恰好是
-   * 最需要周期巡检生效的地方。
-   */
   @EventHandler(ignoreCancelled = true)
   public void onChangedWorld(PlayerChangedWorldEvent event) {
     rescheduleEntityTasks(event.getPlayer());
   }
 
-  /**
-   * 重排该玩家的两条实体调度任务（周期巡检 + 视线即时显形）。
-   *
-   * <p>只在 Folia 需要：Paper 的周期巡检与视线显形是两条全局任务（见 {@link #start()}），与实体退役
-   * 无关。旧句柄先摘后取消，避免重复任务空转；调度再次失败（实体尚未就位）时由下一次事件兜底。
-   */
   private void rescheduleEntityTasks(Player player) {
-    if (stopping || player == null || !PlatformSupport.isFolia()) {
-      return;
+    UUID id = player.getUniqueId();
+    pendingBreaks.remove(id);
+    periodicWindows.remove(id);
+    digMarks.remove(id);
+    nearRetryMarks.remove(id);
+    viewMarks.remove(id);
+    ownChanges.remove(id);
+    if (PlatformSupport.isFolia()) {
+      scheduleEntityTask(player, Math.max(1, proximity.intervalTicks()));
     }
-    UUID playerId = player.getUniqueId();
-    ScheduledTask previousLook = lookScans.remove(playerId);
-    if (previousLook != null) {
-      cancelQuietly(previousLook);
-    }
-    EntityScan previousScan = entityScans.remove(playerId);
-    if (previousScan != null) {
-      cancelQuietly(previousScan.task());
-    }
-    scheduleEntityTask(player, Math.max(1, proximity.intervalTicks()));
   }
-
   /** 玩家登出：取消其巡检任务句柄，并清理其已显形标记，避免为离线玩家保留坐标。 */
   @EventHandler(ignoreCancelled = true)
   public void onQuit(PlayerQuitEvent event) {
-    ScheduledTask lookScan = lookScans.remove(event.getPlayer().getUniqueId());
-    if (lookScan != null) {
-      cancelQuietly(lookScan);
-    }
     EntityScan scan = entityScans.remove(event.getPlayer().getUniqueId());
     if (scan != null) {
-      try {
-        scan.task().cancel();
-      } catch (Throwable ignored) {
-        // 任务可能已随实体退役结束，取消失败可忽略
-      }
+      cancelQuietly(scan.task);
     }
     book.clearPlayer(event.getPlayer().getUniqueId());
     instantQuota.clear(event.getPlayer().getUniqueId());
-    breakSweepQuota.clear(event.getPlayer().getUniqueId());
+    digQuota.clear(event.getPlayer().getUniqueId());
+    miningFrontQuota.clear(event.getPlayer().getUniqueId());
+    pendingBreaks.remove(event.getPlayer().getUniqueId());
+    periodicWindows.remove(event.getPlayer().getUniqueId());
     chunkDeliveryQuota.clear(event.getPlayer().getUniqueId());
     digMarks.remove(event.getPlayer().getUniqueId());
     nearRetryMarks.remove(event.getPlayer().getUniqueId());
@@ -815,11 +854,10 @@ public final class ProximityRevealer implements Listener {
     // 本轮看哪一片：同一轮里所有玩家看同一片（分片轮转的节奏只与巡检次数有关，见 SCAN_SHARDS）。
     // 按「巡检轮次」推进，而不是按墙钟时间取模——服务器掉 tick 时墙钟会跑在实际巡检前面，
     // 反而会让一部分分片被整轮跳过。
-    int shard = shardFor(globalPasses.incrementAndGet());
     // 每个玩家各自一份额度：不再因「前面的玩家用光了」而跳过后面的玩家。
     for (Player player : Bukkit.getOnlinePlayers()) {
       try {
-        reveal(player, new Budget(limit()), shard);
+        reveal(player, new Budget(limit()));
       } catch (Throwable throwable) {
         logThrottled(throwable);
       }
@@ -837,10 +875,8 @@ public final class ProximityRevealer implements Listener {
     // 在线人数恰为 SCAN_SHARDS 的倍数时，单个玩家在相邻两次巡检之间会被其他玩家把计数推进正好
     // SCAN_SHARDS 次，于是它每轮都读到同一分片——其周围 (SCAN_SHARDS-1)/SCAN_SHARDS 的伪装区块
     // 再也不会被周期扫描到（洞穴里裸露的矿一直显示为伪装方块）。
-    EntityScan scan = entityScans.get(player.getUniqueId());
-    long round = scan == null ? 1L : scan.passes().incrementAndGet();
     try {
-      reveal(player, new Budget(limit()), shardFor(round));
+      reveal(player, new Budget(limit()));
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
@@ -921,95 +957,86 @@ public final class ProximityRevealer implements Listener {
     return shouldRevealInWorld(worldName) ? worldName : null;
   }
 
-  /** 主线程 / 区域线程：局部扫描取候选 → （可选）工作线程筛选 → 读真实方块 → 发包 → 标记已显形。 */
-  private void reveal(Player player, Budget budget, int shard) {
+  private static final int MAX_PERIODIC_COLUMNS = 128;
+  private static final int MAX_PERIODIC_POSITIONS = 2048;
+  private final ConcurrentHashMap<UUID, PeriodicWindow> periodicWindows = new ConcurrentHashMap<>();
+
+  private static final class PeriodicWindow {
+    private final ProximityScanner.Cursor[] cursors = new ProximityScanner.Cursor[SCAN_SHARDS];
+    private final AtomicBoolean inFlight = new AtomicBoolean();
+    private int nextShard;
+  }
+
+  /** 区域线程只取玩家快照；扫描游标、预筛与射线都在工作池。 */
+  private void reveal(Player player, Budget budget) {
     if (!gateOpen(player)) {
       return;
     }
     World world = player.getWorld();
-    // 只排除黑名单世界：总开关关闭后仍保留索引与巡检，好让已下发到客户端的假矿还能被还原
-    //（索引为空时天然零发包，见 shouldRevealInWorld 的说明）。
-    String worldName = revealWorld(player);
-    if (worldName == null) {
+    if (world == null || !shouldRevealInWorld(world.getName())) {
       return;
     }
-
-    Location location = player.getLocation();
-    ProximityScanner.Tally scanTally = new ProximityScanner.Tally();
-    // 显形半径按「区块」计，并钳到该玩家的有效视距（服务器视距与客户端自报视距取小）：
-    // 显形包只在客户端已加载该区块时才会被应用，越界的包会被客户端丢弃。见 {@link #effectiveRevealChunks}。
-    int revealChunks = effectiveRevealChunks(proximity.distanceChunks(),
-        playerViewDistance(player), playerClientViewDistance(player));
-    double maxDistance = revealChunks * 16.0D;
-    // 近处重试的相位按 tick 分散：所有玩家的巡检落在同一 tick 时也只是重扫身边 3×3 区块，
-    // 不会因为「全服同时重试」放大成尖峰（每 25 tick 命中一次）。
-    // 抽成一个方法是为了让局部变量保持 effectively final（下面的工作线程 lambda 要捕获它）
-    final boolean retryNearbyRevealed = nearRetryPhase(player.getUniqueId());
-    boolean frustum = proximity.frustumEnabled();
-    boolean visibility = proximity.raycastEnabled();
-    // 语义等价预筛：六面全被遮挡的坐标在任何射线判定下都必然不可见（见 BitmapVisibility#hasExposedFace），
-    // 提前丢弃只缩小评估量、不改变任何显形结论。只在射线判定开启时挂：关掉射线时窗口里每条候选都会
-    // 直接发包，此时按暴露面丢弃就变成「改变行为」了。
-    // 仓库只查一次（一趟扫描内世界不变）；没有位图表时干脆不挂预筛：那属于「遮挡子系统整体缺失」，
-    // 交给后续的可见性判定按既定方向处理，预筛不替它做决定。
-    OcclusionStore worldStore = occlusionStores == null ? null : occlusionStores.lookup(worldName);
-    BitmapVisibility faceProbe = visibility && worldStore != null ? BitmapVisibility.local() : null;
-    ProximityScanner.Prefilter prefilter = faceProbe == null ? null
-        : (px, py, pz) -> faceProbe.hasExposedFace(worldStore, px, py, pz);
-    List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.candidates(chunkIndex,
-        revealedSet, player.getUniqueId(), worldName, location.getBlockX(), location.getBlockY(),
-        location.getBlockZ(), maxDistance, fetchLimit(budget.remaining()), shard,
-        SCAN_SHARDS, scanTally, Long.MAX_VALUE, retryNearbyRevealed, prefilter);
-    recordScanTally(scanTally);
-    if (candidates.isEmpty()) {
-      return;
-    }
-    // 周期/事件显形的候选可见性判定走遮挡位图（视线即时显形是独立的 6 格方块射线，不经过这里）。
-    // 位图缺失（罕见故障）时 BitmapVisibility 按「遮挡」处理（严格方向：不显形），绝不裸发——
-    // 「无数据 ≠ 通畅」是显形侧的既定安全方向。
-    if (!frustum && !visibility) {
-      // 两项筛选都关闭：无任何可做的判定，直接发包
-      sendCandidates(player, world, candidates, null, null, budget, scanTally, false,
-          retryNearbyRevealed);
-      return;
-    }
-
-    // 只把纯值交给工作线程；这里的 Player 引用仅供「交回所属线程」调度使用，工作线程不对它做任何调用
-    ProximitySelector.Eye eye = eyeOf(player);
-
     if (!canOffloadPlanning(workPool)) {
-      // 队列已满 / 未装配工作池：本轮直接跳过（计入统计），候选仍在伪装索引里，下一巡检周期会重新取到。
-      // 为什么不在当前线程同步算完：这里的候选筛选最多要做 MAX_CANDIDATES 次「暴露面 + 多候选点射线」，
-      // 正是本模块刻意搬到工作线程的那笔 CPU；退化到主线程 / 区域线程，等于在「改写队列已塞满」这个
-      // 服务器最忙的时刻把它整笔还回去。显形只延迟一个周期、绝不丢失——宁可延迟也不能阻塞。
       skipPassBecauseNoCapacity();
       return;
     }
-
+    UUID id = player.getUniqueId();
+    PeriodicWindow window = periodicWindows.computeIfAbsent(id, ignored -> new PeriodicWindow());
+    if (!window.inFlight.compareAndSet(false, true)) {
+      return;
+    }
     try {
-      // flatten 放进工作线程：它是纯值转换，没理由每玩家每周期在区域线程上分配最多 6 KB 的 int[]
+      int revealChunks = effectiveRevealChunks(proximity.distanceChunks(),
+          playerViewDistance(player), playerClientViewDistance(player));
+      Location location = player.getLocation();
+      int x = location.getBlockX();
+      int y = location.getBlockY();
+      int z = location.getBlockZ();
+      ProximitySelector.Eye eye = eyeOf(player);
+      String worldName = world.getName();
+      boolean retryNearby = nearRetryPhase(id);
+      boolean visibility = proximity.raycastEnabled();
       workPool.execute(() -> {
-        Plan plan = computePlan(eye, flatten(candidates), worldName, visibility);
-        // 读方块与发包必须回到玩家所属线程。世界在候选筛选时已捕获（见 reveal 的 world 局部量），
-        // 这里绝不再取 player.getWorld()：异步回调期间玩家可能已切换世界，重取会让「旧世界的候选坐标」
-        // 配上「新世界的 ChunkKey」（污染已显形集合）并发出冗余包。改用捕获的世界，且校验玩家仍在同一
-        // 世界——跨世界则放弃本轮（fail-open，绝不误发/误标）。
-        Schedulers.onEntity(plugin, player, () -> {
-          try {
-            if (player.isOnline() && player.getWorld() == world) {
-              sendCandidates(player, world, null, plan, eye, budget, scanTally, visibility,
-                  retryNearbyRevealed);
-            }
-          } catch (Throwable throwable) {
-            logThrottled(throwable);
+        try {
+          if (stopping || periodicWindows.get(id) != window) {
+            return;
           }
-        });
+          int shard = shardFor(window.nextShard++);
+          if (window.cursors[shard] == null) {
+            window.cursors[shard] = new ProximityScanner.Cursor();
+          }
+          OcclusionStore store = visibility && occlusionStores != null ? occlusionStores.lookup(worldName) : null;
+          BitmapVisibility bitmap = store == null ? null : BitmapVisibility.local();
+          ProximityScanner.Prefilter prefilter = bitmap == null ? null
+              : (bx, by, bz) -> bitmap.hasExposedFace(store, bx, by, bz);
+          ProximityScanner.Tally tally = new ProximityScanner.Tally();
+          List<ObfuscatedChunkIndex.Position> candidates = ProximityScanner.nextWindow(window.cursors[shard],
+              chunkIndex, revealedSet, id, worldName, x, y, z, revealChunks, shard, SCAN_SHARDS,
+              fetchLimit(budget.remaining()), MAX_PERIODIC_COLUMNS, MAX_PERIODIC_POSITIONS, retryNearby,
+              tally, prefilter);
+          recordScanTally(tally);
+          if (candidates.isEmpty()) {
+            return;
+          }
+          Plan plan = computePlan(eye, flatten(candidates), worldName, visibility);
+          if (plan.count() > 0) {
+            Schedulers.onEntity(plugin, player, () -> {
+              if (periodicWindows.get(id) == window && gateOpen(player) && player.getWorld() == world
+                  && shouldRevealInWorld(worldName)) {
+                sendCandidates(player, world, null, plan, eye, budget, tally, visibility, retryNearby);
+              }
+            });
+          }
+        } catch (RuntimeException exception) {
+          logThrottled(exception);
+        } finally {
+          window.inFlight.set(false);
+        }
       });
-    } catch (Throwable throwable) {
-      // 入队失败（线程池关闭 / 停用中）：与「无容量」同一处置——本轮跳过，绝不在玩家线程同步算完。
-      // 此时旧实例本就不会再发包（sendCandidates 入口的 stopping 闸），跳过不丢任何新实例的显形。
-      logThrottled(throwable);
+    } catch (RuntimeException exception) {
+      window.inFlight.set(false);
       skipPassBecauseNoCapacity();
+      logThrottled(exception);
     }
   }
 
@@ -1070,6 +1097,10 @@ public final class ProximityRevealer implements Listener {
       stats.prefilterDropped.add(scanTally.prefiltered);
     }
     stats.recordWindowReach(scanTally.farthestDistanceSquared);
+    stats.periodicVisited.add(scanTally.visited);
+    if (scanTally.continued) {
+      stats.periodicContinued.increment();
+    }
   }
 
   /** 本轮是否有可用的工作线程来执行纯计算筛选（包级可见，便于离线单测）。 */
@@ -1207,10 +1238,14 @@ public final class ProximityRevealer implements Listener {
       if (budget.remaining() <= 0) {
         break;
       }
-      resetNearbyMarkForRetry(player, world, plan.coordinates[i * 3], plan.coordinates[i * 3 + 1],
-          plan.coordinates[i * 3 + 2], retryNearbyRevealed);
-      sendOne(player, world, plan.coordinates[i * 3], plan.coordinates[i * 3 + 1],
-          plan.coordinates[i * 3 + 2], eye, budget, tally, batch, visibilityInPlan);
+      int x = plan.coordinates[i * 3];
+      int y = plan.coordinates[i * 3 + 1];
+      int z = plan.coordinates[i * 3 + 2];
+      if (!chunkIndex.containsPosition(world.getName(), x, y, z)) {
+        continue; // 异步期间真实变更已注销该格，不覆盖原版更新。
+      }
+      resetNearbyMarkForRetry(player, world, x, y, z, retryNearbyRevealed);
+      sendOne(player, world, x, y, z, eye, budget, tally, batch, visibilityInPlan);
     }
     flushBatch(player, batch, tally);
     logFirstRevealDiagnostic(candidateCount, frustumCulled, tally);
@@ -1777,7 +1812,7 @@ public final class ProximityRevealer implements Listener {
     plugin.getLogger().fine("首次显形诊断：扫描区块 " + tally.chunksScanned + " 个（整块跳过 "
         + tally.chunksSkipped + "，分片推迟 " + tally.chunksDeferred + "／共 " + SCAN_SHARDS
         + " 片），坐标评估 " + tally.positionsEvaluated + " 个，其中预筛丢弃 " + tally.prefiltered
-        + " 个，候选 " + candidateCount + " 个，窗口覆盖 "
+        + " 个，候选 " + candidateCount + " 个，本轮最远入选候选 "
         + (tally.farthestDistanceSquared <= 0L ? 0L : (long) Math.sqrt(tally.farthestDistanceSquared))
         + " 格，视锥剔除 " + frustumCulled + "，射线剔除 " + tally.rayCulled
         + "，实际发送 " + tally.sent);
@@ -2002,36 +2037,73 @@ public final class ProximityRevealer implements Listener {
     if (chunkIndex == null || revealedSet == null) {
       return;
     }
-    if (hasDisguisedNearby(chunkIndex, worldName, x, y, z, instant.radius())) {
-      Schedulers.onEntity(plugin, player, () -> revealImmediately(player, x, y, z));
+    if (worldName.equals(player.getWorld().getName())
+        && hasDisguisedNearby(chunkIndex, worldName, x, y, z, instant.radius())) {
+      revealImmediately(player, x, y, z);
+    }
+  }
+
+  /** 兼顾瞬挖和不经 BlockDamageEvent 的破坏路径。只拦下本次确实完成显形纠正的目标。 */
+  @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+  public void onBreakMiningGuard(BlockBreakEvent event) {
+    Block block = event.getBlock();
+    if (revealDigTarget(event.getPlayer(), block.getWorld(), block.getX(), block.getY(), block.getZ())) {
+      event.setCancelled(true);
+      stats.miningTargetCorrections.increment();
     }
   }
 
   /**
-   * 破坏方块后的邻域强制显形入口（{@link BlockChangeRevealListener} 在「新状态是空气」时调用，封包线程）。
-   *
-   * <p><b>与 {@link #onBlockChangeObserved} 的分工</b>：那个入口服务于放置与其它暴露类变更，只还原
-   * 「本来被这一格挡住」的坐标，避免一次动作改掉十几个方块的外观；本入口服务于真正的<b>破坏</b>，
-   * 把破坏点邻域整片过一遍（见 {@link AntiXrayConfig.BreakSweep}）——「挖开一块之后身边立刻都是真方块」
-   * 因此成为硬保证，而不是「等候选窗口轮到它」。
-   *
-   * <p>初筛在封包线程完成（只查伪装索引、不读世界）：邻域内没有伪装坐标时不产生任何调度。
+   * 成功破坏前优先还原破口的下一层；下一 tick 核实世界状态，再补查整个邻域。
    */
-  public void onBreakObserved(Player player, String worldName, int x, int y, int z) {
-    if (player == null || worldName == null || stopping) {
+  @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+  public void onBlockBreak(BlockBreakEvent event) {
+    Player player = event.getPlayer();
+    if (!gateOpen(player) || !instant.enabled() || instant.maxPerTick() <= 0) {
       return;
     }
-    if (!instant.enabled() || instant.maxPerTick() <= 0
-        || !breakSweep.enabled() || breakSweep.maxPerTick() <= 0) {
+    Block block = event.getBlock();
+    World world = block.getWorld();
+    if (world != player.getWorld() || !shouldRevealInWorld(world.getName())) {
       return;
     }
-    if (WorldBlacklistConfig.isBlacklistedNow(worldName) || chunkIndex == null || revealedSet == null) {
+    int x = block.getX();
+    int y = block.getY();
+    int z = block.getZ();
+    UUID id = player.getUniqueId();
+    if (proximity.preRevealOnDig() && proximity.raycastEnabled()
+        && !breakSweepHasOcclusionOverrides && digDedupAllows(id, x, y, z, Bukkit.getCurrentTick())) {
+      revealMiningFront(player, world, x, y, z);
+    }
+    if (!breakSweep.enabled() || breakSweep.maxPerTick() <= 0 || !proximity.raycastEnabled()
+        || !ownsChunk(world, x >> 4, z >> 4)) {
       return;
     }
-    int radius = breakSweep.radius();
-    if (hasDisguisedNearby(chunkIndex, worldName, x, y, z, radius)) {
-      Schedulers.onEntity(plugin, player, () -> revealSweep(player, x, y, z, radius));
+    PendingBreaks pending = pendingBreaks.compute(id,
+        (ignored, old) -> old != null && old.world == world ? old : new PendingBreaks(world));
+    long key = packCoordinate(x, y, z);
+    if (pending.centers.size() >= MAX_PENDING_BREAKS && !pending.centers.containsKey(key)) {
+      pending.centers.pollFirstEntry();
+      stats.breakSweepQueueDropped.increment();
     }
+    pending.centers.put(key, new BreakCenter(x, y, z, block.getType()));
+    if (!pending.scheduled) {
+      pending.scheduled = true;
+      scheduleBreakSweep(player, id, pending);
+    }
+  }
+
+  private void scheduleBreakSweep(Player player, UUID id, PendingBreaks pending) {
+    Runnable retired = () -> pendingBreaks.remove(id, pending);
+    try {
+      if (!stopping && player.getScheduler().run(plugin,
+          task -> revealSweep(player, id, pending), retired) != null) {
+        return;
+      }
+    } catch (RuntimeException ex) {
+      logThrottled(ex);
+    }
+    retired.run();
   }
 
   /**
@@ -2104,9 +2176,9 @@ public final class ProximityRevealer implements Listener {
     if (chunkIndex == null || revealedSet == null) {
       return;
     }
-    if (hasDisguisedNearSection(chunkIndex, worldName, coordinates, count, instant.radius())) {
-      Schedulers.onEntity(plugin, player,
-          () -> revealSectionImmediately(player, coordinates, count));
+    if (worldName.equals(player.getWorld().getName())
+        && hasDisguisedNearSection(chunkIndex, worldName, coordinates, count, instant.radius())) {
+      revealSectionImmediately(player, coordinates, count);
     }
   }
 
@@ -2222,74 +2294,99 @@ public final class ProximityRevealer implements Listener {
   }
 
   /**
-   * 玩家所属线程：把刚被破坏的那一格邻域里「仍伪装 + 未显形 + 视线可见」的坐标一次性发回真实状态。
-   *
-   * <p><b>不受任何调度限制</b>：不走候选窗口、不走分片轮转、不让开同段安静窗口、不做「是否被这一格
-   * 挡住」的张角判定——这些限制都是为「少发几个包」服务的，代价是玩家眼前的假方块要排队。
-   * <b>但可见性判定照旧</b>（遮挡位图射线）：去掉它等于把透视端要的东西直接发过去。
-   *
-   * <p>额度独立（{@link #breakSweepQuota}）：否则一次爆炸事件就可能把当 tick 的即时显形额度吃光，
-   * 让紧随其后的挖掘一格都发不出去。耗尽时计数留痕，剩余坐标由周期巡检兜底。
+   * 每名玩家只排一条任务。扫描额度和实际发包额度分别封顶，未完成的邻域在下个 tick 续扫。
    */
-  private void revealSweep(Player player, int cx, int cy, int cz, int radius) {
+  private void revealSweep(Player player, UUID id, PendingBreaks pending) {
     try {
-      if (!gateOpen(player)) {
+      World world = pending.world;
+      if (pendingBreaks.get(id) != pending || !gateOpen(player) || player.getWorld() != world
+          || !shouldRevealInWorld(world.getName())) {
+        pendingBreaks.remove(id, pending);
         return;
       }
-      World world = player.getWorld();
-      String liveWorld = revealWorld(player);
-      if (liveWorld == null) {
-        return;
-      }
-      Location location = player.getLocation();
-      if (!withinManhattanRadius(location.getBlockX(), location.getBlockY(), location.getBlockZ(),
-          cx, cy, cz, radius)) {
-        return;
-      }
-      // 与其它路径同一 Folia 纪律：先判 region 归属，再问区块是否加载（跨区读会触发 TickThread 校验）
-      if (!ownsChunk(world, cx >> 4, cz >> 4) || !world.isChunkLoaded(cx >> 4, cz >> 4)) {
-        return;
-      }
-      UUID playerId = player.getUniqueId();
-      long tick = Bukkit.getCurrentTick();
-      int maxPerTick = Math.max(1, breakSweep.maxPerTick());
-      int granted = breakSweepQuota.claim(playerId, tick, maxPerTick, maxPerTick);
-      Budget budget = new Budget(granted);
-      if (budget.remaining() <= 0) {
-        stats.breakSweepBudgetExhausted.increment();
-        return;
-      }
-      ProximitySelector.Eye eye = proximity.raycastEnabled() ? eyeOf(player) : null;
+      int[][] offsets = instantOffsets(breakSweep.radius());
+      Budget budget = new Budget(breakSweep.maxPerTick());
+      ProximitySelector.Eye eye = eyeOf(player);
       PassTally tally = new PassTally();
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
-      boolean truncated = false;
-      for (int[] offset : instantOffsets(radius)) {
-        if (budget.remaining() <= 0) {
-          truncated = true;
-          break;
-        }
-        int x = cx + offset[0];
-        int y = cy + offset[1];
-        int z = cz + offset[2];
-        if (x == cx && y == cy && z == cz) {
-          continue; // 刚变更的那一格客户端已经有新状态，再发一次只会同格重绘
-        }
-        if (!isInstantCandidate(playerId, liveWorld, x, y, z)) {
+      BitmapVisibility visibility = BitmapVisibility.local();
+      String worldName = world.getName();
+      java.util.Set<Long> tested = new java.util.HashSet<>();
+      Location liveEye = player.getEyeLocation();
+      int liveChecks = breakSweepHasOcclusionOverrides ? 0 : DIG_NEIGHBOUR_COUNT;
+      int probes = MAX_BREAK_PROBES_PER_TICK;
+      for (int centers = 0; centers < MAX_BREAK_CENTERS_PER_TICK
+          && probes > 0 && budget.remaining() > 0 && !pending.centers.isEmpty(); centers++) {
+        BreakCenter center = pending.centers.firstEntry().getValue();
+        int cx = center.x >> 4;
+        int cz = center.z >> 4;
+        if (!ownsChunk(world, cx, cz) || !world.isChunkLoaded(cx, cz)) {
+          pending.centers.pollFirstEntry();
           continue;
         }
-        // visibilityInPlan=false：在当前线程用遮挡位图判定（被墙挡住的候选不发）
-        sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
+        BlockData current = world.getBlockData(center.x, center.y, center.z);
+        if (current.getMaterial() == center.original) {
+          pending.centers.pollFirstEntry(); // 事件之后世界没有发生破坏。
+          continue;
+        }
+        // 原包的位图补丁有可能还没到。只覆盖已从世界核实、且确定透明的那一格；其余仍严格检查。
+        Material material = current.getMaterial();
+        boolean knownOpening = !breakSweepHasOcclusionOverrides && (material.isAir() || material == Material.WATER);
+        if (knownOpening) {
+          visibility.beginIgnoring(center.x, center.y, center.z);
+        }
+        try {
+          while (center.nextOffset < offsets.length && probes > 0 && budget.remaining() > 0) {
+            int[] offset = offsets[center.nextOffset++];
+            probes--;
+            int x = center.x + offset[0];
+            int y = center.y + offset[1];
+            int z = center.z + offset[2];
+            long key = packCoordinate(x, y, z);
+            if (!pending.centers.containsKey(key) && isInstantCandidate(id, worldName, x, y, z)
+                && !tested.contains(key)) {
+              int before = budget.remaining();
+              // 少量近场目标先核对真实几何，防止旧位图把刚露出的矿继续判成被挡。
+              if (liveChecks > 0 && MiningSight.inRange(liveEye.getX(), liveEye.getY(), liveEye.getZ(),
+                  x, y, z, DIG_MAX_SIGHT_DISTANCE)) {
+                liveChecks--;
+                if (visibleMiningFace(world, liveEye, x, y, z, null)) {
+                  sendOne(player, world, x, y, z, null, budget, tally, batch, true);
+                }
+              }
+              if (budget.remaining() == before) {
+                sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
+              }
+              if (budget.remaining() < before) {
+                tested.add(key); // 只去重已找到可行视线的候选，另一破口可重新判定。
+              }
+            }
+          }
+        } finally {
+          if (knownOpening) {
+            visibility.endIgnoring();
+          }
+        }
+        if (center.nextOffset >= offsets.length) {
+          pending.centers.pollFirstEntry();
+        }
       }
       flushBatch(player, batch, tally);
-      if (tally.sent > 0) {
-        stats.breakSweepSent.add(tally.sent);
-      }
-      if (truncated) {
+      stats.breakSweepSent.add(tally.sent);
+      if (!pending.centers.isEmpty()) {
         stats.breakSweepBudgetExhausted.increment();
       }
-      breakSweepQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
-    } catch (Throwable throwable) {
-      logThrottled(throwable);
+    } catch (RuntimeException ex) {
+      pendingBreaks.remove(id, pending);
+      logThrottled(ex);
+    } finally {
+      if (pendingBreaks.get(id) == pending) {
+        if (pending.centers.isEmpty()) {
+          pendingBreaks.remove(id, pending);
+        } else {
+          scheduleBreakSweep(player, id, pending);
+        }
+      }
     }
   }
 
@@ -2669,43 +2766,13 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
-  /**
-   * 开掘预显形入口（{@link BlockDamageEvent}，玩家所属线程）：玩家开始挖某个方块时，把该方块 6 邻中
-   * 「挖开后会看见」的伪装坐标提前显形。
-   *
-   * <p><b>为什么必须提前</b>：客户端对挖掘有本地预测——方块一破，客户端立刻用本地状态渲染邻接方块。
-   * 服务端若等「方块被破坏」后再补发显形，必然晚一个网络往返，那一瞬玩家会看到邻接的伪装方块。
-   * 提前到「开始挖」发送，正常挖掘速度（≥ 0.2 秒）下显形包会先于破坏到达客户端。
-   *
-   * <p>同一格在 {@value #DIG_DEDUP_TICKS} tick 内只处理一次（该事件在持续挖掘时会重复触发）。
-   * 仅在射线判定开启时生效：否则「挖开后会看见」无从判定，等于把 6 邻全部裸发（会过度显形）。
-   */
-  @EventHandler(ignoreCancelled = true)
+  /** 当真实目标仍待同步时，先发真实材质，再让下一次原版挖掘接管。 */
+  @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
   public void onBlockDamage(BlockDamageEvent event) {
-    if (stopping || !instant.enabled() || instant.maxPerTick() <= 0) {
-      return;
-    }
-    Player player = event.getPlayer();
-    if (player == null
-        || (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId()))) {
-      return;
-    }
-    try {
-      Block block = event.getBlock();
-      int x = block.getX();
-      int y = block.getY();
-      int z = block.getZ();
-      // 兜底先做：正在挖的这一格必须已经是真实方块。显形要经过「巡检周期 → 工作线程规划 →
-      // 回投玩家线程」，快速挖掘时这段延迟比挖穿一格还长，客户端会一直画着伪装方块直到空气包到达，
-      // 结果就是「挖玄武岩掉下界残骸」。这里在方块尚未破坏时同 tick 补发真实状态。
-      revealDigTarget(player, x, y, z);
-      if (!proximity.preRevealOnDig() || !proximity.raycastEnabled()
-          || !digDedupAllows(player.getUniqueId(), x, y, z, Bukkit.getCurrentTick())) {
-        return;
-      }
-      revealAfterDig(player, x, y, z);
-    } catch (Throwable throwable) {
-      logThrottled(throwable);
+    Block block = event.getBlock();
+    if (revealDigTarget(event.getPlayer(), block.getWorld(), block.getX(), block.getY(), block.getZ())) {
+      event.setCancelled(true);
+      stats.miningTargetCorrections.increment();
     }
   }
 
@@ -2741,8 +2808,7 @@ public final class ProximityRevealer implements Listener {
       // 因此只要求起点与终点区块都属于本 region；不属于就跳过（该坐标仍留在索引里，靠近后由巡检补上）。
       int endX = (int) Math.floor(eye.getX() + eye.getDirection().getX() * LOOK_MAX_DISTANCE);
       int endZ = (int) Math.floor(eye.getZ() + eye.getDirection().getZ() * LOOK_MAX_DISTANCE);
-      if (!ownsChunk(world, eye.getBlockX() >> 4, eye.getBlockZ() >> 4)
-          || !ownsChunk(world, endX >> 4, endZ >> 4)) {
+      if (!rayChunksAvailable(world, eye, endX, endZ)) {
         return;
       }
       RayTraceResult hit = world.rayTraceBlocks(eye, eye.getDirection(), LOOK_MAX_DISTANCE,
@@ -2778,68 +2844,34 @@ public final class ProximityRevealer implements Listener {
     }
   }
 
-  /**
-   * 挖掘兜底：玩家开始挖某格时，若该格仍是伪装坐标，立刻把真实状态发给他。
-   *
-   * <p><b>为什么需要</b>：正常路径要经过「巡检周期（默认 4 tick）→ 工作线程规划 → 回投玩家线程 → 发包」，
-   * 合计 250~400 ms；效率镐/急迫下挖穿一格只要 50~200 ms。玩家看到伪装方块被挖掉、却掉了真实物品，
-   * 过程与结果不一致。这里在开始挖（方块尚未破坏）的同 tick 补发一次真实状态，玩家在挖掘动画期间
-   * 先看到真方块，破坏后掉落与所见一致。
-   *
-   * <p><b>安全边界</b>：只处理「玩家正在挖的那一格」，并且<b>必须通过视线判定</b>——服务端对
-   * START_DESTROY_BLOCK 不校验视线，只校验区块已加载与交互距离，因此「他正在挖它」并不能推出「他看得见它」：
-   * 不判视线时，伪造破坏包就能把任意伪装坐标换成真实状态。已显形、非伪装坐标、跨 region、
-   * 未加载区块、视线被挡一律跳过。
-   */
-  private void revealDigTarget(Player player, int x, int y, int z) {
+  /** 真实更新提交成功后才返回 true；非伪装目标和已还原目标照常挖掘。 */
+  private boolean revealDigTarget(Player player, World world, int x, int y, int z) {
     try {
-      if (!gateOpen(player)) {
-        return;
+      if (!instant.enabled() || instant.maxPerTick() <= 0 || !gateOpen(player)
+          || player.getWorld() != world || !shouldRevealInWorld(world.getName())
+          || chunkIndex == null || revealedSet == null) {
+        return false;
       }
-      World world = player.getWorld();
-      if (revealWorld(player) == null) {
-        return;
-      }
-      if (chunkIndex == null || revealedSet == null) {
-        return;
-      }
-      if (!ownsChunk(world, x >> 4, z >> 4) || !world.isChunkLoaded(x >> 4, z >> 4)) {
-        return;
-      }
-      UUID playerId = player.getUniqueId();
-      ChunkKey key = ChunkKey.ofBlock(world.getName(), x, z);
-      if (!chunkIndex.containsPosition(key, x, y, z)) {
-        return; // 不是伪装坐标：客户端本来显示的就是真实方块
-      }
-      if (revealedSet.contains(playerId, key, x, y, z)) {
-        return; // 已经显形
-      }
-      // 视线判定：{@link BlockDamageEvent} 只代表客户端「声明」正在挖这一格——服务端对
-      // START_DESTROY_BLOCK 只校验区块已加载与交互距离，不校验视线。少了这一步，伪造破坏包就能把
-      // 任意伪装坐标换成真实状态（隔墙透视，暴露面约一个交互距离）。
-      // 判定本身见 {@link #canSeeDugBlock}：两条射线（中心 + 真实视线），斜着挖也不会被相邻方块挡掉。
-      Location eye = player.getEyeLocation();
-      if (!ownsChunk(world, eye.getBlockX() >> 4, eye.getBlockZ() >> 4)) {
-        return;
-      }
-      if (!canSeeDugBlock(world, eye, x, y, z)) {
-        return;
+      UUID id = player.getUniqueId();
+      if (!isInstantCandidate(id, world.getName(), x, y, z)
+          || !canSeeDugBlock(world, player.getEyeLocation(), x, y, z)) {
+        return false;
       }
       long tick = Bukkit.getCurrentTick();
-      int granted = digQuota.claim(playerId, tick, 1, 1);
+      int granted = digQuota.claim(id, tick, 1, 1);
       if (granted <= 0) {
-        return;
+        return false;
       }
-      Budget budget = new Budget(granted);
       PassTally tally = new PassTally();
-      RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
-      // eye=null + visibilityInPlan=true：视线已在上方用「眼睛 → 方块中心」的射线判过（被挡就 return），
-      // 这里不再重复位图判定，直接按当前真实状态发给他。
-      sendOne(player, world, x, y, z, null, budget, tally, batch, true);
-      flushBatch(player, batch, tally);
-      digQuota.release(playerId, tick, 1, granted, tally.sent);
-    } catch (Throwable throwable) {
-      logThrottled(throwable);
+      try {
+        sendOne(player, world, x, y, z, null, new Budget(1), tally, null, true);
+        return tally.sent > 0;
+      } finally {
+        digQuota.release(id, tick, 1, granted, tally.sent);
+      }
+    } catch (RuntimeException ex) {
+      logThrottled(ex);
+      return false;
     }
   }
 
@@ -2858,17 +2890,63 @@ public final class ProximityRevealer implements Listener {
   private static boolean canSeeDugBlock(World world, Location eye, int x, int y, int z) {
     Vector toBlock = new Vector(x + 0.5D - eye.getX(), y + 0.5D - eye.getY(), z + 0.5D - eye.getZ());
     double sightDistance = toBlock.length();
-    if (sightDistance > DIG_MAX_SIGHT_DISTANCE) {
+    if (!MiningSight.inRange(eye.getX(), eye.getY(), eye.getZ(), x, y, z, DIG_MAX_SIGHT_DISTANCE)) {
       return false;
     }
-    RayTraceResult center = world.rayTraceBlocks(eye, toBlock.normalize(), sightDistance + 0.5D,
-        FluidCollisionMode.NEVER, true);
-    if (hitsBlock(center, x, y, z)) {
-      return true;
+    if (sightDistance >= 1.0E-6D && sightDistance <= DIG_MAX_SIGHT_DISTANCE
+        && rayChunksAvailable(world, eye, x, z)) {
+      RayTraceResult center = world.rayTraceBlocks(eye, toBlock.normalize(), sightDistance,
+          FluidCollisionMode.NEVER, true);
+      if (hitsBlock(center, x, y, z)) {
+        return true;
+      }
     }
-    RayTraceResult view = world.rayTraceBlocks(eye, eye.getDirection(), LOOK_MAX_DISTANCE,
-        FluidCollisionMode.NEVER, true);
-    return hitsBlock(view, x, y, z);
+    Vector direction = eye.getDirection();
+    int endX = (int) Math.floor(eye.getX() + direction.getX() * LOOK_MAX_DISTANCE);
+    int endZ = (int) Math.floor(eye.getZ() + direction.getZ() * LOOK_MAX_DISTANCE);
+    if (rayChunksAvailable(world, eye, endX, endZ)) {
+      RayTraceResult view = world.rayTraceBlocks(eye, direction, LOOK_MAX_DISTANCE,
+          FluidCollisionMode.NEVER, true);
+      if (hitsBlock(view, x, y, z)) {
+        return true;
+      }
+    }
+    return visibleMiningFace(world, eye, x, y, z, null);
+  }
+
+  /** 实时检查不读取位图；首个命中必须是真实目标，且所有途中区块都已有归属。 */
+  private static boolean visibleMiningFace(World world, Location eye, int x, int y, int z,
+      java.util.function.Predicate<? super Block> keepCover) {
+    if (!MiningSight.inRange(eye.getX(), eye.getY(), eye.getZ(), x, y, z, DIG_MAX_SIGHT_DISTANCE)
+        || !rayChunksAvailable(world, eye, x, z)) {
+      return false;
+    }
+    // 水不遮眼；岩浆仍作为遮挡，避免实时兜底把熔岩里的矿亮出来。
+    java.util.function.Predicate<Block> collision = block -> (keepCover == null || keepCover.test(block))
+        && block.getType() != Material.WATER;
+    return MiningSight.anyHit(eye.getX(), eye.getY(), eye.getZ(), x, y, z,
+        DIG_MAX_SIGHT_DISTANCE, (px, py, pz) -> {
+          Vector direction = new Vector(px - eye.getX(), py - eye.getY(), pz - eye.getZ());
+          RayTraceResult result = world.rayTraceBlocks(eye, direction, direction.length(),
+              FluidCollisionMode.ALWAYS, true, collision);
+          return hitsBlock(result, x, y, z);
+        });
+  }
+
+  /** 斜线可能经过起终点之外的区块；检查小矩形的全部区块，避免触发跨区访问或加载新区块。 */
+  private static boolean rayChunksAvailable(World world, Location eye, int endX, int endZ) {
+    int startX = eye.getBlockX() >> 4;
+    int startZ = eye.getBlockZ() >> 4;
+    int cx = endX >> 4;
+    int cz = endZ >> 4;
+    for (int x = Math.min(startX, cx); x <= Math.max(startX, cx); x++) {
+      for (int z = Math.min(startZ, cz); z <= Math.max(startZ, cz); z++) {
+        if (!ownsChunk(world, x, z) || !world.isChunkLoaded(x, z)) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   /** 射线结果是否正好命中指定方块坐标（{@code null} 或别的方块都算未命中）。 */
@@ -2911,69 +2989,44 @@ public final class ProximityRevealer implements Listener {
     return true;
   }
 
-  /**
-   * 玩家所属线程：把「正在挖的那一格」6 邻中挖开后会看见的伪装坐标显形（见 {@link #onBlockDamage}）。
-   *
-   * <p><b>判定口径</b>：把正在挖的那一格按空气处理（{@link BitmapVisibility#beginIgnoring}），于是
-   * 朝向它的那个面成为暴露面、步进射线也不再被它挡住；其余仍是严格口径（缺数据 = 遮挡、不显形）。
-   * 这样只会提前还原「挖开之后真能看见」的坐标，不会隔着墙泄漏。
-   */
-  private void revealAfterDig(Player player, int bx, int by, int bz) {
+  /** 在最终破坏事件中检查六邻；原版实时射线只忽略本次要移除的那一格。 */
+  private void revealMiningFront(Player player, World world, int bx, int by, int bz) {
     try {
-      if (!gateOpen(player)) {
+      UUID id = player.getUniqueId();
+      String name = world.getName();
+      boolean hasNeighbour = false;
+      for (int i = 0; i < DIG_NEIGHBOUR_COUNT && !hasNeighbour; i++) {
+        hasNeighbour = isInstantCandidate(id, name, bx + DIG_DX[i], by + DIG_DY[i], bz + DIG_DZ[i]);
+      }
+      if (!hasNeighbour || !ownsChunk(world, bx >> 4, bz >> 4)
+          || !world.isChunkLoaded(bx >> 4, bz >> 4)
+          || miningFrontQuota.claim(id, Bukkit.getCurrentTick(), 1, 1) == 0) {
         return;
       }
-      World world = player.getWorld();
-      String worldName = revealWorld(player);
-      if (worldName == null) {
+      Location eye = player.getEyeLocation();
+      if (!canSeeDugBlock(world, eye, bx, by, bz)) {
         return;
       }
-      UUID playerId = player.getUniqueId();
-      long tick = Bukkit.getCurrentTick();
-      int maxPerTick = Math.max(1, instant.maxPerTick());
-      int granted = instantQuota.claim(playerId, tick, maxPerTick, DIG_NEIGHBOUR_COUNT);
-      Budget budget = new Budget(granted);
-      if (budget.remaining() <= 0) {
-        return;
-      }
-      ProximitySelector.Eye eye = eyeOf(player);
+      java.util.function.Predicate<Block> keepCover = block -> block.getX() != bx
+          || block.getY() != by || block.getZ() != bz;
+      Budget budget = new Budget(DIG_NEIGHBOUR_COUNT);
       PassTally tally = new PassTally();
       RevealBatch batch = batchRevealSends ? new RevealBatch(world) : null;
-      BitmapVisibility bitmap = BitmapVisibility.local();
-      bitmap.beginIgnoring(bx, by, bz);
-      try {
-        for (int i = 0; i < DIG_NEIGHBOUR_COUNT; i++) {
-          if (budget.remaining() <= 0) {
-            break;
-          }
-          int x = bx + DIG_DX[i];
-          int y = by + DIG_DY[i];
-          int z = bz + DIG_DZ[i];
-          if (!isInstantCandidate(playerId, worldName, x, y, z)) {
-            continue;
-          }
-          // 开掘预显形的本意是「挖开之后才看得见」的那几格：只有位于正在挖的方块<b>背后</b>
-          // （从眼睛看被它挡住）的候选才提前还原；与它并排、本来就看得见的坐标交给周期巡检。
-          if (!occludedBy(eye, bx, by, bz, x, y, z)) {
-            continue;
-          }
-          // 这里<b>不</b>让开安静窗口（与逐坐标路径口径不同，是刻意的）：上面 occludedBy 已经保证这些
-          // 坐标此刻被正在挖的那一格挡住、根本不在画面上，因此不存在「与刚变更的那一格同段重绘导致闪一下」
-          // 的问题；反过来按 section 剔除时，6 邻与正在挖的一格几乎总在同一 section，会把这条预显形整条
-          // 路径变成永不执行（连续挖掘时尤其明显）。
-          sendOne(player, world, x, y, z, eye, budget, tally, batch, false);
+      for (int i = 0; i < DIG_NEIGHBOUR_COUNT; i++) {
+        int x = bx + DIG_DX[i];
+        int y = by + DIG_DY[i];
+        int z = bz + DIG_DZ[i];
+        if (isInstantCandidate(id, name, x, y, z)
+            && visibleMiningFace(world, eye, x, y, z, keepCover)) {
+          sendOne(player, world, x, y, z, null, budget, tally, batch, true);
         }
-      } finally {
-        bitmap.endIgnoring();
       }
       flushBatch(player, batch, tally);
-      instantQuota.release(playerId, tick, maxPerTick, granted, tally.sent);
-    } catch (Throwable throwable) {
-      logThrottled(throwable);
+      stats.miningLiveReveals.add(tally.sent);
+    } catch (RuntimeException ex) {
+      logThrottled(ex);
     }
   }
-
-  // ============================== 视野变化增量巡检（M3）==============================
 
   /** 视野变化增量巡检：单次最多评估的候选数（硬上限；同时也是取候选窗口）。 */
   private static final int MAX_VIEW_CHANGE_CANDIDATES = 32;

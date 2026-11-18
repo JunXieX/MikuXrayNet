@@ -56,39 +56,36 @@ jobs:
       - name: Resolve release info
         if: startsWith(github.ref, 'refs/tags/')
         id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          VER="${GITHUB_REF_NAME#v}"
-          echo "title=MikuXrayNet ${VER}" >> "$GITHUB_OUTPUT"
-          # 版本规则：只有显式后缀（-alpha / -beta / -rc 等）才是预发布；
-          # 纯数字 x.y.z 一律正式版（1.30.5 这类补丁版也是正式版，自动置为 Latest）。
-          case "$VER" in
-            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
-            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
-          esac
-          # 更新日志：取该 tag 所指提交的正文（%(contents:body)；打轻量 tag 时会回落到提交正文）。
-          # 约定：发版提交（release: 发布正式版 x.y.z / 测试版）的正文就是本次更新日志。
-          # 取不到（例如该提交没有正文）时留空，由下面的 generate_release_notes 兜底——
-          # 绝不因为「缺日志」让发布失败，也绝不阻断构建。
-          # 优先取发版提交的正文：注解 tag 的 %(contents:body) 会剥掉以 # 开头的行
-          # （章节标题如 ## 修复 会被 git 当成注释丢弃），提交正文则原样保留。
-          # 正文为空时才回落到 tag 正文，绝不因缺日志让发布失败。
+          VER="$(python3 -c 'import xml.etree.ElementTree as et; print(et.parse("pom.xml").getroot().findtext("{http://maven.apache.org/POM/4.0.0}version"))')"
+          if [[ ! "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || "$GITHUB_REF_NAME" != "v$VER" ]]; then
+            echo "::error::标签 $GITHUB_REF_NAME 与 pom.xml 版本 $VER 不一致，或不是正式版本号"
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          NOTES="$(git log -1 --format=%b "$GITHUB_SHA")"
+          if [[ -z "${NOTES//[[:space:]]/}" ]]; then
+            echo '::error::发版提交缺少更新日志正文'
+            exit 1
+          fi
+          DELIMITER="$(cat /proc/sys/kernel/random/uuid)"
           {
-            echo 'notes<<MIKUXRAYNET_RELEASE_NOTES_EOF'
-            NOTES="$(git log -1 --format=%b "$GITHUB_SHA" 2>/dev/null || true)"
-            if [ -z "$NOTES" ]; then
-              NOTES="$(git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" 2>/dev/null || true)"
-            fi
+            echo 'publish=true'
+            echo "title=MikuXrayNet $VER"
+            echo "notes<<$DELIMITER"
             printf '%s\n' "$NOTES"
-            echo 'MIKUXRAYNET_RELEASE_NOTES_EOF'
+            echo "$DELIMITER"
           } >> "$GITHUB_OUTPUT"
 
       - name: Publish Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && steps.rel.outputs.publish == 'true'
         uses: softprops/action-gh-release@v3
         with:
           name: ${{ steps.rel.outputs.title }}
           files: target/MikuXrayNet-*.jar
-          prerelease: ${{ steps.rel.outputs.prerelease }}
-          # 更新日志在前、GitHub 自动生成的变更清单与 Full Changelog 链接附在其后
           body: ${{ steps.rel.outputs.notes }}
-          generate_release_notes: true

@@ -98,6 +98,39 @@ class ObfuscationProcessorTest {
   }
 
   @Test
+  void exposedOreStaysGenuineOnFirstPacketButCoveredOreAndOtherTargetsAreStillMasked() {
+    int otherTarget = 3;
+    BitSet targets = new BitSet();
+    targets.set(DIAMOND_ORE);
+    targets.set(otherTarget);
+    BitSet keepExposed = new BitSet();
+    keepExposed.set(DIAMOND_ORE);
+    ObfuscationProcessor.WorldProfile profile = new ObfuscationProcessor.WorldProfile(targets,
+        new int[] {STONE}, new int[] {1}, new int[0], new int[0], new int[0][], new int[0][],
+        Integer.MIN_VALUE, Integer.MAX_VALUE, true, false, keepExposed);
+    ObfuscationProcessor processor = new ObfuscationProcessor(new ChunkCodec(registry(), MODERN),
+        id -> id != AIR && id != otherTarget, false, true,
+        new ObfuscationProcessor.PaletteOptions(false, false), false, null, profile,
+        new ObfuscationProcessor.WorldProfile[0], null);
+    int[] states = filled(STONE);
+    int exposed = index(8, 8, 8);
+    int neighbouringTarget = index(7, 8, 8);
+    int buried = index(10, 8, 10);
+    states[exposed] = DIAMOND_ORE;
+    states[neighbouringTarget] = otherTarget;
+    states[buried] = DIAMOND_ORE;
+
+    ObfuscationProcessor.Result result = processor.rewrite(chunk(states), 1, 42L);
+
+    assertTrue(result.changed());
+    assertEquals(DIAMOND_ORE, decodeState(result.data(), 1, exposed),
+        "不能让先改写的邻格遮住矿物原本露出的面");
+    assertEquals(STONE, decodeState(result.data(), 1, buried));
+    assertEquals(STONE, decodeState(result.data(), 1, neighbouringTarget));
+    assertArrayEquals(new int[] {neighbouringTarget, buried}, result.obfuscatedPositions());
+  }
+
+  @Test
   void diagonalNeighborsDoNotCount() {
     int[] states = filled(AIR);
     for (int dx = -1; dx <= 1; dx++) {

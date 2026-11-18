@@ -66,6 +66,7 @@ public final class OcclusionEngine implements AutoCloseable {
   private final ArrayDeque<Request> queue = new ArrayDeque<>();
   /** 本周期已消耗的射线耗时（写锁内更新；工作线程在读锁内比对预算）。 */
   private long budgetSpentNanos;
+  private long cycleGeneration;
   /** 本周期预算；{@code -1} 表示尚未开启任何周期。 */
   private long budgetNanos = -1L;
   private boolean cycleActive;
@@ -111,6 +112,7 @@ public final class OcclusionEngine implements AutoCloseable {
     synchronized (lock) {
       this.budgetNanos = budgetNanos;
       this.budgetSpentNanos = 0L;
+      this.cycleGeneration++;
       this.cycleActive = budgetNanos > 0L;
       lock.notifyAll();
     }
@@ -201,6 +203,7 @@ public final class OcclusionEngine implements AutoCloseable {
     CountingLookup lookup = new CountingLookup(stats);
     while (true) {
       Request request;
+      long dispatchedIn;
       synchronized (lock) {
         while (!closed && (!cycleActive || queue.isEmpty())) {
           if (closed) {
@@ -227,6 +230,7 @@ public final class OcclusionEngine implements AutoCloseable {
           continue;
         }
         request = queue.pollFirst();
+        dispatchedIn = cycleGeneration;
         if (request == null) {
           continue;
         }
@@ -251,11 +255,21 @@ public final class OcclusionEngine implements AutoCloseable {
         stats.computeFailures.increment();
         continue;
       }
-      long spent = System.nanoTime() - start;
+      long end = System.nanoTime();
+      long spent = end - start;
       stats.computed.increment();
       stats.nanosTotal.add(spent);
       synchronized (lock) {
-        budgetSpentNanos += spent;
+        if (closed) {
+          return;
+        }
+        if (dispatchedIn == cycleGeneration) {
+          budgetSpentNanos += spent;
+        }
+      }
+      if (deadline != 0L && end - deadline > 0L) {
+        stats.timeoutDiscarded.increment();
+        continue;
       }
       try {
         request.sink().accept(request, fullyOccluded);

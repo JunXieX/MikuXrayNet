@@ -242,8 +242,9 @@ public final class SwmrLongMap<V> {
     t.slots[index] = USED;
     size++;
 
-    if ((size + tombstones) * 1.0f / capacity >= LOAD_FACTOR) {
-      rehash(capacity << 1);
+    if ((size + tombstones) >= capacity * LOAD_FACTOR) {
+      // 卸载造成的墓碑先原地清理；只有较多活条目时才扩大表，保留重建迟滞。
+      rehash(size < (capacity >>> 1) ? capacity : capacity << 1);
     }
     return null;
   }

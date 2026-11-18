@@ -3,9 +3,8 @@ package net.mikumc.mikuxraynet.concurrency;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -24,7 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class MikuWorkPool implements AutoCloseable {
 
   private final ThreadPoolExecutor executor;
-  private final ScheduledExecutorService watchdog;
+  private final ScheduledThreadPoolExecutor watchdog;
   private final int queueCapacity;
 
   /** 非关键任务准入时为区块改写预留的队列比例分母（1/4 ⇒ 最多用 3/4）。 */
@@ -81,11 +80,13 @@ public final class MikuWorkPool implements AutoCloseable {
         workerFactory,
         new ThreadPoolExecutor.AbortPolicy());
 
-    this.watchdog = Executors.newSingleThreadScheduledExecutor(runnable -> {
+    this.watchdog = new ScheduledThreadPoolExecutor(1, runnable -> {
       Thread thread = new Thread(runnable, "MikuXrayNet-Watchdog");
       thread.setDaemon(true);
       return thread;
     });
+    // 每个已写出的区块都会取消定时器，不能让已取消节点留到原截止时间才出队。
+    this.watchdog.setRemoveOnCancelPolicy(true);
   }
 
   /** 工作线程数（诊断用）。 */
@@ -253,7 +254,7 @@ public final class MikuWorkPool implements AutoCloseable {
     // 早于上面的置位 ⇒ 早于快照）；凡登记晚于快照的任务，execute 的第二次 closed 读必然为 true，
     // 由它自行 releaseOnTimeout 放行。两侧合起来即「恰好放行一次」。
     Set<RewriteTask> snapshot = Set.copyOf(pending);
-    this.executor.shutdownNow();
+    int dropped = this.executor.shutdownNow().size();
     for (RewriteTask task : snapshot) {
       try {
         task.releaseOnTimeout();
@@ -264,7 +265,8 @@ public final class MikuWorkPool implements AutoCloseable {
     pending.clear();
     // 队列里被 shutdownNow 丢弃的任务永远不会「开始执行」，其 +1 也就永远不会被撤销；清零避免计数残留。
     // （关闭后 hasCapacity 因 closed 已恒为 false，本值不再影响任何结果，仅作清理以免诊断口径失真。）
-    this.queuedTasks.set(0);
+    // 已出队的任务会自行扣减；这里只扣实际被 shutdownNow 撤下的队列任务。
+    this.queuedTasks.addAndGet(-dropped);
     this.watchdog.shutdownNow();
   }
 }

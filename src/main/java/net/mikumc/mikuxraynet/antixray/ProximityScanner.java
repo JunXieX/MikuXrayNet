@@ -78,6 +78,8 @@ final class ProximityScanner {
      * 不需要再靠玩家反馈猜。
      */
     long farthestDistanceSquared;
+    int visited;
+    boolean continued;
   }
 
   /** 带距离与到达序号的候选（堆选择需要次级键来保持「等距候选先到者在前」的稳定顺序）。 */
@@ -111,6 +113,111 @@ final class ProximityScanner {
    * 因此按固定周期给它们一次重试机会，把「永久假」收敛成「最多一个重试周期」。
    */
   static final double NEAR_RETRY_DISTANCE_SQUARED = 64.0D;
+
+  /** 周期巡检的窗口。每轮消费一段游标，不以“最近的同一批”覆盖上一轮。 */
+  static final class Cursor {
+    private String world;
+    private int chunkX, chunkZ, radius;
+    private int ordinal;
+    private int localIndex;
+
+    private void anchor(String name, int cx, int cz, int distance) {
+      if (!name.equals(world) || cx != chunkX || cz != chunkZ || distance != radius) {
+        world = name;
+        chunkX = cx;
+        chunkZ = cz;
+        radius = distance;
+        ordinal = 0;
+        localIndex = 0;
+      }
+    }
+  }
+
+  static List<ObfuscatedChunkIndex.Position> nextWindow(Cursor cursor, ObfuscatedChunkIndex index,
+      RevealedSet revealed, UUID playerId, String world, int x, int y, int z, int radius,
+      int shard, int shards, int limit, int maxColumns, int maxPositions, boolean retryNearby,
+      Tally tally, Prefilter prefilter) {
+    cursor.anchor(world, x >> 4, z >> 4, radius);
+    int width = 2 * radius + 1;
+    int columns = width * width;
+    long maxDistance = 16L * radius;
+    long maxDistanceSquared = maxDistance * maxDistance;
+    List<ObfuscatedChunkIndex.Position> results = new ArrayList<>(Math.min(limit, 32));
+    for (int lookedUp = 0; cursor.ordinal < columns && lookedUp < maxColumns
+        && tally.visited < maxPositions && results.size() < limit; lookedUp++) {
+      long offset = ringOffset(cursor.ordinal);
+      int cx = cursor.chunkX + (int) (offset >> 32);
+      int cz = cursor.chunkZ + (int) offset;
+      ObfuscatedChunkIndex.ChunkEntry entry = shardOf(cx, cz, shards) == shard
+          ? index.entry(world, cx, cz) : null;
+      if (entry != null) {
+        revealed.touch(playerId, world, cx, cz);
+        int[] locals = entry.locals();
+        if (revealed.sizeFor(playerId, world, cx, cz) < locals.length || retryNearby) {
+          tally.chunksScanned++;
+          while (cursor.localIndex < locals.length && tally.visited < maxPositions
+              && results.size() < limit) {
+            int local = locals[cursor.localIndex++];
+            tally.visited++;
+            int bx = (cx << 4) | (local & 15);
+            int by = entry.minHeight() + (local >> 8);
+            int bz = (cz << 4) | ((local >>> 4) & 15);
+            long distance = distanceSquared(bx, by, bz, x, y, z);
+            if (distance > maxDistanceSquared
+                || (revealed.contains(playerId, world, cx, cz, bx, by, bz)
+                    && !(retryNearby && distance <= NEAR_RETRY_DISTANCE_SQUARED))) {
+              continue;
+            }
+            tally.positionsEvaluated++;
+            if (prefilter != null && !prefilter.test(bx, by, bz)) {
+              tally.prefiltered++;
+              continue;
+            }
+            results.add(new ObfuscatedChunkIndex.Position(bx, by, bz));
+          }
+          if (cursor.localIndex < locals.length) {
+            break;
+          }
+        } else {
+          tally.chunksSkipped++;
+        }
+      } else if (shards > 1) {
+        tally.chunksDeferred++;
+      }
+      cursor.ordinal++;
+      cursor.localIndex = 0;
+    }
+    tally.continued = cursor.ordinal < columns;
+    if (!tally.continued) {
+      cursor.ordinal = 0;
+      cursor.localIndex = 0;
+    }
+    results.sort(java.util.Comparator.comparingLong(pos -> distanceSquared(pos.x(), pos.y(), pos.z(), x, y, z)));
+    if (!results.isEmpty()) {
+      ObfuscatedChunkIndex.Position last = results.getLast();
+      tally.farthestDistanceSquared = distanceSquared(last.x(), last.y(), last.z(), x, y, z);
+    }
+    return results;
+  }
+
+  private static long ringOffset(int ordinal) {
+    if (ordinal == 0) {
+      return 0L;
+    }
+    int ring = ((int) Math.sqrt(ordinal) + 1) / 2;
+    int side = ring * 2;
+    int prevWidth = side - 1;
+    int step = ordinal - prevWidth * prevWidth;
+    int dx;
+    int dz;
+    switch (step / side) {
+      case 0 -> { dx = -ring + step; dz = -ring; }
+      case 1 -> { dx = ring; dz = -ring + step - side; }
+      case 2 -> { dx = ring - (step - 2 * side); dz = ring; }
+      default -> { dx = -ring; dz = ring - (step - 3 * side); }
+    }
+    return ((long) dx << 32) | (dz & 0xffffffffL);
+  }
 
   private ProximityScanner() {
   }

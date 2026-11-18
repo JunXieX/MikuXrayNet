@@ -130,6 +130,11 @@ public final class RewriteTask {
     return occlusionStamps;
   }
 
+  /** 纯计算可跳过已被看门狗或停用路径放行的任务。 */
+  public boolean isOpen() {
+    return gate.get() == GATE_OPEN;
+  }
+
   /** 是否已超过处理时限。 */
   public boolean expired() {
     return System.nanoTime() - deadlineNanos > 0L;

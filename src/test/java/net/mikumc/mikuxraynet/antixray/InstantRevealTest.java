@@ -534,9 +534,9 @@ class InstantRevealTest {
   private static void invokeReveal(ProximityRevealer revealer, Player player) {
     try {
       Method reveal = ProximityRevealer.class.getDeclaredMethod("reveal", Player.class,
-          ProximityRevealer.Budget.class, int.class);
+          ProximityRevealer.Budget.class);
       reveal.setAccessible(true);
-      reveal.invoke(revealer, player, new ProximityRevealer.Budget(64), 0);
+      reveal.invoke(revealer, player, new ProximityRevealer.Budget(64));
     } catch (ReflectiveOperationException failure) {
       Throwable cause = failure.getCause() == null ? failure : failure.getCause();
       throw new AssertionError("无工作池时 reveal 必须直接跳过，绝不同步计算：" + cause, cause);

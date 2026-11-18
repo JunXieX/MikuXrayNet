@@ -134,6 +134,30 @@ class ProximityScannerTest {
     assertEquals(plain, filtered, "预筛返回 true 时必须与不挂预筛逐条一致（纯剪枝，不改结论）");
   }
 
+  @Test
+  void boundedCursorReachesFarCandidateWithoutWaitingForBuriedOrVisibleCellsToDisappear() {
+    ObfuscatedChunkIndex index = index();
+    RevealedSet revealed = revealed();
+    index.recordChunkWithRemovals(WORLD, 0, 0, MIN_HEIGHT,
+        new int[] {local(8, 64, 8), local(9, 64, 8), local(10, 64, 8), local(11, 64, 8)});
+    index.recordChunkWithRemovals(WORLD, 1, 0, MIN_HEIGHT, new int[] {local(16, 64, 8)});
+    ProximityScanner.Cursor cursor = new ProximityScanner.Cursor();
+    List<Integer> seen = new java.util.ArrayList<>();
+    boolean continued;
+    int rounds = 0;
+    do {
+      ProximityScanner.Tally tally = new ProximityScanner.Tally();
+      for (var pos : ProximityScanner.nextWindow(cursor, index, revealed, PLAYER, WORLD, 8, 64, 8,
+          1, 0, 1, 1, 2, 2, false, tally, (x, y, z) -> x >= 11)) {
+        seen.add(pos.x());
+      }
+      assertTrue(tally.visited <= 2, "全部被拒的坐标也计入访问额度");
+      continued = tally.continued;
+      assertTrue(++rounds < 12, "截断后游标必须前进");
+    } while (continued);
+    assertEquals(List.of(11, 16), seen, "近区留在索引里也不应继续霸占窗口");
+  }
+
   // ------------------------------------------------------------------ 局部扫描边界
 
   @Test

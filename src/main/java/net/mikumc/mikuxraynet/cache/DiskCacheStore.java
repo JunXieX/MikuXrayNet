@@ -15,7 +15,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -213,7 +213,7 @@ public final class DiskCacheStore implements AutoCloseable {
   private final long readTimeoutMillis;
   /** flush / 世界失效的等待预算（毫秒）；生产为 {@link #FLUSH_WAIT_MILLIS}，测试可放宽。 */
   private final long flushWaitMillis;
-  private final ScheduledExecutorService executor;
+  private final ScheduledThreadPoolExecutor executor;
   /**
    * 压缩（整文件重写）专用线程：<b>读写与压缩分线程</b>。
    *
@@ -238,6 +238,8 @@ public final class DiskCacheStore implements AutoCloseable {
   private final AtomicBoolean compactionRunning = new AtomicBoolean();
 
   private volatile boolean closed;
+  /** 最终收尾已经到达磁盘线程，迟到的提交不得再打开区域文件。 */
+  private volatile boolean ioFinalized;
 
   /**
    * {@link #close()} 是否已开始（CAS 保证并发/重复调用只真正排空一次）。
@@ -277,7 +279,7 @@ public final class DiskCacheStore implements AutoCloseable {
     this.flushWaitMillis = Math.max(1L, flushWaitMillis);
     // 0 表示不限制单文件大小（磁盘换命中率）；压实时的内存尖峰仍由 compact 的总解压量闸门兜住。
     this.maxFileSizeBytes = config.maxFileSizeMb() <= 0 ? 0L : (long) config.maxFileSizeMb() * 1024L * 1024L;
-    this.executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
+    this.executor = new ScheduledThreadPoolExecutor(1, runnable -> {
       Thread thread = new Thread(() -> {
         // 由磁盘线程自身写入身份标记：只有在磁盘线程内执行时才为 true，外来线程无法伪造（见 DISK_THREAD）
         DISK_THREAD.set(Boolean.TRUE);
@@ -293,6 +295,7 @@ public final class DiskCacheStore implements AutoCloseable {
 
     // 压缩专用线程：不写 DISK_THREAD 身份标记（它本就不是磁盘线程，submit() 因此不会把它误判成
     // 「已在磁盘线程内」而绕过排队；压缩路径也从不提交任务给磁盘线程，不存在自等自）。
+    this.executor.setRemoveOnCancelPolicy(true);
     this.compactionExecutor = Executors.newSingleThreadExecutor(runnable -> {
       Thread thread = new Thread(runnable, "MikuXrayNet-DiskCache-Compact");
       thread.setDaemon(true);
@@ -498,6 +501,7 @@ public final class DiskCacheStore implements AutoCloseable {
     }
     try {
       executor.submit(() -> {
+        ioFinalized = true;
         try {
           flushAll();
           closeAllHandles();
@@ -1326,20 +1330,15 @@ public final class DiskCacheStore implements AutoCloseable {
    *         调用方若依赖「任务必然执行」来做收尾（如压缩后的记账），必须检查该返回值。
    */
   private boolean execute(ThrowingRunnable task) {
-    // closed 也视为「不可提交」：关闭排队期间仍可能有工作线程越过 usable() 判定才提交，
-    // 若放行就会在排空之后重新打开句柄（见 close() 说明）。
-    if (closed || executor == null || executor.isShutdown()) {
+    if (!reserveOperation()) {
       return false;
     }
-    if (pendingOps.get() >= config.queueCapacity()) {
-      stats.rejectedByBacklog.increment();
-      return false;
-    }
-    pendingOps.incrementAndGet();
     try {
       executor.execute(() -> {
         try {
-          task.run();
+          if (!ioFinalized) {
+            task.run();
+          }
         } catch (Throwable throwable) {
           stats.errors.increment();
         } finally {
@@ -1354,10 +1353,24 @@ public final class DiskCacheStore implements AutoCloseable {
     }
   }
 
-  /** 提交一个带预算的任务；超时或异常都返回 {@code null}（fail-open）。 */
+  /** 含排队和正在执行的操作，额度由 CAS 一次申请。周期维护和最终关停不占该额度。 */
+  private boolean reserveOperation() {
+    if (closed || executor.isShutdown()) {
+      return false;
+    }
+    int current;
+    do {
+      current = pendingOps.get();
+      if (current >= config.queueCapacity()) {
+        stats.rejectedByBacklog.increment();
+        return false;
+      }
+    } while (!pendingOps.compareAndSet(current, current + 1));
+    return true;
+  }
+
   private <T> T submit(Callable<T> task, long timeoutMillis) {
-    // 与 execute() 同理：closed 后一律不再提交（关闭中的排空任务由 close() 直接 submit，不走这里）。
-    if (closed || executor == null || executor.isShutdown()) {
+    if (closed || executor.isShutdown()) {
       return null;
     }
     if (isCacheThread()) {
@@ -1368,66 +1381,44 @@ public final class DiskCacheStore implements AutoCloseable {
         return null;
       }
     }
-    if (pendingOps.get() >= config.queueCapacity()) {
-      stats.rejectedByBacklog.increment(); // 读因积压被拒即降级为未命中，必须可见（否则只表现为命中率偏低）
+    if (!reserveOperation()) {
       return null;
     }
-
-    pendingOps.incrementAndGet();
-    // 「本次提交的额度只归还一次」的令牌：超时路径与任务 finally 都靠它做 claim-once。
-    //
-    // 为什么不能用 future.cancel(false) 的返回值判断：FutureTask.cancel 对**正在运行**的任务同样返回
-    // true（运行中状态仍是 NEW，只有 set() 才离开 NEW）。于是「任务在 50ms 内超时、但仍在磁盘线程上
-    // 执行」时，读线程扣一次、任务 finally 再扣一次 → pendingOps 每次 -1 漂移，变负后三处队列上限
-    // （读/写/收尾）永远为假，积压保护彻底失效且 rejectedByBacklog 不再自增。
-    AtomicBoolean settled = new AtomicBoolean();
     Future<T> future;
     try {
       future = executor.submit(() -> {
         try {
-          return task.call();
+          return ioFinalized ? null : task.call();
         } finally {
-          if (settled.compareAndSet(false, true)) {
-            pendingOps.decrementAndGet();
-          }
+          pendingOps.decrementAndGet();
         }
       });
     } catch (Throwable throwable) {
-      if (settled.compareAndSet(false, true)) {
-        pendingOps.decrementAndGet();
-      }
+      pendingOps.decrementAndGet();
       fail("磁盘缓存任务提交失败", throwable);
       return null;
     }
-
     try {
       return future.get(timeoutMillis, TimeUnit.MILLISECONDS);
     } catch (TimeoutException exception) {
-      // 只取消、不中断：磁盘线程是共享的单线程，interrupt=true 会打断它正在进行的 FileChannel IO，
-      // 而 FileChannel 一被中断就永久关闭（ClosedByInterruptException）→ 该区域文件句柄作废，
-      // 且脏 bucket 无法再落盘（真机上表现为每 30 秒一条 ClosedChannelException）。
-      // 读超时的语义本来就是「本次按未命中降级」，任务稍后自行跑完即可，无需打断。
-      //
-      // pendingOps 必须精确偿还：计数在提交前自增，唯一的递减点在任务 lambda 的 finally 里。
-      // 若任务「尚未被工作线程取出」，cancel(false) 会把 FutureTask 直接置为 CANCELLED，
-      // 该 callable 永不执行 → 其 finally 永不运行 → 计数每超时一次永久 +1；
-      // 累积到 queueCapacity 后（put 与 submit 都以它为门限）磁盘缓存会静默彻底停用，直到重启。
-      // 因此：cancel 返回 true（确认任务未运行、finally 不会执行）时由本线程补一次递减；
-      // cancel 返回 false 说明任务已在运行或已完成，其 finally 会（或已经）递减，不得重复扣减。
-      future.cancel(false);
-      if (settled.compareAndSet(false, true)) {
-        // 抢到令牌 ⇒ 任务尚未开始（其 finally 不会执行）⇒ 由本线程归还额度。
-        // 抢不到 ⇒ 任务已开始或已结束，其 finally 已归还，绝不重复扣减。
-        pendingOps.decrementAndGet();
-      }
+      cancelQueuedRead(future);
       stats.errors.increment();
       return null;
     } catch (ExecutionException exception) {
       fail("磁盘缓存任务执行失败", exception.getCause() == null ? exception : exception.getCause());
       return null;
     } catch (InterruptedException exception) {
+      cancelQueuedRead(future);
       Thread.currentThread().interrupt();
       return null;
+    }
+  }
+
+  /** 只有从队列里实际摘下的操作才当场还额度；已被 worker 取走的由 finally 收尾。 */
+  private void cancelQueuedRead(Future<?> future) {
+    if (future instanceof Runnable queued && executor.remove(queued)) {
+      future.cancel(false);
+      pendingOps.decrementAndGet();
     }
   }
 
@@ -1459,17 +1450,16 @@ public final class DiskCacheStore implements AutoCloseable {
       }
       return;
     }
-    if (pendingOps.get() >= config.queueCapacity()) {
-      stats.rejectedByBacklog.increment(); // 收尾操作（落盘/关句柄）被跳过：脏数据滞留内存更久，必须可见
+    if (!reserveOperation()) {
       return;
     }
-
-    pendingOps.incrementAndGet();
     Future<?> future;
     try {
       future = executor.submit(() -> {
         try {
-          task.call();
+          if (!ioFinalized) {
+            task.call();
+          }
         } catch (Throwable throwable) {
           // 在这里就地记录：调用方超时返回后没人再看 future 的异常，否则失败会被静默吞掉
           fail("磁盘缓存收尾操作失败（本次按无操作跳过，不影响链路）", throwable);

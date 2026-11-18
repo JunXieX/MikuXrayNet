@@ -548,6 +548,34 @@ class DiskCacheStoreTest {
    * 累积到 {@code queue-capacity} 后 {@code put}/{@code submit} 双双提前返回，磁盘缓存被静默彻底停用。
    */
   @Test
+  void timedOutQueuedReadsAreRemovedImmediately(@TempDir Path dir) throws Exception {
+    try (DiskCacheStore cache = new DiskCacheStore(dir, config(32, 600, 600), LOGGER, 15L)) {
+      var executor = (java.util.concurrent.ScheduledThreadPoolExecutor) diskThreadExecutor(cache);
+      var started = new CountDownLatch(1);
+      var release = new CountDownLatch(1);
+      executor.execute(() -> {
+        started.countDown();
+        try {
+          release.await();
+        } catch (InterruptedException ex) {
+          Thread.currentThread().interrupt();
+        }
+      });
+      try {
+        assertTrue(started.await(2, TimeUnit.SECONDS));
+        int initial = executor.getQueue().size();
+        for (int i = 0; i < 8; i++) {
+          assertNull(cache.get("world", i, 0, 0));
+        }
+        assertEquals(initial, executor.getQueue().size(), "超时操作不得继续占用等待队列");
+        assertEquals(0, pendingOps(cache));
+      } finally {
+        release.countDown();
+      }
+    }
+  }
+
+  @Test
   void readTimeoutDoesNotLeakPendingOperations(@TempDir Path dir) throws Exception {
     DiskCacheStore store = store(dir, config(100, 3600, 300));
     CountDownLatch release = new CountDownLatch(1);

@@ -24,31 +24,16 @@ class RevealDeliveryGuardTest {
 
   private static final Path MAIN = Path.of("src/main/java/net/mikumc/mikuxraynet");
 
-  /**
-   * Folia 上实体调度器任务随实体退役：重生与切维都会重建实体，任务句柄随之失效且不保证回调。
-   * 周期巡检与视线即时显形都是「每玩家一条实体调度任务」，不重排就是该玩家此后只能靠事件还原假矿。
-   */
   @Test
-  void proximityTasksAreRescheduledOnRespawnAndWorldChange() throws IOException {
+  void foliaReusesHealthyTaskAndRetiresByIdentity() throws IOException {
     String source = stripComments(readSource("antixray/ProximityRevealer.java"));
-    for (String handler : new String[] {"onRespawn", "onChangedWorld"}) {
-      String body = methodBody(source, handler);
-      assertTrue(body != null, handler + " 必须存在（Folia 重生 / 切维会重建实体）");
-      assertTrue(body.contains("rescheduleEntityTasks("),
-          handler + " 必须重排周期巡检与视线即时显形任务，否则该玩家的假矿从此只由事件路径还原");
-    }
-    String reschedule = methodBody(source, "rescheduleEntityTasks");
-    assertTrue(reschedule != null, "rescheduleEntityTasks 必须存在");
-    assertTrue(reschedule.contains("scheduleEntityTask("),
-        "重排必须真的重新调度：只取消不重排等于把两条路径永久停掉");
-    assertTrue(reschedule.contains("lookScans.remove"), "重排前必须摘掉旧的视线任务句柄");
-    assertTrue(reschedule.contains("entityScans.remove"), "重排前必须摘掉旧的周期巡检任务句柄");
+    String schedule = methodBody(source, "scheduleEntityTask");
+    assertTrue(schedule.indexOf("previous.isLive(") < schedule.indexOf("runAtFixedRate("));
+    assertTrue(schedule.contains("next.heartbeat = System.nanoTime()"));
+    assertTrue(schedule.contains("entityScans.remove(id, next)"));
+    assertTrue(methodBody(source, "rescheduleEntityTasks").contains("periodicWindows.remove(id)"));
   }
 
-  /**
-   * 开掘预显形的视线判定：只走「眼睛 → 方块中心」一条射线时，斜着挖（准星落在方块边缘/角上）
-   * 会先命中相邻方块而被判不可见——玩家整段挖掘期间看到的都是伪装方块，破坏后却掉真实矿物。
-   */
   @Test
   void digTargetRevealFallsBackToViewRay() throws IOException {
     String source = stripComments(readSource("antixray/ProximityRevealer.java"));
@@ -66,79 +51,69 @@ class RevealDeliveryGuardTest {
     assertTrue(sightBody.contains("eye.getDirection()"), "第二条射线必须用玩家真实视线方向");
   }
 
-  /**
-   * 段级（MULTI_BLOCK_CHANGE）变更的「回显过滤 + 变更日志」必须在封包线程同步完成。
-   *
-   * <p>区块包放行动作可能在改写一完成后立刻执行（封包线程或玩家线程），而历史实现把这两步连同
-   * 索引摘除一起投递到 BlockUndo 后台线程——晚一步落库就是「旧区块字节盖回去、补发列表里没有它」，
-   * 客户端永久保留旧状态（幽匿脉络等附着方块整段卡住，右键被服务端纠正后才消失）。
-   */
   @Test
-  void sectionChangeJournalingStaysOnPacketThread() throws IOException {
+  void sectionJournalingPrecedesBackgroundIndexWork() throws IOException {
     String body = methodBody(stripComments(readSource("antixray/BlockChangeRevealListener.java")),
         "unregisterMulti");
-    assertTrue(body != null, "unregisterMulti 必须存在");
-    int journal = body.indexOf("recordChange(");
-    int submit = body.indexOf("submitUndo(");
-    assertTrue(journal >= 0, "多方块变更必须在封包线程逐个记录变更日志");
-    assertTrue(submit > journal,
-        "变更日志必须先于后台投递落库：区块放行与 BlockUndo 线程竞速，晚一步落库就等于该格永不补发");
+    int journal = body.indexOf("changeJournal.recordSection(");
+    assertTrue(journal >= 0 && journal < body.indexOf("submitUndo("));
   }
 
-  /**
-   * 周期候选窗口必须挂「语义等价预筛」（六面全遮挡直接丢弃）。
-   *
-   * <p>没有它时，高矿密度世界的窗口名额会被最近的全埋矿占满（真机 dump：407 个伪装坐标/区块），
-   * 看得见的矿排在窗口外，玩家只能靠准星对准才看到真方块。
-   */
   @Test
-  void periodicScanWiresTheSemanticPrefilter() throws IOException {
-    String source = stripComments(readSource("antixray/ProximityRevealer.java"));
-    String body = methodBody(source, "reveal");
-    assertTrue(body != null, "reveal 必须存在");
-    assertTrue(body.contains("hasExposedFace("),
-        "周期巡检必须挂语义等价预筛：窗口名额只该发给可能可见的坐标");
-    assertTrue(body.contains("prefilter)") || body.contains("prefilter,"),
-        "预筛必须真的传进 ProximityScanner.candidates（只建对象不传等于没挂）");
-    assertTrue(body.contains("recordScanTally("),
-        "窗口覆盖距离与预筛丢弃数必须记账，否则「覆盖够不够」无法从 dump 判断");
+  void chunkReleaseNeverWaitsForEntityAndRepairStartsAfterWrite() throws IOException {
+    String source = stripComments(readSource("antixray/ProtocolLibAsyncListener.java"));
+    String release = methodBody(source, "completeRelease");
+    assertTrue(release.contains("signalPacketTransmission(event)"));
+    assertFalse(release.contains("scheduleReplay("));
+    assertFalse(release.contains("getScheduler("));
+    String observer = methodBody(source, "registerDeliveryObserver");
+    assertTrue(observer.contains("addPostListener("));
+    assertTrue(observer.contains("onChunkWritten("));
+    assertTrue(methodBody(source, "onChunkWritten").contains("changeJournal.written("));
   }
 
-  /**
-   * 破坏方块后的邻域强制显形：<b>去掉调度限制、保留可见性判定</b>。
-   *
-   * <p>去掉的是窗口/分片/同段安静窗口/张角判定（它们服务的是「少发包」，代价是玩家眼前的假方块排队）；
-   * 保留的是遮挡位图射线（去掉它等于把透视端要的东西直接发过去）。额度必须独立，否则一次爆炸事件
-   * 就能把当 tick 的即时显形额度吃光，紧随其后的挖掘一格都发不出去。
-   */
   @Test
-  void breakSweepBypassesSchedulingFiltersButKeepsVisibility() throws IOException {
-    String source = stripComments(readSource("antixray/ProximityRevealer.java"));
-    String entry = methodBody(source, "onBreakObserved");
-    assertTrue(entry != null, "onBreakObserved 必须存在（破坏方块后的邻域强制显形入口）");
-    assertTrue(entry.contains("breakSweep"), "入口必须读 break-sweep 配置（可关闭、可调半径）");
-    assertTrue(entry.contains("hasDisguisedNearby("), "封包线程必须先做邻域初筛，避免无谓调度");
+  void periodicScanRunsBoundedSelectionInWorker() throws IOException {
+    String body = methodBody(stripComments(readSource("antixray/ProximityRevealer.java")), "reveal");
+    int submit = body.indexOf("workPool.execute(");
+    assertTrue(submit >= 0 && body.indexOf("hasExposedFace(") > submit);
+    assertTrue(body.indexOf("nextWindow(") > submit);
+    assertTrue(body.contains("MAX_PERIODIC_POSITIONS"));
+  }
 
+  @Test
+  void successfulBreakQueuesSweepAndDoesNotReplaceLegacyAirUpdates() throws IOException {
+    String source = stripComments(readSource("antixray/ProximityRevealer.java"));
+    assertTrue(source.contains("@EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)"
+        + "\n  public void onBlockBreak(BlockBreakEvent event)"));
+    String entry = methodBody(source, "onBlockBreak");
+    assertTrue(entry.contains("!proximity.raycastEnabled()"));
+    assertTrue(entry.indexOf("revealMiningFront(") < entry.indexOf("breakSweep.enabled()"));
+    for (String guard : new String[] {"onBlockDamage", "onBreakMiningGuard"}) {
+      String body = methodBody(source, guard);
+      int correction = body.indexOf("if (revealDigTarget(");
+      assertTrue(correction >= 0 && correction < body.indexOf("event.setCancelled(true)"));
+      assertFalse(body.contains("revealMiningFront("), "尝试和拒绝事件不能提前亮出墙后");
+    }
     String sweep = methodBody(source, "revealSweep");
-    assertTrue(sweep != null, "revealSweep 必须存在");
-    assertFalse(sweep.contains("occludedBy"), "不得再做「只还原被这一格挡住」的张角判定");
-    assertFalse(sweep.contains("sameSectionAsOwnChange"), "不得让开同段安静窗口（否则整条路径几乎永不执行）");
-    assertTrue(sweep.contains("sendOne("), "必须复用既有发包链路（标记/额度/统计单点）");
-    assertTrue(sweep.contains("batch, false)"), "必须保留遮挡位图可见性判定（visibilityInPlan=false）");
-    assertTrue(sweep.contains("breakSweepQuota"), "必须用独立额度，不能被其它即时显形路径挤占");
+    assertTrue(sweep.indexOf("center.original") < sweep.indexOf("sendOne("));
+    assertTrue(sweep.contains("batch, false)"));
+    assertFalse(sweep.contains("withinManhattanRadius("));
+    assertFalse(sweep.contains("sameSectionAsOwnChange("));
+    String observe = methodBody(stripComments(readSource("antixray/BlockChangeRevealListener.java")),
+        "observeChange");
+    assertTrue(observe.contains("onBlockChangeObserved("));
+    assertFalse(observe.contains("onBreakObserved("));
   }
 
-  /** 「变成空气」与一般暴露类变更必须分流：前者整片扫邻域，后者保持旧的「只还原被挡住的」。 */
   @Test
-  void airChangesRouteToBreakSweep() throws IOException {
-    String source = stripComments(readSource("antixray/BlockChangeRevealListener.java"));
-    assertTrue(source.contains("clearedToAir("), "必须区分「新状态是空气」与一般暴露类变更");
-    String body = methodBody(source, "observeChange");
-    assertTrue(body != null, "observeChange 必须存在");
-    int sweep = body.indexOf("onBreakObserved(");
-    int legacy = body.indexOf("onBlockChangeObserved(");
-    assertTrue(sweep >= 0, "破坏（新状态是空气）必须走邻域强制显形");
-    assertTrue(legacy > sweep, "非空气的暴露类变更（火把/玻璃）仍走旧的「只还原被挡住」路径");
+  void slowPreparationDoesNotClaimExclusivePacketWrite() throws IOException {
+    String body = methodBody(stripComments(readSource("antixray/ProtocolLibAsyncListener.java")), "handleAsync");
+    int prepare = body.indexOf("pipeline.rewrite(");
+    int claim = body.indexOf("task.tryBeginWrite()");
+    assertTrue(prepare >= 0 && claim > prepare, "磁盘、解码和缓存命中准备阶段仍须让看门狗抢占");
+    assertTrue(body.indexOf("restoreOcclusion(") < claim);
+    assertTrue(claim < body.indexOf("writeBack("));
   }
 
   private static String readSource(String relativePath) throws IOException {

@@ -160,6 +160,9 @@ public final class ProximityStats {
    * （{@link #windowFarthestBlocks()}）应随之明显变大。
    */
   public final LongAdder prefilterDropped = new LongAdder();
+  public final LongAdder periodicVisited = new LongAdder();
+  public final LongAdder periodicContinued = new LongAdder();
+  public final LongAdder taskRestarts = new LongAdder();
 
   /**
    * 破坏方块后的邻域强制显形（{@code proximity.instant-reveal.break-sweep}）累计发包数。
@@ -171,6 +174,12 @@ public final class ProximityStats {
 
   /** 破坏邻域显形因每 tick 额度耗尽被截断的次数（持续偏高说明额度太小或范围工具在连破）。 */
   public final LongAdder breakSweepBudgetExhausted = new LongAdder();
+  /** 等待破坏点达到每玩家上限时淘汰的条数。 */
+  public final LongAdder breakSweepQueueDropped = new LongAdder();
+  /** 因目标仍需同步而先纠正材质、暂停本次破坏的次数。 */
+  public final LongAdder miningTargetCorrections = new LongAdder();
+  /** 实时几何确认后优先还原的方块数。 */
+  public final LongAdder miningLiveReveals = new LongAdder();
 
   /** 周期巡检窗口内最远候选的距离（格，单调取历史最大值；0 = 尚未取到候选）。 */
   private final AtomicLong windowFarthestBlocks = new AtomicLong();

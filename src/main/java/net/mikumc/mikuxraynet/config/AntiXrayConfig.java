@@ -600,9 +600,8 @@ public final class AntiXrayConfig {
    * @param revealOnChunkSend     区块包下发后立即把「该区块中当前可见」的伪装坐标显形（默认开启）。
    *                              目的是消掉「区块先以伪装状态下发、等巡检才还原」造成的矿石/箱子凭空出现；
    *                              显形包紧随区块包发出，客户端通常在同一 tick 内一并应用。
-   * @param preRevealOnDig        玩家开始挖某个方块时，预先显形其 6 邻中「挖开后会看见」的伪装坐标
-   *                              （默认开启）。客户端对挖掘有本地预测，等方块破坏后再显形必然晚一个 RTT；
-   *                              改为开掘即显形，正常挖掘速度下显形包先于方块破坏到达，玩家看不到假方块。
+   * @param preRevealOnDig        在成功破坏提交前提前还原破口附近能看到的方块
+   * @param keepExposedOres       区块首包保留有无遮蔽面的矿物；完整包住的矿仍按原规则伪装
    * @param viewChange            视野变化增量巡检（移动/转向触发，见 {@link ViewChange}）：把周期巡检
    *                              分片轮转最坏 0.8 秒的补发窗口压到 ≤ 冷却+1 tick
    */
@@ -611,7 +610,7 @@ public final class AntiXrayConfig {
       boolean frustumEnabled, double frustumFov, double frustumMinDistance,
       boolean raycastEnabled, int raycastSamples,
       InstantReveal instantReveal, int overRevealSampling, boolean batchRevealSends,
-      boolean revealOnChunkSend, boolean preRevealOnDig, ViewChange viewChange) {
+      boolean revealOnChunkSend, boolean preRevealOnDig, boolean keepExposedOres, ViewChange viewChange) {
   }
 
   /**
@@ -627,23 +626,11 @@ public final class AntiXrayConfig {
   }
 
   /**
-   * 破坏方块后的邻域强制显形：一方块被挖掉 / 炸掉 / 烧掉（新状态是空气）时，把该方块曼哈顿
-   * {@code radius} 格内「仍在伪装、玩家尚未显形过、且当前视线可见」的坐标一次性发回真实状态。
+   * 实际破坏经下一 tick 核实后，只为破坏者检查邻域内未显形的可见坐标。
    *
-   * <p><b>与事件即时显形的区别</b>：事件路径只还原「本来被这一格挡住」的坐标（按变更格对眼睛的张角
-   * 判定），并把「身边本来就看得见的伪装方块」留给周期巡检——那批坐标要等窗口轮转才轮到，玩家侧就是
-   * 「我站在这儿看着它，它还是石头」。本项把破坏点邻域<b>整片</b>过一遍（不受候选窗口、分片轮转、
-   * 同段安静窗口与张角判定限制），让「挖开一块之后身边立刻都是真方块」成为硬保证。
-   *
-   * <p><b>「强制」不等于「无视可见性」</b>：每格仍必须过遮挡位图射线（{@code raycast.enabled=true} 时）。
-   * 无视可见性就等于把透视端要的东西直接发过去；这里去掉的只是「窗口/轮转/启发式」这类<b>调度</b>限制。
-   *
-   * <p><b>触发口径只用空气</b>：放置火把 / 玻璃等同样会「露出后面的方块」，但并没有打开新的视线，
-   * 而且放置是高频动作；只认空气可避免「插一个火把刷一片显形」的观感与开销。
-   *
-   * @param enabled    总开关（默认开启）
-   * @param radius     曼哈顿半径（格，1~8，默认 4）：判定量随半径三次方增长，不建议调到 8
-   * @param maxPerTick 每玩家每 tick 的发包上限（默认 32，0 = 关闭本项）；未轮到的坐标由周期巡检兜底
+   * @param enabled 是否启用；原即时显形不随此开关关闭
+   * @param radius 曼哈顿半径（1~8 格，默认 4）
+   * @param maxPerTick 每玩家每 tick 的坐标上限（默认 32，0 表示关闭）
    */
   public record BreakSweep(boolean enabled, int radius, int maxPerTick) {
   }
@@ -972,6 +959,7 @@ public final class AntiXrayConfig {
       overrideFingerprints.add(List.of(this.worldOverrides.get(i).pattern(), perDimension));
     }
     this.configHash = Objects.hash(dimensionFingerprints, overrideFingerprints, layerObfuscation,
+        proximity.keepExposedOres(),
         neighbors.enabled(), neighbors.missingPolicy().name(),
         OcclusionRules.sortedList(this.occlusion.extraOccluding()),
         OcclusionRules.sortedList(this.occlusion.extraNonOccluding()),
@@ -1198,9 +1186,9 @@ public final class AntiXrayConfig {
             // 区块下发即显形（默认开启）：区块包放行后立即补发「该区块中当前可见」的坐标，
             // 消掉「区块先伪装、等巡检才还原」的凭空出现窗口（见 ProximityRevealer#onChunkDelivered）。
             lenientBoolean(root, "proximity.reveal-on-chunk-send", true, typeAdjustments),
-            // 开掘即预显形（默认开启）：客户端对挖掘有本地预测，等方块破坏后再显形必然晚一个 RTT；
-            // 提前到「开始挖」时把 6 邻中挖开后会看见的坐标发下去（见 ProximityRevealer#onBlockDamage）。
+            // 成功破坏前提前检查破口的六邻，不等待下一轮巡检。
             lenientBoolean(root, "proximity.instant-reveal.pre-reveal-on-dig", true, typeAdjustments),
+            lenientBoolean(root, "proximity.keep-exposed-ores", true, typeAdjustments),
             // 视野变化增量巡检（默认开启）：移动/转向超阈值时当 tick 对近场补一次受限增量扫描，
             // 把周期巡检分片轮转的最坏 0.8 秒窗口压到 ≤ 冷却+1 tick（见 ProximityRevealer#onPlayerMove）。
             new ViewChange(

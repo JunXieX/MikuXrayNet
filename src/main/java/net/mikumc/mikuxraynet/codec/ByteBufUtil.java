@@ -18,8 +18,12 @@ public class ByteBufUtil {
       if (bytes >= 5) {
         throw new IndexOutOfBoundsException("varint32 too long");
       }
-      byte in = buffer.readByte();
-      out |= (in & 0x7F) << bytes * 7;
+      int in = buffer.readUnsignedByte();
+      // 第五字节只有 4 个有效位，其余负载位不能静默折回一个看似合法的调色板值。
+      if (bytes == 4 && (in & 0x70) != 0) {
+        throw new IndexOutOfBoundsException("varint32 overflow");
+      }
+      out |= (in & 0x7F) << (bytes * 7);
       bytes++;
       if ((in & 0x80) == 0) {
         return out;

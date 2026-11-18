@@ -103,6 +103,7 @@ public final class ProtocolLibHook {
           bypassRegistry, diskCache);
       this.asyncListenerHandler = asynchronousManager.registerAsyncHandler(listener);
       // 必须显式 start()，否则异步监听器不会真正开始分发封包
+      listener.registerDeliveryObserver(protocolManager);
       this.asyncListenerHandler.start();
 
       logger.fine("反矿透封包拦截已启用（ProtocolLib 异步通道，监听 "

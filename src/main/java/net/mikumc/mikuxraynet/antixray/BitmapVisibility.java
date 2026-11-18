@@ -71,9 +71,7 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
   private final IgnoringView ignoringView = new IgnoringView();
 
   /**
-   * 本次判定要「视为空气」的方块（挖掘预显形用，见 {@code ProximityRevealer#revealAfterDig}）：
-   * 玩家正在挖的方块此刻还在客户端屏幕上，但马上就会变成空气；判定「挖开之后能不能看到邻接伪装坐标」
-   * 时必须把它按空气处理，否则射线永远被它挡住、预显形一个都不会发生。
+   * 破坏后补扫中已从实时世界核实不遮挡、但位图可能尚未更新的一格（见 {@code ProximityRevealer#revealSweep}）。
    *
    * <p><b>只影响本线程的这一次判定</b>：{@link #beginIgnoring} 与 {@link #endIgnoring} 必须成对调用
    * （异常路径写在 finally），且本实例是线程本地复用，不会影响其它线程/其它判定。
@@ -164,7 +162,7 @@ final class BitmapVisibility implements ProximitySelector.RayQuery, ProximitySel
   }
 
   /**
-   * 开始一次「把该方块视为空气」的可见性判定（挖掘预显形，见 {@code ProximityRevealer#revealAfterDig}）。
+   * 开始一次覆盖该格旧遮挡位的可见性判定（不修改共享位图）。
    *
    * <p>语义：该格在暴露面判定与步进射线上都按「不遮挡」处理（等同于它已经被挖掉），
    * 判定「挖开之后可见吗」；作用于随后在本线程上的所有 {@link #isVisible} / {@link #isOccluding} /
