@@ -54,7 +54,7 @@ MikuMC 服务器原创的 **反矿透 + 带宽优化** 双模块插件，适配 
 
 1. **依赖**
    - **PacketEvents 2.13.0+（必需）**：缺失时插件直接禁用。
-   - **ProtocolLib 5.3.0+（必需）**：它是封包拦截通道；缺失时插件仍能加载，但反矿透与带宽优化停用，仅保留配置与命令，便于排查。
+   - **ProtocolLib 5.3.0+（反矿透必需）**：它是唯一的封包拦截通道；缺失时插件仍能加载，但反矿透停用，依赖封包通道的三项带宽子模块（零位移取消 / 方块变更合并 / AFK 降级）不接线；**实体剔除与高延迟降视距不因缺少 ProtocolLib 而停用**（实体剔除此时只剩配置允许的子项：视锥看 `entity-culling.frustum.enabled`，射线遮挡要遮挡数据），调色板压缩需要区块改写、随反矿透一并停用。`/mxnet status` 的「实际未注册：…」会逐项写出未接线的模块与原因。
    - 可选兼容：ViaVersion / ViaBackwards / Geyser-Spigot（自动识别加载顺序）。
 2. **运行环境**：Paper 26.2+ 或 Folia 26.x，**Java 25**；不支持 Java 17 及以下。Folia 兼容（世界访问一律走区域调度器），且已在 `paper-plugin.yml` 显式声明 `folia-supported: true`。**只支持 Paper 系核心**（Paper / Leaf / Folia）：jar 内只附带 `paper-plugin.yml`，不再附带传统 `plugin.yml`，纯 Bukkit/Spigot 核心无法加载本插件。
 3. **配置文件**：首次启动自动生成 `antixray.yml`、`bandwidth.yml` 与 `blacklist.yml`（世界黑名单，对两个模块同时生效），全部带中文注释，按服主视角说明每项作用；改完执行 `/mikuxraynet reload` 即时生效（少部分项需重启，命令会提示）。

@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -337,36 +338,36 @@ public final class EntityPacketFilter extends PacketAdapter implements Listener 
     }
   }
 
+  /**
+   * 前段判定（纯函数，包可见便于离线回归）：{@code true} = 本次放行原包、不再判定。
+   *
+   * <p>快照缺失（{@code null}）按「判不出世界」放行：回退读 {@code player.getWorld()} 在 Folia 上属跨区域
+   * 读实体状态（先打 ERROR 再抛），封包线程一次都不能碰。黑名单世界同样不做任何优化。
+   */
+  static boolean skipInspection(String snapshotWorldName) {
+    return snapshotWorldName == null || WorldBlacklistConfig.isBlacklistedNow(snapshotWorldName);
+  }
+
   @Override
   public void onPacketSending(PacketEvent event) {
     if (!config.skipZeroMovement() || event.isCancelled() || event.getPlayer() == null) {
       return;
     }
     Player packetPlayer = event.getPlayer();
-    // 世界黑名单：命中世界的玩家不做任何带宽优化（零位移取消一并跳过）。
-    // 名单为空（默认）时 isBlacklistedNow 直接早退，热路径近乎零开销。
+    UUID playerId = packetPlayer.getUniqueId();
+    // 世界名只查 PlayerWorldIndex 快照：封包线程绝不读实体状态（Folia 上跨区域读会先打 ERROR 再抛）。
     // 世界名同时用于「实体类型索引」的世界维度（entityId 按世界各自计数，必须带上世界才能避免撞号）。
-    //
-    // 封包线程读 player.getWorld() 属跨线程读取（Folia 上是跨区域读实体状态）：与同包另两个模块
-    // （BlockChangeMerger / AfkTracker）保持同一纪律——取不到世界名就按「不做任何优化」直通，
-    // 绝不让一次读取失败把包扣住、也不让异常逃出封包监听器。
-    // 世界名优先查 PlayerWorldIndex 快照：封包线程不读实体状态（Folia 上跨区域读会先打 ERROR
-    // 再抛 No currently ticking region，每包一次）。快照缺失只可能出现在「反矿透未启用」的部署，
-    // 此时才回退到读实体世界；取不到就按「不做任何优化」直通。
-    String worldName = PlayerWorldIndex.worldName(packetPlayer.getUniqueId());
-    if (worldName == null) {
-      try {
-        worldName = packetPlayer.getWorld().getName();
-      } catch (Throwable ignored) {
+    // 快照缺失即原包放行（与 BlockChangeMerger 同一纪律）并照旧计入「放行」口径；黑名单世界不计数，
+    // 与既有口径一致（未参与判定的包不算「到达」）。
+    String worldName = PlayerWorldIndex.worldName(playerId);
+    if (skipInspection(worldName)) {
+      if (worldName == null) {
         pass();
-        return;
       }
-    }
-    if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       return;
     }
     // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API
-    if (BypassRegistry.isBypassedNow(packetPlayer.getUniqueId())) {
+    if (BypassRegistry.isBypassedNow(playerId)) {
       return;
     }
 

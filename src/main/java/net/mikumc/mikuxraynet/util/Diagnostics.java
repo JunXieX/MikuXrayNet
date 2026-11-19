@@ -1146,8 +1146,9 @@ public final class Diagnostics {
    * <p><b>并非严格纯函数</b>：文本里有三处读进程级静态状态——①「世界黑名单」一行读活动名单
    * （{@link WorldBlacklistConfig#current()}），同一份 {@link Snapshot} 在名单发布前后会格式化出不同结果；
    * ②「带宽开关」一行经 {@code ThrottlePipeline.plan()} 读平台判定（{@link PlatformSupport#isFolia()}）；
-   * ③ 同上，缺 ProtocolLib 的判定读 {@link DependencyGuard}。要让本方法真正纯，需把这些都放进
-   * {@code Snapshot}（会连带改 {@code DiagnosticsTest} 的构造点），故此处只先把描述改准。
+   * ③「带宽开关」的接线结论读快照的 {@code Env} / {@code Occlusion}（不再二次探测 Bukkit），
+   * 但平台判定与「各模块 start 是否成功」仍不在快照里——要让本方法真正纯，需把这些也放进
+   * {@code Snapshot}。
    */
   public static List<String> formatStatus(Snapshot s) {
     List<String> lines = new ArrayList<>();
@@ -1368,7 +1369,8 @@ public final class Diagnostics {
     lines.add("带宽：AFK 玩家 " + s.throttle().afkPlayers() + "（累计进入 " + s.throttle().afkEntered()
         + "），AFK 丢包 " + s.throttle().afkPacketsDropped() + "，降视距 " + s.throttle().viewDistanceReduced()
         + "/还原 " + s.throttle().viewDistanceRestored());
-    lines.add(bandwidthSwitches(s.bandwidth()));
+    lines.add(bandwidthSwitches(s.bandwidth(), s.env().protocolLibReady(),
+        s.env().antiXrayActive(), s.occlusion().active()));
     if (s.throttle().cleanupIncomplete()) {
       // 停用期有子模块清理失败：监听器/任务可能仍挂在旧实例上（停用后计数还会涨、重新启用后
       // 同一封包被处理两遍）。这类「静默残留」平时完全看不出来，必须显式点名。
@@ -1540,8 +1542,19 @@ public final class Diagnostics {
     return hints;
   }
 
-  /** 带宽各模块开关回显（一行，供 status/dump 看出每个开关的实际取值）。 */
-  private static String bandwidthSwitches(BandwidthConfig c) {
+  /** 缺封包通道时三项模块的统一原因（只用于零位移取消 / 变更合并 / AFK 降级）。 */
+  private static final String MISSING_PROTOCOL_LIB = "缺少 ProtocolLib，需要封包通道";
+
+  /**
+   * 带宽开关回显（一行）：前半句是配置，后半句是「按配置能否工作」。
+   *
+   * <p>只有零位移取消 / 变更合并 / AFK 降级要封包通道（{@code ThrottlePipeline} 在 manager==null 时跳过
+   * 它们）；实体剔除与高延迟降视距不看该前置。另两处前置写在各自片段里：调色板压缩需区块改写，
+   * 射线遮挡需遮挡数据（{@code occlusionWired}）。{@code plan()} 只按配置推导、不是装配结果，
+   * 因此本行不做「已生效」断言。
+   */
+  private static String bandwidthSwitches(BandwidthConfig c, boolean protocolLibReady,
+      boolean chunkRewriteActive, boolean occlusionWired) {
     if (c == null) {
       return "带宽开关：配置未加载";
     }
@@ -1554,62 +1567,59 @@ public final class Diagnostics {
             ? "（skip-zero-movement " + c.entityPackets().skipZeroMovement() + "）" : "")
         + "｜变更合并 " + c.blockChanges().enabled()
         + "｜调色板压缩 " + paletteSwitch(c.palette())
-        + "｜实体剔除 " + entityCullingSwitch(c.entityCulling())
+        + paletteWiring(c.palette(), c.enabled(), chunkRewriteActive)
+        + "｜实体剔除 " + entityCullingSwitch(c.entityCulling(), occlusionWired)
         + "｜AFK 降级 " + afkSwitch(c.afk())
         + "｜高延迟降视距 " + c.latency().enabled();
-    // 上面是「配置怎么写」，下面补「实际是否注册」：两者不是一回事——Folia + 非空白名单时零位移取消
-    // 整项不注册，只按配置键回显会把一个永不生效的模块显示成已启用（正是本类注释点名要避免的误读）。
-    // 无差异时不加后缀，避免正常服务器多出一段噪声。
-    ThrottlePipeline.ModulePlan plan = ThrottlePipeline.plan(c);
-    List<String> notRegistered = new ArrayList<>();
-    if (c.entityPackets().enabled() && !plan.entityPackets()) {
-      notRegistered.add("零位移取消");
+    if (!c.enabled()) {
+      // 总开关关闭是全部模块共同且唯一的原因；不能换成「缺少 ProtocolLib」这种归因错误的统一原因。
+      return configured + "｜实际未注册：全部模块（带宽总开关关闭）";
     }
-    if (c.blockChanges().enabled() && !plan.blockChanges()) {
-      notRegistered.add("变更合并");
+    ThrottlePipeline.ModulePlan plan = ThrottlePipeline.plan(c);
+    List<String> notWired = new ArrayList<>(3);
+    if (c.entityPackets().enabled() && !(protocolLibReady && plan.entityPackets())) {
+      notWired.add("零位移取消（" + (protocolLibReady
+          ? ThrottlePipeline.entityPacketsDisabledReason(c) : MISSING_PROTOCOL_LIB) + "）");
+    }
+    if (c.blockChanges().enabled() && !(protocolLibReady && plan.blockChanges())) {
+      notWired.add("变更合并（" + (protocolLibReady
+          ? "block-changes.merge=false" : MISSING_PROTOCOL_LIB) + "）");
+    }
+    if (c.afk().enabled() && !protocolLibReady) {
+      notWired.add("AFK 降级（" + MISSING_PROTOCOL_LIB + "）");
     }
     if (c.entityCulling().enabled() && !plan.entityCulling()) {
-      notRegistered.add("实体剔除");
+      notWired.add("实体剔除（raycast 与 frustum.enabled 均为 false）");
     }
-    if (c.afk().enabled() && !plan.afk()) {
-      notRegistered.add("AFK 降级");
-    }
-    if (c.latency().enabled() && !plan.latency()) {
-      notRegistered.add("高延迟降视距");
-    }
-    // plan() 只按配置与平台推导，不判依赖可用性：缺 ProtocolLib 时 ThrottlePipeline.startLocked
-    // 的 manager==null 分支会让所有子模块都不注册，此时整行必须以「未接线」收尾，
-    // 否则面板会显示「全部启用」而实际一个模块都没工作。
-    //
-    // 探测本身要兜底：离线单测没有 Bukkit 服务端实例（Bukkit.server == null），
-    // DependencyGuard 内部会读 PluginManager 而抛 NPE——这里按「依赖可用」处理（与
-    // ThrottlePipeline.isFoliaSafe 同一保守方向：探测失败绝不把模块显示成未注册）。
-    if (protocolLibMissing()) {
-      return configured + "｜实际未注册：全部子模块（缺少 ProtocolLib）";
-    }
-    if (notRegistered.isEmpty()) {
+    if (notWired.isEmpty()) {
       return configured;
     }
-    // 原因直接写进面板：实机 dump 里只有「（原因见启动日志）」，而日志会滚动、服主手上常常只剩 dump——
-    // 一个配了 true 却整项未注册的模块，排查起点必须是面板自己能说清为什么。
-    String reason = notRegistered.contains("零位移取消")
-        ? ThrottlePipeline.entityPacketsDisabledReason(c) : null;
-    return configured + "｜实际未注册：" + String.join("/", notRegistered)
-        + (reason == null ? "（原因见启动日志）" : "（原因：" + reason + "）");
+    String suffix = "｜实际未注册：" + String.join("、", notWired);
+    if (!protocolLibReady) {
+      // 缺前置只影响上面三项：另两项能否工作按配置判断，射线遮挡另需遮挡数据。
+      String others = null;
+      if (c.entityCulling().enabled() && plan.entityCulling()) {
+        others = "实体剔除（射线遮挡" + (occlusionWired ? "可用" : "不可用：缺遮挡数据") + "）";
+      }
+      if (c.latency().enabled()) {
+        others = others == null ? "高延迟降视距" : others + "、高延迟降视距";
+      }
+      if (others != null) {
+        suffix = suffix + "；不需 ProtocolLib 的还有：" + others;
+      }
+    }
+    return configured + suffix;
   }
 
-  /**
-   * ProtocolLib 是否缺失（探测失败按「不缺失」处理，见 {@code bandwidthSwitches} 的说明）。
-   *
-   * <p>只在 command/dump 路径调用，不在热路径上；一次异常不会影响其它诊断字段。
-   */
-  private static boolean protocolLibMissing() {
-    try {
-      return !DependencyGuard.isProtocolLibPresent();
-    } catch (Throwable ignored) {
-      // 离线单测 / 服务端尚未初始化：无法判定时按「存在」处理，避免误报「全部未注册」
-      return false;
+  /** 调色板压缩的前置：它只在区块改写编码时生效（自身关闭时不追加任何文字）。 */
+  private static String paletteWiring(BandwidthConfig.Palette palette, boolean bandwidthOn,
+      boolean chunkRewriteActive) {
+    if (!palette.enabled() || !palette.widthBudget() || (bandwidthOn && chunkRewriteActive)) {
+      return "";
     }
+    return bandwidthOn
+        ? "（需区块改写：反矿透未接线，本项不生效）"
+        : "（需区块改写：带宽总开关关闭，本项不生效）";
   }
 
   /**
@@ -1618,8 +1628,14 @@ public final class Diagnostics {
    * <p><b>为什么要把射线与视锥两个子项都写出来</b>：只打印 {@code entityCulling().enabled()} 会出现
    * 「实体剔除 true」这种极易被误读为「射线遮挡剔除在生效」的输出——实际上 {@code raycast=false} 时
    * 只做视锥剔除，两者失效模式完全不同，必须一次说清。
+   *
+   * <p><b>射线遮挡另有前提</b>：判据是遮挡位图（反矿透解码时旁路生成），位图没接线时该子路径整体
+   * 跳过（方向是「少藏」）。本模块不依赖 ProtocolLib，因此缺数据时既不写「未注册」，也不写「射线遮挡」。
+   *
+   * @param occlusionWired 遮挡判定是否已接线（引擎已起 + 数据源可用）
    */
-  private static String entityCullingSwitch(BandwidthConfig.EntityCulling culling) {
+  private static String entityCullingSwitch(BandwidthConfig.EntityCulling culling,
+      boolean occlusionWired) {
     if (!culling.enabled()) {
       return "关闭（模块未启用）";
     }
@@ -1630,7 +1646,12 @@ public final class Diagnostics {
       return "关闭（raycast 与 frustum.enabled 均为 false，本模块不注册）";
     }
     StringBuilder sb = new StringBuilder("启用（");
-    sb.append(raycast ? "射线遮挡" : "不做射线遮挡");
+    if (raycast) {
+      // 只用一条与成因无关的条件：未接线可能来自反矿透未起、引擎创建失败或无管线，点名单一成因会误判。
+      sb.append(occlusionWired ? "射线遮挡" : "射线遮挡不可用（缺遮挡数据）");
+    } else {
+      sb.append("不做射线遮挡");
+    }
     sb.append(" + 视锥剔除");
     if (frustumOn) {
       // 显示「有效距离门」而非配置原值：实际门槛是 max(min-distance, force-visible-distance)。

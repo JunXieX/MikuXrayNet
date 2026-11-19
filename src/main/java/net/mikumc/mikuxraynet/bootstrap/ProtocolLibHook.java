@@ -101,15 +101,27 @@ public final class ProtocolLibHook {
       this.listener = new ProtocolLibAsyncListener(plugin, config, liveConfig, processor, workPool,
           asynchronousManager, neighborProvider, handleChunkBatch, obfuscatedChunkIndex, revealedSet,
           bypassRegistry, diskCache);
+      // 观察器必须先于异步处理器安装。
+      //
+      // registerAsyncHandler 默认 autoInject = true：它会把自动生成的同步 NullPacketListener 立刻挂进管理器，
+      // 从那一刻起 MAP_CHUNK 已被识别为异步类型并开始入队（handler.start() 之前入队的包同样会在启动后被处理）。
+      // 若先注册异步处理器，这段「已识别、尚无观察器」的窗口里入队的区块包身上没有随包世界快照，
+      // 异步回调只能整批 fail-open（首批区块不被改写）；观察器先装则任何被识别的包都已经过它。
+      //
+      // 观察器只是 MONITOR 级的只读同步监听：不取消、不登记处理延迟，单独安装不会扣住任何包；
+      // 安装失败或后续步骤失败都由 unregister() 摘除（先摘 Bukkit 钩子与观察器，再注销异步处理器，
+      // 顺序见 unregister 的注释），据此保持 fail-open。
+      listener.registerDeliveryObserver(protocolManager);
       this.asyncListenerHandler = asynchronousManager.registerAsyncHandler(listener);
       // 必须显式 start()，否则异步监听器不会真正开始分发封包
-      listener.registerDeliveryObserver(protocolManager);
       this.asyncListenerHandler.start();
 
       logger.fine("反矿透封包拦截已启用（ProtocolLib 异步通道，监听 "
           + (handleChunkBatch ? "MAP_CHUNK + CHUNK_BATCH_START/FINISHED" : "MAP_CHUNK") + "）");
       return null;
     } catch (Throwable throwable) {
+      // 任一步失败都整段回滚：unregister() 先摘 Bukkit 钩子（含本轮的写出观察器）与在途登记，再注销异步处理器；
+      // 调用方随后降级为「仅 MAP_CHUNK」重试或整体停用，两条路径都不会留下半注册状态。
       unregister();
       return throwable;
     }

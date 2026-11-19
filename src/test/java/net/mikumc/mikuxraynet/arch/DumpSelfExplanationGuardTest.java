@@ -180,6 +180,46 @@ class DumpSelfExplanationGuardTest {
   }
 
   @Test
+  void playerMonitorsAreRescheduledOnPostRespawnAndWorldChange() throws Exception {
+    assertMonitorReschedule("bandwidth/EntityCuller.java", "scheduleRecheck(", "retireRecheck(");
+    assertMonitorReschedule("bandwidth/LatencyMonitor.java", "scheduleCheck(", "retireCheck(");
+  }
+
+  /**
+   * 玩家周期任务的重排纪律（{@code EntityCuller} / {@code LatencyMonitor}）：挂在「复活完成」阶段、
+   * 处理器与事件线程无关、退役回调只按注册身份摘除且不碰实体。
+   *
+   * <p>为什么只能源码守门：真实退役由 Folia 运行时驱动，离线造不出「实体被移除」；但「谁负责重排、重排
+   * 挂在哪个阶段、退役回调允许做什么」全都写在源码里，可以静态钉死。行为面（幂等 / 精确 fencing / 停用与
+   * 退出收口）由 {@code PlayerMonitorRescheduleTest} 用调度器替身覆盖。
+   */
+  private static void assertMonitorReschedule(String file, String scheduleCall, String retireMethod)
+      throws Exception {
+    String monitor = source(file);
+    assertTrue(monitor.contains("PlayerPostRespawnEvent"),
+        file + " 的复活重排必须挂 PlayerPostRespawnEvent：PlayerRespawnEvent 触发时玩家尚未落到复活点，"
+            + "此时登记的任务会随旧实体退役（等于白排一次）");
+    String post = methodBody(monitor, "public void onPostRespawn(");
+    assertTrue(post.length() > 40, file + " 缺复活完成后的重排处理器（Folia 上复活后巡检会永久停摆）");
+    assertTrue(post.contains(scheduleCall), file + " 的复活处理必须重排周期任务");
+    String changed = methodBody(monitor, "public void onChangedWorld(");
+    assertTrue(changed.length() > 40, file + " 缺切维后的重排处理器");
+    assertTrue(changed.contains(scheduleCall), file + " 的切维处理必须重排周期任务");
+    for (String body : new String[] {post, changed}) {
+      assertTrue(!body.contains("getWorld()") && !body.contains("getLocation")
+              && !body.contains("getPing()") && !body.contains("isOnline()"),
+          file + " 的重排处理器不得读世界/坐标/在线状态：调度登记可从任意线程进行，处理器必须与事件线程无关");
+    }
+    String retire = methodBody(monitor, "private void " + retireMethod);
+    assertTrue(retire.length() > 20, file + " 必须把退役回调单独成方法（关键代码路径要可静态核对）");
+    assertTrue(retire.contains("remove(playerId, entry)"),
+        file + " 的退役回调必须按注册身份精确摘除：按键盲删会把重建后的新注册一起摘掉");
+    assertTrue(!retire.contains("cancel("),
+        file + " 的退役回调在关键代码里执行（Javadoc 明令不得操作实体/世界），只许做内存记账");
+    assertTrue(monitor.contains("isLive("),
+        file + " 必须按「注册是否仍存活」复用任务，否则同 tick 的复活+切维会登记两条周期任务");
+  }
+  @Test
   void staleSnapshotIsTreatedAsUnknown() throws Exception {
     assertTrue(source("bandwidth/PlayerPositionSnapshots.java").contains("isStale("),
         "快照必须能自报心跳过期：冻结快照的内容看起来完全正常，只盯内容发现不了它已经死了");

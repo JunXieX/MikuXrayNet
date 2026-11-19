@@ -5,10 +5,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -69,6 +70,12 @@ import net.mikumc.mikuxraynet.config.AntiXrayConfig;
  *
  * <p><b>fail-open</b>：任何异常/超时都只记日志并计数，读写统统退化为「未命中 / 不写入」，
  * 绝不影响封包链路与反矿透主流程。
+ *
+ * <p><b>打开失败不成灾</b>：区域文件「打不开」（权限 / 被占用 / 路径过长）与「结构损坏」被严格区分——
+ * 前者<b>绝不删除文件</b>，只把该区域记进退避表（默认 30s、容量有界），窗口内按未命中/跳过降级
+ * （纯内存判断，不重试系统调用、不排任务），到期自动重试；后者由 {@link RegionFile#open} 沿已持锁的
+ * 同一条通道就地重建并记一次。日志按失败类别限频（前 {@value #OPEN_FAILURE_LOG_LIMIT} 次逐条、
+ * 之后汇总），真实次数以 {@link #stats()} 的「异常」为准。
  */
 public final class DiskCacheStore implements AutoCloseable {
 
@@ -178,7 +185,8 @@ public final class DiskCacheStore implements AutoCloseable {
      * 本句柄当前「计入」{@link #approximateEntries} 的条目数（只有磁盘线程访问）。
      *
      * <p>句柄关闭（闲置 / 世界卸载 / 停用 / 通道失效）时据此把该文件的额度收回，
-     * 避免条目计数只增不减、上限随句柄开关不断抬高。重新打开时会重新扫描磁盘并补计。
+     * 避免条目计数只增不减、上限随句柄开关不断抬高。重新打开时由打开期的基线（
+     *     {@code RegionFile#diskEntryBaseline()}）重新补计，不再额外读盘。
      */
     private long accountedEntries;
 
@@ -200,13 +208,38 @@ public final class DiskCacheStore implements AutoCloseable {
   private final AtomicInteger pendingOps = new AtomicInteger();
   private final AtomicInteger approximateEntries = new AtomicInteger();
   /**
-   * 本进程内「已做过磁盘既有条目补计、且句柄仍打开」的区域文件集合。
+   * 「打开失败 → 退避」表：<b>只在磁盘线程访问</b>（{@code handle()} 只由磁盘线程的 doGet/doPut 调用），
+   * 因此无需任何同步，用 {@link LinkedHashMap}（访问序）承担「有容量上限的 LRU」即可。
    *
-   * <p>重启后 {@link #approximateEntries} 从 0 开始；首次打开某个已存在的区域文件时把磁盘上的
-   * 真实条目数补计进来，否则 {@code max-entries} 上限在重启后完全失效（旧条目不占额度）。
-   * 句柄关闭时该键会被移除、其额度一并收回（见 {@link #removeAndClose}），因此重开时会重新扫描补计。
+   * <p><b>为什么要退避</b>：缓存目录只读 / 文件被占用 / 路径过长这类<b>环境失败</b>会持续存在，
+   * 而 {@code handle()} 在「每个区块包」的路径上。若每次都真去 {@code FileChannel.open}，就会变成
+   * 每包 1~2 次失败的系统调用 + 一条 WARN。这里记住「这个区域暂时打不开」，窗口内直接按未命中/
+   * 跳过降级（纯内存判断、零 I/O、不排队），窗口到期自动重试——环境恢复后无需重启即可自愈。
    */
-  private final Set<RegionKey> entryCounted = ConcurrentHashMap.newKeySet();
+  private final LinkedHashMap<RegionKey, OpenFailure> openFailures = new LinkedHashMap<>(16, 0.75f, true);
+
+  /**
+   * 打开失败的分类型提示计数（只在磁盘线程累加）。
+   *
+   * <p>口径：同一类别最多逐条提示 {@value #OPEN_FAILURE_LOG_LIMIT} 次，之后只在第
+   * {@code LIMIT+1} 次与每 1000 次给一条汇总——既让服主第一时间看到真实原因，又不会把日志刷满。
+   * 真实失败次数永远以 {@link DiskCacheStats#errors} 为准（诊断面板显示的就是它）。
+   */
+  private final HashMap<String, Integer> openFailureLogCounts = new HashMap<>();
+
+  /** 同一区域文件打开失败后的退避窗口（毫秒）：窗口内不再重试，到期自动重新尝试。 */
+  private static final long OPEN_FAILURE_BACKOFF_MILLIS = 30_000L;
+
+  /** 退避表容量上限：超出后淘汰最久未用的键（代价只是那个区域会被再试一次，不影响正确性）。 */
+  private static final int OPEN_FAILURE_BACKOFF_CAPACITY = 128;
+
+  /** 同一失败类别最多逐条提示的次数（之后改为汇总提示，见 {@link #openFailureLogCounts}）。 */
+  private static final int OPEN_FAILURE_LOG_LIMIT = 3;
+
+  /** 一次打开失败的记录：{@code untilNanos} 之前不再尝试打开该区域文件。 */
+  private record OpenFailure(long untilNanos) {
+  }
+
   private final long maxFileSizeBytes;
 
 
@@ -1003,8 +1036,9 @@ public final class DiskCacheStore implements AutoCloseable {
   }
 
   /**
-   * 从打开表摘除句柄并关闭它，同时<b>收回该句柄计入的条目额度</b>并把该键从「已补计」集合移除——
-   * 让下次打开时重新扫描磁盘、重新补计（否则计数只增不减，{@code max-entries} 会随句柄开关不断抬高）。
+   * 从打开表摘除句柄并关闭它，同时<b>收回该句柄计入的条目额度</b>（否则计数只增不减，
+   * {@code max-entries} 会随句柄开关不断抬高）。下次打开时由 {@code RegionFile#diskEntryBaseline()}
+   * 在打开的同一次遍历里重新算出基线并补计。
    *
    * <p>只有磁盘线程调用；{@link ConcurrentHashMap#remove(Object, Object)} 返回 false（句柄已被别处移除）时不做任何事。
    */
@@ -1038,7 +1072,8 @@ public final class DiskCacheStore implements AutoCloseable {
       handle.accountedEntries = 0L;
       approximateEntries.updateAndGet(value -> (int) Math.max(0L, value - accounted));
     }
-    entryCounted.remove(key);
+    // 句柄关闭即「重新开始」：清掉该区域的退避记录，避免一个陈旧窗口挡住刚刚被重建/删除的文件。
+    openFailures.remove(key);
     closeHandleQuietly(handle, deleteFile);
   }
 
@@ -1066,7 +1101,18 @@ public final class DiskCacheStore implements AutoCloseable {
     return System.currentTimeMillis() - entry.writtenAtMillis() > expireMillis;
   }
 
-  /** 打开（或复用）区域文件句柄；文件头损坏时删除重建（缓存可丢，但不能卡住链路）。 */
+  /**
+   * 打开（或复用）区域文件句柄。
+   *
+   * <p><b>失败语义（与 {@link RegionFile#open} 的分类严格对齐）</b>：
+   * <ul>
+   *   <li><b>结构损坏</b>：已在 {@code RegionFile.open} 内部、沿同一条持锁通道就地重建并返回可用句柄，
+   *       这里只把这次重建计进 {@link DiskCacheStats#errors}（不删文件、不刷日志）；</li>
+   *   <li><b>环境失败</b>（打不开 / 目录不可写 / 通道失败）：<b>绝不删除文件</b>，记入退避表并按
+   *       「暂时不可用」降级——返回 {@code null}，调用方按未命中/写入跳过处理。窗口内的后续访问
+   *       只做一次内存查表（零 I/O、零排队），到期自动重试，环境恢复后无需重启即可自愈。</li>
+   * </ul>
+   */
   private Handle handle(String worldName, int regionX, int regionZ, boolean create)
       throws IOException {
     if (closed) {
@@ -1083,31 +1129,37 @@ public final class DiskCacheStore implements AutoCloseable {
       existing.touch();
       return existing;
     }
+    if (inOpenBackoff(key)) {
+      // 该区域刚刚打不开过：窗口内直接降级。纯内存判断，绝不重试系统调用、不排任何任务。
+      return null;
+    }
 
     Path path = pathFor(world, regionX, regionZ);
     if (!create && !Files.isRegularFile(path)) {
       return null;
     }
-    if (create) {
-      Path dir = path.getParent();
-      if (dir != null && !Files.isDirectory(dir)) {
-        Files.createDirectories(dir);
-      }
-    }
 
     RegionFile file;
     try {
+      if (create) {
+        Path dir = path.getParent();
+        if (dir != null && !Files.isDirectory(dir)) {
+          Files.createDirectories(dir);
+        }
+      }
       file = RegionFile.open(path, config.bucketCacheSize());
-    } catch (IOException firstFailure) {
+    } catch (IOException unavailable) {
+      // 打不开 ≠ 损坏：文件内容没被判断过，删除只会白丢一份可能仍可用的缓存（而且删除本身也会失败）。
+      recordOpenFailure(key, unavailable);
+      return null;
+    }
+
+    if (file.rebuiltOnOpen()) {
+      // 结构损坏已就地重建：计一次异常事件（与「损坏被识别」的既有诊断口径一致；不新增统计字段）。
       stats.errors.increment();
-      logger.warning("磁盘缓存区域文件损坏，已删除重建：" + path + "（" + firstFailure.getMessage() + "）");
-      Files.deleteIfExists(path);
-      file = RegionFile.open(path, config.bucketCacheSize());
     }
 
     Handle created = new Handle(file);
-    // 先入表、再排程补计：补计提交被拒时，句柄必须已经在表里，才能被 removeAndClose 真正摘除
-    // （它只处理表内的句柄）。这里仍保留「先到者优先」的兜底——全部操作都在磁盘线程上串行，正常撞不上。
     Handle raced = open.putIfAbsent(key, created);
     if (raced != null) {
       // 只 close 不 delete——文件可能正被先到者使用，删除会破坏对方句柄（A9）。
@@ -1118,26 +1170,16 @@ public final class DiskCacheStore implements AutoCloseable {
       }
       return raced;
     }
-    if (entryCounted.add(key) && file.sizeBytes() > BufferedLinearV3Format.DATA_AREA_OFFSET) {
-      // 重启后 approximateEntries 从 0 开始：必须把磁盘上已有的条目补计进来，
-      // 否则 max-entries 上限在重启后完全失效（旧条目不占额度，磁盘可无限增长）。
-      // 异步一次性扫描（逐 bucket 解码计数），不阻塞触发本次打开的读写；此后由
-      // put/remove/compact 增量维护。排程与扫描之间恰被落盘的新写入会被重复计入一次——
-      // 计数本就是近似值，偏差方向是「提前拒绝新写入」，保守无害。
-      // execute() 已把「队列满 / 已关闭 / RejectedExecutionException」统一折算成 false 并计入 errors，
-      // 四个出口都只 return，不会抛——因此直接看返回值。
-      boolean scheduled = execute(() -> countDiskEntries(key, created));
-      if (!scheduled) {
-        // 提交被拒时不能只清 entryCounted 就返回：句柄此刻已在 open 表里，之后 handle() 会直接命中
-        // 这个已有句柄、再也不会走到本分支，注释承诺的「下次打开重试」永远不会发生——该文件的旧条目
-        // 从此不占 max-entries 额度，磁盘可超上限增长。因此按既有语义把句柄摘除并关闭
-        // （removeAndClose 会一并归还额度、清掉 entryCounted 标记），让下一次打开重新扫描补计；
-        // 本次读写按未命中/跳过降级（fail-open）。
-        removeAndClose(key, created);
-        logger.warning("磁盘缓存补计任务未能提交，已摘除该区域文件句柄"
-            + "（下次打开会重新补计，本次读写按未命中处理）：" + path);
-        return null;
-      }
+    // 打开成功：清掉该区域的退避记录，下次失败重新计时。
+    openFailures.remove(key);
+    // 重启后 approximateEntries 从 0 开始：把「磁盘上已有的条目数」补进近似计数，否则 max-entries
+    // 在重启后完全失效。基线由 RegionFile#loadIndex 在**本次打开的同一次遍历**里按记录头算出
+    //（不重复读盘）；此刻句柄尚未交付、本会话也还没有任何写入落在它身上，因此绝不会与随后的
+    // put 重复记账。此后由 put/remove/compact 增量维护，句柄关闭时整笔归还（见 removeAndClose）。
+    int baseline = file.diskEntryBaseline();
+    if (baseline > 0) {
+      created.accountedEntries += baseline;
+      approximateEntries.addAndGet(baseline);
     }
     // 新开一个文件后立刻检查「打开的文件数」上限：超限就按最久未访问淘汰整个区域文件。
     // 放在这里而不是维护周期，是因为磁盘占用增长只发生在「新开文件」这一刻；早一步回收就不会先涨后降。
@@ -1150,11 +1192,76 @@ public final class DiskCacheStore implements AutoCloseable {
     return created;
   }
 
+  /** 该区域是否处于「打开失败」的退避窗口内；窗口已过则顺手清掉记录（下次重试）。 */
+  private boolean inOpenBackoff(RegionKey key) {
+    OpenFailure failure = openFailures.get(key);
+    if (failure == null) {
+      return false;
+    }
+    if (System.nanoTime() - failure.untilNanos() >= 0L) {
+      openFailures.remove(key);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * 记录一次「打开失败」并按类别限频提示。
+   *
+   * <p>容量封顶：超出 {@value #OPEN_FAILURE_BACKOFF_CAPACITY} 条时淘汰最久未用的键——代价只是那个区域
+   * 会被再试一次（可能多一次失败的系统调用），不会无界增长，也不会影响任何正确性。
+   */
+  private void recordOpenFailure(RegionKey key, Throwable failure) {
+    openFailures.put(key, new OpenFailure(
+        System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(OPEN_FAILURE_BACKOFF_MILLIS)));
+    while (openFailures.size() > OPEN_FAILURE_BACKOFF_CAPACITY) {
+      var eldest = openFailures.keySet().iterator();
+      eldest.next();
+      eldest.remove();
+    }
+    stats.errors.increment();
+    warnOpenFailureThrottled(key, failure);
+  }
+
+  /** 打开失败的分类键：让「权限不对」与「瞬时 I/O」在日志里各自限频、互不遮蔽。 */
+  private static String openFailureCategory(Throwable failure) {
+    if (failure instanceof java.nio.file.AccessDeniedException) {
+      return "权限拒绝";
+    }
+    if (failure instanceof java.nio.file.NoSuchFileException) {
+      return "路径不存在";
+    }
+    if (failure instanceof java.nio.file.FileSystemException) {
+      return "文件系统";
+    }
+    return "I/O";
+  }
+
+  /**
+   * 打开失败的中文提示：<b>按类别限频</b>（前 {@value #OPEN_FAILURE_LOG_LIMIT} 次逐条给全信息，
+   * 之后只在第 {@code LIMIT+1} 次与每 1000 次给一条汇总），真实次数以 {@code stats().errors} 为准。
+   */
+  private void warnOpenFailureThrottled(RegionKey key, Throwable failure) {
+    String category = openFailureCategory(failure);
+    int count = openFailureLogCounts.merge(category, 1, Integer::sum);
+    if (count <= OPEN_FAILURE_LOG_LIMIT) {
+      logger.warning("磁盘缓存区域文件暂时无法打开（不删除文件；该区域退避 " + OPEN_FAILURE_BACKOFF_MILLIS
+          + "ms 后自动重试，窗口内只按未命中/跳过降级）：" + key.worldName() + "/r." + key.regionX()
+          + "." + key.regionZ() + REGION_FILE_SUFFIX + "（类别 " + category + "：" + failure + "）");
+    } else if (count == OPEN_FAILURE_LOG_LIMIT + 1) {
+      logger.warning("磁盘缓存区域文件打开失败在持续发生（类别 " + category + "）：此后同类不再逐条提示，"
+          + "累计次数请看 /mikuxraynet status 的「异常」计数；环境恢复后缓存会自行恢复写入");
+    } else if (count % 1000 == 0) {
+      logger.warning("磁盘缓存区域文件打开失败（类别 " + category + "）已累计 " + count
+          + " 次：缓存已退避降级，不影响封包链路与反矿透本身");
+    }
+  }
+
   /**
    * 打开的区域文件数超上限时，按「最久未访问」淘汰整个文件（真正的磁盘回收）。
    *
    * <p><b>为什么必须有这一层</b>：{@code max-entries} 只统计<b>当前已打开</b>文件的条目——关句柄即归还
-   * 额度、重开才由 {@code countDiskEntries} 补计，因此它约束的是「同时打开的文件的条目数」，
+   * 额度、重开才按 {@code RegionFile#diskEntryBaseline()} 补计，因此它约束的是「同时打开的文件的条目数」，
    * 而不是磁盘上的总量。若只靠它，磁盘条目可达「区域文件数 × 每文件条目数」，且触顶后旧实现只拒写、
    * 不淘汰，缓存会永久停更。{@code max-region-files} 直接约束磁盘上的文件数，二者共同界定磁盘占用：
    * 前者控「每个文件多满」，后者控「一共有几个文件」。
@@ -1215,36 +1322,6 @@ public final class DiskCacheStore implements AutoCloseable {
         return;
       }
       before = open.size();
-    }
-  }
-
-  /**
-   * 首次打开某区域文件时，把磁盘上已有的条目数补进 {@link #approximateEntries}（一次性后台扫描）。
-   *
-   * <p>计数取「文件里的全部条目」而不过滤过期/旧代次——这些条目随后被惰性清理或压缩回收时
-   * 会正常递减，多计的部分只是暂时的保守值；宁可计数偏大提前拒绝写入，也不偏小放任磁盘增长。
-   *
-   * <p>只读字节流数长度前缀（{@link RegionFile#countEntriesOnDisk()}）：既不解码负载也不进 LRU，
-   * 因此启动期统计不会把别的区域文件的脏桶挤出去写盘（旧实现逐个 {@code get} 会触发整文件解码）。
-   */
-  private void countDiskEntries(RegionKey key, Handle handle) {
-    if (closed || open.get(key) != handle) {
-      // 句柄已被世界卸载/停用关闭或被重建：放回待计数集合，下次打开时重试
-      entryCounted.remove(key);
-      return;
-    }
-    try {
-      int count = handle.file.countEntriesOnDisk();
-      if (count > 0) {
-        handle.accountedEntries += count;
-        approximateEntries.addAndGet(count);
-      }
-    } catch (Throwable throwable) {
-      // 计数失败只影响上限的准确度（偏小），绝不影响缓存读写（fail-open）。
-      // 同时归还「已补计」标记：否则该句柄存续期间 max-entries 对这份文件完全失明（旧条目不占额度），
-      // 与「宁可偏大提前拒绝」的取向相反。归还后下次句柄重开时会重新扫描补计。
-      entryCounted.remove(key);
-      fail("统计磁盘缓存既有条目失败（max-entries 计数可能偏小，不影响缓存功能）", throwable);
     }
   }
 

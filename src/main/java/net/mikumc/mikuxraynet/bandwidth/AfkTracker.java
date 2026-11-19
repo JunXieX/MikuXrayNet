@@ -256,26 +256,17 @@ public final class AfkTracker implements Listener {
       return;
     }
     Player player = event.getPlayer();
-    // 世界黑名单：命中世界不做任何带宽优化（AFK 丢包一并跳过）。
-    // 世界名优先查 PlayerWorldIndex 快照——封包线程不读实体状态（Folia 上跨区域读会先打 ERROR
-    // 再抛 No currently ticking region，每包一次异常）。快照缺失只可能出现在「反矿透未启用」的部署，
-    // 此时才回退到读实体世界；取不到就放行原包，绝不因一次读取失败把封包扣住。
-    String worldName = PlayerWorldIndex.worldName(player.getUniqueId());
-    if (worldName == null) {
-      try {
-        worldName = player.getWorld().getName();
-      } catch (Throwable ignored) {
-        return;
-      }
-    }
-    if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
+    UUID playerId = player.getUniqueId();
+    // 世界名只查 PlayerWorldIndex 快照：封包线程绝不读实体状态（Folia 上跨区域读会先打 ERROR 再抛）。
+    // 快照缺失即原包放行（与 BlockChangeMerger 同一纪律），绝不回退到 player.getWorld()。
+    if (skipInspection(PlayerWorldIndex.worldName(playerId))) {
       return;
     }
     // 统一走直通名单：只读并发集合，封包线程不触碰 Bukkit 权限 API
-    if (BypassRegistry.isBypassedNow(player.getUniqueId())) {
+    if (BypassRegistry.isBypassedNow(playerId)) {
       return;
     }
-    AfkState state = states.get(player.getUniqueId());
+    AfkState state = states.get(playerId);
     if (state == null) {
       return;
     }
@@ -296,6 +287,16 @@ public final class AfkTracker implements Listener {
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
+  }
+
+  /**
+   * 前段判定（纯函数，包可见便于离线回归）：{@code true} = 本次跳过、原包放行。
+   *
+   * <p>快照缺失（{@code null}）按「判不出世界」放行：回退读 {@code player.getWorld()} 在 Folia 上属跨区域
+   * 读实体状态（先打 ERROR 再抛），封包线程一次都不能碰。黑名单世界同样跳过（该世界不做任何带宽优化）。
+   */
+  static boolean skipInspection(String snapshotWorldName) {
+    return snapshotWorldName == null || WorldBlacklistConfig.isBlacklistedNow(snapshotWorldName);
   }
 
   /** 低价值包过滤监听器（静态嵌套，避免在 super(...) 中引用外部实例）。 */

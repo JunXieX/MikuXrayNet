@@ -1,7 +1,9 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
+import com.destroystokyo.paper.event.player.PlayerPostRespawnEvent;
 import io.papermc.paper.event.player.PlayerTrackEntityEvent;
 import io.papermc.paper.event.player.PlayerUntrackEntityEvent;
+import io.papermc.paper.threadedregions.scheduler.EntityScheduler;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -32,6 +34,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
@@ -323,8 +326,33 @@ public final class EntityCuller implements Listener {
     }
   }
 
-  /** 每个在线玩家的周期复检任务（Paper 与 Folia 同一套实体调度器；玩家退出即随实体退役失效）。 */
-  private final ConcurrentHashMap<UUID, ScheduledTask> recheckTasks = new ConcurrentHashMap<>();
+  /** 每个在线玩家的周期复检注册（owner 身份 + 句柄，见 {@link RecheckTask}）。 */
+  private final ConcurrentHashMap<UUID, RecheckTask> recheckTasks = new ConcurrentHashMap<>();
+
+  /**
+   * 一次周期复检注册：登记时的 owner + 句柄 + 退役标志。
+   *
+   * <p>退役回调跑在关键代码里、只能做内存记账，且必须能回答「摘的是不是我自己那条」——所以回调持有本
+   * 对象、用 {@code recheckTasks.remove(playerId, entry)} 按<b>注册身份</b>摘除；{@code owner} 用来识别
+   * 「实体换了调度器」的旧注册（它已不可能再回调本玩家，应判为不存活并重排）。
+   */
+  static final class RecheckTask {
+    private final EntityScheduler owner;
+    private volatile ScheduledTask handle;
+    private volatile boolean retired;
+
+    RecheckTask(EntityScheduler owner) {
+      this.owner = owner;
+    }
+
+    /** 未退役、句柄在、未被取消，且 owner 未被换掉（{@code null} = 不比较）。 */
+    boolean isLive(EntityScheduler current) {
+      ScheduledTask task = handle;
+      return !retired && task != null && !task.isCancelled()
+          && (current == null || owner == current);
+    }
+  }
+
   /**
    * 热重载恢复链路（每个「账本被 drain 但尚未恢复」的实体一条）：{@code stop()} 必须把它们一起取消。
    *
@@ -714,30 +742,91 @@ public final class EntityCuller implements Listener {
     return drained;
   }
 
-  /** 为单个玩家登记周期复检任务；同一玩家重复登记时以最新任务为准（旧任务取消）。 */
-  private void scheduleRecheck(Player player, long interval) {
+  /**
+   * 为单个玩家登记（或复用）周期复检任务；返回此刻是否有一条存活注册。
+   *
+   * <p>幂等：复活与切维可能在同一 tick 连发两个事件，两次调用都收敛到<b>恰好一条</b>存活任务。需要重排时
+   * 先登记、再入账、最后取消旧句柄——任何时刻最多一条存活任务，且没有「旧的已取消、新的还没登记」的空窗。
+   * {@code runAtFixedRate} 对已移除实体返回 {@code null}（两个回调都不会被调用），此时不重试：调用点都是
+   * 「实体必然有效」的阶段，null 只意味着玩家正在并发退出。
+   */
+  private boolean scheduleRecheck(Player player, long interval) {
+    UUID playerId = player.getUniqueId();
+    EntityScheduler owner;
+    try {
+      // 取调度器本身不读世界状态，且 EntityScheduler 的 Javadoc 明确「完全线程安全、可从任意线程调度」，
+      // 因此本方法在 Paper 主线程与 Folia 区域线程上都成立，不依赖「事件恰好落在区域线程」这一前提。
+      owner = player.getScheduler();
+    } catch (Throwable throwable) {
+      // 实体已退役 / 包装正在替换：本次不登记，交给下一个正常阶段（登录 / 复活完成 / 切维完成）补上
+      return false;
+    }
+    RecheckTask existing = recheckTasks.get(playerId);
+    if (existing != null && existing.isLive(owner)) {
+      return true;
+    }
+    RecheckTask entry = new RecheckTask(owner);
     ScheduledTask task = Schedulers.repeatOnEntity(plugin, player, interval, interval,
-        () -> recheck(player));
+        () -> recheck(player), () -> retireRecheck(playerId, entry));
     if (task == null) {
+      return false;
+    }
+    entry.handle = task;
+    RecheckTask previous = recheckTasks.put(playerId, entry);
+    if (previous != null) {
+      // 旧注册已被新注册替换：它的退役回调按身份摘不到新条目（见 retireRecheck），句柄必须由这里取消，
+      // 否则旧任务会继续按自己的周期跑（同一玩家两条复检）。
+      cancelQuietly(previous.handle);
+    }
+    // 入账后再读一次 volatile（与 hide() / stop() 同一套收口）：
+    // ① retired 可能先于入账到达（退役回调里的 remove 找不到条目），这条注册已是死句柄，不能留表；
+    // ② stop() 的取消循环可能在本次入账之前就跑完了，它永远看不到这一条，必须自己取消。
+    if (stopping || entry.retired) {
+      recheckTasks.remove(playerId, entry);
+      cancelQuietly(task);
+      return false;
+    }
+    return true;
+  }
+
+  /** 退役回调：只做内存记账（Javadoc：retired 在关键代码里执行）；按注册身份摘除，迟到者摘不到新注册。 */
+  private void retireRecheck(UUID playerId, RecheckTask entry) {
+    entry.retired = true;
+    recheckTasks.remove(playerId, entry);
+  }
+
+  /**
+   * 复活完成后重排本玩家的周期复检。
+   *
+   * <p>用 {@code PlayerPostRespawnEvent}（复活完成）而非 {@code PlayerRespawnEvent}：后者触发时玩家尚未
+   * 落到复活点（其 Javadoc 亦指明「改玩家状态请用 post 事件」），此时登记会随旧实体退役、等于白排。
+   * 处理器只读 uuid 与调度器（可从任意线程登记），不读世界/坐标，故与事件线程无关。
+   */
+  @EventHandler(ignoreCancelled = true)
+  public void onPostRespawn(PlayerPostRespawnEvent event) {
+    if (stopping || !active()) {
       return;
     }
-    ScheduledTask previous = recheckTasks.put(player.getUniqueId(), task);
-    if (previous != null) {
-      cancelQuietly(previous);
+    scheduleRecheck(event.getPlayer(), Math.max(1, config.updateIntervalTicks()));
+  }
+
+  /** 切维后重排（任务可能随玩家移出旧 world 退役；与同 tick 的复活共用同一套幂等登记）。 */
+  @EventHandler(ignoreCancelled = true)
+  public void onChangedWorld(PlayerChangedWorldEvent event) {
+    if (stopping || !active()) {
+      return;
     }
-    // 与 hide() 同一套「入账后再读一次 volatile」收口：若 stop() 的取消循环已在我们入表<b>之前</b>
-    // 跑完，它永远看不到这条任务，必须由我们自己取消（否则任务空跑到玩家退出并钉住旧实例）。
-    if (stopping) {
-      recheckTasks.remove(player.getUniqueId(), task);
-      cancelQuietly(task);
-    }
+    scheduleRecheck(event.getPlayer(), Math.max(1, config.updateIntervalTicks()));
   }
 
   /** 「取消任务失败」只提示一次（每实例；代价仅是该任务空跑到实体退役，不影响可见性）。 */
   private final AtomicBoolean cancelFailureNoticed = new AtomicBoolean();
 
   private void cancelRecheckTask(UUID playerId) {
-    cancelQuietly(recheckTasks.remove(playerId));
+    RecheckTask task = recheckTasks.remove(playerId);
+    if (task != null) {
+      cancelQuietly(task.handle);
+    }
   }
 
   /**
@@ -751,8 +840,11 @@ public final class EntityCuller implements Listener {
    */
   private void cancelRecheckTasks() {
     for (UUID playerId : new ArrayList<>(recheckTasks.keySet())) {
-      // 单条取消失败不能中断整轮：否则后面的玩家任务全部漏取消，钉住整个已停用的旧实例
-      cancelQuietly(recheckTasks.remove(playerId));
+      RecheckTask task = recheckTasks.remove(playerId);
+      if (task != null) {
+        // 单条取消失败不能中断整轮：否则后面的玩家任务全部漏取消，钉住整个已停用的旧实例
+        cancelQuietly(task.handle);
+      }
     }
   }
 

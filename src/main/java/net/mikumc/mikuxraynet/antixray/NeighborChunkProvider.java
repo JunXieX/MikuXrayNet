@@ -528,16 +528,26 @@ public final class NeighborChunkProvider {
    * 那一格为止（<b>含</b>该格）。裁掉的那些格子必是空气、必不遮挡，位保持 0，因此平面内容与
    * 「全高度逐格读」逐格等价；主世界 384 高度里通常只有下半部分有方块，于是省掉大部分快照读取。
    *
+   * <p><b>坐标生成</b>：贴边层只有一条轴随列变化。固定轴与变轴基点由 {@link #worldPosition}(…, 0)
+   * 一次给出（与逐列调用逐位相同，见 {@code NeighborChunkProviderTest#planeCoordinatesFromBaseMatchPerColumnWorldPosition}），
+   * 变轴在循环里 {@code + local}——旧实现每列都 {@code new int[2]}，一次抓取 4 侧共 64 次短命分配。
+   *
    * @return 位打包的遮挡平面（长度为 {@code ceil(height × 16 / 64)}），位下标为 {@code y << 4 | localOther}
    */
   static long[] capturePlane(int baseY, int height, NeighborEdges.Side side, int chunkX, int chunkZ,
       OcclusionQuery query, ColumnTopQuery columnTop) {
     long[] plane = new long[NeighborEdges.planeLongCount(height)];
+    int[] base = worldPosition(side, chunkX, chunkZ, 0);
+    // X 两侧：x 固定、z 随 local 递增；Z 两侧：z 固定、x 随 local 递增（worldPosition 的定义）
+    boolean variesOnZ = side == NeighborEdges.Side.X_MINUS || side == NeighborEdges.Side.X_PLUS;
+    int fixed = variesOnZ ? base[0] : base[1];
+    int origin = variesOnZ ? base[1] : base[0];
     for (int local = 0; local < SIDE_LENGTH; local++) {
-      int[] position = worldPosition(side, chunkX, chunkZ, local);
-      int top = topRelativeY(baseY, height, position[0], position[1], columnTop);
+      int x = variesOnZ ? fixed : origin + local;
+      int z = variesOnZ ? origin + local : fixed;
+      int top = topRelativeY(baseY, height, x, z, columnTop);
       for (int y = 0; y <= top; y++) {
-        if (query.isOccluding(position[0], baseY + y, position[1])) {
+        if (query.isOccluding(x, baseY + y, z)) {
           NeighborEdges.setOccluding(plane, y << 4 | local);
         }
       }

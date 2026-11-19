@@ -551,9 +551,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * 这些原包在发送流中的位置本在切维包之前，被扣下后无论怎样重发都只会落在切维包之后——客户端会把
    * 旧世界坐标按新世界解释（鬼影方块）。玩家离开该世界后区块会整列重建，丢弃这批旧态不构成丢更新。
    *
-   * <p><b>为什么在调用线程内联执行</b>：它不聚簇、不构包、不发送，只做「取消原包 + 恰好放行一次」，
-   * 没有 {@link #flushInternal} 那种阻塞封包线程的风险；而内联才能保证取消发生在任何定时冲刷之前
-   * （异步投递会重新打开「旧世界数据落在切维包之后」的窗口）。
+   * <p><b>为什么在调用线程内联执行</b>：判定为「真切维」时它只清空、不聚簇、不构包、不发包，内联才能保证
+   * 取消发生在任何定时冲刷之前（异步投递会重新打开「旧世界数据落在切维包之后」的窗口）；只有证明世界
+   * 没变（{@code redeem}）时才在同一次调用里补发，且聚簇已移到封存锁之外，不额外占用封包线程要抢的那把锁。
    */
   private void discard(Pending target, ThrottleStats.DiscardSource source) {
     discard(target, source, null);
@@ -565,7 +565,9 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     int buffered = 0;
     List<List<Update<WrappedBlockData>>> clusters = List.of();
     Set<Coord> passed = Set.of();
+    Set<Coord> passedSealed = null;
     boolean redeem = false;
+    boolean clustersDeferred = false;
     String currentWorld = null;
     try {
       synchronized (target) {
@@ -585,11 +587,19 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         // 而且不会自愈。因此世界名相同即改走既有交付路径补发（见 deliver，失败自带逐条补发）。
         redeem = cancelled > 0 && shouldRedeem(target.world, currentWorld);
         if (redeem) {
-          clusters = target.batch.drainClusters(config.mergeRadius());
-          passed = target.passed.isEmpty() ? Set.of() : new HashSet<>(target.passed);
+          // 判据已在上面取完，这里只交出「已封存」的引用：聚簇与 passed 的只读复制都移到锁外
+          // （封存已完成 —— 见 flushInternal 里对「为什么锁外等价」的说明）。
+          clustersDeferred = true;
+          passedSealed = target.passed.isEmpty() ? null : target.passed;
         } else {
           target.batch.clear();
+          target.passed.clear();
         }
+      }
+      if (clustersDeferred) {
+        clusters = target.batch.drainClusters(config.mergeRadius());
+        passed = passedSealed == null ? Set.of() : new HashSet<>(passedSealed);
+        // 复制之后才清：对象已封存，锁外清空与锁内清空等价（只影响可达性，不参与任何判定）
         target.passed.clear();
       }
       if (timer != null) {
@@ -1096,8 +1106,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     int discarded = 0;
     boolean worldChanged = false;
     String bufferedWorld = null;
+    String indexWorld = null;
     String currentWorld = null;
     boolean snapshotResync = false;
+    boolean clustersDeferred = false;
+    Set<Coord> passedSealed = null;
     ScheduledFuture<?> timer = null;
     try {
       synchronized (target) {
@@ -1130,7 +1143,11 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
           // （Folia 上实体调度器任务随实体被移出旧 world 退役，退役不保证回调清理入口）。
           // 拿一份可能冻结的快照当作「玩家已换世界」的证据，代价是整批已取消的更新永久丢失——
           // 实测 29 人 4 小时丢了 69.5 万个原包，玩家侧看到的就是挖不掉的假方块。
-          worldChanged = shouldDiscardAtFlush(bufferedWorld, PlayerWorldIndex.worldName(target.uuid));
+          //
+          // 索引世界名只在这里读一次：下面的判定与留痕共用 indexWorld，锁外不再重读。两次读会把
+          // 「决策依据」与「取证文字」拉到两个不同时刻，现场就会出现自相矛盾的丢弃记录。
+          indexWorld = PlayerWorldIndex.worldName(target.uuid);
+          worldChanged = shouldDiscardAtFlush(bufferedWorld, indexWorld);
           if (!worldChanged && currentWorld != null && !currentWorld.equals(bufferedWorld)) {
             // 两源互相矛盾：索引说没换、快照说换过。以索引为准（不丢），并把这份不可信的快照丢掉，
             // 让近身判定立即回到 fail-open —— 冻结快照会持续把每批变更判成「远」，只补发一次没用。
@@ -1143,11 +1160,23 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
           target.batch.clear();
           target.passed.clear();
         } else {
-          clusters = target.batch.drainClusters(config.mergeRadius());
-          // 本窗口内「已有更新下发覆盖过」的坐标：缓冲里的同一坐标属旧状态，必须剔除
-          passed = target.passed.isEmpty() ? Set.of() : new HashSet<>(target.passed);
           cancelled = target.cancelledPackets;
+          // 封存到此完成：target 已被 pending.remove 摘除、flushed 已置位。此后任何写入方都必须先经
+          // pending 表取到对象，再在锁内复核 flushed（onPacketSending 的重取循环、rememberDelivered*），
+          // 拿不到这个旧对象；同一把 flushed CAS 也让 discard 无法再进来。所以这里只交出引用与计数，
+          // 聚簇（最坏 O(n²)、配置上限 8192 时千万级比较）与 passed 的只读复制都挪到锁外执行——
+          // 那把锁正是该玩家封包线程 onPacketSending 要抢的锁。
+          clustersDeferred = true;
+          passedSealed = target.passed.isEmpty() ? null : target.passed;
         }
+      }
+      // 锁外：纯聚类与对已封存集合的只读复制。旧对象与新窗口（此后新建的 Pending）已彻底分离，
+      // 这段不读任何共享可变状态，也不改变「何时封存、丢弃哪一批、last-write-wins 剔除哪条」的结论；
+      // 锁时点仍是上面那次 CAS，封存内容与锁内聚簇逐位相同。
+      if (clustersDeferred) {
+        clusters = target.batch.drainClusters(config.mergeRadius());
+        // 本窗口内「已有更新下发覆盖过」的坐标：缓冲里的同一坐标属旧状态，必须剔除
+        passed = passedSealed == null ? Set.of() : new HashSet<>(passedSealed);
       }
       if (timer != null) {
         timer.cancel(false);
@@ -1157,7 +1186,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         // 四条丢弃入口一律留痕：这是「门只开一半」排查里最先要看的东西，不能只有总数
         trace.record(BlockUpdateTrace.Decision.DISCARD, bufferedWorld, false, discarded, 0, 0, 0,
             "冲刷前比对：缓冲世界 " + bufferedWorld + " ≠ 索引世界 "
-                + PlayerWorldIndex.worldName(target.uuid) + "（旧世界区块将整列重建）");
+                + indexWorld + "（旧世界区块将整列重建）");
         return false; // 旧世界的被延迟包按丢弃处理：既未下发、也未合并
       }
       if (cancelled <= 0) {

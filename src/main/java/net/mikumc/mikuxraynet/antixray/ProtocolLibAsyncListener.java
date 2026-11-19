@@ -5,9 +5,11 @@ import com.comphenix.protocol.PacketType;
 import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.async.AsyncMarker;
 import com.comphenix.protocol.events.ListenerPriority;
+import com.comphenix.protocol.events.NetworkMarker;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.events.PacketPostAdapter;
+import com.comphenix.protocol.events.PacketPostListener;
 import io.papermc.paper.math.Position;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -48,6 +50,9 @@ import org.bukkit.plugin.Plugin;
  *
  * <p>线程模型：网络线程（本监听回调）只做「读坐标 → 建任务 → 登记延迟 → 入队」，
  * 解码/判定/重编码全部交给 {@link MikuWorkPool} 的工作线程；工作线程不触碰任何 Bukkit API。
+ * 世界名 / 维度 / 高度一律取自「由实体所属线程发布、并随封包固定下来的不可变快照」
+ * （见 {@link PlayerWorldIndex} 与 {@link ChunkDeliveryPostAdapter}）：本回调不读实体活状态、不按名查世界，
+ * 因此跨维度瞬间不会出现「旧世界的字节按新世界的档案/高度编」；拿不到快照的包按原包即时放行。
  * 需要邻块数据时，网络线程只登记「需要快照」这件事，由主线程 / Folia 区域线程执行
  * {@link NeighborChunkProvider#capture} 抓取，再回到工作线程改写。
  *
@@ -451,13 +456,22 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
           return;
         }
         UUID playerId = player.getUniqueId();
-        String world = PlayerWorldIndex.worldName(playerId);
+        boolean chunkPacket = event.getPacketType() == PacketType.Play.Server.MAP_CHUNK;
+        // 二次同步观察（见 alreadyObserved）：本包已有一次性记账与世界快照，直接早退——
+        // 不查世界表、不查配置、不开 ticket。只有 MAP_CHUNK 会在放行时被再派发一次，
+        // 所以把这道判定提到业务查表之前不会给其它包类型增加任何成本（多一次枚举比较）。
+        if (chunkPacket && alreadyObserved(event)) {
+          return;
+        }
+        // 世界名与上下文取同一次快照：两者来自同一条记录，不会出现「名字是甲、维度是乙」。
+        PlayerWorldIndex.WorldContext context = PlayerWorldIndex.context(playerId);
+        String world = context == null ? null : context.worldName();
         if (world == null || !worldAllowed(live(), world)
             || (bypassRegistry != null && bypassRegistry.isBypassed(playerId))) {
           return;
         }
         try {
-          if (event.getPacketType() != PacketType.Play.Server.MAP_CHUNK) {
+          if (!chunkPacket) {
             if (chunkDeliveryHook == null) {
               observeUpdatesWithoutRevealer(event, playerId, world);
             }
@@ -470,12 +484,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
             return;
           }
           ChunkChangeJournal.Ticket ticket = changeJournal.open(playerId, world, x, z);
-          event.getNetworkMarker().addPostListener(new PacketPostAdapter(getPlugin()) {
-            @Override
-            public void onPostEvent(PacketEvent sent) {
-              onChunkWritten(player, playerId, ticket);
-            }
-          });
+          // 同一份快照随包固定下来（见 ChunkDeliveryPostAdapter）：异步回调从同一个 NetworkMarker 读回，
+          // 既不重复查表，也不会与「换世界后再查一次」的结果错配。
+          event.getNetworkMarker().addPostListener(
+              new ChunkDeliveryPostAdapter(player, playerId, ticket, context));
         } catch (Throwable throwable) {
           stats.replaySkipped.increment();
           logThrottled("区块在途更新观察登记失败（原包不受影响）", throwable);
@@ -483,6 +495,79 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       }
     };
     manager.addPacketListener(deliveryObserver);
+  }
+
+  /**
+   * 携带世界快照的区块写出观察器：MAP_CHUNK 在<b>同步观察阶段</b>就把「该包属于哪个世界的哪一份快照」
+   * 固定下来，异步回调与写出回调都从<b>同一个</b> {@code NetworkMarker} 读回。
+   *
+   * <p><b>为什么挂在 NetworkMarker 上</b>：ProtocolLib 的 {@code PacketEvent#fromSynchronous} 复制同步事件的
+   * {@code networkMarker} <b>引用</b>（5.3.0 已核实：{@code this.networkMarker = original.networkMarker}），
+   * 因此异步回调（{@link #handleChunk}）与最终写出回调（{@link #onChunkWritten}）看到的是同一个 marker。
+   * 这样既不需要额外的 per-packet 映射或锁，也不会出现「观察时查一次、异步时再查一次」得到两份数据。
+   *
+   * <p>快照为 {@code null} 表示观察阶段就没拿到可靠上下文：该包在异步回调里<b>立即放行、不登记延迟</b>。
+   */
+  private final class ChunkDeliveryPostAdapter extends PacketPostAdapter {
+
+    private final Player player;
+    private final UUID playerId;
+    private final ChunkChangeJournal.Ticket ticket;
+    private final PlayerWorldIndex.WorldContext context;
+
+    private ChunkDeliveryPostAdapter(Player player, UUID playerId, ChunkChangeJournal.Ticket ticket,
+        PlayerWorldIndex.WorldContext context) {
+      super(getPlugin());
+      this.player = player;
+      this.playerId = playerId;
+      this.ticket = ticket;
+      this.context = context;
+    }
+
+    @Override
+    public void onPostEvent(PacketEvent sent) {
+      onChunkWritten(player, playerId, ticket, context);
+    }
+  }
+
+  /**
+   * 本封包是否已被本模块的一次同步观察登记过（同一个 marker 上已有本次的 {@link ChunkDeliveryPostAdapter}）。
+   *
+   * <p><b>为什么必须判</b>：ProtocolLib 在异步放行时用 {@code sendServerPacket(player, packet, marker, false)}
+   * 把包交回注入器，{@code false} 表示「未过滤」——同步监听链（含本 MONITOR 观察器）会被<b>第二次</b>执行，
+   * 同一个 {@code NetworkMarker} 会再次抵达观察器。若不早退，就会：① 为同一个包再开一个 journal ticket
+   * （{@code open} 会顶掉旧 ticket，旧的一次性记账随之失效）；② 再挂一个 adapter，而 {@code boundContext}
+   * 只能拿其中一个（{@code HashSet} 无序遍历）；③ 新 ticket 会按「此刻」的世界归属，玩家恰在持包期间换维时
+   * 就是<b>把旧世界的包记到新世界账上</b>。
+   */
+  private static boolean alreadyObserved(PacketEvent event) {
+    return boundContext(event) != null;
+  }
+
+  /**
+   * 从封包自己的 {@code NetworkMarker} 上<b>只读</b>读回同步阶段固定的世界快照；观察阶段未登记时返回
+   * {@code null}。
+   *
+   * <p><b>用 static peek 而不是 {@code event.getNetworkMarker()}</b>：后者是「懒创建」——对黑名单世界、
+   * 直通玩家、被上游取消等<b>本模块根本不观察</b>的包也会凭空 new 一个 {@code NetworkMarker} 并挂到
+   * {@code PacketEvent} 上（多一次分配，且改动了本不该被改的包状态）。{@code NetworkMarker.getNetworkMarker(event)}
+   * 直接返回事件当前持有的引用，没有就返回 {@code null}——这正好是「观察阶段没登记过 → 本包不可靠」的判据。
+   *
+   * <p>同步阶段的 marker 是<b>同一个对象</b>被异步事件复制引用（ProtocolLib 5.3.0 已核实），因此这里读到的
+   * 就是同步观察者写进去的那一份；本方法只读取 {@code getPostListeners()} 的不可变视图，不改动 marker。
+   * 只认本插件的 {@link ChunkDeliveryPostAdapter}（其它插件的 post listener 与本模块无关）。
+   */
+  private static PlayerWorldIndex.WorldContext boundContext(PacketEvent event) {
+    NetworkMarker marker = NetworkMarker.getNetworkMarker(event);
+    if (marker == null) {
+      return null;
+    }
+    for (PacketPostListener post : marker.getPostListeners()) {
+      if (post instanceof ChunkDeliveryPostAdapter adapter) {
+        return adapter.context;
+      }
+    }
+    return null;
   }
 
   private void observeUpdatesWithoutRevealer(PacketEvent event, UUID playerId, String world) {
@@ -545,44 +630,50 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     if (player == null) {
       return;
     }
-    // 世界只取一次并复用同一引用：旧实现 appliesTo(player) 内部取一次 getWorld()、
-    // 下面又取一次——玩家恰在两次取之间切换世界时，可能用「新世界的生效判定」去放行
-    // 「旧世界的区块原包」（窗口极小，但确实存在 TOCTOU）。这里固定一次读取。
-    World world = player.getWorld();
-    boolean bypassed = bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId());
-    // 纯值取值：以下全部是 Bukkit 取值，判定本身由 RewriteGate 完成（可离线枚举顺序语义）。
-    boolean worldPermitted = world != null && worldAllowed(live(), world.getName());
+    UUID playerId = player.getUniqueId();
+    // 世界上下文只从「本封包自己的 NetworkMarker」读回：那是同步观察阶段（更早，且是同一个 marker）
+    // 在实体所属线程发布后固定下来的不可变快照。相对「异步回调里现读实体世界」它修掉两件事：
+    // ① 异步时点读到的世界可能已不是该封包所属世界（跨维度时＝用新世界的档案/高度去编旧世界的字节）；
+    // ② 非所有者线程读实体状态属本项目禁止的越界读取（{@code CraftEntity#getWorld()} 本身只是字段返回、
+    //    未必抛，但同族实体读取在 Folia 上出现过 No currently ticking region，见 PacketThreadPurityTest）。
+    // 于是「用哪份世界数据编码」在整条链路（解码 / 编码 / 登记清单）上永远只有一份。
+    PlayerWorldIndex.WorldContext context = boundContext(event);
+    if (context == null) {
+      // 不可靠取得上下文：原包即时放行，且绝不登记任何处理延迟（由 ProtocolLib 自行放行）。
+      // <b>不计数</b>：这条路径同时吸收了「直通玩家 / 黑名单世界 / 观察阶段没登记」等本来就不该改写的
+      // 意图，计进 chunksSkipped 会把统计与「本来无需改写＝跳过 − 异常」的算术一起污染；
+      // 可观测性由发布侧提供——取不到上下文时 PlayerWorldIndex 会打一次性 WARN，register/capture 失败
+      // 另有分类限流日志。这里也绝不为了统计多查一次表（热路径零额外开销）。
+      return;
+    }
+    boolean bypassed = bypassRegistry != null && bypassRegistry.isBypassed(playerId);
+    // 纯值取值：以下全部来自同一份快照，判定本身由 RewriteGate 完成（可离线枚举顺序语义）。
+    boolean worldPermitted = worldAllowed(live(), context.worldName());
 
+    // 维度由快照里的 Environment 纯枚举映射得到（不触碰世界、不会抛：null 归入主世界）。
     // 维度关闭的世界（默认 dimensions.the_end.enabled=false）必须在构造 accessor / 队列判定 /
     // 取批次闸门之前放行：accessor 构造会做 ProtocolLib 修饰符解析（getSpecificModifier().read(0)），
     // 而这些区块永远进不了缓存（profile 非 active），每包都是纯白付。此路径没有取得任何闸门/延迟，
     // 直接返回由 ProtocolLib 自行放行。
-    AntiXrayConfig.Dimension dimension = null;
-    if (world != null) {
-      try {
-        dimension = AntiXrayConfig.Dimension.of(world.getEnvironment());
-      } catch (Throwable throwable) {
-        // 读维度失败（世界正在卸载等）：按原包放行，绝不阻塞区块加载
-        return;
-      }
-    }
-    boolean dimensionEnabled = false;
-    if (dimension != null) {
-      try {
-        dimensionEnabled = live().enabledForWorld(world.getName(), dimension);
-      } catch (Throwable throwable) {
-        // 配置供应器/世界黑名单异常：按原包放行并记录，绝不把异常冒出异步监听器
-        logThrottled("维度开关判定失败，已按原包放行", throwable);
-        return;
-      }
+    AntiXrayConfig.Dimension dimension = AntiXrayConfig.Dimension.of(context.environment());
+    boolean dimensionEnabled;
+    try {
+      dimensionEnabled = live().enabledForWorld(context.worldName(), dimension);
+    } catch (Throwable throwable) {
+      // 配置供应器/世界黑名单异常：按原包放行并记录，绝不把异常冒出异步监听器
+      logThrottled("维度开关判定失败，已按原包放行", throwable);
+      return;
     }
 
     AsyncMarker marker = event.getAsyncMarker();
     if (marker == null) {
       return;
     }
-    RewriteGate.Decision decision = RewriteGate.decide(true, world != null, bypassed, worldPermitted,
-        dimension != null, dimensionEnabled, workPool.hasCapacity());
+    // worldPresent / dimensionPresent 恒传 true：上下文已存在即代表两者都已解析出确定值
+    // （世界名来自快照，维度来自 Environment 的纯枚举映射），"拿不到" 的情况在上面的 boundContext 分支里
+    // 已经放行，绝不会走到这里。
+    RewriteGate.Decision decision = RewriteGate.decide(true, true, bypassed, worldPermitted,
+        true, dimensionEnabled, workPool.hasCapacity());
     if (decision != RewriteGate.Decision.PROCEED) {
       if (decision == RewriteGate.Decision.SKIP_QUEUE_FULL) {
         // 队列满：直接放行原包，不登记延迟。必须计数：这是唯一「本区块完全未伪装、矿物以真实状态
@@ -617,8 +708,10 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 后面还要用（看门狗预算 / 邻块判定），故在 try 外声明。
     long timeoutMillis;
     try {
-      int minHeight = world.getMinHeight();
-      int sectionCount = (world.getMaxHeight() - minHeight) / 16;
+      // 高度与 section 数同样来自快照：与维度、世界名出自同一时刻的同一份数据，因此不存在
+      // 「按甲世界的档案解码、按乙世界的高度编码」这种跨维错配。
+      int minHeight = context.minHeight();
+      int sectionCount = context.sectionCount();
       // 超时实时读「当前」配置：reload 改了 advanced.timeout-millis 必须立即生效（本监听器不随 reload 重建）。
       // 同一区块的任务构造与看门狗注册共用这一个值，保证两者一致。
       timeoutMillis = live().timeoutMillis();
@@ -629,8 +722,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
       // 原包放行不依赖玩家任务；更新只在出站回调后另行补发。
       Runnable delivery = () -> completeRelease(event, gate);
       task = new RewriteTask(accessor.chunkX(), accessor.chunkZ(),
-          world.getName(), dimension, minHeight, sectionCount, timeoutMillis, delivery,
-          processor.capturePatchStamps(world.getName(), accessor.chunkX(), accessor.chunkZ(),
+          context.worldName(), dimension, minHeight, sectionCount, timeoutMillis, delivery,
+          processor.capturePatchStamps(context.worldName(), accessor.chunkX(), accessor.chunkZ(),
               minHeight >> 4, sectionCount));
     } catch (Throwable throwable) {
       if (gate != null) {
@@ -675,9 +768,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 看门狗已注册，异常一旦漏出去，本封包就只能干等看门狗（默认 2500 ms）才被放行——违反「失败立即
     // fail-open」。故与下面 workPool.execute 的失败分支保持一致：取消看门狗 + 立刻放行原包。
     try {
-      if (neighborsNeeded(world.getName(), dimension)
-          && neighborProvider.cached(world.getName(), accessor.chunkX(), accessor.chunkZ()) == null
-          && scheduleCaptureThenRewrite(task, accessor, world, timeout)) {
+      if (neighborsNeeded(context.worldName(), dimension)
+          && neighborProvider.cached(context.worldName(), accessor.chunkX(), accessor.chunkZ()) == null
+          && scheduleCaptureThenRewrite(task, accessor, context.world(), timeout)) {
         return;
       }
     } catch (Throwable throwable) {
@@ -706,7 +799,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** CHUNK_BATCH_START：打开本玩家的批次闸门。本身不延迟放行（块仍逐个流式下发）。 */
   private void handleBatchStart(PacketEvent event) {
     Player player = event.getPlayer();
-    if (player == null || !appliesTo(player)) {
+    if (player == null || !appliesTo(player.getUniqueId())) {
       return;
     }
     // 闸门表有界：超限时 BatchTable 只淘汰最旧的一个条目（旧实现 clear() 会误清所有玩家的批次）
@@ -731,7 +824,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     // 与「闸门 = 配对 START/FINISHED 才延迟」的本意不符。对不受影响的路径而言，这一步只做一次有界的
     // 移除——下面立即返回，不回写任何数据、不登记任何延迟，因此「恰好一次放行」不受影响。
     ChunkBatchGate gate = batches.remove(player.getUniqueId());
-    if (!appliesTo(player)) {
+    if (!appliesTo(player.getUniqueId())) {
       return;
     }
     if (gate == null) {
@@ -1106,9 +1199,13 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
   }
 
-  private void onChunkWritten(Player player, UUID playerId, ChunkChangeJournal.Ticket ticket) {
+  private void onChunkWritten(Player player, UUID playerId, ChunkChangeJournal.Ticket ticket,
+      PlayerWorldIndex.WorldContext bound) {
     ChunkChangeJournal.Column column = ticket.column;
-    if (stopping || !column.world().equals(PlayerWorldIndex.worldName(playerId))) {
+    // 会话身份按<b>引用相等</b>判定：快照被换过（跨维度 / 退出 / 世界重载）就按过期处理——既不补发，
+    // 也不清新会话的已显形标记。同身份重复发布复用同一实例，所以同一世界内的重复事件不会误判。
+    // 注意：这里只判定「写出后回调」该不该继续；ticket 的身份语义（写入/补发/摘除）完全不变。
+    if (stopping || bound == null || PlayerWorldIndex.context(playerId) != bound) {
       changeJournal.finish(ticket, false);
       return;
     }
@@ -1290,22 +1387,23 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         && processor.needsNeighbors(worldName, dimension);
   }
 
-  /** 该玩家是否受本模块影响（直通名单绕过 + 反矿透世界判定）。 */
-  private boolean appliesTo(Player player) {
-    World world = player.getWorld();
-    return world != null && appliesTo(player, world);
-  }
-
   /**
-   * 该玩家是否受本模块影响（判定用调用方已捕获的世界实例，避免重复 {@code getWorld()} 造成 TOCTOU）。
+   * 该玩家是否受本模块影响（直通名单绕过 + 反矿透世界判定）。
+   *
+   * <p>世界名只从实体所属线程发布的快照读（封包线程不读实体活状态、也不按名查世界）；没有快照即
+   * 「无法判定」→ 不受影响（批次包因此不登记延迟，由 ProtocolLib 自行放行）。
    *
    * <p>黑名单判定必须读「当前」配置（本监听器不随热重载重建）：否则 reload 后纳入黑名单的世界仍会被改写。
    */
-  private boolean appliesTo(Player player, World world) {
-    if (bypassRegistry != null && bypassRegistry.isBypassed(player.getUniqueId())) {
+  private boolean appliesTo(UUID playerId) {
+    PlayerWorldIndex.WorldContext context = PlayerWorldIndex.context(playerId);
+    if (context == null) {
       return false;
     }
-    return worldAllowed(live(), world.getName());
+    if (bypassRegistry != null && bypassRegistry.isBypassed(playerId)) {
+      return false;
+    }
+    return worldAllowed(live(), context.worldName());
   }
 
   /**

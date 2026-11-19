@@ -137,8 +137,28 @@ public final class OcclusionStore implements OcclusionRay.Lookup {
   // 读（无锁乐观读）
   // ------------------------------------------------------------------
 
+  /**
+   * 读取某 section 的遮挡数据；<b>越界 sectionY 一律返回 {@code null}（缺数据），绝不抛异常</b>。
+   *
+   * <p>本方法是射线与显形可见性判定的热路径（每跨一个 section 一次），调用方按「查不到条目」分流语义：
+   * 实体侧按不遮挡（fail-open，少藏）、显形侧按遮挡（严格，不显形）。
+   * {@link SectionKey#packSection} 会对越界 sectionY 抛 {@link IllegalArgumentException}，而
+   * {@link SectionKey} 的成文契约是「调用方（射线/建表）对异常一律按 fail-open 处理」——因此必须在这里
+   * 就地转成 {@code null} 才与契约一致。旧实现让异常冒到 {@code BitmapVisibility} /
+   * {@code OcclusionEngine} 之外，命中时会把<b>整轮</b>例行巡检打掉（而不是只跳过该坐标），
+   * 每轮还刷一条限流日志，与「缺数据 = 按遮挡处理」的注释承诺不符。
+   *
+   * <p><b>只拦 Y</b>：方块坐标是 {@code int}，{@code x >> 4} / {@code z >> 4} 的取值必然落在
+   * {@code [HORIZONTAL_MIN, HORIZONTAL_MAX]}（int 的极值除以 16 恰好等于 28 位边界，见
+   * {@code OcclusionStoreTest#horizontalChunkCoordsFromBlockCoordsAlwaysFitSectionKey}）；
+   * 而 {@code y >> 4} 可达 ±1.34 亿，远超 8 位 sectionY 的可表示范围（自定义超高/超低世界）。
+   */
   @Override
   public SectionOcclusion section(int chunkX, int sectionY, int chunkZ) {
+    if (sectionY < SectionKey.SECTION_Y_MIN || sectionY > SectionKey.SECTION_Y_MAX) {
+      // 越界 = 该段不存在，与「表里没有条目」同一语义（显形侧按遮挡、实体侧按不遮挡）
+      return null;
+    }
     return sections.get(SectionKey.packSection(chunkX, sectionY, chunkZ));
   }
 

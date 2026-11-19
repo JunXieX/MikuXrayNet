@@ -331,4 +331,50 @@ class OcclusionStoreTest {
     assertEquals(0, filled);
     assertSame(EmptyOcclusion.INSTANCE, store.section(0, 0, 0), "已有段不被覆盖");
   }
+
+  // ---------------------------------------------------------- 越界坐标的「缺数据」语义
+
+  /**
+   * <b>本轮修复回归</b>：越界 sectionY 的<b>读取</b>必须返回 {@code null}（缺数据），不得抛异常。
+   *
+   * <p>{@link SectionKey#packSection} 对越界 sectionY 抛 {@code IllegalArgumentException}，而
+   * {@link SectionKey} 的成文契约是「调用方（射线/建表）对异常一律按 fail-open 处理」：射线与显形可见性
+   * 判定正走 {@link OcclusionStore#section}，异常冒出去会把<b>整轮</b>巡检打掉（而不是只跳过该坐标），
+   * 且与「缺数据 = 按遮挡处理」的注释承诺不符。写入侧（{@code setBlockOccluding}）保持显式拒绝。
+   */
+  @Test
+  void sectionOutOfRangeYReturnsMissingInsteadOfThrowing() {
+    OcclusionStore store = new OcclusionStore();
+    store.replaceSection(0, 0, 0, SolidOcclusion.INSTANCE);
+
+    int tooHigh = SectionKey.SECTION_Y_MAX + 1;
+    int tooLow = SectionKey.SECTION_Y_MIN - 1;
+    assertNull(store.section(0, tooHigh, 0), "越界 sectionY 按缺数据返回 null");
+    assertNull(store.section(0, tooLow, 0), "越界 sectionY 按缺数据返回 null（负方向）");
+    // 同一列的合法段不受影响（越界只影响该坐标自己）
+    assertSame(SolidOcclusion.INSTANCE, store.section(0, 0, 0));
+
+    // 方块坐标路径：方块 Y 换算出的 sectionY 超出 8 位（自定义超高/超低世界）也不得抛
+    assertNull(store.section(0, 20_480 >> 4, 0), "方块 y=20480 所在段越界，按缺数据返回");
+    assertNull(store.section(0, -20_480 >> 4, 0), "方块 y=-20480 所在段越界，按缺数据返回");
+  }
+
+  /**
+   * 越界只可能来自 <b>Y</b>：方块坐标是 {@code int}，{@code x >> 4} / {@code z >> 4} 的两个极值恰好等于
+   * 28 位有符号边界（{@link SectionKey#HORIZONTAL_MIN}/{@link SectionKey#HORIZONTAL_MAX}），因此水平方向
+   * 不需要（也不应该）在读取路径上加守卫——多一道守卫会把「合法但极端」的世界坐标误判成缺数据。
+   */
+  @Test
+  void horizontalChunkCoordsFromBlockCoordsAlwaysFitSectionKey() {
+    assertEquals(SectionKey.HORIZONTAL_MAX, Integer.MAX_VALUE >> 4, "int 上界除以 16 恰为 28 位上界");
+    assertEquals(SectionKey.HORIZONTAL_MIN, Integer.MIN_VALUE >> 4, "int 下界除以 16 恰为 28 位下界");
+
+    OcclusionStore store = new OcclusionStore();
+    int maxChunkX = Integer.MAX_VALUE >> 4;
+    int minChunkZ = Integer.MIN_VALUE >> 4;
+    // 极值区块可正常读写（说明 packSection 的水平校验永远不会命中方块坐标导出的值）
+    store.replaceSection(maxChunkX, 0, minChunkZ, SolidOcclusion.INSTANCE);
+    assertSame(SolidOcclusion.INSTANCE, store.section(maxChunkX, 0, minChunkZ));
+    assertNull(store.section(maxChunkX, 0, maxChunkX), "相邻极端区块互不串数据");
+  }
 }

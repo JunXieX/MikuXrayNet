@@ -340,4 +340,63 @@ class NeighborChunkProviderTest {
       }
     }
   }
+
+  /**
+   * 慢速参照实现：<b>逐列</b>调用 {@link NeighborChunkProvider#worldPosition}（优化前的做法），用于锁住
+   * 「固定轴 + 变轴基点 + local」与逐列生成<b>逐位等价</b>。
+   *
+   * <p>只用无上界裁剪（{@code columnTop} 恒为世界顶部），因此参照实现无需复制裁剪逻辑。
+   */
+  private static long[] referencePlane(int baseY, int height, NeighborEdges.Side side, int chunkX,
+      int chunkZ, OcclusionQuery query) {
+    long[] plane = new long[NeighborEdges.planeLongCount(height)];
+    for (int local = 0; local < 16; local++) {
+      int[] position = NeighborChunkProvider.worldPosition(side, chunkX, chunkZ, local);
+      for (int y = 0; y < height; y++) {
+        if (query.isOccluding(position[0], baseY + y, position[1])) {
+          NeighborEdges.setOccluding(plane, y << 4 | local);
+        }
+      }
+    }
+    return plane;
+  }
+
+  /**
+   * <b>本轮优化回归</b>：{@code capturePlane} 改为按「固定轴 + 变轴基点 + local」生成坐标（不再为每一列
+   * 分配 {@code int[2]}）。四个方向 × 正/负区块坐标（含两者皆负的角）都必须与逐列 {@code worldPosition}
+   * 逐位一致——位置相关的遮挡函数会让任何轴向或符号错误立刻显形。
+   */
+  @Test
+  void planeCoordinatesFromBaseMatchPerColumnWorldPosition() {
+    OcclusionQuery band = (x, y, z) -> y >= 20 && ((x + z) & 1) == 0 && (x & 3) != 1;
+    int[][] columns = {{4, 7}, {0, 0}, {-1, -1}, {-5, 3}, {-37, 128}, {128, -37}};
+    for (int[] column : columns) {
+      for (NeighborEdges.Side side : NeighborEdges.Side.values()) {
+        long[] optimized =
+            NeighborChunkProvider.capturePlane(0, HEIGHT, side, column[0], column[1], band, UNBOUNDED);
+        long[] reference = referencePlane(0, HEIGHT, side, column[0], column[1], band);
+        assertArrayEquals(reference, optimized,
+            "side=" + side + " chunk=(" + column[0] + "," + column[1] + ")");
+      }
+    }
+  }
+
+  /**
+   * 变轴/固定轴不得互换（把「随列变化」误放到固定轴上时，整条平面会退化成同一条世界列）。
+   * 这里用只与 X 或只与 Z 相关的遮挡函数，逐列断言取到的是预期的那条轴。
+   */
+  @Test
+  void planeVariesAlongTheExpectedAxisOnly() {
+    OcclusionQuery onZ = (x, y, z) -> (z & 1) == 0;
+    long[] zPlane =
+        NeighborChunkProvider.capturePlane(0, HEIGHT, NeighborEdges.Side.X_PLUS, 4, 7, onZ, UNBOUNDED);
+    assertEquals(1, NeighborEdges.isOccludingAt(zPlane, 0 << 4 | 0) ? 1 : 0, "X 侧 local=0 → z 偶");
+    assertEquals(0, NeighborEdges.isOccludingAt(zPlane, 0 << 4 | 1) ? 1 : 0, "X 侧 local=1 → z 奇");
+
+    OcclusionQuery onX = (x, y, z) -> (x & 1) == 0;
+    long[] xPlane =
+        NeighborChunkProvider.capturePlane(0, HEIGHT, NeighborEdges.Side.Z_PLUS, 4, 7, onX, UNBOUNDED);
+    assertEquals(1, NeighborEdges.isOccludingAt(xPlane, 0 << 4 | 0) ? 1 : 0, "Z 侧 local=0 → x 偶");
+    assertEquals(0, NeighborEdges.isOccludingAt(xPlane, 0 << 4 | 1) ? 1 : 0, "Z 侧 local=1 → x 奇");
+  }
 }

@@ -45,6 +45,9 @@ final class RegionFile implements AutoCloseable {
    */
   private static final AtomicBoolean SELF_HELD_WARNING = new AtomicBoolean();
 
+  /** 「结构损坏已就地重建」的 WARN 只打一次（重建会持续发生，逐次打会刷屏；次数见 stats().errors）。 */
+  private static final AtomicBoolean CORRUPT_REBUILD_WARNING = new AtomicBoolean();
+
   /**
    * 「压缩预算不足、本次压缩已跳过」的 WARN 只打一次。
    *
@@ -190,6 +193,18 @@ final class RegionFile implements AutoCloseable {
   private volatile boolean compacting;
   private boolean closed;
 
+  /**
+   * 打开时（{@link #loadIndex}）按磁盘记录头统计到的「既有条目」数。
+   *
+   * <p>供 {@code DiskCacheStore} 在句柄发布之前一次性补进近似计数：此刻本句柄还没有任何新写入，
+   * 因此基线<b>不会</b>与本次会话的 {@code put} 重复记账；新建/重建/锁不可用时恒为 0。
+   * 句柄发布之后不再读取它（{@code compact} 只改 {@code accountedEntries}，不维护本字段），
+   * 下一次打开会按磁盘现状重算。
+   */
+  private int diskEntryBaseline;
+  /** 本次打开是否因结构损坏而就地重建过（供上层计数与诊断；重建后基线为 0）。 */
+  private boolean rebuiltOnOpen;
+
   private RegionFile(Path path, FileChannel channel, int hashSeed, byte compression,
       int bucketCacheSize, boolean lockUnavailable) {
     this.path = path;
@@ -298,13 +313,59 @@ final class RegionFile implements AutoCloseable {
   static volatile Boolean lockOutcomeOverrideForTest;
 
   /**
+   * 结构损坏（可就地重建）：文件短于「头部 + 偏移表」、魔数/版本/压缩方案非法、偏移表被截断。
+   *
+   * <p><b>只有确定与文件内容有关的失败才用本类型。</b>打不开文件（权限/被占用/路径过长）、目录不可写、
+   * 通道读写失败、落盘失败等<b>环境问题一律抛普通 {@link IOException}</b>，由调用方按「暂时不可用」
+   * 退避重试并<b>保留文件</b>——这些失败与文件内容无关，删掉只会白丢一份本来还能用的缓存。
+   */
+  static final class CorruptFileException extends IOException {
+
+    CorruptFileException(String message) {
+      super(message);
+    }
+
+    CorruptFileException(String message, Throwable cause) {
+      super(message, cause);
+    }
+  }
+
+  /**
    * 打开（必要时创建）区域文件。
    *
-   * <p>文件头损坏时抛 {@link IOException}，由调用方决定「删掉重建」还是「跳过」。
+   * <p><b>失败分类</b>（本方法的核心契约，见 {@link CorruptFileException}）：
+   * <ul>
+   *   <li><b>环境失败</b>：原样抛 {@link IOException}，<b>不删除文件</b>，由调用方退避降级；</li>
+   *   <li><b>结构损坏</b>：内部用 {@link CorruptFileException} 表达（不逃出本方法），并<b>沿已经持有
+   *       文件锁的同一条通道就地重建</b>（清索引 + 重写头部与全零偏移表），随后照常交付可用句柄，
+   *       由 {@link #rebuiltOnOpen()} 告知上层「重建过一次」。
+   *       不删文件、不重开通道：删除在 Windows 上可能因其它句柄/占用失败，而且会让「重建」多一次
+   *       创建-重开-再取锁的窗口。</li>
+   * </ul>
+   *
+   * <p><b>通道所有权</b>：通道一旦打开就归本方法所有，<b>任何一步抛异常都必须在这里关闭它</b>
+   * （含 {@code channel.size()}：旧实现把它写在 close-guard 外面，通道失效时既不关通道也不放锁，
+   * 同 JVM 内随后 open 会撞 {@code OverlappingFileLockException}，该文件此后一直「锁不可用」）。
+   * 唯一把通道移交出去而不回滚的路径是「锁被占用」——空壳句柄持有它，由它的 {@code close()} 释放。
    */
   static RegionFile open(Path path, int bucketCacheSize) throws IOException {
     FileChannel channel = FileChannel.open(path,
         StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+    // 通道从这一行起归本方法所有：以下任何一步抛异常都必须在这里关闭它（含 channel.size()）。
+    try {
+      return openWithLock(path, channel, bucketCacheSize);
+    } catch (Throwable throwable) {
+      closeQuietly(channel);
+      throw throwable;
+    }
+  }
+
+  /**
+   * {@link #open(Path, int)} 的锁内主体。除「锁被占用 → 返回空壳句柄（通道随句柄移交）」这一条返回路径外，
+   * 通道所有权始终在外层：任何异常都会由 {@link #open(Path, int)} 统一关闭。
+   */
+  private static RegionFile openWithLock(Path path, FileChannel channel, int bucketCacheSize)
+      throws IOException {
     // 先取锁、再读文件内容：被占用时立即停用，绝不尝试读取对方正在写的文件。
     // 顺序很关键——Windows 的 FileLock 是强制锁，读被占用文件的区域会直接抛 IOException
     //（实测「另一个程序已锁定文件的一部分」）；若先读头，open 会失败而不是优雅停用。
@@ -313,36 +374,63 @@ final class RegionFile implements AutoCloseable {
       warnLockUnavailableOnce(hold.sameJvm());
       // 停用态：不读头、不建索引，返回一个只在内存里的「空壳」句柄——后续 get 一律未命中、
       // put/flush/compact 一律跳过（见各方法开头的判定），功能不受影响（fail-open）。
+      // 通道移交给空壳句柄，由它的 close() 释放：这是本方法唯一「不回滚通道」的返回路径。
       return new RegionFile(path, channel, BufferedLinearV3Format.DEFAULT_HASH_SEED,
           BufferedLinearV3Format.currentCompression(), bucketCacheSize, true);
     }
 
     int hashSeed = BufferedLinearV3Format.DEFAULT_HASH_SEED;
     byte compression = BufferedLinearV3Format.currentCompression();
-    long size = channel.size();
+    long size;
+    CorruptFileException corruption = null;
     try {
+      size = channel.size();
       if (size > 0) {
         if (size < BufferedLinearV3Format.DATA_AREA_OFFSET) {
-          throw new IOException("区域文件过小（" + size + " 字节）");
+          throw new CorruptFileException("区域文件过小（" + size + " 字节，头部+偏移表需要 "
+              + BufferedLinearV3Format.DATA_AREA_OFFSET + " 字节）");
         }
         // 读取种子与压缩方案：文件头里「格式版本」与「压缩方案」是两个独立字段——
         // 格式版本由 BufferedLinearV3Format.VERSION 标识（当前 0x06；低于它的旧版本由 decodeHeaderInfo 明确拒绝）；
         // 压缩方案 0x02(zstd) 为当前写入值，0x01(Deflate) 是历史格式，两者都要能读。
-        BufferedLinearV3Format.Header header = BufferedLinearV3Format.decodeHeaderInfo(
-            readAt(channel, 0, BufferedLinearV3Format.HEADER_SIZE));
+        //
+        // 【失败分类：读盘与解析必须是两步、两个 try，不能合并】
+        //   ① readAt 的普通 IOException = 文件系统/通道故障（环境）。它原样上抛 → 外层 open 关通道、
+        //      上层 DiskCacheStore 退避降级；只有读到文件尾（read < 0）时才抛 CorruptFileException，代表截断。
+        //   ② decodeHeaderInfo 只对「已经读进内存的 14 字节」做纯解析，它的 IOException 只可能是不符合本格式
+        //      （魔数 / 版本 / 压缩方案字节）⇒ 结构损坏，可就地重建。
+        // 曾把 ①② 写进同一个 try：readAt 的普通通道 IOException 会被下面的 catch 误标成结构损坏，
+        // 进而把一份本来可用的头部与偏移表就地重写掉（数据全丢）。
+        byte[] headerBytes = readAt(channel, 0, BufferedLinearV3Format.HEADER_SIZE);
+        BufferedLinearV3Format.Header header;
+        try {
+          header = BufferedLinearV3Format.decodeHeaderInfo(headerBytes);
+        } catch (IOException headerFailure) {
+          throw new CorruptFileException(headerFailure.getMessage(), headerFailure);
+        }
         hashSeed = header.hashSeed();
         compression = header.compression();
       }
-    } catch (IOException exception) {
-      closeQuietly(channel);
-      throw exception;
+    } catch (CorruptFileException corrupt) {
+      // 结构损坏：不删文件、不重开通道，改为「沿已持锁的同一条通道就地重建为空表」。
+      corruption = corrupt;
+      size = 0L; // 复用「新建」分支的落盘语义：写头部 + 全零偏移表
+      hashSeed = BufferedLinearV3Format.DEFAULT_HASH_SEED;
+      compression = BufferedLinearV3Format.currentCompression();
     }
 
     RegionFile file = new RegionFile(path, channel, hashSeed, compression, bucketCacheSize, false);
     // 已取得的锁必须持强引用（防止被 GC 提前释放）；「同 JVM 自持」时 hold.lock() 为 null（不重复持锁）。
     file.lock = hold.lock();
     try {
-      if (size <= 0L) {
+      if (corruption != null) {
+        // 就地重建：清索引 + 重写头部与全零偏移表。append-only 布局下数据区从 DATA_AREA_OFFSET 起
+        // 被后续追加覆盖，无需截断文件，也就无需删除/替换文件（Windows 上删除还可能因占用失败）。
+        file.resetIndex();
+        file.writeHeaderAndEmptyTable();
+        file.rebuiltOnOpen = true;
+        warnCorruptRebuildOnce(corruption);
+      } else if (size <= 0L) {
         // 新建（或刚被清空）的文件：必须先落「文件头 + 全零偏移表」，
         // 否则后续 append 会从偏移 0 开始写，直接把头部与偏移表踩掉（重开时被判为损坏）。
         file.writeHeaderAndEmptyTable();
@@ -395,6 +483,12 @@ final class RegionFile implements AutoCloseable {
     BufferedLinearV3Format.warnSchemeDowngradeOnce(compression, feasible);
     this.compression = feasible;
     // 先丢弃不可读的旧索引，再重写头部与全零偏移表（顺序不能反，否则会把旧偏移写回偏移表）
+    resetIndex();
+    writeHeaderAndEmptyTable();
+  }
+
+  /** 清空内存索引与槽位表（<b>不写盘</b>）：供「结构损坏就地重建」与「压缩方案迁移」共用。 */
+  private void resetIndex() {
     for (int bucket = 0; bucket < BufferedLinearV3Format.BUCKET_COUNT; bucket++) {
       positions[bucket] = 0L;
       bucketSizes[bucket] = 0L;
@@ -402,14 +496,39 @@ final class RegionFile implements AutoCloseable {
       slots[bucket] = null;
     }
     loaded.clear();
-    writeHeaderAndEmptyTable();
     liveBytes = 0L;
     garbageBytes = 0L;
+    diskEntryBaseline = 0;
   }
 
-  /** 读入偏移表并统计有效/垃圾字节数（损坏的引用按「空桶 + 垃圾」处理）。 */
+  /**
+   * 「结构损坏就地重建」的中文提示：<b>只提示一次</b>（重建会持续发生，逐次打会把日志刷满；
+   * 次数请以 {@code DiskCacheStore.stats().errors} 为准）。
+   */
+  private static void warnCorruptRebuildOnce(IOException corruption) {
+    if (CORRUPT_REBUILD_WARNING.compareAndSet(false, true)) {
+      LOGGER.warning("磁盘缓存区域文件结构损坏，已在原文件上就地重建为空表（不删除文件，"
+          + "该文件的旧条目按未命中重建；缓存只是可选加速，不影响封包链路）：" + corruption.getMessage()
+          + "（本条只提示一次，后续同类重建静默进行、计入「异常」计数）");
+    }
+  }
+
+  /**
+   * 读入偏移表并统计有效/垃圾字节数，同时<b>复用这批记录头</b>统计「磁盘上已有条目数」的基线
+   * （{@link #diskEntryBaseline()}）。
+   *
+   * <p><b>失败分类</b>：只有「记录头被截断」（{@link CorruptFileException}，即 {@code readAt} 读到文件尾）
+   * 才按「这个桶是坏的、当空 + 计入垃圾」处理；<b>普通通道 {@code IOException} 一律上抛</b>，由外层
+   * 关闭通道、上层退避降级。绝不能在循环里把它吞成空桶——那会让打开带着一份残缺索引继续，
+   * 后续写入把「本还在的记录」当成新条目、落盘时覆盖掉偏移表（沿用坏索引写新数据）。
+   *
+   * <p>基线必须在这里一次算完：旧实现另起一个延迟任务（{@code countDiskEntries}）把同样的 8 字节记录头
+   * 再读一遍（最多 1024 次随机 {@code pread}/文件打开），既慢又会把「打开之后才写进来的条目」重复计入。
+   * 这里与 {@code countEntriesOnDisk} 同口径：记录有效 + 声明原始长度落在文件预算内 + 声明了非空内容。
+   */
   private void loadIndex(long size) throws IOException {
     this.fileSize = size;
+    this.diskEntryBaseline = 0;
     if (size <= 0) {
       return;
     }
@@ -417,6 +536,7 @@ final class RegionFile implements AutoCloseable {
     long[] table = BufferedLinearV3Format.decodePosTable(
         readAt(channel, BufferedLinearV3Format.POS_TABLE_OFFSET, BufferedLinearV3Format.POS_TABLE_SIZE));
     long live = 0L;
+    int entries = 0;
     for (int bucket = 0; bucket < table.length; bucket++) {
       long offset = table[bucket];
       positions[bucket] = offset;
@@ -429,7 +549,7 @@ final class RegionFile implements AutoCloseable {
       try {
         byte[] lengths = readAt(channel, offset, 8);
         ByteBuffer buffer = ByteBuffer.wrap(lengths);
-        buffer.getInt();
+        int rawLength = buffer.getInt();
         int compressedLength = buffer.getInt();
         if (compressedLength <= 0 || offset + 8L + compressedLength > size) {
           positions[bucket] = 0L;
@@ -437,12 +557,22 @@ final class RegionFile implements AutoCloseable {
         }
         bucketSizes[bucket] = 8L + compressedLength;
         live += bucketSizes[bucket];
-      } catch (IOException exception) {
+        // 复用上面这两个字段（原本 rawLength 被直接丢弃）：口径与 countEntriesOnDisk 完全一致
+        //（rawLength 体积 sanity + declaredEntryCount），因此两条路径算出的条目数必然相同。
+        if (rawLengthWithinFileBudget(rawLength)
+            && BufferedLinearV3Format.declaredEntryCount(rawLength) > 0) {
+          entries++;
+        }
+      } catch (CorruptFileException truncatedRecord) {
+        // 只有「记录头被截断」才丢这一个桶（结构损坏，fail-open 到该桶）；
+        // 普通通道 IOException 是环境故障，必须上抛：在循环里吞掉会让本次打开带着一份
+        // 读了一半的索引继续，随后 put/flush 会把仍存在的记录当新条目、并用这份索引覆盖偏移表。
         positions[bucket] = 0L;
       }
     }
     this.liveBytes = live;
     this.garbageBytes = Math.max(0L, size - BufferedLinearV3Format.DATA_AREA_OFFSET - live);
+    this.diskEntryBaseline = entries;
   }
 
   // ------------------------------------------------------------------ 读
@@ -474,6 +604,21 @@ final class RegionFile implements AutoCloseable {
    */
   boolean isCompacting() {
     return compacting;
+  }
+
+  /**
+   * 打开时统计到的「磁盘上已有条目数」基线（见 {@link #loadIndex}）。
+   *
+   * <p>锁不可用、新建文件、结构损坏重建之后均为 0；它<b>只</b>描述打开那一刻的内容，
+   * 不含本会话随后写入的条目（那些由 {@code DiskCacheStore} 的 put/clear/compact 增量维护）。
+   */
+  int diskEntryBaseline() {
+    return diskEntryBaseline;
+  }
+
+  /** 本次打开是否发生过「结构损坏就地重建」（供上层计一次异常、并在诊断里可见）。 */
+  boolean rebuiltOnOpen() {
+    return rebuiltOnOpen;
   }
 
   /**
@@ -1329,14 +1474,33 @@ final class RegionFile implements AutoCloseable {
     }
   }
 
-  private static byte[] readAt(FileChannel channel, long startOffset, int length) throws IOException {
+  /**
+   * 定长随机读。
+   *
+   * <p><b>失败分类</b>：读到文件尾（{@code read < 0}）说明文件比结构要求的短 ⇒ 截断，抛
+   * {@link CorruptFileException}（结构损坏，调用方按 fail-open 处理：单桶丢弃、头部/偏移表则由
+   * {@code open} 就地重建）；通道本身读失败仍抛普通 {@link IOException}（环境问题，
+   * <b>绝不据此重写或删除文件</b>——调用方必须让它上抛到退避路径，而不是当成损坏去重建）。
+   *
+   * <p><b>不允许 0 字节进展</b>：阻塞式 {@code FileChannel} 在有剩余空间时不会返回 0，一旦返回 0 说明
+   * 通道处于无法推进的状态；旧写法会在这里无限循环，把唯一的磁盘线程永久钉死。
+   */
+  // 声明里同时列出两个类型不是冗余：CorruptFileException 是「已分类的结构损坏」，普通 IOException 是
+  // 「通道/文件系统故障」。分开声明让调用方可以只捕获前者（例如 loadIndex 只丢被截断的那个桶），
+  // 而不会因为「声明的只有 IOException」被迫把两者写进同一个 catch（那正是本类曾经踩过的坑）。
+  private static byte[] readAt(FileChannel channel, long startOffset, int length)
+      throws CorruptFileException, IOException {
     byte[] out = new byte[length];
     ByteBuffer buffer = ByteBuffer.wrap(out);
     long offset = startOffset;
     while (buffer.hasRemaining()) {
       int read = channel.read(buffer, offset);
       if (read < 0) {
-        throw new IOException("区域文件在偏移 " + offset + " 处意外结束");
+        throw new CorruptFileException("区域文件在偏移 " + offset + " 处意外结束（应读 " + length
+            + " 字节，起始 " + startOffset + "）：文件被截断");
+      }
+      if (read == 0) {
+        throw new IOException("区域文件读取无进展（偏移 " + offset + "）：通道可能已失效");
       }
       offset += read;
     }
