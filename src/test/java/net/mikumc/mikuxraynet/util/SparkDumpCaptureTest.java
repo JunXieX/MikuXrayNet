@@ -57,9 +57,47 @@ class SparkDumpCaptureTest {
   }
 
   @Test
+  void notStartedBlockNeverClaimsAProfileWindow() {
+    // 真机 T4 抓到的红项：Spark 没跑时仍写「窗口：30 秒」，与同文件 10 秒的数值采样段自相矛盾
+    for (String state : List.of(
+        "未执行（本服没有可用的 Spark）",
+        "未执行（已有 Spark 采样在进行，未打断它）",
+        "未执行（Spark 已被服务端的全局配置禁用）",
+        "未执行（本服没有 spark 命令）",
+        "未执行（派发 Spark 命令失败：连接超时）")) {
+      String text = SparkDumpCapture.render(state, null, "说明占位");
+      assertFalse(text.contains("30 秒"), "未执行时不得出现 30 秒口径：" + state);
+      assertFalse(text.contains("全部线程"), "未执行时不得出现「全部线程」：" + state);
+      assertTrue(text.contains("窗口：未采样"), "未执行时必须明说没有性能记录：" + state);
+      assertTrue(text.contains("状态：" + state), "状态行必须保留：" + state);
+      assertTrue(text.endsWith("\n"));
+    }
+  }
+
+  @Test
+  void startedBlockKeepsTheThirtySecondWindow() {
+    for (String state : List.of("已上传", "未完成（等待 Spark 生成采样文件超时）",
+        "未完成（上传失败：服务端返回 500）", "未完成（本次采样文件超出大小上限，未上传）")) {
+      String text = SparkDumpCapture.render(state, null, "说明占位");
+      assertTrue(text.contains("窗口：30 秒"), "已启动分支必须保留 30 秒口径：" + state);
+      assertTrue(text.contains("全部线程"), "已启动分支必须保留采样范围说明：" + state);
+      assertFalse(text.contains("窗口：未采样"), "已启动分支不得写成未采样：" + state);
+    }
+  }
+
+  @Test
   void blankStateFallsBackToUnknownInsteadOfEmpty() {
     assertTrue(SparkDumpCapture.render(null, null, null).contains("状态：未完成（未知原因）"));
     assertTrue(SparkDumpCapture.render("  ", null, null).contains("状态：未完成（未知原因）"));
+  }
+
+  @Test
+  void isNotStartedOnlyMatchesTheNotStartedStateWord() {
+    assertTrue(SparkDumpCapture.isNotStarted("未执行（本服没有可用的 Spark）"));
+    assertFalse(SparkDumpCapture.isNotStarted("已上传"));
+    assertFalse(SparkDumpCapture.isNotStarted("未完成（等待 Spark 生成采样文件超时）"));
+    assertFalse(SparkDumpCapture.isNotStarted("已取消（插件停用或调用方放弃等待）"));
+    assertFalse(SparkDumpCapture.isNotStarted(null));
   }
 
   @Test

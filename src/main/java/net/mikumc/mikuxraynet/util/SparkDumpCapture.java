@@ -101,6 +101,22 @@ public final class SparkDumpCapture {
   /** 返回文本的标题行：调用方按这一行定位整段（前导换行让拼接处不漏行）。 */
   private static final String TITLE = "\n---- Spark 采样 ----\n";
 
+  /**
+   * 「本次 Spark 根本没跑」的唯一状态词前缀。
+   *
+   * <p>它同时决定返回段里的<b>窗口口径</b>：未执行时不存在任何 Spark 性能记录，窗口行必须写成
+   * 「未采样」——否则 dump 会出现「Spark 段说 30 秒、同文件运行采样段是 10 秒」的自相矛盾
+   * （对外的承诺是 30 秒窗口，收回 10 秒后绝不能仍宣称 30 秒）。
+   */
+  static final String NOT_STARTED = "未执行";
+
+  /** 未启动时的窗口行：明说没有性能记录，绝不出现「30 秒 / 全部线程」字样。 */
+  private static final String WINDOW_NOT_SAMPLED = "窗口：未采样（Spark 未启动，无性能记录）";
+
+  /** 已启动时的窗口行。 */
+  private static final String WINDOW_SAMPLED = "窗口：" + PROFILE_SECONDS
+      + " 秒（Spark 原生采样：全部线程、间隔 10 毫秒、由 Spark 到期自动落盘）";
+
   /** 默认上传端点（Spark 官方；与 SparkPlatform 的默认配置一致）。 */
   private static final String DEFAULT_BYTEBIN = "https://spark-usercontent.lucko.me/";
 
@@ -731,11 +747,12 @@ public final class SparkDumpCapture {
    * 以换行结尾，便于直接拼进 dump 文本。
    */
   static String render(String state, String link, String note) {
+    String effectiveState = state == null || state.isBlank() ? "未完成（未知原因）" : state;
     StringBuilder builder = new StringBuilder(320);
     builder.append(TITLE);
-    builder.append("窗口：").append(PROFILE_SECONDS)
-        .append(" 秒（Spark 原生采样：全部线程、间隔 10 毫秒、由 Spark 到期自动落盘）").append('\n');
-    builder.append("状态：").append(state == null || state.isBlank() ? "未完成（未知原因）" : state).append('\n');
+    // 窗口口径必须与「到底有没有在采样」一致：未执行 = 没有 Spark 性能记录，不能写 30 秒/全部线程
+    builder.append(isNotStarted(effectiveState) ? WINDOW_NOT_SAMPLED : WINDOW_SAMPLED).append('\n');
+    builder.append("状态：").append(effectiveState).append('\n');
     if (link != null && !link.isBlank()) {
       builder.append("完整链接：").append(link).append('\n');
     }
@@ -743,6 +760,11 @@ public final class SparkDumpCapture {
       builder.append("说明：").append(note).append('\n');
     }
     return builder.toString();
+  }
+
+  /** 状态是否属于「本次 Spark 根本没跑」（{@link #NOT_STARTED} 前缀）。 */
+  static boolean isNotStarted(String state) {
+    return state != null && state.startsWith(NOT_STARTED);
   }
 
   /**
