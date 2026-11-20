@@ -176,6 +176,10 @@ public final class OcclusionRules {
    * ——例如反矿透边界邻块的 {@code BlockData} 路径，它必须与 {@code ObfuscationProcessor} 内部
    * 经 {@link BlockStateRegistry#isOccluding} 的伪装判定保持同源。
    *
+   * <p><b>本方法是边界邻块真值表的唯一规则来源</b>：逐格热路径不再调用本方法，而是在构造期把
+   * （方块名, 逐状态真值）的全部组合预计算成表（{@code BukkitOcclusion.MaterialTable}），运行期只查表。
+   * 因此这里改规则必然同步改表；两者的逐值等价性由 {@code BukkitOcclusionTableTest} 全覆盖对照。
+   *
    * @param blockName         方块名（可带命名空间/大小写，内部归一化）
    * @param serverOccluding   服务端对该状态的原始 isOccluding 判定
    * @param extraOccluding    用户额外声明为「遮挡」的方块名（已归一化；可为 {@code null}）

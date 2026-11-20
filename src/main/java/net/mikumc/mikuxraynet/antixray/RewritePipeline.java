@@ -57,18 +57,39 @@ public final class RewritePipeline {
   /**
    * 一次改写结果。
    *
-   * @param cached          命中值（内存或磁盘）；未命中为 {@code null}
-   * @param result          未命中时的改写结果；命中时为 {@code null}
-   * @param fromDisk        是否由磁盘回填（供诊断口径）
-   * @param contentRejected 命中但不可用的次数（源指纹不符 / 缺遮挡位图），供调用方计入
-   *                        {@code cacheContentRejected}
-   * @param diskRejected    磁盘负载存在但解码失败或源指纹不符，供调用方计入 {@code diskPayloadRejected}
+   * @param cached           命中值（内存或磁盘）；未命中为 {@code null}
+   * @param result           未命中时的改写结果；命中时为 {@code null}
+   * @param fromDisk         是否由磁盘回填（供诊断口径）
+   * @param sourceChanged    键命中但源字节指纹已变（内容过期）的次数，供调用方计入
+   *                         {@code cacheRejectedSourceChanged}
+   * @param occlusionMissing 键命中但缺遮挡位图、被迫按未命中重写的次数，供调用方计入
+   *                         {@code cacheRejectedOcclusionMissing}
+   * @param diskReject       磁盘负载存在但被拒的原因；未被拒为 {@code null}。调用方按
+   *                         {@link DiskPayload.Reject#sourceHashMismatch()} 分两类计数：真 = 缓存内容已过期
+   *                         （正常失效，照常重写覆盖），假 = 信封/数据故障（负载损坏或容器格式不符）。
+   *                         「被拒总数」仍等于 {@code diskReject() != null}，与既有聚合口径一致
    */
   public record Outcome(CachedChunk cached, ObfuscationProcessor.Result result, boolean fromDisk,
-      int contentRejected, boolean diskRejected) {
+      int sourceChanged, int occlusionMissing, DiskPayload.Reject diskReject) {
+
+    /**
+     * 命中但不可用的次数 = 源字节已变 + 缺遮挡位图。
+     *
+     * <p><b>派生而非独立分量</b>：拆分前它由同一个局部变量累加，两类成因混在一个数里——「内容真的变了」
+     * 属正常失效，「缺遮挡位图」是遮挡建表的回归（该区块会一直按「缺数据 = 遮挡」藏住矿）。改成派生值后
+     * 聚合口径与既有调用点不变，而子项之和恒等于它，不会出现两处计数互相漂移。
+     */
+    public int contentRejected() {
+      return sourceChanged + occlusionMissing;
+    }
 
     public boolean hit() {
       return cached != null;
+    }
+
+    /** 磁盘负载存在但被拒（解码失败或源指纹不符）：口径等同于 {@code diskReject() != null}。 */
+    public boolean diskRejected() {
+      return diskReject != null;
     }
   }
 
@@ -94,24 +115,26 @@ public final class RewritePipeline {
     NeighborEdges edges = neighbors.get(request.worldName(), request.chunkX(), request.chunkZ(),
         request.dimension());
     int print = fingerprint.of(edges);
-    int rejected = 0;
+    int sourceChanged = 0;
+    int occlusionMissing = 0;
 
     CachedChunk cached = cache.get(request.worldName(), request.chunkX(), request.chunkZ(), print);
     if (cached != null && cached.sourceHash() != request.sourceHash()) {
       // 键命中但内容已变：命中计数 +1 却用不上，必须单列，否则命中率虚高且磁盘查询数对不上
-      rejected++;
+      sourceChanged++;
       cached = null;
     }
-    boolean diskRejected = false;
+    DiskPayload.Reject diskReject = null;
     boolean fromDisk = false;
     if (cached == null && disk != null && disk.usable()) {
       byte[] payload = disk.get(request.worldName(), request.chunkX(), request.chunkZ(), print);
       if (payload != null) {
         DiskPayload.Decoded decoded = DiskPayload.decode(payload, request.sourceHash());
-        if (decoded == null) {
+        if (!decoded.usable()) {
           // 读到了负载但用不上（信封损坏或原始字节指纹不符）：这是「命中率正常却仍在重写」的唯一出口，
           // 必须让调用方计数——否则会被混进普通未命中，无法区分是内容指纹还是配置指纹在拦。
-          diskRejected = true;
+          // 拒绝原因由同一次解码给出（不重解、不重读盘），调用方据此把「内容过期」与「信封/数据故障」分列。
+          diskReject = decoded.reject();
         } else {
           cached = new CachedChunk(decoded.sourceHash(), decoded.data(), decoded.positions(),
               decoded.occlusion());
@@ -123,12 +146,12 @@ public final class RewritePipeline {
     if (cached != null && processor.occlusionEnabled() && cached.occlusion() == null) {
       // 启用遮挡却没有位图：直接命中会让该区块长期「已伪装但无位图」→ 显形侧按缺数据=遮挡 → 玩家漏矿。
       // 视为未命中重写一次（代价一次性），逼出位图。
-      rejected++;
+      occlusionMissing++;
       cached = null;
       fromDisk = false;
     }
     if (cached != null) {
-      return new Outcome(cached, null, fromDisk, rejected, diskRejected);
+      return new Outcome(cached, null, fromDisk, sourceChanged, occlusionMissing, diskReject);
     }
 
     boolean occlusionRequired = processor.occlusionEnabled();
@@ -150,7 +173,7 @@ public final class RewritePipeline {
             () -> DiskPayload.encode(request.sourceHash(), positions, result.occlusion(), bytes));
       }
     }
-    return new Outcome(null, result, false, rejected, diskRejected);
+    return new Outcome(null, result, false, sourceChanged, occlusionMissing, diskReject);
   }
 
   /**

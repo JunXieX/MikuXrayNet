@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 
@@ -17,9 +18,17 @@ import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
  * 一个窗口的延迟）。改为「每 tick 刷新」后，任何位置变化（含传送）都在至多一个 tick 内进入快照，
  * 不依赖任何移动/传送事件补丁。
  *
- * <p><b>发布方式</b>：快照是不可变 {@link Position} 记录，经 {@link ConcurrentHashMap} 读写。
- * 记录字段是 {@code final}，而 {@code ConcurrentHashMap} 的读写建立 happens-before，因此调用方
- * 看到的一定是一份完整的新快照（不会读到「半新半旧」的坐标），无需额外加锁或 volatile 数组。
+ * <p><b>每玩家只有一个持有者（{@link Session}）</b>：位置快照、心跳、会话号都在同一个对象上，表里存的是
+ * 「当前连接的那个持有者」。换代 = 换对象（{@link #beginSession(UUID)} 直接替换表里的引用）：
+ * <ul>
+ *   <li>旧持有者上的迟到写入只落在旧对象里——读取侧只读表里当前持有者的字段，新连接看不到旧坐标；</li>
+ *   <li>不存在「清表之后、重新登记之前」被旧任务写回新代的窗口（旧实现是「位置表 + 心跳表 + 无锁
+ *       check→put」，重连时编号还会从 1 重来，属于典型的 ABA）；</li>
+ *   <li>退役回调拿着旧持有者，只能按引用相等摘掉自己那一条（见 {@code BlockChangeMerger}）。</li>
+ * </ul>
+ * 会话号是<b>进程级单调递增</b>的，只用于诊断与日志；<b>世界代次不在这里</b>——世界身份（含代次）由
+ * {@code PlayerWorldIndex.WorldContext} 负责，本类只回答「这个玩家的哪一次连接、什么时候、在哪个世界、
+ * 方块坐标是多少」。
  *
  * <p><b>零分配读取端口</b>：刷新侧刻意用 {@code player.getX()/getY()/getZ()} 三个基本类型 getter
  * （{@link org.bukkit.entity.Entity#getX()} 等），不用 {@code getLocation()}——后者每 tick 每玩家
@@ -29,8 +38,8 @@ import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
  * 无法判断距离时宁可少合并，绝不制造延迟。本类不触碰任何 Bukkit API，可离线单测。
  *
  * <p><b>方块坐标不变的提前返回</b>：判定只用到方块坐标（见 {@link #immediatePass}），因此
- * {@link #refresh} 先读回当前快照，若其方块坐标与本次完全相同就直接返回——不 new 记录、不写 CHM。
- * 这样静止玩家（占绝大多数）每 tick 只剩一次 CHM 读，省下每秒每玩家一次记录分配与写操作。
+ * {@link #refresh} 先读回当前快照，若其方块坐标与本次完全相同就直接返回——不 new 记录、不写持有者。
+ * 这样静止玩家（占绝大多数）每 tick 只剩一次字段读，省下每秒每玩家一次记录分配。
  * 判据是<b>同一枚</b> {@link #blockCoordinate} 纯函数同时供写入侧（是否重发）与判定侧（算距离）使用，
  * 两侧不可能漂移。
  *
@@ -38,8 +47,7 @@ import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
  * {@link #refreshWorldOnly} 只维护「当前世界」而<b>跳过坐标读取</b>（省掉每 tick 三次 getter 与三次
  * floor 比较）。该分支下坐标被标记为未知（{@link Position#positionKnown()} = false），
  * {@link #immediatePass} 据此 fail-open（按近身立即放行），绝不拿一个与当前世界无关的旧坐标去算距离。
- * 「当前世界」仍每 tick 维护，因为跨世界丢弃（切维事件 / 位置快照比对 / 封包线程守卫）全靠它判定。
- * 切出黑名单世界后调用方改回 {@link #refresh}，下一次刷新即恢复精确坐标。
+ * 「当前世界」仍每 tick 维护，因为世界归属判定全靠它。
  */
 final class PlayerPositionSnapshots {
 
@@ -49,7 +57,8 @@ final class PlayerPositionSnapshots {
    * <p><b>为什么带世界名</b>：方块变更包里的坐标<b>不含世界标识</b>。合并窗口内玩家跨世界（传送门 /
    * {@code /tp}）时，若仍把旧世界的变更照常合并发出，客户端会把这些坐标当成<b>新世界</b>的坐标，
    * 表现为新世界对应位置出现「鬼影方块」，直到该区块被重新下发。有了世界名，封包线程就能在
-   * 「封包所属世界 ≠ 当前快照世界」时立刻判定为跨世界切换（见 {@link BlockChangeMerger}）。
+   * 「快照世界 ≠ 索引世界」时判定为<b>不一致</b>并即时放行原包（见 {@code BlockChangeMerger}）；
+   * 跨世界丢弃仍然只认「已证实的会话/世界更替」，绝不拿单侧快照当丢弃依据。
    *
    * <p>世界名由<b>拥有该玩家的线程</b>读取后写入，封包线程只读这份快照——与坐标同一纪律，绝不跨线程读
    * {@code Player#getWorld()}。
@@ -62,25 +71,71 @@ final class PlayerPositionSnapshots {
   }
 
   /**
+   * 一次连接的持有者：位置快照 + 心跳 + 会话号。
+   *
+   * <p>字段全部 volatile：位置与心跳由拥有线程每 tick 写、封包线程无锁读。两者在同一对象上，
+   * 读取侧看到的一定是「某一次连接」的数据，不会出现「新会话的世界 + 旧会话的坐标」这种跨代拼接。
+   * 位置与心跳是两次独立的 volatile 写，读者可能读到「新位置 + 上一 tick 的心跳」——那只影响
+   * {@link #isStale(UUID)} 的判定精度（最多早一个 tick 判过期，方向是 fail-open），不影响正确性。
+   */
+  static final class Session {
+    private final UUID playerId;
+    private final long id;
+    private volatile Position position;
+    private volatile long stamp;
+
+    private Session(UUID playerId, long id) {
+      this.playerId = playerId;
+      this.id = id;
+    }
+
+    UUID playerId() {
+      return playerId;
+    }
+
+    /** 会话号（进程级单调递增，仅用于诊断与日志）。 */
+    long id() {
+      return id;
+    }
+
+    Position position() {
+      return position;
+    }
+
+    /** 心跳是否已过期；从未刷新同样算过期。 */
+    boolean isStale(long now) {
+      long last = stamp;
+      return last == 0L || now - last > STALE_NANOS;
+    }
+
+    void touch(long now) {
+      stamp = now;
+    }
+  }
+
+  /**
    * 快照「心跳」阈值：刷新任务是每 tick 执行的，超过这个时长没有心跳就说明它已经不再运行。
    *
    * <p><b>为什么需要心跳</b>：Folia 的实体调度器任务会随实体被移出旧 world（切维、重生）而退役，
    * 而退役并<b>不保证</b>回调到我们的清理入口——结果就是快照被冻结在切换前的那一刻，并且看起来一切正常：
    * 世界名还是旧世界、坐标还是旧坐标。冻结的快照比「没有快照」危险得多：近身判定会把所有变更判成「远」
-   * （全部进合并窗口），跨世界守卫则会拿旧世界名与真实世界名比较，把每一批都当成「玩家已切维」整批丢弃。
-   * 实测（29 人 / 4 小时的 dump）仅这一条就丢了 69.5 万个原包，玩家侧表现是假方块挖不掉、右键才消失。
+   * （全部进合并窗口），世界归属判定也会拿着一份旧世界名去和索引比对。实测（29 人 / 4 小时的 dump）仅这
+   * 一条就丢了 69.5 万个原包，玩家侧表现是假方块挖不掉、右键才消失。
+   *
+   * <p>心跳只能证明「还有人在写」，<b>不能</b>证明「写的人拥有这个实体」。1.34.13 生产 dump 里
+   * 「快照重同步 1234102 / 冲刷 2428522」证明的是两源长期冲突，尚未证明是哪一侧——可能的原因有：
+   * 旧实体上的任务仍在非拥有线程读实体（心跳新鲜、世界陈旧）、索引漏接/错序了切维事件、或切维事件与
+   * 本任务的重排之间存在竞态。因此写侧另有一道归属闸与一道会话闸（见
+   * {@code BlockChangeMerger#refreshPosition}），并用 {@code ThrottleStats#indexRepaired} /
+   * {@code #worldConflict} 在下一次 dump 里区分这两种候选根因。
    */
   static final long STALE_NANOS = 5_000_000_000L;
 
-  private final ConcurrentHashMap<UUID, Position> positions = new ConcurrentHashMap<>();
+  /** 当前连接持有者：每玩家一条，换代即换对象。 */
+  private final ConcurrentHashMap<UUID, Session> sessions = new ConcurrentHashMap<>();
 
-  /**
-   * 每玩家最后刷新时刻（{@link System#nanoTime()}）。
-   *
-   * <p>用「原地改写 {@code long[]}」而不是每次发布新值：刷新是每 tick 每玩家一次的热路径，
-   * 这里既不想分配记录（快照本身有「同一方块不重发」的优化，见类注释），也不想每 tick 写一次 CHM。
-   */
-  private final ConcurrentHashMap<UUID, long[]> stamps = new ConcurrentHashMap<>();
+  /** 会话号分配器（进程级单调递增；不参与任何判定，只用于诊断）。 */
+  private final AtomicLong sessionSeq = new AtomicLong();
 
   /** 时钟（测试可注入，生产即 {@link System#nanoTime}）。 */
   private final LongSupplier clock;
@@ -94,18 +149,67 @@ final class PlayerPositionSnapshots {
   }
 
   /**
-   * 刷新某玩家快照（必须在拥有该玩家的线程调用）。方块坐标与世界均未变时不发布，见类注释。
+   * 开始一次新会话（玩家加入 / 插件启用时的在线玩家快照）：换一个持有者，旧持有者立即失效。
    *
+   * <p>{@code put} 是原子的：旧任务即便正在写，也只会写进它自己手里的旧持有者，表里已经是新对象——
+   * 不存在「先清空、再被旧任务写回」的窗口。
+   *
+   * @return 新会话（恒非 {@code null}）
+   */
+  Session beginSession(UUID playerId) {
+    if (playerId == null) {
+      return null;
+    }
+    return sessions.compute(playerId,
+        (key, previous) -> new Session(key, sessionSeq.incrementAndGet()));
+  }
+
+  /** 当前会话；没有会话（未登录 / 已退出 / 停用）时为 {@code null}。 */
+  Session session(UUID playerId) {
+    return playerId == null ? null : sessions.get(playerId);
+  }
+
+  /** 该会话是否仍是表里的当前会话（迟到的刷新/退役必须据此停手）。 */
+  boolean isCurrent(Session session) {
+    return session != null && sessions.get(session.playerId()) == session;
+  }
+
+  /**
+   * 只失效「位置快照 + 心跳」，<b>保留连接会话</b>。
+   *
+   * <p>用于「这次读不到世界 / 读实体抛异常 / 本轮刷新任务退役」这类<b>临时</b>失败：读取侧立刻 fail-open
+   * （入口一律即时放行），但会话令牌还在——否则一次瞬时读失败就会被下游当成「换了连接」，把已有待发批
+   * 判成上一代连接而整批不投递，属于用临时故障换永久损失。
+   */
+  void invalidate(Session session) {
+    if (!isCurrent(session)) {
+      return;
+    }
+    session.position = null;
+    session.stamp = 0L;
+  }
+
+  /** 结束会话（退出 / 停用）：此后读取侧一律 fail-open。 */
+  void endSession(UUID playerId) {
+    if (playerId != null) {
+      sessions.remove(playerId);
+    }
+  }
+
+  /**
+   * 刷新某玩家快照（必须在<b>拥有该玩家的线程</b>调用）。方块坐标与世界均未变时不发布，见类注释。
+   *
+   * @param session 本任务的会话（见 {@link #beginSession(UUID)}）；已不是当前会话时本方法无操作
    * @return <b>刷新前</b>快照的世界名（原本没有快照时为 {@code null}），未发布时返回当前世界名
    *         （此时等于入参 {@code world}）。调用方据此检测跨世界切换——旧世界的方块变更缓冲必须丢弃，
    *         绝不能按新世界坐标下发（见 {@code BlockChangeMerger}）
    */
-  String refresh(UUID playerId, String world, double x, double y, double z) {
-    if (playerId == null) {
+  String refresh(Session session, String world, double x, double y, double z) {
+    if (!isCurrent(session)) {
       return null;
     }
-    touch(playerId);
-    Position current = positions.get(playerId);
+    session.touch(clock.getAsLong());
+    Position current = session.position;
     // positionKnown 必须一起判：黑名单世界留下的「世界名相同但坐标未知」快照不能被当成「坐标未变」而
     // 跳过发布，否则切出黑名单世界后坐标会一直是未知、近身判定永远 fail-open。
     if (current != null && current.positionKnown() && Objects.equals(current.world(), world)
@@ -116,7 +220,7 @@ final class PlayerPositionSnapshots {
       // 返回当前世界名（= world）：调用方只据此判断「世界是否变化」，此处不得触发丢弃。
       return current.world();
     }
-    positions.put(playerId, new Position(world, x, y, z, true));
+    session.position = new Position(world, x, y, z, true);
     return current == null ? null : current.world();
   }
 
@@ -128,65 +232,55 @@ final class PlayerPositionSnapshots {
    *
    * @return <b>刷新前</b>快照的世界名（原本没有快照时为 {@code null}），与 {@link #refresh} 语义一致
    */
-  String refreshWorldOnly(UUID playerId, String world) {
-    if (playerId == null) {
+  String refreshWorldOnly(Session session, String world) {
+    if (!isCurrent(session)) {
       return null;
     }
-    touch(playerId);
-    Position current = positions.get(playerId);
+    session.touch(clock.getAsLong());
+    Position current = session.position;
     if (current != null && !current.positionKnown() && Objects.equals(current.world(), world)) {
       return current.world();
     }
-    positions.put(playerId, new Position(world, 0.0D, 0.0D, 0.0D, false));
+    session.position = new Position(world, 0.0D, 0.0D, 0.0D, false);
     return current == null ? null : current.world();
   }
 
-  /** 只读快照；尚未建立时返回 {@code null}（调用方按 fail-open 处理）。 */
+  /** 只读快照；尚未建立会话时返回 {@code null}（调用方按 fail-open 处理）。 */
   Position get(UUID playerId) {
-    return playerId == null ? null : positions.get(playerId);
+    if (playerId == null) {
+      return null;
+    }
+    Session session = sessions.get(playerId);
+    return session == null ? null : session.position();
   }
 
   /**
-   * 该玩家的快照是否已经<b>过期</b>（没有快照也算过期）。
+   * 该玩家的快照是否已经<b>过期</b>（没有会话 / 从未刷新也算过期）。
    *
-   * <p>过期即视为「未知」：近身判定按立即放行（fail-open），跨世界守卫按「无法证明玩家已换世界」
-   * 处理（照常合并/补发，绝不整批丢弃）。判据是心跳而不是内容——内容看起来完全正常恰恰是冻结点最
+   * <p>过期即视为「未知」：近身判定按立即放行（fail-open），世界归属判定按「无法证明玩家已换世界」
+   * 处理（照常交付，绝不整批丢弃）。判据是心跳而不是内容——内容看起来完全正常恰恰是冻结点最
    * 会骗人的地方（世界名与坐标都停留在切换前）。
    */
   boolean isStale(UUID playerId) {
     if (playerId == null) {
       return true;
     }
-    long[] stamp = stamps.get(playerId);
-    return stamp == null || clock.getAsLong() - stamp[0] > STALE_NANOS;
+    Session session = sessions.get(playerId);
+    return session == null || session.isStale(clock.getAsLong());
   }
 
-  /** 记录一次刷新心跳（原地改写，零分配）。 */
-  private void touch(UUID playerId) {
-    stamps.computeIfAbsent(playerId, ignored -> new long[1])[0] = clock.getAsLong();
-  }
-
-  /** 丢弃某玩家快照（玩家退出 / 实体退役 / 守卫发现不一致）：此后读取侧一律 fail-open。 */
-  void discard(UUID playerId) {
-    if (playerId != null) {
-      positions.remove(playerId);
-      stamps.remove(playerId);
-    }
-  }
-
-  /** 清空全部快照（插件停用）。 */
+  /** 清空全部会话（插件停用）。 */
   void clear() {
-    positions.clear();
-    stamps.clear();
+    sessions.clear();
   }
 
   /**
-   * 当前快照数。
+   * 当前会话数。
    *
    * <p>测试专用豁免：生产路径不读该值，本方法当前仅单测在用，保留以免破坏测试。
    */
   int size() {
-    return positions.size();
+    return sessions.size();
   }
 
   /**

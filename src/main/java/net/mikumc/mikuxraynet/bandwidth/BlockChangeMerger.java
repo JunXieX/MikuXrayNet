@@ -1,5 +1,6 @@
 package net.mikumc.mikuxraynet.bandwidth;
 
+import com.destroystokyo.paper.event.player.PlayerPostRespawnEvent;
 import com.comphenix.protocol.PacketType;
 import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.events.ListenerPriority;
@@ -8,6 +9,7 @@ import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.wrappers.BlockPosition;
 import com.comphenix.protocol.wrappers.WrappedBlockData;
+import io.papermc.paper.threadedregions.scheduler.EntityScheduler;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -27,10 +29,12 @@ import net.mikumc.mikuxraynet.antixray.SectionCoords;
 import net.mikumc.mikuxraynet.bandwidth.BlockChangeBatch.Update;
 import net.mikumc.mikuxraynet.config.BandwidthConfig;
 import net.mikumc.mikuxraynet.util.PlayerWorldIndex;
+import net.mikumc.mikuxraynet.util.PlayerWorldIndex.WorldContext;
 import net.mikumc.mikuxraynet.config.WorldBlacklistConfig;
 import net.mikumc.mikuxraynet.util.BypassRegistry;
 import net.mikumc.mikuxraynet.util.Constants;
 import org.bukkit.Bukkit;
+import org.bukkit.World;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.HandlerList;
@@ -38,7 +42,6 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
-import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.plugin.Plugin;
 
 /**
@@ -57,8 +60,17 @@ import org.bukkit.plugin.Plugin;
  * （旧实现依赖 {@code PlayerMoveEvent}，而传送有独立 HandlerList，会按陈旧坐标判错）。
  *
  * <p><b>fail-open</b>：读不出字段、构包失败、定时器排不上、玩家离线 —— 一律原样放行原包，绝不丢更新；
- * 只有「已确认写入缓冲」的包才会被取消。位置快照不可用（尚未建立 / 刷新或读取异常）时同样 fail-open：
- * 近身判定按「立即放行」处理，宁可少合并、绝不制造延迟。
+ * 只有「已确认写入缓冲」的包才会被取消。位置快照不可用（尚未建立 / 心跳过期 / 刷新或读取异常）时同样
+ * fail-open：近身判定按「立即放行」处理，宁可少合并、绝不制造延迟。
+ *
+ * <p><b>入口两源一致闸</b>：方块变更包不含世界标识，因此「这批坐标属于哪个世界」只能靠两份来源推断——
+ * {@link PlayerWorldIndex}（玩家事件驱动）与 {@link PlayerPositionSnapshots}（拥有线程每 tick 读实体）。
+ * 只有两者<b>同会话、同世界、坐标已知、心跳新鲜</b>时本类才允许入缓冲；任一侧未知或两侧冲突时
+ * <b>原包即时放行</b>（不进窗口、不按任何一侧的旧世界名打标、不延迟），计数见
+ * {@code ThrottleStats#worldUnknown} / {@code #worldConflict}。
+ * 这条闸是 1.34.13 生产 dump 的直接回归：那份 dump 里「快照重同步 1234102 / 冲刷 2428522」，
+ * 处置环反复出现「位置快照（world）与索引（minecraft_lobby）矛盾」——两源长期不一致时，旧实现仍把每个包
+ * 按索引世界入缓冲，再在冲刷时整批补发：既不丢更新，也永远修不好近身判定（每批都白吃一个窗口）。
  *
  * <p><b>last-write-wins</b>：窗口内已经由「立即放行」路径下发过新状态的坐标，会在冲刷时从合并结果里
  * 剔除（见 {@link #dropPassed}）——旧态晚到会把先到的新态覆盖回去（方块回退）。剔除后没有剩余坐标时
@@ -68,16 +80,19 @@ import org.bukkit.plugin.Plugin;
  * 字段做结构校验（单条与多条的路径都做）。校验不过即放弃本次合并结果、按 section 逐条补发原更新——
  * 原包此时已被取消，退化成逐条补发是唯一能保证「不丢更新」的做法。
  *
- * <p><b>跨世界丢弃只认世界索引</b>：缓冲坐标按 {@link PlayerWorldIndex} 打标，索引由玩家事件驱动、
- * 随真实切维前进；而位置快照由实体调度器的每 tick 任务维护，任务在 Folia 上会随实体被移出旧 world
- * （切维 / 重生）退役且不保证回调清理入口，快照于是可能<b>冻结</b>而看起来一切正常。
- * 因此冲刷守卫改成「索引也说变了才丢」，冻结快照只会触发一次重同步（{@code snapshotResync}），
- * 绝不据此整批丢弃。
+ * <p><b>冲刷丢弃只认「两源一致地证明换了世界」</b>：缓冲把世界上下文（{@link WorldContext}，含世界名与
+ * 进程级代次）与<b>接收连接</b>（{@link PlayerPositionSnapshots} 的连接会话）一起固定。冲刷与送出前按序判定：
+ * ① <b>接收连接已换代</b>（或世界身份换代但名字相同）→ 上一代，不投递
+ * （与快照新鲜度无关：新连接可能还没有第一条位置快照）；
+ * ② 索引上下文 / 活快照缺失或心跳过期 → 世界未知，照常交付；③ 索引与快照不一致 → 冲突，照常交付；
+ * ④ 索引已换代、活快照与索引同世界、且与固定的世界不同 → 真切维，整批丢弃。单侧证据永远不是丢弃依据
+ * （历史事故 69.5 万包正是拿冻结快照整批丢的）。
  *
  * <p><b>不变量（取消即欠账）</b>：凡本类 {@code event.setCancelled(true)} 过的包，<b>必须</b>经
  * {@link #deliver} 的合并包或 {@link UpdateDelivery#deliverEach} 的逐条补发之一离开本模块；
- * 整批丢弃只允许在「已证明玩家换到了别的世界、客户端会整列重建该世界区块」时发生（四条入口共用
- * {@link #shouldRedeem} 这一张判定表）。交付末段的任何一步都不允许把异常当成「玩家已离线」：
+ * 整批丢弃只允许在「已证明玩家换到了别的世界、客户端会整列重建该世界区块」时发生（事件 / 黑名单入口
+ * 用 {@link #shouldRedeem}，冲刷入口用 {@link FlushWorld#classify}；同名世界重连按「上一代连接」不投递，
+ * 同样不丢有效更新）。交付末段的任何一步都不允许把异常当成「玩家已离线」：
  * 探测失败按「未知、照常发送」处理，单条失败只损失该条并计入 {@code ThrottleStats#sendFailed}。
  * 违反这条不变量的表现就是「门只开一半、另一半永远不动」。
  *
@@ -150,19 +165,39 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     /** 本窗口内被取消（改为窗口末合并下发）的原包数，供统计与「是否有实包」判定。 */
     private int cancelledPackets;
     /**
-     * 本缓冲内坐标所属的世界名（入缓冲时由封包线程从 {@code PlayerWorldIndex} 快照写入；
+     * 本缓冲内坐标所属的世界上下文（入缓冲时由封包线程从 {@link PlayerWorldIndex} 读取后在锁内固定；
      * {@code null} = 尚未入过包）。
      *
      * <p><b>为什么需要它</b>：方块变更包<b>不含世界标识</b>，冲刷时无法从包本身判断「这些坐标属于哪个世界」。
-     * 若玩家在合并窗口内切维（切维事件与快照比对都漏接的极端情形），窗口到期仍会把旧世界坐标按新世界
-     * 下发——客户端在新世界对应位置出现「鬼影方块」。冲刷前比对该值与此刻的快照世界，不一致即整批丢弃
-     * （旧世界区块会整列重建，丢弃不构成丢更新）。
+     * 固定的不只是世界名，还有该世界的<b>代次</b>（{@code session}）：同名世界重连时世界名一模一样，
+     * 只有代次能区分「同一世界的同一代连接」与「重连后的新连接」。冲刷时据此判定
+     * {@code SAME / UNKNOWN / CONFLICT / CHANGED / PREVIOUS_CONNECTION}（见 {@link FlushWorld}）。
+     *
+     * <p>只在 {@code synchronized (target)} 内读写；{@link #worldName()} 供留痕与报文使用。
      */
-    private volatile String world;
+    private WorldContext context;
+
+    /**
+     * 接收这批更新的<b>连接</b>（{@code PlayerPositionSnapshots} 的会话持有者，登录建立、退出结束）。
+     *
+     * <p><b>为什么不借世界代次充当连接</b>：世界代次只在「世界身份变化」时换代，同名世界重连前后完全
+     * 相同；而连接换代与世界无关（退出重登、断线重连）。两者混用就会出现「上一连接的缓冲算成同一世界，
+     * 发给新连接」——尤其在新连接还没产出第一条位置快照时，快照新鲜度也救不了。
+     *
+     * <p>刻意<b>不</b> pin {@code Player} 实例：Folia 上重生/切维会重建实体，同一连接会换对象；
+     * 按实例比对会把「同一连接换了实体」误判成新连接而丢掉仍在有效期内的批。
+     */
+    private PlayerPositionSnapshots.Session connection;
     private final Set<Coord> buffered = new HashSet<>();
     private final Set<Coord> passed = new HashSet<>();
     private final BlockChangeBatch<WrappedBlockData> batch;
     private ScheduledFuture<?> timer;
+
+    /** 缓冲坐标所属的世界名；尚未入过包时为 {@code null}（只用于留痕与报文）。 */
+    private String worldName() {
+      WorldContext pinned = context;
+      return pinned == null ? null : pinned.worldName();
+    }
 
     private void rememberPass(int x, int y, int z) {
       Coord coord = new Coord(x, y, z);
@@ -185,6 +220,108 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     private Pending(UUID uuid, int maxEntries) {
       this.uuid = uuid;
       this.batch = new BlockChangeBatch<>(maxEntries);
+    }
+  }
+
+  /**
+   * 一次「每 tick 位置刷新」的注册：会话 + 句柄 + 退役/失主标志。
+   *
+   * <p>退役回调跑在关键代码里，只能做内存记账；它必须能回答「摘的是不是我自己这条」——因此回调持有本
+   * 对象、用 {@code positionTasks.remove(playerId, slot)} 按<b>注册身份</b>摘除：旧实体迟到的退役摘不到
+   * 重建后的新注册，也删不掉新会话的位置快照（{@code PlayerPositionSnapshots#invalidate} 只作用于仍是
+   * 当前会话的那一条）。
+   */
+  static final class RefreshSlot {
+    /** 登记时的连接会话（{@code PlayerPositionSnapshots} 的持有者；换代即换对象）。 */
+    final PlayerPositionSnapshots.Session session;
+    /** 登记时该玩家实体的调度器：实体被重建后 owner 会变，旧注册据此判为「已不可能再服务」。 */
+    final EntityScheduler owner;
+    /** 调度返回的句柄（调度失败时不会入表）。 */
+    volatile ScheduledTask handle;
+    /** 退役回调已到达（只做记账，不得操作实体/世界）。 */
+    volatile boolean retired;
+    /** 已判定为「跑在非拥有线程」的僵尸注册：只允许触发一次重建。 */
+    volatile boolean ownerLost;
+
+    RefreshSlot(PlayerPositionSnapshots.Session session, EntityScheduler owner) {
+      this.session = session;
+      this.owner = owner;
+    }
+
+    /**
+     * 未退役、句柄在、未被取消，且 owner 没被换掉。
+     *
+     * <p>owner 比较不可省：同一玩家重生/切维后实体被重建，旧实体上的任务即便还没被服务端取消，也
+     * 不可能再服务这个玩家——只按 {@code isCancelled()} 判断会把它当成「已有登记」而拒绝重排。
+     */
+    boolean isLive(EntityScheduler current) {
+      ScheduledTask task = handle;
+      return !retired && task != null && !task.isCancelled() && owner == current;
+    }
+  }
+
+  /**
+   * 冲刷前对「这批已取消的坐标还能不能交给当前连接」的判定表（唯一实现，纯函数）。
+   *
+   * <p>三段证据缺一不可：入缓冲时固定的世界上下文（{@code pinned}）、此刻的世界索引上下文
+   * （{@code now}）、此刻的位置快照（{@code snapshotFresh} + {@code snapshotWorld}）。
+   * 任何单侧证据都不构成丢弃理由——历史事故（69.5 万包）正是拿冻结快照当证据整批丢掉的。
+   */
+  enum FlushWorld {
+    /** 两源一致：仍是入缓冲时的那个世界，照常交付。 */
+    SAME,
+    /** 世界未知（索引或快照缺失 / 心跳过期）：无法证明换过世界，按「不丢」交付。 */
+    UNKNOWN,
+    /** 两源冲突（索引未换代却世界不同，或换代后两源不一致）：按「不丢」交付，保留快照等对账修正。 */
+    CONFLICT,
+    /** 已证明换世界（同一连接下索引换代 + 活快照与索引同世界 + 与固定世界不同）：整批丢弃。 */
+    CHANGED,
+    /**
+     * 接收连接已换代（同名世界重连），或世界身份换代但名字相同（世界重载）。
+     *
+     * <p>两者都与快照新鲜度无关：前者不能在「新连接还没有第一条位置快照」时被降级成「世界未知」，
+     * 后者说明固定下来的旧上下文已经失效。结论一致：不投递给当前连接（新世界/新连接会重新下发区块）。
+     */
+    PREVIOUS_CONNECTION;
+
+    /**
+     * 判定「这批坐标能不能交给当前连接」。
+     *
+     * <p><b>为什么必须两源</b>：索引由玩家事件驱动（切维/重连时才换代），位置快照由拥有线程每 tick
+     * 读实体。只认索引，会把「索引漏接事件」当成没换世界（把旧世界坐标发进新世界 = 鬼影方块）；
+     * 只认快照，会把「刷新任务跑在旧实体上」当成换了世界（整批丢弃 = 永久缺格，实测 69.5 万包）。
+     *
+     * @param pinned         入缓冲时固定的世界上下文（可为 {@code null}：历史缓冲）
+     * @param now            此刻的索引上下文（{@code null} = 索引未知）
+     * @param snapshotFresh  位置快照是否存在且心跳新鲜
+     * @param snapshotWorld  位置快照里的世界名（{@code snapshotFresh=false} 时必须为 {@code null}）
+     * @param sameConnection 此刻的接收连接是否仍是入缓冲时的那个连接（见 {@code Pending#connection}）
+     */
+    static FlushWorld classify(WorldContext pinned, WorldContext now, boolean snapshotFresh,
+        String snapshotWorld, boolean sameConnection) {
+      if (!sameConnection) {
+        // 接收者已换代：这与世界、快照新鲜度都无关——新连接会重新收到区块，绝不能把上一连接的
+        // 已取消批次发给它。这一条必须排在最前：新连接刚上线时往往还没有第一条位置快照，
+        // 若先看快照新鲜度，就会落到 UNKNOWN 分支而被「按不丢交付」发出去。
+        return PREVIOUS_CONNECTION;
+      }
+      if (pinned == null) {
+        // 没有固定上下文（历史缓冲 / 停用瞬间）：按原行为交付，绝不凭猜测丢弃
+        return SAME;
+      }
+      if (now == null || !snapshotFresh || snapshotWorld == null) {
+        return UNKNOWN;
+      }
+      if (now.session() == pinned.session()) {
+        // 索引没换代：同一世界仍是唯一可证明的结论。快照若不同意，那是「两源冲突」，不是换世界。
+        return snapshotWorld.equals(pinned.worldName()) ? SAME : CONFLICT;
+      }
+      if (!shouldDiscardAtFlush(pinned.worldName(), now.worldName())) {
+        // 世界身份换了一代但名字相同（世界重载 / 高度变化）：固定下来的旧上下文已失效，不按新世界投递
+        return PREVIOUS_CONNECTION;
+      }
+      // 索引换代、世界不同：还必须活快照独立同意，否则是快照陈旧（冲突），不丢
+      return snapshotWorld.equals(now.worldName()) ? CHANGED : CONFLICT;
     }
   }
 
@@ -211,8 +348,35 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * @see PlayerPositionSnapshots
    */
   private final PlayerPositionSnapshots positions = new PlayerPositionSnapshots();
-  /** 每玩家的位置刷新任务句柄（退出 / 实体退役 / 停用时逐一取消）。 */
-  private final ConcurrentHashMap<UUID, ScheduledTask> positionTasks = new ConcurrentHashMap<>();
+
+  /**
+   * 实体归属判定：刷新任务只允许在<b>拥有该玩家</b>的线程写快照。
+   *
+   * <p>生产实现是 {@code Bukkit.isOwnedByCurrentRegion}；离线单测可注入假实现（同 {@code EntityCuller}
+   * 的做法）。这道闸针对的<b>候选根因</b>是：Folia 上被移出旧 world 的实体任务仍可能再跑一次，它在非拥有
+   * 线程读到的 {@code getWorld()} 还是旧世界，却会把心跳刷成新鲜的（「心跳新鲜、世界陈旧」的僵尸快照）。
+   * 1.34.13 生产 dump 只能证明两源冲突（「快照重同步 1234102 / 冲刷 2428522」），不能单独证明这条路径；
+   * 另一种同形原因是索引漏接切维事件，由 {@code ThrottleStats#indexRepaired} 与 {@code #worldConflict} 区分。
+   */
+  @FunctionalInterface
+  interface PlayerOwnership {
+    boolean isOwnedByCurrentRegion(Player player);
+  }
+
+  /** 生产实现：{@link Bukkit#isOwnedByCurrentRegion(org.bukkit.entity.Entity)}（判定不可用时按「属于本区域」）。 */
+  private static boolean ownedByCurrentRegion(Player player) {
+    try {
+      return Bukkit.isOwnedByCurrentRegion(player);
+    } catch (Throwable throwable) {
+      // 判定不可用（离线单测无服务端实例等）：退回「属于本区域」，与改动前行为一致
+      return true;
+    }
+  }
+
+  private final PlayerOwnership ownership;
+
+  /** 每玩家的位置刷新注册（会话 + 句柄；退役回调按注册身份摘除，见 {@link RefreshSlot}）。 */
+  private final ConcurrentHashMap<UUID, RefreshSlot> positionTasks = new ConcurrentHashMap<>();
   /**
    * 停用中标记：{@link #stop()} 首行置位，供 {@link #schedulePositionRefresh} 做「入账后再读一次」收口。
    *
@@ -221,6 +385,14 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * 就永远无人取消。
    */
   private volatile boolean stopping;
+  /**
+   * 位置刷新看门狗（全局区域线程，低频）。
+   *
+   * <p>刷新任务只在 登录 / 复活完成 / 切维 / 启用 四个时机登记。若某次登记落在已退役实体上（调度返回
+   * {@code null}）或任务被服务端取消，该玩家会永久停在「快照过期 → 入口一律即时放行」的 fail-open 态：
+   * 不丢更新、不制造延迟，但块变更合并对他完全停摆。看门狗把这个停摆限制在 ≤5 秒。
+   */
+  private volatile ScheduledTask watchdog;
   private final AtomicInteger errorCounter = new AtomicInteger();
   /** 「位置快照不可用 → 近身判定一律立即放行」的一次性提示闸。 */
   private final AtomicBoolean snapshotFailOpenNoticed = new AtomicBoolean();
@@ -239,12 +411,24 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
   public BlockChangeMerger(Plugin plugin, ProtocolManager protocolManager,
       BandwidthConfig.BlockChanges config, ThrottleStats stats) {
+    this(plugin, protocolManager, config, stats, BlockChangeMerger::ownedByCurrentRegion);
+  }
+
+  /**
+   * 完整构造：追加实体归属判定（离线单测可注入假实现，用于覆盖「刷新跑在非拥有线程」的僵尸快照分支）。
+   *
+   * <p>生产装配链（{@code ThrottlePipeline}）只用上面的公开构造，注入点仅为离线用例存在——与
+   * {@code EntityCuller} 的 {@code EntityOwnership} 同一做法。
+   */
+  BlockChangeMerger(Plugin plugin, ProtocolManager protocolManager,
+      BandwidthConfig.BlockChanges config, ThrottleStats stats, PlayerOwnership ownership) {
     super(plugin, ListenerPriority.NORMAL, PacketType.Play.Server.BLOCK_CHANGE,
         PacketType.Play.Server.MULTI_BLOCK_CHANGE);
     this.plugin = plugin;
     this.protocolManager = protocolManager;
     this.config = config;
     this.stats = stats;
+    this.ownership = ownership == null ? BlockChangeMerger::ownedByCurrentRegion : ownership;
     this.flusher = new ScheduledThreadPoolExecutor(1, runnable -> {
       Thread thread = new Thread(runnable, "MikuXrayNet-BlockMerge");
       thread.setDaemon(true);
@@ -268,12 +452,15 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     protocolManager.addPacketListener(this);
     registered = true;
     plugin.getServer().getPluginManager().registerEvents(this, plugin);
-    // 位置快照任务「始终登记」：它不只服务近身判定，还承载「玩家当前世界」，而跨世界守卫必须靠它
-    // 才能发现「玩家已切维」（见 refreshPosition / isCrossWorld）。immediate-radius=0 时快照只用于
-    // 世界判定：静止玩家的每 tick 开销仅为一次 CHM 读（方块坐标与世界都未变时不发布快照），可忽略。
+    // 位置快照任务「始终登记」：它不只服务近身判定，还承载「玩家当前世界」——入口一致闸与冲刷判定
+    // 都要靠它（见 refreshPosition / verifiedSnapshot）。immediate-radius=0 时快照只用于世界归属：
+    // 静止玩家的每 tick 开销仅为一次字段读（方块坐标与世界都未变时不发布快照），可忽略。
     for (Player player : plugin.getServer().getOnlinePlayers()) {
+      // 启用即一代新会话（热重载会重建本类实例，旧实例的会话令牌不跨实例复用）
+      positions.beginSession(player.getUniqueId());
       schedulePositionRefresh(player);
     }
+    startWatchdog();
     plugin.getLogger().fine("带宽模块已启用：方块变更合并（时间窗 " + config.mergeWindowMillis()
         + "ms，邻域半径 " + config.mergeRadius() + "，立即放行半径 " + config.immediateRadius()
         + " 格，缓冲上限 " + config.maxPendingEntries() + "）");
@@ -294,6 +481,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     }
     flushAll();
     HandlerList.unregisterAll(this);
+    cancelWatchdog();
     cancelAllPositionRefreshTasks();
     positions.clear();
     flusher.shutdownNow();
@@ -305,8 +493,12 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
   @EventHandler(ignoreCancelled = true)
   public void onJoin(PlayerJoinEvent event) {
-    // 与 start() 一致：位置快照同时承担跨世界检测，必须始终登记（见 start() 的说明）。
-    schedulePositionRefresh(event.getPlayer());
+    Player player = event.getPlayer();
+    // 新连接 = 新会话：旧连接（同 UUID）迟到的刷新/退役从此写不进、也删不掉这一代会话。
+    // 同名世界重连时世界名一模一样，只有会话能区分两代连接——这是「同世界不同连接不能串」的起点。
+    positions.beginSession(player.getUniqueId());
+    // 与 start() 一致：位置快照同时承担世界归属判定，必须始终登记（见 start() 的说明）。
+    schedulePositionRefresh(player);
   }
 
   /**
@@ -320,35 +512,50 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * 因此事件到来时玩家世界已是新世界、而缓冲里的坐标必然全部属于旧世界：此刻丢弃既准确又及时，
    * 把「合并窗口定时器按墙钟触发」那条路径的窗口归零。
    *
-   * <p>这是三道兜底的<b>主路径</b>：
+   * <p>这是三道证据里的<b>主路径</b>（零窗口，覆盖传送门 / 跨世界传送等一切经由
+   * {@code changeDimension} 的切维）：
    * <ol>
-   *   <li>本事件（零窗口，覆盖传送门 / 跨世界传送等一切经由 {@code changeDimension} 的切维；若某条
-   *       实现路径不触发本事件，下面两道兜底仍然生效，只是窗口退化回「≤1 tick」）；</li>
-   *   <li>{@link #refreshPosition} 的每 tick 快照比对（覆盖「漏接本事件」的实现差异）；</li>
-   *   <li>封包线程的 {@code isCrossWorld} 守卫（覆盖「切维后仍有旧世界旧包到达」）。</li>
+   *   <li>本事件：拿玩家此刻的真实世界名做 destination，直接判定「旧世界缓冲还要不要」；</li>
+   *   <li>{@link #refreshPosition} 的每 tick 快照比对（覆盖「漏接本事件」的实现差异），同样用刚读到的
+   *       真实世界名做 destination；</li>
+   *   <li>冲刷前的 {@link FlushWorld#classify}（覆盖「切维后仍有旧世界旧包到达」）：只有索引换代 +
+   *       活快照同世界才算证明。</li>
    * </ol>
-   * 命中本事件后，旧世界封包会被第 3 道守卫按「直通 + 丢弃」处理，不会重新入缓冲。
+   * 命中本事件后，旧世界封包会被入口一致闸按「原包即时放行」处理，不会重新入缓冲；若缓冲已存在，
+   * 本事件内联丢弃（不聚簇、不构包、不发包）。
    */
   @EventHandler(ignoreCancelled = true)
   public void onChangedWorld(PlayerChangedWorldEvent event) {
     Player player = event.getPlayer();
+    String destination = null;
+    try {
+      // 事件在实体所属线程触发，读世界合法；读不到时交回索引判定（discard 内部按 destination == null 处理）
+      destination = player.getWorld() == null ? null : player.getWorld().getName();
+    } catch (Throwable ignored) {
+      // 世界正在卸载等极端情形：退回索引世界名
+    }
     Pending target = pending.get(player.getUniqueId());
     if (target != null) {
-      discard(target, ThrottleStats.DiscardSource.DIMENSION_EVENT, player.getWorld().getName());
+      discard(target, ThrottleStats.DiscardSource.DIMENSION_EVENT, destination);
     }
     // 重排刷新任务：Folia 的实体调度器任务会随实体被移出旧 world 而退役，退役不保证回调到
-    // discardPositionSnapshot。不重排的话，那个玩家的位置快照就永远停在切维前那一刻——近身判定把
-    // 所有变更判成「远」，跨世界守卫又拿旧世界名比对新世界名，每一批在途变更都会被整批丢掉。
+    // retirePositionTask。不重排的话，那个玩家的位置快照就永远停在切维前那一刻——近身判定把所有变更
+    // 判成「远」，入口一致闸又拿旧世界名与索引比对新世界名。重排后由拥有线程按真实世界重新发布快照，
+    // 并顺带对账修正世界索引（见 refreshPosition）。
     schedulePositionRefresh(event.getPlayer());
   }
 
   /**
-   * 重生：Folia 上玩家重生会重建实体，旧实体的调度器随之退役，位置刷新任务同样需要重排。
+   * 复活完成：Folia 上玩家重生会重建实体，旧实体的调度器随之退役，位置刷新任务同样需要重排。
+   *
+   * <p><b>为什么挂 {@code PlayerPostRespawnEvent}</b>：{@code PlayerRespawnEvent} 触发时玩家尚未落到
+   * 复活点（上游文档亦指明「改玩家状态请用 post 事件」），此时登记的任务会随旧实体退役、等于白排一次；
+   * 本模块另两个每玩家周期任务（{@code EntityCuller} / {@code LatencyMonitor}）已按同一时序修正。
    *
    * <p>没有这条时，死亡一次就等于该玩家此后所有方块变更都按「冻结快照」判定（见上）。
    */
   @EventHandler(ignoreCancelled = true)
-  public void onRespawn(PlayerRespawnEvent event) {
+  public void onPostRespawn(PlayerPostRespawnEvent event) {
     schedulePositionRefresh(event.getPlayer());
   }
 
@@ -367,25 +574,59 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * <p><b>为什么用实体调度器</b>：{@code player.getScheduler().runAtFixedRate(...)} 在 Paper 与 Folia
    * 上是同一套 API——Paper 上「实体所属线程」即服务端主线程，Folia 上即该玩家所在区域的区域线程，
    * 因此刷新永远运行在拥有该玩家的线程上（Folia 上绝不跨区域读实体状态），无需按平台二选一。
+   *
+   * <p><b>幂等</b>：同会话的注册仍存活时直接复用——同一 tick 里「复活完成」与「切维」各来一次时，
+   * 不得给同一玩家登记两条每 tick 任务。
    */
   private void schedulePositionRefresh(Player player) {
-    UUID playerId = player.getUniqueId();
-    long period = 1L;
-    ScheduledTask task = Schedulers.repeatOnEntity(plugin, player, period, period,
-        () -> refreshPosition(player, playerId), () -> discardPositionSnapshot(playerId));
-    if (task == null) {
-      // 实体已退役（调度失败）：无句柄可存，读取侧会因缺快照而 fail-open
+    if (player == null || stopping) {
       return;
     }
-    ScheduledTask previous = positionTasks.put(playerId, task);
-    if (previous != null) {
-      previous.cancel();
+    UUID playerId = player.getUniqueId();
+    // 只复用「登录时建立的会话」，绝不在这里补建：看门狗/迟到回调拿着已退出玩家的 UUID 过来时，
+    // 补建会话等于给一个已经离线的 UUID 留下永不清理的令牌与任务（退出事件早已走完）。
+    PlayerPositionSnapshots.Session session = positions.session(playerId);
+    if (session == null) {
+      return;
+    }
+    EntityScheduler owner;
+    try {
+      owner = player.getScheduler();
+    } catch (Throwable throwable) {
+      // 实体已退役：登记无意义，读取侧 fail-open，看门狗下一轮用当前实体再补
+      return;
+    }
+    RefreshSlot existing = positionTasks.get(playerId);
+    // 同会话 + 同 owner + 句柄仍存活才复用：owner 换了（实体被重建）说明旧注册已不可能再服务这个玩家。
+    if (existing != null && existing.session == session && existing.isLive(owner)) {
+      return;
+    }
+    RefreshSlot slot = new RefreshSlot(session, owner);
+    ScheduledTask task;
+    try {
+      task = Schedulers.repeatOnEntity(plugin, player, 1L, 1L,
+          () -> refreshPosition(player, playerId, slot), () -> retirePositionTask(playerId, slot));
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+      return;
+    }
+    if (task == null) {
+      // 实体已退役（调度失败）：无句柄可存，读取侧会因缺快照而 fail-open；看门狗会在 ≤5 秒内补上
+      return;
+    }
+    slot.handle = task;
+    RefreshSlot previous = positionTasks.put(playerId, slot);
+    if (previous != null && previous != slot) {
+      // 旧注册已被新注册替换：它的退役回调按身份摘不到新条目（见 retirePositionTask），句柄必须由这里取消，
+      // 否则旧任务会继续按自己的周期跑（同一玩家两条刷新）
+      previous.retired = true;
+      cancelQuietly(previous.handle);
     }
     // 入账后再读一次 volatile stopping（理由同 EntityCuller.scheduleRecheck）：若 stop() 的取消循环
     // 已经跑完，它看不到这条任务，必须自行取消。
-    if (stopping) {
-      positionTasks.remove(playerId, task);
-      task.cancel();
+    if (stopping || slot.retired || !positions.isCurrent(session)) {
+      positionTasks.remove(playerId, slot);
+      cancelQuietly(task);
     }
   }
 
@@ -397,47 +638,174 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * 任务句柄仍保留以便退出/停用时正常取消，且绝不把异常抛回调度器。
    *
    * <p><b>黑名单世界只维护世界名</b>：黑名单世界不做任何带宽优化，连坐标都不必读；但「当前世界」必须
-   * 继续每 tick 写进快照，否则跨世界丢弃（切维事件 / 本方法比对 / 封包线程守卫）全部失效。因此该分支走
+   * 继续每 tick 写进快照，否则世界归属判定（切维事件 / 本方法比对 / 入口一致闸）全部失效。因此该分支走
    * {@link PlayerPositionSnapshots#refreshWorldOnly}（坐标标记为未知、近身判定 fail-open）；切出黑名单
    * 世界后自动回到下面的正常分支，下一次刷新即恢复坐标捕获。
+   *
+   * <p><b>三道闸，缺一不可</b>：
+   * <ol>
+   *   <li><b>注册身份</b>：本任务已被替换/退役就立刻停手（旧注册不得写新状态）；</li>
+   *   <li><b>会话</b>：连接已换代（同名世界重连）就停手——旧会话的坐标绝不能进新连接；</li>
+   *   <li><b>区域归属</b>：{@link PlayerOwnership} 判定不属于本区域时<b>不写快照、不刷心跳</b>，并重建任务。
+   *       若缺这道闸，被移出旧 world 的实体任务仍可能继续把 {@code getWorld()} 的旧世界写进快照、同时把
+   *       心跳刷成新鲜的（「僵尸快照」候选根因）。1.34.13 生产 dump 只能证明两源冲突
+   *       （「快照重同步 1234102 / 冲刷 2428522」，处置环反复出现「位置快照（world）与索引
+   *       （minecraft_lobby）矛盾」），<b>不能</b>据此断定一定是这种写法持续发生——另一种同形可能是
+   *       索引漏接切维事件（由 {@code ThrottleStats#indexRepaired} 区分）。</li>
+   * </ol>
+   * 三道闸都只做内存读，不额外读世界、不分配对象。
+   *
+   * <p><b>失败只失效「位置 + 心跳」，保留会话令牌</b>：读不到世界 / 读实体抛异常都是一次性故障，
+   * 读者立刻 fail-open 就够；若顺手把会话也结束掉，下游会把已有待发批判成「上一代连接」而整批不投递，
+   * 等于用一次瞬时读失败换永久损失。
    */
-  private void refreshPosition(Player player, UUID playerId) {
+  private void refreshPosition(Player player, UUID playerId, RefreshSlot slot) {
+    if (stopping || slot.retired || positionTasks.get(playerId) != slot) {
+      return; // 已被替换 / 退役的注册：不再写任何状态
+    }
+    if (!positions.isCurrent(slot.session)) {
+      // 会话已换代（同一 UUID 的新连接）：本任务的坐标属于上一条连接，一条都不许写
+      retirePositionTask(playerId, slot);
+      return;
+    }
+    if (!ownership.isOwnedByCurrentRegion(player)) {
+      // 非拥有线程：不写快照、不刷心跳（否则就是僵尸快照）。用自己的当前实体重建一次即可。
+      if (!slot.ownerLost) {
+        slot.ownerLost = true;
+        positionTasks.remove(playerId, slot);
+        rescheduleOnCurrentEntity(playerId);
+      }
+      return;
+    }
     try {
-      // 世界名必须与坐标在同一线程（拥有该玩家的线程）读取后一起写进快照：封包线程只读快照，
+      // 世界必须与坐标在同一线程（拥有该玩家的线程）读取：封包线程只读快照，
       // 绝不自己调 player.getWorld()（Folia 上那是跨区域读实体状态）。
-      String worldName = player.getWorld().getName();
+      World world = player.getWorld();
+      if (world == null) {
+        positions.invalidate(slot.session);
+        return;
+      }
+      String worldName = world.getName();
       // 黑名单世界跳过坐标读取（省掉每 tick 三次 getter + 三次 floor 比较），只更新世界名。
       String previousWorld = WorldBlacklistConfig.isBlacklistedNow(worldName)
-          ? positions.refreshWorldOnly(playerId, worldName)
-          : positions.refresh(playerId, worldName, player.getX(), player.getY(), player.getZ());
-      // 跨世界切换：立即丢弃旧世界的待发缓冲。只靠封包路径的跨世界守卫会漏掉「切维之后不再有旧世界
+          ? positions.refreshWorldOnly(slot.session, worldName)
+          : positions.refresh(slot.session, worldName,
+              player.getX(), player.getY(), player.getZ());
+      // 跨世界切换：立即丢弃旧世界的待发缓冲。只靠封包路径的入口一致闸会漏掉「切维之后不再有旧世界
       // 方块包到达」的情形——那种情形下窗口定时器到期仍会把旧世界坐标发进新世界（鬼影方块）。
       if (previousWorld != null && !previousWorld.equals(worldName)) {
-        discardPending(playerId, ThrottleStats.DiscardSource.POSITION_SNAPSHOT);
+        discardPending(playerId, ThrottleStats.DiscardSource.POSITION_SNAPSHOT, worldName);
+      }
+      // 两源对账：用「同一次 player.getWorld()」修正世界索引（事件遗漏 / 错序 / 迟到）。
+      // 世界身份没变时这里只花一次 CHM 读 + 一次字段比较，不 new 记录、不写表、不换代次。
+      if (PlayerWorldIndex.reconcile(player, world)) {
+        stats.indexRepaired.increment();
       }
     } catch (Throwable throwable) {
-      positions.discard(playerId);
+      positions.invalidate(slot.session);
       noticeSnapshotFailOpen(throwable);
     }
   }
 
-  /** 玩家退出 / 实体退役：取消其刷新任务并丢弃快照。 */
-  private void cancelPositionRefresh(UUID playerId) {
-    ScheduledTask task = positionTasks.remove(playerId);
-    if (task != null) {
-      try {
-        task.cancel();
-      } catch (Throwable ignored) {
-        // 任务可能已随实体退役结束，取消失败可忽略
-      }
+  /** 用「当前在线实体」重建刷新任务（旧实体已退役/移出本区域，旧注册里的 player 不再是 owner）。 */
+  private void rescheduleOnCurrentEntity(UUID playerId) {
+    if (stopping) {
+      return;
     }
-    positions.discard(playerId);
+    Player current;
+    try {
+      current = Bukkit.getPlayer(playerId);
+      if (current == null || !current.isOnline()) {
+        return;
+      }
+    } catch (Throwable ignored) {
+      // 在线表读不到：交给看门狗下一轮再补
+      return;
+    }
+    schedulePositionRefresh(current);
   }
 
-  /** 实体退役回调：摘掉任务句柄并丢弃快照（此后读取侧一律 fail-open）。 */
-  private void discardPositionSnapshot(UUID playerId) {
-    positionTasks.remove(playerId);
-    positions.discard(playerId);
+  /** 玩家退出：取消其刷新任务并结束会话。 */
+  private void cancelPositionRefresh(UUID playerId) {
+    RefreshSlot slot = positionTasks.remove(playerId);
+    if (slot != null) {
+      slot.retired = true;
+      cancelQuietly(slot.handle);
+    }
+    positions.endSession(playerId);
+  }
+
+
+  /**
+   * 退役回调：只做内存记账（关键代码路径，不得操作实体/世界）。
+   *
+   * <p><b>按注册身份摘除</b>：{@code remove(key, value)} 只在表里仍是本次注册时才成功——旧实体迟到的退役
+   * 因此摘不到重建后的新注册。按键盲删会把重建后的新注册一起摘掉，表现为「重生后近身判定永久失效」。
+   *
+   * <p><b>只失效位置与心跳，不结束会话</b>：退役说明「这个实体的刷新任务没了」，不代表玩家断线；
+   * 结束会话会把该玩家已有待发批误判成上一代连接而整批不投递（见 {@code FlushWorld}）。
+   */
+  private void retirePositionTask(UUID playerId, RefreshSlot slot) {
+    slot.retired = true;
+    if (positionTasks.remove(playerId, slot)) {
+      positions.invalidate(slot.session);
+    }
+  }
+
+  /**
+   * 位置刷新看门狗（全局区域线程，每 100 tick）：只补「没有登记的玩家」。
+   *
+   * <p>刷新任务只在 登录 / 复活完成 / 切维 / 启用 四个时机登记。若某次登记落在已退役实体上（调度返回
+   * {@code null}）或任务被服务端取消，该玩家会永久停在「快照过期 → 入口一律即时放行」的 fail-open 态：
+   * 不丢更新、不制造延迟，但块变更合并对他完全停摆。看门狗把这段停摆限制在 ≤5 秒。
+   *
+   * <p><b>不读实体状态、不碰世界</b>：只读在线玩家列表与自己的注册表；世界/坐标读取仍只发生在实体所属
+   * 线程的刷新任务里，因此这里不会制造每 tick 世界读。
+   */
+  private void startWatchdog() {
+    if (stopping || watchdog != null) {
+      return;
+    }
+    try {
+      watchdog = plugin.getServer().getGlobalRegionScheduler()
+          .runAtFixedRate(plugin, task -> sweepPositionTasks(), 100L, 100L);
+    } catch (Throwable throwable) {
+      plugin.getLogger().log(Level.FINE, "位置刷新看门狗未能启动（刷新任务仍由登录/复活/切维重排）", throwable);
+    }
+  }
+
+  private void sweepPositionTasks() {
+    if (stopping) {
+      return;
+    }
+    try {
+      for (Player player : plugin.getServer().getOnlinePlayers()) {
+        if (player == null || positionTasks.containsKey(player.getUniqueId())) {
+          continue;
+        }
+        schedulePositionRefresh(player);
+      }
+    } catch (Throwable ignored) {
+      // 在线列表读取失败：下一轮再补
+    }
+  }
+
+  private void cancelWatchdog() {
+    ScheduledTask task = watchdog;
+    watchdog = null;
+    cancelQuietly(task);
+  }
+
+  /** 取消任务失败可忽略（任务可能已随实体退役结束）；单条失败不得中断整轮取消。 */
+  private void cancelQuietly(ScheduledTask task) {
+    if (task == null) {
+      return;
+    }
+    try {
+      task.cancel();
+    } catch (Throwable ignored) {
+      // 已退役 / 已结束
+    }
   }
 
   /**
@@ -449,13 +817,10 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    */
   private void cancelAllPositionRefreshTasks() {
     for (UUID playerId : new ArrayList<>(positionTasks.keySet())) {
-      ScheduledTask task = positionTasks.remove(playerId);
-      if (task != null) {
-        try {
-          task.cancel();
-        } catch (Throwable ignored) {
-          // 任务可能已随实体退役结束，取消失败可忽略
-        }
+      RefreshSlot slot = positionTasks.remove(playerId);
+      if (slot != null) {
+        slot.retired = true;
+        cancelQuietly(slot.handle);
       }
     }
   }
@@ -529,17 +894,27 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   }
 
   /**
-   * 丢弃某玩家当前的待发缓冲（没有缓冲时无操作）。三条入口（切维事件 / 位置快照比对 / 封包守卫）
+   * 丢弃某玩家当前的待发缓冲（没有缓冲时无操作）。三条入口（切维事件 / 位置快照比对 / 黑名单）
    * 都只做一行转发，语义完全一致。
    *
    * @return 是否确有缓冲被丢弃
    */
   boolean discardPending(UUID playerId, ThrottleStats.DiscardSource source) {
+    return discardPending(playerId, source, null);
+  }
+
+  /**
+   * 同 {@link #discardPending(UUID, ThrottleStats.DiscardSource)}，但由调用方给出「玩家此刻所在世界」。
+   *
+   * <p>事件 / 每 tick 刷新都在拥有线程上刚读到世界，比让 {@link PlayerWorldIndex} 再回答一次更可信
+   * （索引可能还没跟上事件）。{@code null} 表示由索引回答。
+   */
+  boolean discardPending(UUID playerId, ThrottleStats.DiscardSource source, String destination) {
     Pending target = pending.get(playerId);
     if (target == null) {
       return false;
     }
-    discard(target, source);
+    discard(target, source, destination);
     return true;
   }
 
@@ -555,10 +930,6 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * 取消发生在任何定时冲刷之前（异步投递会重新打开「旧世界数据落在切维包之后」的窗口）；只有证明世界
    * 没变（{@code redeem}）时才在同一次调用里补发，且聚簇已移到封存锁之外，不额外占用封包线程要抢的那把锁。
    */
-  private void discard(Pending target, ThrottleStats.DiscardSource source) {
-    discard(target, source, null);
-  }
-
   private void discard(Pending target, ThrottleStats.DiscardSource source, String destination) {
     ScheduledFuture<?> timer = null;
     int cancelled = 0;
@@ -585,7 +956,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         // 等价信息。只有真切维（客户端收到新世界的整列区块）满足这个前提；世界名没变却丢弃，
         // 就是把这些方块变更永久抹掉——客户端会一直停在旧方块上（门只开一半、另一半还挡人即此症状），
         // 而且不会自愈。因此世界名相同即改走既有交付路径补发（见 deliver，失败自带逐条补发）。
-        redeem = cancelled > 0 && shouldRedeem(target.world, currentWorld);
+        redeem = cancelled > 0 && shouldRedeem(target.worldName(), currentWorld);
         if (redeem) {
           // 判据已在上面取完，这里只交出「已封存」的引用：聚簇与 passed 的只读复制都移到锁外
           // （封存已完成 —— 见 flushInternal 里对「为什么锁外等价」的说明）。
@@ -607,15 +978,15 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       }
       if (redeem) {
         stats.discardRedeemed.add(cancelled);
-        recordTrace(BlockUpdateTrace.Decision.REDEEM, target.world, clusters, buffered, 0, 0, 0,
-            "补发 " + cancelled + " 个原包；来源 " + source + "；缓冲世界 " + target.world
+        recordTrace(BlockUpdateTrace.Decision.REDEEM, target.worldName(), clusters, buffered, 0, 0, 0,
+            "补发 " + cancelled + " 个原包；来源 " + source + "；缓冲世界 " + target.worldName()
                 + " = 当前世界 " + currentWorld);
-        deliver(target.uuid, clusters, passed, cancelled);
+        deliver(target.uuid, target.connection, target.context, clusters, passed, cancelled);
         return;
       }
       stats.discarded(source, cancelled);
-      trace.record(BlockUpdateTrace.Decision.DISCARD, target.world, false, buffered, 0, 0, 0,
-          "丢弃 " + cancelled + " 个原包；来源 " + source + "；缓冲世界 " + target.world
+      trace.record(BlockUpdateTrace.Decision.DISCARD, target.worldName(), false, buffered, 0, 0, 0,
+          "丢弃 " + cancelled + " 个原包；来源 " + source + "；缓冲世界 " + target.worldName()
               + " ≠ 当前世界 " + currentWorld + "（旧世界区块将整列重建）");
     } catch (Throwable throwable) {
       logThrottled(throwable);
@@ -628,21 +999,16 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   }
 
   /**
-   * 纯函数：冲刷前是否允许「整批丢弃」。
+   * 纯函数：两侧世界名是否<b>足以证明换了世界</b>（唯一的名称比较实现，事件路径与冲刷路径共用）。
    *
-   * <p><b>为什么只认世界索引</b>：缓冲里的坐标在入缓冲时按索引世界打标，索引由玩家事件驱动
-   * （{@code PlayerJoinEvent} / {@code PlayerChangedWorldEvent}）随真实切维一起前进；而位置快照由
-   * 实体调度器的每 tick 任务维护，任务在 Folia 上会随实体被移出旧 world（切维 / 重生）退役，
-   * 且退役不保证回调我们的清理入口——快照于是<b>冻结</b>在切换前那一刻，内容看起来完全正常。
-   * 用冻结快照判定「玩家已换世界」，就会把每一批在途变更都当成跨世界整批丢掉（实测 69.5 万包）。
+   * <p><b>它只是一个必要条件，不是充分条件</b>：名称不同只说明「有一侧说世界变了」。真正允许整批丢弃
+   * 还要满足 {@link FlushWorld#classify} 的另外两条——索引已换代（玩家事件真的前进过）、活快照也同意
+   * 这个新世界。缺了这两条就只看名称，等于把「索引漏接事件」或「快照冻结」当成真切维：
+   * 历史事故（69.5 万包）正是拿冻结快照当证据整批丢的，玩家侧表现是假方块挖不掉。
    *
-   * <p>因此这里改成两源互证：索引（同源、随事件前进）说<b>世界真的变了</b>才丢；索引未变、只有快照
-   * 不同时，按「无法证明」处理——照常交付（客户端即使收到旧世界坐标也只是短暂的鬼影方块，
-   * 会随区块重建自愈，绝不会像丢弃那样永久缺格）。
-   *
-   * @param bufferedWorld 缓冲里这些坐标所属的世界名（入缓冲时按索引打标），可为 {@code null}
+   * @param bufferedWorld 缓冲里这些坐标所属的世界名，可为 {@code null}
    * @param indexWorld    此刻索引里的世界名，可为 {@code null}
-   * @return true 表示允许整批丢弃
+   * @return true 表示两侧都已知且不同（事件路径据此外加 destination 证据；冲刷路径还要再走判定表）
    */
   static boolean shouldDiscardAtFlush(String bufferedWorld, String indexWorld) {
     if (bufferedWorld == null || indexWorld == null) {
@@ -740,68 +1106,84 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
   }
 
   /**
-   * 该玩家的近身变更判定：<b>只读位置快照</b>（封包线程不触碰任何 Bukkit API）。
+   * 入口的两源一致闸：只有「索引世界与活快照世界一致、坐标已知、心跳新鲜」时才返回快照。
    *
-   * <p>fail-open：快照尚未建立（刚登录 / 刚重置）或读取异常 → 按近身处理（立即放行）。
-   * 与旧实现的唯一语义差别就在这里：旧实现快照缺失时退化为「照常合并」（会延迟），
-   * 现在改为「立即放行」——无法判断距离时宁可少合并，绝不制造延迟。
+   * <p>任一侧未知或两侧冲突时返回 {@code null}，调用方必须<b>原包即时放行</b>：不进合并窗口、不按任何
+   * 一侧的旧世界名打标、不延迟。计数按「未知」/「冲突」分开（{@code ThrottleStats#worldUnknown} /
+   * {@code #worldConflict}）——生产 dump 里两者排查方向完全不同：前者多是一两个 tick 的登录/切维过渡
+   * （自愈），后者说明两份来源长期不一致（要么索引漏接事件，要么刷新跑在非拥有线程上，见
+   * {@code ThrottleStats#indexRepaired} 与 {@code #snapshotResync}）。
+   *
+   * <p>封包线程不触碰实体状态：只读两份快照，一次 CHM 读 + 一次心跳读，零分配。
    */
-  private boolean shouldPassThroughImmediately(UUID playerId, List<Update<WrappedBlockData>> updates) {
-    int radius = config.immediateRadius();
-    if (radius <= 0) {
-      // 配置关闭立即放行：与旧行为一致（全部走合并）
-      return false;
-    }
+  private PlayerPositionSnapshots.Position verifiedSnapshot(UUID playerId, String indexWorld) {
     try {
       PlayerPositionSnapshots.Position position = positions.get(playerId);
-      if (position == null) {
+      if (position == null || !position.positionKnown() || positions.isStale(playerId)) {
+        // 冻结/缺失的快照比没有快照更危险：坐标停在切维前的位置，会把玩家脚下的变更判成「远」。
         noticeSnapshotFailOpen(null);
-      } else if (positions.isStale(playerId)) {
-        // 冻结的快照比没有快照更危险：坐标停在切维前的位置，会把玩家脚下的变更判成「远」而全部塞进
-        // 合并窗口。心跳过期即按未知处理（fail-open），与快照缺失同一条路。
-        noticeSnapshotFailOpen(null);
-        position = null;
+        stats.worldUnknown.increment();
+        return null;
       }
-      return PlayerPositionSnapshots.immediatePass(position, updates, radius);
+      if (!position.world().equals(indexWorld)) {
+        stats.worldConflict.increment();
+        return null;
+      }
+      return position;
     } catch (Throwable throwable) {
       noticeSnapshotFailOpen(throwable);
-      return true;
+      stats.worldUnknown.increment();
+      return null;
     }
   }
 
-  /** 坐标版近身判定（快速路径；不构造任何方块数据包装）。 */
-  private boolean shouldPassThroughImmediately(UUID playerId, int[] coordinates, int count) {
+  /**
+   * 近身判定：<b>只读已通过一致闸的快照</b>（封包线程不触碰任何 Bukkit API）。
+   *
+   * <p>{@code radius <= 0} 表示关闭立即放行，与旧行为一致（全部走合并）。
+   */
+  private boolean shouldPassThroughImmediately(PlayerPositionSnapshots.Position snapshot,
+      List<Update<WrappedBlockData>> updates) {
     int radius = config.immediateRadius();
-    if (radius <= 0) {
-      return false;
-    }
-    try {
-      PlayerPositionSnapshots.Position position = positions.get(playerId);
-      if (position == null) {
-        noticeSnapshotFailOpen(null);
-      } else if (positions.isStale(playerId)) {
-        noticeSnapshotFailOpen(null);
-        position = null;
-      }
-      return PlayerPositionSnapshots.immediatePass(position, coordinates, count, radius);
-    } catch (Throwable throwable) {
-      noticeSnapshotFailOpen(throwable);
-      return true;
-    }
+    return radius > 0 && PlayerPositionSnapshots.immediatePass(snapshot, updates, radius);
+  }
+
+  /** 坐标版近身判定（快速路径；不构造任何方块数据包装）。 */
+  private boolean shouldPassThroughImmediately(PlayerPositionSnapshots.Position snapshot,
+      int[] coordinates, int count) {
+    int radius = config.immediateRadius();
+    return radius > 0 && PlayerPositionSnapshots.immediatePass(snapshot, coordinates, count, radius);
   }
 
   static boolean fitsPendingWindow(int pending, int incoming, int limit) {
     return pending >= 0 && incoming > 0 && pending <= limit && incoming <= limit - pending;
   }
 
+  /**
+   * 缓冲固定的世界上下文与入参是否<b>同一代</b>（世界名 + 代次都比对）。
+   *
+   * <p>{@code null}（尚未固定）时一律返回 false：没有固定的世界就没有可覆盖的旧态，也绝不能拿一个
+   * 不确定的世界名去记账。代次比较是必需的——同名世界重连后世界名完全相同，只比名字会把上一代连接
+   * 的旧批当成「同一世界」而误记覆盖标记。
+   */
+  private static boolean sameWorldGeneration(Pending target, WorldContext context) {
+    if (target == null || context == null || target.flushed.get()) {
+      return false;
+    }
+    WorldContext pinned = target.context;
+    return pinned != null && pinned.session() == context.session()
+        && pinned.worldName().equals(context.worldName());
+  }
+
   /** 记录「这些绝对坐标已有新态下发」（快速路径用，不经过 {@code Update} 列表）。 */
-  private void rememberDeliveredCoords(UUID playerId, String worldName, int[] coordinates, int count) {
+  private void rememberDeliveredCoords(UUID playerId, WorldContext context, int[] coordinates,
+      int count) {
     Pending target = pending.get(playerId);
     if (target == null) {
       return;
     }
     synchronized (target) {
-      if (target.flushed.get() || !worldName.equals(target.world)) {
+      if (!sameWorldGeneration(target, context)) {
         return;
       }
       int usable = Math.min(count, coordinates.length / 3);
@@ -809,6 +1191,38 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         target.rememberPass(coordinates[i * 3], coordinates[i * 3 + 1], coordinates[i * 3 + 2]);
       }
     }
+  }
+
+  /**
+   * 世界归属未知 / 冲突时的<b>坐标-only 覆盖登记</b>。
+   *
+   * <p><b>为什么不能省</b>：这条路径把原包直接放行（不延迟、不入缓冲），但同一连接的旧批可能仍在缓冲里
+   * 等着冲刷；不登记「这些坐标已有新态下发」，窗口末的旧值就会把刚下发的新态盖回去——正是
+   * {@code passed} 这张表存在的理由。旧实现只在「快照可用」的两条路径登记，未知/冲突路径会漏记。
+   *
+   * <p><b>只在确有待发缓冲时解析坐标</b>：没有缓冲就没有可覆盖的旧态，没必要为一次 fail-open 分配
+   * 坐标数组（这条路径通常只持续一两个 tick）。
+   */
+  private void rememberDeliveredOnUnverified(PacketEvent event, WorldContext context) {
+    Player player = event.getPlayer();
+    if (player == null) {
+      return;
+    }
+    Pending target = pending.get(player.getUniqueId());
+    if (target == null) {
+      return;
+    }
+    synchronized (target) {
+      if (!sameWorldGeneration(target, context)) {
+        // 缓冲属于另一代世界（切维 / 重连）：不记标记，也不会冲刷进当前世界
+        return;
+      }
+    }
+    int[] coordinates = positionsOnly(event.getPacketType(), event.getPacket());
+    if (coordinates == null || coordinates.length < 3) {
+      return;
+    }
+    rememberDeliveredCoords(player.getUniqueId(), context, coordinates, coordinates.length / 3);
   }
 
   /**
@@ -827,26 +1241,37 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     if (player == null || BypassRegistry.isBypassedNow(player.getUniqueId())) {
       return;
     }
-    // 世界黑名单：命中世界不做任何带宽优化（变更合并一并跳过，原包照常放行）。
-    // 名单为空（默认）时 isBlacklistedNow 直接早退，热路径近乎零开销。
+    // 世界上下文只查一次：后续打标、黑名单与冲刷判定都用同一份不可变快照（PlayerWorldIndex 是事件驱动）。
     //
-    // 封包线程不读实体状态（Folia 会抛 No currently ticking region）：只查玩家世界名快照。
-    // 快照缺失（刚登录）按「无法判定」直通：原包照常下发，绝不把方块包卡进缓冲。
-    String worldName = PlayerWorldIndex.worldName(player.getUniqueId());
-    if (worldName == null) {
+    // 封包线程不读实体状态（Folia 会抛 No currently ticking region）：只查两份快照。
+    // 上下文缺失（刚登录 / 取不到）按「无法判定」直通：原包照常下发，绝不把方块包卡进缓冲。
+    WorldContext context = PlayerWorldIndex.context(player.getUniqueId());
+    if (context == null) {
+      stats.worldUnknown.increment();
       stats.blockChangesPassed.increment();
       return;
     }
+    String worldName = context.worldName();
     if (WorldBlacklistConfig.isBlacklistedNow(worldName)) {
       // 黑名单世界不做任何带宽优化；同时丢弃可能来自「上一个非黑名单世界」的待发缓冲——
       // 否则窗口到期会把旧世界坐标发进黑名单世界（同样是鬼影方块）。
-      discardPending(player.getUniqueId(), ThrottleStats.DiscardSource.BLACKLIST);
+      discardPending(player.getUniqueId(), ThrottleStats.DiscardSource.BLACKLIST, worldName);
       return;
     }
-    // 跨世界守卫（三道）：① PlayerChangedWorldEvent 零窗口丢弃；② refreshPosition 的每 tick 快照比对；
-    // ③ flushInternal 冲刷前比对「缓冲世界」与此刻快照世界（兜住前两道都漏接的极端情形）。
-    // 方块变更包不含世界标识，封包线程无法判断「这个包属于哪个世界」，因此这里不再有第四道即时判定——
-    // 旧实现曾在此比较「快照世界」与「快照世界」（恒相等），那道守卫实际从未生效，已移除。
+    // 接收连接（登录建立、退出结束；重生/切维不换代）——与「世界代次」是两件事，不能互相顶替。
+    // 它只回答「这批该发给哪条连接」，世界归属另由下面的一致闸回答。
+    PlayerPositionSnapshots.Session connection = positions.session(player.getUniqueId());
+    // 入口两源一致闸（本模块的世界归属判定）：索引世界与活快照世界必须一致、坐标已知、心跳新鲜。
+    // 任一侧未知或冲突 → 原包即时放行（见 verifiedSnapshot）。方块变更包不含世界标识，封包线程没有
+    // 第二种信息来源；旧实现在这里比较「快照世界」与「快照世界」（恒相等），那道守卫从未生效。
+    PlayerPositionSnapshots.Position snapshot = verifiedSnapshot(player.getUniqueId(), worldName);
+    if (snapshot == null || connection == null) {
+      // 原包即时放行，但若同一世界代次的旧批已经取消待发，仍必须记「这些坐标已有新态下发」，
+      // 否则窗口末的旧值会把刚下发的新态盖回去（方块回退）。登记只按坐标并复核代次，绝不据此丢整批。
+      rememberDeliveredOnUnverified(event, context);
+      stats.blockChangesPassed.increment();
+      return;
+    }
 
     // 解析前短路：MULTI_BLOCK_CHANGE 的坐标数与「段原点 + 每格一个 packed short」都能直接读出，
     // 无需把整包解析成 List<Update<WrappedBlockData>>（每坐标一个 WrappedBlockData 反射包装 + 一条
@@ -874,7 +1299,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
           return;
         }
         if (section != null) {
-          rememberDeliveredCoords(player.getUniqueId(), worldName, section, coordShorts);
+          rememberDeliveredCoords(player.getUniqueId(), context, section, coordShorts);
           stats.blockChangesPassed.increment();
           return;
         }
@@ -887,8 +1312,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     int[] quickCoordinates = positionsOnly(event.getPacketType(), event.getPacket());
     if (quickCoordinates != null) {
       int quickCount = quickCoordinates.length / 3;
-      if (shouldPassThroughImmediately(player.getUniqueId(), quickCoordinates, quickCount)) {
-        rememberDeliveredCoords(player.getUniqueId(), worldName, quickCoordinates, quickCount);
+      if (shouldPassThroughImmediately(snapshot, quickCoordinates, quickCount)) {
+        rememberDeliveredCoords(player.getUniqueId(), context, quickCoordinates, quickCount);
         stats.blockChangesPassed.increment();
         recordTracePass(worldName, event.getPacketType() == PacketType.Play.Server.MULTI_BLOCK_CHANGE,
             quickCoordinates, quickCount);
@@ -904,10 +1329,10 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
     // 近身变更立即放行：不登记延迟、不入缓冲，原包按原样流出。
     // 这样玩家自己挖/放方块时的方块更新不会被合并窗口拖延，客户端预测得以立即确认（消除顿感）。
-    if (shouldPassThroughImmediately(player.getUniqueId(), updates)) {
+    if (shouldPassThroughImmediately(snapshot, updates)) {
       // 记录本窗口内已有更新下发的坐标：合并窗口内可能有同一方块的旧状态仍在缓冲，
       // 若不标记会在窗口到期后晚到并把新态覆盖回去（方块短暂回退）。
-      rememberDelivered(player.getUniqueId(), worldName, updates);
+      rememberDelivered(player.getUniqueId(), context, updates);
       stats.blockChangesPassed.increment();
       recordTracePass(worldName, updates);
       return;
@@ -920,7 +1345,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     // 窗口到期会把旧态写回客户端，覆盖刚由本包下发的<b>新态</b>（方块回退）。
     // 不必担心误删新态：同坐标若之后又被重新缓冲，缓冲循环会撤销该标记（见上面的 remove）。
     if (bypassesMerge(event.getPacketType() == PacketType.Play.Server.MULTI_BLOCK_CHANGE, updates.size())) {
-      rememberDelivered(player.getUniqueId(), worldName, updates);
+      rememberDelivered(player.getUniqueId(), context, updates);
       stats.blockChangesPassed.increment();
       recordTracePass(worldName, updates);
       return;
@@ -928,7 +1353,7 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
 
     int maxPending = config.maxPendingEntries();
     if (!fitsPendingWindow(0, updates.size(), maxPending)) {
-      rememberDelivered(player.getUniqueId(), worldName, updates);
+      rememberDelivered(player.getUniqueId(), context, updates);
       stats.blockChangesPassed.increment();
       return;
     }
@@ -943,8 +1368,10 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         if (target.flushed.get()) {
           continue;
         }
-        if (shouldDiscardAtFlush(target.world, worldName)) {
-          // 旧世界还有独立窗口。当前原包直接发，绝不覆盖旧窗口的世界键再混合两批。
+        WorldContext pinned = target.context;
+        if (pinned != null && pinned.session() != context.session()) {
+          // 待发缓冲属于另一个世界代次（切维 / 同名世界重连）。当前原包直接发，绝不覆盖旧窗口的
+          // 世界键再混合两批——那会把两个世界的坐标写进同一个合并包。
           stats.blockChangesPassed.increment();
           return;
         }
@@ -982,8 +1409,10 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
           trace.record(BlockUpdateTrace.Decision.MERGE, worldName, true, updates.size(),
               firstMerged.x(), firstMerged.y(), firstMerged.z(), null);
         }
-        // 记录本批坐标所属世界：冲刷前据此做「跨世界」兜底校验（见 flushInternal）。
-        target.world = worldName;
+        // 固定本批坐标的世界上下文（世界名 + 代次）与接收连接：冲刷/送出前据此判定
+        // SAME/CHANGED/PREVIOUS_CONNECTION（见 FlushWorld）。幂等：同一代次的重复写入是同一个不可变实例。
+        target.context = context;
+        target.connection = connection;
 
         // 溢出调度闸（synchronized(target) 内置位）：只有「本 Pending 尚未排过溢出冲刷」才排任务。
         // add 达上限后每个后续包都返回 overflow=true，但首个任务执行前的窗口内重复排队只是空转
@@ -1024,14 +1453,15 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * <p>只在已有待发缓冲时记录：没有缓冲就不可能有会被旧态覆盖的条目。与 {@code flush}
    * 共用同一把锁，保证「记录」与「冲刷时读取」不交错。
    */
-  private void rememberDelivered(UUID playerId, String worldName, List<Update<WrappedBlockData>> updates) {
+  private void rememberDelivered(UUID playerId, WorldContext context,
+      List<Update<WrappedBlockData>> updates) {
     Pending target = pending.get(playerId);
     if (target == null) {
       return;
     }
     synchronized (target) {
-      if (target.flushed.get() || !worldName.equals(target.world)) {
-        // 窗口已冲刷：缓冲内容已定型（本次记录再无处生效），跳过
+      if (!sameWorldGeneration(target, context)) {
+        // 窗口已冲刷 / 世界已换代：缓冲内容已定型或不属于这一代（本次记录再无处生效），跳过
         return;
       }
       for (Update<WrappedBlockData> update : updates) {
@@ -1051,13 +1481,14 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * <p>上限闸与 {@link #rememberDelivered} 同口径：超限即整体清空（最多让窗口到期时把某个坐标的旧态再下发
    * 一次，不影响正确性）。与 {@code flush} 共用 {@code synchronized(target)}。
    */
-  private void rememberDeliveredCoords(UUID playerId, String worldName, BlockPosition section, short[] positions) {
+  private void rememberDeliveredCoords(UUID playerId, WorldContext context, BlockPosition section,
+      short[] positions) {
     Pending target = pending.get(playerId);
     if (target == null) {
       return;
     }
     synchronized (target) {
-      if (target.flushed.get() || !worldName.equals(target.world)) {
+      if (!sameWorldGeneration(target, context)) {
         return;
       }
       int baseX = section.getX() << 4;
@@ -1104,11 +1535,10 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
     Set<Coord> passed = Set.of();
     int cancelled = 0;
     int discarded = 0;
-    boolean worldChanged = false;
+    FlushWorld verdict = FlushWorld.SAME;
     String bufferedWorld = null;
     String indexWorld = null;
     String currentWorld = null;
-    boolean snapshotResync = false;
     boolean clustersDeferred = false;
     Set<Coord> passedSealed = null;
     ScheduledFuture<?> timer = null;
@@ -1121,41 +1551,24 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         pending.remove(target.uuid, target);
         timer = target.timer;
         target.timer = null;
-        // 第三道跨世界守卫：缓冲内的坐标属于 target.world（入缓冲时的世界）；玩家此刻若已在别的世界，
-        // 整批丢弃——旧世界坐标按新世界下发会在客户端留下「鬼影方块」。旧世界区块会整列重建，
-        // 丢弃不构成丢更新。快照缺失（刚登录 / 刚重置）时无法判断，保持原行为（照常合并，fail-open）。
-        bufferedWorld = target.world;
-        if (bufferedWorld != null) {
+        // 冲刷前的唯一判定表（纯函数）：入缓冲时固定的世界上下文 + 此刻索引上下文 + 此刻活快照。
+        // 三段证据缺一不可——任何单侧证据都不构成丢弃理由（历史事故 69.5 万包正是拿冻结快照整批丢的）。
+        WorldContext pinned = target.context;
+        bufferedWorld = target.worldName();
+        if (pinned != null) {
+          // 索引上下文与快照心跳都只在这里读一次：下面的判定与留痕共用这两个值，锁外不再重读。
+          // 两次读会把「决策依据」与「取证文字」拉到两个不同时刻，现场就会出现自相矛盾的丢弃记录。
+          WorldContext now = PlayerWorldIndex.context(target.uuid);
+          indexWorld = now == null ? null : now.worldName();
           PlayerPositionSnapshots.Position snapshot = positions.get(target.uuid);
-          if (snapshot == null || positions.isStale(target.uuid)) {
-            // 快照缺失或心跳过期：视为未知（fail-open）。过期意味着那份快照是死的——顺手丢掉，
-            // 让近身判定立刻回到「立即放行」，不必等下一次重排。
-            if (snapshot != null) {
-              positions.discard(target.uuid);
-              snapshotResync = true;
-            }
-            currentWorld = null;
-          } else {
-            currentWorld = snapshot.world();
-          }
-          // 丢弃判定只认一件事：<b>世界索引也已经变了</b>。索引由玩家事件驱动（加入 / 切维），
-          // 与入缓冲时打标的来源同源，但它会随真实切维一起前进；而位置快照可能<b>冻结</b>在切维前
-          // （Folia 上实体调度器任务随实体被移出旧 world 退役，退役不保证回调清理入口）。
-          // 拿一份可能冻结的快照当作「玩家已换世界」的证据，代价是整批已取消的更新永久丢失——
-          // 实测 29 人 4 小时丢了 69.5 万个原包，玩家侧看到的就是挖不掉的假方块。
-          //
-          // 索引世界名只在这里读一次：下面的判定与留痕共用 indexWorld，锁外不再重读。两次读会把
-          // 「决策依据」与「取证文字」拉到两个不同时刻，现场就会出现自相矛盾的丢弃记录。
-          indexWorld = PlayerWorldIndex.worldName(target.uuid);
-          worldChanged = shouldDiscardAtFlush(bufferedWorld, indexWorld);
-          if (!worldChanged && currentWorld != null && !currentWorld.equals(bufferedWorld)) {
-            // 两源互相矛盾：索引说没换、快照说换过。以索引为准（不丢），并把这份不可信的快照丢掉，
-            // 让近身判定立即回到 fail-open —— 冻结快照会持续把每批变更判成「远」，只补发一次没用。
-            positions.discard(target.uuid);
-            snapshotResync = true;
-          }
+          boolean snapshotFresh = snapshot != null && !positions.isStale(target.uuid);
+          currentWorld = snapshotFresh ? snapshot.world() : null;
+          // 接收连接是否还是入缓冲时那条（与世界名、快照新鲜度都无关；判定表里排在最前）
+          boolean sameConnection = target.connection == null
+              || positions.session(target.uuid) == target.connection;
+          verdict = FlushWorld.classify(pinned, now, snapshotFresh, currentWorld, sameConnection);
         }
-        if (worldChanged) {
+        if (verdict == FlushWorld.CHANGED) {
           discarded = target.cancelledPackets;
           target.batch.clear();
           target.passed.clear();
@@ -1181,25 +1594,45 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
       if (timer != null) {
         timer.cancel(false);
       }
-      if (worldChanged) {
+      if (verdict == FlushWorld.CHANGED) {
         stats.discarded(ThrottleStats.DiscardSource.FLUSH_SNAPSHOT, discarded);
         // 四条丢弃入口一律留痕：这是「门只开一半」排查里最先要看的东西，不能只有总数
         trace.record(BlockUpdateTrace.Decision.DISCARD, bufferedWorld, false, discarded, 0, 0, 0,
-            "冲刷前比对：缓冲世界 " + bufferedWorld + " ≠ 索引世界 "
-                + indexWorld + "（旧世界区块将整列重建）");
+            "冲刷前判定：缓冲世界 " + bufferedWorld + " → 索引世界 " + indexWorld
+                + "（索引已换代且活快照同世界：真切维，旧世界区块将整列重建）");
         return false; // 旧世界的被延迟包按丢弃处理：既未下发、也未合并
       }
       if (cancelled <= 0) {
         return false; // 只有清理、没有实包：不计入「冲刷次数/耗时」
       }
-      if (snapshotResync) {
-        // 快照与索引矛盾：这批照常交付，但必须留痕——它意味着位置刷新任务已经停了。
-        stats.snapshotResync.increment();
-        trace.record(BlockUpdateTrace.Decision.REDEEM, bufferedWorld, false, cancelled, 0, 0, 0,
-            "位置快照（" + currentWorld + "）与索引（" + bufferedWorld
-                + "）矛盾，已按不丢处理并重置快照");
+      if (verdict == FlushWorld.PREVIOUS_CONNECTION) {
+        // 接收连接已换代（同名世界重连时世界名完全相同，只有连接会话能区分两代）。这批属于上一代连接，
+        // 不能串给新连接——否则就是「同世界不同连接串包」。新连接会重新收到区块，未投递不构成丢更新。
+        stats.pendingOldSession.add(cancelled);
+        stats.blockChangesMerged.add(cancelled);
+        if (cancelled >= 2) {
+          trace.record(BlockUpdateTrace.Decision.REDEEM, bufferedWorld, false, cancelled, 0, 0, 0,
+              "缓冲属于上一个连接（世界 " + bufferedWorld + "，接收连接已换代），未投递给新连接");
+        }
+        return false;
       }
-      deliver(target.uuid, clusters, passed, cancelled);
+      if (verdict == FlushWorld.CONFLICT) {
+        // 两源冲突：这批照常交付（绝不丢），但保留快照——冲突本身要靠拥有线程每 tick 对账修正，
+        // 丢掉快照只会让近身判定白 fail-open 一个 tick，下一次冲刷仍是同样的冲突。
+        stats.snapshotResync.increment();
+        if (cancelled >= 2) {
+          trace.record(BlockUpdateTrace.Decision.REDEEM, bufferedWorld, false, cancelled, 0, 0, 0,
+              "位置快照（" + currentWorld + "）与索引（" + indexWorld
+                  + "）不一致，已按不丢处理并保留快照（索引由拥有线程每 tick 对账修正）");
+        }
+      } else if (verdict == FlushWorld.UNKNOWN) {
+        stats.flushUnknown.increment();
+        if (cancelled >= 2) {
+          trace.record(BlockUpdateTrace.Decision.REDEEM, bufferedWorld, false, cancelled, 0, 0, 0,
+              "世界未知（索引或快照缺失/心跳过期），已按不丢处理");
+        }
+      }
+      deliver(target.uuid, target.connection, target.context, clusters, passed, cancelled);
     } catch (Throwable throwable) {
       logThrottled(throwable);
     }
@@ -1212,8 +1645,8 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
    * <p>原包在入缓冲时已经取消（见 {@code onPacketSending}），因此这里必须保证「这些变更一定交付」：
    * 合并包成功即交付；失败则按 section 逐条重发同样的更新（幂等），绝不因合并链路故障而丢方块更新。
    */
-  private void deliver(UUID playerId, List<List<Update<WrappedBlockData>>> clusters,
-      Set<Coord> passed, int cancelled) {
+  private void deliver(UUID playerId, PlayerPositionSnapshots.Session connection, WorldContext pinned,
+      List<List<Update<WrappedBlockData>>> clusters, Set<Coord> passed, int cancelled) {
     Player player;
     try {
       player = Bukkit.getPlayer(playerId);
@@ -1225,11 +1658,36 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
           "取玩家实例失败，整批未投递（" + cancelled + " 个原包）：" + throwable);
       return;
     }
+    // ① 先核对接收连接：同 UUID 的新连接会拿到一个新的 Player 实例，只按 uuid 找人不区分两代连接。
+    // 这一条不依赖世界名、也不依赖新连接是否已经产出位置快照——新连接刚上线时往往还没有，
+    // 若先看快照新鲜度就会落到「世界未知 → 按不丢交付」而把上一连接的批发给它。
+    PlayerPositionSnapshots.Session current = positions.session(playerId);
+    if (connection != null && current != connection) {
+      stats.pendingOldSession.add(cancelled);
+      stats.blockChangesMerged.add(cancelled);
+      if (cancelled >= 2) {
+        trace.record(BlockUpdateTrace.Decision.REDEEM,
+            pinned == null ? null : pinned.worldName(), false, cancelled, 0, 0, 0,
+            "接收连接已换代（同一 UUID 的新连接），上一连接的已取消批次不投递");
+      }
+      return;
+    }
     if (player == null || Boolean.FALSE.equals(onlineOf(player))) {
       // 客户端不存在（玩家已离线 / 已断连）：取消原包不构成丢更新。
       // 注意 onlineOf 返回 null 表示「探测失败」而非离线——那种情况会继续往下发送，
       // 因为「探测抛异常」绝不能等价于「客户端不需要这批更新」。
       stats.blockChangesMerged.add(cancelled);
+      return;
+    }
+    // ② 送出前最后一次复核（「等待过期 → 封存 → 真正发包」之间还有一段聚簇/构包时间）：
+    // 若这段时间里两份来源已经一致地证明换了世界，就不再把旧世界坐标画到新世界（鬼影方块）。
+    // 判据与冲刷入口同一张表（FlushWorld.classify），因此这里的丢弃同样要求两源一致，不是单侧猜测；
+    // 世界暂时未知 / 冲突时保留「不丢」语义（同一有效连接上的已取消批次绝不因此蒸发）。
+    if (!stillSameWorld(playerId, pinned)) {
+      stats.discarded(ThrottleStats.DiscardSource.FLUSH_SNAPSHOT, cancelled);
+      trace.record(BlockUpdateTrace.Decision.DISCARD,
+          pinned == null ? null : pinned.worldName(), false, cancelled, 0, 0, 0,
+          "送出前复核：缓冲世界已换代（两源一致），本批不再下发");
       return;
     }
     List<List<Update<WrappedBlockData>>> survivors =
@@ -1272,6 +1730,31 @@ public final class BlockChangeMerger extends PacketAdapter implements Listener {
         plugin.getLogger().warning("合并包构造失败后逐条补发仍有 " + (total - resent)
             + " 条未发出（这些方块更新已丢失，客户端会停在旧方块上）");
       }
+    }
+  }
+
+  /**
+   * 送出前复核：此刻的两份来源是否仍指向缓冲时固定的那个世界。
+   *
+   * <p>只回答一件事：<b>是否已证明换了世界</b>（{@link FlushWorld#CHANGED}）。未知 / 冲突一律照常发送——
+   * 宁可让客户端短暂看到旧世界坐标（随区块重建自愈），也不把已取消的更新丢掉（永久缺格）。
+   *
+   * @param pinned 入缓冲时固定的世界上下文（{@code null} = 历史缓冲，直接放行）
+   */
+  private boolean stillSameWorld(UUID playerId, WorldContext pinned) {
+    if (pinned == null) {
+      return true;
+    }
+    try {
+      WorldContext now = PlayerWorldIndex.context(playerId);
+      PlayerPositionSnapshots.Position snapshot = positions.get(playerId);
+      boolean fresh = snapshot != null && !positions.isStale(playerId);
+      // 连接身份已在 deliver 入口核对过（本方法只处理「同一连接」的世界复核），故 sameConnection 传 true
+      return FlushWorld.classify(pinned, now, fresh, fresh ? snapshot.world() : null, true)
+          != FlushWorld.CHANGED;
+    } catch (Throwable throwable) {
+      logThrottled(throwable);
+      return true; // 读不到 → 照常发送（绝不把异常当「已换世界」）
     }
   }
 

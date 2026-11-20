@@ -130,6 +130,8 @@ class RewritePipelineTest {
     RewritePipeline.Outcome second = pipeline.rewrite(request(source, 12L));
     assertFalse(second.hit(), "源字节变了必须视为未命中");
     assertEquals(1, second.contentRejected(), "内容被拒必须单列，不能算有效命中");
+    assertEquals(1, second.sourceChanged(), "两类成因必须能各自归因：内容已变");
+    assertEquals(0, second.occlusionMissing(), "内容已变不得混进「缺遮挡位图」");
   }
 
   @Test
@@ -147,6 +149,8 @@ class RewritePipelineTest {
     RewritePipeline.Outcome hit = coldPipeline.rewrite(request(source, 11L));
     assertTrue(hit.hit(), "磁盘负载必须命中");
     assertTrue(hit.fromDisk(), "命中来源应为磁盘");
+    assertFalse(hit.diskRejected(), "可用负载不得计入磁盘拒绝");
+    assertNull(hit.diskReject(), "可用负载不得携带拒绝原因");
     assertArrayEquals(warmed.result().data(), hit.cached().data());
 
     RewritePipeline.Outcome again = coldPipeline.rewrite(request(source, 11L));
@@ -165,6 +169,46 @@ class RewritePipelineTest {
     RewritePipeline.Outcome outcome = pipeline.rewrite(request(source, 11L));
     assertFalse(outcome.hit());
     assertTrue(outcome.diskRejected(), "负载存在但源指纹不符必须计入磁盘拒绝");
+    assertEquals(DiskPayload.Reject.SOURCE_HASH_MISMATCH, outcome.diskReject(),
+        "原因必须是「内容已过期」这一类，才能与信封故障分列");
+    assertTrue(outcome.diskReject().sourceHashMismatch());
+    assertNotNull(outcome.result(), "被拒之后必须照常重算（fail-open，不是直接放行原包）");
+  }
+
+  /**
+   * 信封/数据故障与「内容已过期」必须能分开：前者持续出现说明负载损坏或容器格式对不上，
+   * 处置（重建缓存 / 查盘）与后者（正常失效）完全不同。
+   */
+  @Test
+  void diskEnvelopeFaultIsReportedSeparatelyFromHashMismatch() {
+    byte[] source = chunkBytes();
+    FakeDisk disk = new FakeDisk();
+    // 指纹与本次一致，但信封里「有伪装坐标却没有区块字节」→ 结构畸形（encode 不会产出，等价于被截断的记录）
+    disk.payloads.put("world,0,0," + FINGERPRINT,
+        DiskPayload.encode(11L, new int[] {5}, null, null));
+    RewritePipeline pipeline = pipeline(null, cache(), disk);
+
+    RewritePipeline.Outcome outcome = pipeline.rewrite(request(source, 11L));
+    assertFalse(outcome.hit());
+    assertEquals(DiskPayload.Reject.POSITION_COUNT_INVALID, outcome.diskReject());
+    assertFalse(outcome.diskReject().sourceHashMismatch(),
+        "信封故障不得被算成「内容已过期」（否则真实的损坏率永远看不见）");
+    assertNotNull(outcome.result(), "不可用的负载必须照常重算");
+  }
+
+  /** 磁盘缓存不可用（未启用 / 按文件停用）时不算拒绝，也不影响照常重算。 */
+  @Test
+  void unusableDiskRecomputesWithoutRejectReason() {
+    byte[] source = chunkBytes();
+    FakeDisk disk = new FakeDisk();
+    disk.usable = false;
+    RewritePipeline pipeline = pipeline(null, cache(), disk);
+
+    RewritePipeline.Outcome outcome = pipeline.rewrite(request(source, 11L));
+    assertFalse(outcome.diskRejected(), "磁盘不可用不是「负载被拒」");
+    assertNull(outcome.diskReject());
+    assertNotNull(outcome.result());
+    assertTrue(outcome.result().changed());
   }
 
   @Test
@@ -180,6 +224,8 @@ class RewritePipelineTest {
     RewritePipeline.Outcome outcome = pipeline.rewrite(request(source, 11L));
     assertFalse(outcome.hit(), "启用遮挡时缺位图的命中必须视为未命中");
     assertEquals(1, outcome.contentRejected());
+    assertEquals(0, outcome.sourceChanged(), "缺位图不得混进「内容已变」");
+    assertEquals(1, outcome.occlusionMissing(), "缺遮挡位图必须能单独归因（该区块会一直藏住矿）");
     assertNotNull(outcome.result().occlusion(), "重写必须产出遮挡负载");
   }
 

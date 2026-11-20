@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class ChunkChangeJournalTest {
@@ -106,5 +107,66 @@ class ChunkChangeJournalTest {
     journal.record(FIRST, "world", 33, 16, 3);
     assertFalse(journal.written(FIRST, later).truncated());
     assertEquals(1, journal.take(later, 1, cells));
+  }
+
+  /**
+   * 「还有没有未补发的格子」是「覆盖丢失」归因的唯一判据：只有确认已到、却再也补不出去时才该为真。
+   * 它只看本 ticket 的脏格，不参与任何放行判定。
+   */
+  @Test
+  void pendingFlagTracksOnlyThisTicketsUnreplayedCells() {
+    ChunkChangeJournal journal = new ChunkChangeJournal();
+    var ticket = journal.open(FIRST, "world", 0, 0);
+    assertFalse(journal.hasPending(ticket), "还没记录任何变更时不该算有在途更新");
+    journal.record(FIRST, "world", 1, 2, 3);
+    assertTrue(journal.hasPending(ticket));
+    assertTrue(journal.written(FIRST, ticket).dirty());
+    assertSame(ticket, journal.poll(ticket.receiver));
+    int[] cells = new int[3];
+    assertEquals(1, journal.take(ticket, 1, cells));
+    journal.acknowledge(ticket, cells, 1);
+    assertFalse(journal.hasPending(ticket), "补发提交成功后不得再报「有在途更新」");
+    assertTrue(journal.finish(ticket, true));
+  }
+
+  /**
+   * 淘汰口径：只有「确实还带着未补发格子」的列被容量/超时挤掉才该计入淘汰；
+   * 同一列被新快照接手时脏格会随 {@code open} 转移到新 ticket，<b>不算</b>淘汰。
+   * 这条口径直接决定线上「回调未结账淘汰」的计数是否可信。
+   */
+  @Test
+  void evictionAccountingOnlyCountsColumnsThatStillHadCells() {
+    AtomicInteger evictions = new AtomicInteger();
+    ChunkChangeJournal journal = new ChunkChangeJournal(4096, evictions::incrementAndGet);
+    var first = journal.open(FIRST, "world", 0, 0);
+    journal.record(FIRST, "world", 1, 2, 3);
+
+    // 同一列第二次下发：脏格转移到新 ticket，旧 ticket 不应记成淘汰。
+    var replaced = journal.open(FIRST, "world", 0, 0);
+    assertEquals(0, evictions.get(), "同列重发不是淘汰：脏格跟随后一个快照");
+    assertTrue(journal.hasPending(replaced));
+    assertFalse(journal.written(FIRST, first).current());
+
+    // 用「没有脏格」的列把表填满，挤掉排在最前的有用列——只有它算淘汰。
+    for (int i = 1; i <= 256; i++) {
+      journal.open(FIRST, "world", i, 0);
+    }
+    assertEquals(1, evictions.get(), "只有仍带在途更新的列被挤掉才计数");
+  }
+
+  @Test
+  void replacingAColumnKeepsItsCellsWithoutCountingEviction() {
+    AtomicInteger evictions = new AtomicInteger();
+    ChunkChangeJournal journal = new ChunkChangeJournal(4096, evictions::incrementAndGet);
+    var first = journal.open(FIRST, "world", 3, 4);
+    journal.record(FIRST, "world", 49, 2, 65);
+    var second = journal.open(FIRST, "world", 3, 4);
+    assertEquals(0, evictions.get());
+    assertFalse(journal.written(FIRST, first).current());
+    assertTrue(journal.written(FIRST, second).dirty());
+    assertSame(second, journal.poll(second.receiver));
+    int[] cells = new int[3];
+    assertEquals(1, journal.take(second, 1, cells));
+    assertArrayEquals(new int[] {49, 2, 65}, cells, "重发后脏格必须完整转交给新快照");
   }
 }

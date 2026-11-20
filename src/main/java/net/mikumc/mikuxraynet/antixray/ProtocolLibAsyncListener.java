@@ -7,11 +7,14 @@ import com.comphenix.protocol.async.AsyncMarker;
 import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.NetworkMarker;
 import com.comphenix.protocol.events.PacketAdapter;
+import com.comphenix.protocol.events.PacketContainer;
 import com.comphenix.protocol.events.PacketEvent;
 import com.comphenix.protocol.events.PacketPostAdapter;
 import com.comphenix.protocol.events.PacketPostListener;
+import com.comphenix.protocol.events.ScheduledPacket;
 import io.papermc.paper.math.Position;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -51,7 +54,7 @@ import org.bukkit.plugin.Plugin;
  * <p>线程模型：网络线程（本监听回调）只做「读坐标 → 建任务 → 登记延迟 → 入队」，
  * 解码/判定/重编码全部交给 {@link MikuWorkPool} 的工作线程；工作线程不触碰任何 Bukkit API。
  * 世界名 / 维度 / 高度一律取自「由实体所属线程发布、并随封包固定下来的不可变快照」
- * （见 {@link PlayerWorldIndex} 与 {@link ChunkDeliveryPostAdapter}）：本回调不读实体活状态、不按名查世界，
+ * （见 {@link PlayerWorldIndex} 与 {@link ChunkWriteObserver}）：本回调不读实体活状态、不按名查世界，
  * 因此跨维度瞬间不会出现「旧世界的字节按新世界的档案/高度编」；拿不到快照的包按原包即时放行。
  * 需要邻块数据时，网络线程只登记「需要快照」这件事，由主线程 / Folia 区域线程执行
  * {@link NeighborChunkProvider#capture} 抓取，再回到工作线程改写。
@@ -230,7 +233,12 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 若持包期间该区块被改过，就补发那几格的当前状态——否则客户端先收到的方块变更会被随后到达的
    * 「改写时刻的旧区块字节」盖回去（真机观感：边走边放方块时，刚放的那一格闪一下）。
    */
-  private final ChunkChangeJournal changeJournal = new ChunkChangeJournal(stats.replaySkipped::increment);
+  private final ChunkChangeJournal changeJournal = new ChunkChangeJournal(() -> {
+    // 交付信号始终没到、ticket 被容量/超时淘汰（也可能是记录阶段脏段超额被截断）：
+    // 与「确认到了但补不出去」（replayRegionFailures）分开计，前者指向协议/连接侧，后者指向调度侧。
+    stats.replayEvicted.increment();
+    stats.replaySkipped.increment();
+  });
   private final BatchTable batches;
   /**
    * 玩家退出清理批次闸门的 Bukkit 监听。
@@ -447,6 +455,22 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   /** 在异步改写排队前开窗，实际出站之后才关闭。原包的放行不依赖这个观察器。 */
   public void registerDeliveryObserver(ProtocolManager manager) {
     deliveryManager = manager;
+    // 交付信号的占位容器：与任何区块封包无关，全进程共用一个（见 ChunkDeliverySignal 的类注释）。
+    // 用它做 ScheduledPacket 的填充物，marker（WeakHashMap 的 value）就不会经由 scheduled 队列反向强引用
+    // 被观察的区块包对象——否则写出未到达时这条 value → 弱键引用会让整列一直收不回来。
+    PacketContainer placeholder = null;
+    try {
+      placeholder = manager.createPacket(PacketType.Play.Server.BLOCK_CHANGE);
+    } catch (Throwable throwable) {
+      // 只降级「交付确认」：占位容器缺失时仍挂一个仅携世界快照的轻量 post 适配器，
+      // handleChunk / alreadyObserved 照旧能从 marker 读回上下文。绝不因为这项可选能力拿不到
+      // 就让整服 MAP_CHUNK 取不到快照、永久跳过改写。
+      logThrottled("区块交付确认不可用（无法创建占位封包），已降级为仅改写："
+          + "写出后的定向补发关闭，反矿透改写本身不受影响", throwable);
+    }
+    // 每个封包都复用它；placeholder 为 null 时走降级路径（只挂上下文载体，不开 ticket）。
+    final boolean confirmDelivery = placeholder != null;
+    final PacketContainer deliveryFiller = placeholder;
     deliveryObserver = new PacketAdapter(getPlugin(), ListenerPriority.MONITOR,
         PacketType.Play.Server.MAP_CHUNK, PacketType.Play.Server.BLOCK_CHANGE, PacketType.Play.Server.MULTI_BLOCK_CHANGE) {
       @Override
@@ -470,6 +494,9 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
             || (bypassRegistry != null && bypassRegistry.isBypassed(playerId))) {
           return;
         }
+        // 登记中途失败时要能把刚开的 ticket 收回去（否则它只会变成一条过期记录，
+        // 把「观测缺失」与「淘汰」两个口径同时加一，破坏四类互斥）。
+        ChunkChangeJournal.Ticket pending = null;
         try {
           if (!chunkPacket) {
             if (chunkDeliveryHook == null) {
@@ -483,12 +510,31 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
           if (x == null || z == null) {
             return;
           }
+          if (!confirmDelivery) {
+            // 降级：只把世界快照随包固定下来。没有确认通道就无从知道「何时可以补发」，
+            // 因此这里绝不 open journal ticket（开了只会堆成过期条目，把统计冲花）。
+            event.getNetworkMarker().addPostListener(new ChunkContextCarrier(getPlugin(), context));
+            return;
+          }
           ChunkChangeJournal.Ticket ticket = changeJournal.open(playerId, world, x, z);
-          // 同一份快照随包固定下来（见 ChunkDeliveryPostAdapter）：异步回调从同一个 NetworkMarker 读回，
-          // 既不重复查表，也不会与「换世界后再查一次」的结果错配。
-          event.getNetworkMarker().addPostListener(
-              new ChunkDeliveryPostAdapter(player, playerId, ticket, context));
+          pending = ticket;
+          // 同一份快照随包固定下来（见 ChunkWriteObserver / ChunkDeliverySignal）：异步回调与写出确认
+          // 都从同一个 NetworkMarker 读回，既不重复查表，也不会与「换世界后再查一次」的结果错配。
+          //
+          // 用 event.schedule(...) 而不是 addPostListener(...)：异步放行路径
+          // （AsyncMarker#sendPacket → sendServerPacket(..., false)）里 ProtocolLib 只派发 scheduled 包，
+          // post listener 因 NetworkProcessor#invokePostEvent 的 event != null 前提拿不到 event——
+          // 按它判「已写出」在真机上永远不会成立（生产 replay 恒 0 即此）。
+          event.schedule(new ChunkDeliverySignal(
+              new ChunkWriteObserver(context,
+                  () -> onChunkWritten(player, playerId, ticket, context),
+                  throwable -> logThrottled("区块写出确认回调失败（在途更新按过期收账）", throwable)),
+              deliveryFiller, player));
         } catch (Throwable throwable) {
+          if (pending != null) {
+            changeJournal.finish(pending, false);
+          }
+          stats.replayUnobserved.increment();
           stats.replaySkipped.increment();
           logThrottled("区块在途更新观察登记失败（原包不受影响）", throwable);
         }
@@ -498,47 +544,42 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   }
 
   /**
-   * 携带世界快照的区块写出观察器：MAP_CHUNK 在<b>同步观察阶段</b>就把「该包属于哪个世界的哪一份快照」
-   * 固定下来，异步回调与写出回调都从<b>同一个</b> {@code NetworkMarker} 读回。
+   * 仅携带随包世界快照的 marker 适配器（<b>占位容器不可用时的降级路径</b>）。
    *
-   * <p><b>为什么挂在 NetworkMarker 上</b>：ProtocolLib 的 {@code PacketEvent#fromSynchronous} 复制同步事件的
-   * {@code networkMarker} <b>引用</b>（5.3.0 已核实：{@code this.networkMarker = original.networkMarker}），
-   * 因此异步回调（{@link #handleChunk}）与最终写出回调（{@link #onChunkWritten}）看到的是同一个 marker。
-   * 这样既不需要额外的 per-packet 映射或锁，也不会出现「观察时查一次、异步时再查一次」得到两份数据。
-   *
-   * <p>快照为 {@code null} 表示观察阶段就没拿到可靠上下文：该包在异步回调里<b>立即放行、不登记延迟</b>。
+   * <p>它只为让 {@link #handleChunk} / {@link #alreadyObserved} 仍能从同一个 {@code NetworkMarker} 读回
+   * 「该封包属于哪个世界的哪一份快照」——占位容器拿不到时若连这个载体都不挂，整服 MAP_CHUNK 都会因
+   * 「取不到上下文」被即时放行，等于反矿透全线下线。它<b>不</b>登记 journal、<b>不</b>参与补发、
+   * <b>不</b>发送任何封包，{@code onPostEvent} 是空实现（该路径没有确认通道）。
    */
-  private final class ChunkDeliveryPostAdapter extends PacketPostAdapter {
+  private static final class ChunkContextCarrier extends PacketPostAdapter {
 
-    private final Player player;
-    private final UUID playerId;
-    private final ChunkChangeJournal.Ticket ticket;
     private final PlayerWorldIndex.WorldContext context;
 
-    private ChunkDeliveryPostAdapter(Player player, UUID playerId, ChunkChangeJournal.Ticket ticket,
-        PlayerWorldIndex.WorldContext context) {
-      super(getPlugin());
-      this.player = player;
-      this.playerId = playerId;
-      this.ticket = ticket;
+    private ChunkContextCarrier(Plugin plugin, PlayerWorldIndex.WorldContext context) {
+      super(plugin);
       this.context = context;
+    }
+
+    PlayerWorldIndex.WorldContext context() {
+      return context;
     }
 
     @Override
     public void onPostEvent(PacketEvent sent) {
-      onChunkWritten(player, playerId, ticket, context);
+      // 只作为 marker 上的上下文载体；交付确认由 ChunkDeliverySignal 完成。
     }
   }
 
   /**
-   * 本封包是否已被本模块的一次同步观察登记过（同一个 marker 上已有本次的 {@link ChunkDeliveryPostAdapter}）。
+   * 本封包是否已被本模块的一次同步观察登记过（同一个 marker 上已有本次的 {@link ChunkDeliverySignal}，
+   * 或降级路径的 {@link ChunkContextCarrier}）。
    *
    * <p><b>为什么必须判</b>：ProtocolLib 在异步放行时用 {@code sendServerPacket(player, packet, marker, false)}
    * 把包交回注入器，{@code false} 表示「未过滤」——同步监听链（含本 MONITOR 观察器）会被<b>第二次</b>执行，
    * 同一个 {@code NetworkMarker} 会再次抵达观察器。若不早退，就会：① 为同一个包再开一个 journal ticket
-   * （{@code open} 会顶掉旧 ticket，旧的一次性记账随之失效）；② 再挂一个 adapter，而 {@code boundContext}
-   * 只能拿其中一个（{@code HashSet} 无序遍历）；③ 新 ticket 会按「此刻」的世界归属，玩家恰在持包期间换维时
-   * 就是<b>把旧世界的包记到新世界账上</b>。
+   * （{@code open} 会顶掉旧 ticket，旧的一次性记账随之失效）；② 再挂一个载体，而 {@code boundContext}
+   * 只能拿其中一个（{@code HashSet} / deque 无序遍历）；③ 新 ticket 会按「此刻」的世界归属，玩家恰在持包
+   * 期间换维时就是<b>把旧世界的包记到新世界账上</b>。
    */
   private static boolean alreadyObserved(PacketEvent event) {
     return boundContext(event) != null;
@@ -554,17 +595,29 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 直接返回事件当前持有的引用，没有就返回 {@code null}——这正好是「观察阶段没登记过 → 本包不可靠」的判据。
    *
    * <p>同步阶段的 marker 是<b>同一个对象</b>被异步事件复制引用（ProtocolLib 5.3.0 已核实），因此这里读到的
-   * 就是同步观察者写进去的那一份；本方法只读取 {@code getPostListeners()} 的不可变视图，不改动 marker。
-   * 只认本插件的 {@link ChunkDeliveryPostAdapter}（其它插件的 post listener 与本模块无关）。
+   * 就是同步观察者写进去的那一份；本方法只读，不改动 marker。
+   *
+   * <p><b>两处载体都要认</b>：正常路径读 {@code scheduledPackets}（{@link ChunkDeliverySignal}；用
+   * {@code NetworkMarker#readScheduledPackets} 静态读法，它不初始化队列、不额外分配）；占位容器不可用的
+   * 降级路径读 {@code postListeners}（{@link ChunkContextCarrier}）。两者都只认本插件自己的类型：
+   * 其它插件的回调即便挂在同一个 marker 上也不参与判定。
    */
   private static PlayerWorldIndex.WorldContext boundContext(PacketEvent event) {
     NetworkMarker marker = NetworkMarker.getNetworkMarker(event);
     if (marker == null) {
       return null;
     }
+    Deque<ScheduledPacket> scheduled = NetworkMarker.readScheduledPackets(marker);
+    if (scheduled != null && !scheduled.isEmpty()) {
+      for (ScheduledPacket entry : scheduled) {
+        if (entry instanceof ChunkDeliverySignal signal) {
+          return signal.observer().context();
+        }
+      }
+    }
     for (PacketPostListener post : marker.getPostListeners()) {
-      if (post instanceof ChunkDeliveryPostAdapter adapter) {
-        return adapter.context;
+      if (post instanceof ChunkContextCarrier carrier) {
+        return carrier.context();
       }
     }
     return null;
@@ -881,10 +934,19 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
           task.worldName(), task.chunkX(), task.chunkZ(), task.minHeight(), task.sectionCount(),
           task.dimension(), source, hash(source), task.occlusionStamps()));
       if (outcome.diskRejected()) {
+        // 聚合口径不变；子项按同一次解码给出的原因二选一（内容过期 / 信封或数据故障）。
         stats.diskPayloadRejected.increment();
+        if (outcome.diskReject().sourceHashMismatch()) {
+          stats.diskPayloadRejectedSourceHash.increment();
+        } else {
+          stats.diskPayloadRejectedEnvelopeFault.increment();
+        }
       }
       if (outcome.contentRejected() > 0) {
+        // 聚合口径不变；两个子项由 Outcome 派生值给出（之和恒等于 contentRejected），此处只做累加。
         stats.cacheContentRejected.add(outcome.contentRejected());
+        stats.cacheRejectedSourceChanged.add(outcome.sourceChanged());
+        stats.cacheRejectedOcclusionMissing.add(outcome.occlusionMissing());
       }
       if (!canPrepareRewrite(task)) {
         return;
@@ -1201,20 +1263,33 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
 
   private void onChunkWritten(Player player, UUID playerId, ChunkChangeJournal.Ticket ticket,
       PlayerWorldIndex.WorldContext bound) {
+    // 交付确认已到达：这是「写出动作之后」的唯一正面信号——与「发送前 MONITOR」「固定等若干 tick」
+    // 「signalPacketTransmission 已调用」都不同，那些只证明「我们允许它走」，证明不了它进过管线。
+    // 契约边界见 ChunkDeliverySignal：它不是 ChannelPromise 成功，更不是客户端 ACK。
+    stats.replayDelivered.increment();
     ChunkChangeJournal.Column column = ticket.column;
     // 会话身份按<b>引用相等</b>判定：快照被换过（跨维度 / 退出 / 世界重载）就按过期处理——既不补发，
     // 也不清新会话的已显形标记。同身份重复发布复用同一实例，所以同一世界内的重复事件不会误判。
     // 注意：这里只判定「写出后回调」该不该继续；ticket 的身份语义（写入/补发/摘除）完全不变。
     if (stopping || bound == null || PlayerWorldIndex.context(playerId) != bound) {
+      // 确认到了、但这一列的在途更新已不可能补出去（会话/世界已经变了）：属「覆盖丢失」，
+      // 与「确认根本没来」的淘汰分开计数，否则真机上无法区分是断连还是调度。
+      if (changeJournal.hasPending(ticket)) {
+        stats.replayCoverageLost.increment();
+        stats.replaySkipped.increment();
+      }
       changeJournal.finish(ticket, false);
       return;
     }
     ChunkChangeJournal.Written written = changeJournal.written(playerId, ticket);
     if (!written.current()) {
-      return; // 更新的区块快照接手了该列。
+      // 更新的区块快照接手了该列：脏格已随 open(...) 转移到新 ticket，不算丢失，也绝不重发区块包。
+      return;
     }
     clearRevealedOnDelivery(column.world(), column.x(), column.z(), playerId);
     if (written.truncated()) {
+      // 记录阶段脏段数超限被截断：确认到了，但被截断的格子再也补不出去。
+      stats.replayCoverageLost.increment();
       stats.replaySkipped.increment();
     }
     if (!written.dirty()) {
@@ -1238,6 +1313,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private void scheduleReplay(Player player, UUID playerId, ChunkChangeJournal.Receiver receiver) {
     Runnable abandon = () -> {
       changeJournal.abandonDrain(receiver);
+      // 区域调度器不受理（插件停用中 / 实体已不可调度）：确认通道是通的，只是没补出去。
+      stats.replayRegionFailures.increment();
       stats.replaySkipped.increment();
     };
     try {
@@ -1269,6 +1346,11 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
         }
         ChunkChangeJournal.Column column = ticket.column;
         if (!world.getName().equals(column.world()) || !changeJournal.isCurrent(playerId, ticket)) {
+          // 该列已不属于当前世界 / 已被新快照取代：在途更新无法补出去（确认是到过的）。
+          if (changeJournal.hasPending(ticket)) {
+            stats.replayCoverageLost.increment();
+            stats.replaySkipped.increment();
+          }
           changeJournal.finish(ticket, false);
           continue;
         }
@@ -1280,6 +1362,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
               deferred.add(ticket);
               continue;
             }
+            // 区域归属 / 区块已加载 / 已发送三项检查连续若干 tick 都没通过：补发放弃。
+            stats.replayRegionFailures.increment();
             stats.replaySkipped.increment();
           } else {
             ticket.retries = 0;
@@ -1302,6 +1386,8 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
             }
           }
         } catch (RuntimeException ex) {
+          // 取样/发包抛异常：同样属「确认到了但没补出去」。
+          stats.replayRegionFailures.increment();
           stats.replaySkipped.increment();
           logThrottled("区块写出后方块补发失败（原包不受影响）", ex);
         }

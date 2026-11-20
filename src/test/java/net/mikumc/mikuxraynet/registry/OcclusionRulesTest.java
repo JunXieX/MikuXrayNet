@@ -311,4 +311,32 @@ class OcclusionRulesTest {
     assertFalse(OcclusionRules.visualVerdict("barrier", true),
         "显形：barrier 同样判非遮挡 → 其后方矿石能显形（体验正确，不泄露）");
   }
+
+  /**
+   * 边界邻块的预计算真值表以 {@code OcclusionRules#camouflageVerdict} 为唯一规则来源，因此本方法必须对
+   * 「同一名字 × 真值两向 × 冲突覆盖表」给出稳定、可复现的结论——这正是那张表的两列（服务端判定为真是 /
+   * 假）所能拼出的全部输入。表与规则的逐材料等价性另由 {@code BukkitOcclusionTableTest} 全覆盖对照。
+   */
+  @Test
+  void camouflageVerdictIsStableAcrossBothTruthValues() {
+    // 状态相关方块：同一名字的两个状态结论相反（表里「名字 → 结论」那一维正是这样被二分的）
+    assertFalse(OcclusionRules.camouflageVerdict("oak_slab", false, NO_OVERRIDE, NO_OVERRIDE));
+    assertTrue(OcclusionRules.camouflageVerdict("oak_slab", true, NO_OVERRIDE, NO_OVERRIDE));
+
+    // 两个反向例外在两个真值方向上都不动摇
+    assertFalse(OcclusionRules.camouflageVerdict("barrier", true, NO_OVERRIDE, NO_OVERRIDE));
+    assertFalse(OcclusionRules.camouflageVerdict("barrier", false, NO_OVERRIDE, NO_OVERRIDE));
+    assertTrue(OcclusionRules.camouflageVerdict("lava", false, NO_OVERRIDE, NO_OVERRIDE));
+    assertTrue(OcclusionRules.camouflageVerdict("lava", true, NO_OVERRIDE, NO_OVERRIDE));
+
+    // 覆盖表在真值两向上都优先，且「不遮挡」压过「遮挡」
+    Set<String> extraOccluding = OcclusionRules.normalizeAll(Set.of("barrier"));
+    Set<String> extraNonOccluding = OcclusionRules.normalizeAll(Set.of("stone"));
+    for (boolean truth : new boolean[] {true, false}) {
+      assertTrue(OcclusionRules.camouflageVerdict("barrier", truth, extraOccluding, NO_OVERRIDE),
+          "extra-occluding 在真值 " + truth + " 下都应生效");
+      assertFalse(OcclusionRules.camouflageVerdict("stone", truth, extraOccluding, extraNonOccluding),
+          "extra-non-occluding 在真值 " + truth + " 下都应优先");
+    }
+  }
 }

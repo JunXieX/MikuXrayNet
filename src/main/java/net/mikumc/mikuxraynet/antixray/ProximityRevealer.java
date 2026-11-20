@@ -2803,15 +2803,19 @@ public final class ProximityRevealer implements Listener {
         return;
       }
       Location eye = player.getEyeLocation();
+      // 方向只取一次：getDirection() 每次都新建 Vector 并重算 yaw/pitch 的 toRadians/sin/cos，
+      // 这里原本对同一次调用取了三遍（两次算终点、一次给射线）。复用的只是本次调用的局部结果——
+      // 不缓存、不跨 tick 复用，射线距离与准星语义都不变。
+      Vector direction = eye.getDirection();
       // Folia 线程纪律：rayTraceBlocks 会连续读方块，射线跨到邻 region 时 TickThread 校验会先打 ERROR
       // 再抛异常（本路径每 tick 都跑，等于持续刷日志且视线显形失效）。6 格射线最多跨一个区块边界，
       // 因此只要求起点与终点区块都属于本 region；不属于就跳过（该坐标仍留在索引里，靠近后由巡检补上）。
-      int endX = (int) Math.floor(eye.getX() + eye.getDirection().getX() * LOOK_MAX_DISTANCE);
-      int endZ = (int) Math.floor(eye.getZ() + eye.getDirection().getZ() * LOOK_MAX_DISTANCE);
+      int endX = (int) Math.floor(eye.getX() + direction.getX() * LOOK_MAX_DISTANCE);
+      int endZ = (int) Math.floor(eye.getZ() + direction.getZ() * LOOK_MAX_DISTANCE);
       if (!rayChunksAvailable(world, eye, endX, endZ)) {
         return;
       }
-      RayTraceResult hit = world.rayTraceBlocks(eye, eye.getDirection(), LOOK_MAX_DISTANCE,
+      RayTraceResult hit = world.rayTraceBlocks(eye, direction, LOOK_MAX_DISTANCE,
           FluidCollisionMode.NEVER, true);
       if (hit == null || hit.getHitBlock() == null) {
         return;

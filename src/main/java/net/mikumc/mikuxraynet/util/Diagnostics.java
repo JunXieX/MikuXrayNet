@@ -142,23 +142,39 @@ public final class Diagnostics {
     }
 
     /**
-     * 附加诊断域：把「一个大数字拆开」的三组来源与耗时分位放进同一处，避免继续膨胀主字段。
+     * 附加诊断域：把「一个大数字拆开」的来源拆分、兜底计数与世界归属计数放进同一处，避免继续膨胀主字段。
      *
      * <p>为什么这些必须拆：实机 dump（45 人 / 16 小时）里「丢弃 62.8 万」「缺遮挡数据 60.2 万」
      * 各只有一个总数，无法判断是正常运营（真切维 / 世界刚加载）还是缺陷（守卫误判 / 段未建表）；
      * 而「视野增量 最大 63.7 ms」与 0.3 ms 预算差两个数量级，单看最大值只会得出错误结论——
      * 最大值被 GC 与线程调度污染，p99 才是算法口径。
      *
+     * <p><b>世界归属的几类故障只分列、不合并</b>：入口未知 / 两源冲突是「原包」，冲刷未知是「批次」，
+     * 弃旧连接是「原包」，索引纠偏是「次数」——量纲不同，任何汇总数都会让「到底丢没丢更新」失去判据。
+     *
      * @param viewChangeP99Millis 视野增量巡检耗时的 p99（毫秒）；{@code NaN} = 无样本，{@code Infinity} = 落在最高档
      */
     public record Extras(long discardedByDimensionEvent, long discardedByPositionSnapshot,
         long discardedByBlacklist, long discardedByFlushSnapshot, long unknownSectionNoStore,
         long unknownSectionNoEntry, double viewChangeP99Millis, long discardRedeemed,
-        long mergeVerifyFailed, long sendFailed, long snapshotResync) {
+        long mergeVerifyFailed, long sendFailed, long snapshotResync,
+        long worldUnknown, long worldConflict, long flushUnknown, long pendingOldSession,
+        long indexRepaired) {
+
+      /** 兼容构造（不含世界归属五项，等价于全 0）：旧快照不伪造这些计数。 */
+      public Extras(long discardedByDimensionEvent, long discardedByPositionSnapshot,
+          long discardedByBlacklist, long discardedByFlushSnapshot, long unknownSectionNoStore,
+          long unknownSectionNoEntry, double viewChangeP99Millis, long discardRedeemed,
+          long mergeVerifyFailed, long sendFailed, long snapshotResync) {
+        this(discardedByDimensionEvent, discardedByPositionSnapshot, discardedByBlacklist,
+            discardedByFlushSnapshot, unknownSectionNoStore, unknownSectionNoEntry,
+            viewChangeP99Millis, discardRedeemed, mergeVerifyFailed, sendFailed, snapshotResync,
+            0L, 0L, 0L, 0L, 0L);
+      }
 
       /** 未采集附加诊断时的零值兜底。 */
       public static final Extras EMPTY =
-          new Extras(0L, 0L, 0L, 0L, 0L, 0L, Double.NaN, 0L, 0L, 0L, 0L);
+          new Extras(0L, 0L, 0L, 0L, 0L, 0L, Double.NaN, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
 
       /** 是否采到了附加诊断（p99 为 NaN 即未采集，渲染层据此写「未采集」而不是 0 ms）。 */
       public boolean collected() {
@@ -201,6 +217,17 @@ public final class Diagnostics {
      * （分母即全部查询次数，因为作废的命中是 {@code cacheHits} 的子集）。
      * 另外 {@code cacheMisses + cacheContentRejected = 磁盘查询次数}，可用来和磁盘缓存一行的分母对账。
      *
+     * <p><b>{@code cacheContentRejected} 与 {@code replaySkipped} 都是「合计」</b>：前者拆成
+     * {@code cacheRejectedSourceChanged}（内容真的变了，正常失效）与 {@code cacheRejectedOcclusionMissing}
+     * （缺遮挡位图、被迫重写——持续增长说明遮挡建表在这批区块上失败，而缺位图的区块会一直按「缺数据 = 遮挡」
+     * 藏住矿）；后者拆成四类放弃（观测缺失 / 淘汰 / 区域失败 / 覆盖丢失）再加一条正面证据
+     * {@code replayDelivered}。只有合计时，「补发没发生」看不出问题在协议、线程还是会话侧。
+     *
+     * <p><b>{@code replayDelivered} 不是「补发成功数」</b>：它只回答「交付链路通不通」——统计的是「已写出回调
+     * 到达」，包含「确认到了、但会话/世界已变而直接返回」这条路径，所以不能当补发成功的分子。四类放弃之和恒等于
+     * {@code replaySkipped}，而它与 {@code replayDelivered} 只是不相交，<b>不存在</b>「两者相加 = 总数」的恒等式
+     * （同一区块可能确认到达后既有脏格要补、又因会话失效丢失）。
+     *
      * <p>{@code indexSkippedOnWriteBackFailure} 是「写回未确认生效 → 连旧索引登记一起作废」的次数
      * （{@code writeBackFailures} 的子集）；{@code occlusionCaptureFailures} /
      * {@code occlusionPublishSkipped} 是遮挡建表的失败与「因期间有方块补丁而跳过覆盖的段数」——
@@ -212,7 +239,12 @@ public final class Diagnostics {
         long writeBackFailures, long chunksTimedOut, long chunksSkippedQueueFull,
         long bytesOriginal, long bytesOutput, long bytesSaved, String paletteBitsSummary,
         long indexSkippedOnWriteBackFailure, long occlusionCaptureFailures,
-        long occlusionPublishSkipped, long replayCells, long replaySkipped) {
+        long occlusionPublishSkipped, long replayCells, long replaySkipped,
+        // 两个「命中但作废」的子项：内容真的变了（正常失效）与缺遮挡位图（建表回归）处置完全不同
+        long cacheRejectedSourceChanged, long cacheRejectedOcclusionMissing,
+        // 在途更新的交付确认：成功执行 + 四类放弃（观测缺失 / 淘汰 / 区域失败 / 覆盖丢失）
+        long replayDelivered, long replayUnobserved, long replayEvicted, long replayRegionFailures,
+        long replayCoverageLost) {
 
       /**
        * 兼容构造（不含三项新增的「静默路径」计数，等价于全 0）。
@@ -230,10 +262,30 @@ public final class Diagnostics {
             0L, 0L, 0L, 0L, 0L);
       }
 
+      /**
+       * 兼容构造（不含「子项拆分」七个计数，等价于全 0）。
+       *
+       * <p>子项缺失时面板只写「子项与总数分别读取，无法原子比较」（中性口径，不判故障）——见
+       * {@code splitInner} 的口径说明。
+       */
+      public Rewrite(long cacheHits, long cacheMisses, int cacheEntries, long cacheBytes,
+          long cacheContentRejected,
+          long chunksRewritten, long blocksReplaced, long chunksSkipped, long chunksFailed,
+          long writeBackFailures, long chunksTimedOut, long chunksSkippedQueueFull,
+          long bytesOriginal, long bytesOutput, long bytesSaved, String paletteBitsSummary,
+          long indexSkippedOnWriteBackFailure, long occlusionCaptureFailures,
+          long occlusionPublishSkipped, long replayCells, long replaySkipped) {
+        this(cacheHits, cacheMisses, cacheEntries, cacheBytes, cacheContentRejected,
+            chunksRewritten, blocksReplaced, chunksSkipped, chunksFailed, writeBackFailures,
+            chunksTimedOut, chunksSkippedQueueFull, bytesOriginal, bytesOutput, bytesSaved,
+            paletteBitsSummary, indexSkippedOnWriteBackFailure, occlusionCaptureFailures,
+            occlusionPublishSkipped, replayCells, replaySkipped, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+      }
+
       /** 反矿透未启用时的零值兜底。 */
       public static final Rewrite EMPTY =
           new Rewrite(0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, "无采样",
-              0L, 0L, 0L, 0L, 0L);
+              0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
 
       /** 真正用上的命中数（键命中且内容指纹一致）；被 {@code cacheContentRejected} 作废的不计入。 */
       public long effectiveCacheHits() {
@@ -368,7 +420,9 @@ public final class Diagnostics {
      * <b>配置指纹清理</b>说明条目是旧配置改写的（升级 / 改过会影响改写结果的配置后必然出现一大批，
      * 属正常的「缓存整体重建」），
      * 写入被拒说明容量/文件大小上限在拦，{@code payloadRejected} 说明读到的负载与本次要改写的字节不符
-     * （内容真变了，或信封损坏）。
+     * （内容真变了，或信封损坏）——这两类由 {@code payloadRejectedSourceHash}（内容过期，正常失效）与
+     * {@code payloadRejectedEnvelopeFault}（负载损坏 / 容器格式与代码不一致）分开计数：前者无需处置，
+     * 后者持续增长就要清缓存并查盘。
      *
      * <p><b>注意 {@code hits} 是「读到了条目」，不等于「用上了」</b>：其中被 {@code payloadRejected}
      * 拒掉的（内容指纹不符）实际等同于未命中（会回退整块重写）。要判断磁盘缓存真正起了多少作用，
@@ -377,11 +431,21 @@ public final class Diagnostics {
      */
     public record DiskCache(long hits, long misses, int entries, int openFiles,
         long expiredRemoved, long configMismatchRemoved, long payloadRejected,
-        long rejectedByCapacity, long rejectedBySize, long rejectedByBacklog, long errors) {
+        long rejectedByCapacity, long rejectedBySize, long rejectedByBacklog, long errors,
+        // 「读到了但用不上」的两个子项：内容过期（正常失效）与信封/数据故障（负载损坏或格式不符）
+        long payloadRejectedSourceHash, long payloadRejectedEnvelopeFault) {
+
+      /** 兼容构造（不含两个子项，等价于全 0）：面板只写「无法原子比较」的中性口径，不判故障。 */
+      public DiskCache(long hits, long misses, int entries, int openFiles, long expiredRemoved,
+          long configMismatchRemoved, long payloadRejected, long rejectedByCapacity,
+          long rejectedBySize, long rejectedByBacklog, long errors) {
+        this(hits, misses, entries, openFiles, expiredRemoved, configMismatchRemoved, payloadRejected,
+            rejectedByCapacity, rejectedBySize, rejectedByBacklog, errors, 0L, 0L);
+      }
 
       /** 磁盘缓存未启用时的零值兜底。 */
       public static final DiskCache EMPTY =
-          new DiskCache(0L, 0L, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+          new DiskCache(0L, 0L, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
 
       /** 真正用上的命中数（读到条目且负载可用）；被 {@code payloadRejected} 拒掉的不计入。 */
       public long effectiveHits() {
@@ -973,7 +1037,12 @@ public final class Diagnostics {
             rewriteStats.indexSkippedOnWriteBackFailure.sum(),
             rewriteStats.occlusionCaptureFailures.sum(),
             rewriteStats.occlusionPublishSkipped.sum(), rewriteStats.replayCells.sum(),
-            rewriteStats.replaySkipped.sum());
+            rewriteStats.replaySkipped.sum(),
+            rewriteStats.cacheRejectedSourceChanged.sum(),
+            rewriteStats.cacheRejectedOcclusionMissing.sum(),
+            rewriteStats.replayDelivered.sum(), rewriteStats.replayUnobserved.sum(),
+            rewriteStats.replayEvicted.sum(), rewriteStats.replayRegionFailures.sum(),
+            rewriteStats.replayCoverageLost.sum());
     Snapshot.Proximity proximity = proximityStats == null ? Snapshot.Proximity.EMPTY
         : new Snapshot.Proximity(proximityStats.revealsSent.sum(), proximityStats.revealsSkipped.sum(),
             proximityStats.unregistered.sum(), proximityStats.revealsFrustumCulled.sum(),
@@ -1026,7 +1095,10 @@ public final class Diagnostics {
             rewriteStats == null ? 0L : rewriteStats.diskPayloadRejected.sum(),
             diskCache.stats().rejectedByCapacity.sum(), diskCache.stats().rejectedBySize.sum(),
             diskCache.stats().rejectedByBacklog.sum(),
-            diskCache.stats().errors.sum());
+            diskCache.stats().errors.sum(),
+            // 两个子项来自改写侧（负载解封与指纹比对在 RewritePipeline 里做），与聚合值同源
+            rewriteStats == null ? 0L : rewriteStats.diskPayloadRejectedSourceHash.sum(),
+            rewriteStats == null ? 0L : rewriteStats.diskPayloadRejectedEnvelopeFault.sum());
 
     return new Snapshot(
         new Snapshot.Env(DependencyGuard.isPacketEventsPresent(),
@@ -1091,7 +1163,12 @@ public final class Diagnostics {
         throttle == null ? 0L : throttle.discardRedeemed.sum(),
         throttle == null ? 0L : throttle.mergeVerifyFailed.sum(),
         throttle == null ? 0L : throttle.sendFailed.sum(),
-        throttle == null ? 0L : throttle.snapshotResync.sum());
+        throttle == null ? 0L : throttle.snapshotResync.sum(),
+        throttle == null ? 0L : throttle.worldUnknown.sum(),
+        throttle == null ? 0L : throttle.worldConflict.sum(),
+        throttle == null ? 0L : throttle.flushUnknown.sum(),
+        throttle == null ? 0L : throttle.pendingOldSession.sum(),
+        throttle == null ? 0L : throttle.indexRepaired.sum());
   }
 
   /**
@@ -1166,9 +1243,16 @@ public final class Diagnostics {
     // 「命中」是「键命中且未过期」，与「有效命中」分列：内容指纹已变的那些其实等于未命中（必须重新改写）。
     // 另给出「磁盘查询」= 内存未命中 + 内容不符 —— 它与磁盘缓存一行的分母（命中 + 未命中）必然相等，
     // 两行互相对账即可发现「某类查询没有计数」这类统计缺口。
+    // 「内容已变」是两类成因的合计：内容真的变了（正常失效，重写覆盖即可）与缺遮挡位图
+    // （建表回归：该区块会一直按「缺数据 = 遮挡」藏住矿，玩家挖到的矿始终是假方块）。
+    String contentRejectedSplit = splitInner(s.rewrite().cacheContentRejected(),
+        new long[] {s.rewrite().cacheRejectedSourceChanged(),
+            s.rewrite().cacheRejectedOcclusionMissing()},
+        "源字节已变", "缺位图");
     lines.add("改写缓存：命中 " + s.rewrite().cacheHits()
         + "（有效 " + s.rewrite().effectiveCacheHits() + "，内容已变 "
-        + s.rewrite().cacheContentRejected() + "）"
+        + s.rewrite().cacheContentRejected()
+        + (contentRejectedSplit.isEmpty() ? "" : "：" + contentRejectedSplit) + "）"
         + "，未命中 " + s.rewrite().cacheMisses()
         + "，命中率 " + hitRate(s.rewrite().cacheHits(), s.rewrite().cacheMisses())
         // 有效命中率的分母仍是「全部查询次数」= 有效命中 + 未命中 + 内容已变（三者互斥、恰好划分全体员工），
@@ -1196,8 +1280,18 @@ public final class Diagnostics {
         + " 次（该区块无位图：矿可能一直显示假方块，且每次重发都要重算）"
         + "，发布跳过 " + s.rewrite().occlusionPublishSkipped()
         + " 段（期间有方块补丁，保留活位图）");
+    // 「补发未完成」混着四种完全不同的处置：观测缺失（观察链路报错，永远等不到确认）、淘汰（包没被
+    // 真正写出，本就不该补）、区域失败（确认到了但补不出去）、覆盖丢失（确认到了、内容已被新会话取代）。
+    // 只给合计时只能看到「补发没发生」，看不出责任在协议/线程/会话哪一侧。
+    String replaySkippedSplit = splitInner(s.rewrite().replaySkipped(),
+        new long[] {s.rewrite().replayUnobserved(), s.rewrite().replayEvicted(),
+            s.rewrite().replayRegionFailures(), s.rewrite().replayCoverageLost()},
+        "观测缺失", "淘汰", "区域失败", "覆盖丢失");
+    String replayNote = s.rewrite().replayDelivered() <= 0L && replaySkippedSplit.isEmpty() ? ""
+        : "（写出确认 " + s.rewrite().replayDelivered() + " 次"
+            + (replaySkippedSplit.isEmpty() ? "" : "；" + replaySkippedSplit) + "）";
     lines.add("在途更新：区块写出后定向补发 " + s.rewrite().replayCells()
-        + " 格，登记或补发未完成 " + s.rewrite().replaySkipped() + " 次");
+        + " 格，登记或补发未完成 " + s.rewrite().replaySkipped() + " 次" + replayNote);
     // 「未改写」按原始计数器分列，并写明各自的归属关系：chunksSkipped 是「已处理但原包放行」的<b>总量</b>，
     // chunksFailed 是它的子集；而「队列满」与「超时放行」都在各自的提前返回分支里计数、并不计入
     // chunksSkipped。任何用减法（如 跳过 − 异常）去推算「本来就无需改写」的写法都会漏掉这两条路径，
@@ -1269,6 +1363,10 @@ public final class Diagnostics {
     // 「无数据」与「未启用」必须分开：前者是空缓存（首次启动、或刚被配置指纹整体清理），
     // 后者是管理员关掉了 disk-cache.enabled——旧文案把两者混成一个词，排查命中率时无法区分
     // 「功能正常但还没积累」与「功能压根没开」。
+    String diskRejectSplit = splitInner(s.diskCache().payloadRejected(),
+        new long[] {s.diskCache().payloadRejectedSourceHash(),
+            s.diskCache().payloadRejectedEnvelopeFault()},
+        "源指纹不一致", "信封/数据故障");
     lines.add("磁盘缓存：" + diskCacheState(s)
         + "｜命中 " + s.diskCache().hits() + "（有效 " + s.diskCache().effectiveHits() + "）"
         + "，未命中 " + s.diskCache().misses()
@@ -1279,7 +1377,10 @@ public final class Diagnostics {
         + "，条目约 " + s.diskCache().entries() + "，打开区域文件 " + s.diskCache().openFiles()
         + "｜过期清理 " + s.diskCache().expiredRemoved()
         + "，配置指纹不符清理 " + s.diskCache().configMismatchRemoved()
+        // 「负载被拒」拆两类：源指纹不一致是区块内容真变了（正常失效、照常重写覆盖），
+        // 信封/数据故障说明负载损坏或容器格式与代码不一致——两者处置完全不同，合计看不出来。
         + "，负载被拒 " + s.diskCache().payloadRejected()
+        + (diskRejectSplit.isEmpty() ? "" : "（" + diskRejectSplit + "）")
         + "，写入被拒 " + (s.diskCache().rejectedByCapacity() + s.diskCache().rejectedBySize())
         // 积压被拒单列：它不代表配置上限在拦，而是磁盘线程跟不上（压缩/落盘成瓶颈），
         // 处理方式与调容量上限完全不同，因此不与「写入被拒」合并。
@@ -1289,8 +1390,7 @@ public final class Diagnostics {
         + "，异常 " + s.diskCache().errors() + "（含读超时降级与真实异常）");
     List<String> diskHints = s.antiXray() == null ? List.of()
         : diskWatermarkHints(s.diskCache().openFiles(), s.antiXray().diskCache().maxOpenFiles(),
-            s.antiXray().diskCache().bucketCacheSize(), s.antiXray().diskCache().maxEntries(),
-            s.antiXray().diskCache().maxRegionFiles());
+            s.antiXray().diskCache().maxEntries(), s.antiXray().diskCache().maxRegionFiles());
     if (!diskHints.isEmpty()) {
       lines.add("磁盘缓存提示：" + String.join("；", diskHints));
     }
@@ -1311,6 +1411,10 @@ public final class Diagnostics {
         // 丢弃单列：切维 / 进黑名单世界时整批原包被刻意丢弃（既不合并也不放行，客户端暂时收不到
         // 那几次变更）。不计数就等于「这些包从未存在」，排查「切维后方块不更新」时没有依据。
         + "，丢弃（切维/黑名单）" + s.throttle().blockChangesDiscarded()
+        // 「冲刷前比对」含两个取点（封存判定 + 送出前 stillSameWorld 复核），同一批只命中其中一个，
+        // 因此它是原包口径的和，与处置环的记录条数不是一一对应：封存判定命中时即使丢弃 0 个也会留痕
+        // （环里可能出现「丢弃 0 个原包」的行），环容量固定 32、只留最近若干条并与 MERGE/PASS/VERIFY_FAIL
+        // 混排，所以条数与计数在任何情况下都不能对账。
         // 四源拆分：只有一个总数时无法区分「玩家真的切了世界」与「守卫误判」——后者会让客户端停在
         // 旧方块上直到区块重发。正常态「切维事件」应占绝对多数；若「快照比对 / 冲刷前比对」占比高即为缺陷
         + "（切维事件 " + s.extras().discardedByDimensionEvent()
@@ -1326,7 +1430,9 @@ public final class Diagnostics {
         + "，单条补发失败 " + s.extras().sendFailed()
         // 快照与索引矛盾：不丢更新（照常交付），但说明位置刷新任务已停——冻结快照会让近身判定
         // 把所有变更判成「远」，是「假方块挖不掉」的直接成因。正常运营恒为 0。
-        + "，快照重同步 " + s.extras().snapshotResync()
+        // 该计数的旧名「快照重同步」已不适用：它只在冲刷判定为「两源冲突」时自增一次（批次，
+        // 按不丢交付并保留快照），并不重置快照；名字保留是为了不打断既有日志口径。
+        + "，快照重同步 " + s.extras().snapshotResync() + "（冲刷两源冲突，按不丢交付；非重置快照）"
         // 单线程冲刷的「次数 + 累计耗时」：极端配置下的延迟瓶颈靠它观测（累计/次数 = 平均一次的成本）
         + "；单线程冲刷 " + s.throttle().blockMergeFlushes() + " 次（累计 "
         + formatMillis(s.throttle().blockMergeFlushNanos()) + " ms，平均 "
@@ -1335,6 +1441,13 @@ public final class Diagnostics {
         + "，实体隐藏 " + s.throttle().entitiesHidden() + "/恢复 " + s.throttle().entitiesShown()
         + "（当前隐藏中 " + s.throttle().entitiesHiddenNow()
         + "；两者之差 = 死亡/卸载被服务端自然回收 + 仍在隐藏）");
+    // 世界归属的故障量纲不同：入口未知/冲突是「原包」，冲刷未知是「批次」，弃旧连接是「原包」，
+    // 索引纠偏是「次数」。合成一个总数会让「到底有没有丢更新」失去判据，故各带单位分列。
+    lines.add("带宽：世界判定 入口未知 " + s.extras().worldUnknown() + " 原包 / 两源冲突 "
+        + s.extras().worldConflict() + " 原包（均即时放行）"
+        + "｜冲刷未知 " + s.extras().flushUnknown() + " 批次（证据不足，按不丢交付）"
+        + "｜弃旧连接原包 " + s.extras().pendingOldSession() + "（同计入合并）"
+        + "｜索引纠偏 " + s.extras().indexRepaired() + " 次（正常恒 0）");
     // 「复检」单列：累计隐藏混合了「入场即被遮挡」与「周期复检发现新遮挡」两条来源，
     // 只看总数无法判断「先可见、之后才被挡住」的实体是否真被收敛到隐藏（本次缺陷的观测口径）。
     lines.add("带宽：实体复检 " + s.throttle().recheckSubmitted()
@@ -1521,19 +1634,64 @@ public final class Diagnostics {
   }
 
   /**
+   * 把「一个大数」拆成子项的内联渲染（纯函数）：总数与子项都为 0（没发生过）时返回空串，不占版面。
+   *
+   * <p><b>只给「无法原子比较」这个中性结论，不判故障</b>：聚合值来自一个 {@code LongAdder}，子项来自另外
+   * 几个，格式化时只能分别 {@code sum()}——{@code LongAdder} 不保证线性一致快照，工作线程正在自增时
+   * 完全可能出现「子项合计 ≠ 总数」，此时接线是对的。因此子项更少时只写「子项与总数分别读取，无法原子比较」；
+   * 若把它写成「接线不完整」这类故障口径，生产面板会周期性误报，反而稀释真问题。
+   * （离线兼容构造的子项恒为 0，也会落在这条中性文案上——那里同样不是故障。）
+   *
+   * <p>不为格式化引入采样锁/双读重试：诊断文本只在 {@code status}/{@code dump} 时生成，为它加锁或重读
+   * 会把一次只读渲染变成与热路径争用的同步点，代价与收益完全不成比例。
+   *
+   * @param parts  子项计数（按展示顺序）
+   * @param labels 与 {@code parts} 一一对应的中文标签
+   */
+  private static String splitInner(long total, long[] parts, String... labels) {
+    long sum = 0L;
+    for (long part : parts) {
+      sum += part;
+    }
+    if (total <= 0L && sum <= 0L) {
+      return "";
+    }
+    if (sum < total) {
+      return "子项与总数分别读取，无法原子比较";
+    }
+    StringBuilder text = new StringBuilder(64);
+    for (int index = 0; index < parts.length; index++) {
+      if (index > 0) {
+        text.append(" / ");
+      }
+      text.append(labels[index]).append(' ').append(parts[index]);
+    }
+    return text.toString();
+  }
+
+  /**
    * 磁盘缓存水位提示（纯函数）：只在「已经会明显掉收益」或「完全没有上限」时各给一条，
    * 正常态返回空列表（面板不增长）。
+   *
+   * <p><b>只比同量纲</b>：{@code openFiles} / {@code maxOpenFiles} 都是「常驻的区域文件句柄」，
+   * 到 90% 才意味着要开始逐出重开——这是真实水位（生产 dump 实测 43/128，未饱和，面板不出提示；
+   * 该读数来自 1.34.13 的现网 dump，不是本工作区版本的结论）。
+   * {@code bucket-cache-size} 是<b>每个</b>已打开文件缓存的桶 LRU 槽位数（内存旋钮，安全上限 64），
+   * 与句柄上限不是同一量纲：谁大谁小既不说明桶索引被重读，也不说明常驻内存够不够（常驻内存约等于
+   * 「同时打开的句柄数 × 每文件桶数」，不是两者的比较结果）。旧实现在 {@code bucket-cache-size <
+   * max-open-files} 时建议「取同值或更大」，照做会把每文件驻留内存放大到 4 倍且没有任何收益，
+   * 该提示已删除，不参与判定。
    */
-  static List<String> diskWatermarkHints(int openFiles, int maxOpenFiles, int bucketCacheSize,
+  static List<String> diskWatermarkHints(int openFiles, int maxOpenFiles,
       int maxEntries, int maxRegionFiles) {
     List<String> hints = new ArrayList<>();
+    // 句柄与句柄比：到 90% 才会开始逐出重开（先关最久未用的句柄，文件仍留在盘上）
     if (maxOpenFiles > 0 && openFiles * 10 >= maxOpenFiles * 9) {
       hints.add("打开区域文件 " + openFiles + "/" + maxOpenFiles + " 已到 90% 水位：再涨会开始逐出重开，"
-          + "磁盘命中率随之下降，建议把 max-open-files 调到 " + Math.max(maxOpenFiles * 2, 128));
-    }
-    if (bucketCacheSize > 0 && maxOpenFiles > 0 && bucketCacheSize < maxOpenFiles) {
-      hints.add("bucket-cache-size(" + bucketCacheSize + ") 小于 max-open-files(" + maxOpenFiles
-          + ")：桶索引会被反复重读，建议取同值或更大");
+          + "磁盘命中率随之下降，建议把 max-open-files 调到 " + Math.max(maxOpenFiles * 2, 128)
+          // 该参数属启动期固化（DiskCacheStore 只在 startAntiXray 里构造一次，见 ReloadCoordinator），
+          // 面板若不说清，管理员改完 reload 会以为已生效。
+          + "（重启生效）");
     }
     if (maxEntries <= 0 && maxRegionFiles <= 0) {
       hints.add("max-entries 与 max-region-files 均为 0（不限制）：磁盘只能靠 expire-seconds 过期回收，"

@@ -143,6 +143,37 @@ public final class PlayerWorldIndex implements Listener {
     return current == null || playerId == null ? null : current.contexts.get(playerId);
   }
 
+  /**
+   * 拥有线程上的<b>两源对账</b>：把「实体实况」与表里的上下文对齐，事件遗漏/错序时自动修正。
+   *
+   * <p><b>为什么需要它</b>：本类的上下文只由 {@link PlayerJoinEvent} / {@link PlayerChangedWorldEvent}
+   * 发布。Folia 上切维、镜像与代理侧传送都可能让事件迟到、合并或干脆不投递，于是表里停在上一个世界，
+   * 而按 tick 读实体的位置快照已经在新世界——两份来源长期互相矛盾。生产 1.34.13 dump 的
+   * 「快照重同步 1234102 / 冲刷 2428522」对应的正是这类长期不一致（另一类是同名世界重连的旧坐标，
+   * 见 {@code PlayerPositionSnapshots}）。
+   *
+   * <p><b>只在差异时发布</b>：世界身份（名 / 实例 / 维度 / 高度）与表里一致时直接返回 {@code false}，
+   * 每 tick 只花一次 CHM 读 + 一次字段比较，<b>不 new 记录、不写表、不换代次</b>。
+   *
+   * <p><b>只接受拥有线程的调用</b>：本方法会读实体状态，因此先做一次廉价归属校验；不属于本区域时
+   * 什么都不做（返回 {@code false}）。这条闸不可省：Folia 上被移出旧 world 的实体任务仍可能再执行一次，
+   * 它在非拥有线程读到的 {@code getWorld()} 仍指向旧世界——放任它写表就会把<b>正确的</b>上下文改回旧世界。
+   *
+   * @param player 拥有该玩家的线程上取得的玩家
+   * @param world  同一次刷新里刚从同一玩家读到的世界（与位置快照同源，不再二次读取）
+   * @return 是否真的发布了新上下文（世界身份变化或上下文缺失）
+   */
+  public static boolean reconcile(Player player, World world) {
+    PlayerWorldIndex current = instance;
+    if (current == null || player == null || world == null) {
+      return false;
+    }
+    if (!ownsEntity(player)) {
+      return false;
+    }
+    return current.reconcileOwned(player.getUniqueId(), world);
+  }
+
   // ------------------------------------------------------------------ 生命周期
 
   /** 注册并快照当前在线玩家（幂等）。 */
@@ -264,10 +295,19 @@ public final class PlayerWorldIndex implements Listener {
       return null;
     }
     try {
-      World world = player.getWorld();
-      if (world == null) {
-        return null;
-      }
+      return capture(player.getWorld());
+    } catch (Throwable throwable) {
+      // 世界正在卸载 / 实体已退役：调用方按「无上下文」放行，绝不阻塞封包
+      return null;
+    }
+  }
+
+  /** 由<b>已经读到的</b>世界构造上下文（供 {@link #reconcile(Player, World)} 复用同一次读取）。 */
+  private static WorldContext capture(World world) {
+    if (world == null) {
+      return null;
+    }
+    try {
       int minHeight = world.getMinHeight();
       int sectionCount = (world.getMaxHeight() - minHeight) / 16;
       if (sectionCount <= 0) {
@@ -275,9 +315,42 @@ public final class PlayerWorldIndex implements Listener {
       }
       return new WorldContext(world.getName(), world, world.getEnvironment(), minHeight, sectionCount, 0L);
     } catch (Throwable throwable) {
-      // 世界正在卸载 / 实体已退役：调用方按「无上下文」放行，绝不阻塞封包
       return null;
     }
+  }
+
+  /**
+   * 拥有线程对账的实例侧实现（离线单测直接驱动）：世界身份与表里一致时无操作。
+   *
+   * <p>必须由调用方保证「{@code world} 是拥有线程上从该玩家读到的那一份」；本方法不读任何实体状态。
+   *
+   * @return 是否发布了新上下文
+   */
+  boolean reconcileOwned(UUID playerId, World world) {
+    if (playerId == null || world == null) {
+      return false;
+    }
+    if (instance != null && instance != this) {
+      // 退休实例：迟到的刷新回调不得写进已退休的表（与 publishPlayer 同一条闸）
+      return false;
+    }
+    WorldContext existing = contexts.get(playerId);
+    String worldName;
+    try {
+      worldName = world.getName();
+    } catch (Throwable throwable) {
+      return false;
+    }
+    if (existing != null && existing.world() == world && existing.worldName().equals(worldName)) {
+      // 快路径：与刷新读到的「同一次世界」一致。每 tick 到这里就结束：零分配、零写入、不换代次。
+      return false;
+    }
+    WorldContext fresh = capture(world);
+    if (fresh == null) {
+      return false;
+    }
+    publish(playerId, fresh);
+    return true;
   }
 
   // ------------------------------------------------------------------ 发布/清理路径

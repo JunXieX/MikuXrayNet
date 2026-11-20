@@ -3,14 +3,20 @@ package net.mikumc.mikuxraynet.antixray;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider.ChunkLoadedCheck;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider.ColumnTopQuery;
 import net.mikumc.mikuxraynet.antixray.NeighborChunkProvider.OcclusionQuery;
@@ -398,5 +404,103 @@ class NeighborChunkProviderTest {
         NeighborChunkProvider.capturePlane(0, HEIGHT, NeighborEdges.Side.Z_PLUS, 4, 7, onX, UNBOUNDED);
     assertEquals(1, NeighborEdges.isOccludingAt(xPlane, 0 << 4 | 0) ? 1 : 0, "Z 侧 local=0 → x 偶");
     assertEquals(0, NeighborEdges.isOccludingAt(xPlane, 0 << 4 | 1) ? 1 : 0, "Z 侧 local=1 → x 奇");
+  }
+
+  /**
+   * <b>生产逐格路径守门</b>：真实抓取（{@code captureSideFromWorld} 里的匿名 {@link SideSnapshot}）必须只查
+   * 构造期建好的真值表，<b>不得</b>再逐格取方块名/归一化/查覆盖表——也<b>不得残留任何一次旧入口调用</b>：
+   * 留一条就足以把整格重新拖回「取名字 → 归一化 → 哈希查找」的开销（生产采样里名字归一化占 25.66s）。
+   *
+   * <p>离线没有 Bukkit 世界，这条路径取不到 {@code ChunkSnapshot}，无法做行为断言，因此退化为源码结构断言
+   * ——与本仓 {@code RegressionWiringGuardTest} 同一思路。断言前先剥注释，避免「说明文字里提到」被当成真实
+   * 调用；读文件时先把行尾归一化成 LF，避免 CRLF/LF 混用让切片失配。
+   */
+  @Test
+  void hotCellPathOnlyConsultsThePrecomputedTable() throws IOException {
+    String source = readSource("antixray/NeighborChunkProvider.java");
+    String code = stripComments(source);
+    String body = methodBody(source, "captureSideFromWorld");
+
+    assertNotNull(body, "captureSideFromWorld 必须存在（生产逐格抓取的唯一入口）");
+    body = stripComments(body);
+    assertTrue(body.contains(".camouflage("),
+        "逐格判定必须走预计算真值表（MaterialTable#camouflage）");
+    assertTrue(body.contains("getBlockData("),
+        "必须读快照的逐状态 BlockData：Material 级无法区分单/双台阶");
+    assertFalse(body.contains(".name()"), "逐格不得再取方块名（那是归一化的前置开销）");
+    assertFalse(body.contains("normalize("), "逐格不得再做名字归一化");
+    assertFalse(body.contains("camouflageOccluding"), "旧的逐格字符串入口不得残留在热路径里");
+    assertFalse(code.contains("camouflageOccluding"),
+        "整个类都不得再引用旧入口：任何一条分支留着它就等于绕开真值表");
+    assertTrue(code.contains("MaterialTable.build("),
+        "真值表必须在构造期（规则重建点）一次性建立");
+  }
+
+  /**
+   * 生产构造（带非空覆盖表）走的就是建表路径：离线也必须建得出表——真值表只能由 {@code Material} 名与覆盖表
+   * 算出；一旦退回 {@code Material#isOccluding()} 这类需要服务端注册表的取真值方式，本用例会直接抛错。
+   */
+  @Test
+  void productionConstructorBuildsTableWithoutServerRegistry() {
+    NeighborChunkProvider provider = new NeighborChunkProvider(8,
+        Set.of("minecraft:BARRIER", "oak_slab"), Set.of("stone"));
+
+    NeighborEdges edges = provider.capture("world", 0, HEIGHT, 4, 7,
+        (chunkX, chunkZ) -> true, QUERY, UNBOUNDED);
+
+    assertTrue(edges.has(Side.X_MINUS), "建表不影响抓取流程");
+    assertEquals(1, edges.occluding(Side.X_MINUS, 25, 3), "邻块 y=25 遮挡（注入的判定照旧生效）");
+    assertEquals(0, edges.occluding(Side.X_MINUS, 5, 3));
+  }
+
+  /** 读源码（行尾归一化成 LF）：相对 {@code src/main/java/net/mikumc/mikuxraynet}。 */
+  private static String readSource(String relativePath) throws IOException {
+    return Files.readString(Path.of("src/main/java/net/mikumc/mikuxraynet").resolve(relativePath))
+        .replace("\r\n", "\n");
+  }
+
+  /** 丢掉行注释与块注释行，避免「注释里提到过」被当成真实调用。 */
+  private static String stripComments(String text) {
+    StringBuilder builder = new StringBuilder(text.length());
+    for (String line : text.split("\n", -1)) {
+      String trimmed = line.trim();
+      if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) {
+        builder.append('\n');
+        continue;
+      }
+      builder.append(line).append('\n');
+    }
+    return builder.toString();
+  }
+
+  /** 取方法体（含花括号配对）；未找到返回 {@code null}。 */
+  private static String methodBody(String source, String name) {
+    Matcher matcher = Pattern.compile("long\\[\\]\\s+" + Pattern.quote(name) + "\\s*\\(")
+        .matcher(source);
+    if (!matcher.find()) {
+      return null;
+    }
+    return blockAt(source, matcher.start());
+  }
+
+  /** 从 {@code fromIndex} 之后第一个左花括号开始，返回到配对右花括号为止的片段。 */
+  private static String blockAt(String text, int fromIndex) {
+    int brace = text.indexOf('{', fromIndex);
+    if (brace < 0) {
+      return "";
+    }
+    int depth = 0;
+    for (int i = brace; i < text.length(); i++) {
+      char character = text.charAt(i);
+      if (character == '{') {
+        depth++;
+      } else if (character == '}') {
+        depth--;
+        if (depth == 0) {
+          return text.substring(brace, i + 1);
+        }
+      }
+    }
+    return text.substring(brace);
   }
 }

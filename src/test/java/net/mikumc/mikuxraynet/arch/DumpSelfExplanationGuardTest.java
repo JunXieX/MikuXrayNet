@@ -134,8 +134,8 @@ class DumpSelfExplanationGuardTest {
     // 纯函数里，因此守门改为：flushInternal 必须调用该纯函数，且不得再自己拼世界比较去决定丢弃。
     String body = methodBody(source("bandwidth/BlockChangeMerger.java"), "private boolean flushInternal(");
     assertTrue(body.length() > 200, "flushInternal 必须仍存在");
-    assertTrue(body.contains("shouldDiscardAtFlush("),
-        "冲刷前的丢弃判定必须落在唯一的纯函数里（shouldDiscardAtFlush）");
+    assertTrue(body.contains("FlushWorld.classify("),
+        "冲刷前的丢弃判定必须落在唯一的判定表里（FlushWorld.classify）");
     assertTrue(!body.contains("worldChanged = !"), "丢弃判定不得再在方法体内就地拼表达式");
   }
 
@@ -160,11 +160,11 @@ class DumpSelfExplanationGuardTest {
     String merger = source("bandwidth/BlockChangeMerger.java");
     String body = methodBody(merger, "private boolean flushInternal(");
     assertTrue(body.length() > 200, "flushInternal 必须仍存在且能取到方法体");
-    assertTrue(body.contains("shouldDiscardAtFlush("),
-        "冲刷守卫必须走 shouldDiscardAtFlush：位置快照会冻结（Folia 实体调度器随切维退役且不保证回调），"
+    assertTrue(body.contains("FlushWorld.classify("),
+        "冲刷守卫必须走 FlushWorld.classify：单侧快照会冻结（Folia 实体调度器随切维退役且不保证回调），"
             + "拿它当「玩家已换世界」的证据会整批丢掉在途更新（实测 69.5 万包）");
-    assertTrue(body.contains("PlayerWorldIndex.worldName"),
-        "守卫必须读世界索引这条与打标同源的证据，不能只看快照");
+    assertTrue(body.contains("PlayerWorldIndex.context("),
+        "守卫必须读世界索引上下文（与入缓冲固定同源），不能只看快照");
   }
 
   @Test
@@ -174,9 +174,12 @@ class DumpSelfExplanationGuardTest {
     assertTrue(changedBody.length() > 100, "切维处理器必须存在");
     assertTrue(changedBody.contains("schedulePositionRefresh("),
         "切维后必须重排位置刷新任务：实体调度器任务会随实体移出旧 world 退役，不重排则快照永久冻结");
-    String respawnBody = methodBody(merger, "public void onRespawn(");
-    assertTrue(respawnBody.length() > 40, "必须处理重生：Folia 上重生会重建实体，调度器任务同样退役");
-    assertTrue(respawnBody.contains("schedulePositionRefresh("), "重生后同样要重排刷新任务");
+    String respawnBody = methodBody(merger, "public void onPostRespawn(");
+    assertTrue(respawnBody.length() > 40,
+        "必须处理复活完成：Folia 上重生会重建实体，调度器任务同样退役");
+    assertTrue(respawnBody.contains("schedulePositionRefresh("), "复活完成后同样要重排刷新任务");
+    assertTrue(merger.contains("PlayerPostRespawnEvent"),
+        "复活重排必须挂 PlayerPostRespawnEvent：PlayerRespawnEvent 时玩家尚未落到复活点，登记会随旧实体退役");
   }
 
   @Test

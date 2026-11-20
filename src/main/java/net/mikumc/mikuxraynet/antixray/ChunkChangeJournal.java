@@ -177,6 +177,17 @@ public final class ChunkChangeJournal {
     }
   }
 
+  /**
+   * 该 ticket 是否还有未补发的格子（只用于「覆盖丢失」归因，不参与任何放行判定）。
+   *
+   * <p>调用点都在「确认已到、但这一列已经补不出去」的少数路径上，锁内只有一次布尔读，不进逐格循环。
+   */
+  boolean hasPending(Ticket ticket) {
+    synchronized (ticket.receiver) {
+      return hasDirty(ticket);
+    }
+  }
+
   boolean isCurrent(UUID player, Ticket ticket) {
     Receiver receiver = ticket.receiver;
     synchronized (receiver) {

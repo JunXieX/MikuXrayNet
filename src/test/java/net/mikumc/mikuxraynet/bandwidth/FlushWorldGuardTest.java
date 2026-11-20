@@ -16,11 +16,13 @@ import org.junit.jupiter.api.Test;
  * 而同期 {@code PlayerChangedWorldEvent} 计数为 0。逐条处置环写得很清楚：
  * 「缓冲世界 minecraft_lobby ≠ 当前世界 world」。也就是说没有任何玩家真的切维，却有几十万批被判成跨世界丢弃。
  *
- * <p><b>根因</b>：守卫拿<b>位置快照</b>当证据。快照由 Folia 实体调度器的每 tick 任务维护，而该任务会随实体
- * 被移出旧 world（切维 / 重生）退役、且退役不保证回调清理入口 —— 快照冻结在切换前那一刻，世界名与坐标都
+ * <p><b>候选根因</b>：守卫拿<b>位置快照</b>当证据。快照由 Folia 实体调度器的每 tick 任务维护，而该任务会随实体
+ * 被移出旧 world（切维 / 重生）退役、且退役不保证回调清理入口 —— 快照可能冻结在切换前那一刻，世界名与坐标都
  * 看起来正常。于是每一批在途变更都被判成「玩家已换世界」而整批丢掉，玩家侧表现就是假方块挖不掉、右键才消失。
+ * （1.34.13 的新 dump 只证明两源冲突，未证明这种写法持续发生；见 {@code BlockChangeMergerSessionTest}。）
  *
- * <p><b>结论</b>：只认世界索引（与打标同源、随事件前进）。索引未变时，快照说什么都不许丢。
+ * <p><b>结论</b>：任何<b>单侧</b>证据都不许成为丢弃依据。冲刷入口现在走
+ * {@link BlockChangeMerger.FlushWorld#classify}：索引换代 + 活快照同世界 + 与固定世界不同，三条齐了才丢。
  */
 class FlushWorldGuardTest {
 
@@ -91,13 +93,14 @@ class FlushWorldGuardTest {
     String merger = source("bandwidth/BlockChangeMerger.java");
     String body = methodBody(merger, "private boolean flushInternal(");
     String lock = synchronizedBlock(body);
-    assertTrue(lock.contains("shouldDiscardAtFlush("),
+    assertTrue(lock.contains("FlushWorld.classify("),
         "丢弃判定必须仍在封存时点的锁内执行：锁外重算会让「封存了哪一批」与「此刻世界」错位");
-    assertTrue(lock.contains("PlayerWorldIndex.worldName("),
-        "世界索引必须在锁内读取（与入缓冲打标同源），锁外不得成为判定依据");
+    assertTrue(lock.contains("PlayerWorldIndex.context("),
+        "世界索引上下文必须在锁内读取（与入缓冲固定同源），锁外不得成为判定依据");
     assertTrue(lock.contains("positions.isStale("), "快照心跳判定同样必须在锁内取一次");
-    assertEquals(1, countOf(body, "PlayerWorldIndex.worldName("),
+    assertEquals(1, countOf(body, "PlayerWorldIndex.context("),
         "同一次冲刷只能读一次世界索引：两次读会让判定与留痕来自不同时刻");
+    assertEquals(1, countOf(body, "FlushWorld.classify("), "同一次冲刷只能判定一次");
     assertEquals(1, countOf(body, "drainClusters("), "同一次冲刷只能聚簇一次");
   }
 

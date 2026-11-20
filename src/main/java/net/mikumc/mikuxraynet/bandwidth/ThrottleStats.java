@@ -86,13 +86,52 @@ public final class ThrottleStats {
   public final LongAdder sendFailed = new LongAdder();
 
   /**
-   * 「位置快照与世界索引互相矛盾」的次数：冲刷前发现快照说换了世界、索引说没换。
+   * 冲刷时「位置快照与世界索引互相矛盾」的批次数：两份来源都活着（快照心跳新鲜）却给出不同世界。
    *
-   * <p><b>为什么必须单列</b>：矛盾本身不丢更新（照常交付），但它说明<b>位置刷新任务已经停了</b>——
-   * 快照冻结在切维/重生那一刻，此后近身判定把所有变更判成「远」。这一条是那个故障的唯一早期信号：
-   * 有它就该查任务为何没重排，而不是等玩家反馈「假方块挖不掉」。正常运营恒为 0。
+   * <p><b>为什么必须单列</b>：矛盾本身不丢更新（按「不丢」照常交付、并<b>保留</b>快照），但它说明
+   * 有一份世界归属已经错了：要么刷新任务跑在已移出旧 world 的实体上（心跳新鲜、世界陈旧），要么索引
+   * 漏接/错序了切维事件。正常运营应趋近 0——入口的一致闸会把冲突包改为即时放行（见
+   * {@link #worldConflict}），而拥有线程的每 tick 对账会把索引修正回来。
    */
   public final LongAdder snapshotResync = new LongAdder();
+
+  /**
+   * 入口「世界归属未知」的原包数：世界索引或位置快照缺失/心跳过期，无法证明这批坐标属于哪个世界。
+   *
+   * <p>一律原包<b>即时放行</b>（不进合并窗口）。与 {@link #worldConflict} 分开统计是因为两者排查方向
+   * 完全不同：未知通常是一两个 tick 的登录/切维过渡（自愈），冲突则说明两份来源长期不一致。
+   */
+  public final LongAdder worldUnknown = new LongAdder();
+
+  /**
+   * 入口「两源冲突」的原包数：索引与活快照对同一玩家给出不同世界。
+   *
+   * <p>一律原包<b>即时放行</b>：绝不按任何一侧的旧世界名入缓冲，也就不会把两个世界的坐标混进同一批
+   * 合并包。持续增长说明位置刷新跑在非拥有线程上（旧实体）或索引漏接切维事件。
+   */
+  public final LongAdder worldConflict = new LongAdder();
+
+  /** 冲刷时「世界未知」的批次数：缓冲已取消，按「不丢」处理（照常交付），绝不据此丢弃。 */
+  public final LongAdder flushUnknown = new LongAdder();
+
+  /**
+   * 冲刷时「待发缓冲属于上一个连接 / 上一个世界代次」的包数：不投递给新连接。
+   *
+   * <p><b>为什么不能投递</b>：同名世界重连时世界名完全一样，只有世界代次（会话）能区分两代连接；
+   * 把上一代缓冲发给新连接就是「同世界不同连接串包」。新连接会重新收到区块，丢弃不构成丢更新。
+   *
+   * <p><b>口径</b>：这些包同时计入 {@link #blockChangesMerged}（与「玩家已离线」同一口径），
+   * 于是「取消 = 合并 + 丢弃 + 放行」这条对账关系仍然成立；本计数只回答其中「因连接换代而未投递」的部分。
+   */
+  public final LongAdder pendingOldSession = new LongAdder();
+
+  /**
+   * 位置刷新顺带修正世界索引的次数（事件遗漏 / 错序 / 迟到）。
+   *
+   * <p>正常运营恒为 0；持续增长说明索引的发布路径（{@code PlayerJoinEvent} / {@code PlayerChangedWorldEvent}）
+   * 有缺口——此时靠每 tick 对账兜住，但应当去查发布侧为何漏。
+   */
+  public final LongAdder indexRepaired = new LongAdder();
 
   /**
    * 丢弃来源（{@link #blockChangesDiscarded} 的拆分）。

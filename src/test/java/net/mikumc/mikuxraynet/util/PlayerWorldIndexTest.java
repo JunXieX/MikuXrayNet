@@ -233,6 +233,124 @@ class PlayerWorldIndexTest {
     assertNull(PlayerWorldIndex.context(UUID.randomUUID()));
   }
 
+  // ------------------------------------------------------------------ 拥有线程对账（reconcile）
+
+  /**
+   * 对账是「事件遗漏 / 错序」的兜底：拥有线程每 tick 用同一次 {@code player.getWorld()} 与表里比对，
+   * 只在身份不同或上下文缺失时发布一次。
+   *
+   * <p>生产 1.34.13 dump 的「快照重同步 1234102 / 冲刷 2428522」只证明两份来源长期不一致；可能的方向
+   * 之一是索引停在上一个世界（事件漏接/错序）。这里的对账就是那个方向的修复，且<b>不</b>依赖事件。
+   */
+  @Test
+  void reconcilePublishesWhenContextIsMissing() {
+    UUID player = UUID.randomUUID();
+    World world = worldProxy(OVERWORLD, -64, 320);
+
+    assertTrue(index.reconcileOwned(player, world), "上下文缺失时必须补发布");
+    PlayerWorldIndex.WorldContext stored = index.contextOf(player);
+    assertNotNull(stored);
+    assertEquals(OVERWORLD, stored.worldName());
+    assertSame(world, stored.world(), "必须复用拥有线程读到的同一个 World 实例");
+    assertEquals(24, stored.sectionCount());
+    assertTrue(stored.session() > 0L);
+  }
+
+  @Test
+  void reconcileKeepsIdentityWhenWorldIsUnchanged() {
+    UUID player = UUID.randomUUID();
+    World world = worldProxy(OVERWORLD, -64, 320);
+    index.reconcileOwned(player, world);
+    PlayerWorldIndex.WorldContext first = index.contextOf(player);
+
+    // 每 tick 都会走到这里：世界身份一致时必须零分配、零写入、不换代次（否则在途区块改写会被当成跨会话）
+    assertFalse(index.reconcileOwned(player, world), "同一世界身份不得重复发布");
+    assertSame(first, index.contextOf(player), "必须复用同一个不可变实例");
+  }
+
+  @Test
+  void reconcileReplacesStaleWorldWithFreshSession() {
+    UUID player = UUID.randomUUID();
+    // 表里停在上一个世界（事件漏接/错序的形态）
+    index.publish(player, context("minecraft_lobby", World.Environment.NORMAL, 0, 16));
+    long staleSession = index.contextOf(player).session();
+
+    World world = worldProxy(OVERWORLD, -64, 320);
+    assertTrue(index.reconcileOwned(player, world), "实况世界与表里不同 → 必须发布修正");
+    PlayerWorldIndex.WorldContext fixed = index.contextOf(player);
+    assertEquals(OVERWORLD, fixed.worldName());
+    assertTrue(fixed.session() > staleSession, "修正必须换代次：在途旧世界数据据此判为跨代");
+  }
+
+  @Test
+  void reconcileIgnoresIncompleteInput() {
+    assertFalse(index.reconcileOwned(null, worldProxy(OVERWORLD, -64, 320)));
+    assertFalse(index.reconcileOwned(UUID.randomUUID(), null));
+    assertEquals(0, index.size());
+  }
+
+  @Test
+  void staticReconcileIsInertWithoutInstalledInstance() {
+    // 未安装实例（离线单测）：静态门面必须直接返回 false，既不抛异常也不触达实体
+    UUID player = UUID.randomUUID();
+    assertFalse(PlayerWorldIndex.reconcile(playerProxy(player), worldProxy(OVERWORLD, -64, 320)));
+  }
+
+  /** 世界动态代理桩：只提供对账与上下文构造需要的四个方法。 */
+  private static World worldProxy(String name, int minHeight, int maxHeight) {
+    return (World) java.lang.reflect.Proxy.newProxyInstance(World.class.getClassLoader(),
+        new Class<?>[] {World.class}, (proxy, method, args) -> switch (method.getName()) {
+          case "getName" -> name;
+          case "getMinHeight" -> minHeight;
+          case "getMaxHeight" -> maxHeight;
+          case "getEnvironment" -> World.Environment.NORMAL;
+          case "toString" -> "WorldStub(" + name + ")";
+          case "hashCode" -> System.identityHashCode(proxy);
+          case "equals" -> proxy == args[0];
+          default -> defaultValue(method.getReturnType());
+        });
+  }
+
+  private static org.bukkit.entity.Player playerProxy(UUID playerId) {
+    return (org.bukkit.entity.Player) java.lang.reflect.Proxy.newProxyInstance(
+        org.bukkit.entity.Player.class.getClassLoader(),
+        new Class<?>[] {org.bukkit.entity.Player.class}, (proxy, method, args) -> switch (method.getName()) {
+          case "getUniqueId" -> playerId;
+          case "toString" -> "PlayerStub";
+          case "hashCode" -> System.identityHashCode(proxy);
+          case "equals" -> proxy == args[0];
+          default -> defaultValue(method.getReturnType());
+        });
+  }
+
+  private static Object defaultValue(Class<?> type) {
+    if (!type.isPrimitive()) {
+      return null;
+    }
+    if (type == boolean.class) {
+      return false;
+    }
+    if (type == char.class) {
+      return (char) 0;
+    }
+    if (type == byte.class) {
+      return (byte) 0;
+    }
+    if (type == short.class) {
+      return (short) 0;
+    }
+    if (type == int.class) {
+      return 0;
+    }
+    if (type == long.class) {
+      return 0L;
+    }
+    if (type == float.class) {
+      return 0F;
+    }
+    return 0D;
+  }
+
   /** 构造一份离线上下文：{@code world} 传 null（仅影响邻块抓取，不影响维度与高度）。 */
   private static PlayerWorldIndex.WorldContext context(String worldName, World.Environment environment,
       int minHeight, int sectionCount) {

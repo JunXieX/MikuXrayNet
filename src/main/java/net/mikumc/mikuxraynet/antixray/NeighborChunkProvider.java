@@ -6,7 +6,6 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
 import net.mikumc.mikuxraynet.bootstrap.BukkitOcclusion;
-import net.mikumc.mikuxraynet.registry.OcclusionRules;
 import org.bukkit.ChunkSnapshot;
 import org.bukkit.World;
 
@@ -23,8 +22,9 @@ import org.bukkit.World;
  *
  * <p><b>一次抓取、稳定读取</b>：生产路径先用 {@code Chunk#getChunkSnapshot(true,false,false)} 把每个邻块
  * 抓成一份快照（一次复制该区块的方块数据与高度图），随后所有逐格读取都走快照的区块内数组查询——
- * 不再经世界→区块解析（遮挡判定经统一入口 {@code BukkitOcclusion#camouflageOccluding}，取逐状态真值并套用
- * {@code occlusion.extra-*} 覆盖）。快照只在本
+ * 不再经世界→区块解析（遮挡判定查构造期按 {@code Material} 预计算的真值表，见
+ * {@link BukkitOcclusion.MaterialTable}：逐格取该状态的逐状态真值并套用 {@code occlusion.extra-*} 覆盖，
+ * 但不做名字归一化、不查覆盖表哈希）。快照只在本
  * 方法内短暂存活，不进入缓存，抓取逻辑仍可离线构造桩验证（见 {@link SideSnapshot}）。
  *
  * <p><b>按列高度上界裁剪扫描</b>：每列先问一次该列的「最高非空气方块」Y（生产实现直接读快照自带
@@ -109,14 +109,18 @@ public final class NeighborChunkProvider {
   private final long cacheTtlNanos;
   private final LongSupplier nanoClock;
   /**
-   * 伪装口径的用户覆盖表（{@code occlusion.extra-occluding} / {@code extra-non-occluding}，已归一化）。
+   * 伪装口径的预计算真值表（构造期由 {@code occlusion.extra-*} 经
+   * {@link BukkitOcclusion.MaterialTable#build} 一次建好，之后只读）。
    *
    * <p><b>为什么边界邻块也要用它</b>：邻块贴边位的遮挡判定必须与 {@code ObfuscationProcessor} 内部经
    * {@link net.mikumc.mikuxraynet.registry.BlockStateRegistry#isOccluding} 的伪装判定<b>同源</b>——否则
    * 覆盖表（如把某个方块名声明为遮挡）只作用于区块内部，边界那一圈会得出相反结论而泄漏。
+   *
+   * <p><b>为什么是表而不是逐格查规则</b>：{@code mode=enclosed} 下每个区块要读四条贴边层（真实地形常有上千格），
+   * 逐格调规则意味着每格一次名字归一化（{@code trim()/toLowerCase()/去命名空间}各新建字符串）与两次覆盖表
+   * 哈希查找。表把这些代价提到构造期，逐格只剩「取 Material + 读该状态真值 + 数组下标」。
    */
-  private final Set<String> extraOccluding;
-  private final Set<String> extraNonOccluding;
+  private final BukkitOcclusion.MaterialTable materialTable;
 
   /** 主存储：读取完全无锁。 */
   private final ConcurrentHashMap<ChunkKey, CacheEntry> entries = new ConcurrentHashMap<>();
@@ -169,8 +173,8 @@ public final class NeighborChunkProvider {
    */
   public NeighborChunkProvider(int cacheMaximumSize, Collection<String> extraOccluding,
       Collection<String> extraNonOccluding) {
-    this(cacheMaximumSize, DEFAULT_CACHE_TTL_MILLIS, System::nanoTime,
-        OcclusionRules.normalizeAll(extraOccluding), OcclusionRules.normalizeAll(extraNonOccluding));
+    this(cacheMaximumSize, DEFAULT_CACHE_TTL_MILLIS, System::nanoTime, extraOccluding,
+        extraNonOccluding);
   }
 
   /** 测试专用：额外注入时间源，便于离线验证过期语义（无需真实等待）。 */
@@ -179,12 +183,13 @@ public final class NeighborChunkProvider {
   }
 
   private NeighborChunkProvider(int cacheMaximumSize, long cacheTtlMillis, LongSupplier nanoClock,
-      Set<String> extraOccluding, Set<String> extraNonOccluding) {
+      Collection<String> extraOccluding, Collection<String> extraNonOccluding) {
     this.cacheMaximumSize = Math.max(1, cacheMaximumSize);
     this.cacheTtlNanos = cacheTtlMillis <= 0 ? 0L : cacheTtlMillis * 1_000_000L;
     this.nanoClock = nanoClock;
-    this.extraOccluding = extraOccluding;
-    this.extraNonOccluding = extraNonOccluding;
+    // 规则在构造期（唯一的规则重建点）一次性折进真值表：运行期逐格只查表，不再归一化名字/查覆盖表。
+    // 与既有语义一致：occlusion.extra-* 改动需要重启（ReloadCoordinator 已把「遮挡规则表」列为需重启项）。
+    this.materialTable = BukkitOcclusion.MaterialTable.build(extraOccluding, extraNonOccluding);
   }
 
   /**
@@ -271,11 +276,15 @@ public final class NeighborChunkProvider {
    * 「同时最多一个 BlockData」相比更高，但换取的是读取次数的显著下降（抓取仅在 {@code mode=enclosed}
    * 世界发生，且有 30 秒 TTL 缓存兜底）。
    *
-   * <p><b>遮挡判定经统一入口 {@link BukkitOcclusion#camouflageOccluding}（伪装口径）</b>：取贴边方块的
-   * <b>逐状态真值</b>（{@code BlockData#isOccluding()} + 唯一的 barrier 例外），并套上
-   * {@code occlusion.extra-*} 覆盖表，与 {@code ObfuscationProcessor} 内部经
-   * {@code BlockStateRegistry#isOccluding} 的伪装判定<b>同源</b>。刻意不用 {@code Material#isOccluding()}：
-   * 它只是方块级默认状态的近似，无法区分同方块的不同状态（双台阶 vs 单台阶），会导致边界圈漏判。
+   * <p><b>遮挡判定查构造期建好的真值表（伪装口径）</b>：每格只把贴边方块的<b>逐状态真值</b>
+   * （{@code BlockData#isOccluding()}）作为表的第二维取结论——与 {@code ObfuscationProcessor} 内部经
+   * {@code BlockStateRegistry#isOccluding} 的伪装判定<b>同源</b>（同一规则函数、同一覆盖表，见
+   * {@code OcclusionRules#camouflageVerdict} 与 {@link BukkitOcclusion.MaterialTable}）。
+   *
+   * <p><b>逐格不做的事</b>：不取方块名、不做名字归一化（{@code trim()/toLowerCase()/去命名空间}各会新建
+   * 字符串）、不查覆盖表哈希——真实地形下贴边层每区块常有上千格，这些正是「名字归一化」开销的来源。
+   * 也刻意不用 {@code Material#isOccluding()}：它只是方块级默认状态的近似，无法区分同方块的不同状态
+   * （双台阶 vs 单台阶），会导致边界圈漏判。
    */
   private long[] captureSideFromWorld(World world, int baseY, int height, int chunkX, int chunkZ,
       NeighborEdges.Side side) {
@@ -294,6 +303,8 @@ public final class NeighborChunkProvider {
       // includeMaxBlockY=true 才能用快照自带高度图做「按列裁剪」（等价于旧 World#getHighestBlockYAt）
       ChunkSnapshot snapshot = world.getChunkAt(neighbor[0], neighbor[1])
           .getChunkSnapshot(true, false, false);
+      // 逐格热路径用的真值表先取到栈上：循环体里只读局部变量
+      BukkitOcclusion.MaterialTable table = this.materialTable;
       return captureSideFromSnapshot(baseY, height, side, chunkX, chunkZ, neighbor[0], neighbor[1],
           new SideSnapshot() {
             @Override
@@ -302,9 +313,8 @@ public final class NeighborChunkProvider {
               // 的 y 参数是<b>世界绝对 Y</b>（26.x 支持负值，如主世界 -64..319），因此这里必须加回 baseY：
               // 少了这一步会把相对 Y 当成绝对 Y 去读，主世界会整体错层 64 格（读到的是 y-64 那一层），
               // 邻块贴边的遮挡判定随之失真——正是「边界一圈漏伪装」或「多伪装」的来源。
-              return BukkitOcclusion.camouflageOccluding(
-                  snapshot.getBlockData(localX, localY + baseY, localZ),
-                  extraOccluding, extraNonOccluding);
+              // 逐格只做「取该状态的方块数据 → 查表」：名字归一化与覆盖表查找已在构造期完成
+              return table.camouflage(snapshot.getBlockData(localX, localY + baseY, localZ));
             }
 
             @Override

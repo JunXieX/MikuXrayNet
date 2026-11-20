@@ -158,10 +158,10 @@ class PacketThreadPurityTest {
     assertNotNull(observer, "未找到区块写出观察器（deliveryObserver）的 onPacketSending 方法体");
     int guard = observer.indexOf("alreadyObserved(");
     int ticket = observer.indexOf("changeJournal.open(");
-    int adapter = observer.indexOf("new ChunkDeliveryPostAdapter(");
+    int signal = observer.indexOf("new ChunkDeliverySignal(");
     assertTrue(guard >= 0, "观察器必须先用 alreadyObserved(...) 早退，否则二次同步观察会重复记账");
     assertTrue(ticket > guard, "早退判定必须早于 changeJournal.open(...)，否则等于没早退");
-    assertTrue(adapter > ticket, "adapter 必须在开 ticket 之后创建，并携带同一份世界快照");
+    assertTrue(signal > ticket, "交付信号必须在开 ticket 之后挂上，并携带同一份世界快照");
   }
 
   private static void strict(String file, String... methods) {

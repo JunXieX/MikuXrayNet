@@ -36,8 +36,10 @@ class DiagnosticsTest {
   private static Diagnostics.Snapshot fixed(BandwidthConfig bandwidth) {
     return new Diagnostics.Snapshot(
         new Diagnostics.Snapshot.Env(true, true, false, true, 1, "Paper 1.20.4", "25", "1.2.5"),
-        new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 30L, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
-            0L, 0L, 0L, "无采样"),
+        // 28 参完整构造：内容已变与「补发放弃」都带子项（子项与总数一致时面板才展开明细）
+        new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 0L, 30L, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
+            0L, 0L, 0L, "无采样", 0L, 0L, 0L, 0L, 9L,
+            28L, 2L, 1200L, 1L, 5L, 2L, 1L),
         new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 1L, 40L, 6L, 11L, 2_200_000L, 900_000L, 1L, 2L,
             // 窗口覆盖 / 预筛丢弃：dump 与运行摘要都必须渲染（覆盖度是「看得见的矿排不进窗口」的唯一读数）
             55L, 9_000L, 12L, 0L, 64L, 7L, 2L, 3L, 5L, 9L),
@@ -50,7 +52,7 @@ class DiagnosticsTest {
             6L, 5L, 4, 40L, 7L, 3L, 11L, 2L,
             2, 3L, 8L, 9L, 4L, 5L, 25_000_000L),
         new Diagnostics.Snapshot.Pool(4, 2, 10, 2048),
-        new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2, 4L, 3L, 5L, 6L, 1L, 0L, 0L),
+        new Diagnostics.Snapshot.DiskCache(30L, 10L, 12, 2, 4L, 3L, 5L, 6L, 1L, 0L, 0L, 4L, 1L),
         Diagnostics.Snapshot.ChunkAccessor.EMPTY,
         null, bandwidth);
   }
@@ -213,10 +215,11 @@ class DiagnosticsTest {
   @Test
   void statusEchoesNewlyObservableSilentPathsAndDumpEchoesCacheByteCap() {
     Diagnostics.Snapshot base = fixed();
+    // 子项与总数自洽（28 + 2 = 内容已变 30；0 + 1 = 补发放弃 1）：面板才展开明细
     Diagnostics.Snapshot.Rewrite rewrite = new Diagnostics.Snapshot.Rewrite(
         90L, 10L, 42, 4096L, 30L, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
         0L, 0L, 0L, "无采样",
-        3L, 7L, 11L, 23L, 1L);
+        3L, 7L, 11L, 23L, 1L, 28L, 2L, 40L, 0L, 1L, 0L, 0L);
     Diagnostics.Snapshot withCounters = new Diagnostics.Snapshot(base.env(), rewrite,
         base.proximity(), base.index(), base.occlusion(), base.throttle(), base.pool(),
         base.diskCache(), base.chunkAccessor(), base.antiXray(), base.bandwidth());
@@ -257,8 +260,9 @@ class DiagnosticsTest {
     assertTrue(text.contains("命中率 90.0%"), text);
     // 内存缓存分列：命中但内容指纹已变的那些其实等于未命中，必须单列并与磁盘查询数对账
     // （夹具自洽：磁盘查询 40 = 内存未命中 10 + 内容已变 30 = 磁盘 命中 30 + 未命中 10）
-    assertTrue(text.contains("命中 90（有效 60，内容已变 30）"),
-        "改写缓存必须分列「键命中」与「有效命中」（内容指纹一致），否则命中率虚高：" + text);
+    assertTrue(text.contains("命中 90（有效 60，内容已变 30：源字节已变 28 / 缺位图 2）"),
+        "改写缓存必须分列「键命中」与「有效命中」，并把「内容已变」拆成「源字节已变」与「缺位图」"
+            + "（后者是遮挡建表回归：该区块会一直藏住矿）：" + text);
     assertTrue(text.contains("有效命中率 60.0%"),
         "有效命中率 = 有效命中 / (有效命中 + 未命中 + 内容已变)：" + text);
     assertTrue(text.contains("磁盘查询 40"),
@@ -297,7 +301,8 @@ class DiagnosticsTest {
     assertTrue(text.contains("有效命中率 62.5%"),
         "有效命中率 = (hits − 负载被拒) / (hits − 负载被拒 + misses + 负载被拒) =" + text);
     // 「命中率为什么异常」的自证口径：过期清理 / 配置指纹清理 / 负载被拒 / 写入被拒 / 积压被拒 / 异常必须可见
-    assertTrue(text.contains("过期清理 4，配置指纹不符清理 3，负载被拒 5，写入被拒 7，积压被拒 0，异常 0"),
+    assertTrue(text.contains("过期清理 4，配置指纹不符清理 3，负载被拒 5（源指纹不一致 4 / 信封/数据故障 1），"
+        + "写入被拒 7，积压被拒 0，异常 0"),
         "磁盘缓存必须分列过期清理、配置指纹不符清理、负载被拒、写入被拒、积压被拒与异常，"
             + "否则「命中率异常」无法自证（尤其配置指纹清理：升级后命中率骤降的头号成因，此前完全不可见）：" + text);
     assertTrue(text.contains("==== MikuXrayNet 运行状态（v1.2.5） ===="),
@@ -331,6 +336,115 @@ class DiagnosticsTest {
     assertTrue(text.contains("AFK 玩家 2"), text);
     assertTrue(text.contains("线程池"), text);
     assertTrue(text.contains("队列 10/2048"), text);
+  }
+
+  /**
+   * 三处「合计」都必须拆开渲染：内容已变（源字节已变 / 缺位图）、负载被拒（源指纹不一致 / 信封故障）、
+   * 补发放弃（四类）+ 写出确认。
+   *
+   * <p>为什么不能只显示合计：每一组里「正常失效」与「真故障」混在同一个数里，运维只会得到
+   * 「有问题但不知道是什么」。
+   *
+   * <p>子项与总数对不上时（离线兼容构造恒为 0；生产上聚合与子项是分别 {@code sum()} 的，
+   * {@code LongAdder} 不保证线性一致快照，热路径正在自增也会出现），文案只给中性结论
+   * 「子项与总数分别读取，无法原子比较」——把它写成「接线不完整」会让生产面板周期性误报。
+   */
+  @Test
+  void splitCountersAreRenderedAndMismatchStaysNeutral() {
+    String wired = String.join("\n", Diagnostics.formatStatus(fixed()));
+    assertTrue(wired.contains("内容已变 30：源字节已变 28 / 缺位图 2"),
+        "内容已变必须拆成「源字节已变」与「缺位图」：" + wired);
+    assertTrue(wired.contains("负载被拒 5（源指纹不一致 4 / 信封/数据故障 1）"),
+        "负载被拒必须拆成「源指纹不一致」与「信封/数据故障」：" + wired);
+    assertTrue(wired.contains(
+        "登记或补发未完成 9 次（写出确认 1200 次；观测缺失 1 / 淘汰 5 / 区域失败 2 / 覆盖丢失 1）"),
+        "补发放弃必须拆成四类，并与「写出确认」这条正面证据并列：" + wired);
+
+    // 只有聚合值的旧快照形态：必须给出中性说明（说明为什么没有明细），不能凭空显示 0/0
+    Diagnostics.Snapshot base = fixed();
+    Diagnostics.Snapshot.Rewrite aggregateOnly = new Diagnostics.Snapshot.Rewrite(
+        90L, 10L, 42, 30L, 100L, 331L, 5L, 2L, 1L, 2L, 0L, 0L, 0L, 0L, "无采样");
+    Diagnostics.Snapshot unwired = new Diagnostics.Snapshot(base.env(), aggregateOnly,
+        base.proximity(), base.index(), base.occlusion(), base.throttle(), base.pool(),
+        Diagnostics.Snapshot.DiskCache.EMPTY, base.chunkAccessor(), base.antiXray(),
+        base.bandwidth());
+    String unwiredText = String.join("\n", Diagnostics.formatStatus(unwired));
+    assertTrue(unwiredText.contains("内容已变 30：子项与总数分别读取，无法原子比较"), unwiredText);
+    assertFalse(unwiredText.contains("接线不完整"),
+        "子项对不上不等于接线故障：聚合与子项分别 sum()，生产上热路径自增也会出现这种差值：" + unwiredText);
+  }
+
+  /** 没发生过的事不占版面：分母与子项都为 0 时既不出明细，也不能冒出「无法原子比较」。 */
+  @Test
+  void splitCountersStaySilentWhenNothingHappened() {
+    String text = String.join("\n", Diagnostics.formatStatus(new Diagnostics.Snapshot(
+        fixed().env(), Diagnostics.Snapshot.Rewrite.EMPTY, Diagnostics.Snapshot.Proximity.EMPTY,
+        Diagnostics.Snapshot.Index.EMPTY, Diagnostics.Snapshot.Occlusion.EMPTY,
+        Diagnostics.Snapshot.Throttle.EMPTY, Diagnostics.Snapshot.Pool.EMPTY,
+        Diagnostics.Snapshot.DiskCache.EMPTY, Diagnostics.Snapshot.ChunkAccessor.EMPTY,
+        null, null)));
+    assertFalse(text.contains("无法原子比较"), text);
+    assertFalse(text.contains("源指纹不一致"), text);
+    assertFalse(text.contains("观测缺失"), text);
+  }
+
+  /**
+   * 世界归属的几类故障必须分列且各带自己的单位：入口未知 / 两源冲突是「原包」，冲刷未知是「批次」，
+   * 弃旧连接是「原包」，索引纠偏是「次数」。
+   *
+   * <p>为什么不能合成总数：四者量纲不同（原包 / 批次 / 次数），相加得到的数不对应任何真实对象，
+   * 而「到底丢没丢更新」恰恰靠这四者的关系判断——合并只会让判据消失。
+   */
+  @Test
+  void worldEvidenceCountersAreRenderedWithTheirOwnUnits() {
+    String text = String.join("\n", Diagnostics.formatStatus(withExtras(
+        new Diagnostics.Snapshot.Extras(0L, 0L, 0L, 0L, 0L, 0L, 0.3D, 0L, 0L, 0L, 0L,
+            37L, 12L, 5L, 2048L, 3L))));
+
+    assertTrue(text.contains("入口未知 37 原包 / 两源冲突 12 原包（均即时放行）"), text);
+    assertTrue(text.contains("冲刷未知 5 批次（证据不足，按不丢交付）"), text);
+    assertTrue(text.contains("弃旧连接原包 2048（同计入合并）"), text);
+    assertTrue(text.contains("索引纠偏 3 次（正常恒 0）"), text);
+    assertFalse(text.contains("合计"), "四类量纲不同，不得合成总数：" + text);
+    assertFalse(text.contains("总计"), text);
+  }
+
+  /**
+   * 全 0 与「旧快照兼容构造」都必须按 0 显示，绝不伪造：正常运营恒 0 本身就是信息，
+   * 而兼容构造缺这五项时也只能是 0，不能从别的计数推断。
+   */
+  @Test
+  void worldEvidenceCountersShowZerosAndNeverFabricate() {
+    String zeros = String.join("\n",
+        Diagnostics.formatStatus(withExtras(Diagnostics.Snapshot.Extras.EMPTY)));
+    assertTrue(zeros.contains("入口未知 0 原包 / 两源冲突 0 原包"), zeros);
+    assertTrue(zeros.contains("冲刷未知 0 批次"), zeros);
+    assertTrue(zeros.contains("弃旧连接原包 0"), zeros);
+    assertTrue(zeros.contains("索引纠偏 0 次"), zeros);
+    // 同一族的「快照重同步」旧名已不适用：语义是冲刷两源冲突（批次、按不丢交付），非重置快照
+    assertTrue(zeros.contains("快照重同步 0（冲刷两源冲突，按不丢交付；非重置快照）"), zeros);
+
+    // 11 参兼容构造（旧快照形态）：其它附加诊断有值，世界归属五项仍必须是 0
+    Diagnostics.Snapshot.Extras legacy = new Diagnostics.Snapshot.Extras(
+        1L, 2L, 3L, 4L, 5L, 6L, 7.5D, 8L, 9L, 10L, 11L);
+    assertEquals(0L, legacy.worldUnknown());
+    assertEquals(0L, legacy.worldConflict());
+    assertEquals(0L, legacy.flushUnknown());
+    assertEquals(0L, legacy.pendingOldSession());
+    assertEquals(0L, legacy.indexRepaired());
+    assertTrue(String.join("\n", Diagnostics.formatStatus(withExtras(legacy)))
+        .contains("入口未知 0 原包 / 两源冲突 0 原包"), "兼容构造不得被推断成非 0");
+  }
+
+  /** 只装附加诊断域的最小快照（状态面板其余各行取零值兜底）。 */
+  private static Diagnostics.Snapshot withExtras(Diagnostics.Snapshot.Extras extras) {
+    return new Diagnostics.Snapshot(
+        new Diagnostics.Snapshot.Env(true, true, false, true, 0, "Paper", "25", ""),
+        Diagnostics.Snapshot.Rewrite.EMPTY, Diagnostics.Snapshot.Proximity.EMPTY,
+        Diagnostics.Snapshot.Index.EMPTY, Diagnostics.Snapshot.Occlusion.EMPTY,
+        Diagnostics.Snapshot.Throttle.EMPTY, Diagnostics.Snapshot.Pool.EMPTY,
+        Diagnostics.Snapshot.DiskCache.EMPTY, Diagnostics.Snapshot.ChunkAccessor.EMPTY,
+        null, extras, null);
   }
 
   @Test

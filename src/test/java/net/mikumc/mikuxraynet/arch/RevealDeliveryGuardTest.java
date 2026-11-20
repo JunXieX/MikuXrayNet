@@ -69,17 +69,21 @@ class RevealDeliveryGuardTest {
     assertFalse(release.contains("getScheduler("));
     String observer = methodBody(source, "registerDeliveryObserver");
     assertNotNull(observer, "registerDeliveryObserver 必须存在");
-    assertTrue(observer.contains("addPostListener("));
-    // 写出回调已迁到随包快照适配器：观察器只负责把它挂上 marker（并携带世界快照），
-    // 因此这里断言的是「注册了 ChunkDeliveryPostAdapter」，而不是旧版写死在观察器体内的 onChunkWritten 调用。
-    assertTrue(observer.contains("new ChunkDeliveryPostAdapter("),
-        "观察器必须通过 addPostListener 注册携带随包世界快照的 ChunkDeliveryPostAdapter，"
-            + "否则异步回调拿不到可靠的世界上下文（只能整批放行原包）");
-    // 独立核「写出后回调确实接到区块交付逻辑」：适配器的 onPostEvent 必须转调 onChunkWritten，
+    // 交付确认必须挂在 scheduled 包上：ProtocolLib 的异步放行路径只派发 scheduled 包，post listener 因
+    // NetworkProcessor#invokePostEvent 的 event != null 前提永远拿不到 event——用 post listener 判「已写出」
+    // 在真机上是恒不成立的（生产 replay 恒 0 即此），所以这条断言不能退回 addPostListener。
+    assertTrue(observer.contains("event.schedule("),
+        "交付确认必须通过 event.schedule(...) 挂在 scheduled 包上，否则异步放行路径永远收不到写出信号");
+    assertTrue(observer.contains("new ChunkDeliverySignal("),
+        "观察器必须挂携带随包世界快照的 ChunkDeliverySignal，否则异步回调拿不到可靠的世界上下文");
+    // 占位容器拿不到时只允许降级「补发」，不允许连上下文载体一起没有：
+    // 否则整服 MAP_CHUNK 会因取不到快照被即时放行（反矿透全线下线）。
+    assertTrue(observer.contains("addPostListener("),
+        "降级路径必须保留仅携世界快照的 ChunkContextCarrier，否则占位封包缺失会连带改写一起停摆");
+    assertTrue(observer.contains("new ChunkContextCarrier("));
+    // 独立核「写出确认确实接到区块交付逻辑」：一次性确认对象必须转调 onChunkWritten，
     // 且 onChunkWritten 必须真的走 journal.written（旧断言把这三段钉在同一个方法体里，重构后必须分开核）。
-    String postEvent = methodBody(source, "onPostEvent");
-    assertNotNull(postEvent, "ChunkDeliveryPostAdapter.onPostEvent 必须存在");
-    assertTrue(postEvent.contains("onChunkWritten("), "写出后回调必须转调 onChunkWritten");
+    assertTrue(observer.contains("onChunkWritten("), "交付确认必须转调 onChunkWritten");
     assertTrue(methodBody(source, "onChunkWritten").contains("changeJournal.written("));
   }
 

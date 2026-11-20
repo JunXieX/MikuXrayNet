@@ -80,9 +80,80 @@ public final class RewriteStats {
    */
   public final LongAdder cacheContentRejected = new LongAdder();
 
-  /** 已在区块出站后定向补发的方块数，以及补发放弃/登记失败次数。 */
+  /**
+   * {@link #cacheContentRejected} 的子项：键命中但<b>源字节指纹已变</b>（区块内容真的变了）。
+   *
+   * <p>属正常失效——该条目会被本次重写覆盖。与 {@link #cacheRejectedOcclusionMissing} 互斥，两者之和恒等于
+   * {@code cacheContentRejected} 的增量（同一次改写里由 {@code RewritePipeline} 的派生值给出，不重算）。
+   */
+  public final LongAdder cacheRejectedSourceChanged = new LongAdder();
+
+  /**
+   * {@link #cacheContentRejected} 的子项：键命中但<b>缺遮挡位图</b>、被迫按未命中重写。
+   *
+   * <p>健康状态下应≈0（只在升级到带位图负载的那一轮出现）；持续增长说明遮挡建表在这批区块上失败——
+   * 缺位图时显形侧按「缺数据 = 遮挡」判定，玩家挖到的矿会一直显示假方块。
+   */
+  public final LongAdder cacheRejectedOcclusionMissing = new LongAdder();
+
+  /** 已在区块出站后定向补发的方块数。 */
   public final LongAdder replayCells = new LongAdder();
+
+  /**
+   * 补发被放弃的<b>合计</b>次数 = {@link #replayUnobserved} + {@link #replayEvicted} +
+   * {@link #replayRegionFailures} + {@link #replayCoverageLost}。
+   *
+   * <p><b>为什么保留这个合计</b>：既有面板与 dump 读的就是它（{@code Diagnostics}），换名字会让线上口径
+   * 断档。四项互不重叠、每项都在「每个区块一次」的出口上自增，因此和恒等于本值；</p>
+   *
+   * <p><b>为什么必须拆开</b>：合计数无法回答「补发到底卡在哪」——观测缺失（信号没挂上）、淘汰（信号始终
+   * 没来）、区域失败（来了但补不出去）、覆盖丢失（来了但内容已被取代）四类的处置与修复方向完全不同，
+   * 混成一个数时只能看到「补发没发生」，看不出是谁的责任。</p>
+   */
   public final LongAdder replaySkipped = new LongAdder();
+
+  /**
+   * 写出确认<b>成功执行</b>的次数：该区块包的「已写出」回调确实到达，并进入补发判定。
+   *
+   * <p>它是「交付链路是通的」的唯一正面证据；与 {@link #replaySkipped} 不相交（本项是成功，不是放弃）。
+   * 注意确认的契约是「写出动作已递交到本连接的 Netty 管线」，<b>不是</b> ChannelPromise 成功、
+   * 更不是客户端 ACK（见 {@code ChunkDeliverySignal} 的类注释）。
+   */
+  public final LongAdder replayDelivered = new LongAdder();
+
+  /**
+   * 观测缺失：同步观察阶段没能把交付信号挂到封包上（登记抛出 / marker 异常）。
+   *
+   * <p>这类区块包照常写出（原包不受影响），但我们永远不会知道它何时写出，因此在途更新只能等过期。
+   * 持续增长说明观察链路本身在报错（看配对的一次性 WARN / 分类限流日志）。
+   */
+  public final LongAdder replayUnobserved = new LongAdder();
+
+  /**
+   * 淘汰：交付信号始终没有到达，ticket 被容量/超时淘汰（脏格随之释放、再也补不出去）。
+   *
+   * <p>典型成因是封包没被真正写出（连接已断、被上游取消、ProtocolLib 发送队列丢弃）——此时补发本就不该
+   * 发生，属正常收账；只有它在稳定运行时持续增长，才需要怀疑交付信号本身没被派发。
+   */
+  public final LongAdder replayEvicted = new LongAdder();
+
+  /**
+   * 区域失败：写出确认已到，但补发本身没做成——区域归属/区块已加载/已发送三项检查重试用尽、
+   * 区域调度器拒绝受理、补发执行抛异常。
+   *
+   * <p>与 {@link #replayEvicted} 的分界：这里确认通道是通的、只是没补出去（调度/线程侧问题），
+   * 而淘汰是确认通道根本没响（协议/连接侧问题）。
+   */
+  public final LongAdder replayRegionFailures = new LongAdder();
+
+  /**
+   * 覆盖丢失：写出确认已到，但该列的在途更新已不可能补出去——会话/世界已变（ticket 被新会话取代）、
+   * 或记录阶段脏段数超限被截断。
+   *
+   * <p>与 {@link #replayEvicted} 的分界：这里的确认是到的（我们知道包写出来了），丢的是内容；
+   * 前者丢的是「知道包写出来了」这件事本身。
+   */
+  public final LongAdder replayCoverageLost = new LongAdder();
 
   /**
    * 磁盘缓存「读到了负载但被拒」的次数：负载里的原始区块字节指纹与本次要改写的字节不符（或信封损坏）。
@@ -92,6 +163,23 @@ public final class RewriteStats {
    * 「命中率低」会被混在一起，无法定位到是<b>内容指纹</b>在拦还是<b>配置指纹</b>在拦。
    */
   public final LongAdder diskPayloadRejected = new LongAdder();
+
+  /**
+   * {@link #diskPayloadRejected} 的子项：负载记录的原始字节指纹与本次要改写的字节不符。
+   *
+   * <p>属<b>缓存内容已过期</b>的正常失效：照常重写并覆盖该条。与
+   * {@link #diskPayloadRejectedEnvelopeFault} 互斥，两者之和恒等于 {@code diskPayloadRejected} 的增量。
+   */
+  public final LongAdder diskPayloadRejectedSourceHash = new LongAdder();
+
+  /**
+   * {@link #diskPayloadRejected} 的子项：信封/数据故障（负载被截断、坐标个数非法、遮挡长度非法、
+   * 声明了坐标却没有区块字节、解析异常）。
+   *
+   * <p>与「内容过期」分开看才能算出真实的损坏率：它持续增长意味着磁盘缓存写入被截断或容器格式与代码
+   * 不一致，命中率会被这类条目白白吃掉。
+   */
+  public final LongAdder diskPayloadRejectedEnvelopeFault = new LongAdder();
 
   /**
    * 遮挡建表（{@code captureOcclusion}）失败次数：该区块的遮挡位图没有生成出来。
