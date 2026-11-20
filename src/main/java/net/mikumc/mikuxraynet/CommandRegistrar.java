@@ -8,6 +8,10 @@ import java.util.List;
 import java.util.logging.Level;
 import net.mikumc.mikuxraynet.command.MikuCommand;
 import net.mikumc.mikuxraynet.util.Constants;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerQuitEvent;
 
 /**
  * 管理命令注册器：把 {@code /mikuxraynet}（别名 {@code mxnet} / {@code mxr}）注册到服务端。
@@ -57,6 +61,9 @@ final class CommandRegistrar {
     // 成功日志也只能在真正 register 之后打，否则失败时会出现「先说已注册、再报失败」。
     try {
       MikuCommand executor = new MikuCommand(plugin);
+      // 停用 / 热重载时由插件层经这个钩子中断在途转储会话（会话与闸门都在命令层，见 MikuCommand#abortDump）
+      plugin.setDumpAbortHook(executor::abortDump);
+      registerDumpSessionListeners(executor);
       plugin.getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
         try {
           event.registrar().register(COMMAND_NAME, COMMAND_DESCRIPTION, COMMAND_ALIASES,
@@ -70,6 +77,33 @@ final class CommandRegistrar {
     } catch (Throwable throwable) {
       plugin.getLogger().log(Level.WARNING,
           "命令生命周期 API 不可用（/" + COMMAND_NAME + " 不可用）", throwable);
+    }
+  }
+
+  /**
+   * 转储会话的断线回收：发起者退出就连带作废在途会话并放闸门。
+   *
+   * <p><b>为什么挂在这里</b>：会话归命令层所有，注册点与命令同生命周期；放进插件主类会把「谁负责收尾」
+   * 拆到两个文件里。监听器只在启用时注册一次（热重载不重建命令），不存在重复注册。
+   *
+   * <p><b>为什么用 MONITOR</b>：其它插件取消退出事件的语义在本项目无意义（玩家已确定离开），这里也不改
+   * 任何事件状态，只是搭车做一次内存记账。
+   */
+  private void registerDumpSessionListeners(MikuCommand executor) {
+    try {
+      plugin.getServer().getPluginManager().registerEvents(new Listener() {
+        @EventHandler(priority = EventPriority.MONITOR)
+        public void onPlayerQuit(PlayerQuitEvent event) {
+          try {
+            executor.onSenderDisconnect(event.getPlayer());
+          } catch (Throwable throwable) {
+            // 回收失败只影响闸门（下次会话会被拒到超时为止），绝不能从事件分发器外抛
+            plugin.getLogger().log(Level.FINE, "注销转储会话失败（忽略）", throwable);
+          }
+        }
+      }, plugin);
+    } catch (Throwable throwable) {
+      plugin.getLogger().log(Level.WARNING, "注册断线回收监听失败（不影响命令本身）", throwable);
     }
   }
 

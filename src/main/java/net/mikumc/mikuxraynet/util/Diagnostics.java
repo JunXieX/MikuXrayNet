@@ -907,11 +907,76 @@ public final class Diagnostics {
     return samples.isEmpty() ? 0 : sum / (double) samples.size();
   }
 
-  /** 转储文本（采样段插在状态面板之后、运行环境之前）；运行环境段由调用方在主线程预先采集。 */
+  /**
+   * 转储文本（采样段插在状态面板之后；Spark 段与运行环境段依次跟在采样段之后）。
+   *
+   * <p><b>段序是纪律</b>：状态面板（此刻的累计值）→ 运行采样（窗口内的速率/峰值）→ Spark 采样
+   * （同一窗口的性能记录链接）→ 运行环境。前三段说的是同一段时间，必须挨着读；运行环境是静态背景，
+   * 放最后不会把「读数」与「背景」混在一起。
+   *
+   * @param sparkSection   Spark 段（自带标题的一段中文）；{@code null}/空白 = 本次没有 Spark 段
+   * @param runtimeSection 运行环境段，由调用方在区域线程预先采集（异步线程读 TPS/世界列表会失败）
+   */
+  public String dumpText(String timestamp, List<Sample> samples, long durationMillis,
+      boolean reloadDuring, String sparkSection, String runtimeSection) {
+    return formatDump(snapshot(), timestamp) + formatSamples(samples, durationMillis, reloadDuring)
+        + trailingSections(sparkSection, runtimeSection);
+  }
+
+  /** 兼容调用（无 Spark 段）：等价于 {@code sparkSection = null}。 */
   public String dumpText(String timestamp, List<Sample> samples, long durationMillis,
       boolean reloadDuring, String runtimeSection) {
-    return formatDump(snapshot(), timestamp) + formatSamples(samples, durationMillis, reloadDuring)
-        + runtimeSection;
+    return dumpText(timestamp, samples, durationMillis, reloadDuring, null, runtimeSection);
+  }
+
+  /**
+   * 采样段之后的两段：Spark 段 + 运行环境段（纯函数，可离线单测段序与规整）。
+   *
+   * <p>单列成方法是为了让「段序」本身可被断言：Spark 段必须在运行环境<b>之前</b>，否则「这段时间的
+   * 性能记录」会被静态背景切断，读的人要在几百行里来回找。
+   */
+  static String trailingSections(String sparkSection, String runtimeSection) {
+    return normalizeSparkSection(sparkSection) + (runtimeSection == null ? "" : runtimeSection);
+  }
+
+  /**
+   * 把 Spark 段规整成「以恰好一个换行开头、以恰好一个换行结尾」的一段。
+   *
+   * <p><b>为什么要规整</b>：Spark 段来自插件层的异步回调（其前后换行由实现方决定），而 dump 的其余段
+   * 都以 {@code "\n---- 标题 ----\n"} 起头。两边各写一半换行必然会出现「标题贴着上一段」或段间空两行；
+   * 这里统一收敛一次，拼接结果与调用方是否自带换行无关（幂等）。
+   */
+  static String normalizeSparkSection(String section) {
+    if (section == null) {
+      return "";
+    }
+    String body = section.strip();
+    return body.isEmpty() ? "" : "\n" + body + "\n";
+  }
+
+  /**
+   * Spark 段：<b>未请求</b>时的自解释文案（{@code dump local} 与「未安装 Spark」都走这里）。
+   *
+   * <p>不写「无数据」而写清原因：dump 的价值在于拿到文件的人能自己判断，留一段空壳等于让他回头问人。
+   *
+   * @param reason 中文原因（{@code null}/空白时给通用文案）
+   */
+  public static String sparkSectionNotRequested(String reason) {
+    String detail = reason == null || reason.isBlank() ? "本次未请求 Spark 性能记录" : reason;
+    return "\n---- Spark 采样 ----\n未请求：" + detail + "\n";
+  }
+
+  /** Spark 段：等待超时（本地 dump 照写，只是没有链接）。 */
+  public static String sparkSectionTimeout(long waitedSeconds) {
+    return "\n---- Spark 采样 ----\n超时：等待 " + Math.max(0L, waitedSeconds)
+        + " 秒仍未取到结果，本次 dump 不含 Spark 链接（本地采样段完整，未上传任何内容）。\n";
+  }
+
+  /** Spark 段：请求失败（Spark 在但采样没能起来）。 */
+  public static String sparkSectionFailed(String reason) {
+    String detail = reason == null || reason.isBlank() ? "原因未知" : reason;
+    return "\n---- Spark 采样 ----\n失败：" + detail
+        + "（本地采样段完整；本次没有可分享的 Spark 链接）\n";
   }
 
   /**
@@ -924,13 +989,26 @@ public final class Diagnostics {
    */
   public File writeDump(List<Sample> samples, long durationMillis, boolean reloadDuring,
       String runtimeSection) throws IOException {
+    return writeDump(samples, durationMillis, reloadDuring, null, runtimeSection);
+  }
+
+  /**
+   * 写入带「运行采样 + Spark 采样」两段的转储文件。
+   *
+   * <p><b>一次调用 = 一次文件</b>：调用方必须自己保证只调一次（会话层的 exactly-once 收口）。这里不做
+   * 去重也不做延迟重写——转储是一次现场取证，迟到的一方再补写一份会让「哪份才是这次 dump」失去答案。
+   *
+   * @param sparkSection Spark 段（{@code null}/空白 = 本次没有 Spark 段）
+   */
+  public File writeDump(List<Sample> samples, long durationMillis, boolean reloadDuring,
+      String sparkSection, String runtimeSection) throws IOException {
     String stamp = LocalDateTime.now().format(FILE_STAMP);
     File folder = plugin.getDataFolder();
     if (!folder.isDirectory() && !folder.mkdirs() && !folder.isDirectory()) {
       throw new IOException("无法创建数据目录：" + folder.getAbsolutePath());
     }
     File file = writeNewDump(folder, stamp,
-        dumpText(stamp, samples, durationMillis, reloadDuring, runtimeSection));
+        dumpText(stamp, samples, durationMillis, reloadDuring, sparkSection, runtimeSection));
     int removed = pruneOldDumps(folder, MAX_DUMP_FILES);
     if (removed > 0) {
       // 只做一次 INFO：清理是正常行为，不需要 WARN 级别的噪音

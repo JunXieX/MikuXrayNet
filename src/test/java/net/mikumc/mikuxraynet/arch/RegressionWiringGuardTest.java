@@ -74,6 +74,87 @@ class RegressionWiringGuardTest {
         "必须先放行区块包再归还批次计数：否则 CHUNK_BATCH_FINISHED 会排到最后一个区块包之前");
   }
 
+  // ------------------------------------------------- Spark 转储会话接线
+
+  /**
+   * 默认 dump 必须在<b>同一个全局区域 tick</b> 里先起 Spark、再起数值采样。
+   *
+   * <p>为什么这也要守门：{@code SparkDumpCapture#start} 的契约是「在全局区域拥有线程调用」，而玩家执行
+   * 命令时命令线程是他所属的区域线程。把两路各投一处（一个 {@code run}、一个 {@code runAtFixedRate}）
+   * 不会报错，只会让「同一窗口」这个承诺变成「差不多同一窗口」——这种偏差在任何行为用例里都看不出来。
+   */
+  @Test
+  void sparkAndSamplingStartInTheSameGlobalRegionTick() throws IOException {
+    String body = methodBody(readSource("command/MikuCommand.java"), "begin");
+    assertTrue(body != null, "begin 必须存在");
+    assertTrue(body.contains("getGlobalRegionScheduler"),
+        "两路必须一起投到全局区域线程：Spark start 的契约就是在全局区域拥有线程上调用");
+    int spark = body.indexOf("startSpark()");
+    int sampling = body.indexOf("startNumericSampling()");
+    assertTrue(spark >= 0 && sampling >= 0, "begin 内必须同时启动 Spark 与数值采样");
+    assertTrue(spark < sampling, "先起 Spark 再起采样：反过来会让两端的起点差出一个 tick");
+  }
+
+  /** 写盘只发生一次，且一定在 AsyncScheduler 上（区域线程/命令线程不做同步 IO）。 */
+  @Test
+  void dumpWritesExactlyOnceAndOffTheRegionThread() throws IOException {
+    String source = readSource("command/MikuCommand.java");
+    String maybeFinish = methodBody(source, "maybeFinish");
+    assertTrue(maybeFinish != null, "maybeFinish 必须存在");
+    assertTrue(maybeFinish.contains("finished.compareAndSet(false, true)"),
+        "汇合必须用一次性 CAS 收口：Spark 结果与数值窗口任一先到都会触发，重复执行就会写出第二份文件");
+    String writeOnce = methodBody(source, "writeOnce");
+    assertTrue(writeOnce != null, "writeOnce 必须存在");
+    assertTrue(writeOnce.contains("getAsyncScheduler"),
+        "写盘必须投到 AsyncScheduler：命令线程与区域线程都不允许阻塞 IO");
+    assertTrue(writeOnce.contains("writeDump("), "写盘必须走 Diagnostics#writeDump（唯一出口）");
+  }
+
+  /** 等 Spark 只能靠回调 + 异步超时，绝不在任何线程上 join/sleep/await。 */
+  @Test
+  void dumpNeverBlocksWaitingForSpark() throws IOException {
+    String source = stripComments(readSource("command/MikuCommand.java"));
+    assertFalse(source.contains(".join("), "不得用 CompletionStage#join 同步等待 Spark");
+    assertFalse(source.contains("Thread.sleep"), "不得 sleep 等 Spark");
+    assertFalse(source.contains("awaitTermination"), "不得等待线程池收尾");
+    assertTrue(source.contains("whenComplete"), "结果必须走回调汇合（否则只能在某个线程上阻塞等）");
+  }
+
+  /** Spark 链接只回给发起人：不广播、不遍历在线玩家。 */
+  @Test
+  void sparkLinkIsOnlyEverSentToTheRequester() throws IOException {
+    String source = stripComments(readSource("command/MikuCommand.java"));
+    assertFalse(source.contains("broadcast("), "链接绝不广播");
+    assertFalse(source.contains("getOnlinePlayers"), "不得遍历在线玩家（等价于广播）");
+    assertTrue(source.contains("replyToSender(sender, reply)"),
+        "转储结果（含链接）只能回给发起人本人");
+  }
+
+  /** 「会上传」必须在开始采样<b>之前</b>说出口。 */
+  @Test
+  void uploadNoticeIsToldBeforeSamplingStarts() throws IOException {
+    String source = stripComments(readSource("command/MikuCommand.java"));
+    assertTrue(source.contains("SPARK_UPLOAD_NOTICE"),
+        "口径提示必须由命令自己拼出来，不能只写在 README 里");
+    String announce = methodBody(source, "announce");
+    assertTrue(announce != null && announce.contains("SPARK_UPLOAD_NOTICE"),
+        "开始采样前就要告知「Spark 记录会上传、dump 留本地」——事后再在文件里发现是不可接受的");
+  }
+
+  /** 停用 / 热重载 / 发起者断线三条路径都要能中断会话并放闸门。 */
+  @Test
+  void dumpSessionIsAbortedOnDisableReloadAndQuit() throws IOException {
+    String plugin = stripComments(readSource("MikuXrayNet.java"));
+    int first = plugin.indexOf("abortDumpSession(");
+    int second = first < 0 ? -1 : plugin.indexOf("abortDumpSession(", first + 1);
+    assertTrue(first >= 0 && second > first,
+        "停用与热重载都必须中断在途会话：否则闸门被占到超时，且异步写盘会落在已停用的插件上");
+    String registrar = stripComments(readSource("CommandRegistrar.java"));
+    assertTrue(registrar.contains("setDumpAbortHook("), "生命周期钩子必须在注册命令时接上");
+    assertTrue(registrar.contains("PlayerQuitEvent"), "发起者断线必须能触发回收");
+    assertTrue(registrar.contains("onSenderDisconnect("), "断线事件必须转交给命令层的会话注销入口");
+  }
+
   private static String readSource(String relativePath) throws IOException {
     return Files.readString(MAIN.resolve(relativePath));
   }

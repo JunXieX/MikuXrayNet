@@ -77,6 +77,17 @@ public final class MikuXrayNet extends JavaPlugin {
    */
   private volatile AntiXrayRuntime runtime;
 
+  /**
+   * 「中断在途诊断转储会话」的入口（由命令层在构造后登记）。
+   *
+   * <p><b>为什么放在插件层</b>：会话由命令层持有，但需要作废它的时机全在插件生命周期里——停用、
+   * 热重载，以及由命令注册器转发的断线事件。把它们统一收在一个钩子上，比让命令层自己去监听插件状态
+   * 简单得多，也避免命令类反向依赖生命周期事件。
+   *
+   * <p>{@code volatile}：登记发生在启用装配（主线程），调用发生在命令线程/停用线程。
+   */
+  private volatile java.util.function.Consumer<String> dumpAbortHook;
+
   private final ReloadCoordinator reloadCoordinator = new ReloadCoordinator();
   /** 最近一次热重载的回显（供 dump 带出：reload 后配置没生效是最常见的反馈之一）。 */
   private volatile List<String> lastReloadResult = List.of();
@@ -155,6 +166,9 @@ public final class MikuXrayNet extends JavaPlugin {
     // 与热重载共用同一把会话锁：否则「停用」与「reload 的停旧建新」会交错，重载可能在停用之后
     // 又装配出一套监听器/任务，它们挂在已停用的插件上永远不被清理（见 ReloadCoordinator#runExclusively）。
     reloadCoordinator.runExclusively(() -> {
+      // 第一步就作废在途转储会话：它可能正等 Spark 的异步结果并占着闸门，晚一步就可能把文件写到
+      // 已停用的插件上（异步调度被拒），或者让闸门一直卡着直到进程结束。
+      abortDumpSession("插件停用");
       // 逐步兜底：任何一步抛错都不能吞掉后续清理（否则会留下被隐藏的实体/降过的视距/未注销的监听器）。
       // 顺序本身是纪律（先带宽、后反矿透），所以不用 finally 串联，而是各步独立 try/catch。
       try {
@@ -309,6 +323,9 @@ public final class MikuXrayNet extends JavaPlugin {
    * @return 中文结果行
    */
   public List<String> reloadConfigs() {
+    // 先作废在途转储会话：热重载会重建模块与计数，窗口内的增量会变成「半旧半新」，写出来的速率是假的；
+    // 同时把闸门放开，重载后立刻可以重新取证。
+    abortDumpSession("配置热重载");
     List<String> result = reloadCoordinator.reload(new ReloadCoordinator.Target() {
       @Override
       public int antiXrayFingerprint() {
@@ -353,6 +370,38 @@ public final class MikuXrayNet extends JavaPlugin {
     this.lastReloadResult = List.copyOf(result);
     this.lastReloadAt = System.currentTimeMillis();
     return result;
+  }
+
+  /**
+   * 登记「中断在途诊断转储会话」的入口（重复登记以最后一次为准）。
+   *
+   * @param hook 接受中文原因的回调；{@code null} 表示注销
+   */
+  public void setDumpAbortHook(java.util.function.Consumer<String> hook) {
+    this.dumpAbortHook = hook;
+  }
+
+  /**
+   * 中断在途诊断转储会话（停用 / 热重载）。
+   *
+   * <p><b>为什么必须主动中断</b>：转储会话在等 Spark 的结果，最多占用闸门约 65 秒。停用时若不中断，
+   * 异步写盘可能落在已停用的插件上（抛 {@code IllegalPluginAccessException}），闸门则一直占着；热重载
+   * 时不中断，窗口里的计数会被重建，写出来的增量是「半旧半新」的——两种情况都会产出一份不可信的 dump。
+   *
+   * <p>本方法不抛：钩子内部逐层兜底，失败最多是「这次没中断成功」，绝不影响停用/重载主流程。
+   *
+   * @param reason 中文原因（写进命令层日志）
+   */
+  public void abortDumpSession(String reason) {
+    java.util.function.Consumer<String> hook = dumpAbortHook;
+    if (hook == null) {
+      return;
+    }
+    try {
+      hook.accept(reason);
+    } catch (Throwable throwable) {
+      getLogger().log(Level.WARNING, "中断在途诊断转储会话失败（" + reason + "，已忽略）", throwable);
+    }
   }
 
   /** 最近一次热重载的回显（启动后未执行过时为空列表）。 */
