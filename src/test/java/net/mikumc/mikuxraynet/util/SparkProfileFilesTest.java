@@ -237,7 +237,9 @@ class SparkProfileFilesTest {
   @Test
   void candidatesUseModificationWindowAndNeverBecomeTheCorrelation() throws IOException {
     Path old = write("profile-2026-11-20_17.41.00.sparkprofile", profileWithComment(MARKER));
-    Files.setLastModifiedTime(old, FileTime.fromMillis(1_000_000L));
+    // 修改时间必须落到「窗口下界 500_000 之下」：实现是 modified < minModifiedMillis 才跳过，
+    // 取 1_000_000 会落在窗内（用例期望与实现相反），取 100 才是真正早于窗口的历史文件
+    Files.setLastModifiedTime(old, FileTime.fromMillis(100L));
     Path fresh = write("profile-2026-11-20_17.41.01.sparkprofile", profileWithComment(MARKER));
 
     List<Path> inWindow = SparkProfileFiles.candidates(this.temp, 500_000L, 8).stream()

@@ -26,10 +26,15 @@ class DiagnosticsSparkDumpTest {
       完整链接：https://spark.lucko.me/AbCdEf1234
       """;
 
-  private static final String RUNTIME_SECTION = """
-      ---- 运行环境 ----
-      在线人数：12
-      """;
+  /**
+   * 运行环境段夹具：<b>必须自带前导换行</b>。
+   *
+   * <p>生产侧 {@code Diagnostics#runtimeSection()} 返回的就是 {@code "\n---- 运行环境 ----\n…"}（段与段之间靠这个
+   * 前导换行分隔），而 {@link Diagnostics#trailingSections} 对运行环境是<b>原样拼接</b>——夹具漏掉前导换行，
+   * 断言就会对着一个生产里不会出现的输入求值（CI 已因此红过一次）。这里用显式字符串而不是文本块：文本块的
+   * 首行留空能凑出换行，但读的人看不出「这个换行是契约的一部分」。
+   */
+  private static final String RUNTIME_SECTION = "\n---- 运行环境 ----\n在线人数：12\n";
 
   // ------------------------------------------------------------ 换行规整
 
