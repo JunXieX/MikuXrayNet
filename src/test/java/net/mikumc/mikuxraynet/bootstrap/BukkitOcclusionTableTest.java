@@ -45,7 +45,13 @@ class BukkitOcclusionTableTest {
     }
   }
 
-  /** 覆盖表非空（含两表冲突项）时，仍必须逐材料、逐真值等于规则——覆盖优先级不能被建表顺序改掉。 */
+  /**
+   * 覆盖表非空（含两表冲突项）时，仍必须逐材料、逐真值等于规则——覆盖优先级不能被建表顺序改掉。
+   *
+   * <p>末尾几条按真实优先级逐层核对：<b>extra-non-occluding ＞ extra-occluding ＞ 视觉口径</b>
+   * （视觉口径本身 = 逐状态真值 + barrier/岩浆两处例外）。因此「同一名字同时出现在两张表」时结论是
+   * <b>不遮挡</b>，而岩浆例外只在空覆盖表下才成立。
+   */
   @Test
   void matchesPerCellRuleWhenOverrideTablesConflict() {
     Set<String> extraOccluding =
@@ -66,13 +72,18 @@ class BukkitOcclusionTableTest {
       }
     }
 
-    // 两表冲突：「不遮挡」优先（与 OcclusionRules 的既定优先级一致）
-    assertFalse(table.occluding(Material.STONE, true), "stone 同时在两张表里 → 不遮挡优先");
+    // 第一层 extra-non-occluding（优先级最高）：同时出现在两张表的名字按「不遮挡」判定
+    assertFalse(table.occluding(Material.STONE, true), "stone 同时在两张表 → 不遮挡优先");
     assertFalse(table.occluding(Material.OAK_SLAB, true), "oak_slab 冲突 → 不遮挡优先");
-    // 覆盖项已归一化：带命名空间/大写的写法同样生效（且能压过 barrier 例外）
-    assertTrue(table.occluding(Material.BARRIER, true));
-    // 未覆盖的方块仍按视觉口径：岩浆真值非遮挡，但视觉上不透明 → 遮挡
-    assertTrue(table.occluding(Material.LAVA, false));
+    // 覆盖表压过视觉口径：lava 同样在两张表里冲突 → 不遮挡优先。
+    // 岩浆例外只在「空覆盖表」下成立，那一侧由 typicalBlocksKeepTheirOldVerdicts 验证。
+    assertFalse(table.occluding(Material.LAVA, false), "lava 冲突 → 不遮挡优先，压过岩浆视觉例外");
+    // 「不遮挡」覆盖在真值两向都生效：oak_fence 真值遮挡（视觉口径本会判遮挡）也被改判为不遮挡
+    assertFalse(table.occluding(Material.OAK_FENCE, true), "oak_fence 只被 non 覆盖 → 真值遮挡也改判不遮挡");
+    // 第二层 extra-occluding：既压过 barrier 例外（真值遮挡 → 判遮挡），也在真值非遮挡方向补判
+    assertTrue(table.occluding(Material.BARRIER, true), "带命名空间+大写同样命中，并压过 barrier 例外");
+    assertTrue(table.occluding(Material.BARRIER, false), "遮挡覆盖在真值非遮挡方向同样生效");
+    assertTrue(table.occluding(Material.DIAMOND_ORE, false), "diamond_ore 只被 occ 覆盖 → 真值非遮挡也补判遮挡");
   }
 
   /** 典型方块的既有口径（石头、单双台阶、水、岩浆、屏障、箱子）逐条钉死。 */
