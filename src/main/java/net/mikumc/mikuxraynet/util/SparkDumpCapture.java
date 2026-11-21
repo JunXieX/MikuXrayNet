@@ -157,6 +157,9 @@ public final class SparkDumpCapture {
   private static final int MAX_DIAGNOSTIC_LINES = 24;
   private static final int MAX_DIAGNOSTIC_CHARS = 200;
 
+  /** 「路径被拒」那一行的前缀：它计入 {@link #MAX_DIAGNOSTIC_CHARS} 的单行预算，不额外超界。 */
+  private static final String REJECTION_PREFIX = "路径校验：";
+
   /** 返回文本的标题行：调用方按这一行定位整段（前导换行让拼接处不漏行）。 */
   private static final String TITLE = "\n---- Spark 采样 ----\n";
 
@@ -308,7 +311,12 @@ public final class SparkDumpCapture {
   private volatile boolean hintClassified;
   /** 判定出的回执四态（写进自诊断）。 */
   private volatile String hintState = "unknown";
-  /** 账本/回执给出路径但没过四道校验时的最后一条原因（写进自诊断）。 */
+  /**
+   * <b>回执或账本</b>给出了路径、但没过四道校验时的最后一条原因（写进自诊断的「路径校验：」一行）。
+   *
+   * <p>只有这一条线索能解释「Spark 明明说写了文件，dump 却说没认领」：目录轮询看不到它（例如目录不可枚举、
+   * 或定制构建把文件写在别的目录），账本行也可能根本没有本次条目。因此它必须独立渲染，而不是附在某一行后面。
+   */
   private volatile String activityRejection;
 
   /**
@@ -970,7 +978,33 @@ public final class SparkDumpCapture {
       }
     }
     lines.addAll(describeActivity(directories));
+    lines.addAll(rejectionLines(this.activityRejection));
     return lines;
+  }
+
+  /**
+   * 把「回执/账本给了路径但没过四道校验」的原因渲染成一行诊断（纯函数，可离线单测）。
+   *
+   * <p>为什么单列成一行而不是附在目录/账本行里：这条失败恰恰发生在<b>目录轮询也看不到</b>的时候
+   * （目录不可枚举、或定制构建写在别的目录、账本没有本次条目），只有它能说清「Spark 说写了文件，
+   * 我们为什么不认领」。空白原因不产生行；单行（含前缀）不超过 {@link #MAX_DIAGNOSTIC_CHARS}，
+   * 且与其余诊断一样剥掉颜色与 URL。
+   *
+   * @param rejection 形如 {@code 回执路径未通过校验：<原因>} / {@code 账本路径未通过校验：<原因>}
+   */
+  static List<String> rejectionLines(String rejection) {
+    if (rejection == null || rejection.isBlank()) {
+      return List.of();
+    }
+    String reason = receiptLine(rejection);
+    int room = MAX_DIAGNOSTIC_CHARS - REJECTION_PREFIX.length();
+    if (room <= 0) {
+      return List.of();
+    }
+    if (reason.length() > room) {
+      reason = reason.substring(0, room);
+    }
+    return reason.isEmpty() ? List.of() : List.of(REJECTION_PREFIX + reason);
   }
 
   /** 账本视角：本次开始之后 spark 自己记下的落盘路径（「有记录但文件没通过校验」是最关键的线索）。 */
@@ -990,9 +1024,8 @@ public final class SparkDumpCapture {
         lines.add("Spark 账本（activity.json）：没有本次新条目（最近一条 " + name + "，早于本次开始）");
         continue;
       }
-      String rejection = this.activityRejection;
-      lines.add("Spark 账本（activity.json）：本次新条目 " + name
-          + (rejection == null || rejection.isBlank() ? "（尚未通过校验）" : "（" + rejection + "）"));
+      // 被拒原因统一由 rejectionLines 那一行承担（这条只负责指出「账本里有本次条目」）
+      lines.add("Spark 账本（activity.json）：本次新条目 " + name);
     }
     return lines;
   }

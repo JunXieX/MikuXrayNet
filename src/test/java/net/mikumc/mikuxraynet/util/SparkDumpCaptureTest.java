@@ -160,6 +160,41 @@ class SparkDumpCaptureTest {
   }
 
   @Test
+  void rejectedLocatorPathIsNamedInTheDiagnostics() {
+    // 真机 smoke R-C/R-D 的缺口：Spark 回了 Data has been written to: …，但路径被四道校验拒掉，
+    // 而目录轮询也看不到那个文件 —— 此时 dump 必须点名「为什么没认领」。
+    List<String> receiptRejected =
+        SparkDumpCapture.rejectionLines("回执路径未通过校验：真实路径不在 Spark 数据目录内");
+
+    assertEquals(1, receiptRejected.size());
+    assertEquals("路径校验：回执路径未通过校验：真实路径不在 Spark 数据目录内", receiptRejected.get(0));
+
+    String section = SparkDumpCapture.render("未完成（等待 Spark 生成采样文件超时）", null,
+        SparkDumpCapture.BACKGROUND_NOTE, receiptRejected);
+    assertTrue(section.contains("诊断："), "失败分支必须带诊断段");
+    assertTrue(section.contains("回执路径未通过校验：真实路径不在 Spark 数据目录内"),
+        "回执给了路径却被拒时，dump 必须点名原因：" + section);
+
+    // 账本是另一条来源：同样必须点名
+    String ledgerSection = SparkDumpCapture.render("未完成（等待 Spark 生成采样文件超时）", null, null,
+        SparkDumpCapture.rejectionLines("账本路径未通过校验：注释与本轮标记不一致"));
+    assertTrue(ledgerSection.contains("账本路径未通过校验：注释与本轮标记不一致"), ledgerSection);
+
+    // 没有拒绝原因时不产生这一行（成功路径与「本来就没路径」的情形都不该被它污染）
+    assertTrue(SparkDumpCapture.rejectionLines(null).isEmpty());
+    assertTrue(SparkDumpCapture.rejectionLines("   ").isEmpty());
+
+    // 有界 + 剥 URL/颜色：诊断可以被转发，绝不能带出链接或超长行
+    List<String> noisy = SparkDumpCapture.rejectionLines(
+        "§c回执路径未通过校验：https://spark.lucko.me/abcdef " + "x".repeat(400));
+    assertEquals(1, noisy.size());
+    assertTrue(noisy.get(0).startsWith("路径校验："));
+    assertFalse(noisy.get(0).contains("https://"), "诊断行里不得出现 URL：" + noisy.get(0));
+    assertFalse(noisy.get(0).contains("§"), "颜色码要剥掉：" + noisy.get(0));
+    assertTrue(noisy.get(0).length() <= 200, "单行必须有界（含前缀）：" + noisy.get(0).length());
+  }
+
+  @Test
   void diagnosticsAreAbsentWhenThereIsNothingToExplain() {
     assertFalse(SparkDumpCapture.render("已上传", "https://spark.lucko.me/abc123", "说明占位").contains("诊断："),
         "成功分支不该被诊断刷屏");
