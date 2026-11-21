@@ -199,6 +199,49 @@ public final class ThrottleStats {
   public final LongAdder recheckHidden = new LongAdder();
   public final LongAdder recheckShown = new LongAdder();
 
+
+  /**
+   * 实体剔除·周期复检的<b>通道拆分</b>（累计；验收 M1 必需）。
+   *
+   * <p><b>为什么必须拆</b>：{@link #recheckSubmitted} 把两条通道合计并跨通道去重，只有总数时无法回答
+   * 「复检成本到底花在哪」——同一个数字既可能是「轮转在推进真实实体」，也可能是「通道①在全量扫描
+   * 已卸载实体留下的死条目」。拆开后两条通道各自的扫描量与摘除量都可见，据此判断账本是否还在无界增长。
+   *
+   * <p><b>口径</b>：{@code firstPassScanned} / {@code batchScanned} 是「本周期被遍历到的条目数」，
+   * {@code firstPassStale} / {@code batchStale} 是其中「判定为已失效并就地摘除」的条数，
+   * 因此「保留 = 扫描 − 摘除失效」恒成立（面板据此渲染，不再单列一个会与两者失步的计数）。
+   * 三条口径都只增不减，属纯观测，不影响任何行为。
+   */
+  public final LongAdder recheckFirstPassScanned = new LongAdder();
+  public final LongAdder recheckFirstPassStale = new LongAdder();
+  public final LongAdder recheckBatchScanned = new LongAdder();
+  public final LongAdder recheckBatchStale = new LongAdder();
+
+  /**
+   * 通道②里「因处于强制可见距离内而整段跳过」的实体数。
+   *
+   * <p><b>为什么单列</b>：跳过是本次优化唯一改变「复检提交」口径的动作——通道①在本周期已经对同一实体
+   * 做过同一件事（近距一律恢复可见），通道②再做一遍是纯重复。它与 {@link #recheckSubmitted} 的关系是
+   * 硬约束：同一夹具下 A/B 两版的效果计数必须逐位相等，且「B 的提交数 − A 的提交数」必须等于本计数
+   * （已隐藏条目除外：它们在两条通道里都被去重，见 {@code EntityCuller#recheck}）。
+   */
+  public final LongAdder recheckSkippedNear = new LongAdder();
+
+  /**
+   * 实体剔除账本的<b>瞬时量</b>（非累计）：隐藏条目的存活数 / 已失效数，以及全部玩家的轮转队列总长。
+   *
+   * <p><b>为什么是瞬时量而不是计数器</b>：{@link #entitiesHiddenNow} 只有一个总数，而「当前隐藏中 4976」
+   * 这类数字在修复前混着大量「实体早已卸载、账本条目却还留着」的死条目，无法据此判断账本是否健康。
+   * 拆成存活 / 已失效之后，前者应约等于「此刻真的被隐藏着的实体数」，后者正常态应趋近 0。
+   *
+   * <p><b>由谁刷新</b>：只在诊断读取账本时（{@code EntityCuller#hiddenCount()}，每次面板 / dump 渲染一次）
+   * 重算并写入，不在复检热路径上累加——热路径上维护这种跨玩家的瞬时量只能靠额外的全量遍历或易失步的增量
+   * 记账，两者都比「渲染时算一次」更贵也更不可信。
+   */
+  public volatile int hiddenEntriesAlive;
+  public volatile int hiddenEntriesStale;
+  public volatile int rotationLength;
+
   /**
    * 运动跳过生效次数：位置与结论都没变、且遮挡几何未被方块补丁改动，因而省下的重复射线提交数。
    *

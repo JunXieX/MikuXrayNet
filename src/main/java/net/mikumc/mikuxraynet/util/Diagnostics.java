@@ -373,7 +373,42 @@ public final class Diagnostics {
         int afkPlayers, long afkEntered, long afkPacketsDropped,
         long viewDistanceReduced, long viewDistanceRestored,
         long blockMergeFlushes, long blockMergeFlushNanos, boolean cleanupIncomplete,
-        long motionSkips) {
+        long motionSkips, Recheck recheck) {
+
+      /**
+       * 实体复检的<b>通道拆分</b>与账本瞬时量（{@code EntityCuller#recheck} 的观测口径）。
+       *
+       * <p><b>为什么必须单列</b>：只有 {@code recheckSubmitted} 一个合计值时，「复检」这个数字既可能是
+       * 「轮转在推进真实实体」，也可能是「通道①在全量扫描已卸载实体留下的死条目」——两者的处置方向完全
+       * 相反（前者正常、后者要查为什么摘不掉）。拆开之后「扫描 / 摘除失效 / 保留」三条口径可对账，
+       * 且 {@code scanned = alive + stale} 恒成立。
+       *
+       * @param firstPassScanned 通道①（已隐藏账本）本周期遍历到的条目数
+       * @param firstPassStale   通道①其中判定为「实体已移除 / 已卸载」并就地摘除的条数
+       * @param batchScanned     通道②（轮转队列）本周期取出的批条目数
+       * @param batchStale       通道②其中判定为已失效并摘除的条数
+       * @param nearSkipped      通道②因「处于强制可见距离内（通道①同拍已处理）」而整段跳过的实体数
+       * @param rotationLength   全部玩家的轮转队列总长（瞬时值）
+       * @param hiddenAlive      隐藏账本中存活条目数（瞬时值）
+       * @param hiddenStale      隐藏账本中已失效条目数（瞬时值）
+       */
+      public record Recheck(long firstPassScanned, long firstPassStale,
+          long batchScanned, long batchStale, long nearSkipped,
+          int rotationLength, int hiddenAlive, int hiddenStale) {
+
+        /** 复检计数未接线时的零值兜底。 */
+        public static final Recheck EMPTY = new Recheck(0L, 0L, 0L, 0L, 0L, 0, 0, 0);
+
+        /**
+         * 通道①本周期<b>保留</b>下来的条目数（= 扫描 − 已失效）。
+         *
+         * <p>两个 {@code LongAdder} 分别求和，热路径正在自增时可能出现极小的负差；按 0 兜底，
+         * 面板不显示负数。
+         */
+        public long firstPassAlive() {
+          return Math.max(0L, firstPassScanned - firstPassStale);
+        }
+      }
 
       /**
        * 兼容构造（不含 {@code cleanupIncomplete}，等价于「清理完整」）。
@@ -395,13 +430,13 @@ public final class Diagnostics {
             blockChangesPassed, 0L, entitiesHidden, entitiesShown, entitiesHiddenNow, recheckSubmitted,
             recheckHidden, recheckShown, frustumHidden, frustumShown, afkPlayers, afkEntered,
             afkPacketsDropped, viewDistanceReduced, viewDistanceRestored, blockMergeFlushes,
-            blockMergeFlushNanos, false, 0L);
+            blockMergeFlushNanos, false, 0L, Recheck.EMPTY);
       }
 
       /** 带宽优化未启用时的零值兜底。 */
       public static final Throttle EMPTY = new Throttle(
           0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0,
-          0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, 0L);
+          0L, 0L, 0L, 0L, 0L, 0, 0L, 0L, 0L, 0L, 0L, 0L, false, 0L, Recheck.EMPTY);
     }
 
     /** 工作线程池域：线程数、活动数与队列占用。 */
@@ -1160,7 +1195,14 @@ public final class Diagnostics {
             throttleStats.afkPacketsDropped.sum(), throttleStats.viewDistanceReduced.sum(),
             throttleStats.viewDistanceRestored.sum(), throttleStats.blockMergeFlushes.sum(),
             throttleStats.blockMergeFlushNanos.sum(), pipeline.cleanupIncomplete(),
-            throttleStats.motionSkips.sum());
+            throttleStats.motionSkips.sum(),
+            // 复检通道拆分（累计）+ 账本瞬时量（由 EntityCuller#hiddenCount 在读取时刷新）
+            new Snapshot.Throttle.Recheck(throttleStats.recheckFirstPassScanned.sum(),
+                throttleStats.recheckFirstPassStale.sum(),
+                throttleStats.recheckBatchScanned.sum(), throttleStats.recheckBatchStale.sum(),
+                throttleStats.recheckSkippedNear.sum(),
+                throttleStats.rotationLength, throttleStats.hiddenEntriesAlive,
+                throttleStats.hiddenEntriesStale));
     Snapshot.Pool poolSnapshot = pool == null ? Snapshot.Pool.EMPTY
         : new Snapshot.Pool(pool.poolSize(), pool.activeCount(), pool.queueSize(),
             pool.queueCapacity());
@@ -1534,6 +1576,20 @@ public final class Diagnostics {
         // 视锥剔除单列：它的失效模式是「转头后实体迟一步出现」，与射线剔除（该看见的被藏）完全不同，
         // 分列后管理员据此判断该不该调大 frustum.min-distance 或关掉该子项。
         + "）｜视锥剔除 隐藏 " + s.throttle().frustumHidden() + "/恢复 " + s.throttle().frustumShown());
+    // 复检的<b>通道拆分</b>：合计值区分不了「轮转在推进真实实体」与「通道①在全量扫描已卸载实体的死条目」，
+    // 而两者的处置方向相反。「扫描 = 保留 + 摘除失效」恒成立，可直接对账；「近距跳过」是通道② 不再重复
+    // 做通道① 同拍已做完的近距恢复（它只会让 recheckSubmitted 变小，不改变任何可见性结论）。
+    Snapshot.Throttle.Recheck recheck = s.throttle().recheck();
+    lines.add("带宽：复检分通道 通道① 扫描 " + recheck.firstPassScanned()
+        + "（保留 " + recheck.firstPassAlive() + "，摘除失效 " + recheck.firstPassStale() + "）"
+        + "｜通道② 批量 " + recheck.batchScanned()
+        + "（摘除失效 " + recheck.batchStale() + "）"
+        + "｜近距跳过 " + recheck.nearSkipped());
+    // 账本的瞬时量：只看「当前隐藏中」一个总数时，修复前那些「实体早已卸载、条目还留着」的死条目无法与
+    // 「此刻真的被隐藏着」区分。存活应约等于真实隐藏量，已失效正常态应趋近 0；轮转长度是「每周期配额被
+    // 死条目占掉多少」的直接读数（它只增不减时，真实实体的再评估周期会被越拖越长）。
+    lines.add("带宽：隐藏账本 存活 " + recheck.hiddenAlive() + "，已失效 " + recheck.hiddenStale()
+        + "（读取时判定；末影龙部件跨区域判不出，计入存活）｜轮转长度 " + recheck.rotationLength());
     // 遮挡判定单列：它取代了实体线程上的原生命中射线，其「是否接线 / 位图覆盖 / 是否积压」必须独立
     // 观测；「缺遮挡数据」持续偏高说明区块没被建表（射线一律放行）。
     lines.add("遮挡判定：" + (s.occlusion().active() ? "已接线" : "未接线（仅做视锥剔除）")

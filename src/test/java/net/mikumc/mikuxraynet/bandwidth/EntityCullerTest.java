@@ -24,6 +24,7 @@ import net.mikumc.mikuxraynet.occlusion.OcclusionStats;
 import net.mikumc.mikuxraynet.occlusion.OcclusionStores;
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.entity.ComplexEntityPart;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -405,10 +406,12 @@ class EntityCullerTest {
     }
     assertEquals(3, culler.hiddenCount());
 
-    // 10 个可见追踪实体：位置与玩家重合（在强制可见距离内）→ 经真实 onTrack 路径登记进轮转队列，
-    // 且不会被隐藏，从而不占用「已隐藏实体」那条通道
+    // 10 个「远超强制可见距离」的追踪实体：经真实 onTrack 路径登记进轮转队列，且不会被隐藏
+    // （位图未接线 → fail-open），从而不占用「已隐藏实体」那条通道。
+    // 刻意放在远处：强制可见距离内（近距）的实体由通道① 同拍处理，通道② 会整段跳过它们
+    // （见 nearSkipInBatchChannelChangesOnlyTheSubmitCount），那样测不出「通道② 无条数封顶」。
     for (int i = 0; i < 10; i++) {
-      EntityStub stub = new EntityStub(5000 + i, world, 0.5D, 65.0D, 0.5D);
+      EntityStub stub = new EntityStub(5000 + i, world, 200.0D + i, 65.0D, 200.0D);
       culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), stub.proxy()));
     }
 
@@ -419,6 +422,7 @@ class EntityCullerTest {
     culler.recheck(player.proxy());
     assertEquals(2L * (3 + 10), stats.recheckSubmitted.sum(),
         "已隐藏实体仍须每周期复检（行为不退化）");
+    assertEquals(0L, stats.recheckSkippedNear.sum(), "夹具全部在强制可见距离之外，通道② 不应跳过任何实体");
   }
 
   /**
@@ -1154,6 +1158,407 @@ class EntityCullerTest {
     assertEquals(1L, stats.entitiesHidden.sum());
   }
 
+  // ------------------------------------------------- M1：失效条目剪枝（跨区域安全）与 M2：通道② 近距跳过
+
+  /**
+   * M1 主回归：通道①对「已失效」的条目<b>不必等归属</b>就能摘除，而「存活」的条目一律保留。
+   *
+   * <p>旧顺序（先 {@code owns} 后 {@code isValid}）下，实体所在区块卸载后 {@code owns} 恒为 false，
+   * 这些条目永远走不到有效性分支，于是 {@code hidden} 与 {@code rotations} 只增不减——这正是本轮修的缺陷。
+   * 跨区域判定为「存活」的条目<b>必须保留</b>（归属会随玩家移动变回 true，删了就永久隐藏到重登）。
+   */
+  @Test
+  void firstPassPrunesStaleEntriesEvenWhenTheyAreForeign() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub dead = new EntityStub(50_001, world);
+    EntityStub aliveForeign = new EntityStub(50_002, world);
+    EntityStub alive = new EntityStub(50_003, world);
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, frustumOff()), stats,
+        entity -> !((entity == dead.proxy() && dead.foreign)
+            || (entity == aliveForeign.proxy() && aliveForeign.foreign)),
+        playerId -> false);
+
+    culler.evaluate(player.proxy(), dead.proxy(), true);
+    culler.evaluate(player.proxy(), aliveForeign.proxy(), true);
+    culler.evaluate(player.proxy(), alive.proxy(), true);
+    assertEquals(3, culler.hiddenCount());
+
+    // 区块卸载（实体被服务端移除）+ 已不在本区域：旧顺序永远摘不掉的那一类
+    dead.valid = false;
+    dead.foreign = true;
+    aliveForeign.foreign = true;
+    int deadReadsBefore = dead.stateReads();
+    int aliveForeignReadsBefore = aliveForeign.stateReads();
+
+    culler.recheck(player.proxy());
+
+    assertEquals(2, culler.hiddenCount(),
+        "已失效的跨区域条目必须被摘除，存活的两条必须保留：" + culler.hiddenCount());
+    assertEquals(1L, stats.recheckFirstPassStale.sum(), "摘除失效必须计数（M1 的验收主口径）");
+    assertEquals(3L, stats.recheckFirstPassScanned.sum(), "三条都扫描到");
+    assertEquals(2L, stats.recheckFirstPassScanned.sum() - stats.recheckFirstPassStale.sum(),
+        "「扫描 = 保留 + 摘除失效」必须成立");
+    assertEquals(deadReadsBefore, dead.stateReads(),
+        "跨区域条目除了有效性之外不得被读取：其余读取在 Folia 上会先打 ERROR 再抛");
+    assertEquals(aliveForeignReadsBefore, aliveForeign.stateReads(), "存活的跨区域条目同样不得被碰");
+    assertTrue(dead.validityReads() > 0,
+        "跨区域的「失效」只能靠有效性判定得出：CraftEntity#isValid 是纯字段读，跨区域也安全");
+  }
+
+  /**
+   * M1：通道②从轮转队列里摘除已失效条目，且<b>不读实体</b>（按实例摘、用条目自带的 id 清状态）。
+   *
+   * <p>死条目留在轮转里不只是浪费一次 {@code owns}：它还会占满每周期配额，把真实实体的再评估周期
+   * 从 1 拍拖到 2 拍以上（「该显示却仍隐藏」的时间上限被悄悄抬高）。
+   */
+  @Test
+  void batchPrunesStaleRotationEntriesWithoutReadingTheEntity() throws Exception {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    EntityStub dead = new EntityStub(51_001, new WorldStub());
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, frustumOff()), stats,
+        entity -> !(entity == dead.proxy() && dead.foreign), playerId -> false);
+
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), dead.proxy()));
+    assertEquals(1, rotationSize(culler, player.id()));
+
+    dead.valid = false;
+    dead.foreign = true;
+    int readsBefore = dead.stateReads();
+
+    culler.recheck(player.proxy());
+
+    assertEquals(0, rotationSize(culler, player.id()), "失效条目必须从轮转队列摘除");
+    assertEquals(1L, stats.recheckBatchStale.sum());
+    assertEquals(readsBefore, dead.stateReads(),
+        "摘除必须按实例进行（不读 getEntityId 等任何状态）");
+  }
+
+  /**
+   * M1：entityId 被复用时，摘除旧实例<b>不得</b>连带删掉新实例的账本条目。
+   *
+   * <p>账本按 id 存、摘除按<b>引用</b>比：轮转队列里躺着旧实例（已失效），账本里是同 id 的新实例。
+   * 若按 id 盲删，新实例会失去「应恢复」的记录 → 永久隐藏到重登。
+   */
+  @Test
+  void prunedStaleEntryNeverRemovesTheNewInstanceSharingItsId() throws Exception {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub oldInstance = new EntityStub(52_001, world);
+    EntityCuller culler = newCuller(stats);
+
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), oldInstance.proxy()));
+    assertEquals(1, rotationSize(culler, player.id()), "前置：旧实例在轮转队列里");
+
+    // id 复用：新实例占用同一个 id 并被隐藏（账本键是 id，旧记录被新实例顶替）
+    EntityStub newInstance = new EntityStub(52_001, world);
+    culler.evaluate(player.proxy(), newInstance.proxy(), true);
+    assertEquals(1, culler.hiddenCount(), "前置：账本里是复用该 id 的新实例");
+
+    oldInstance.valid = false;
+    culler.recheck(player.proxy());
+
+    assertEquals(1L, stats.recheckBatchStale.sum(), "轮转里的旧实例必须被摘除");
+    assertEquals(0, rotationSize(culler, player.id()), "旧实例必须离开轮转队列");
+    assertEquals(1, culler.hiddenCount(),
+        "新实例的账本条目绝不能被旧实例的摘除连带删掉（否则它永久保持隐藏）");
+  }
+
+  /**
+   * M1：摘除队首之后游标必须回退，否则下一批会跳过实体——该实体在若干周期内不再被复检
+   * （对已隐藏者就是「该恢复却一直隐藏」）。
+   */
+  @Test
+  void prunedRotationEntryKeepsTheCursorFromSkippingTheNextEntity() {
+    EntityCuller.TrackedRotation rotation = new EntityCuller.TrackedRotation();
+    EntityStub first = new EntityStub(53_001, new WorldStub());
+    EntityStub second = new EntityStub(53_002, new WorldStub());
+    EntityStub third = new EntityStub(53_003, new WorldStub());
+    rotation.add(first.proxy());
+    rotation.add(second.proxy());
+    rotation.add(third.proxy());
+
+    assertEquals(Set.of(53_001, 53_002), idsOf(rotation.nextBatch(2)), "前置：第一批按位置推进");
+    assertEquals(53_001, rotation.remove(first.proxy()),
+        "按实例摘除必须返回加入时捕获的 id（供清辅助状态，无需读实体）");
+    assertEquals(Set.of(53_003), idsOf(rotation.nextBatch(1)),
+        "摘除位于游标之前时必须回退游标：否则会跳过一环，该实体本轮不再复检");
+  }
+
+  /**
+   * M1：失效但<b>归属仍为真</b>的条目行为不变——摘账本、不 {@code showEntity}、计入通道①失效。
+   *
+   * <p>这条钉死「优化只改了判断题的<b>顺序</b>，没有改结论」：在归属可用时旧路径本来就摘得掉。
+   */
+  @Test
+  void staleEntriesArePrunedOnTheOwningThreadToo() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler = newCuller(stats);
+    PlayerStub player = new PlayerStub();
+    EntityStub dead = new EntityStub(54_001, new WorldStub());
+
+    culler.evaluate(player.proxy(), dead.proxy(), true);
+    assertEquals(1, culler.hiddenCount());
+
+    dead.valid = false;
+    culler.recheck(player.proxy());
+
+    assertEquals(0, culler.hiddenCount(), "本区域的失效条目同样必须摘除（旧路径不变）");
+    assertEquals(0, player.showCalls.get(), "已被服务端回收的实体不需要（也不该）showEntity");
+    assertEquals(1L, stats.recheckFirstPassStale.sum());
+  }
+
+  /**
+   * 「走远 → 区块卸载 → 回来」的零容忍回归：卸载后账本不得留下死条目，实体重新加载后不得继承隐藏状态。
+   *
+   * <p>安全依据（Folia 26.2 字节码）：实体离开可访问集合时 {@code valid} 被置 false，
+   * 同一方法里 {@code CraftPlayer#onEntityRemove} 会清掉该实体的玩家侧隐藏项——所以摘除死条目既不会
+   * 漏恢复，也不会让「回来」的实体继续不可见。
+   */
+  @Test
+  void chunkUnloadPrunesTheEntryAndTheReturningEntityIsNotLeftHidden() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler = newCuller(stats);
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub oldInstance = new EntityStub(55_001, world);
+
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), oldInstance.proxy()));
+    culler.publishAsync(player.proxy(), oldInstance.proxy(), WORLD_NAME,
+        asyncResult(oldInstance.id(), player), true, true);
+    assertEquals(1, culler.hiddenCount(), "前置：曾因遮挡被隐藏");
+
+    // 区块卸载（服务端移除实体并释放玩家侧隐藏状态）
+    oldInstance.valid = false;
+    culler.recheck(player.proxy());
+    assertEquals(0, culler.hiddenCount(), "卸载后账本不得留下死条目");
+    assertEquals(0, player.showCalls.get(), "服务端已释放隐藏状态，无需也无法再 showEntity");
+
+    // 回来：同一个 entityId 的新实例重新被追踪 → 不得沿用任何旧隐藏记录
+    EntityStub reloaded = new EntityStub(55_001, world);
+    PlayerTrackEntityEvent event = new PlayerTrackEntityEvent(player.proxy(), reloaded.proxy());
+    culler.onTrack(event);
+
+    assertFalse(event.isCancelled(),
+        "旧账本已被摘除：重新加载的实体必须正常展示（该显示却仍隐藏是零容忍）");
+    assertEquals(0, culler.hiddenCount(), "新实例不得继承任何隐藏状态");
+  }
+
+  /**
+   * 换维度（同一实例换 world）的条目<b>必须保留</b>：Paper 在 {@code onTrackingEnd} 里对
+   * {@code removalReason == CHANGED_DIMENSION} 刻意<b>不</b>清玩家侧隐藏项，实体对象会在新世界继续活着。
+   *
+   * <p>反向风险：若把它当普通「已卸载」摘掉，玩家之后进入那个世界就再也找不到恢复依据
+   * （实体一旦被隐藏就永久不可见，直到重登）——这与「该显示却仍隐藏」零容忍直接冲突。
+   */
+  @Test
+  void dimensionChangeKeepsTheEntrySoItCanBeRestoredInTheNewWorld() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler = newCuller(stats);
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub entity = new EntityStub(59_001, world);
+
+    culler.evaluate(player.proxy(), entity.proxy(), true);
+    assertEquals(1, culler.hiddenCount(), "前置：实体已被隐藏");
+
+    // 离开旧世界（valid=false）+ 同一实例换到另一个世界（世界名不同，与服务端一致）
+    WorldStub nether = new WorldStub();
+    nether.rename("world_nether");
+    entity.valid = false;
+    entity.changeWorld(nether);
+    culler.recheck(player.proxy());
+
+    assertEquals(1, culler.hiddenCount(),
+        "换维度的条目必须保留：Paper 不清它的玩家侧隐藏项，实体还会在新世界活着");
+    assertEquals(0L, stats.recheckFirstPassStale.sum(), "换维度的条目不得计入「摘除失效」");
+
+    // 回到玩家所在世界（名字相同即视为同一世界）并重新有效：条目必须重新驱动恢复
+    entity.changeWorld(world);
+    entity.valid = true;
+    player.setPosition(100.0D, 65.0D, 100.0D);
+    culler.recheck(player.proxy());
+
+    assertEquals(0, culler.hiddenCount(), "回到近距必须恢复：保留条目正是为了这一刻");
+    assertEquals(1, player.showCalls.get());
+  }
+
+  /**
+   * 末影龙部件（{@link ComplexEntityPart}）的特殊处理：它的 {@code isValid} 在 Folia 上会走
+   * {@code CraftComplexPart#getHandle} → {@code TickThread} 校验，因此<b>只能</b>在归属通过后判有效性。
+   *
+   * <p>反过来（把它当成普通实体提前判有效）就会跨区域抛异常并刷 ERROR；而把它当成「失效」去摘账本则
+   * 会造成永久隐藏。这条用例把两个方向都钉死。
+   */
+  @Test
+  void complexEntityPartValidityIsOnlyProbedAfterOwnership() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    EntityStub part = EntityStub.complexPart(56_001, new WorldStub());
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8, frustumOff()), stats,
+        entity -> !(entity == part.proxy() && part.foreign), playerId -> false);
+
+    culler.evaluate(player.proxy(), part.proxy(), true);
+    assertEquals(1, culler.hiddenCount());
+    part.foreign = true;
+
+    assertDoesNotThrow(() -> culler.recheck(player.proxy()),
+        "复杂部件的有效性不能跨区域判：复检必须退回「先问归属」的旧顺序，不得抛异常");
+    assertEquals(1, culler.hiddenCount(),
+        "判不出有效性的条目必须保留（绝不能当成失效去摘——那会永久隐藏）");
+
+    // 归属恢复后：失效的部件必须被正常摘除
+    part.foreign = false;
+    part.valid = false;
+    culler.recheck(player.proxy());
+    assertEquals(0, culler.hiddenCount());
+    assertEquals(1L, stats.recheckFirstPassStale.sum());
+  }
+
+  /**
+   * M2 A（近距跳过）等价性：同一夹具下，「近距跳过」与「不跳过」两条路径的可见性结论必须逐位相等，
+   * 且复检提交数的差值恰好等于跳过数。
+   *
+   * <p>对照实现用 {@code force-visible-distance = 0} 得到（此时没有任何实体算「近」，通道② 会照旧提交它们），
+   * 其余配置与夹具完全相同——这正是「只差这一处改动」的 A/B。
+   */
+  @Test
+  void nearSkipInBatchChannelChangesOnlyTheSubmitCount() {
+    // A：生产语义（强制可见距离 2 格）
+    ThrottleStats statsA = new ThrottleStats();
+    EntityCuller cullerA = newCuller(statsA);
+    PlayerStub playerA = new PlayerStub();
+    WorldStub worldA = new WorldStub();
+    trackNearAndFar(cullerA, playerA, worldA);
+    cullerA.recheck(playerA.proxy());
+
+    // B：同一夹具，但强制可见距离为 0 ⇒ 没有任何实体算「近」，通道② 照旧全部提交
+    ThrottleStats statsB = new ThrottleStats();
+    EntityCuller cullerB = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 0.0D, 10, 8, frustumOff()), statsB);
+    PlayerStub playerB = new PlayerStub();
+    WorldStub worldB = new WorldStub();
+    trackNearAndFar(cullerB, playerB, worldB);
+    cullerB.recheck(playerB.proxy());
+
+    assertEquals(statsA.recheckHidden.sum(), statsB.recheckHidden.sum(), "复检致隐藏必须逐位相等");
+    assertEquals(statsA.recheckShown.sum(), statsB.recheckShown.sum(), "复检致恢复必须逐位相等");
+    assertEquals(statsA.frustumHidden.sum(), statsB.frustumHidden.sum(), "视锥隐藏必须逐位相等");
+    assertEquals(statsA.frustumShown.sum(), statsB.frustumShown.sum(), "视锥恢复必须逐位相等");
+    assertEquals(0L, statsA.entitiesHidden.sum(), "夹具里没有可隐藏的实体");
+    assertEquals(0L, statsB.entitiesHidden.sum());
+    assertEquals(0, playerA.showCalls.get(), "近距跳过不产生任何可见性动作");
+    assertEquals(0, playerB.showCalls.get());
+
+    assertEquals(3L, statsA.recheckSkippedNear.sum(), "三个近距实体必须被跳过");
+    assertEquals(0L, statsB.recheckSkippedNear.sum(), "对照版不跳过任何实体");
+    assertEquals(statsB.recheckSubmitted.sum() - statsA.recheckSubmitted.sum(),
+        statsA.recheckSkippedNear.sum(),
+        "提交数的差值必须恰好等于跳过数（跳过发生在计数之前）");
+  }
+
+  /**
+   * M2 A 的顺序不变式：通道① 先跑、通道② 后跑 ——近距已隐藏实体只被恢复<b>一次</b>，
+   * 通道② 随后整段跳过（不得再提交一次判定、也不得重复 showEntity）。
+   */
+  @Test
+  void nearHiddenEntityIsRestoredOnceByFirstPassAndSkippedBySecondPass() {
+    ThrottleStats stats = new ThrottleStats();
+    EntityCuller culler = newCuller(stats);
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityStub entity = new EntityStub(57_001, world);
+
+    culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), entity.proxy()));
+    culler.publishAsync(player.proxy(), entity.proxy(), WORLD_NAME,
+        asyncResult(entity.id(), player), true, true);
+    assertEquals(1, culler.hiddenCount(), "前置：远距离实体已被隐藏");
+
+    player.setPosition(100.0D, 65.0D, 100.0D); // 走到实体身上 → 强制可见距离内
+    culler.recheck(player.proxy());
+
+    assertEquals(0, culler.hiddenCount(), "强制可见距离内的隐藏实体必须恢复（安全策略）");
+    assertEquals(1, player.showCalls.get(), "只能恢复一次：通道② 不得重复下发 showEntity");
+    assertEquals(1L, stats.recheckShown.sum());
+    assertEquals(1L, stats.recheckSkippedNear.sum(), "通道② 必须对近距实体整段跳过");
+  }
+
+  /**
+   * M2 B（玩家侧快照上提）：同一拍内玩家坐标与朝向只读一次，不随实体数增长。
+   *
+   * <p>旧实现是每实体 6 次玩家 getter（{@code View} 里 4 次 + 每次视锥判定 2 次）。这里用「视锥开 + 两个
+   * 远距离（锥外）实体」的夹具，让每次评估都必须读坐标与朝向，从而暴露上提是否真的发生。
+   */
+  @Test
+  void playerReadsAreHoistedOutOfThePerEntityLoop() {
+    ThrottleStats stats = new ThrottleStats();
+    PlayerStub player = new PlayerStub();
+    WorldStub world = new WorldStub();
+    EntityCuller culler = new EntityCuller(new PluginStub().proxy(),
+        new BandwidthConfig.EntityCulling(true, true, 2.0D, 10, 8,
+            new BandwidthConfig.EntityCulling.Frustum(true, 110.0D, 2.0D)),
+        stats, entity -> true, playerId -> false);
+
+    for (int i = 0; i < 2; i++) {
+      EntityStub behind = new EntityStub(58_000 + i, world, 100.0D, 65.0D, -100.0D);
+      culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), behind.proxy()));
+    }
+    assertEquals(2L, stats.frustumHidden.sum(), "前置：两个实体都被视锥剔除");
+
+    player.resetReadCounters();
+    culler.recheck(player.proxy());
+    int positionReadsTwoEntities = player.positionReads();
+    int orientationReadsTwoEntities = player.orientationReads();
+
+    // 实体数翻倍：读取次数必须完全不变（旧实现是每实体 6 次玩家 getter）
+    for (int i = 2; i < 4; i++) {
+      EntityStub behind = new EntityStub(58_000 + i, world, 100.0D, 65.0D, -100.0D);
+      culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), behind.proxy()));
+    }
+    player.resetReadCounters();
+    culler.recheck(player.proxy());
+
+    assertEquals(3, positionReadsTwoEntities,
+        "每拍只读一次 x/y/z（上提为快照）；实际每拍 " + positionReadsTwoEntities + " 次");
+    assertEquals(2, orientationReadsTwoEntities,
+        "每拍只读一次 yaw 与一次 pitch（视线快照整拍复用）；实际每拍 "
+            + orientationReadsTwoEntities + " 次");
+    assertEquals(positionReadsTwoEntities, player.positionReads(),
+        "实体数翻倍后玩家坐标读取次数不得变化（证明已在循环外上提）");
+    assertEquals(orientationReadsTwoEntities, player.orientationReads(),
+        "实体数翻倍后朝向读取次数不得变化");
+  }
+
+  /** A/B 夹具：三个近距实体（≤2 格）+ 两个远距实体，全部经真实 onTrack 登记进轮转队列。 */
+  private static void trackNearAndFar(EntityCuller culler, PlayerStub player, WorldStub world) {
+    int[] ids = {60_001, 60_002, 60_003, 60_004, 60_005};
+    double[][] positions = {
+        {1.0D, 65.0D, 1.0D}, {1.2D, 65.0D, 0.5D}, {0.5D, 65.0D, 1.2D},
+        {100.0D, 65.0D, 100.0D}, {120.0D, 65.0D, 120.0D},
+    };
+    for (int i = 0; i < ids.length; i++) {
+      EntityStub stub = new EntityStub(ids[i], world,
+          positions[i][0], positions[i][1], positions[i][2]);
+      culler.onTrack(new PlayerTrackEntityEvent(player.proxy(), stub.proxy()));
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static int rotationSize(EntityCuller culler, UUID playerId) throws Exception {
+    Field field = EntityCuller.class.getDeclaredField("rotations");
+    field.setAccessible(true);
+    Map<UUID, EntityCuller.TrackedRotation> map =
+        (Map<UUID, EntityCuller.TrackedRotation>) field.get(culler);
+    EntityCuller.TrackedRotation rotation = map.get(playerId);
+    return rotation == null ? 0 : rotation.size();
+  }
+
   private static Set<Integer> idsOf(List<Entity> entities) {
     Set<Integer> ids = new HashSet<>();
     for (Entity entity : entities) {
@@ -1219,6 +1624,10 @@ class EntityCullerTest {
     /** 世界替身：带宽侧世界黑名单判定会读 {@code getWorld().getName()}，默认名 "world"（不在任何黑名单）。 */
     private final WorldStub world = new WorldStub();
     private volatile boolean online = true;
+    /** 坐标读取次数（getX/getY/getZ）：验证玩家侧快照每拍只读一次、不随实体数增长。 */
+    private final AtomicInteger positionReads = new AtomicInteger();
+    /** 朝向读取次数（getYaw/getPitch）：同上（视线快照整拍复用）。 */
+    private final AtomicInteger orientationReads = new AtomicInteger();
 
     Player proxy() {
       return proxy;
@@ -1231,6 +1640,20 @@ class EntityCullerTest {
     /** 转头：视锥判定的方向来自 {@code Location#getDirection()}，改 yaw 即可模拟玩家转身。 */
     void faceYaw(float yaw) {
       location.setYaw(yaw);
+    }
+
+    /** 清零读计数（用于只统计某一拍的玩家读取次数）。 */
+    void resetReadCounters() {
+      positionReads.set(0);
+      orientationReads.set(0);
+    }
+
+    int positionReads() {
+      return positionReads.get();
+    }
+
+    int orientationReads() {
+      return orientationReads.get();
     }
 
     /** 移动玩家位置（用于验证「跨区域条目在归属恢复后重新生效」）。 */
@@ -1256,14 +1679,29 @@ class EntityCullerTest {
         case "getLocation", "getEyeLocation" -> location;
         case "getWorld" -> world.proxy();
         // 强制可见距离闸门改用零分配坐标 getter（不再 new Location）读取玩家位置
-        case "getX" -> location.getX();
-        case "getY" -> location.getY();
-        case "getZ" -> location.getZ();
+        case "getX" -> {
+          positionReads.incrementAndGet();
+          yield location.getX();
+        }
+        case "getY" -> {
+          positionReads.incrementAndGet();
+          yield location.getY();
+        }
+        case "getZ" -> {
+          positionReads.incrementAndGet();
+          yield location.getZ();
+        }
         // 视锥判定改用「yaw/pitch + eyeHeight」手算方向（生产不再 new Location / Vector）。
         // eyeHeight 取 0：本替身的 getEyeLocation() 直接返回 location（Y 未额外加眼高），
         // 两者必须一致，否则「眼睛高度」会与改造前不同、让视锥用例的几何前提悄悄漂移。
-        case "getYaw" -> location.getYaw();
-        case "getPitch" -> location.getPitch();
+        case "getYaw" -> {
+          orientationReads.incrementAndGet();
+          yield location.getYaw();
+        }
+        case "getPitch" -> {
+          orientationReads.incrementAndGet();
+          yield location.getPitch();
+        }
         case "getEyeHeight" -> 0.0D;
         case "hideEntity" -> null;
         case "showEntity" -> {
@@ -1279,27 +1717,58 @@ class EntityCullerTest {
   private static final class EntityStub implements InvocationHandler {
 
     private final int id;
-    private final WorldStub world;
+    /** 可换：换维度是<b>同一个实体实例</b>换 level（Paper 不会清玩家侧隐藏项）。 */
+    private WorldStub world;
     private final Entity proxy;
     private final Location location;
     private volatile BoundingBox box;
     private volatile boolean valid = true;
     /** 模拟「实体已离开本区域」：任何状态读取都像 Folia 那样抛异常（真机还会先打一条 ERROR）。 */
     private volatile boolean foreign;
+    /**
+     * 是否扮演 {@link ComplexEntityPart}（末影龙部件）：它的 {@code isValid} 在 Folia 上会经
+     * {@code CraftComplexPart#getHandle} 走 {@code TickThread} 校验，因此跨区域读取同样会抛。
+     */
+    private final boolean complexPart;
     /** 被读取状态的次数（跨区域回归用：一次都不能被碰到）。 */
     private final AtomicInteger stateReads = new AtomicInteger();
+    /**
+     * 被读「有效性」的次数。
+     *
+     * <p><b>为什么与 {@link #stateReads} 分开</b>：Folia 26.2 的字节码（{@code CraftEntity#isValid}）
+     * 表明它是两次纯字段读、不经 {@code getHandle}，因此跨区域调用是安全的——这正是 M1 把有效性判定
+     * 提到归属判定之前的前提。替身必须如实建模这一条，否则测出来的只是替身的假设。
+     */
+    private final AtomicInteger validityReads = new AtomicInteger();
 
     EntityStub(int id, WorldStub world) {
-      this(id, world, 100.0D, 65.0D, 100.0D);
+      this(id, world, 100.0D, 65.0D, 100.0D, false);
     }
 
     EntityStub(int id, WorldStub world, double x, double y, double z) {
+      this(id, world, x, y, z, false);
+    }
+
+    private EntityStub(int id, WorldStub world, double x, double y, double z, boolean complexPart) {
       this.id = id;
       this.world = world;
+      this.complexPart = complexPart;
       this.location = new Location(null, x, y, z);
       this.box = new BoundingBox(x, y, z, x + 0.6D, y + 1.8D, z + 0.6D);
-      this.proxy = (Entity) Proxy.newProxyInstance(
-          Entity.class.getClassLoader(), new Class<?>[] {Entity.class}, this);
+      Class<?>[] types = complexPart
+          ? new Class<?>[] {Entity.class, ComplexEntityPart.class}
+          : new Class<?>[] {Entity.class};
+      this.proxy = (Entity) Proxy.newProxyInstance(Entity.class.getClassLoader(), types, this);
+    }
+
+    /** 末影龙部件替身：{@code isValid} 跨区域读取会抛（模拟 CraftComplexPart#getHandle 的线程校验）。 */
+    static EntityStub complexPart(int id, WorldStub world) {
+      return new EntityStub(id, world, 100.0D, 65.0D, 100.0D, true);
+    }
+
+    /** 模拟「同一个实体实例被换到另一个世界」（{@code Entity#setLevel}，实例不变）。 */
+    void changeWorld(WorldStub next) {
+      this.world = next;
     }
 
     /** 覆盖包围盒（大型实体的视锥角点回归用）：须让包围盒中心与 {@code location} 一致。 */
@@ -1319,11 +1788,31 @@ class EntityCullerTest {
       return stateReads.get();
     }
 
+    /** 被读「有效性」的次数（跨区域安全读，与 {@link #stateReads} 分列）。 */
+    int validityReads() {
+      return validityReads.get();
+    }
+
     @Override
     public Object invoke(Object ignored, Method method, Object[] args) {
       if (isObjectMethod(method)) {
         return "hashCode".equals(method.getName()) ? System.identityHashCode(proxy)
             : ("equals".equals(method.getName()) ? proxy == args[0] : "EntityStub#" + id);
+      }
+      // isValid 单独处理：Folia 26.2 上它是两次纯字段读（CraftEntity#isValid → isAlive() + valid），
+      // 不经 getHandle，因此跨区域调用安全、也不计入「状态读取」。唯一例外是末影龙部件：
+      // CraftComplexPart#isValid 走 getParent() → getHandle() → TickThread，跨区域照样抛。
+      if ("isValid".equals(method.getName())) {
+        validityReads.incrementAndGet();
+        if (complexPart && foreign) {
+          throw new IllegalStateException("模拟 Folia 跨区域访问（复杂部件）：entity#" + id);
+        }
+        return valid;
+      }
+      // getWorld 同样跨区域安全：CraftEntity#getWorld() = entity.level().getWorld()，
+      // Entity#level() 与 Level#getWorld() 都是字段读（字节码已核），不经 getHandle。
+      if ("getWorld".equals(method.getName())) {
+        return world.proxy();
       }
       stateReads.incrementAndGet();
       if (foreign) {
@@ -1332,8 +1821,6 @@ class EntityCullerTest {
       }
       return switch (method.getName()) {
         case "getEntityId" -> id;
-        case "isValid" -> valid;
-        case "getWorld" -> world.proxy();
         case "getLocation" -> location;
         case "getBoundingBox" -> box;
         // 强制可见距离闸门改用零分配坐标 getter

@@ -324,7 +324,8 @@ class DiagnosticsTest {
     Diagnostics.Snapshot withCleanupFailure = new Diagnostics.Snapshot(s.env(), s.rewrite(),
         s.proximity(), s.index(), s.occlusion(),
         new Diagnostics.Snapshot.Throttle(20L, 30L, 11L, 4L, 39L, 0L, 4L, 40L, 12L, 0L, 6L, 5L, 4,
-            40L, 7L, 3L, 11L, 2L, 2, 3L, 8L, 9L, 4L, 5L, 25_000_000L, true, 0L),
+            40L, 7L, 3L, 11L, 2L, 2, 3L, 8L, 9L, 4L, 5L, 25_000_000L, true, 0L,
+            Diagnostics.Snapshot.Throttle.Recheck.EMPTY),
         s.pool(), s.diskCache(), s.chunkAccessor(), s.antiXray(), s.bandwidth());
     String cleanupFailed = String.join("\n", Diagnostics.formatStatus(withCleanupFailure));
     assertTrue(cleanupFailed.contains("上次停用有子模块清理失败"),
@@ -386,6 +387,49 @@ class DiagnosticsTest {
     assertFalse(text.contains("无法原子比较"), text);
     assertFalse(text.contains("源指纹不一致"), text);
     assertFalse(text.contains("观测缺失"), text);
+  }
+
+  /**
+   * 复检的<b>通道拆分</b>与账本的<b>存活 / 已失效拆分</b>必须渲染出来。
+   *
+   * <p>为什么不能只给合计：{@code recheckSubmitted} 一个数字既可能是「轮转在推进真实实体」，也可能是
+   * 「通道①在全量扫描已卸载实体的死条目」——两者的处置方向完全相反。拆开后「扫描 = 保留 + 摘除失效」
+   * 可对账，账本的瞬时划分也能说明「当前隐藏中」这个数字是否可信。
+   */
+  @Test
+  void recheckChannelSplitAndLedgerSplitAreRendered() {
+    Diagnostics.Snapshot base = fixed();
+    Diagnostics.Snapshot withRecheck = new Diagnostics.Snapshot(base.env(), base.rewrite(),
+        base.proximity(), base.index(), base.occlusion(),
+        new Diagnostics.Snapshot.Throttle(20L, 30L, 11L, 4L, 39L, 0L, 4L, 40L, 12L, 0L, 6L, 5L, 4,
+            40L, 7L, 3L, 11L, 2L, 2, 3L, 8L, 9L, 4L, 5L, 25_000_000L, false, 0L,
+            new Diagnostics.Snapshot.Throttle.Recheck(120L, 20L, 95L, 5L, 7L, 900, 88, 4)),
+        base.pool(), base.diskCache(), base.chunkAccessor(), base.antiXray(), base.bandwidth());
+
+    String text = String.join("\n", Diagnostics.formatStatus(withRecheck));
+    assertTrue(text.contains("复检分通道 通道① 扫描 120（保留 100，摘除失效 20）"),
+        "通道①必须拆出扫描量与摘除失效量（保留 = 扫描 − 失效，可直接对账）：" + text);
+    assertTrue(text.contains("通道② 批量 95（摘除失效 5）"), text);
+    assertTrue(text.contains("近距跳过 7"), text);
+    assertTrue(text.contains("隐藏账本 存活 88，已失效 4"), text);
+    assertTrue(text.contains("轮转长度 900"), text);
+    assertEquals(100L, withRecheck.throttle().recheck().firstPassAlive());
+
+    // dump 与状态面板同源：服主手上往往只有 dump，同一组数字必须也在里面
+    String dump = Diagnostics.formatDump(withRecheck, "20261122-010000");
+    assertTrue(dump.contains("复检分通道 通道① 扫描 120"), dump);
+    assertTrue(dump.contains("隐藏账本 存活 88"), dump);
+
+    // 零值兜底：没有接线时只显示 0，绝不凭空造数
+    String zeros = String.join("\n", Diagnostics.formatStatus(new Diagnostics.Snapshot(
+        base.env(), Diagnostics.Snapshot.Rewrite.EMPTY, Diagnostics.Snapshot.Proximity.EMPTY,
+        Diagnostics.Snapshot.Index.EMPTY, Diagnostics.Snapshot.Occlusion.EMPTY,
+        Diagnostics.Snapshot.Throttle.EMPTY, Diagnostics.Snapshot.Pool.EMPTY,
+        Diagnostics.Snapshot.DiskCache.EMPTY, Diagnostics.Snapshot.ChunkAccessor.EMPTY,
+        null, null)));
+    assertTrue(zeros.contains("通道① 扫描 0（保留 0，摘除失效 0）"), zeros);
+    assertTrue(zeros.contains("隐藏账本 存活 0，已失效 0"), zeros);
+    assertTrue(zeros.contains("轮转长度 0"), zeros);
   }
 
   /**
