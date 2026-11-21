@@ -3,6 +3,7 @@ package net.mikumc.mikuxraynet.util;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
@@ -305,6 +306,312 @@ class SparkProfileFilesTest {
     assertFalse(SparkProfileFiles.isProfileName("profile-2026 11 20.sparkprofile"));
     assertFalse(SparkProfileFiles.isProfileName("profile-" + "a".repeat(200) + ".sparkprofile"));
     assertFalse(SparkProfileFiles.isProfileName(null));
+  }
+
+  // ------------------------------------------------------------------
+  // spark 自己的账本：activity.json
+  // ------------------------------------------------------------------
+
+  /** 真实文件形状（来自隔离靶 plugins/spark/activity.json 的原样结构：美化数组、最新在前）。 */
+  private static final String ACTIVITY_FIXTURE = """
+      [
+        {
+          "user": {
+            "type": "other",
+            "name": "FeedbackForwardingSender"
+          },
+          "time": 1795266253098,
+          "type": "Profiler",
+          "data": {
+            "type": "file",
+            "value": "plugins\\\\spark\\\\profile-2026-11-21_21.04.13.sparkprofile"
+          }
+        },
+        {
+          "user": {
+            "type": "other",
+            "name": "Rcon"
+          },
+          "time": 1795266085032,
+          "type": "Profiler",
+          "data": {
+            "type": "file",
+            "value": "plugins\\\\spark\\\\profile-2026-11-21_21.01.24.sparkprofile"
+          }
+        }
+      ]
+      """;
+
+  @Test
+  void activityLedgerParsesTheRealSparkFormat() {
+    List<SparkProfileFiles.ActivityEntry> entries =
+        SparkProfileFiles.parseActivity(ACTIVITY_FIXTURE, 8);
+
+    assertEquals(2, entries.size(), "两条 Profiler 落盘记录都要能读出来");
+    assertEquals(1795266253098L, entries.get(0).timeMillis(), "账本按时间降序：最新那条在最前");
+    assertEquals("plugins\\spark\\profile-2026-11-21_21.04.13.sparkprofile", entries.get(0).value(),
+        "JSON 里的 \\\\ 要还原成单个反斜杠，否则拼不出真实路径");
+    assertEquals("Profiler", entries.get(0).type());
+    assertEquals("file", entries.get(0).dataType());
+  }
+
+  @Test
+  void activityLedgerAlsoAcceptsOneObjectPerLineAndFiltersOtherTypes() {
+    String json = String.join("\n",
+        ledgerJson(1_700_000_000_000L, "plugins\\spark\\a.sparkprofile"),
+        "{\"time\":1700000000500,\"type\":\"Command\",\"data\":{\"type\":\"file\",\"value\":\"x\"}}",
+        "{\"time\":1700000001000,\"type\":\"Profiler\",\"data\":{\"type\":\"misc\",\"value\":\"y\"}}",
+        ledgerJson(1_700_000_002_000L, "plugins\\spark\\b.sparkprofile"));
+
+    List<SparkProfileFiles.ActivityEntry> entries = SparkProfileFiles.parseActivity(json, 8);
+
+    assertEquals(2, entries.size(), "只认 Profiler + data.type=file");
+    assertEquals("plugins\\spark\\b.sparkprofile", entries.get(0).value());
+  }
+
+  @Test
+  void activityLedgerToleratesTruncatedHeadAndGarbage() {
+    String truncated = ACTIVITY_FIXTURE.substring(17);
+
+    assertFalse(SparkProfileFiles.parseActivity(truncated, 8).isEmpty(),
+        "读尾部可能从半个对象开始：从下一个 { 继续，不能整份放弃");
+    assertTrue(SparkProfileFiles.parseActivity("{{{{", 8).isEmpty(), "垃圾内容不得变成条目");
+    assertTrue(SparkProfileFiles.parseActivity("", 8).isEmpty());
+    assertTrue(SparkProfileFiles.parseActivity(null, 8).isEmpty());
+    assertTrue(SparkProfileFiles.parseActivity(ACTIVITY_FIXTURE, 0).isEmpty(), "上限为 0 不得解析");
+    assertEquals(1, SparkProfileFiles.parseActivity(ACTIVITY_FIXTURE, 1).size(), "条数上限必须生效");
+  }
+
+  @Test
+  void activityLedgerReadsOnlyTheTailOfAHugeFile() throws IOException {
+    StringBuilder builder = new StringBuilder(400_000);
+    builder.append('[');
+    for (int index = 0; index < 4_000; index++) {
+      builder.append(ledgerJson(1_600_000_000_000L + index, "plugins\\spark\\old-" + index + ".sparkprofile"))
+          .append(',');
+    }
+    builder.append(ledgerJson(1_795_266_253_098L, "plugins\\spark\\profile-2026-11-21_21.04.13.sparkprofile"));
+    builder.append(']');
+    Path ledger = this.temp.resolve(SparkProfileFiles.ACTIVITY_FILE);
+    Files.writeString(ledger, builder.toString(), StandardCharsets.UTF_8);
+    assertTrue(Files.size(ledger) > SparkProfileFiles.MAX_ACTIVITY_BYTES,
+        "fixture 必须大于尾部读取上限，才能证明「只读尾部」也拿得到最新条目");
+
+    List<SparkProfileFiles.ActivityEntry> entries = SparkProfileFiles.readActivity(ledger, 4);
+
+    assertEquals(1_795_266_253_098L, entries.get(0).timeMillis());
+    assertEquals("plugins\\spark\\profile-2026-11-21_21.04.13.sparkprofile", entries.get(0).value());
+  }
+
+  @Test
+  void activityLedgerIsReadOnlyAndNeverFollowsLinks() throws IOException {
+    Path ledger = this.temp.resolve(SparkProfileFiles.ACTIVITY_FILE);
+    Files.writeString(ledger, ACTIVITY_FIXTURE, StandardCharsets.UTF_8);
+
+    assertEquals(2, SparkProfileFiles.readActivity(ledger, 8).size());
+    assertTrue(SparkProfileFiles.readActivity(this.temp.resolve("missing.json"), 8).isEmpty());
+    assertTrue(SparkProfileFiles.readActivity(null, 8).isEmpty());
+    assertTrue(SparkProfileFiles.readActivity(ledger, 0).isEmpty());
+
+    Path link = this.temp.resolve("activity-link.json");
+    try {
+      Files.createSymbolicLink(link, ledger.getFileName());
+    } catch (IOException | UnsupportedOperationException unsupported) {
+      Assumptions.assumeTrue(false, "本机不支持创建符号链接，跳过");
+    }
+    assertTrue(SparkProfileFiles.readActivity(link, 8).isEmpty(), "软链接不跟随（可能是别人指向别处的手柄）");
+  }
+
+  @Test
+  void activityPathResolvesAgainstTheServerRoot() {
+    Path root = Path.of("C:/srv/mc").toAbsolutePath().normalize();
+
+    assertEquals(root.resolve("plugins/spark/a.sparkprofile"),
+        SparkProfileFiles.activityPath("plugins\\spark\\a.sparkprofile", root).orElseThrow(),
+        "Windows 风格的反斜杠要能落成真实路径");
+    assertEquals(root.resolve("plugins/spark/a.sparkprofile"),
+        SparkProfileFiles.activityPath("./plugins/spark/a.sparkprofile", root).orElseThrow());
+    assertEquals(Path.of("D:/elsewhere/a.sparkprofile").toAbsolutePath().normalize(),
+        SparkProfileFiles.activityPath("D:\\elsewhere\\a.sparkprofile", root).orElseThrow(),
+        "绝对路径原样保留");
+
+    assertTrue(SparkProfileFiles.activityPath("plugins\\spark\\a.sparkprofile", null).isEmpty(),
+        "相对路径拿不到服务器根就无法解析");
+    assertTrue(SparkProfileFiles.activityPath("", root).isEmpty());
+    assertTrue(SparkProfileFiles.activityPath(null, root).isEmpty());
+    assertTrue(SparkProfileFiles.activityPath("plugins\\spark\\a\u0000.sparkprofile", root).isEmpty(),
+        "控制字符一律拒绝");
+    assertTrue(SparkProfileFiles.activityPath("a".repeat(600), root).isEmpty(), "过长的值直接丢");
+  }
+
+  @Test
+  void ledgerEntryResolvesToTheVerifiableProfile(@TempDir Path root) throws IOException {
+    Path sparkDir = Files.createDirectories(root.resolve("plugins").resolve("spark"));
+    Path profile = sparkDir.resolve("profile-2026-11-21_21.04.13.sparkprofile");
+    Files.write(profile, profileWithComment(MARKER));
+    Path ledger = sparkDir.resolve(SparkProfileFiles.ACTIVITY_FILE);
+    Files.writeString(ledger, "[" + ledgerJson(1_795_266_253_098L,
+        "plugins\\spark\\profile-2026-11-21_21.04.13.sparkprofile") + "]", StandardCharsets.UTF_8);
+
+    SparkProfileFiles.ActivityEntry entry = SparkProfileFiles.readActivity(ledger, 4).get(0);
+    Path resolved = SparkProfileFiles.activityPath(entry.value(), root).orElseThrow();
+
+    assertEquals(profile, resolved);
+    assertTrue(SparkProfileFiles.verifyOwnedProfile(List.of(sparkDir), resolved, MARKER).ok(),
+        "账本给的路径 + 四道校验 = 本次文件");
+  }
+
+  // ------------------------------------------------------------------
+  // 四道校验
+  // ------------------------------------------------------------------
+
+  @Test
+  void everyVerificationGateReportsItsOwnReason(@TempDir Path sparkDir) throws IOException {
+    Path good = sparkDir.resolve("profile-2026-11-21_21.00.00.sparkprofile");
+    Files.write(good, profileWithComment(MARKER));
+    SparkProfileFiles.Checked pass = SparkProfileFiles.verifyOwnedProfile(List.of(sparkDir), good, MARKER);
+    assertTrue(pass.ok(), "四道全过才算本次文件");
+    assertEquals(good, pass.path());
+    assertNull(pass.reason());
+
+    Path foreignName = sparkDir.resolve("notes.txt");
+    Files.write(foreignName, profileWithComment(MARKER));
+    assertTrue(SparkProfileFiles.verifyOwnedProfile(List.of(sparkDir), foreignName, MARKER)
+        .reason().contains("文件名"));
+
+    Path empty = sparkDir.resolve("profile-2026-11-21_21.00.01.sparkprofile");
+    Files.write(empty, new byte[0]);
+    assertTrue(SparkProfileFiles.verifyOwnedProfile(List.of(sparkDir), empty, MARKER)
+        .reason().contains("文件为空"));
+
+    Path huge = sparkDir.resolve("profile-2026-11-21_21.00.02.sparkprofile");
+    try (RandomAccessFile file = new RandomAccessFile(huge.toFile(), "rw")) {
+      file.setLength(SparkProfileFiles.MAX_PROFILE_BYTES + 1L);
+    }
+    assertTrue(SparkProfileFiles.verifyOwnedProfile(List.of(sparkDir), huge, MARKER)
+        .reason().contains("超出大小上限"), "被上限拒必须说清原因（dump 里不再静默）");
+
+    Path outside = Files.createDirectories(sparkDir.getParent().resolve("spark-outside-verify"))
+        .resolve("profile-2026-11-21_21.00.03.sparkprofile");
+    Files.write(outside, profileWithComment(MARKER));
+    assertTrue(SparkProfileFiles.verifyOwnedProfile(List.of(sparkDir), outside, MARKER)
+        .reason().contains("不在 Spark 数据目录内"));
+
+    Path otherSession = sparkDir.resolve("profile-2026-11-21_21.00.04.sparkprofile");
+    Files.write(otherSession, profileWithComment("mxnet-ffffffffffffffffffffffffffffffff"));
+    assertTrue(SparkProfileFiles.verifyOwnedProfile(List.of(sparkDir), otherSession, MARKER)
+        .reason().contains("注释"));
+
+    Path missing = sparkDir.resolve("profile-2026-11-21_21.00.05.sparkprofile");
+    assertTrue(SparkProfileFiles.verifyOwnedProfile(List.of(sparkDir), missing, MARKER)
+        .reason().contains("不存在"));
+
+    assertFalse(SparkProfileFiles.verifyOwnedProfile(List.of(sparkDir), null, MARKER).ok());
+    assertFalse(SparkProfileFiles.verifyOwnedProfile(null, good, null).ok(), "没有标记就没有归属");
+  }
+
+  @Test
+  void symlinkedProfileIsRejectedEvenInsideTheDirectory(@TempDir Path sparkDir) throws IOException {
+    Path real = sparkDir.resolve("profile-2026-11-21_21.00.06.sparkprofile");
+    Files.write(real, profileWithComment(MARKER));
+    Path link = sparkDir.resolve("profile-2026-11-21_21.00.07.sparkprofile");
+    try {
+      Files.createSymbolicLink(link, real.getFileName());
+    } catch (IOException | UnsupportedOperationException unsupported) {
+      Assumptions.assumeTrue(false, "本机不支持创建符号链接，跳过");
+    }
+
+    assertTrue(SparkProfileFiles.verifyOwnedProfile(List.of(sparkDir), link, MARKER)
+        .reason().contains("符号链接"));
+  }
+
+  // ------------------------------------------------------------------
+  // 阈值、去重键与诊断清单
+  // ------------------------------------------------------------------
+
+  @Test
+  void profileLimitIsSixtyFourMiB() {
+    assertEquals(64L * 1024 * 1024, SparkProfileFiles.MAX_PROFILE_BYTES);
+    assertEquals(64L, SparkProfileFiles.maxProfileMegabytes());
+    assertTrue(SparkProfileFiles.acceptableSize(SparkProfileFiles.MAX_PROFILE_BYTES));
+    assertFalse(SparkProfileFiles.acceptableSize(SparkProfileFiles.MAX_PROFILE_BYTES + 1L));
+  }
+
+  @Test
+  void dedupeKeyIncludesSizeSoHalfWrittenFilesAreNotStuck() {
+    Path file = this.temp.resolve("profile-2026-11-21_21.00.08.sparkprofile");
+    String key = SparkProfileFiles.dedupeKey(new SparkProfileFiles.Candidate(file, 7L, 12L));
+
+    assertEquals("profile-2026-11-21_21.00.08.sparkprofile@7@12", key);
+    assertNotEquals(key, SparkProfileFiles.dedupeKey(new SparkProfileFiles.Candidate(file, 7L, 13L)),
+        "同一文件长齐后（字节数变了）必须换一个键，否则半写状态被永久跳过");
+    assertNotEquals(key, SparkProfileFiles.dedupeKey(new SparkProfileFiles.Candidate(file, 8L, 12L)),
+        "修改时间变了也要换键");
+    assertEquals("", SparkProfileFiles.dedupeKey(null));
+  }
+
+  @Test
+  void recentProfilesReportOversizedFilesForDiagnostics() throws IOException {
+    Path huge = this.temp.resolve("profile-2026-11-21_21.00.09.sparkprofile");
+    try (RandomAccessFile file = new RandomAccessFile(huge.toFile(), "rw")) {
+      file.setLength(SparkProfileFiles.MAX_PROFILE_BYTES + 1L);
+    }
+    Path normal = write("profile-2026-11-21_21.00.10.sparkprofile", profileWithComment(MARKER));
+
+    List<SparkProfileFiles.Entry> entries = SparkProfileFiles.recentProfiles(this.temp, Long.MIN_VALUE, 5);
+
+    assertEquals(2, entries.size(), "诊断清单不做大小过滤：超上限的文件也必须报出来");
+    assertTrue(entries.stream().anyMatch(entry -> entry.path().equals(huge)
+        && entry.size() == SparkProfileFiles.MAX_PROFILE_BYTES + 1L));
+    assertTrue(entries.stream().anyMatch(entry -> entry.path().equals(normal)));
+    assertTrue(SparkProfileFiles.recentProfiles(null, Long.MIN_VALUE, 5).isEmpty());
+    assertTrue(SparkProfileFiles.recentProfiles(this.temp, Long.MIN_VALUE, 0).isEmpty());
+  }
+
+  @Test
+  void candidatesAreReturnedNewestFirst() throws IOException {
+    Path oldest = write("profile-2026-11-21_20.00.00.sparkprofile", profileWithComment(MARKER));
+    Files.setLastModifiedTime(oldest, FileTime.fromMillis(1_000L));
+    Path newest = write("profile-2026-11-21_20.00.01.sparkprofile", profileWithComment(MARKER));
+    Files.setLastModifiedTime(newest, FileTime.fromMillis(3_000L));
+    Path middle = write("profile-2026-11-21_20.00.02.sparkprofile", profileWithComment(MARKER));
+    Files.setLastModifiedTime(middle, FileTime.fromMillis(2_000L));
+
+    List<Path> order = SparkProfileFiles.candidates(this.temp, Long.MIN_VALUE, 8).stream()
+        .map(SparkProfileFiles.Candidate::path)
+        .toList();
+
+    assertEquals(List.of(newest, middle, oldest), order, "候选按修改时间降序：前 N 个才是「最近的」");
+    assertEquals(List.of(newest),
+        SparkProfileFiles.candidates(this.temp, Long.MIN_VALUE, 1).stream()
+            .map(SparkProfileFiles.Candidate::path)
+            .toList(),
+        "截断发生在排序之后，否则「取前 8 个」拿到的会是目录枚举顺序");
+  }
+
+  @Test
+  void stampOfIsNullForMissingOrLinkedFiles(@TempDir Path sparkDir) throws IOException {
+    assertNull(SparkProfileFiles.stampOf(null));
+    assertNull(SparkProfileFiles.stampOf(sparkDir.resolve("missing.json")));
+
+    Path ledger = sparkDir.resolve(SparkProfileFiles.ACTIVITY_FILE);
+    Files.writeString(ledger, ACTIVITY_FIXTURE, StandardCharsets.UTF_8);
+    SparkProfileFiles.Stamp stamp = SparkProfileFiles.stampOf(ledger);
+    assertEquals(Files.size(ledger), stamp.size());
+
+    Path link = sparkDir.resolve("activity-link.json");
+    try {
+      Files.createSymbolicLink(link, ledger.getFileName());
+    } catch (IOException | UnsupportedOperationException unsupported) {
+      Assumptions.assumeTrue(false, "本机不支持创建符号链接，跳过");
+    }
+    assertNull(SparkProfileFiles.stampOf(link), "软链接不当作账本");
+  }
+
+  /** 一条 activity.json 记录的 JSON 文本（转义由这里统一处理，避免各处手写反斜杠）。 */
+  private static String ledgerJson(long time, String rawPath) {
+    return "{\"time\":" + time + ",\"type\":\"Profiler\",\"data\":{\"type\":\"file\",\"value\":\""
+        + rawPath.replace("\\", "\\\\") + "\"}}";
   }
 
   // ------------------------------------------------------------------

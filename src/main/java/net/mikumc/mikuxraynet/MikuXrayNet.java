@@ -384,7 +384,7 @@ public final class MikuXrayNet extends JavaPlugin {
   /**
    * 中断在途诊断转储会话（停用 / 热重载）。
    *
-   * <p><b>为什么必须主动中断</b>：转储会话在等 Spark 的结果，最多占用闸门约 65 秒。停用时若不中断，
+   * <p><b>为什么必须主动中断</b>：转储会话在等 Spark 的结果，最多占用闸门约 110 秒。停用时若不中断，
    * 异步写盘可能落在已停用的插件上（抛 {@code IllegalPluginAccessException}），闸门则一直占着；热重载
    * 时不中断，窗口里的计数会被重建，写出来的增量是「半旧半新」的——两种情况都会产出一份不可信的 dump。
    *

@@ -16,9 +16,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
@@ -43,6 +46,22 @@ import org.bukkit.plugin.PluginManager;
  * 异步完成时的链接既拿不可靠、也不该被当作结果来源。因此这里只借 Spark 的「命令 + 落盘」，
  * 归属判定与上传都由我们自己完成。
  *
+ * <p><b>怎么知道文件在哪（三条路径，优先级从高到低）</b>
+ * <ol>
+ *   <li><b>回执</b>：Spark 落盘后会回 {@code Data has been written to: <path>}；这条路径最直接，
+ *       但前提是我们把命令的 {@code CommandSender} <b>强引用</b>住（Spark 内部只持弱引用，30 秒后回执会被 GC）；</li>
+ *   <li><b>账本</b>：Spark 每次落盘都往 {@code <spark 数据目录>/activity.json} 追加一条
+ *       {@code {time, type:"Profiler", data:{type:"file", value:"<相对服务器根的路径>"}}}，
+ *       这条路不依赖 sender 是否还活着，是主路径；</li>
+ *   <li><b>目录轮询</b>：定制构建不写账本时的兜底，按「修改时间窗口 + 注释逐字节相等」认领。</li>
+ * </ol>
+ * 三条路得到的路径都要过同一组<b>四道校验</b>（真实路径在 Spark 目录内 / 文件名合规 / 0&lt;大小≤上限 /
+ * 注释与本轮标记逐字节相等，见 {@link SparkProfileFiles#verifyOwnedProfile(List, Path, String)}）才会被上传。
+ *
+ * <p><b>失败必须能自解释</b>：等到超时/上传失败时，返回段会附上自诊断（Spark 最近几句回执、候选目录里
+ * 本次开始之后的新文件及其大小与注释比对、账本里的本次新条目）。三种完全不同的原因——没落盘、落盘了但被拒、
+ * 落盘了但不是本次——因此在 dump 里不再长成同一句话。
+ *
  * <p><b>线程纪律</b>：{@link #start()} 立即返回，绝不做 IO：命令派发投到全局区域调度器
  * （Paper = 主线程、Folia = 全局区域线程），文件轮询与 HTTP 上传投到异步调度器。
  * 全程不 sleep、不阻塞区域线程 / Netty，轮询频率与次数都有上限。
@@ -56,47 +75,75 @@ import org.bukkit.plugin.PluginManager;
  * 发送 stop / cancel，也不会打断管理员手工启动的采样。
  *
  * <p><b>数据边界</b>：只读 {@code <plugins>/spark}（或独立 spark 插件的实际数据目录）里、comment 严格等于
- * 本次标记的那一个文件；不解析日志、不跟随软链接、不上传 dump 本体或任何令牌；链接只出现在返回给执行者的
- * 文本里（日志最多记状态，不记 URL）。
+ * 本次标记的那一个文件，以及同目录下 spark 自己的 {@code activity.json}（只读、不跟随软链接）；不解析日志、
+ * 不上传 dump 本体或任何令牌；链接只出现在返回给执行者的文本里（日志最多记状态，不记 URL）。
  */
 public final class SparkDumpCapture {
 
   /** 本次采样窗口（秒）。取 30 秒是 Spark 自己的建议阈值：低于 30 秒它会提示结果精度不足。 */
   public static final int PROFILE_SECONDS = 30;
 
+  /**
+   * 采样结束到「应该落盘」之间的宽限（秒）。
+   *
+   * <p>Spark 的 finalize 时长没有上界：零人小服实测 2~3 秒，几十人在线的生产服可能久得多。
+   * 因此这里<b>与 {@code --timeout} 解耦</b>，单独给 60 秒——旧口径把「30 秒采样 + 15 秒余量」写死成 45 秒，
+   * 正好卡在「落盘比预期慢一点」的边缘上，于是生产上看到的全是同一句「超时」。
+   */
+  static final int SAVE_GRACE_SECONDS = 60;
+
+  /** 等待落盘的毫秒上限（采样窗口 + 宽限）。 */
+  static final long FILE_WAIT_MILLIS = (PROFILE_SECONDS + SAVE_GRACE_SECONDS) * 1000L;
+
+  /**
+   * 留给上传的时间预算（秒）。
+   *
+   * <p>整条命令的最坏耗时 = {@link #FILE_WAIT_MILLIS} + 本预算，也就是 {@link #MAX_WAIT_SECONDS}：
+   * 连接 10 秒 + 读取 10 秒的 HTTP 预算。真正的失败（Spark 自报失败、命令没进 spark）会被
+   * {@link #quickFailure()} 与「无任何回执」判定提前收尾，不必等满这个上限。
+   */
+  private static final int UPLOAD_BUDGET_SECONDS = 20;
+
   /** 一次采样的总时限（秒）：等待落盘 + 上传。超过即 fail-soft 返回「未完成」。 */
-  public static final int MAX_WAIT_SECONDS = 65;
+  public static final int MAX_WAIT_SECONDS = PROFILE_SECONDS + SAVE_GRACE_SECONDS + UPLOAD_BUDGET_SECONDS;
 
   /** 轮询 Spark 目录的周期（毫秒）。 */
   private static final long POLL_PERIOD_MILLIS = 500L;
 
   /**
-   * 留给上传的时间预算（秒）。
+   * 派发完成后等多久才判定「Spark 一句话都没回」（毫秒）。
    *
-   * <p>等待落盘的上限 = {@link #MAX_WAIT_SECONDS} 减去它：Spark 在 {@link #PROFILE_SECONDS} 秒后写完文件，
-   * 45 秒的窗口足够覆盖一次慢磁盘/卡顿；剩下的 20 秒正好是「连接 10 秒 + 读取 10 秒」的 HTTP 预算，
-   * 因此整条命令的最坏耗时仍然落在 {@link #MAX_WAIT_SECONDS} 秒这个对外口径内。
+   * <p>Spark 的回执是在 {@code dispatch} 内<b>同步</b>发出的，正常情况派发返回时缓冲里就有了
+   * {@code Profiler is now running!}。留 2.5 秒只是给「同一 tick 里其它插件也在往 sender 里塞东西」留余量；
+   * 这一步只处理「命令根本没进 spark」（被别名劫持、插件自我禁用）的病态情形，命中时状态是
+   * {@code 未执行}，调用方照样会把窗口收回本地口径。
    */
-  private static final int UPLOAD_BUDGET_SECONDS = 20;
-
-  /** 等待落盘的毫秒上限。 */
-  static final long FILE_WAIT_MILLIS = (MAX_WAIT_SECONDS - UPLOAD_BUDGET_SECONDS) * 1000L;
-
-  /** 命令派发后多久检查一次回执提示（毫秒）：派发本身是同步执行完的，留一点余量给调度延迟。 */
-  private static final long HINT_CHECK_MILLIS = 1250L;
+  private static final long HINT_SETTLE_MILLIS = 2500L;
 
   /** 候选文件的时间下界余量（毫秒）：只接受「本次开始前两分钟内」修改过的文件，避免误读旧采样。 */
   private static final long SESSION_SLACK_MILLIS = 120_000L;
 
+  /** 账本时间的容差（毫秒）：取「不早于本次开始前 5 秒」的记录，容忍两次读时钟的抖动。 */
+  private static final long ACTIVITY_SLACK_MILLIS = 5_000L;
+
   /** 每轮扫描最多处理多少个候选（解析头部的次数因此有界）。 */
   private static final int MAX_CANDIDATES_PER_SCAN = 8;
 
-  /** 已解析并排除过的候选上限（文件名 + 修改时间去重）。 */
+  /** 已解析并排除过的候选上限（文件名 + 修改时间 + 字节数去重）。 */
   private static final int MAX_INSPECTED = 256;
+
+  /** 一次账本读取最多取多少条记录（只为找到「本次」那一条）。 */
+  private static final int MAX_ACTIVITY_ENTRIES = 8;
 
   /** 回执提示最多记多少行、每行多长（纯提示用途，内存有界）。 */
   private static final int MAX_FEEDBACK_LINES = 24;
   private static final int MAX_FEEDBACK_CHARS = 200;
+
+  /** 自诊断的边界：回执行数、每个目录的文件数、整段行数、单行字符数。 */
+  private static final int MAX_DIAGNOSTIC_RECEIPTS = 6;
+  private static final int MAX_DIAGNOSTIC_FILES = 5;
+  private static final int MAX_DIAGNOSTIC_LINES = 24;
+  private static final int MAX_DIAGNOSTIC_CHARS = 200;
 
   /** 返回文本的标题行：调用方按这一行定位整段（前导换行让拼接处不漏行）。 */
   private static final String TITLE = "\n---- Spark 采样 ----\n";
@@ -113,9 +160,14 @@ public final class SparkDumpCapture {
   /** 未启动时的窗口行：明说没有性能记录，绝不出现「30 秒 / 全部线程」字样。 */
   private static final String WINDOW_NOT_SAMPLED = "窗口：未采样（Spark 未启动，无性能记录）";
 
-  /** 已启动时的窗口行。 */
+  /**
+   * 已启动时的窗口行。
+   *
+   * <p>刻意<b>不写</b>「由 Spark 到期自动落盘」：失败/超时分支里那句话与「未完成」自相矛盾。
+   * 落盘是 Spark 侧的动作，我们只承诺「采样窗口 30 秒、全部线程、间隔 10 毫秒」。
+   */
   private static final String WINDOW_SAMPLED = "窗口：" + PROFILE_SECONDS
-      + " 秒（Spark 原生采样：全部线程、间隔 10 毫秒、由 Spark 到期自动落盘）";
+      + " 秒（Spark 原生采样：全部线程、间隔 10 毫秒；落盘由 Spark 侧完成）";
 
   /** 默认上传端点（Spark 官方；与 SparkPlatform 的默认配置一致）。 */
   private static final String DEFAULT_BYTEBIN = "https://spark-usercontent.lucko.me/";
@@ -144,6 +196,58 @@ public final class SparkDumpCapture {
   /** 因「Spark 不可用」而不执行的固定说明。 */
   private static final String NOT_REQUESTED_NOTE = "本次不请求 Spark、不上传任何数据。";
 
+  /** 回执里「真实落盘路径」的前缀（Spark 的 SamplerModule 原文）。 */
+  private static final String WRITTEN_PREFIX = "data has been written to:";
+
+  /** 回执四态：被服务端全局配置禁用。 */
+  static final String HINT_DISABLED = "disabled";
+
+  /** 回执四态：已有采样在进行（我们没有打断它）。 */
+  static final String HINT_BUSY = "busy";
+
+  /** 回执四态：Spark 已明确启动（{@code Profiler is now running!}）。 */
+  static final String HINT_STARTED = "started";
+
+  /** 回执四态：Spark 一句话都没回（命令可能根本没进 spark）。 */
+  static final String HINT_SILENT = "silent";
+
+  /** 第五类（非四态之一）：Spark 自己报了错，直接收尾。 */
+  static final String HINT_ERROR = "error";
+
+  /**
+   * Spark 自报失败里<b>无歧义</b>的短语：跑起来了却保存/上传/内部出错，命中即收尾。
+   */
+  private static final String[] HARD_ERROR_PHRASES = {
+      "an error occurred whilst saving",
+      "error whilst uploading",
+      "profiler operation failed unexpectedly",
+  };
+
+  /**
+   * 「某项能力不支持」类提示：<b>只有 Spark 从未确认启动</b>时才算失败。
+   *
+   * <p>这些短语在采样<b>已经在跑</b>时也可能出现在回执里（例如某项可选能力不可用），
+   * 若一律当失败处理，就会把一次正常采样直接丢掉——正是本功能最不能接受的回归。
+   */
+  private static final String[] SOFT_ERROR_PHRASES = {
+      "is not supported on your system",
+  };
+
+  /** ANSI 转义序列（控制台回执里可能带）：ESC + {@code [...]} + 收尾字母。 */
+  private static final Pattern ANSI = Pattern.compile("\033\\[[0-9;]*[A-Za-z]");
+
+  /** MiniMessage 风格标签：自诊断里不需要格式，剥掉避免把标签当成正文。 */
+  private static final Pattern TAG = Pattern.compile("<[^<>\\s]{1,40}>");
+
+  /** 任何形态的 URL：dump 里只允许「完整链接」这一行带链接，其余位置一律隐去。 */
+  private static final Pattern URL = Pattern.compile("[A-Za-z][A-Za-z0-9+.-]*://\\S+");
+
+  /** 控制字符（含换行、制表与 ESC）：自诊断是单行文本。 */
+  private static final Pattern CONTROL = Pattern.compile("\\p{Cntrl}");
+
+  /** 连续空白：压成单个空格。 */
+  private static final Pattern BLANKS = Pattern.compile("\\s+");
+
   private final Plugin plugin;
   private final CompletableFuture<String> result = new CompletableFuture<>();
   private final AtomicBoolean started = new AtomicBoolean();
@@ -157,14 +261,32 @@ public final class SparkDumpCapture {
    */
   private final AtomicBoolean settled = new AtomicBoolean();
   private final List<String> feedback = Collections.synchronizedList(new ArrayList<>());
-  /** 已解析并排除过的候选（文件名@修改时间）：同一文件不重复读，IO 有界。 */
-  private final java.util.Set<String> inspected =
-      java.util.concurrent.ConcurrentHashMap.newKeySet();
+  /** 已解析并排除过的候选（文件名@修改时间@字节数）：同一份内容不重复读，IO 有界。 */
+  private final Set<String> inspected = ConcurrentHashMap.newKeySet();
+  /** 每个 activity.json 上一次解析时的戳：账本没变就不重复解析（轮询是 500 毫秒一拍）。 */
+  private final Map<Path, SparkProfileFiles.Stamp> activityStamps = new ConcurrentHashMap<>();
 
   private volatile ScheduledTask pollTask;
   private volatile String marker = "";
   private volatile long startedAtMillis;
-  private volatile boolean hintChecked;
+  /**
+   * 命令的 {@link CommandSender} <b>强引用</b>。
+   *
+   * <p>Spark 侧用 {@code WeakReference<CommandSender>} 广播回执（{@code CommandResponseHandler}），
+   * 一旦这里的局部变量出栈，30 秒后的 {@code The active profiler has completed!} /
+   * {@code Data has been written to: …} / {@code An error occurred whilst saving the data.}
+   * 就再也到不了我们手里。存成字段是本类唯一需要「主动记住」的东西，收尾时置 null。
+   */
+  private volatile CommandSender dispatchSender;
+  /** 命令是否已派发完成（「Spark 连一句话都没回」的判定前提）。 */
+  private volatile boolean dispatchDone;
+  private volatile long dispatchDoneAtMillis;
+  /** 回执四态是否已判定（只在派发完成后判一次）。 */
+  private volatile boolean hintClassified;
+  /** 判定出的回执四态（写进自诊断）。 */
+  private volatile String hintState = "unknown";
+  /** 账本/回执给出路径但没过四道校验时的最后一条原因（写进自诊断）。 */
+  private volatile String activityRejection;
 
   /**
    * @param plugin 插件实例（用于调度与日志）；为 {@code null} 时 {@link #start()} 直接返回「未执行」，
@@ -216,7 +338,7 @@ public final class SparkDumpCapture {
    *
    * <p>返回的 {@link CompletionStage} <b>永不异常完成</b>：最迟约 {@link #MAX_WAIT_SECONDS} 秒以一段固定格式的
    * 中文文本完成（以 {@code \n---- Spark 采样 ----\n} 开头、以换行结尾），内容只有窗口、状态、上传后的完整链接
-   * 与必要的说明；不含本地路径、标记或令牌。重复调用返回同一个 stage。
+   * 与必要的说明/自诊断；不含本地绝对路径、标记或令牌。重复调用返回同一个 stage。
    */
   public CompletionStage<String> start() {
     if (!this.started.compareAndSet(false, true)) {
@@ -263,6 +385,7 @@ public final class SparkDumpCapture {
     if (!this.closed.compareAndSet(false, true)) {
       return;
     }
+    this.dispatchSender = null;
     cancelPoll();
     settle(render("已取消（插件停用或调用方放弃等待）", null, null));
   }
@@ -304,7 +427,9 @@ public final class SparkDumpCapture {
         return;
       }
       java.util.function.Consumer<Component> forwarded = this::captureFeedback;
+      // 强引用住 sender：Spark 内部只持弱引用，这段引用一旦出栈，后续回执就没人收了
       CommandSender sender = server.createCommandSender(forwarded);
+      this.dispatchSender = sender;
       boolean accepted = commands.dispatch(sender, commandLine(this.marker));
       if (!accepted) {
         settle(render("未执行（spark 命令拒绝了本次请求）", null, NOT_REQUESTED_NOTE));
@@ -313,6 +438,10 @@ public final class SparkDumpCapture {
       log(Level.FINE, "已提交 Spark 采样（窗口 " + PROFILE_SECONDS + " 秒），等待落盘");
     } catch (Throwable throwable) {
       settle(render("未执行（派发 Spark 命令失败：" + describe(throwable) + "）", null, NOT_REQUESTED_NOTE));
+    } finally {
+      // 无论成败都记「派发已结束」：它是「Spark 一句话都没回」判定的唯一前提
+      this.dispatchDoneAtMillis = System.currentTimeMillis();
+      this.dispatchDone = true;
     }
   }
 
@@ -350,14 +479,13 @@ public final class SparkDumpCapture {
         return;
       }
       long elapsed = System.currentTimeMillis() - this.startedAtMillis;
-      if (!this.hintChecked && elapsed >= HINT_CHECK_MILLIS) {
-        this.hintChecked = true;
-        Optional<String> quick = quickFailure();
-        if (quick.isPresent()) {
-          settle(quick.get());
-          return;
-        }
+      // ① 回执里的「已经明确失败」每一拍都看：Spark 自报失败时不必等满窗口
+      Optional<String> quick = quickFailure();
+      if (quick.isPresent()) {
+        settle(quick.get());
+        return;
       }
+      // ② 找文件（回执路径 → 账本 → 目录轮询，内部已过四道校验）
       Path file = locateOwnedProfile();
       if (file != null) {
         // 先占闸门再上传：上传有公网副作用，绝不允许超时/取消路径与它重复收尾
@@ -371,28 +499,73 @@ public final class SparkDumpCapture {
         complete(uploadAndDescribe(file));
         return;
       }
+      // ③ 回执四态：只在派发完成后判一次；一句都没回时不必等满窗口
+      if (!this.hintClassified && this.dispatchDone
+          && System.currentTimeMillis() - this.dispatchDoneAtMillis >= HINT_SETTLE_MILLIS) {
+        this.hintClassified = true;
+        List<String> lines = snapshotFeedback();
+        this.hintState = classifyHint(lines);
+        // 判据是「一句话都没有」，不是「没有我们认识的那句话」：Spark 换了措辞时宁可继续等，
+        // 也不能凭一次未识别的分类就否掉一次真在跑的采样
+        if (lines.isEmpty()) {
+          settle(render(NOT_STARTED + "（Spark 连一句话都没回，命令可能没有进入 spark）", null,
+              NOT_REQUESTED_NOTE));
+          return;
+        }
+      }
+      // ④ 兜底：等满落盘窗口即收尾，并把「为什么」写进自诊断
       if (elapsed >= FILE_WAIT_MILLIS) {
-        settle(render("未完成（等待 Spark 生成采样文件超时）", null, BACKGROUND_NOTE));
+        settle(render("未完成（等待 Spark 生成采样文件超时）", null, BACKGROUND_NOTE, diagnostics()));
       }
     } catch (Throwable throwable) {
-      settle(render("未完成（处理 Spark 采样时出错：" + describe(throwable) + "）", null, BACKGROUND_NOTE));
+      settle(render("未完成（处理 Spark 采样时出错：" + describe(throwable) + "）", null, BACKGROUND_NOTE,
+          diagnostics()));
     }
   }
 
   /**
-   * 回执提示的快速失败：Spark 自己会拒绝的两种情况，无需等满整个窗口。
+   * 回执的快速失败：Spark 自己已经明确拒绝/失败的几种情形，无需等满整个窗口。
    *
-   * <p><b>只作提示</b>：这两条分支都只把「已经被明确拒绝」的情形提前收尾；真正的结论仍以文件匹配为准。
+   * <p><b>只作提示</b>：这些分支都只把「已经被 Spark 明确拒绝」的情形提前收尾；真正的结论仍以文件匹配为准。
    */
   private Optional<String> quickFailure() {
     List<String> lines = snapshotFeedback();
-    if (hintsDisabled(lines)) {
-      return Optional.of(render("未执行（Spark 已被服务端的全局配置禁用）", null, NOT_REQUESTED_NOTE));
+    String hint = classifyHint(lines);
+    if (HINT_DISABLED.equals(hint)) {
+      return Optional.of(render(NOT_STARTED + "（Spark 已被服务端的全局配置禁用）", null, NOT_REQUESTED_NOTE));
     }
-    if (hintsBusy(lines)) {
-      return Optional.of(render("未执行（已有 Spark 采样在进行，未打断它）", null, NOT_REQUESTED_NOTE));
+    if (HINT_BUSY.equals(hint)) {
+      return Optional.of(render(NOT_STARTED + "（已有 Spark 采样在进行，未打断它）", null, NOT_REQUESTED_NOTE));
+    }
+    if (HINT_ERROR.equals(hint)) {
+      String detail = sparkError(lines).orElse("原因未知");
+      return Optional.of(render("未完成（Spark 自报失败：" + receiptLine(detail) + "）", null,
+          BACKGROUND_NOTE, diagnostics()));
     }
     return Optional.empty();
+  }
+
+  /**
+   * 回执四态判定（外加「自报失败」一类）。
+   *
+   * <p>顺序即优先级：{@code disabled} / {@code busy} 是「本次 Spark 根本没跑」，
+   * {@code error} 是「跑了但明确失败」；{@code started} 表示看到启动回执；其余一律 {@code silent}。
+   * 纯函数，可离线单测。
+   */
+  static String classifyHint(List<String> lines) {
+    if (hintsDisabled(lines)) {
+      return HINT_DISABLED;
+    }
+    if (hintsBusy(lines)) {
+      return HINT_BUSY;
+    }
+    if (sparkError(lines).isPresent()) {
+      return HINT_ERROR;
+    }
+    if (hintsStarted(lines)) {
+      return HINT_STARTED;
+    }
+    return HINT_SILENT;
   }
 
   /** 是否收到「Spark 未启用」的回执（Paper 内置 spark 的 CommandImpl 在禁用时只回这一句）。 */
@@ -405,22 +578,54 @@ public final class SparkDumpCapture {
     return containsAny(lines, "profiler is already running");
   }
 
-  private static boolean containsAny(List<String> lines, String... needles) {
+  /** 是否收到「采样已启动」的回执（{@code Profiler is now running!} / {@code Starting a new profiler…}）。 */
+  static boolean hintsStarted(List<String> lines) {
+    return containsAny(lines, "profiler is now running", "starting a new profiler");
+  }
+
+  /**
+   * Spark 自己报的失败：返回命中的那一行原文（未清洗），没有则空。
+   *
+   * <p>命中时「文件永远不会出现」已经是 Spark 自己说过的结论，继续空等毫无意义。
+   * 分两档判定，避免误杀正常采样：
+   * <ol>
+   *   <li><b>硬失败</b>（保存/上传/内部错误）：任何情况下都算；</li>
+   *   <li><b>软失败</b>（「某项能力在你这台机器上不支持」）：只有当 Spark <b>从未</b>确认启动时才算——
+   *       已经在跑时这类提示与本次采样是否成功无关。</li>
+   * </ol>
+   */
+  static Optional<String> sparkError(List<String> lines) {
+    Optional<String> hard = firstPhrase(lines, HARD_ERROR_PHRASES);
+    if (hard.isPresent()) {
+      return hard;
+    }
+    if (hintsStarted(lines)) {
+      return Optional.empty();
+    }
+    return firstPhrase(lines, SOFT_ERROR_PHRASES);
+  }
+
+  private static Optional<String> firstPhrase(List<String> lines, String[] phrases) {
     if (lines == null || lines.isEmpty()) {
-      return false;
+      return Optional.empty();
     }
     for (String line : lines) {
       if (line == null) {
         continue;
       }
       String lower = line.toLowerCase(Locale.ROOT);
-      for (String needle : needles) {
-        if (lower.contains(needle)) {
-          return true;
+      for (String phrase : phrases) {
+        if (lower.contains(phrase)) {
+          return Optional.of(line);
         }
       }
     }
-    return false;
+    return Optional.empty();
+  }
+
+  /** 回执里是否出现任一短语（大小写不敏感；与失败短语共用同一套匹配，避免两处各写一份）。 */
+  private static boolean containsAny(List<String> lines, String... needles) {
+    return firstPhrase(lines, needles).isPresent();
   }
 
   private void captureFeedback(Component component) {
@@ -443,6 +648,23 @@ public final class SparkDumpCapture {
     synchronized (this.feedback) {
       return this.feedback.isEmpty() ? List.of() : List.copyOf(this.feedback);
     }
+  }
+
+  /**
+   * 从 Spark 的「{@code Data has been written to: <path>}」回执里取出路径原文。
+   *
+   * <p>只认这一种句式（大小写不敏感），取冒号之后的全部内容；拿不到就是 {@code null}，绝不猜测。
+   */
+  static String writtenPathFrom(String line) {
+    if (line == null) {
+      return null;
+    }
+    int at = line.toLowerCase(Locale.ROOT).indexOf(WRITTEN_PREFIX);
+    if (at < 0) {
+      return null;
+    }
+    String raw = line.substring(at + WRITTEN_PREFIX.length()).strip();
+    return raw.isEmpty() ? null : raw;
   }
 
   // ------------------------------------------------------------------
@@ -501,30 +723,342 @@ public final class SparkDumpCapture {
   }
 
   /**
-   * 在当前候选目录里找本次匹配的采样文件；找不到返回 {@code null}。
+   * 服务器根目录：activity.json 里的路径是「相对服务器根」的。
    *
-   * <p><b>IO 有界</b>：每轮只取「修改时间不早于本次开始前两分钟」的少量候选，且已解析并排除过的
-   * （文件名 + 修改时间）不再重读——一次采样期间对同一个别人的文件只会读一次头部。
+   * <p>优先问服务端要世界容器（就是根目录），拿不到再由 {@code <plugins>} 反推；都不成立时退回
+   * 第一个候选目录——那种情况下相对路径会解析歪，但四道校验会把歪掉的路径全部拒掉，不会上传错文件。
+   */
+  private Path serverRoot(List<Path> directories) {
+    try {
+      Server server = Bukkit.getServer();
+      if (server != null) {
+        File container = server.getWorldContainer();
+        if (container != null) {
+          return container.toPath().toAbsolutePath().normalize();
+        }
+      }
+    } catch (Throwable ignored) {
+      // 取不到就按目录结构反推
+    }
+    for (Path directory : directories) {
+      Path parent = directory.getParent();
+      if (parent != null && parent.getFileName() != null
+          && "plugins".equalsIgnoreCase(parent.getFileName().toString())) {
+        Path root = parent.getParent();
+        if (root != null) {
+          return root.toAbsolutePath().normalize();
+        }
+      }
+    }
+    return directories.isEmpty() ? null : directories.get(0).toAbsolutePath().normalize();
+  }
+
+  /**
+   * 找本次匹配的采样文件；找不到返回 {@code null}。
+   *
+   * <p>顺序：回执里的真实路径（最快，零额外读盘）→ spark 账本（最权威，不依赖 sender）→ 目录轮询（兜底）。
+   * 三条路的产出都要过 {@link SparkProfileFiles#verifyOwnedProfile(List, Path, String)} 的四道校验。
    */
   private Path locateOwnedProfile() {
-    long notBefore = this.startedAtMillis - SESSION_SLACK_MILLIS;
-    for (Path directory : directories()) {
-      List<SparkProfileFiles.Candidate> candidates =
-          SparkProfileFiles.candidates(directory, notBefore, MAX_CANDIDATES_PER_SCAN);
-      for (SparkProfileFiles.Candidate candidate : candidates) {
-        String key = candidate.path().getFileName() + "@" + candidate.modifiedMillis();
-        if (!this.inspected.add(key)) {
+    List<Path> directories = directories();
+    if (directories.isEmpty()) {
+      return null;
+    }
+    Path serverRoot = serverRoot(directories);
+    Path fromReceipt = profileFromReceipt(directories, serverRoot);
+    if (fromReceipt != null) {
+      return fromReceipt;
+    }
+    Path fromActivity = profileFromActivity(directories, serverRoot);
+    if (fromActivity != null) {
+      return fromActivity;
+    }
+    return scanProfileDirectories(directories, this.marker, this.startedAtMillis, this.inspected,
+        MAX_CANDIDATES_PER_SCAN, MAX_INSPECTED);
+  }
+
+  /** 加速路径：Spark 已经回过「Data has been written to: …」时直接用那个路径。 */
+  private Path profileFromReceipt(List<Path> directories, Path serverRoot) {
+    for (String line : snapshotFeedback()) {
+      String raw = writtenPathFrom(line);
+      if (raw == null) {
+        continue;
+      }
+      Optional<Path> resolved = SparkProfileFiles.activityPath(raw, serverRoot);
+      if (resolved.isEmpty()) {
+        this.activityRejection = "回执里的路径形态不可用";
+        continue;
+      }
+      SparkProfileFiles.Checked checked =
+          SparkProfileFiles.verifyOwnedProfile(directories, resolved.get(), this.marker);
+      if (checked.ok()) {
+        log(Level.FINE, "按 Spark 回执定位到本次采样文件");
+        return checked.path();
+      }
+      this.activityRejection = "回执路径未通过校验：" + checked.reason();
+    }
+    return null;
+  }
+
+  /** 主路径：读 spark 自己的 {@code activity.json}，取「本次开始之后」最新的 Profiler 落盘记录。 */
+  private Path profileFromActivity(List<Path> directories, Path serverRoot) {
+    long since = this.startedAtMillis - ACTIVITY_SLACK_MILLIS;
+    for (Path directory : directories) {
+      Optional<List<SparkProfileFiles.ActivityEntry>> fresh = freshActivity(directory);
+      if (fresh.isEmpty()) {
+        continue;
+      }
+      for (SparkProfileFiles.ActivityEntry entry : fresh.get()) {
+        if (entry.timeMillis() < since) {
           continue;
         }
-        if (this.inspected.size() > MAX_INSPECTED) {
-          this.inspected.clear();
+        Optional<Path> resolved = SparkProfileFiles.activityPath(entry.value(), serverRoot);
+        if (resolved.isEmpty()) {
+          this.activityRejection = "账本里的路径形态不可用";
+          continue;
         }
-        if (SparkProfileFiles.matches(candidate.path(), this.marker)) {
-          return candidate.path();
+        SparkProfileFiles.Checked checked =
+            SparkProfileFiles.verifyOwnedProfile(directories, resolved.get(), this.marker);
+        if (checked.ok()) {
+          log(Level.FINE, "按 Spark 账本（activity.json）定位到本次采样文件");
+          return checked.path();
+        }
+        this.activityRejection = "账本路径未通过校验：" + checked.reason();
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 读一次账本；<b>文件没变就返回空</b>（上一拍已经看过这一版内容）。
+   *
+   * <p>这样 500 毫秒一拍的轮询不会把 {@code activity.json} 反复解析：只有 spark 真的追加了新记录
+   * （size/mtime 变化）时才重新读，读也仍然是有界尾部读。
+   */
+  private Optional<List<SparkProfileFiles.ActivityEntry>> freshActivity(Path directory) {
+    Path activityFile = directory.resolve(SparkProfileFiles.ACTIVITY_FILE);
+    SparkProfileFiles.Stamp stamp = SparkProfileFiles.stampOf(activityFile);
+    if (stamp == null) {
+      this.activityStamps.remove(activityFile);
+      return Optional.empty();
+    }
+    SparkProfileFiles.Stamp previous = this.activityStamps.put(activityFile, stamp);
+    if (stamp.equals(previous)) {
+      return Optional.empty();
+    }
+    return Optional.of(SparkProfileFiles.readActivity(activityFile, MAX_ACTIVITY_ENTRIES));
+  }
+
+  /**
+   * 兜底路径：按目录轮询找本次文件（<b>静态</b>，只碰文件系统，便于离线单测）。
+   *
+   * <p><b>去重键带字节数</b>：Spark 边写边可见，轮询可能在文件只写了一半时读到它（头部不可解析）。
+   * 只有「读到可解析的头」或「文件早于本次开始（稳定垃圾）」才登记键，半写文件下一轮长齐后还能被认领。
+   *
+   * @param startedAtMillis 本次开始时刻（用于判定「稳定」与扫描窗口下界）
+   * @param inspected       跨轮共用的去重集合（会被本方法就地修改）
+   */
+  static Path scanProfileDirectories(List<Path> directories, String marker, long startedAtMillis,
+      Set<String> inspected, int maxCandidates, int maxInspected) {
+    if (directories == null || directories.isEmpty() || inspected == null) {
+      return null;
+    }
+    long notBefore = startedAtMillis - SESSION_SLACK_MILLIS;
+    for (Path directory : directories) {
+      for (SparkProfileFiles.Candidate candidate :
+          SparkProfileFiles.candidates(directory, notBefore, maxCandidates)) {
+        String key = SparkProfileFiles.dedupeKey(candidate);
+        if (inspected.contains(key)) {
+          continue;
+        }
+        Optional<SparkProfileFiles.Header> header = SparkProfileFiles.readHeader(candidate.path());
+        if (header.isPresent()) {
+          rememberInspected(inspected, key, maxInspected);
+          if (header.get().matches(marker)) {
+            return candidate.path();
+          }
+          continue;
+        }
+        if (candidate.modifiedMillis() < startedAtMillis) {
+          // 早于本次开始就存在且读不出头：稳定的无关文件，登记后不再每轮重读
+          rememberInspected(inspected, key, maxInspected);
         }
       }
     }
     return null;
+  }
+
+  private static void rememberInspected(Set<String> inspected, String key, int maxInspected) {
+    if (maxInspected > 0 && inspected.size() >= maxInspected) {
+      inspected.clear();
+    }
+    inspected.add(key);
+  }
+
+  // ------------------------------------------------------------------
+  // 自诊断：失败时把「为什么」写进 Spark 段
+  // ------------------------------------------------------------------
+
+  /**
+   * 构造自诊断行（全部有界）：回执最近 {@value #MAX_DIAGNOSTIC_RECEIPTS} 行、每个候选目录本次开始之后的
+   * {@value #MAX_DIAGNOSTIC_FILES} 个新文件、账本里的本次新条目。
+   *
+   * <p>只在失败/超时分支调用；行数上限 {@value #MAX_DIAGNOSTIC_LINES}，单行上限
+   * {@value #MAX_DIAGNOSTIC_CHARS}，且 URL / 颜色 / 控制字符都会被剥掉（投影到 dump 里不外带链接）。
+   */
+  private List<String> diagnostics() {
+    try {
+      return buildDiagnostics();
+    } catch (Throwable ignored) {
+      // 自诊断只是解释失败原因：它自己出错绝不能把「已经失败的采样」变成「抛进调度器的异常」
+      return List.of();
+    }
+  }
+
+  /** {@link #diagnostics()} 的实现体（做真正的枚举与读盘）。 */
+  private List<String> buildDiagnostics() {
+    List<String> lines = new ArrayList<>(12);
+    List<String> receipts = snapshotFeedback();
+    int from = Math.max(0, receipts.size() - MAX_DIAGNOSTIC_RECEIPTS);
+    lines.add("Spark 回执（共 " + receipts.size() + " 行，最近 " + (receipts.size() - from) + " 行）：");
+    if (receipts.isEmpty()) {
+      lines.add("· 无（Spark 未回任何一句话）");
+    } else {
+      for (int index = from; index < receipts.size(); index++) {
+        lines.add("· " + receiptLine(receipts.get(index)));
+      }
+    }
+    if (!"unknown".equals(this.hintState)) {
+      lines.add("回执四态：" + describeHint(this.hintState));
+    }
+    List<Path> directories = directories();
+    long notBefore = this.startedAtMillis - SESSION_SLACK_MILLIS;
+    if (directories.isEmpty()) {
+      lines.add("Spark 目录：未解析到任何候选目录");
+    }
+    for (Path directory : directories) {
+      List<SparkProfileFiles.Entry> recent =
+          SparkProfileFiles.recentProfiles(directory, notBefore, MAX_DIAGNOSTIC_FILES);
+      lines.add("Spark 目录 " + describeDirectory(directory) + "："
+          + (recent.isEmpty() ? "本次开始后没有新文件" : "本次开始后的新文件（最近 " + recent.size() + " 个）"));
+      for (SparkProfileFiles.Entry entry : recent) {
+        lines.add("· " + describeEntry(entry));
+      }
+    }
+    lines.addAll(describeActivity(directories));
+    return lines;
+  }
+
+  /** 账本视角：本次开始之后 spark 自己记下的落盘路径（「有记录但文件没通过校验」是最关键的线索）。 */
+  private List<String> describeActivity(List<Path> directories) {
+    List<String> lines = new ArrayList<>(2);
+    long since = this.startedAtMillis - ACTIVITY_SLACK_MILLIS;
+    for (Path directory : directories) {
+      List<SparkProfileFiles.ActivityEntry> entries =
+          SparkProfileFiles.readActivity(directory.resolve(SparkProfileFiles.ACTIVITY_FILE),
+              MAX_ACTIVITY_ENTRIES);
+      if (entries.isEmpty()) {
+        continue;
+      }
+      SparkProfileFiles.ActivityEntry newest = entries.get(0);
+      String name = fileNameOf(newest.value());
+      if (newest.timeMillis() < since) {
+        lines.add("Spark 账本（activity.json）：没有本次新条目（最近一条 " + name + "，早于本次开始）");
+        continue;
+      }
+      String rejection = this.activityRejection;
+      lines.add("Spark 账本（activity.json）：本次新条目 " + name
+          + (rejection == null || rejection.isBlank() ? "（尚未通过校验）" : "（" + rejection + "）"));
+    }
+    return lines;
+  }
+
+  /** 一个候选文件的判定摘要：名字、字节数、注释是否等于本轮标记、是否被上限拒。 */
+  private String describeEntry(SparkProfileFiles.Entry entry) {
+    StringBuilder builder = new StringBuilder(64);
+    builder.append(fileNameOf(entry.path() == null ? null : entry.path().toString()))
+        .append(' ').append(entry.size()).append(" 字节");
+    if (entry.size() <= 0L) {
+      return builder.append("，空文件（可能仍在写入）").toString();
+    }
+    if (!SparkProfileFiles.acceptableSize(entry.size())) {
+      return builder.append("，超出上限 ").append(SparkProfileFiles.maxProfileMegabytes())
+          .append(" MiB（被拒，未上传）").toString();
+    }
+    Optional<SparkProfileFiles.Header> header = SparkProfileFiles.readHeader(entry.path());
+    if (header.isEmpty()) {
+      return builder.append("，头部不可解析（可能仍在写入）").toString();
+    }
+    if (header.get().matches(this.marker)) {
+      return builder.append("，注释=本轮标记（未通过路径校验）").toString();
+    }
+    return builder.append("，注释≠本轮标记（不是本次采样）").toString();
+  }
+
+  /** 候选目录的展示名：优先「相对服务器根的相对路径」（不把用户的绝对目录写进 dump）。 */
+  private String describeDirectory(Path directory) {
+    if (directory == null) {
+      return "（未知）";
+    }
+    List<Path> directories = List.of(directory);
+    Path root = serverRoot(directories);
+    try {
+      if (root != null && directory.toAbsolutePath().normalize().startsWith(root)) {
+        Path relative = root.relativize(directory.toAbsolutePath().normalize());
+        String text = relative.toString().replace('\\', '/');
+        if (!text.isEmpty()) {
+          return text;
+        }
+      }
+    } catch (RuntimeException ignored) {
+      // 相对化失败就退回文件名
+    }
+    Path name = directory.getFileName();
+    return name == null ? "（未知）" : name.toString();
+  }
+
+  private static String fileNameOf(String raw) {
+    if (raw == null || raw.isBlank()) {
+      return "（未知文件）";
+    }
+    String text = raw.replace('\\', '/');
+    int slash = text.lastIndexOf('/');
+    return slash < 0 ? text : text.substring(slash + 1);
+  }
+
+  /** 回执四态的中文口径（写进自诊断，便于读的人一眼确认「到底哪一态」）。 */
+  private static String describeHint(String hint) {
+    if (hint == null) {
+      return "未知";
+    }
+    return switch (hint) {
+      case HINT_DISABLED -> "Spark 已被服务端全局配置禁用";
+      case HINT_BUSY -> "已有采样在进行（未打断）";
+      case HINT_STARTED -> "已收到启动回执（Profiler is now running!）";
+      case HINT_SILENT -> "Spark 无任何回执（命令可能未进入 spark）";
+      case HINT_ERROR -> "Spark 自报失败";
+      default -> "未知";
+    };
+  }
+
+  /**
+   * 单行回执清洗：剥 ANSI 颜色、MiniMessage 标签、URL，压掉控制字符与连续空白，截断到
+   * {@value #MAX_DIAGNOSTIC_CHARS} 字符。
+   *
+   * <p>剥 URL 不是洁癖：dump 可能被服主转给别人，Spark 段里唯一该出现的链接是「完整链接」那一行。
+   * 纯函数，可离线单测。
+   */
+  static String receiptLine(String raw) {
+    if (raw == null) {
+      return "";
+    }
+    String text = raw.replaceAll("§.", "");
+    text = ANSI.matcher(text).replaceAll("");
+    text = TAG.matcher(text).replaceAll("");
+    text = URL.matcher(text).replaceAll("(URL)");
+    text = CONTROL.matcher(text).replaceAll(" ");
+    text = BLANKS.matcher(text).replaceAll(" ").strip();
+    return text.length() > MAX_DIAGNOSTIC_CHARS ? text.substring(0, MAX_DIAGNOSTIC_CHARS) : text;
   }
 
   // ------------------------------------------------------------------
@@ -665,17 +1199,19 @@ public final class SparkDumpCapture {
     try {
       size = Files.size(file);
     } catch (IOException | RuntimeException unreadable) {
-      return render("未完成（读取本次采样文件大小失败）", null, BACKGROUND_NOTE);
+      return render("未完成（读取本次采样文件大小失败）", null, BACKGROUND_NOTE, diagnostics());
     }
     if (!SparkProfileFiles.acceptableSize(size)) {
-      return render("未完成（本次采样文件超出大小上限，未上传）", null, BACKGROUND_NOTE);
+      // 被上限拒也必须说清「多大、上限多少」，绝不静默跳过
+      return render("未完成（本次采样文件超出上限：" + size + " 字节 > "
+          + SparkProfileFiles.maxProfileMegabytes() + " MiB，未上传）", null, BACKGROUND_NOTE, diagnostics());
     }
     Endpoints endpoints = endpoints(file.getParent());
     Upload upload = upload(file, endpoints);
     if (upload.ok()) {
       return render("已上传", link(endpoints.viewerUrl(), upload.key()), BACKGROUND_NOTE);
     }
-    return render("未完成（上传失败：" + upload.reason() + "）", null, BACKGROUND_NOTE);
+    return render("未完成（上传失败：" + upload.reason() + "）", null, BACKGROUND_NOTE, diagnostics());
   }
 
   private Upload upload(Path file, Endpoints endpoints) {
@@ -740,13 +1276,18 @@ public final class SparkDumpCapture {
   // 结果文本与收尾
   // ------------------------------------------------------------------
 
-  /**
-   * 渲染返回给执行者的整段文本。
-   *
-   * <p>格式固定（调用方与文档都按它对齐）：标题行 → 窗口 → 状态 →（上传成功时）完整链接 →（必要时）说明。
-   * 以换行结尾，便于直接拼进 dump 文本。
-   */
+  /** 渲染返回给执行者的整段文本（无自诊断）。 */
   static String render(String state, String link, String note) {
+    return render(state, link, note, List.of());
+  }
+
+  /**
+   * 渲染返回给执行者的整段文本（可带自诊断）。
+   *
+   * <p>格式固定（调用方与文档都按它对齐）：标题行 → 窗口 → 状态 →（上传成功时）完整链接 →（必要时）说明
+   * →（失败时）诊断。以换行结尾，便于直接拼进 dump 文本。诊断行逐行清洗并受行数/长度上限约束。
+   */
+  static String render(String state, String link, String note, List<String> details) {
     String effectiveState = state == null || state.isBlank() ? "未完成（未知原因）" : state;
     StringBuilder builder = new StringBuilder(320);
     builder.append(TITLE);
@@ -758,6 +1299,24 @@ public final class SparkDumpCapture {
     }
     if (note != null && !note.isBlank()) {
       builder.append("说明：").append(note).append('\n');
+    }
+    if (details != null && !details.isEmpty()) {
+      int written = 0;
+      StringBuilder block = new StringBuilder(256);
+      for (String raw : details) {
+        if (written >= MAX_DIAGNOSTIC_LINES) {
+          break;
+        }
+        String line = receiptLine(raw);
+        if (line.isEmpty()) {
+          continue;
+        }
+        block.append("  ").append(line).append('\n');
+        written++;
+      }
+      if (block.length() > 0) {
+        builder.append("诊断：\n").append(block);
+      }
     }
     return builder.toString();
   }
@@ -792,6 +1351,8 @@ public final class SparkDumpCapture {
 
   private void complete(String text) {
     cancelPoll();
+    // 结果已定：不再需要 spark 的回执，放掉强引用（也避免把 sender 及其缓冲挂在实例上）
+    this.dispatchSender = null;
     try {
       this.result.complete(text == null || text.isBlank() ? render(null, null, null) : text);
     } catch (Throwable ignored) {

@@ -77,8 +77,8 @@ public final class MikuCommand {
   /**
    * 从发起到写文件的最长等待（秒）：数值窗口结束后 Spark 仍未返回，就在这个上限处按超时收尾。
    *
-   * <p>取值同样来自后端（它自己会给出一个约 65 秒的结果），本类只按同一个上限做兜底，避免出现
-   * 「后端 65 秒放弃、这里等到 90 秒」这种两套口径。
+   * <p>取值同样来自后端（它自己会给出一个约 110 秒的结果），本类只按同一个上限做兜底，避免出现
+   * 「后端 110 秒放弃、这里等到 140 秒」这种两套口径。
    */
   static final int SPARK_MAX_WAIT_SECONDS = SparkDumpCapture.MAX_WAIT_SECONDS;
 
@@ -221,7 +221,7 @@ public final class MikuCommand {
    * 全局区域调度器）：Folia 上绝不能在异步线程直接向玩家发包。提交失败与生成失败都必须回显原因，绝不静默。
    *
    * <p><b>全程不 wait/join</b>：汇合靠 {@link CompletionStage} 回调 + 异步超时任务，绝不在区域线程或
-   * 服务端线程上阻塞等待 Spark——为了一个链接让整段区域停摆 65 秒，比拿不到链接严重得多。
+   * 服务端线程上阻塞等待 Spark——为了一个链接让整段区域停摆 110 秒，比拿不到链接严重得多。
    */
   private void dump(CommandSender sender, String label, String[] args) {
     if (!allowed(sender, "dump")) {
@@ -584,7 +584,7 @@ public final class MikuCommand {
      * Spark 等待上限：窗口结束后仍未落定就挂一个<b>异步</b>超时任务（绝不在任何线程上 sleep/join）。
      *
      * <p>上限从<b>发起时刻</b>算起而不是从此刻算起：Spark 已经在前面跑了一段时间，再等满
-     * {@link #SPARK_MAX_WAIT_SECONDS} 秒会把「最多约 65 秒」变成「最多约 95 秒」。剩余时间非正时立即按
+     * {@link #SPARK_MAX_WAIT_SECONDS} 秒会把「最多约 110 秒」变成「最多约 140 秒」。剩余时间非正时立即按
      * 超时处理。
      */
     private void scheduleSparkTimeout() {

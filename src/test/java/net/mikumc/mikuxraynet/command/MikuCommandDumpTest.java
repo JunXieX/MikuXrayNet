@@ -7,6 +7,7 @@ import java.lang.reflect.Proxy;
 import java.util.List;
 import java.util.Set;
 import net.mikumc.mikuxraynet.util.Constants;
+import net.mikumc.mikuxraynet.util.SparkDumpCapture;
 import org.bukkit.command.CommandSender;
 import org.junit.jupiter.api.Test;
 
@@ -116,11 +117,12 @@ class MikuCommandDumpTest {
 
   // -------------------------------------------------------------- 常量
 
-  /** 两个窗口与上限必须与文档/README 的口径一致（30 / 65 / 10）。 */
+  /** 两个窗口与上限必须与文档/README 的口径一致（30 / 110 / 10）。 */
   @Test
   void windowConstantsMatchTheDocumentedContract() {
     assertEquals(30, MikuCommand.SPARK_WINDOW_SECONDS, "默认窗口必须与 Spark profile 同为 30 秒");
-    assertEquals(65, MikuCommand.SPARK_MAX_WAIT_SECONDS, "总等待上限必须与后端一致（约 65 秒）");
+    assertEquals(SparkDumpCapture.MAX_WAIT_SECONDS, MikuCommand.SPARK_MAX_WAIT_SECONDS,
+        "总等待上限必须与后端一致（引用同一常量，避免两处各写一份数字漂移）");
     assertEquals(10, MikuCommand.LOCAL_WINDOW_SECONDS, "dump local 保持原来的 10 秒");
     assertTrue(MikuCommand.SPARK_MAX_WAIT_SECONDS > MikuCommand.SPARK_WINDOW_SECONDS,
         "上限必须大于窗口，否则正常采样也会被判超时");
