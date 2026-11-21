@@ -709,10 +709,10 @@ final class SparkProfileFiles {
     if (!(dataType instanceof String dataTypeText) || !ACTIVITY_DATA_FILE.equalsIgnoreCase(dataTypeText)) {
       return null;
     }
-    if (!(data.get("value") instanceof String value)) {
+    if (!(data.get("value") instanceof String path)) {
       return null;
     }
-    return new ActivityEntry(timeMillis, typeText, dataTypeText, value);
+    return new ActivityEntry(timeMillis, typeText, dataTypeText, path);
   }
 
   /**
