@@ -258,16 +258,26 @@ class SparkDumpCaptureTest {
     // 「某项能力不支持」只是提示：采样已经在跑时不得据此收尾
     assertEquals(SparkDumpCapture.HINT_STARTED, SparkDumpCapture.classifyHint(List.of(
         "Profiler is now running!",
-        "Native hooks are not supported on your system!")));
+        "Allocation profiling is not supported on your system. Check the console for more info.")));
+
+    // 上传失败后 spark 会「改用落盘」，已在跑时不能据此收尾
+    assertEquals(SparkDumpCapture.HINT_STARTED, SparkDumpCapture.classifyHint(List.of(
+        "Profiler is now running!",
+        "An error occurred whilst uploading the results. Attempting to save to disk instead.")));
   }
 
   @Test
-  void sparkReportedFailuresAreRecognisedByPhrase() {
+  void sparkReportedFailuresFollowTheRealReceiptWording() {
+    // 措辞取自 spark 1.10.180（Paper 内置）与 1.10.187（独立插件）的 SamplerModule 字符串常量，
+    // 两份 jar 实测一致：保存失败 = "An error occurred whilst saving the data."，
+    // 上传失败 = "An error occurred whilst uploading the results. Attempting to save to disk instead."
     for (String phrase : List.of(
         "An error occurred whilst saving the data.",
+        "Profiler operation failed unexpectedly",
+        "Profiler operation failed unexpectedly. Error: java.lang.IllegalStateException",
+        "An error occurred whilst uploading the results. Attempting to save to disk instead.",
         "An error occurred whilst uploading the data.",
-        "A profiler operation failed unexpectedly.",
-        "The profiler is not supported on your system!")) {
+        "Allocation profiling is not supported on your system. Check the console for more info.")) {
       assertTrue(SparkDumpCapture.sparkError(List.of(phrase)).isPresent(), "必须识别：" + phrase);
     }
     assertFalse(SparkDumpCapture.sparkError(List.of("Profiler is now running!")).isPresent());
@@ -275,9 +285,17 @@ class SparkDumpCaptureTest {
     assertFalse(SparkDumpCapture.sparkError(null).isPresent());
     // 已在跑 + 「能力不支持」提示 ≠ 本次失败（否则会把一次正常采样直接丢掉）
     assertFalse(SparkDumpCapture.sparkError(List.of("Profiler is now running!",
-        "Native hooks are not supported on your system!")).isPresent());
+        "Allocation profiling is not supported on your system. Check the console for more info.")).isPresent());
+    // 已在跑 + 上传失败 ≠ 终局失败：spark 紧接着会落盘并回 Data has been written to
+    assertFalse(SparkDumpCapture.sparkError(List.of("Profiler is now running!",
+        "An error occurred whilst uploading the results. Attempting to save to disk instead.")).isPresent(),
+        "上传失败只是「改用落盘」，据此收尾会丢掉一次即将成功的采样");
     // 已在跑 + 保存失败 = 真失败
     assertTrue(SparkDumpCapture.sparkError(List.of("Profiler is now running!",
+        "An error occurred whilst saving the data.")).isPresent());
+    // 上传失败 + 保存也失败：硬失败胜出
+    assertTrue(SparkDumpCapture.sparkError(List.of("Profiler is now running!",
+        "An error occurred whilst uploading the results. Attempting to save to disk instead.",
         "An error occurred whilst saving the data.")).isPresent());
     assertEquals("An error occurred whilst saving the data.",
         SparkDumpCapture.sparkError(List.of("Profiler is now running!", "An error occurred whilst saving the data."))
@@ -327,13 +345,22 @@ class SparkDumpCaptureTest {
     byte[] full = samplerWithComment(MARKER);
     long startedAt = System.currentTimeMillis();
     Files.write(file, Arrays.copyOf(full, 8));
+    // 复现时间戳粒度较粗的文件系统（Linux CI/容器常见 1 秒粒度）：刚写出的文件会被取整到 startedAt 之前
+    Files.setLastModifiedTime(file, FileTime.fromMillis(startedAt - 500L));
 
     Set<String> inspected = ConcurrentHashMap.newKeySet();
 
     assertNull(SparkDumpCapture.scanProfileDirectories(List.of(directory), MARKER, startedAt, inspected, 8, 256),
         "只写了开头的文件这一轮认不出来");
     assertTrue(inspected.isEmpty(),
-        "本次会话内写出的半写文件不得登记去重键：下一轮长齐后还要再试");
+        "本次会话内写出的半写文件不得登记去重键：时间戳被取整到 startedAt 之前也一样（容差内仍属本次会话）");
+
+    // 真正的历史垃圾（远超容差且读不出头）读一次就登记，避免每轮重读
+    Path stale = directory.resolve("profile-2026-11-21_19.00.00.sparkprofile");
+    Files.write(stale, "not a protobuf".getBytes(StandardCharsets.UTF_8));
+    Files.setLastModifiedTime(stale, FileTime.fromMillis(startedAt - 60_000L));
+    assertNull(SparkDumpCapture.scanProfileDirectories(List.of(directory), MARKER, startedAt, inspected, 8, 256));
+    assertEquals(1, inspected.size(), "历史垃圾登记一次（半写文件仍不登记）");
 
     Files.write(file, full);
 

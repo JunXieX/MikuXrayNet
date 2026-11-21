@@ -123,6 +123,18 @@ public final class SparkDumpCapture {
   /** 候选文件的时间下界余量（毫秒）：只接受「本次开始前两分钟内」修改过的文件，避免误读旧采样。 */
   private static final long SESSION_SLACK_MILLIS = 120_000L;
 
+  /**
+   * 判「稳定无关文件」时必须比本次开始时刻再往前退的容差（毫秒）。
+   *
+   * <p><b>为什么不能直接比 {@code mtime < startedAt}</b>：文件时间戳的精度不一定是毫秒。Linux CI 与容器
+   * 常见的时间戳粒度是 1 秒，{@code Files.getLastModifiedTime(...).toMillis()} 会把「本次会话内刚写出的文件」
+   * 向下取整到秒，于是它看起来比 {@code startedAt} 还早。若据此把它当成「历史垃圾」登记去重键，
+   * 这个<b>正在写</b>的文件就再也读不到了（半写文件重试的契约被破坏）。
+   *
+   * <p>2 秒足够覆盖 1 秒粒度 + 时钟抖动；真正早于本次采样的历史文件是分钟/小时级，不受影响。
+   */
+  static final long STABLE_MTIME_SLACK_MILLIS = 2_000L;
+
   /** 账本时间的容差（毫秒）：取「不早于本次开始前 5 秒」的记录，容忍两次读时钟的抖动。 */
   private static final long ACTIVITY_SLACK_MILLIS = 5_000L;
 
@@ -215,21 +227,32 @@ public final class SparkDumpCapture {
   static final String HINT_ERROR = "error";
 
   /**
-   * Spark 自报失败里<b>无歧义</b>的短语：跑起来了却保存/上传/内部出错，命中即收尾。
+   * Spark 自报失败里<b>无歧义、且一定意味着「不会有文件」</b>的短语，命中即收尾。
+   *
+   * <p>两条都取自 spark 1.10.180/1.10.187 的 {@code SamplerModule} 字符串常量（本机 jar 实测，
+   * 含 Paper 内置 {@code spark-paper} 与独立 {@code spark-bukkit} 两份，措辞一致）：
+   * <ul>
+   *   <li>{@code An error occurred whilst saving the data.} —— 落盘失败，之后不会再产出文件；</li>
+   *   <li>{@code Profiler operation failed unexpectedly}（另有带 {@code . Error: } 的变体）—— 采样器内部错误。</li>
+   * </ul>
    */
   private static final String[] HARD_ERROR_PHRASES = {
       "an error occurred whilst saving",
-      "error whilst uploading",
       "profiler operation failed unexpectedly",
   };
 
   /**
-   * 「某项能力不支持」类提示：<b>只有 Spark 从未确认启动</b>时才算失败。
+   * <b>不</b>意味着本次采样失败、只能当线索的短语：<b>只有 Spark 从未确认启动</b>时才算失败。
    *
-   * <p>这些短语在采样<b>已经在跑</b>时也可能出现在回执里（例如某项可选能力不可用），
-   * 若一律当失败处理，就会把一次正常采样直接丢掉——正是本功能最不能接受的回归。
+   * <p>上传失败就是这一类：spark 的同一条回执原文是
+   * {@code An error occurred whilst uploading the results. Attempting to save to disk instead.}
+   * ——它后面会<b>继续落盘</b>，紧接着回 {@code Data has been written to: …}。
+   * 把它当终局失败收尾，就会在一次即将成功的采样上提前放弃（本功能最不能接受的回归）。
+   * 「某项能力不支持」同理：采样照跑，只是那项能力不可用。
    */
   private static final String[] SOFT_ERROR_PHRASES = {
+      "an error occurred whilst uploading",
+      "error whilst uploading",
       "is not supported on your system",
   };
 
@@ -879,8 +902,9 @@ public final class SparkDumpCapture {
           }
           continue;
         }
-        if (candidate.modifiedMillis() < startedAtMillis) {
-          // 早于本次开始就存在且读不出头：稳定的无关文件，登记后不再每轮重读
+        if (candidate.modifiedMillis() + STABLE_MTIME_SLACK_MILLIS < startedAtMillis) {
+          // 早于本次开始（且超出时间戳粒度容差）又读不出头：稳定的无关文件，登记后不再每轮重读。
+          // 容差不可省：时间戳粒度较粗的文件系统会把「本会话刚写出」的文件取整到 startedAt 之前。
           rememberInspected(inspected, key, maxInspected);
         }
       }

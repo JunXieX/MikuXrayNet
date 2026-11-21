@@ -423,17 +423,30 @@ class SparkProfileFilesTest {
   }
 
   @Test
-  void activityPathResolvesAgainstTheServerRoot() {
-    Path root = Path.of("C:/srv/mc").toAbsolutePath().normalize();
+  void activityPathResolvesAgainstTheServerRoot(@TempDir Path root) {
+    Path expectedRelative = root.resolve("plugins/spark/a.sparkprofile").toAbsolutePath().normalize();
 
-    assertEquals(root.resolve("plugins/spark/a.sparkprofile"),
+    assertEquals(expectedRelative,
         SparkProfileFiles.activityPath("plugins\\spark\\a.sparkprofile", root).orElseThrow(),
-        "Windows 风格的反斜杠要能落成真实路径");
-    assertEquals(root.resolve("plugins/spark/a.sparkprofile"),
-        SparkProfileFiles.activityPath("./plugins/spark/a.sparkprofile", root).orElseThrow());
-    assertEquals(Path.of("D:/elsewhere/a.sparkprofile").toAbsolutePath().normalize(),
-        SparkProfileFiles.activityPath("D:\\elsewhere\\a.sparkprofile", root).orElseThrow(),
+        "账本里的反斜杠要能落成真实路径（Windows 原文，POSIX 上同样要解析得出）");
+    assertEquals(expectedRelative,
+        SparkProfileFiles.activityPath("./plugins/spark/a.sparkprofile", root).orElseThrow(),
+        "前导 ./ 要归一");
+
+    // 「绝对路径不被服务器根改写」必须用本平台真正绝对的路径来断言：@TempDir 一定是绝对路径。
+    // 不能写死 C:/… 或 D:/…——在 POSIX 上它们只是普通相对路径，那是在测平台假设而不是契约。
+    Path absolute = root.resolve("elsewhere").resolve("a.sparkprofile").toAbsolutePath().normalize();
+    assertEquals(absolute,
+        SparkProfileFiles.activityPath(absolute.toString(), root).orElseThrow(),
         "绝对路径原样保留");
+
+    // 反过来把平台语义钉住：盘符风格串在 POSIX 上不是绝对路径 → 按服务器根解析（生产如此，正确）
+    Path driveLike = Path.of("D:/elsewhere/a.sparkprofile");
+    if (!driveLike.isAbsolute()) {
+      assertEquals(root.resolve(driveLike).toAbsolutePath().normalize(),
+          SparkProfileFiles.activityPath("D:\\elsewhere\\a.sparkprofile", root).orElseThrow(),
+          "POSIX 上 D:/… 是相对路径，必须按服务器根解析");
+    }
 
     assertTrue(SparkProfileFiles.activityPath("plugins\\spark\\a.sparkprofile", null).isEmpty(),
         "相对路径拿不到服务器根就无法解析");
