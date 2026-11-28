@@ -38,7 +38,7 @@ class DiagnosticsTest {
         new Diagnostics.Snapshot.Env(true, true, false, true, 1, "Paper 1.20.4", "25", "1.2.5"),
         // 28 参完整构造：内容已变与「补发放弃」都带子项（子项与总数一致时面板才展开明细）
         new Diagnostics.Snapshot.Rewrite(90L, 10L, 42, 0L, 30L, 100L, 331L, 5L, 2L, 1L, 2L, 0L,
-            0L, 0L, 0L, "无采样", 0L, 0L, 0L, 0L, 9L,
+            0L, 0L, 0L, "无采样", 0L, 0L, 0L, 0L, 2L,
             28L, 2L, 1200L, 1L, 5L, 2L, 1L),
         new Diagnostics.Snapshot.Proximity(7L, 3L, 1L, 3L, 2L, 1L, 40L, 6L, 11L, 2_200_000L, 900_000L, 1L, 2L,
             // 窗口覆盖 / 预筛丢弃：dump 与运行摘要都必须渲染（覆盖度是「看得见的矿排不进窗口」的唯一读数）
@@ -229,7 +229,7 @@ class DiagnosticsTest {
         "写回未确认生效时必须回显「连旧索引一起作废」的次数（与写回失败同源、口径为其子集）：" + status);
     assertTrue(status.contains("遮挡建表：失败 7 次"),
         "遮挡建表失败必须可见（否则「矿挖不掉」无从归因）：" + status);
-    assertTrue(status.contains("定向补发 23 格，登记或补发未完成 1 次"), status);
+    assertTrue(status.contains("定向补发 23 格，最终覆盖缺口 1 次"), status);
     assertTrue(status.contains("，发布跳过 11 段"),
         "发布时跳过覆盖的段数必须可见（该值偏高说明建表窗口内方块变更频繁）：" + status);
 
@@ -341,7 +341,7 @@ class DiagnosticsTest {
 
   /**
    * 三处「合计」都必须拆开渲染：内容已变（源字节已变 / 缺位图）、负载被拒（源指纹不一致 / 信封故障）、
-   * 补发放弃（四类）+ 写出确认。
+   * 最终覆盖缺口 + 异常兜底 + 写出确认。
    *
    * <p>为什么不能只显示合计：每一组里「正常失效」与「真故障」混在同一个数里，运维只会得到
    * 「有问题但不知道是什么」。
@@ -358,7 +358,7 @@ class DiagnosticsTest {
     assertTrue(wired.contains("负载被拒 5（源指纹不一致 4 / 信封/数据故障 1）"),
         "负载被拒必须拆成「源指纹不一致」与「信封/数据故障」：" + wired);
     assertTrue(wired.contains(
-        "登记或补发未完成 9 次（写出确认 1200 次；观测缺失 1 / 淘汰 5 / 区域失败 2 / 覆盖丢失 1）"),
+        "最终覆盖缺口 2 次（写出确认 1200 次；观测缺失 1 / 覆盖丢失 1；异常兜底：淘汰 5 / 区域 2）"),
         "补发放弃必须拆成四类，并与「写出确认」这条正面证据并列：" + wired);
 
     // 只有聚合值的旧快照形态：必须给出中性说明（说明为什么没有明细），不能凭空显示 0/0

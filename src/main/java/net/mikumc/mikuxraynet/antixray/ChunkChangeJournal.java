@@ -4,6 +4,8 @@ import java.util.BitSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.TreeMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -31,8 +33,15 @@ public final class ChunkChangeJournal {
     final Column column;
     private final long started = System.nanoTime();
     private TreeMap<Integer, BitSet> dirty;
+    private TreeMap<Integer, java.util.HashMap<Integer, Long>> revisions;
     private boolean written;
     private boolean truncated;
+    private long revision;
+    private long captureRevision;
+    private boolean evicted;
+    private boolean wholeColumnRefresh;
+    private long refreshRevision;
+    private long truncatedRevision;
     int retries;
 
     private Ticket(Receiver receiver, Column column) {
@@ -47,7 +56,12 @@ public final class ChunkChangeJournal {
 
   private final ConcurrentHashMap<UUID, Receiver> recipients = new ConcurrentHashMap<>();
   private final int maxDirtySections;
-  private final Runnable onEvicted;
+  private final CoverageLoss onEvicted;
+
+  @FunctionalInterface
+  interface CoverageLoss {
+    void onCoverageLost(UUID player, Column column);
+  }
 
   public ChunkChangeJournal() {
     this(MAX_DIRTY_SECTIONS_PER_RECEIVER, () -> { });
@@ -57,7 +71,15 @@ public final class ChunkChangeJournal {
     this(MAX_DIRTY_SECTIONS_PER_RECEIVER, onEvicted);
   }
 
+  ChunkChangeJournal(CoverageLoss onEvicted) {
+    this(MAX_DIRTY_SECTIONS_PER_RECEIVER, onEvicted);
+  }
+
   ChunkChangeJournal(int maxDirtySections, Runnable onEvicted) {
+    this(maxDirtySections, (player, column) -> onEvicted.run());
+  }
+
+  ChunkChangeJournal(int maxDirtySections, CoverageLoss onEvicted) {
     this.maxDirtySections = maxDirtySections;
     this.onEvicted = onEvicted;
   }
@@ -66,14 +88,23 @@ public final class ChunkChangeJournal {
     Receiver receiver = recipients.computeIfAbsent(player, ignored -> new Receiver());
     Column column = new Column(world, x, z);
     Ticket next = new Ticket(receiver, column);
+    List<Column> evicted = null;
     synchronized (receiver) {
       Ticket previous = receiver.columns.remove(column);
       if (previous != null) {
         receiver.ready.remove(previous);
-        // 尚未修复的格子也要跟随后一个区块快照；旧回调不再有权补发。
-        next.dirty = previous.dirty;
-        next.truncated = previous.truncated;
-        previous.dirty = null;
+        if (previous.wholeColumnRefresh) {
+          inheritAfterWholeColumnRefresh(previous, next);
+        } else {
+          // 普通新快照继承尚未修复的格子；旧回调不再有权补发。
+          next.dirty = previous.dirty;
+          next.revisions = previous.revisions;
+          next.revision = previous.revision;
+          next.truncated = previous.truncated;
+          next.truncatedRevision = previous.truncatedRevision;
+          previous.dirty = null;
+          previous.revisions = null;
+        }
       }
       while (!receiver.columns.isEmpty()) {
         Ticket head = receiver.columns.firstEntry().getValue();
@@ -81,11 +112,21 @@ public final class ChunkChangeJournal {
           break;
         }
         if (hasDirty(head) || head.truncated) {
-          onEvicted.run();
+          if (evicted == null) {
+            evicted = new ArrayList<>();
+          }
+          evicted.add(head.column);
+          head.evicted = true;
         }
         remove(head);
       }
       receiver.columns.put(column, next);
+    }
+    if (evicted != null) {
+      // 调度与整列刷新一律在 journal 锁外，Paper 上区域回调可能立即执行。
+      for (Column lost : evicted) {
+        onEvicted.onCoverageLost(player, lost);
+      }
     }
     return next;
   }
@@ -100,7 +141,7 @@ public final class ChunkChangeJournal {
         return false;
       }
       Ticket ticket = receiver.columns.get(new Column(world, x, z));
-      return ticket != null && !ticket.written;
+      return ticket != null;
     }
   }
 
@@ -124,7 +165,7 @@ public final class ChunkChangeJournal {
           return;
         }
         Ticket ticket = receiver.columns.get(new Column(world, coordinates[0] >> 4, coordinates[2] >> 4));
-        if (ticket == null || ticket.written) {
+        if (ticket == null) {
           return;
         }
         for (int i = 0; i < count; i++) {
@@ -135,7 +176,7 @@ public final class ChunkChangeJournal {
   }
 
   private void set(Ticket ticket, int x, int y, int z) {
-    if (ticket == null || ticket.written) {
+    if (ticket == null) {
       return;
     }
     int section = y >> 4;
@@ -144,6 +185,7 @@ public final class ChunkChangeJournal {
       if (ticket.receiver.dirtySections >= maxDirtySections
           || (ticket.dirty != null && ticket.dirty.size() >= MAX_SECTIONS)) {
         ticket.truncated = true;
+        ticket.truncatedRevision = ++ticket.revision;
         return;
       }
       if (ticket.dirty == null) {
@@ -151,9 +193,15 @@ public final class ChunkChangeJournal {
       }
       cells = new BitSet(4096);
       ticket.dirty.put(section, cells);
+      if (ticket.revisions == null) {
+        ticket.revisions = new TreeMap<>();
+      }
+      ticket.revisions.put(section, new java.util.HashMap<>());
       ticket.receiver.dirtySections++;
     }
-    cells.set(((y & 15) << 8) | ((z & 15) << 4) | (x & 15));
+    int bit = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
+    cells.set(bit);
+    ticket.revisions.get(section).put(bit, ++ticket.revision);
   }
 
   /** 只有出站写回调才能封存快照；改写任务声明 ready 并不是这个时点。 */
@@ -164,10 +212,11 @@ public final class ChunkChangeJournal {
         return Written.STALE;
       }
       ticket.written = true;
-      if (!hasDirty(ticket)) {
+      if (!hasDirty(ticket) && !ticket.truncated) {
         remove(ticket);
-        return new Written(true, false, false, ticket.truncated);
+        return new Written(true, false, false, false);
       }
+      // 截断即使没有任何可枚举脏格也必须保持 ready，直到整列刷新已提交。
       receiver.ready.add(ticket);
       if (receiver.draining) {
         return new Written(true, true, false, ticket.truncated);
@@ -184,7 +233,64 @@ public final class ChunkChangeJournal {
    */
   boolean hasPending(Ticket ticket) {
     synchronized (ticket.receiver) {
-      return hasDirty(ticket);
+      return hasDirty(ticket) || ticket.truncated;
+    }
+  }
+
+  boolean isTruncated(Ticket ticket) {
+    synchronized (ticket.receiver) {
+      return ticket.truncated;
+    }
+  }
+
+  boolean wasEvicted(Ticket ticket) {
+    synchronized (ticket.receiver) {
+      return ticket.evicted;
+    }
+  }
+
+  void prepareWholeColumnRefresh(Ticket ticket) {
+    synchronized (ticket.receiver) {
+      if (current(ticket)) {
+        ticket.wholeColumnRefresh = true;
+        ticket.refreshRevision = ticket.revision;
+      }
+    }
+  }
+
+  Ticket prepareWholeColumnRefresh(UUID player, Column column) {
+    Receiver receiver = recipients.get(player);
+    if (receiver == null) {
+      return null;
+    }
+    synchronized (receiver) {
+      Ticket ticket = receiver.columns.get(column);
+      if (ticket != null) {
+        ticket.wholeColumnRefresh = true;
+        ticket.refreshRevision = ticket.revision;
+      }
+      return ticket;
+    }
+  }
+
+  void completeEvictedRefresh(Ticket ticket) {
+    if (ticket == null) {
+      return;
+    }
+    synchronized (ticket.receiver) {
+      if (current(ticket)) {
+        // 没有自-trigger 新包时保留原票的正常 written/replay 权利；旧包迟到仍能收敛。
+        ticket.wholeColumnRefresh = false;
+      }
+    }
+  }
+
+  void cancelWholeColumnRefresh(Ticket ticket) {
+    if (ticket == null) {
+      return;
+    }
+    synchronized (ticket.receiver) {
+      ticket.wholeColumnRefresh = false;
     }
   }
 
@@ -207,12 +313,24 @@ public final class ChunkChangeJournal {
     }
   }
 
+  /** 调度失败时只读快照；票仍留在 ready，由整列刷新逐项收账。 */
+  List<Ticket> ready(Receiver receiver) {
+    synchronized (receiver) {
+      return receiver.ready.isEmpty() ? List.of() : new ArrayList<>(receiver.ready);
+    }
+  }
+
   /** 读出下一批坐标，保留余下的位，避免大批变化在同一个 tick 集中读世界。 */
   int take(Ticket ticket, int max, int[] out) {
+    return take(ticket, max, out, null);
+  }
+
+  int take(Ticket ticket, int max, int[] out, long[] expectedRevisions) {
     synchronized (ticket.receiver) {
       if (!current(ticket) || !ticket.written || !hasDirty(ticket)) {
         return 0;
       }
+      ticket.captureRevision = ticket.revision;
       int count = 0;
       for (var section : ticket.dirty.entrySet()) {
         if (count >= max) {
@@ -223,6 +341,9 @@ public final class ChunkChangeJournal {
           out[count * 3] = (ticket.column.x() << 4) | (bit & 15);
           out[count * 3 + 1] = (section.getKey() << 4) | ((bit >>> 8) & 15);
           out[count * 3 + 2] = (ticket.column.z() << 4) | ((bit >>> 4) & 15);
+          if (expectedRevisions != null) {
+            expectedRevisions[count] = ticket.revisions.get(section.getKey()).get(bit);
+          }
           count++;
         }
       }
@@ -230,10 +351,46 @@ public final class ChunkChangeJournal {
     }
   }
 
-  /** 只有补发提交成功后才移除坐标，让取样之后到达的新区块能完整接手。 */
-  void acknowledge(Ticket ticket, int[] cells, int count) {
+  long captureRevision(Ticket ticket) {
+    synchronized (ticket.receiver) {
+      return ticket.captureRevision;
+    }
+  }
+
+  /** 逐格确认：无关格的新变更不会阻塞本批，变更格保留到下一轮。 */
+  void acknowledge(Ticket ticket, int[] cells, int count, long[] expectedRevisions) {
     synchronized (ticket.receiver) {
       if (!current(ticket) || ticket.dirty == null) {
+        return;
+      }
+      for (int i = 0; i < count * 3; i += 3) {
+        int section = cells[i + 1] >> 4;
+        int bit = ((cells[i + 1] & 15) << 8) | ((cells[i + 2] & 15) << 4) | (cells[i] & 15);
+        java.util.HashMap<Integer, Long> versions = ticket.revisions.get(section);
+        BitSet bits = ticket.dirty.get(section);
+        Long version = versions == null ? null : versions.get(bit);
+        if (version != null && bits != null && version == expectedRevisions[i / 3]) {
+          bits.clear(bit);
+          versions.remove(bit);
+          if (bits.isEmpty()) {
+            ticket.dirty.remove(section);
+            ticket.revisions.remove(section);
+            ticket.receiver.dirtySections--;
+          }
+        }
+      }
+    }
+  }
+
+  /** 兼容旧调用：使用最近一次 take 固定的全局代次。 */
+  void acknowledge(Ticket ticket, int[] cells, int count) {
+    acknowledge(ticket, cells, count, captureRevision(ticket));
+  }
+
+  /** 只有发送成功且取样后没有新修改才清位；代次不符时整批保留到下一轮。 */
+  void acknowledge(Ticket ticket, int[] cells, int count, long expectedRevision) {
+    synchronized (ticket.receiver) {
+      if (!current(ticket) || ticket.dirty == null || ticket.revision != expectedRevision) {
         return;
       }
       for (int i = 0; i < count * 3; i += 3) {
@@ -256,7 +413,7 @@ public final class ChunkChangeJournal {
       if (!current(ticket)) {
         return false;
       }
-      if (retry && hasDirty(ticket)) {
+      if (retry && (hasDirty(ticket) || ticket.truncated)) {
         ticket.receiver.ready.add(ticket);
         return false;
       }
@@ -272,16 +429,6 @@ public final class ChunkChangeJournal {
       }
       receiver.draining = false;
       return false;
-    }
-  }
-
-  void abandonDrain(Receiver receiver) {
-    synchronized (receiver) {
-      for (Ticket ticket : new java.util.ArrayList<>(receiver.ready)) {
-        remove(ticket);
-      }
-      receiver.ready.clear();
-      receiver.draining = false;
     }
   }
 
@@ -332,10 +479,45 @@ public final class ChunkChangeJournal {
     releaseDirty(ticket);
   }
 
+  /** 整列快照只覆盖屏障前状态；屏障后的变化仍逐格跟随后一个 ticket。 */
+  private static void inheritAfterWholeColumnRefresh(Ticket previous, Ticket next) {
+    long barrier = previous.refreshRevision;
+    next.revision = previous.revision;
+    next.truncated = previous.truncated && previous.truncatedRevision > barrier;
+    next.truncatedRevision = next.truncated ? previous.truncatedRevision : 0L;
+    if (previous.dirty != null) {
+      for (var section : previous.dirty.entrySet()) {
+        var versions = previous.revisions.get(section.getKey());
+        for (int bit = section.getValue().nextSetBit(0); bit >= 0;
+            bit = section.getValue().nextSetBit(bit + 1)) {
+          long revision = versions.get(bit);
+          if (revision <= barrier) {
+            continue;
+          }
+          if (next.dirty == null) {
+            next.dirty = new TreeMap<>();
+            next.revisions = new TreeMap<>();
+          }
+          BitSet cells = next.dirty.computeIfAbsent(section.getKey(), ignored -> new BitSet(4096));
+          var nextVersions = next.revisions.computeIfAbsent(section.getKey(),
+              ignored -> new java.util.HashMap<Integer, Long>());
+          if (cells.isEmpty()) {
+            next.receiver.dirtySections++;
+          }
+          cells.set(bit);
+          nextVersions.put(bit, revision);
+        }
+      }
+    }
+    releaseDirty(previous);
+    previous.truncated = false;
+  }
+
   private static void releaseDirty(Ticket ticket) {
     if (ticket.dirty != null) {
       ticket.receiver.dirtySections -= ticket.dirty.size();
       ticket.dirty = null;
+      ticket.revisions = null;
     }
   }
 }

@@ -233,12 +233,99 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
    * 若持包期间该区块被改过，就补发那几格的当前状态——否则客户端先收到的方块变更会被随后到达的
    * 「改写时刻的旧区块字节」盖回去（真机观感：边走边放方块时，刚放的那一格闪一下）。
    */
-  private final ChunkChangeJournal changeJournal = new ChunkChangeJournal(() -> {
-    // 交付信号始终没到、ticket 被容量/超时淘汰（也可能是记录阶段脏段超额被截断）：
-    // 与「确认到了但补不出去」（replayRegionFailures）分开计，前者指向协议/连接侧，后者指向调度侧。
-    stats.replayEvicted.increment();
-    stats.replaySkipped.increment();
-  });
+  private final ChunkChangeJournal changeJournal = new ChunkChangeJournal(
+      (UUID playerId, ChunkChangeJournal.Column column) -> {
+        stats.replayEvicted.increment();
+        ProtocolLibAsyncListener.this.replayCoordinator.evicted(playerId, column);
+      });
+  /** 生产 Bukkit 适配；编排本身由 ChunkReplayCoordinatorTest 离线驱动。 */
+  private final ChunkReplayCoordinator<Player, World, BlockData> replayCoordinator =
+      new ChunkReplayCoordinator<>(changeJournal, new ChunkReplayCoordinator.Bridge<>() {
+        @Override
+        public boolean active() {
+          return !stopping;
+        }
+
+        @Override
+        public ChunkReplayCoordinator.Session<World> session(Player player) {
+          if (stopping || !player.isOnline()) {
+            return null;
+          }
+          World world = player.getWorld();
+          return new ChunkReplayCoordinator.Session<>(world, world.getName());
+        }
+
+        @Override
+        public World world(UUID playerId, ChunkChangeJournal.Column column) {
+          PlayerWorldIndex.WorldContext context = PlayerWorldIndex.context(playerId);
+          return context != null && column.world().equals(context.worldName()) ? context.world() : null;
+        }
+
+        @Override
+        public boolean schedulePlayer(Player player, Runnable task, Runnable retired, long delayTicks) {
+          return delayTicks <= 0
+              ? player.getScheduler().run(getPlugin(), ignored -> task.run(), retired) != null
+              : player.getScheduler().runDelayed(getPlugin(), ignored -> task.run(), retired, delayTicks) != null;
+        }
+
+        @Override
+        public void scheduleRegion(World world, ChunkChangeJournal.Column column, Runnable task) {
+          Bukkit.getRegionScheduler().execute(getPlugin(), world, column.x(), column.z(), task);
+        }
+
+        @Override
+        public boolean scheduleGlobal(Runnable task, long delayTicks) {
+          return Bukkit.getGlobalRegionScheduler().runDelayed(getPlugin(), ignored -> task.run(), delayTicks) != null;
+        }
+
+        @Override
+        public boolean chunkSent(Player player, ChunkChangeJournal.Column column) {
+          return player.isChunkSent(Chunk.getChunkKey(column.x(), column.z()));
+        }
+
+        @Override
+        public boolean chunkLoaded(World world, ChunkChangeJournal.Column column) {
+          return world.isChunkLoaded(column.x(), column.z());
+        }
+
+        @Override
+        public BlockData blockData(World world, int x, int y, int z) {
+          return world.getBlockData(x, y, z);
+        }
+
+        @Override
+        public void send(Player player, ChunkChangeJournal.Column column, int[] cells, int count,
+            List<BlockData> states) {
+          Map<Position, BlockData> changes = new LinkedHashMap<>(Math.max(16, count * 2));
+          for (int i = 0, c = 0; c < count; i += 3, c++) {
+            changes.put(Position.block(cells[i], cells[i + 1], cells[i + 2]), states.get(c));
+          }
+          player.sendMultiBlockChange(changes);
+          stats.replayCells.add(count);
+        }
+
+        @Override
+        public boolean refresh(World world, ChunkChangeJournal.Column column) {
+          return world.refreshChunk(column.x(), column.z());
+        }
+
+        @Override
+        public void delivered(Player player, ChunkChangeJournal.Column column) {
+          notifyChunkWritten(player, column);
+        }
+
+        @Override
+        public void failed(ChunkChangeJournal.Column column, String stage, Throwable throwable) {
+          stats.replayRegionFailures.increment();
+          logThrottled("区块在途补发阶段失败：" + stage,
+              "区块在途补发已转入重排或整列刷新（阶段 " + stage + "，列 " + column + "）", throwable);
+        }
+
+        @Override
+        public void retire(UUID playerId) {
+          changeJournal.clear(playerId);
+        }
+      });
   private final BatchTable batches;
   /**
    * 玩家退出清理批次闸门的 Bukkit 监听。
@@ -275,9 +362,6 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   private final AtomicBoolean firstRewriteDiagnosed = new AtomicBoolean();
   private ProtocolManager deliveryManager;
   private PacketAdapter deliveryObserver;
-  private static final int MAX_REPLAY_CELLS_PER_TICK = 256;
-  private static final int MAX_REPLAY_COLUMNS_PER_TICK = 8;
-  private static final int MAX_REPLAY_WAIT_TICKS = 4;
   /**
    * 停用中标记：{@link #unregisterBukkitHooks()} 首行置位（{@code ProtocolLibHook.unregister} 会在注销
    * 异步处理器之前先调它）。
@@ -1283,19 +1367,16 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
     }
     ChunkChangeJournal.Written written = changeJournal.written(playerId, ticket);
     if (!written.current()) {
-      // 更新的区块快照接手了该列：脏格已随 open(...) 转移到新 ticket，不算丢失，也绝不重发区块包。
+      // 被淘汰的旧 MAP_CHUNK 迟到时再次刷新；普通同列替换由协调器直接忽略。
+      replayCoordinator.written(player, playerId, ticket, written);
       return;
     }
     clearRevealedOnDelivery(column.world(), column.x(), column.z(), playerId);
-    if (written.truncated()) {
-      // 记录阶段脏段数超限被截断：确认到了，但被截断的格子再也补不出去。
-      stats.replayCoverageLost.increment();
-      stats.replaySkipped.increment();
-    }
     if (!written.dirty()) {
       notifyChunkWritten(player, column);
-    } else if (written.schedule()) {
-      scheduleReplay(player, playerId, ticket.receiver);
+    } else {
+      // 截断由协调器直接整列刷新；普通脏格仍受 256 格 / 8 列预算约束。
+      replayCoordinator.written(player, playerId, ticket, written);
     }
   }
 
@@ -1311,100 +1392,7 @@ public final class ProtocolLibAsyncListener extends PacketAdapter {
   }
 
   private void scheduleReplay(Player player, UUID playerId, ChunkChangeJournal.Receiver receiver) {
-    Runnable abandon = () -> {
-      changeJournal.abandonDrain(receiver);
-      // 区域调度器不受理（插件停用中 / 实体已不可调度）：确认通道是通的，只是没补出去。
-      stats.replayRegionFailures.increment();
-      stats.replaySkipped.increment();
-    };
-    try {
-      if (!stopping && player.getScheduler().run(getPlugin(),
-          task -> drainReplay(player, playerId, receiver), abandon) != null) {
-        return;
-      }
-    } catch (RuntimeException ex) {
-      logThrottled("区块写出后补发调度失败（原包已放行）", ex);
-    }
-    abandon.run();
-  }
-
-  private void drainReplay(Player player, UUID playerId, ChunkChangeJournal.Receiver receiver) {
-    try {
-      if (stopping || !player.isOnline()) {
-        changeJournal.abandonDrain(receiver);
-        return;
-      }
-      World world = player.getWorld();
-      int budget = MAX_REPLAY_CELLS_PER_TICK;
-      int[] cells = new int[budget * 3];
-      // 顺延项放到本轮最后才入队，防止同一列在一个 tick 内耗尽所有重试。
-      List<ChunkChangeJournal.Ticket> deferred = new ArrayList<>(MAX_REPLAY_COLUMNS_PER_TICK);
-      for (int i = 0; i < MAX_REPLAY_COLUMNS_PER_TICK && budget > 0; i++) {
-        ChunkChangeJournal.Ticket ticket = changeJournal.poll(receiver);
-        if (ticket == null) {
-          break;
-        }
-        ChunkChangeJournal.Column column = ticket.column;
-        if (!world.getName().equals(column.world()) || !changeJournal.isCurrent(playerId, ticket)) {
-          // 该列已不属于当前世界 / 已被新快照取代：在途更新无法补出去（确认是到过的）。
-          if (changeJournal.hasPending(ticket)) {
-            stats.replayCoverageLost.increment();
-            stats.replaySkipped.increment();
-          }
-          changeJournal.finish(ticket, false);
-          continue;
-        }
-        try {
-          if (!Bukkit.isOwnedByCurrentRegion(world, column.x(), column.z())
-              || !world.isChunkLoaded(column.x(), column.z())
-              || !player.isChunkSent(Chunk.getChunkKey(column.x(), column.z()))) {
-            if (++ticket.retries < MAX_REPLAY_WAIT_TICKS) {
-              deferred.add(ticket);
-              continue;
-            }
-            // 区域归属 / 区块已加载 / 已发送三项检查连续若干 tick 都没通过：补发放弃。
-            stats.replayRegionFailures.increment();
-            stats.replaySkipped.increment();
-          } else {
-            ticket.retries = 0;
-            int count = changeJournal.take(ticket, budget, cells);
-            budget -= count;
-            if (count > 0) {
-              Map<Position, BlockData> changes = new LinkedHashMap<>();
-              for (int c = 0; c < count * 3; c += 3) {
-                changes.put(Position.block(cells[c], cells[c + 1], cells[c + 2]),
-                    world.getBlockData(cells[c], cells[c + 1], cells[c + 2]));
-              }
-              if (changeJournal.isCurrent(playerId, ticket)) {
-                // Paper API 自行按区块段分组；只发给该区块包的接收者。
-                player.sendMultiBlockChange(changes);
-                changeJournal.acknowledge(ticket, cells, count);
-                stats.replayCells.add(count);
-              }
-              deferred.add(ticket);
-              continue;
-            }
-          }
-        } catch (RuntimeException ex) {
-          // 取样/发包抛异常：同样属「确认到了但没补出去」。
-          stats.replayRegionFailures.increment();
-          stats.replaySkipped.increment();
-          logThrottled("区块写出后方块补发失败（原包不受影响）", ex);
-        }
-        if (changeJournal.finish(ticket, false)) {
-          notifyChunkWritten(player, column);
-        }
-      }
-      for (ChunkChangeJournal.Ticket ticket : deferred) {
-        if (changeJournal.finish(ticket, true)) {
-          notifyChunkWritten(player, ticket.column);
-        }
-      }
-    } finally {
-      if (changeJournal.continueDrain(receiver)) {
-        scheduleReplay(player, playerId, receiver);
-      }
-    }
+    replayCoordinator.schedule(player, playerId, receiver, 0L);
   }
 
 

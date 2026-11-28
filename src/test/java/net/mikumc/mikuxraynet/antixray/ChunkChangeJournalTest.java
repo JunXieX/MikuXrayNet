@@ -29,12 +29,21 @@ class ChunkChangeJournalTest {
     journal.record(FIRST, "world", 1, -62, 3);
     assertTrue(journal.written(FIRST, a).schedule());
     assertFalse(journal.written(SECOND, b).dirty());
-    journal.record(FIRST, "world", -13, -60, 3); // 区块写出之后的更新已在正确顺序，不应再补。
     assertSame(a, journal.poll(a.receiver));
     int[] cells = new int[6];
-    assertEquals(2, journal.take(a, 2, cells));
+    long[] revisions = new long[2];
+    assertEquals(2, journal.take(a, 2, cells, revisions));
     assertArrayEquals(new int[] {-15, -62, 3, -14, -61, 3}, cells);
-    journal.acknowledge(a, cells, 2);
+    // 两跳补发窗口内的新变更必须升代次，防止先取的旧 BlockData 晚到后盖回新状态。
+    journal.record(FIRST, "world", -13, -60, 3);
+    journal.acknowledge(a, cells, 2, revisions);
+    assertFalse(journal.finish(a, true), "取样后变化的第三格必须留到下一轮");
+    assertSame(a, journal.poll(a.receiver));
+    cells = new int[3];
+    long[] nextRevisions = new long[1];
+    assertEquals(1, journal.take(a, 1, cells, nextRevisions));
+    assertArrayEquals(new int[] {-13, -60, 3}, cells);
+    journal.acknowledge(a, cells, 1, nextRevisions);
     assertTrue(journal.finish(a, true));
     assertFalse(journal.continueDrain(a.receiver));
   }
@@ -152,6 +161,23 @@ class ChunkChangeJournalTest {
       journal.open(FIRST, "world", i, 0);
     }
     assertEquals(1, evictions.get(), "只有仍带在途更新的列被挤掉才计数");
+  }
+
+  @Test
+  void acknowledgementDoesNotClearCellsWhenCaptureRevisionChanged() {
+    ChunkChangeJournal journal = new ChunkChangeJournal();
+    var ticket = journal.open(FIRST, "world", 0, 0);
+    journal.record(FIRST, "world", 1, 2, 3);
+    journal.written(FIRST, ticket);
+    assertSame(ticket, journal.poll(ticket.receiver));
+    int[] cells = new int[3];
+    assertEquals(1, journal.take(ticket, 1, cells));
+    long revision = journal.captureRevision(ticket);
+
+    journal.acknowledge(ticket, cells, 1, revision - 1);
+    assertTrue(journal.hasPending(ticket), "代次不符表示样本已旧，新账必须保留");
+    journal.acknowledge(ticket, cells, 1, revision);
+    assertFalse(journal.hasPending(ticket));
   }
 
   @Test

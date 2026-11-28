@@ -100,15 +100,13 @@ public final class RewriteStats {
   public final LongAdder replayCells = new LongAdder();
 
   /**
-   * 补发被放弃的<b>合计</b>次数 = {@link #replayUnobserved} + {@link #replayEvicted} +
-   * {@link #replayRegionFailures} + {@link #replayCoverageLost}。
+   * 最终覆盖缺口合计 = {@link #replayUnobserved} + {@link #replayCoverageLost}。
+   * 淘汰与区域异常现在会进入整列刷新或重排，属于兜底触发次数，不再计入最终缺口。
    *
    * <p><b>为什么保留这个合计</b>：既有面板与 dump 读的就是它（{@code Diagnostics}），换名字会让线上口径
-   * 断档。四项互不重叠、每项都在「每个区块一次」的出口上自增，因此和恒等于本值；</p>
+   * 断档。只有确认不会再由本版修复的缺口才计入；仍在重排或已经刷新收敛的ticket不计入。</p>
    *
-   * <p><b>为什么必须拆开</b>：合计数无法回答「补发到底卡在哪」——观测缺失（信号没挂上）、淘汰（信号始终
-   * 没来）、区域失败（来了但补不出去）、覆盖丢失（来了但内容已被取代）四类的处置与修复方向完全不同，
-   * 混成一个数时只能看到「补发没发生」，看不出是谁的责任。</p>
+   * <p>诊断同时列出淘汰/区域异常的兜底触发次数；它们是过程指标，不与最终缺口求和。</p>
    */
   public final LongAdder replaySkipped = new LongAdder();
 
@@ -130,7 +128,7 @@ public final class RewriteStats {
   public final LongAdder replayUnobserved = new LongAdder();
 
   /**
-   * 淘汰：交付信号始终没有到达，ticket 被容量/超时淘汰（脏格随之释放、再也补不出去）。
+   * 淘汰兜底：交付信号始终没有到达，ticket 被容量/超时淘汰并触发整列刷新。
    *
    * <p>典型成因是封包没被真正写出（连接已断、被上游取消、ProtocolLib 发送队列丢弃）——此时补发本就不该
    * 发生，属正常收账；只有它在稳定运行时持续增长，才需要怀疑交付信号本身没被派发。
@@ -138,8 +136,7 @@ public final class RewriteStats {
   public final LongAdder replayEvicted = new LongAdder();
 
   /**
-   * 区域失败：写出确认已到，但补发本身没做成——区域归属/区块已加载/已发送三项检查重试用尽、
-   * 区域调度器拒绝受理、补发执行抛异常。
+   * 区域异常兜底：就绪等待耗尽、调度器拒收或补发执行异常，随后保留票据并重排/整列刷新。
    *
    * <p>与 {@link #replayEvicted} 的分界：这里确认通道是通的、只是没补出去（调度/线程侧问题），
    * 而淘汰是确认通道根本没响（协议/连接侧问题）。
@@ -147,8 +144,7 @@ public final class RewriteStats {
   public final LongAdder replayRegionFailures = new LongAdder();
 
   /**
-   * 覆盖丢失：写出确认已到，但该列的在途更新已不可能补出去——会话/世界已变（ticket 被新会话取代）、
-   * 或记录阶段脏段数超限被截断。
+   * 覆盖丢失：写出确认到达时所属会话已经失效；记录截断已由整列刷新收敛，不计入本项。
    *
    * <p>与 {@link #replayEvicted} 的分界：这里的确认是到的（我们知道包写出来了），丢的是内容；
    * 前者丢的是「知道包写出来了」这件事本身。

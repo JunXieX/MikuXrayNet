@@ -1400,18 +1400,17 @@ public final class Diagnostics {
         + " 次（该区块无位图：矿可能一直显示假方块，且每次重发都要重算）"
         + "，发布跳过 " + s.rewrite().occlusionPublishSkipped()
         + " 段（期间有方块补丁，保留活位图）");
-    // 「补发未完成」混着四种完全不同的处置：观测缺失（观察链路报错，永远等不到确认）、淘汰（包没被
-    // 真正写出，本就不该补）、区域失败（确认到了但补不出去）、覆盖丢失（确认到了、内容已被新会话取代）。
-    // 只给合计时只能看到「补发没发生」，看不出责任在协议/线程/会话哪一侧。
+    // 最终缺口与「触发过兜底」分开：后者可能随后刷新成功，不能继续算作未完成。
     String replaySkippedSplit = splitInner(s.rewrite().replaySkipped(),
-        new long[] {s.rewrite().replayUnobserved(), s.rewrite().replayEvicted(),
-            s.rewrite().replayRegionFailures(), s.rewrite().replayCoverageLost()},
-        "观测缺失", "淘汰", "区域失败", "覆盖丢失");
+        new long[] {s.rewrite().replayUnobserved(), s.rewrite().replayCoverageLost()},
+        "观测缺失", "覆盖丢失");
     String replayNote = s.rewrite().replayDelivered() <= 0L && replaySkippedSplit.isEmpty() ? ""
         : "（写出确认 " + s.rewrite().replayDelivered() + " 次"
-            + (replaySkippedSplit.isEmpty() ? "" : "；" + replaySkippedSplit) + "）";
+            + (replaySkippedSplit.isEmpty() ? "" : "；" + replaySkippedSplit)
+            + "；异常兜底：淘汰 " + s.rewrite().replayEvicted()
+            + " / 区域 " + s.rewrite().replayRegionFailures() + "）";
     lines.add("在途更新：区块写出后定向补发 " + s.rewrite().replayCells()
-        + " 格，登记或补发未完成 " + s.rewrite().replaySkipped() + " 次" + replayNote);
+        + " 格，最终覆盖缺口 " + s.rewrite().replaySkipped() + " 次" + replayNote);
     // 「未改写」按原始计数器分列，并写明各自的归属关系：chunksSkipped 是「已处理但原包放行」的<b>总量</b>，
     // chunksFailed 是它的子集；而「队列满」与「超时放行」都在各自的提前返回分支里计数、并不计入
     // chunksSkipped。任何用减法（如 跳过 − 异常）去推算「本来就无需改写」的写法都会漏掉这两条路径，
