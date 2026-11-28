@@ -34,8 +34,9 @@ import java.util.regex.Pattern;
  * 顶层 {@code metadata = field 1, wire type 2}，其内部 {@code comment = field 6, wire type 2}
  * （见 spark 仓库 {@code spark-common/src/main/proto/spark/spark_sampler.proto}）。因此只读文件前
  * {@link #MAX_HEADER_BYTES} 字节，按 protobuf 线格式逐字段推进；字段顺序在 protobuf 编码里按字段号升序，
- * comment（6）排在 platform_metadata（7）之前，必然落在前缀内。任何长度越界、线类型非法（组 3/4）、
- * 声明长度大于真实文件长度，一律判为「不是本文件」并放弃——宁可漏认，也不把别人的数据当成自己的。
+ * comment（6）排在 platform_metadata（7）与 sources（13）之前。若这些后续大字段超出前缀，
+ * 已完整读取的 comment 与 start_time 已足够判定归属，不再扫描未读部分。可读范围内任何长度越界、
+ * 线类型非法（组 3/4）、声明长度大于真实文件长度，一律判为「不是本文件」并放弃。
  *
  * <p><b>不碰符号链接</b>：目录本身与每个候选条目都做 {@code NOFOLLOW_LINKS} 判定，并要求
  * {@code toRealPath()} 仍落在该目录内；打不开、读一半、是目录、是链接、超大，全部跳过。
@@ -65,7 +66,7 @@ final class SparkProfileFiles {
   /** 文件名长度上限：真实名字约 39 字符，留富余但拒绝异常长名。 */
   private static final int MAX_FILE_NAME = 96;
 
-  /** 只读头部这么多字节用于解析元数据；comment 位于元数据前段，64 KiB 足够且严格有界。 */
+  /** 只读文件前缀用于定位 start_time 与 comment；完整解析大型采样数据不是这里的职责。 */
   static final int MAX_HEADER_BYTES = 64 * 1024;
 
   /**
@@ -240,8 +241,9 @@ final class SparkProfileFiles {
   /**
    * 纯字节解析（可离线单测）：{@code data} 只含文件前 {@code headLength} 字节，{@code fileSize} 是真实文件大小。
    *
-   * <p>结构约束：顶层第一个字段必须就是 {@code metadata}；元数据内部按字段号推进，遇到 comment 即取，
-   * 越界/组/非法线类型一律放弃。
+   * <p>结构约束：顶层第一个字段必须就是 {@code metadata}；元数据内部按字段号推进，遇到 comment 即取。
+   * 元数据超出前缀时，完整读到 comment 后即可返回，后续未读字段不影响归属；前缀内仍严格拒绝
+   * 越界/组/非法线类型。
    */
   static Optional<Header> parseHeader(byte[] data, int headLength, long fileSize) {
     if (data == null || headLength <= 0 || fileSize <= 0L) {
@@ -300,6 +302,10 @@ final class SparkProfileFiles {
           }
           if (field == FIELD_COMMENT && length <= MAX_COMMENT_BYTES) {
             comment = cursor.readString((int) length);
+            if (metadataEnd > limit) {
+              // 后续字段只是被读取上限截断；已读到的归属信息无需等待完整元数据
+              return Optional.of(new Header(comment, startTime));
+            }
           } else if (!cursor.skipStrict((int) length)) {
             return Optional.empty();
           }

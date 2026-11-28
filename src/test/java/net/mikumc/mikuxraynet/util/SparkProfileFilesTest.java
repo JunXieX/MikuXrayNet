@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
@@ -60,6 +61,42 @@ class SparkProfileFilesTest {
     assertTrue(header.isPresent(), "真实结构的采样文件必须能被解析");
     assertEquals(MARKER, header.get().comment());
     assertEquals(1_700_000_000_000L, header.get().startTimeMillis());
+  }
+
+  @Test
+  void readsMarkerAndStartTimeBeforeLargeMetadataFields() {
+    byte[] profile = largeMetadataProfile(MARKER);
+    byte[] prefix = Arrays.copyOf(profile, SparkProfileFiles.MAX_HEADER_BYTES);
+    assertTrue(profile.length > prefix.length, "fixture 的元数据必须明显超过 64 KiB 读取上限");
+
+    Optional<SparkProfileFiles.Header> header =
+        SparkProfileFiles.parseHeader(prefix, prefix.length, profile.length);
+
+    assertTrue(header.isPresent(), "comment 已完整读到时，后续大字段被前缀上限截断不影响解析");
+    assertEquals(MARKER, header.get().comment());
+    assertEquals(1_700_000_000_000L, header.get().startTimeMillis());
+  }
+
+  @Test
+  void truncatedLargeMetadataIsRejectedEvenWhenCommentIsReadable() {
+    byte[] profile = largeMetadataProfile(MARKER);
+    byte[] prefix = Arrays.copyOf(profile, SparkProfileFiles.MAX_HEADER_BYTES);
+
+    assertTrue(SparkProfileFiles.parseHeader(prefix, prefix.length, profile.length - 1L).isEmpty(),
+        "metadataEnd 超过真实文件大小时仍是真实截断，必须拒绝");
+  }
+
+  @Test
+  void largeMetadataFileIsOwnedOnlyByExactMarker() throws IOException {
+    Path ours = write("profile-2026-11-28_09.42.18.sparkprofile", largeMetadataProfile(MARKER));
+    Path other = write("profile-2026-11-28_09.42.19.sparkprofile",
+        largeMetadataProfile("mxnet-ffffffffffffffffffffffffffffffff"));
+
+    SparkProfileFiles.Checked owned = SparkProfileFiles.verifyOwnedProfile(List.of(this.temp), ours, MARKER);
+    assertTrue(owned.ok(), "完整落盘的大 metadata 文件必须能被本次 marker 认领");
+    assertEquals(ours, owned.path());
+    assertTrue(SparkProfileFiles.verifyOwnedProfile(List.of(this.temp), other, MARKER)
+        .reason().contains("注释"), "不同 marker 仍必须拒绝");
   }
 
   @Test
@@ -642,6 +679,17 @@ class SparkProfileFilesTest {
         varintField(2, 1_700_000_000_000L),
         varintField(3, 10L),
         stringField(6, comment)));
+  }
+
+  private static byte[] largeMetadataProfile(String comment) {
+    return sampler(metadata(
+        varintField(2, 1_700_000_000_000L),
+        varintField(3, 10L),
+        stringField(6, comment),
+        lengthDelimited(7, stringField(1, "p".repeat(40_000))),
+        lengthDelimited(13, concat(
+            stringField(1, "spark"),
+            lengthDelimited(2, stringField(1, "s".repeat(40_000)))))));
   }
 
   private static byte[] sampler(byte[]... fields) {
